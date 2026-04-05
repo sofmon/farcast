@@ -18,7 +18,7 @@ FarCast is a cloud operating system where privacy is the foundational principle.
 
 **Cost control is mandatory, not optional.** Every instance must have a cost limit set at creation — there is no way to skip it. TechnoCore monitors cloud spending continuously, breaks costs down per application, warns as spending approaches the limit, and takes protective action when the limit is reached (stop high-cost apps first, then the entire instance if needed, keeping only TechnoCore alive). The two non-negotiable pillars of FarCast are: (1) security/privacy, (2) cost control. Everything else is secondary.
 
-**Manifests describe what, not how.** The `./farcast` manifest is intentionally minimal. Applications declare what they need to run and which external services they connect to. They never specify resources, ports, or infrastructure details. TechnoCore monitors and adapts resources automatically.
+**Manifests describe what, not how.** The `./farcast` manifest is intentionally minimal. A single manifest declares one or more applications grouped as a deployment: each application's identity, its Containerfile, and the external services it connects to. Build steps and startup commands live in the Containerfile. Manifests never specify resources, ports, or infrastructure details. TechnoCore monitors and adapts resources automatically.
 
 ## Key Design Decisions
 

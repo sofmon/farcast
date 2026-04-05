@@ -1,0 +1,9 @@
+name: my-app
+apps:
+  - name: server
+    containerfile: ./Containerfile
+    external:
+      - host: api.stripe.com
+        reason: Payment processing
+      - host: smtp.mailgun.org
+        reason: Transactional email delivery

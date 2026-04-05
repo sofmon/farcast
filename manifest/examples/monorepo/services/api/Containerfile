@@ -1,0 +1,3 @@
+FROM alpine:3.19
+# build context is the repository root; shared code is available under ./shared
+CMD ["echo", "hello from api"]

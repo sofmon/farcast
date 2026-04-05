@@ -1,0 +1,3 @@
+FROM alpine:3.19
+# build context defaults to ./services/web (the directory containing this file)
+CMD ["echo", "hello from web"]

@@ -1,3 +1,0 @@
-# ./farcast — minimal
-name: my-application
-entrypoint: node server.js

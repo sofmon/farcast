@@ -11,10 +11,10 @@ A phased build order for FarCast. Each phase builds on the previous one and deli
 ### 0.1 Manifest parser
 The manifest is the contract between applications and the OS. Every module will need to read it. Build the parser first so all subsequent work has a shared schema to rely on.
 
-- Define the `./farcast` YAML schema (name, entrypoint, external)
+- Define the `./farcast` YAML schema: top-level `name` + `apps[]`, where each app has `name`, `containerfile`, optional `context`, and optional `external` (see [`manifest/README.md`](manifest/README.md) for the full specification)
 - Implement the Go parser library (`manifest/parser/`)
 - Write comprehensive tests — this is the foundation, it must be solid
-- Include validation (missing fields, malformed YAML, unknown keys)
+- Include validation: missing required fields, malformed YAML, unknown keys at any level, empty `apps` list, duplicate app names, DNS-label rules on names, relative-path safety on `containerfile`/`context` (no absolute paths, no `..`), duplicate hosts within a single app's `external` list
 
 ### 0.2 SDK — Go (core interfaces)
 Define the Go SDK interfaces before any implementation exists. These are the "syscall" signatures that applications will use and that modules will implement behind the scenes.
@@ -161,9 +161,9 @@ The kernel comes online. It manages what runs inside the instance and enforces c
 ### 4.2 Planck — manifest-to-workload translator
 Translate a `./farcast` manifest into K8s resources.
 
-- Parse manifest → generate K8s Deployment, Service, ConfigMap
+- Parse manifest → create a K8s namespace named after the top-level `name`, then generate Deployment, Service, and ConfigMap resources for each entry in `apps[]` within that namespace
 - Sensible defaults for resources (start conservative, TechnoCore will adapt later)
-- Container image building or resolution from entrypoint
+- Build each app's container image from its `containerfile` path, using the app's `context` directory (or the Containerfile's directory when `context` is omitted); report a clear error if a referenced Containerfile is missing
 - Inject SDK as sidecar or init container
 
 ### 4.3 FarSight CLI — `farcast run`
@@ -180,7 +180,7 @@ The core command that makes FarCast useful.
 ### 4.4 Shrike — manifest enforcement for running apps
 Extend Shrike to monitor per-application traffic.
 
-- Each app's FatLine allowlist derived from its own manifest
+- Each app's FatLine allowlist derived from its own entry in the manifest
 - App A cannot use App B's external declarations
 - Violation alerts tied to specific applications
 

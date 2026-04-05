@@ -10,7 +10,7 @@ FarCast is a cloud-native operating system by [Sofmon](https://sofmon.com). It t
 
 ## Core Concept
 
-Traditional operating systems run on hardware. FarCast runs on cloud primitives. Rather than reinventing compute, storage, or networking, FarCast provides a sovereign abstraction layer over mature cloud services — managed Kubernetes for compute (Planck), object storage for persistence (DataSphere), and encrypted networking over cloud infrastructure (FatLine). The unit of execution is not a binary — it is a **Git repository**. Repositories declare their requirements in a `./farcast` manifest file and Planck translates them into workloads on the underlying cloud provider.
+Traditional operating systems run on hardware. FarCast runs on cloud primitives. Rather than reinventing compute, storage, or networking, FarCast provides a sovereign abstraction layer over mature cloud services — managed Kubernetes for compute (Planck), object storage for persistence (DataSphere), and encrypted networking over cloud infrastructure (FatLine). The unit of execution is not a binary — it is a **Git repository**. A repository may contain one or more applications, declared together in a single `./farcast` manifest, and Planck translates them into a namespace of workloads on the underlying cloud provider.
 
 Every instance is private by default. No external party can connect to or control a FarCast instance without explicit permission from the operator. Every instance has a mandatory cost limit — FarCast protects the operator's wallet as fiercely as their data.
 
@@ -168,28 +168,54 @@ See each module's `README.md` for language specifics, architecture detail, and i
 
 ## The ./farcast Manifest
 
-Any Git repository can run on FarCast by adding a `./farcast` file to its root. The manifest is intentionally minimal — it describes *what* to run, not *how* to run it. There are no resource declarations, no port mappings, no infrastructure details.
+Any Git repository can run on FarCast by adding a `./farcast` file to its root. The manifest is intentionally minimal — it describes *what* to run, not *how* to run it. There are no resource declarations, no port mappings, no infrastructure details. Build instructions and startup commands live in each application's Containerfile; the manifest only declares identity and the security contract.
 
 TechnoCore monitors every running application and adapts resources automatically — scaling CPU, memory, and replicas based on observed behaviour. The operator never needs to guess at resource requirements or tune infrastructure.
 
+A manifest can describe one or more applications grouped as a single deployment. Planck translates it into a Kubernetes namespace with one workload per application — so a monorepo can deploy its full set of services from a single file.
+
 ```yaml
-# ./farcast — minimal
+# ./farcast — single application
 name: my-application
-entrypoint: node server.js
+apps:
+  - name: server
+    containerfile: ./Containerfile
 ```
 
-If an application needs to connect to external services, it must declare them explicitly. All outbound connections are denied by default — only declared endpoints are allowed. This ensures the operator knows exactly what an application will access before running it, and gives Shrike a clear contract to enforce at runtime.
+If an application needs to connect to external services, it must declare them explicitly. All outbound connections are denied by default — only declared endpoints are allowed. Declarations are scoped per-application: each app sees only its own allowlist. This ensures the operator knows exactly what each application will access before running it, and gives Shrike a clear contract to enforce at runtime.
 
 ```yaml
 # ./farcast — with external access
 name: my-application
-entrypoint: node server.js
+apps:
+  - name: server
+    containerfile: ./Containerfile
+    external:
+      - host: api.stripe.com
+        reason: Payment processing
+      - host: smtp.mailgun.org
+        reason: Transactional emails
+```
 
-external:
-  - host: api.stripe.com
-    reason: Payment processing
-  - host: smtp.mailgun.org
-    reason: Transactional emails
+A monorepo with multiple services uses multiple entries under `apps`. Each service points to its own Containerfile and carries its own `external` declarations.
+
+```yaml
+# ./farcast — monorepo with multiple services
+name: my-platform
+apps:
+  - name: api
+    containerfile: ./services/api/Containerfile
+    context: .
+    external:
+      - host: api.stripe.com
+        reason: Payment processing
+
+  - name: worker
+    containerfile: ./services/worker/Containerfile
+    context: .
+
+  - name: web
+    containerfile: ./services/web/Containerfile
 ```
 
 FarCast provides sensible defaults for everything else. Applications that need to interact with the FarCast environment (storage, networking, configuration, secrets) do so through the **farcast SDK** — a language-level library analogous to syscalls in a traditional OS kernel.
@@ -210,7 +236,7 @@ Every instance is private by default. All connections — inbound and outbound �
 Cloud costs are unpredictable by nature. FarCast treats cost control as a mandatory safeguard, not an optional dashboard. When summoning an instance, the operator **must** set a cost limit — there is no default, no "unlimited", no way to skip it. TechnoCore continuously monitors cloud spending across compute (Planck), storage (DataSphere), networking (FatLine), and AI (AllThing). It breaks costs down per application, warns the operator as spending approaches the threshold, and takes protective action when the limit is reached — stopping the highest-cost applications first, and if necessary, shutting down the entire instance while keeping only TechnoCore alive to report status and allow the operator to respond.
 
 ### Git-Native Execution
-Repositories are first-class executables. `farcast run github.com/user/repo` fetches the repository, reads its minimal manifest, and Planck translates it into workloads on the underlying managed Kubernetes. TechnoCore monitors the application and adapts resources automatically — no build pipeline, no deployment tooling, no capacity planning required.
+Repositories are first-class executables. `farcast run github.com/user/repo` fetches the repository, reads its minimal manifest, and Planck translates it into a namespace containing one or more workloads on the underlying managed Kubernetes. TechnoCore monitors the applications and adapts resources automatically — no build pipeline, no deployment tooling, no capacity planning required.
 
 ### DataSphere
 DataSphere is the storage abstraction layer. It proxies all file storage and retrieval, hiding the underlying cloud provider (S3, GCS, or any object store) behind a uniform interface. Before any data leaves the instance, DataSphere encrypts it — the cloud provider only ever sees encrypted blobs. Combined with FatLine's encryption in transit, this means the cloud provider is completely blind to both traffic and stored data.

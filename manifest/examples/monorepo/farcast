@@ -1,0 +1,18 @@
+name: my-platform
+apps:
+  - name: api
+    containerfile: ./services/api/Containerfile
+    context: .
+    external:
+      - host: api.stripe.com
+        reason: Payment processing
+
+  - name: worker
+    containerfile: ./services/worker/Containerfile
+    context: .
+    external:
+      - host: smtp.mailgun.org
+        reason: Sending notification emails
+
+  - name: web
+    containerfile: ./services/web/Containerfile
