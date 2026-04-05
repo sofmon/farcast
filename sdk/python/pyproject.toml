@@ -1,0 +1,4 @@
+[project]
+name = "farcast"
+version = "0.0.1"
+description = "FarCast SDK for Python"

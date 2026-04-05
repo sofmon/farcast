@@ -1,0 +1,9 @@
+# ./farcast — with external access
+name: my-application
+entrypoint: node server.js
+
+external:
+  - host: api.stripe.com
+    reason: Payment processing
+  - host: smtp.mailgun.org
+    reason: Transactional emails

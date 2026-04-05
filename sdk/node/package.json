@@ -1,0 +1,6 @@
+{
+  "name": "@farcast/sdk",
+  "version": "0.0.1",
+  "description": "FarCast SDK for Node.js",
+  "private": true
+}

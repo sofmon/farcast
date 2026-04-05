@@ -1,0 +1,339 @@
+# Sofmon FarCast
+
+> *"Just farcast it."*
+
+FarCast is a cloud-native operating system by [Sofmon](https://sofmon.com). It treats cloud infrastructure as its hardware — no dedicated machines, no fixed location. A FarCast instance is a **private sovereign space** that lives within the public cloud universe, owned and controlled exclusively by its operator.
+
+**[sofmon.com/farcast](https://sofmon.com/farcast)** · **[farcast.one](https://farcast.one)** *(the first FarCast instance)*
+
+---
+
+## Core Concept
+
+Traditional operating systems run on hardware. FarCast runs on cloud primitives. Rather than reinventing compute, storage, or networking, FarCast provides a sovereign abstraction layer over mature cloud services — managed Kubernetes for compute (Planck), object storage for persistence (DataSphere), and encrypted networking over cloud infrastructure (FatLine). The unit of execution is not a binary — it is a **Git repository**. Repositories declare their requirements in a `./farcast` manifest file and Planck translates them into workloads on the underlying cloud provider.
+
+Every instance is private by default. No external party can connect to or control a FarCast instance without explicit permission from the operator. Every instance has a mandatory cost limit — FarCast protects the operator's wallet as fiercely as their data.
+
+---
+
+## Repository Structure
+
+Each module is self-contained: its README.md serves as the specification, and source code lives alongside it. Detailed specs, architecture notes, and API documentation go in a `docs/` subfolder within each module. Tests sit next to the code they cover.
+
+```
+farcast/
+│
+├── README.md                       ← you are here
+│
+├── technocore/                     ← Kernel & core runtime
+│   ├── README.md                   ← Module spec & overview
+│   ├── docs/                       ← Detailed specs, architecture, API
+│   ├── cmd/                        ← Entry point
+│   │   └── technocore/
+│   │       └── main.go
+│   ├── internal/                   ← Private packages
+│   │   ├── scheduler/
+│   │   ├── monitor/
+│   │   └── costs/                  ← Cost tracking & enforcement
+│   ├── pkg/                        ← Public packages (if any)
+│   ├── go.mod
+│   └── go.sum
+│
+├── planck/                         ← Compute abstraction over managed K8s
+│   ├── README.md
+│   ├── docs/
+│   ├── cmd/
+│   │   └── planck/
+│   │       └── main.go
+│   ├── internal/
+│   │   ├── providers/              ← EKS, GKE, AKS adapters
+│   │   └── translator/            ← Manifest → K8s workload
+│   ├── go.mod
+│   └── go.sum
+│
+├── fatline/                        ← Networking, routing, proxy & encryption
+│   ├── README.md
+│   ├── docs/
+│   ├── cmd/
+│   │   └── fatline/
+│   │       └── main.go
+│   ├── internal/
+│   │   ├── proxy/
+│   │   ├── router/
+│   │   └── crypto/
+│   ├── go.mod
+│   └── go.sum
+│
+├── datasphere/                     ← Storage abstraction & encryption-at-rest
+│   ├── README.md
+│   ├── docs/
+│   ├── cmd/
+│   │   └── datasphere/
+│   │       └── main.go
+│   ├── internal/
+│   │   ├── providers/              ← S3, GCS adapters
+│   │   └── crypto/                 ← Encryption-at-rest
+│   ├── go.mod
+│   └── go.sum
+│
+├── allthing/                       ← AI abstraction layer
+│   ├── README.md
+│   ├── docs/
+│   ├── cmd/
+│   │   └── allthing/
+│   │       └── main.go
+│   ├── internal/
+│   │   ├── providers/              ← Gemini, Claude, OpenAI adapters
+│   │   └── chat/                   ← Chat interface
+│   ├── go.mod
+│   └── go.sum
+│
+├── shrike/                         ← Security monitor & policy enforcement
+│   ├── README.md
+│   ├── docs/
+│   ├── cmd/
+│   │   └── shrike/
+│   │       └── main.go
+│   ├── internal/
+│   │   ├── policy/                 ← Manifest-based rule engine
+│   │   └── inspector/              ← Traffic analysis
+│   ├── go.mod
+│   └── go.sum
+│
+├── farsight/                       ← The "farcast" app (GUI + CLI + server)
+│   ├── README.md
+│   ├── docs/
+│   ├── server/                     ← Go — UX composition & session management
+│   │   ├── cmd/
+│   │   │   └── farsight-server/
+│   │   │       └── main.go
+│   │   ├── internal/
+│   │   ├── go.mod
+│   │   └── go.sum
+│   ├── client/                     ← Electron + TypeScript — GUI
+│   │   ├── src/
+│   │   ├── package.json
+│   │   └── tsconfig.json
+│   └── cli/                        ← Go — command line interface
+│       ├── cmd/
+│       │   └── farcast/
+│       │       └── main.go
+│       ├── internal/
+│       ├── go.mod
+│       └── go.sum
+│
+├── sdk/                            ← FarCast libraries (syscall-like APIs)
+│   ├── README.md
+│   ├── go/                         ← Go SDK
+│   │   ├── farcast.go
+│   │   └── go.mod
+│   ├── node/                       ← Node.js SDK
+│   │   ├── src/
+│   │   └── package.json
+│   └── python/                     ← Python SDK
+│       ├── farcast/
+│       └── pyproject.toml
+│
+├── manifest/                       ← ./farcast manifest spec & parser
+│   ├── README.md
+│   ├── docs/
+│   ├── parser/                     ← Go — manifest parser library
+│   │   ├── parser.go
+│   │   ├── parser_test.go
+│   │   └── go.mod
+│   └── examples/                   ← Example manifests
+│
+└── docs/                           ← Project-wide docs
+    ├── hyperion-reference.md       ← Naming lore
+    └── adr/                        ← Architecture Decision Records
+```
+
+---
+
+## Technology Stack
+
+| Component | Language | Role |
+|---|---|---|
+| **TechnoCore** | Go | Kernel — orchestration, instance lifecycle, adaptive resource management, cost enforcement |
+| **Planck** | Go | Compute abstraction — cloud-agnostic layer over managed Kubernetes (EKS, GKE, AKS) |
+| **FatLine** | Go | Networking layer — routing, proxy, encryption, all traffic in/out |
+| **DataSphere** | Go | Storage abstraction layer — cloud-agnostic proxy with encryption-at-rest |
+| **AllThing** | Go | AI abstraction — cloud-agnostic layer over managed AI services (Gemini, Claude, OpenAI) |
+| **Shrike** | Go | Security monitor — validates traffic against manifest declarations, intervenes on violations |
+| **FarSight** | Go + Electron + TypeScript | The "farcast" app — GUI (tiling browser), CLI, and server-side composition |
+
+See each module's `README.md` for language specifics, architecture detail, and implementation notes.
+
+---
+
+## The ./farcast Manifest
+
+Any Git repository can run on FarCast by adding a `./farcast` file to its root. The manifest is intentionally minimal — it describes *what* to run, not *how* to run it. There are no resource declarations, no port mappings, no infrastructure details.
+
+TechnoCore monitors every running application and adapts resources automatically — scaling CPU, memory, and replicas based on observed behaviour. The operator never needs to guess at resource requirements or tune infrastructure.
+
+```yaml
+# ./farcast — minimal
+name: my-application
+entrypoint: node server.js
+```
+
+If an application needs to connect to external services, it must declare them explicitly. All outbound connections are denied by default — only declared endpoints are allowed. This ensures the operator knows exactly what an application will access before running it, and gives Shrike a clear contract to enforce at runtime.
+
+```yaml
+# ./farcast — with external access
+name: my-application
+entrypoint: node server.js
+
+external:
+  - host: api.stripe.com
+    reason: Payment processing
+  - host: smtp.mailgun.org
+    reason: Transactional emails
+```
+
+FarCast provides sensible defaults for everything else. Applications that need to interact with the FarCast environment (storage, networking, configuration, secrets) do so through the **farcast SDK** — a language-level library analogous to syscalls in a traditional OS kernel.
+
+Full manifest specification → [`manifest/README.md`](manifest/README.md)
+
+---
+
+## Key Concepts
+
+### Instances
+A FarCast instance is the fundamental unit — analogous to a running OS on a physical machine. Instances are summoned from base images, live in cloud infrastructure, and are terminated when no longer needed.
+
+### Sovereignty
+Every instance is private by default. All connections — inbound and outbound — are denied unless explicitly declared. Each application must list the external services it needs in its `./farcast` manifest, including a human-readable reason. The operator reviews these declarations before running the app. FatLine enforces the boundary, allowing only declared endpoints. Shrike monitors traffic at runtime and intervenes if an application attempts to reach an undeclared destination. The cloud provider cannot access the contents of an instance.
+
+### Cost Control
+Cloud costs are unpredictable by nature. FarCast treats cost control as a mandatory safeguard, not an optional dashboard. When summoning an instance, the operator **must** set a cost limit — there is no default, no "unlimited", no way to skip it. TechnoCore continuously monitors cloud spending across compute (Planck), storage (DataSphere), networking (FatLine), and AI (AllThing). It breaks costs down per application, warns the operator as spending approaches the threshold, and takes protective action when the limit is reached — stopping the highest-cost applications first, and if necessary, shutting down the entire instance while keeping only TechnoCore alive to report status and allow the operator to respond.
+
+### Git-Native Execution
+Repositories are first-class executables. `farcast run github.com/user/repo` fetches the repository, reads its minimal manifest, and Planck translates it into workloads on the underlying managed Kubernetes. TechnoCore monitors the application and adapts resources automatically — no build pipeline, no deployment tooling, no capacity planning required.
+
+### DataSphere
+DataSphere is the storage abstraction layer. It proxies all file storage and retrieval, hiding the underlying cloud provider (S3, GCS, or any object store) behind a uniform interface. Before any data leaves the instance, DataSphere encrypts it — the cloud provider only ever sees encrypted blobs. Combined with FatLine's encryption in transit, this means the cloud provider is completely blind to both traffic and stored data.
+
+### FatLine
+FatLine is the sole networking layer for a FarCast instance. All traffic — instance-to-instance, instance-to-internet, and client-to-instance — flows through FatLine. It acts as router, proxy, and encryption boundary in one. By default, all connections are denied. FatLine only permits outbound traffic to external endpoints that are explicitly declared in an application's `./farcast` manifest. A FatLine connection is established the moment a client connects to a FarCast environment, and nothing enters or leaves the instance without passing through it.
+
+### AllThing
+AllThing is the AI abstraction layer. Like Planck abstracts compute and DataSphere abstracts storage, AllThing abstracts cloud AI services — Gemini, Claude, OpenAI, or any provider the operator chooses. Applications interact with AI through AllThing via the SDK, never directly with a provider. Initially, AllThing provides a chat interface accessible through FarSight. Over time, it becomes the AI backbone for the entire system — powering TechnoCore's adaptive resource management, Shrike's traffic analysis, and any application that needs intelligence.
+
+### FarCast SDK
+The farcast SDK is a set of language-level libraries that let applications interact with the FarCast environment — analogous to syscalls in a traditional OS. Instead of directly calling cloud APIs or managing infrastructure, applications import the farcast library and get access to storage (DataSphere), networking (FatLine), configuration, secrets, and environment defaults. The SDK abstracts the OS boundary so that applications remain cloud-agnostic and portable across any FarCast instance.
+
+### FarSight
+FarSight is how users see and interact with FarCast — the entire UX layer. It consists of a client and a server.
+
+The user downloads a single app called "farcast". It provides three interfaces: a **GUI** (the tiling browser), a **CLI** (for operators and automation), and a **server** that runs inside the FarCast instance.
+
+When opened, the app provides two functions: (1) **Install** — a guided process to deploy FarCast to a cloud environment, where the operator provides admin credentials for their chosen cloud provider, and (2) **Connect** — open a FarSight session towards a running FarCast instance. Both functions are accessible from the GUI and the CLI.
+
+Once connected via the GUI, FarSight presents a browser-like interface using a tiling window manager layout. Each tile is an application running inside the FarCast instance. Every request from the FarSight client is proxied through FatLine — all traffic flows through the FarCast instance, meaning the user's local network cannot observe what they are doing. The user's point of presence on the internet is the FarCast instance, not their local machine.
+
+The **FarSight server** runs inside the FarCast instance and handles UX composition — assembling the tiled layout, managing sessions, and serving the interface back to the client through FatLine.
+
+---
+
+## Naming
+
+All component names are drawn from Dan Simmons' *Hyperion Cantos*. Each name reflects the component's role by design, not decoration. Full reference → [`docs/hyperion-reference.md`](docs/hyperion-reference.md)
+
+---
+
+## Instance Lifecycle
+
+```
+summon → bind → run → release
+```
+
+- **Summon** — create a new instance from a base image; operator must set a cost limit
+- **Bind** — establish FatLine connections, mount DataSphere volumes
+- **Run** — operational state; execute repositories via Planck
+- **Release** — terminate the instance
+
+---
+
+## CLI Quick Reference
+
+```bash
+# Summon an instance (cost limit is mandatory)
+farcast summon --name my-instance --cost-limit 100/month
+
+# Run a repository on an instance
+farcast run github.com/username/repo
+
+# List running instances
+farcast ps
+
+# View cost breakdown
+farcast costs my-instance
+
+# Connect to a FarCast instance via FarSight
+farcast connect my-instance
+
+# Terminate an instance
+farcast release my-instance
+```
+
+Full CLI reference → [`farsight/cli/README.md`](farsight/cli/README.md)
+
+---
+
+## Module READMEs
+
+Each module folder contains its own `README.md` with:
+
+- Purpose and responsibilities
+- Architecture and internal design
+- API and interfaces exposed to other modules
+- Configuration reference
+- Implementation notes and language specifics
+
+| Module | README |
+|---|---|
+| TechnoCore | [`technocore/README.md`](technocore/README.md) |
+| Planck | [`planck/README.md`](planck/README.md) |
+| FatLine | [`fatline/README.md`](fatline/README.md) |
+| DataSphere | [`datasphere/README.md`](datasphere/README.md) |
+| Shrike | [`shrike/README.md`](shrike/README.md) |
+| AllThing | [`allthing/README.md`](allthing/README.md) |
+| FarSight | [`farsight/README.md`](farsight/README.md) |
+| SDK | [`sdk/README.md`](sdk/README.md) |
+| Manifest Spec | [`manifest/README.md`](manifest/README.md) |
+
+---
+
+## Status
+
+> This project is in early specification phase. No production code exists yet.
+
+| Module | Spec | Implementation |
+|---|---|---|
+| TechnoCore | 🔲 Draft | 🔲 Not started |
+| Planck | 🔲 Draft | 🔲 Not started |
+| FatLine | 🔲 Draft | 🔲 Not started |
+| DataSphere | 🔲 Draft | 🔲 Not started |
+| Shrike | 🔲 Draft | 🔲 Not started |
+| AllThing | 🔲 Draft | 🔲 Not started |
+| FarSight | 🔲 Draft | 🔲 Not started |
+| SDK | 🔲 Draft | 🔲 Not started |
+| Manifest Spec | 🔲 Draft | 🔲 Not started |
+
+---
+
+## Future Concepts
+
+The following components are planned for future implementation phases but are not part of the initial scope.
+
+### TimeTomb — Snapshots & Recovery
+
+*Hyperion origin: Sealed artifacts immune to change (the Time Tombs).*
+
+TimeTomb will provide point-in-time snapshots of an entire FarCast instance — state, configuration, and DataSphere volumes — allowing operators to freeze, restore, and clone instances. This would extend the instance lifecycle with a **Snapshot** step between Run and Release, enabling recovery from failures and migration between cloud providers.
+
+---
+
+*Sofmon FarCast — [sofmon.com/farcast](https://sofmon.com/farcast)*

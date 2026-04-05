@@ -1,0 +1,6 @@
+{
+  "name": "@farcast/farsight-client",
+  "version": "0.0.1",
+  "description": "FarSight client — tiling browser GUI",
+  "private": true
+}
