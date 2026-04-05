@@ -61,8 +61,9 @@ All component names come from Dan Simmons' *Hyperion Cantos*. The naming is inte
 
 ## Conventions
 
-- Each module is a self-contained Go module with its own `go.mod`.
-- README.md in each module serves as the specification.
+- The repository is a single Go module rooted at `github.com/sofmon/farcast`, with one `go.mod`, one `go.sum`, and one shared `vendor/` directory at the repo root. Dependencies are vendored — `go mod vendor` is the source of truth, and builds run in vendor mode.
+- The one exception is `sdk/go/`, which is its own Go module. The SDK is the public import surface for external applications (analogous to a syscall library), so it must have an independent dependency graph that end users can pull without dragging in the rest of FarCast.
+- Each top-level folder (technocore, planck, fatline, …) is a logical module — a package tree under the root module — not a separate Go module. README.md in each folder serves as the specification.
 - Deeper specs, architecture notes, and API docs go in each module's `docs/` subfolder.
 - Tests sit next to the code they cover (`_test.go` files alongside source).
 - Empty directories use `.gitkeep` for Git tracking.

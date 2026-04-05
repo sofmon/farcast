@@ -18,12 +18,17 @@ Every instance is private by default. No external party can connect to or contro
 
 ## Repository Structure
 
-Each module is self-contained: its README.md serves as the specification, and source code lives alongside it. Detailed specs, architecture notes, and API documentation go in a `docs/` subfolder within each module. Tests sit next to the code they cover.
+FarCast is organised as a single Go module rooted at `github.com/sofmon/farcast`, with one `go.mod`, one `go.sum`, and one shared `vendor/` directory at the repo root. Each top-level folder is a logical module — its `README.md` serves as the specification, source code lives alongside it, detailed specs and API documentation go in a `docs/` subfolder, and tests sit next to the code they cover. Dependencies are vendored: `go mod vendor` is the source of truth and builds run in vendor mode.
+
+The one exception is `sdk/go/`, which is its own Go module. The SDK is the public import surface for external applications, so it has an independent dependency graph that end users can pull without dragging in the rest of FarCast.
 
 ```
 farcast/
 │
 ├── README.md                       ← you are here
+├── go.mod                          ← single module: github.com/sofmon/farcast
+├── go.sum
+├── vendor/                         ← shared vendored dependencies
 │
 ├── technocore/                     ← Kernel & core runtime
 │   ├── README.md                   ← Module spec & overview
@@ -35,9 +40,7 @@ farcast/
 │   │   ├── scheduler/
 │   │   ├── monitor/
 │   │   └── costs/                  ← Cost tracking & enforcement
-│   ├── pkg/                        ← Public packages (if any)
-│   ├── go.mod
-│   └── go.sum
+│   └── pkg/                        ← Public packages (if any)
 │
 ├── planck/                         ← Compute abstraction over managed K8s
 │   ├── README.md
@@ -45,11 +48,9 @@ farcast/
 │   ├── cmd/
 │   │   └── planck/
 │   │       └── main.go
-│   ├── internal/
-│   │   ├── providers/              ← EKS, GKE, AKS adapters
-│   │   └── translator/            ← Manifest → K8s workload
-│   ├── go.mod
-│   └── go.sum
+│   └── internal/
+│       ├── providers/              ← EKS, GKE, AKS adapters
+│       └── translator/             ← Manifest → K8s workload
 │
 ├── fatline/                        ← Networking, routing, proxy & encryption
 │   ├── README.md
@@ -57,12 +58,10 @@ farcast/
 │   ├── cmd/
 │   │   └── fatline/
 │   │       └── main.go
-│   ├── internal/
-│   │   ├── proxy/
-│   │   ├── router/
-│   │   └── crypto/
-│   ├── go.mod
-│   └── go.sum
+│   └── internal/
+│       ├── proxy/
+│       ├── router/
+│       └── crypto/
 │
 ├── datasphere/                     ← Storage abstraction & encryption-at-rest
 │   ├── README.md
@@ -70,11 +69,9 @@ farcast/
 │   ├── cmd/
 │   │   └── datasphere/
 │   │       └── main.go
-│   ├── internal/
-│   │   ├── providers/              ← S3, GCS adapters
-│   │   └── crypto/                 ← Encryption-at-rest
-│   ├── go.mod
-│   └── go.sum
+│   └── internal/
+│       ├── providers/              ← S3, GCS adapters
+│       └── crypto/                 ← Encryption-at-rest
 │
 ├── allthing/                       ← AI abstraction layer
 │   ├── README.md
@@ -82,11 +79,9 @@ farcast/
 │   ├── cmd/
 │   │   └── allthing/
 │   │       └── main.go
-│   ├── internal/
-│   │   ├── providers/              ← Gemini, Claude, OpenAI adapters
-│   │   └── chat/                   ← Chat interface
-│   ├── go.mod
-│   └── go.sum
+│   └── internal/
+│       ├── providers/              ← Gemini, Claude, OpenAI adapters
+│       └── chat/                   ← Chat interface
 │
 ├── shrike/                         ← Security monitor & policy enforcement
 │   ├── README.md
@@ -94,11 +89,9 @@ farcast/
 │   ├── cmd/
 │   │   └── shrike/
 │   │       └── main.go
-│   ├── internal/
-│   │   ├── policy/                 ← Manifest-based rule engine
-│   │   └── inspector/              ← Traffic analysis
-│   ├── go.mod
-│   └── go.sum
+│   └── internal/
+│       ├── policy/                 ← Manifest-based rule engine
+│       └── inspector/              ← Traffic analysis
 │
 ├── farsight/                       ← The "farcast" app (GUI + CLI + server)
 │   ├── README.md
@@ -107,9 +100,7 @@ farcast/
 │   │   ├── cmd/
 │   │   │   └── farsight-server/
 │   │   │       └── main.go
-│   │   ├── internal/
-│   │   ├── go.mod
-│   │   └── go.sum
+│   │   └── internal/
 │   ├── client/                     ← Electron + TypeScript — GUI
 │   │   ├── src/
 │   │   ├── package.json
@@ -118,15 +109,14 @@ farcast/
 │       ├── cmd/
 │       │   └── farcast/
 │       │       └── main.go
-│       ├── internal/
-│       ├── go.mod
-│       └── go.sum
+│       └── internal/
 │
 ├── sdk/                            ← FarCast libraries (syscall-like APIs)
 │   ├── README.md
-│   ├── go/                         ← Go SDK
+│   ├── go/                         ← Go SDK — separate Go module
 │   │   ├── farcast.go
-│   │   └── go.mod
+│   │   ├── go.mod
+│   │   └── go.sum
 │   ├── node/                       ← Node.js SDK
 │   │   ├── src/
 │   │   └── package.json
@@ -139,8 +129,7 @@ farcast/
 │   ├── docs/
 │   ├── parser/                     ← Go — manifest parser library
 │   │   ├── parser.go
-│   │   ├── parser_test.go
-│   │   └── go.mod
+│   │   └── parser_test.go
 │   └── examples/                   ← Example manifests
 │
 └── docs/                           ← Project-wide docs
