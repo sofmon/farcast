@@ -30,7 +30,7 @@ FarCast is a cloud operating system where privacy is the foundational principle.
 
 **TimeTomb is deferred.** Snapshot and recovery functionality (TimeTomb) is a future concept documented in the appendix. It is not part of the initial scope.
 
-**DataSphere uses Go, not Rust.** Originally Rust was considered for the storage layer. Since DataSphere is an abstraction over cloud storage (not a custom filesystem), Go keeps the stack uniform without sacrificing anything.
+**Go by default; Rust only on the data plane.** The whole question of "Go or Rust" was settled with a clear principle: **Go for everything that abstracts a cloud or K8s primitive; Rust only where a module is the data plane on hostile bytes.** FarCast is overwhelmingly glue over cloud/K8s SDKs, and that ecosystem is Go-native (`client-go`, first-party AWS/GCP/Azure SDKs, the controller-runtime/kubebuilder corpus) — so the glue majority stays Go even though all code is AI-authored and human readability is a non-concern. The one module with a genuine Rust case is **FatLine** (the universal TLS/mTLS proxy on attacker-controlled bytes, where no-GC tail latency and compile-time data-race elimination matter), and even that is gated on a benchmark — default to Go-first, Rust-on-evidence. **DataSphere stays Go:** it is an abstraction over cloud storage (not a custom filesystem), and its crypto is commodity AES-256-GCM (AES-NI-accelerated, a wash between the languages). Full reasoning and the FatLine benchmark gate: [`docs/adr/0002-backend-language-strategy.md`](docs/adr/0002-backend-language-strategy.md).
 
 ## Module Relationships
 
@@ -67,4 +67,7 @@ All component names come from Dan Simmons' *Hyperion Cantos*. The naming is inte
 - Deeper specs, architecture notes, and API docs go in each module's `docs/` subfolder.
 - Tests sit next to the code they cover (`_test.go` files alongside source).
 - Empty directories use `.gitkeep` for Git tracking.
-- FarSight's client is Electron + TypeScript. Everything else is Go.
+- FarSight's client is Electron + TypeScript. Everything else is Go (see "Go by default; Rust only on the data plane" above; the sole Rust candidate is a benchmark-gated FatLine data plane).
+- **Language guardrails (these make AI-authored code safe without a human reviewer, so they are not optional):**
+  - Go modules: `go test -race`, `go vet`, and `golangci-lint` in CI. Go's memory safety is conditional on the absence of data races — `-race` defends that.
+  - Any Rust module (currently only a possible FatLine data plane): `#![forbid(unsafe_code)]`, clippy and `cargo-geiger`, plus cancellation-safety integration tests (the one genuinely silent Rust AI hazard — data loss on a future dropped mid-`select!`, non-atomic state across `.await`) and multithreaded/race-style tests for shared session/allowlist state.
