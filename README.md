@@ -216,13 +216,13 @@ Full manifest specification → [`manifest/README.md`](manifest/README.md)
 ## Key Concepts
 
 ### Instances
-A FarCast instance is the fundamental unit — analogous to a running OS on a physical machine. Instances are summoned from base images, live in cloud infrastructure, and are terminated when no longer needed.
+A FarCast instance is the fundamental unit — analogous to a running OS on a physical machine. Instances are installed from base images, live in cloud infrastructure, and are terminated when no longer needed.
 
 ### Sovereignty
 Every instance is private by default. All connections — inbound and outbound — are denied unless explicitly declared. Each application must list the external services it needs in its `./farcast` manifest, including a human-readable reason. The operator reviews these declarations before running the app. FatLine enforces the boundary, allowing only declared endpoints. Shrike monitors traffic at runtime and intervenes if an application attempts to reach an undeclared destination. The cloud provider cannot access the contents of an instance.
 
 ### Cost Control
-Cloud costs are unpredictable by nature. FarCast treats cost control as a mandatory safeguard, not an optional dashboard. When summoning an instance, the operator **must** set a cost limit — there is no default, no "unlimited", no way to skip it. TechnoCore continuously monitors cloud spending across compute (Planck), storage (DataSphere), networking (FatLine), and AI (AllThing). It breaks costs down per application, warns the operator as spending approaches the threshold, and takes protective action when the limit is reached — stopping the highest-cost applications first, and if necessary, shutting down the entire instance while keeping only TechnoCore alive to report status and allow the operator to respond.
+Cloud costs are unpredictable by nature. FarCast treats cost control as a mandatory safeguard, not an optional dashboard. When installing an instance, the operator **must** set a cost limit — there is no default, no "unlimited", no way to skip it. TechnoCore continuously monitors cloud spending across compute (Planck), storage (DataSphere), networking (FatLine), and AI (AllThing). It breaks costs down per application, warns the operator as spending approaches the threshold, and takes protective action when the limit is reached — stopping the highest-cost applications first, and if necessary, shutting down the entire instance while keeping only TechnoCore alive to report status and allow the operator to respond.
 
 ### Git-Native Execution
 Repositories are first-class executables. `farcast run github.com/user/repo` fetches the repository, reads its minimal manifest, and Planck translates it into a namespace containing one or more workloads on the underlying managed Kubernetes. TechnoCore monitors the applications and adapts resources automatically — no build pipeline, no deployment tooling, no capacity planning required.
@@ -261,10 +261,10 @@ All component names are drawn from Dan Simmons' *Hyperion Cantos*. Each name ref
 ## Instance Lifecycle
 
 ```
-summon → bind → run → release
+install → bind → run → release
 ```
 
-- **Summon** — create a new instance from a base image; operator must set a cost limit
+- **Install** — create a new instance from a base image; operator must set a cost limit
 - **Bind** — establish FatLine connections, mount DataSphere volumes
 - **Run** — operational state; execute repositories via Planck
 - **Release** — terminate the instance
@@ -274,8 +274,8 @@ summon → bind → run → release
 ## CLI Quick Reference
 
 ```bash
-# Summon an instance (cost limit is mandatory)
-farcast summon --name my-instance --cost-limit 100/month
+# Install an instance (cost limit is mandatory)
+farcast install --name my-instance --cost-limit 100/month
 
 # Run a repository on an instance
 farcast run github.com/username/repo
@@ -323,7 +323,7 @@ Each module folder contains its own `README.md` with:
 
 ## Status
 
-> This project is in early specification phase. No production code exists yet.
+> This project is in early development. Phase 0 (foundation) is complete: the manifest parser and the Go SDK (core interfaces + logging) are implemented. The remaining modules are in specification.
 
 | Module | Spec | Implementation |
 |---|---|---|
@@ -333,9 +333,11 @@ Each module folder contains its own `README.md` with:
 | DataSphere | 🔲 Draft | 🔲 Not started |
 | Shrike | 🔲 Draft | 🔲 Not started |
 | AllThing | 🔲 Draft | 🔲 Not started |
-| FarSight | 🔲 Draft | 🔲 Not started |
-| SDK | 🔲 Draft | 🔲 Not started |
-| Manifest Spec | 🔲 Draft | 🔲 Not started |
+| FarSight | 🟡 In progress | 🟡 CLI scaffold |
+| SDK | 🟡 In progress | 🟡 Go: logging live, interfaces stubbed |
+| Manifest Spec | ✅ Complete | ✅ Parser + tests |
+
+*Legend: ✅ complete · 🟡 in progress · 🔲 draft / not started.*
 
 ---
 

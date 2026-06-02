@@ -9,6 +9,9 @@ A phased build order for FarCast. Each phase builds on the previous one and deli
 *Goal: establish the shared plumbing that every other module depends on.*
 
 ### 0.1 Manifest parser
+
+**Status: ✅ Complete** — implemented in `manifest/parser/` with full validation and a comprehensive test suite.
+
 The manifest is the contract between applications and the OS. Every module will need to read it. Build the parser first so all subsequent work has a shared schema to rely on.
 
 - Define the `./farcast` YAML schema: top-level `name` + `apps[]`, where each app has `name`, `containerfile`, optional `context`, and optional `external` (see [`manifest/README.md`](manifest/README.md) for the full specification)
@@ -17,6 +20,9 @@ The manifest is the contract between applications and the OS. Every module will 
 - Include validation: missing required fields, malformed YAML, unknown keys at any level, empty `apps` list, duplicate app names, DNS-label rules on names, relative-path safety on `containerfile`/`context` (no absolute paths, no `..`), duplicate hosts within a single app's `external` list
 
 ### 0.2 SDK — Go (core interfaces)
+
+**Status: ✅ Complete** — interfaces, capability accessors, context helpers, and error sentinels in [`sdk/go/`](sdk/go/README.md).
+
 Define the Go SDK interfaces before any implementation exists. These are the "syscall" signatures that applications will use and that modules will implement behind the scenes.
 
 - `farcast.Log()` — structured logging (first concrete capability)
@@ -27,6 +33,9 @@ Define the Go SDK interfaces before any implementation exists. These are the "sy
 - All interfaces only — no implementations yet. These define the contract.
 
 ### 0.3 SDK — Logging implementation
+
+**Status: ✅ Complete** — structured `slog`-based JSON logger in [`sdk/go/`](sdk/go/README.md); `go test -race`, `go vet`, and `golangci-lint` all clean.
+
 First real SDK implementation. Logging is the simplest capability and immediately useful for every subsequent phase.
 
 - Structured JSON logging to stdout
@@ -34,7 +43,7 @@ First real SDK implementation. Logging is the simplest capability and immediatel
 - Context propagation (instance ID, app name, request ID)
 - This becomes the standard logging mechanism for all FarCast modules too
 
-**Phase 0 deliverable:** a manifest parser and an SDK with working logging. Every module built after this will import both.
+**Phase 0 deliverable** ✅ **achieved:** a manifest parser and an SDK with working logging. Every module built after this will import both.
 
 ---
 
@@ -43,6 +52,9 @@ First real SDK implementation. Logging is the simplest capability and immediatel
 *Goal: `farcast install` provisions a FarCast instance on a cloud provider from scratch.*
 
 ### 1.1 FarSight CLI — scaffold
+
+**Status: ✅ Complete** — command router, `version`/`help`, local config handling, and human/JSON output in [`farsight/cli/`](farsight/cli/README.md); `go test -race`, `go vet`, and `golangci-lint` clean.
+
 Build the CLI framework. No commands work yet, but the structure is in place.
 
 - CLI argument parsing and subcommand routing
@@ -184,7 +196,7 @@ Extend Shrike to monitor per-application traffic.
 - App A cannot use App B's external declarations
 - Violation alerts tied to specific applications
 
-**Phase 4 deliverable:** the full `summon → bind → run → release` lifecycle works. Operators can deploy Git repositories, review their security declarations, and monitor running applications.
+**Phase 4 deliverable:** the full `install → bind → run → release` lifecycle works. Operators can deploy Git repositories, review their security declarations, and monitor running applications.
 
 ---
 
