@@ -121,9 +121,7 @@ func Parse(data []byte) (*Manifest, error) {
 	if len(errs) > 0 {
 		joined := make([]error, 0, len(errs)+1)
 		joined = append(joined, ErrInvalidManifest)
-		for _, e := range errs {
-			joined = append(joined, e)
-		}
+		joined = append(joined, errs...)
 		return nil, errors.Join(joined...)
 	}
 	return m, nil
@@ -316,7 +314,7 @@ func validateDNSLabel(s, path string) error {
 		return newFieldError(path, "must be at most 63 characters (got %d)", len(s))
 	}
 	first := s[0]
-	if !(first >= 'a' && first <= 'z') {
+	if first < 'a' || first > 'z' {
 		return newFieldError(path, "must start with a lowercase letter (a-z)")
 	}
 	if len(s) == 1 {

@@ -365,10 +365,10 @@ apps:
 	}
 	msg := err.Error()
 	wants := []string{
-		"name",                          // top-level bad name
-		"apps[0].containerfile",         // absolute path
-		"apps[0].external[0].host",      // scheme
-		"apps[0].external[0].reason",    // empty
+		"name",                       // top-level bad name
+		"apps[0].containerfile",      // absolute path
+		"apps[0].external[0].host",   // scheme
+		"apps[0].external[0].reason", // empty
 	}
 	for _, w := range wants {
 		if !strings.Contains(msg, w) {
