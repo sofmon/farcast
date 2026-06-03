@@ -2,16 +2,24 @@ package gke
 
 import (
 	"context"
-	"errors"
+	"encoding/base64"
+	"fmt"
+
+	container "cloud.google.com/go/container/apiv1"
+	"cloud.google.com/go/container/apiv1/containerpb"
+	"google.golang.org/api/option"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/sofmon/farcast/planck"
 )
 
 // clusterAPI is the narrow seam over the cloud's cluster-management API,
-// expressed in neutral terms so the adapter's logic (defaults, status
-// mapping, readiness polling, idempotency, kubeconfig assembly) is unit
-// testable without the cloud SDK. The real implementation wraps
-// cloud.google.com/go/container; see newClient.
+// expressed in neutral terms so the adapter's logic (defaults, status mapping,
+// readiness polling, idempotency, kubeconfig assembly) stays unit testable
+// without the cloud SDK. The real implementation, gkeClient, wraps
+// cloud.google.com/go/container's ClusterManagerClient; the unit tests use a
+// fake (see gke_test.go).
 type clusterAPI interface {
 	// validate performs a cheap, side-effect-free permission probe.
 	validate(ctx context.Context) error
@@ -38,34 +46,117 @@ type createInput struct {
 type clusterState struct {
 	RawStatus string // cloud-native status string, e.g. "RUNNING"
 	Endpoint  string // API server host
-	CACert    []byte // cluster CA certificate, for the kubeconfig
+	CACert    []byte // cluster CA certificate (PEM), for the kubeconfig
 }
 
-// errClientNotWired reports that the real GCP-backed client has not been
-// built yet. The adapter's logic and its unit tests run against a fake
-// clusterAPI; wiring the real client means vendoring
-// cloud.google.com/go/container and implementing it here (see
-// planck/README.md → "First adapter: GKE Autopilot").
-var errClientNotWired = errors.New("gke: GCP client not wired — vendor cloud.google.com/go/container and implement newClient")
-
-// newClient builds the real GCP-backed clusterAPI from cfg. Until the Google
-// Cloud SDK is vendored it returns a stub whose operations report
-// errClientNotWired, so the package builds and the adapter's logic stays
-// fully testable in the meantime.
-func newClient(_ planck.Config) (clusterAPI, error) {
-	return stubClient{}, nil
+// gkeClient is the real clusterAPI, backed by the GKE cluster-management API.
+// One client is scoped to a single GCP project; each call supplies the
+// cluster's location and name via a ClusterRef/createInput.
+type gkeClient struct {
+	svc     *container.ClusterManagerClient
+	project string
 }
 
-type stubClient struct{}
+var _ clusterAPI = (*gkeClient)(nil)
 
-var _ clusterAPI = stubClient{}
-
-func (stubClient) validate(context.Context) error { return errClientNotWired }
-
-func (stubClient) get(context.Context, planck.ClusterRef) (clusterState, bool, error) {
-	return clusterState{}, false, errClientNotWired
+// newClient builds a GCP-backed clusterAPI from cfg. When cfg.Credentials is
+// set it is treated as a service-account key JSON; otherwise Application
+// Default Credentials are used. The gRPC connection lives for the life of the
+// process — FarCast's callers (the planck harness and `farcast install`) are
+// short-lived — so the client is not explicitly closed.
+func newClient(cfg planck.Config) (clusterAPI, error) {
+	var opts []option.ClientOption
+	if len(cfg.Credentials) > 0 {
+		// Restrict the accepted credential to a service-account key (FarCast's
+		// operator supplies an SA key JSON) rather than the deprecated
+		// WithCredentialsJSON, which loads any credential type — a security
+		// risk when the material may come from an untrusted source.
+		opts = append(opts, option.WithAuthCredentialsJSON(option.ServiceAccount, cfg.Credentials))
+	}
+	svc, err := container.NewClusterManagerClient(context.Background(), opts...)
+	if err != nil {
+		return nil, fmt.Errorf("gke: build cluster-manager client: %w", err)
+	}
+	return &gkeClient{svc: svc, project: cfg.Project}, nil
 }
 
-func (stubClient) create(context.Context, createInput) error { return errClientNotWired }
+// locationPath is the GKE "projects/P/locations/L" parent path. Pass "-" as
+// location to address every location in the project.
+func (c *gkeClient) locationPath(location string) string {
+	return fmt.Sprintf("projects/%s/locations/%s", c.project, location)
+}
 
-func (stubClient) delete(context.Context, planck.ClusterRef) error { return errClientNotWired }
+// clusterPath is the fully-qualified "projects/P/locations/L/clusters/N" name.
+func (c *gkeClient) clusterPath(ref planck.ClusterRef) string {
+	return fmt.Sprintf("%s/clusters/%s", c.locationPath(ref.Location), ref.Name)
+}
+
+func (c *gkeClient) validate(ctx context.Context) error {
+	// Listing clusters across every location is a cheap, read-only probe that
+	// exercises the credentials and the container.clusters.list permission.
+	if _, err := c.svc.ListClusters(ctx, &containerpb.ListClustersRequest{
+		Parent: c.locationPath("-"),
+	}); err != nil {
+		return fmt.Errorf("gke: validate credentials: %w", err)
+	}
+	return nil
+}
+
+func (c *gkeClient) get(ctx context.Context, ref planck.ClusterRef) (clusterState, bool, error) {
+	cl, err := c.svc.GetCluster(ctx, &containerpb.GetClusterRequest{Name: c.clusterPath(ref)})
+	if status.Code(err) == codes.NotFound {
+		return clusterState{}, false, nil
+	}
+	if err != nil {
+		return clusterState{}, false, err
+	}
+	ca, err := decodeCACert(cl.GetMasterAuth().GetClusterCaCertificate())
+	if err != nil {
+		return clusterState{}, false, err
+	}
+	return clusterState{
+		RawStatus: cl.GetStatus().String(),
+		Endpoint:  cl.GetEndpoint(),
+		CACert:    ca,
+	}, true, nil
+}
+
+func (c *gkeClient) create(ctx context.Context, in createInput) error {
+	cluster := &containerpb.Cluster{
+		Name:           in.Name,
+		ResourceLabels: in.Labels,
+		Autopilot:      &containerpb.Autopilot{Enabled: in.Autopilot},
+	}
+	if in.Version != "" {
+		cluster.InitialClusterVersion = in.Version
+	}
+	// CreateCluster returns once the long-running operation is accepted; the
+	// adapter polls get() until the cluster reports Running.
+	_, err := c.svc.CreateCluster(ctx, &containerpb.CreateClusterRequest{
+		Parent:  c.locationPath(in.Location),
+		Cluster: cluster,
+	})
+	return err
+}
+
+func (c *gkeClient) delete(ctx context.Context, ref planck.ClusterRef) error {
+	_, err := c.svc.DeleteCluster(ctx, &containerpb.DeleteClusterRequest{Name: c.clusterPath(ref)})
+	if status.Code(err) == codes.NotFound {
+		return nil // already gone — deletion is idempotent
+	}
+	return err
+}
+
+// decodeCACert turns GKE's base64-encoded cluster CA certificate into the raw
+// PEM bytes buildKubeconfig expects (it re-encodes them for the kubeconfig's
+// certificate-authority-data field).
+func decodeCACert(b64 string) ([]byte, error) {
+	if b64 == "" {
+		return nil, nil
+	}
+	pem, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		return nil, fmt.Errorf("gke: decode cluster CA certificate: %w", err)
+	}
+	return pem, nil
+}

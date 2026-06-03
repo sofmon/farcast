@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sofmon/farcast/planck"
@@ -29,37 +30,62 @@ func init() {
 // New constructs the GKE provider. Config.Project (GCP project ID) is
 // required; Config.Location sets the default region when a ClusterSpec omits
 // one; Config.Credentials, when present, is a service-account key JSON.
+//
+// New does not contact GCP or resolve credentials — per the Provider contract
+// that is Validate's responsibility. The underlying client is built lazily on
+// first use (see client).
 func New(cfg planck.Config) (planck.Provider, error) {
 	if cfg.Project == "" {
 		return nil, fmt.Errorf("gke: Config.Project (GCP project ID) is required")
-	}
-	api, err := newClient(cfg)
-	if err != nil {
-		return nil, err
 	}
 	loc := cfg.Location
 	if loc == "" {
 		loc = defaultLocation
 	}
 	return &provider{
-		api:             api,
+		cfg:             cfg,
 		defaultLocation: loc,
 		pollInterval:    defaultPollInterval,
 	}, nil
 }
 
 type provider struct {
-	api             clusterAPI
+	cfg             planck.Config
 	defaultLocation string
 	pollInterval    time.Duration
+
+	mu  sync.Mutex
+	api clusterAPI // built lazily on first use; see client
 }
 
 var _ planck.Provider = (*provider)(nil)
 
 func (*provider) Name() string { return providerName }
 
+// client lazily builds the GCP-backed clusterAPI. Construction resolves
+// credentials, so — keeping with the Provider contract where Validate owns
+// credential checks — it is deferred out of New and first surfaces through
+// whichever operation the caller runs. Tests inject a fake api directly,
+// bypassing this path.
+func (p *provider) client() (clusterAPI, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.api == nil {
+		api, err := newClient(p.cfg)
+		if err != nil {
+			return nil, err
+		}
+		p.api = api
+	}
+	return p.api, nil
+}
+
 func (p *provider) Validate(ctx context.Context) error {
-	return p.api.validate(ctx)
+	api, err := p.client()
+	if err != nil {
+		return err
+	}
+	return api.validate(ctx)
 }
 
 func (p *provider) CreateCluster(ctx context.Context, spec planck.ClusterSpec) (*planck.Cluster, error) {
