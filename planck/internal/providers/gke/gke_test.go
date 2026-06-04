@@ -197,3 +197,40 @@ func TestNewRequiresProject(t *testing.T) {
 		t.Fatalf("New with a project: %v", err)
 	}
 }
+
+// TestLazyClientWiring exercises a provider built by New (api starts nil) so
+// every operation must construct the client via client(). It guards against
+// methods dereferencing a nil p.api directly — the bug the release path hit.
+func TestLazyClientWiring(t *testing.T) {
+	orig := newClient
+	t.Cleanup(func() { newClient = orig })
+	fake := &fakeClient{states: []stateResult{
+		{state: clusterState{RawStatus: "RUNNING", Endpoint: "uid.us-central1.gke.goog"}, exists: true},
+	}}
+	built := 0
+	newClient = func(planck.Config) (clusterAPI, error) {
+		built++
+		return fake, nil
+	}
+
+	p, err := New(planck.Config{Project: "p"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx := context.Background()
+	if err := p.Validate(ctx); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if _, err := p.CreateCluster(ctx, planck.ClusterSpec{Name: "demo"}); err != nil {
+		t.Fatalf("CreateCluster: %v", err)
+	}
+	if _, err := p.ClusterStatus(ctx, planck.ClusterRef{Name: "demo"}); err != nil {
+		t.Fatalf("ClusterStatus: %v", err)
+	}
+	if err := p.DeleteCluster(ctx, planck.ClusterRef{Name: "demo"}); err != nil {
+		t.Fatalf("DeleteCluster: %v", err)
+	}
+	if built != 1 {
+		t.Errorf("newClient called %d times, want 1 (built once, then reused)", built)
+	}
+}

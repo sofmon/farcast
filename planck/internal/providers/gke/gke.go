@@ -93,22 +93,30 @@ func (p *provider) CreateCluster(ctx context.Context, spec planck.ClusterSpec) (
 	if err != nil {
 		return nil, err
 	}
+	api, err := p.client()
+	if err != nil {
+		return nil, err
+	}
 	ref := planck.ClusterRef{Name: in.Name, Location: in.Location}
 
-	_, exists, err := p.api.get(ctx, ref)
+	_, exists, err := api.get(ctx, ref)
 	if err != nil {
 		return nil, fmt.Errorf("gke: look up cluster %q: %w", in.Name, err)
 	}
 	if !exists {
-		if err := p.api.create(ctx, in); err != nil {
+		if err := api.create(ctx, in); err != nil {
 			return nil, fmt.Errorf("gke: create cluster %q: %w", in.Name, err)
 		}
 	}
-	return p.waitReady(ctx, ref)
+	return p.waitReady(ctx, api, ref)
 }
 
 func (p *provider) ClusterStatus(ctx context.Context, ref planck.ClusterRef) (planck.ClusterStatus, error) {
-	st, exists, err := p.api.get(ctx, ref)
+	api, err := p.client()
+	if err != nil {
+		return planck.StatusUnknown, err
+	}
+	st, exists, err := api.get(ctx, ref)
 	if err != nil {
 		return planck.StatusUnknown, err
 	}
@@ -119,7 +127,11 @@ func (p *provider) ClusterStatus(ctx context.Context, ref planck.ClusterRef) (pl
 }
 
 func (p *provider) DeleteCluster(ctx context.Context, ref planck.ClusterRef) error {
-	if err := p.api.delete(ctx, ref); err != nil {
+	api, err := p.client()
+	if err != nil {
+		return err
+	}
+	if err := api.delete(ctx, ref); err != nil {
 		return fmt.Errorf("gke: delete cluster %q: %w", ref.Name, err)
 	}
 	return nil
@@ -147,9 +159,9 @@ func (p *provider) planCreate(spec planck.ClusterSpec) (createInput, error) {
 
 // waitReady polls until the cluster reports Running (returning it with a
 // kubeconfig), enters an error state, or ctx expires.
-func (p *provider) waitReady(ctx context.Context, ref planck.ClusterRef) (*planck.Cluster, error) {
+func (p *provider) waitReady(ctx context.Context, api clusterAPI, ref planck.ClusterRef) (*planck.Cluster, error) {
 	for {
-		st, exists, err := p.api.get(ctx, ref)
+		st, exists, err := api.get(ctx, ref)
 		if err != nil {
 			return nil, fmt.Errorf("gke: poll cluster %q: %w", ref.Name, err)
 		}

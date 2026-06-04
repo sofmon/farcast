@@ -66,7 +66,10 @@ var _ clusterAPI = (*gkeClient)(nil)
 // Default Credentials are used. The gRPC connection lives for the life of the
 // process — FarCast's callers (the planck harness and `farcast install`) are
 // short-lived — so the client is not explicitly closed.
-func newClient(cfg planck.Config) (clusterAPI, error) {
+//
+// It is a package variable so tests can substitute a fake and exercise the
+// provider's lazy-construction path without real credentials.
+var newClient = func(cfg planck.Config) (clusterAPI, error) {
 	var opts []option.ClientOption
 	if len(cfg.Credentials) > 0 {
 		// Restrict the accepted credential to a service-account key (FarCast's
