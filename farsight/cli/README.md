@@ -4,9 +4,9 @@
 
 `farcast` is the command line face of [FarSight](../README.md), the FarCast UX layer. The same downloadable "farcast" app provides a GUI (the tiling browser), a server (UX composition inside an instance), and this CLI. The CLI is what operators and automation use to provision instances, deploy repositories, connect through FatLine, and monitor spending.
 
-This document specifies **Phase 1.1 — the CLI scaffold**: the command framework, the two commands that work from day one (`version`, `help`), local configuration handling, and the human/JSON output model. No instance-touching command does real work yet; the structure is what 1.1 delivers.
+This document specifies two phases of the CLI. **Phase 1.1 — the CLI scaffold** (implemented): the command framework, the two commands that work from day one (`version`, `help`), local configuration handling, and the human/JSON output model. **Phase 1.3 — `farcast install`** (specified here, not yet built): the first command that does real, billable work — interactively provisioning a cloud instance through Planck under a mandatory cost limit. The scaffold is what makes `install` a small, uniform addition.
 
-> **Status.** Phase 1.1 (scaffold) — **implemented** (`go test -race`, `go vet`, and `golangci-lint` all clean). Delivered: argument parsing and subcommand routing, `farcast version`, `farcast help`, local config file handling, and human + JSON output formatting. Every other command is **registered but stubbed** — it appears in `help` and routes correctly, but exits non-zero with a "not yet implemented" message naming its [`PLAN.md`](../../PLAN.md) phase. The real commands land in later phases (`install` → 1.3, `connect` → 2.3, `run`/`ps`/`logs`/`costs` → 4.3, and so on).
+> **Status.** **Phase 1.1 (scaffold) — implemented** (`go test -race`, `go vet`, and `golangci-lint` all clean): argument parsing and subcommand routing, `farcast version`, `farcast help`, local config file handling, and human + JSON output formatting. **Phase 1.3 (`farcast install`) — in specification** (this document): interactive provisioning through [Planck](../../planck/README.md), a mandatory cost limit, a reachability health check, and secure local persistence of instance metadata + credentials. Every other command is **registered but stubbed** — it appears in `help` and routes correctly, but exits non-zero with a "not yet implemented" message naming its [`PLAN.md`](../../PLAN.md) phase (`connect` → 2.3, `run`/`ps`/`logs`/`costs` → 4.3, and so on).
 
 ---
 
@@ -22,7 +22,7 @@ This document specifies **Phase 1.1 — the CLI scaffold**: the command framewor
 
 ## Design principles
 
-1. **Minimal dependencies, for security.** The CLI stores cloud admin credentials. Every third-party dependency is attack surface against those credentials, so the scaffold is built on the Go standard library (plus the already-vendored YAML library for config). See [Open decisions](#open-decisions) for the CLI-framework choice this implies.
+1. **Minimal dependencies, for security.** The CLI stores cloud admin credentials. Every third-party dependency is attack surface against those credentials, so the scaffold is built on the Go standard library (plus the already-vendored YAML library for config). See [Decisions](#decisions) for the CLI-framework choice this implies.
 2. **Results and diagnostics are separate streams.** Command *results* go to **stdout** (human text or JSON, per `--output`). *Diagnostics* go to **stderr** (and only when `--verbose`). A caller can always `farcast … --output json | jq` without log noise on stdout.
 3. **Every command is scriptable.** Anything a command prints in human mode it can also emit as JSON, so the CLI is automation-first. Exit codes are meaningful.
 4. **Secure local state by construction.** The config directory is `0700`, credential files are `0600`, and the CLI refuses (or repairs, with a warning) state that is more permissive. Credentials never leave the operator's machine except through an explicit, declared channel.
@@ -66,7 +66,7 @@ farcast [global flags] <command> [command flags] [arguments]
 |---|---|---|---|
 | `version` | ✅ works | Print version, commit, build date, Go/OS/arch | 1.1 |
 | `help` | ✅ works | Help for `farcast` or a specific command | 1.1 |
-| `install` | ⏳ stub | Provision a new instance on a cloud provider (interactive) | 1.3 |
+| `install` | 📝 specified ([below](#farcast-install--provision-an-instance-phase-13)) | Provision a new instance on a cloud provider (interactive) | 1.3 |
 | `release` | ⏳ stub | Destroy an instance and clean up local state | 1.4 |
 | `connect` | ⏳ stub | Open a FatLine tunnel to an instance | 2.3 |
 | `run` | ⏳ stub | Deploy a Git repository to an instance | 4.3 |
@@ -170,9 +170,11 @@ FarCast has **zero central dependency** ([AGENTS.md](../../AGENTS.md)): there is
 <config-dir>/                         (0700)
 ├── config.yaml                       (0600)  CLI preferences (default output, etc.)
 └── instances/                        (0700)
-    └── <instance-name>/              (0700)
-        ├── metadata.yaml             (0600)  cloud provider, region, cost limit, instance IDs
-        └── credentials.yaml          (0600)  cloud credentials  ← secret
+    └── <instance-name>/              (0700)  one directory per installed instance
+        ├── metadata.yaml             (0600)  non-secret: provider, project, region, cluster
+        │                                      name + endpoint, status, cost limit, timestamps
+        ├── credentials.yaml          (0600)  secret: cloud provider credential (SA key JSON)
+        └── kubeconfig.yaml           (0600)  secret: cluster-access kubeconfig
 ```
 
 **Security.** Credentials are secrets the cloud provider would love and an attacker would love more:
@@ -181,9 +183,108 @@ FarCast has **zero central dependency** ([AGENTS.md](../../AGENTS.md)): there is
 - Non-secret metadata is kept separate from secret credentials, so a command that only needs metadata never opens the credential file.
 - Plaintext-at-rest with `0600` matches the baseline of `aws`/`gcloud`. Hardening — OS keychain integration, or encrypting credentials with an operator passphrase — is noted for a later phase, consistent with FarCast's security-first posture.
 
-**Format.** YAML, via the already-vendored `github.com/goccy/go-yaml` (the same library the manifest parser uses), keeping the dependency set unchanged and the files operator-readable. See [Open decisions](#open-decisions).
+**Format.** YAML, via the already-vendored `github.com/goccy/go-yaml` (the same library the manifest parser uses), keeping the dependency set unchanged and the files operator-readable. See [Decisions](#decisions).
 
-**Phase 1.1 scope.** The scaffold delivers the `config` package — path resolution, directory/permission enforcement, and typed load/save of `config.yaml` — plus the placeholder layout above. The credential and instance schemas are filled in by `install` (1.3).
+**Phase 1.1 delivered** the `config` package — path resolution, `0700`/`0600` enforcement, and typed load/save of `config.yaml`. **Phase 1.3 adds the instance store** above — typed `metadata.yaml` / `credentials.yaml` / `kubeconfig.yaml` per instance, created and written by [`farcast install`](#farcast-install--provision-an-instance-phase-13) under the same permission rules, with a write-ordering that keeps a cluster from ever existing un-recorded (see that section).
+
+---
+
+## `farcast install` — provision an instance (Phase 1.3)
+
+`farcast install` turns "a cloud account + a cost limit" into "a running FarCast instance." It is the first command that does real, billable work: it provisions a managed Kubernetes cluster through [Planck](../../planck/README.md) ([GKE Autopilot](../../docs/adr/0003-gke-autopilot.md) today), confirms the control plane is reachable, and records everything needed to operate and later tear the instance down — all under the strict local-state rules above.
+
+It is **interactive by default** and **fully scriptable**: every prompt has a matching flag, so an operator can run it conversationally while automation runs it unattended.
+
+### Flow
+
+1. **Resolve inputs** from flags, then interactive prompts (human mode + TTY only) for whatever is missing. The mandatory cost limit is never defaulted.
+2. **Select the provider** from those Planck has registered (`planck.Providers()`) — today just `gke`.
+3. **Validate credentials** — `planck.Open` then `Validate`, before creating anything. Bad credentials fail here, fast and free.
+4. **Confirm** — show a summary (provider, region, cluster name, cost limit) and require a yes. `--yes` skips it; it is required when non-interactive. This is the last step before money is spent.
+5. **Record intent** — write `metadata.yaml` (status `provisioning`) and `credentials.yaml` *before* provisioning, so a cluster can never exist un-recorded.
+6. **Provision** — `CreateCluster` blocks until the cluster is `RUNNING` (several minutes), with progress on stderr.
+7. **Health check** — confirm the instance is alive via the GKE management API (`ClusterStatus == RUNNING`) plus the IAM-gated DNS endpoint; the control plane is private, so there is no public IP to dial ([ADR 0004](../../docs/adr/0004-private-control-plane.md)).
+8. **Finalize** — update metadata to `running`, write `kubeconfig.yaml`, print the result.
+
+### Command surface
+
+```
+farcast install [flags]
+```
+
+| Flag | Required | Meaning |
+|---|---|---|
+| `--name <name>` | yes | Instance name — the local-state key and the basis for the cluster name (`farcast-<name>`). DNS-label form. |
+| `--provider <id>` | no | Cloud provider (default: the sole registered one, `gke`). |
+| `--project <id>` | yes for `gke` | Cloud project (GCP project ID). |
+| `--region <region>` | no | Cloud region (default: the provider's, `us-central1`). |
+| `--credentials <path>` | no | Path to a credential file (GCP service-account key JSON). Omit to use Application Default Credentials. |
+| `--cost-limit <amount>` | **yes** | Monthly spend ceiling, in USD. **No default, no "unlimited" — install will not proceed without it.** Must be > 0. |
+| `--yes`, `-y` | no | Skip the confirmation prompt; required when running non-interactively. |
+
+Global flags (`--output`, `--verbose`, `--config`) apply as everywhere; with `--output json` the command prints one JSON result object and never prompts.
+
+**Interactive vs. unattended.** The CLI prompts only when the session is interactive — human output mode *and* stdin is a terminal (detected via `os.ModeCharDevice`; no dependency). Otherwise every required value must come from a flag, `--yes` is required, and a missing value is a usage error (exit 2) rather than a hung prompt. Prompts go to **stderr** and answers are read from **stdin**, so stdout carries only the result and `farcast install … --output json | jq` stays clean.
+
+### The mandatory cost limit
+
+FarCast treats cost control as a safeguard, not a dashboard ([root README](../../README.md#cost-control)). `install` enforces this at the one point where it is structural — the moment the instance is created:
+
+- **No default and no skip.** Omitting `--cost-limit` unattended is a usage error; interactively, the prompt repeats until a valid positive amount is given.
+- The limit is persisted in `metadata.yaml`. **Enforcement belongs to TechnoCore** ([phase 4.1](../../technocore/README.md)); 1.3 *captures and persists* the ceiling so the enforcement loop and every cost-aware command have an authoritative value to read. Recording it at install time is what makes "no instance without a limit" a property of the system rather than a habit.
+
+For 1.3 the limit is a monthly USD amount (`{amount, currency: USD, period: monthly}` in metadata, with currency/period fixed); generalizing currency and window is a later refinement.
+
+### Provisioning through Planck
+
+`install` names no cloud. It blank-imports `planck/providers` (so adapters self-register), then drives the neutral interface:
+
+```go
+p, err := planck.Open(provider, planck.Config{Project: project, Location: region, Credentials: cred})
+if err := p.Validate(ctx); err != nil { /* bad credentials — fail before creating */ }
+cluster, err := p.CreateCluster(ctx, planck.ClusterSpec{Name: clusterName, Location: region, Labels: farcastLabels})
+// blocks until RUNNING; cluster.Kubeconfig reaches the control plane
+```
+
+Cluster shape — Autopilot, node management, networking — is entirely Planck's concern; `install` supplies a name, a region, and FarCast resource labels and gets back a ready `*planck.Cluster`. Planck provisions a **private control plane** (no public IP; IAM-gated DNS-based endpoint — [ADR 0004](../../docs/adr/0004-private-control-plane.md)), so `Cluster.Endpoint` is a DNS FQDN and the kubeconfig targets it. `CreateCluster` is idempotent, so re-running after a partial failure resumes rather than duplicates. The cluster name is derived as `farcast-<instance>` and validated against the provider's rules before anything is created.
+
+### Health check
+
+"Basic health check confirms the instance is alive" (PLAN 1.3). `CreateCluster` already waits for `RUNNING`; the health check re-confirms it independently and verifies the operator's own access path. Because FarCast clusters have a **private control plane with no public IP** ([ADR 0004](../../docs/adr/0004-private-control-plane.md)), there is no public endpoint to dial directly — the operator reaches the API server through GKE's IAM-gated **DNS-based endpoint**. So the check is two cheap, dependency-free steps: (1) re-query the GKE **management API** for `ClusterStatus == RUNNING` (configuration-independent, always reachable), and (2) optionally make one IAM-authenticated request to the DNS endpoint to confirm the operator can reach the control plane.
+
+A deeper check — API-server `/healthz`, FarCast components, workloads — needs the in-cluster components and TechnoCore and lands with them. If it fails, the cluster is **kept** (it is billable, and the failure may be transient networking): the instance is recorded `unreachable`, the operator is warned, and the command exits non-zero so automation notices.
+
+### Local state & atomicity
+
+`install` fills in the instance store from [Configuration & credential storage](#configuration--credential-storage). Because an un-recorded cluster is an untracked bill, it writes the local record **before** provisioning:
+
+1. **Reserve** `instances/<name>/`; refuse if it already exists — no silent clobber (release first, or pick another name).
+2. **Write** `credentials.yaml` and `metadata.yaml` with `status: provisioning`.
+3. **`CreateCluster`.** On error, leave the record (`status: provisioning`/`error`), direct the operator to `farcast release <name>`, exit 1.
+4. **On success**, run the health check, then update `metadata.yaml` (`status: running` | `unreachable`, plus the endpoint) and write `kubeconfig.yaml`.
+
+So an interruption at any point — failure, `Ctrl-C` (the root context is cancelled on `SIGINT`), crash — always leaves a local record carrying the deterministic cluster name and the credentials, which `farcast release` (1.4) can act on. The metadata/credentials split means `release`, `costs`, and `ps` read non-secret metadata without ever opening a secret file.
+
+### Output
+
+Human:
+
+```
+✓ instance "prod" installed
+  provider:    gke (Autopilot)
+  region:      us-central1
+  cluster:     farcast-prod
+  endpoint:    a1b2c3d4.us-central1.gke.goog
+  cost limit:  USD 50 / month
+  state:       running
+  config:      ~/Library/Application Support/farcast/instances/prod
+```
+
+JSON (`--output json`) — a single object, the same data:
+
+```json
+{"name":"prod","provider":"gke","region":"us-central1","cluster":"farcast-prod","endpoint":"a1b2c3d4.us-central1.gke.goog","status":"running","cost_limit":{"amount":50,"currency":"USD","period":"monthly"},"config_path":"…/farcast/instances/prod"}
+```
 
 ---
 
@@ -207,11 +308,13 @@ farsight/cli/
     │   ├── command.go         ← Command interface + registry
     │   ├── env.go             ← Env passed to commands (printer, config, streams)
     │   ├── version.go         ← version command
-    │   └── help.go            ← help command
+    │   ├── help.go            ← help command
+    │   └── install.go         ← farcast install: provision via Planck, persist state  (1.3)
     ├── output/                ← human/JSON printer, error formatting, exit codes
     │   └── output.go
     ├── config/                ← local config + credential store, permission enforcement
-    │   └── config.go
+    │   ├── config.go          ← config dir resolution, perms, config.yaml load/save
+    │   └── instance.go        ← per-instance metadata / credentials / kubeconfig store  (1.3)
     └── buildinfo/             ← Version/Commit/Date (ldflags), ReadBuildInfo fallback
         └── buildinfo.go
 ```
@@ -260,6 +363,7 @@ Per [AGENTS.md](../../AGENTS.md) and [ADR 0002](../../docs/adr/0002-backend-lang
 - **`version`** — human and JSON output, with `buildinfo` values injected.
 - **Output** — human vs JSON rendering; error formatting in both modes; exit codes.
 - **Config** — path resolution (flag/env/default precedence) and permission enforcement, using `t.TempDir()`; a too-permissive directory is rejected or repaired.
+- **`install`** — flag/prompt precedence; a missing or non-positive `--cost-limit` is rejected (the headline guarantee); unattended mode with a missing required flag exits `2`; the record-before-create ordering and `running`/`unreachable`/`error` state transitions are exercised against a **fake `planck.Provider`** (registered via `planck.Register`), with `t.TempDir()` for state and asserted `0700`/`0600` perms — no real cloud calls.
 - Commands are tested by calling `Run` with buffers for `Out`/`Err` — no process spawning.
 
 ---
@@ -271,6 +375,9 @@ The choices made for the scaffold, with rationale:
 1. **CLI framework: standard library (not Cobra).** The CLI holds cloud admin credentials, so minimizing the dependency/supply-chain surface is a security decision, consistent with the SDK's stdlib-only stance and FarCast's first pillar. The command tree is shallow enough (mostly `farcast <verb>`, with `storage` as the only two-level case) that Cobra's machinery isn't required. Trade-off: help rendering is hand-written and there is no shell completion yet. If the command tree grows unwieldy, adopting Cobra later is mechanical.
 2. **Config format: YAML.** Reuses the already-vendored `goccy/go-yaml` (no new dependency) and keeps config operator-readable and consistent with the manifest.
 3. **Single module.** The stray per-module `go.mod` files were removed; the CLI lives in the root module per the repository convention, and only `sdk/go` remains a separate module.
+4. **The cost limit is mandatory, enforced at install (1.3).** No default, no "unlimited", no skip — recorded into instance metadata at creation, so "no instance without a limit" is structural. Enforcement is TechnoCore's (4.1); `install` owns capture.
+5. **Record before create (1.3).** Local state is written before `CreateCluster`, so an interruption never leaves an untracked, billable cluster — a cost-pillar safety property, at the cost of a possible orphaned *record* (which `release` cleans up).
+6. **Dependency-free interaction & health check (1.3).** Prompting and TTY detection use the standard library (`os.ModeCharDevice`), not a prompt library; the health check uses the GKE management API plus the IAM-gated DNS endpoint ([ADR 0004](../../docs/adr/0004-private-control-plane.md)), not a vendored Kubernetes client or a raw public-IP dial — consistent with principle 1, since every dependency is attack surface against stored credentials.
 
 ---
 
@@ -280,8 +387,9 @@ The choices made for the scaffold, with rationale:
 
 | Phase | Adds |
 |---|---|
-| **1.1** (this) | Scaffold: routing, `version`, `help`, config handling, output formatting |
-| 1.2–1.3 | [Planck](../../planck/README.md) provider adapter + `install` (interactive provisioning, mandatory cost limit) |
+| **1.1** | Scaffold: routing, `version`, `help`, config handling, output formatting — **done** |
+| 1.2 | [Planck](../../planck/README.md) provider adapter (GKE Autopilot) — done |
+| **1.3** (this) | `install`: interactive provisioning, mandatory cost limit, health check, instance store |
 | 1.4 | `release` |
 | 2.3 | `connect` (route subsequent commands through [FatLine](../../fatline/README.md)) |
 | 3.3 | `storage ls` / `storage cp` |
@@ -297,4 +405,6 @@ The choices made for the scaffold, with rationale:
 - Agent/architecture context — [`../../AGENTS.md`](../../AGENTS.md)
 - Execution plan — [`../../PLAN.md`](../../PLAN.md)
 - FarCast SDK (the in-instance counterpart) — [`../../sdk/go/README.md`](../../sdk/go/README.md)
+- Compute layer this drives — [`../../planck/README.md`](../../planck/README.md)
 - Backend language strategy — [ADR 0002](../../docs/adr/0002-backend-language-strategy.md)
+- GKE Autopilot decision — [ADR 0003](../../docs/adr/0003-gke-autopilot.md)
