@@ -153,6 +153,18 @@ func TestStubNotImplementedJSON(t *testing.T) {
 	}
 }
 
+func TestFlagsAfterPositional(t *testing.T) {
+	// "release <name> --yes" must parse --yes after the positional, so this is a
+	// no-such-instance runtime error (exit 1), not a usage error (exit 2).
+	_, errOut, code := runCLI(t, "release", "demo", "--yes")
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1; stderr=%s", code, errOut)
+	}
+	if !strings.Contains(errOut, "no such instance") {
+		t.Errorf("expected no-such-instance, got:\n%s", errOut)
+	}
+}
+
 func TestInvalidOutputMode(t *testing.T) {
 	_, errOut, code := runCLI(t, "-o", "xml", "version")
 	if code != 2 {

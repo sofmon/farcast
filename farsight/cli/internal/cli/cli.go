@@ -71,7 +71,8 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	cfs.Usage = func() {}
 	opts.registerCommon(cfs)
 	cmd.SetFlags(cfs)
-	if err := cfs.Parse(rest[1:]); err != nil {
+	cmdArgs, err := parseInterspersed(cfs, rest[1:])
+	if err != nil {
 		fprintf(stderr, "farcast %s: %v\nRun 'farcast help %s' for usage.\n", name, err, name)
 		return 2
 	}
@@ -115,7 +116,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		Log:       logger,
 	}
 
-	if err := cmd.Run(ctx, env, cfs.Args()); err != nil {
+	if err := cmd.Run(ctx, env, cmdArgs); err != nil {
 		if _, ok := errors.AsType[*usageError](err); ok {
 			fprintf(stderr, "farcast %s: %v\nRun 'farcast help %s' for usage.\n", name, err, name)
 			return 2
@@ -124,6 +125,27 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return 1
 	}
 	return 0
+}
+
+// parseInterspersed parses flags that may appear before, after, or between
+// positional arguments, returning the positionals. The standard flag package
+// stops at the first non-flag token, so we resume parsing after each
+// positional — letting "release prod --yes" work as well as "release --yes
+// prod". Flag values persist across the repeated Parse calls (they are set
+// through the registered pointers).
+func parseInterspersed(fs *flag.FlagSet, args []string) ([]string, error) {
+	var positionals []string
+	for {
+		if err := fs.Parse(args); err != nil {
+			return nil, err
+		}
+		rest := fs.Args()
+		if len(rest) == 0 {
+			return positionals, nil
+		}
+		positionals = append(positionals, rest[0])
+		args = rest[1:]
+	}
 }
 
 func defaultRegistry() *Registry {
@@ -135,7 +157,7 @@ func defaultRegistry() *Registry {
 	help.reg = reg
 
 	reg.Register(&installCommand{})
-	reg.Register(newStub("release", "Destroy an instance and clean up local state", "1.4"))
+	reg.Register(&releaseCommand{})
 	reg.Register(newStub("connect", "Open a FatLine tunnel to an instance", "2.3"))
 	reg.Register(newStub("run", "Deploy a Git repository to an instance", "4.3"))
 	reg.Register(newStub("ps", "List running applications", "4.3"))

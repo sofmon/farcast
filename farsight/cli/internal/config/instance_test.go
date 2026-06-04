@@ -81,6 +81,14 @@ func TestSaveInstanceSecretsAre0600(t *testing.T) {
 	}
 	assertPerm(t, filepath.Join(d.InstancePath("prod"), credentialsFile), 0o600)
 	assertPerm(t, filepath.Join(d.InstancePath("prod"), kubeconfigFile), 0o600)
+
+	creds, err := d.LoadInstanceCredentials("prod")
+	if err != nil {
+		t.Fatalf("LoadInstanceCredentials: %v", err)
+	}
+	if creds.Provider != "gke" || creds.ServiceAccountKey != `{"k":"v"}` {
+		t.Errorf("credentials round-trip mismatch: %+v", creds)
+	}
 }
 
 func TestInstanceExistsAndList(t *testing.T) {

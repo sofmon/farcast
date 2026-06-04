@@ -24,12 +24,16 @@ type fakeProvider struct {
 	createErr   error
 	status      planck.ClusterStatus
 	statusErr   error
+	deleteErr   error
+	deleteCalls int
 }
 
 func (*fakeProvider) Name() string                     { return "fake" }
 func (f *fakeProvider) Validate(context.Context) error { return f.validateErr }
-func (*fakeProvider) DeleteCluster(context.Context, planck.ClusterRef) error {
-	return nil
+
+func (f *fakeProvider) DeleteCluster(context.Context, planck.ClusterRef) error {
+	f.deleteCalls++
+	return f.deleteErr
 }
 
 func (f *fakeProvider) CreateCluster(_ context.Context, spec planck.ClusterSpec) (*planck.Cluster, error) {

@@ -24,6 +24,7 @@ const (
 	InstanceProvisioning = "provisioning"
 	InstanceRunning      = "running"
 	InstanceUnreachable  = "unreachable"
+	InstanceDeleting     = "deleting"
 	InstanceError        = "error"
 )
 
@@ -147,6 +148,20 @@ func (d Dir) SaveInstanceCredentials(name string, c *InstanceCredentials) error 
 		return fmt.Errorf("encode instance credentials: %w", err)
 	}
 	return d.writeInstanceFile(name, credentialsFile, data)
+}
+
+// LoadInstanceCredentials reads credentials.yaml for an instance.
+func (d Dir) LoadInstanceCredentials(name string) (*InstanceCredentials, error) {
+	path := filepath.Join(d.instanceDir(name), credentialsFile)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var c InstanceCredentials
+	if err := yaml.Unmarshal(data, &c); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	return &c, nil
 }
 
 // SaveInstanceKubeconfig writes kubeconfig.yaml (0600) for an instance.
