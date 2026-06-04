@@ -61,7 +61,7 @@ func TestCreateClusterProvisionsAndWaits(t *testing.T) {
 	api := &fakeClient{states: []stateResult{
 		{exists: false}, // existence check → not found
 		{state: clusterState{RawStatus: "PROVISIONING"}, exists: true},
-		{state: clusterState{RawStatus: "RUNNING", Endpoint: "e1", CACert: []byte("ca")}, exists: true},
+		{state: clusterState{RawStatus: "RUNNING", Endpoint: "uid.us-central1.gke.goog"}, exists: true},
 	}}
 	p := newTestProvider(api)
 
@@ -75,14 +75,17 @@ func TestCreateClusterProvisionsAndWaits(t *testing.T) {
 	if !api.created.Autopilot {
 		t.Error("created cluster should have Autopilot enabled")
 	}
+	if !api.created.PrivateControlPlane {
+		t.Error("created cluster should have the private control plane enabled (ADR 0004)")
+	}
 	if api.created.Location != "us-central1" {
 		t.Errorf("location = %q, want default us-central1", api.created.Location)
 	}
 	if c.Status != planck.StatusRunning {
 		t.Errorf("status = %v, want running", c.Status)
 	}
-	if c.Endpoint != "e1" {
-		t.Errorf("endpoint = %q, want e1", c.Endpoint)
+	if c.Endpoint != "uid.us-central1.gke.goog" {
+		t.Errorf("endpoint = %q, want the DNS endpoint", c.Endpoint)
 	}
 	if len(c.Kubeconfig) == 0 {
 		t.Error("expected a kubeconfig")
@@ -91,7 +94,7 @@ func TestCreateClusterProvisionsAndWaits(t *testing.T) {
 
 func TestCreateClusterIdempotent(t *testing.T) {
 	api := &fakeClient{states: []stateResult{
-		{state: clusterState{RawStatus: "RUNNING", Endpoint: "e1", CACert: []byte("ca")}, exists: true},
+		{state: clusterState{RawStatus: "RUNNING", Endpoint: "uid.us-central1.gke.goog"}, exists: true},
 	}}
 	p := newTestProvider(api)
 
@@ -173,11 +176,16 @@ func TestMapStatus(t *testing.T) {
 }
 
 func TestBuildKubeconfig(t *testing.T) {
-	kc := string(buildKubeconfig("demo", "203.0.113.1", []byte("ca-bytes")))
-	for _, want := range []string{"name: demo", "server: https://203.0.113.1", "gke-gcloud-auth-plugin", "certificate-authority-data:"} {
+	kc := string(buildKubeconfig("demo", "uid.us-central1.gke.goog"))
+	for _, want := range []string{"name: demo", "server: https://uid.us-central1.gke.goog", "gke-gcloud-auth-plugin"} {
 		if !strings.Contains(kc, want) {
 			t.Errorf("kubeconfig missing %q:\n%s", want, kc)
 		}
+	}
+	// The DNS endpoint uses a publicly-trusted cert (ADR 0004), so the kubeconfig
+	// must not pin the cluster CA.
+	if strings.Contains(kc, "certificate-authority-data") {
+		t.Errorf("kubeconfig must not embed certificate-authority-data:\n%s", kc)
 	}
 }
 

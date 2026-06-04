@@ -4,7 +4,7 @@
 
 **Date:** 2026-06-02
 
-**Relates to:** Implements the GKE choice in Planck phase 1.2 ([`../../planck/README.md`](../../planck/README.md)). Interacts with [ADR 0002](0002-backend-language-strategy.md): a kernel-level Rust FatLine data plane is gated by this decision to a Standard/hybrid node pool.
+**Relates to:** Implements the GKE choice in Planck phase 1.2 ([`../../planck/README.md`](../../planck/README.md)). Interacts with [ADR 0002](0002-backend-language-strategy.md): a kernel-level Rust FatLine data plane is gated by this decision to a Standard/hybrid node pool. The control-plane **network-isolation** posture (private control plane via the DNS-based endpoint, no public IP) is decided separately in [ADR 0004](0004-private-control-plane.md).
 
 ---
 

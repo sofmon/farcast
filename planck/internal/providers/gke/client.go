@@ -2,7 +2,6 @@ package gke
 
 import (
 	"context"
-	"encoding/base64"
 	"fmt"
 
 	container "cloud.google.com/go/container/apiv1"
@@ -40,13 +39,16 @@ type createInput struct {
 	Version   string // empty = provider default
 	Labels    map[string]string
 	Autopilot bool // always true for FarCast (ADR 0003)
+	// PrivateControlPlane applies FarCast's control-plane network isolation
+	// (ADR 0004): public IP endpoint off, internal endpoint on, IAM-gated DNS
+	// endpoint on. Always true for FarCast.
+	PrivateControlPlane bool
 }
 
 // clusterState is the neutral snapshot the seam returns for a cluster.
 type clusterState struct {
 	RawStatus string // cloud-native status string, e.g. "RUNNING"
-	Endpoint  string // API server host
-	CACert    []byte // cluster CA certificate (PEM), for the kubeconfig
+	Endpoint  string // control-plane DNS endpoint, e.g. uid.us-central1.gke.goog (ADR 0004)
 }
 
 // gkeClient is the real clusterAPI, backed by the GKE cluster-management API.
@@ -110,14 +112,11 @@ func (c *gkeClient) get(ctx context.Context, ref planck.ClusterRef) (clusterStat
 	if err != nil {
 		return clusterState{}, false, err
 	}
-	ca, err := decodeCACert(cl.GetMasterAuth().GetClusterCaCertificate())
-	if err != nil {
-		return clusterState{}, false, err
-	}
+	// FarCast clusters expose only the DNS endpoint to operators (ADR 0004); the
+	// public IP endpoint is disabled, so cl.GetEndpoint() is not used.
 	return clusterState{
 		RawStatus: cl.GetStatus().String(),
-		Endpoint:  cl.GetEndpoint(),
-		CACert:    ca,
+		Endpoint:  cl.GetControlPlaneEndpointsConfig().GetDnsEndpointConfig().GetEndpoint(),
 	}, true, nil
 }
 
@@ -129,6 +128,20 @@ func (c *gkeClient) create(ctx context.Context, in createInput) error {
 	}
 	if in.Version != "" {
 		cluster.InitialClusterVersion = in.Version
+	}
+	if in.PrivateControlPlane {
+		// ADR 0004: no public control-plane IP. Keep the internal IP endpoint
+		// for in-cluster/VPC access, disable the public endpoint, and enable the
+		// IAM-gated DNS endpoint for external operator access.
+		cluster.ControlPlaneEndpointsConfig = &containerpb.ControlPlaneEndpointsConfig{
+			IpEndpointsConfig: &containerpb.ControlPlaneEndpointsConfig_IPEndpointsConfig{
+				Enabled:              new(true),
+				EnablePublicEndpoint: new(false),
+			},
+			DnsEndpointConfig: &containerpb.ControlPlaneEndpointsConfig_DNSEndpointConfig{
+				AllowExternalTraffic: new(true),
+			},
+		}
 	}
 	// CreateCluster returns once the long-running operation is accepted; the
 	// adapter polls get() until the cluster reports Running.
@@ -145,18 +158,4 @@ func (c *gkeClient) delete(ctx context.Context, ref planck.ClusterRef) error {
 		return nil // already gone — deletion is idempotent
 	}
 	return err
-}
-
-// decodeCACert turns GKE's base64-encoded cluster CA certificate into the raw
-// PEM bytes buildKubeconfig expects (it re-encodes them for the kubeconfig's
-// certificate-authority-data field).
-func decodeCACert(b64 string) ([]byte, error) {
-	if b64 == "" {
-		return nil, nil
-	}
-	pem, err := base64.StdEncoding.DecodeString(b64)
-	if err != nil {
-		return nil, fmt.Errorf("gke: decode cluster CA certificate: %w", err)
-	}
-	return pem, nil
 }

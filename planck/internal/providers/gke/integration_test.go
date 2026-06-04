@@ -28,6 +28,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -113,6 +114,15 @@ func TestIntegrationClusterLifecycle(t *testing.T) {
 	}
 	if len(c.Kubeconfig) == 0 {
 		t.Error("expected a kubeconfig for the ready cluster")
+	}
+	// ADR 0004: the control plane is private — its endpoint is the DNS FQDN and
+	// the kubeconfig must not pin the cluster CA (the DNS endpoint is publicly
+	// trusted).
+	if !strings.HasSuffix(c.Endpoint, ".gke.goog") {
+		t.Errorf("endpoint = %q, want a DNS endpoint (…gke.goog)", c.Endpoint)
+	}
+	if strings.Contains(string(c.Kubeconfig), "certificate-authority-data") {
+		t.Error("DNS-endpoint kubeconfig must not embed certificate-authority-data")
 	}
 
 	st, err := p.ClusterStatus(ctx, ref)

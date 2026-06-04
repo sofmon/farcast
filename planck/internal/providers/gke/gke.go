@@ -136,11 +136,12 @@ func (p *provider) planCreate(spec planck.ClusterSpec) (createInput, error) {
 		loc = p.defaultLocation
 	}
 	return createInput{
-		Name:      spec.Name,
-		Location:  loc,
-		Version:   spec.Version,
-		Labels:    spec.Labels,
-		Autopilot: true,
+		Name:                spec.Name,
+		Location:            loc,
+		Version:             spec.Version,
+		Labels:              spec.Labels,
+		Autopilot:           true,
+		PrivateControlPlane: true,
 	}, nil
 }
 
@@ -159,7 +160,7 @@ func (p *provider) waitReady(ctx context.Context, ref planck.ClusterRef) (*planc
 					Ref:        ref,
 					Status:     planck.StatusRunning,
 					Endpoint:   st.Endpoint,
-					Kubeconfig: buildKubeconfig(ref.Name, st.Endpoint, st.CACert),
+					Kubeconfig: buildKubeconfig(ref.Name, st.Endpoint),
 				}, nil
 			case planck.StatusError:
 				return nil, fmt.Errorf("gke: cluster %q entered an error state", ref.Name)
