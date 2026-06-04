@@ -105,13 +105,14 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	logger := slog.New(slog.NewTextHandler(logOut, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	env := &Env{
-		Out:     stdout,
-		Err:     stderr,
-		In:      stdin,
-		Printer: printer,
-		Config:  cfg,
-		Verbose: opts.verbose,
-		Log:     logger,
+		Out:       stdout,
+		Err:       stderr,
+		In:        stdin,
+		Printer:   printer,
+		Config:    cfg,
+		ConfigDir: dir,
+		Verbose:   opts.verbose,
+		Log:       logger,
 	}
 
 	if err := cmd.Run(ctx, env, cfs.Args()); err != nil {
@@ -133,7 +134,7 @@ func defaultRegistry() *Registry {
 	reg.Register(help)
 	help.reg = reg
 
-	reg.Register(newStub("install", "Provision a new instance on a cloud provider", "1.3"))
+	reg.Register(&installCommand{})
 	reg.Register(newStub("release", "Destroy an instance and clean up local state", "1.4"))
 	reg.Register(newStub("connect", "Open a FatLine tunnel to an instance", "2.3"))
 	reg.Register(newStub("run", "Deploy a Git repository to an instance", "4.3"))

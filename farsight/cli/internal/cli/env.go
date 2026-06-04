@@ -14,8 +14,9 @@ type Env struct {
 	Err io.Writer
 	In  io.Reader
 
-	Printer *output.Printer
-	Config  *config.Config
-	Verbose bool
-	Log     *slog.Logger
+	Printer   *output.Printer
+	Config    *config.Config
+	ConfigDir config.Dir
+	Verbose   bool
+	Log       *slog.Logger
 }

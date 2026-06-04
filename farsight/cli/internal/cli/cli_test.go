@@ -72,7 +72,7 @@ func TestHelpForCommand(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit = %d, want 0", code)
 	}
-	if !strings.Contains(out, "install") || !strings.Contains(out, "1.3") {
+	if !strings.Contains(out, "install") || !strings.Contains(out, "cost-limit") {
 		t.Errorf("install help unexpected:\n%s", out)
 	}
 }
@@ -86,7 +86,7 @@ func TestRootHelpFlag(t *testing.T) {
 
 func TestCommandHelpFlag(t *testing.T) {
 	out, _, code := runCLI(t, "install", "--help")
-	if code != 0 || !strings.Contains(out, "1.3") {
+	if code != 0 || !strings.Contains(out, "cost-limit") {
 		t.Fatalf("install --help: code=%d out=%q", code, out)
 	}
 }
@@ -122,17 +122,17 @@ func TestBadFlag(t *testing.T) {
 }
 
 func TestStubNotImplementedHuman(t *testing.T) {
-	_, errOut, code := runCLI(t, "install")
+	_, errOut, code := runCLI(t, "connect")
 	if code != 1 {
 		t.Fatalf("exit = %d, want 1", code)
 	}
-	if !strings.Contains(errOut, "not yet implemented") || !strings.Contains(errOut, "1.3") {
+	if !strings.Contains(errOut, "not yet implemented") || !strings.Contains(errOut, "2.3") {
 		t.Errorf("unexpected stub error:\n%s", errOut)
 	}
 }
 
 func TestStubNotImplementedJSON(t *testing.T) {
-	out, _, code := runCLI(t, "-o", "json", "install")
+	out, _, code := runCLI(t, "-o", "json", "connect")
 	if code != 1 {
 		t.Fatalf("exit = %d, want 1", code)
 	}

@@ -4,9 +4,9 @@
 
 `farcast` is the command line face of [FarSight](../README.md), the FarCast UX layer. The same downloadable "farcast" app provides a GUI (the tiling browser), a server (UX composition inside an instance), and this CLI. The CLI is what operators and automation use to provision instances, deploy repositories, connect through FatLine, and monitor spending.
 
-This document specifies two phases of the CLI. **Phase 1.1 — the CLI scaffold** (implemented): the command framework, the two commands that work from day one (`version`, `help`), local configuration handling, and the human/JSON output model. **Phase 1.3 — `farcast install`** (specified here, not yet built): the first command that does real, billable work — interactively provisioning a cloud instance through Planck under a mandatory cost limit. The scaffold is what makes `install` a small, uniform addition.
+This document specifies two phases of the CLI. **Phase 1.1 — the CLI scaffold** (implemented): the command framework, the two commands that work from day one (`version`, `help`), local configuration handling, and the human/JSON output model. **Phase 1.3 — `farcast install`** (implemented): the first command that does real, billable work — interactively provisioning a cloud instance through Planck under a mandatory cost limit. The scaffold is what makes `install` a small, uniform addition.
 
-> **Status.** **Phase 1.1 (scaffold) — implemented** (`go test -race`, `go vet`, and `golangci-lint` all clean): argument parsing and subcommand routing, `farcast version`, `farcast help`, local config file handling, and human + JSON output formatting. **Phase 1.3 (`farcast install`) — in specification** (this document): interactive provisioning through [Planck](../../planck/README.md), a mandatory cost limit, a reachability health check, and secure local persistence of instance metadata + credentials. Every other command is **registered but stubbed** — it appears in `help` and routes correctly, but exits non-zero with a "not yet implemented" message naming its [`PLAN.md`](../../PLAN.md) phase (`connect` → 2.3, `run`/`ps`/`logs`/`costs` → 4.3, and so on).
+> **Status.** **Phase 1.1 (scaffold) — implemented** (`go test -race`, `go vet`, and `golangci-lint` all clean): argument parsing and subcommand routing, `farcast version`, `farcast help`, local config file handling, and human + JSON output formatting. **Phase 1.3 (`farcast install`) — implemented** (`go test -race`, `go vet`, `golangci-lint` all clean): interactive provisioning through [Planck](../../planck/README.md), a mandatory cost limit, a management-API + DNS-endpoint health check, and record-before-create local persistence of instance metadata + credentials + kubeconfig. Every other command is **registered but stubbed** — it appears in `help` and routes correctly, but exits non-zero with a "not yet implemented" message naming its [`PLAN.md`](../../PLAN.md) phase (`connect` → 2.3, `run`/`ps`/`logs`/`costs` → 4.3, and so on).
 
 ---
 
@@ -66,7 +66,7 @@ farcast [global flags] <command> [command flags] [arguments]
 |---|---|---|---|
 | `version` | ✅ works | Print version, commit, build date, Go/OS/arch | 1.1 |
 | `help` | ✅ works | Help for `farcast` or a specific command | 1.1 |
-| `install` | 📝 specified ([below](#farcast-install--provision-an-instance-phase-13)) | Provision a new instance on a cloud provider (interactive) | 1.3 |
+| `install` | ✅ works | Provision a new instance on a cloud provider (interactive) | 1.3 |
 | `release` | ⏳ stub | Destroy an instance and clean up local state | 1.4 |
 | `connect` | ⏳ stub | Open a FatLine tunnel to an instance | 2.3 |
 | `run` | ⏳ stub | Deploy a Git repository to an instance | 4.3 |
@@ -389,7 +389,7 @@ The choices made for the scaffold, with rationale:
 |---|---|
 | **1.1** | Scaffold: routing, `version`, `help`, config handling, output formatting — **done** |
 | 1.2 | [Planck](../../planck/README.md) provider adapter (GKE Autopilot) — done |
-| **1.3** (this) | `install`: interactive provisioning, mandatory cost limit, health check, instance store |
+| **1.3** (this) | `install`: interactive provisioning, mandatory cost limit, health check, instance store — **done** |
 | 1.4 | `release` |
 | 2.3 | `connect` (route subsequent commands through [FatLine](../../fatline/README.md)) |
 | 3.3 | `storage ls` / `storage cp` |
