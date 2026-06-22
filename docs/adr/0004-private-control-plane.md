@@ -48,9 +48,10 @@ All three are mutable after creation (`gcloud … clusters update`, or `ClusterU
 1. **Planck provisions every cluster with a private control plane by default**, via `ControlPlaneEndpointsConfig`:
    - external (public) IP endpoint **off** (`IpEndpointsConfig.EnablePublicEndpoint = false`),
    - internal (VPC) IP endpoint **on** (`IpEndpointsConfig.Enabled = true`) — robust in-cluster and VPC access,
+   - **master authorized networks on with an empty CIDR list** (`IpEndpointsConfig.AuthorizedNetworksConfig.Enabled = true`, no `CidrBlocks`) — GKE **rejects** a disabled public endpoint unless authorized networks is enabled (`enable_master_authorized_networks should be enabled if private endpoint is enabled`); the empty allowlist locks the IP endpoint to the cluster's own VPC/node ranges (which stay always-allowed) and does **not** gate the DNS endpoint,
    - DNS-based endpoint **on** for external operator access (`DnsEndpointConfig.AllowExternalTraffic = true`).
 
-   This is a FarCast **invariant**, in the same spirit as "Autopilot always on" — with an escape hatch (see 5) rather than a per-install knob.
+   This is a FarCast **invariant**, in the same spirit as "Autopilot always on" — with an escape hatch (see 5) rather than a per-install knob. Authorized networks gate only the IP endpoints; the operator's DNS path stays open via IAM (`container.clusters.connect`) and `AllowExternalTraffic`, and the cluster-level `Cluster.MasterAuthorizedNetworksConfig` is left unset (the SDK forbids setting both it and the nested config).
 
 2. **Operator/CLI access is via the DNS endpoint + IAM** (`container.clusters.connect`). The kubeconfig Planck returns uses the **DNS FQDN** (`server: https://uid.<region>.gke.goog`), not a public IP, with the `gke-gcloud-auth-plugin` exec credential.
 

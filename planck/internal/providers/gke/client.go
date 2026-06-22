@@ -133,18 +133,7 @@ func (c *gkeClient) create(ctx context.Context, in createInput) error {
 		cluster.InitialClusterVersion = in.Version
 	}
 	if in.PrivateControlPlane {
-		// ADR 0004: no public control-plane IP. Keep the internal IP endpoint
-		// for in-cluster/VPC access, disable the public endpoint, and enable the
-		// IAM-gated DNS endpoint for external operator access.
-		cluster.ControlPlaneEndpointsConfig = &containerpb.ControlPlaneEndpointsConfig{
-			IpEndpointsConfig: &containerpb.ControlPlaneEndpointsConfig_IPEndpointsConfig{
-				Enabled:              new(true),
-				EnablePublicEndpoint: new(false),
-			},
-			DnsEndpointConfig: &containerpb.ControlPlaneEndpointsConfig_DNSEndpointConfig{
-				AllowExternalTraffic: new(true),
-			},
-		}
+		cluster.ControlPlaneEndpointsConfig = privateControlPlaneConfig()
 	}
 	// CreateCluster returns once the long-running operation is accepted; the
 	// adapter polls get() until the cluster reports Running.
@@ -153,6 +142,33 @@ func (c *gkeClient) create(ctx context.Context, in createInput) error {
 		Cluster: cluster,
 	})
 	return err
+}
+
+// privateControlPlaneConfig is FarCast's control-plane network isolation
+// (ADR 0004): no public IP; the internal endpoint on for in-cluster/VPC access;
+// the IAM-gated DNS endpoint on for external operator access.
+//
+// GKE rejects a disabled public endpoint unless master authorized networks is
+// enabled, so we enable it with an empty CIDR list. That locks the IP endpoint
+// to the cluster's own VPC/node ranges (which stay always-allowed) while
+// leaving the operator's DNS-endpoint path — governed by IAM and
+// AllowExternalTraffic, not by authorized networks — fully open.
+// PrivateEndpointEnforcementEnabled is left unset, and the cluster-level
+// Cluster.MasterAuthorizedNetworksConfig is deliberately not set (the SDK
+// forbids specifying both it and this nested config).
+func privateControlPlaneConfig() *containerpb.ControlPlaneEndpointsConfig {
+	return &containerpb.ControlPlaneEndpointsConfig{
+		IpEndpointsConfig: &containerpb.ControlPlaneEndpointsConfig_IPEndpointsConfig{
+			Enabled:              new(true),
+			EnablePublicEndpoint: new(false),
+			AuthorizedNetworksConfig: &containerpb.MasterAuthorizedNetworksConfig{
+				Enabled: true,
+			},
+		},
+		DnsEndpointConfig: &containerpb.ControlPlaneEndpointsConfig_DNSEndpointConfig{
+			AllowExternalTraffic: new(true),
+		},
+	}
 }
 
 func (c *gkeClient) delete(ctx context.Context, ref planck.ClusterRef) error {

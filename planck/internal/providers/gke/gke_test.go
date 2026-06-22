@@ -189,6 +189,28 @@ func TestBuildKubeconfig(t *testing.T) {
 	}
 }
 
+func TestPrivateControlPlaneConfig(t *testing.T) {
+	c := privateControlPlaneConfig()
+	ip := c.GetIpEndpointsConfig()
+	if ip.GetEnablePublicEndpoint() {
+		t.Error("public control-plane endpoint must be disabled (ADR 0004)")
+	}
+	if !ip.GetEnabled() {
+		t.Error("the internal IP endpoint must stay enabled")
+	}
+	// GKE rejects a disabled public endpoint unless master authorized networks
+	// is enabled — the constraint a live create caught.
+	if !ip.GetAuthorizedNetworksConfig().GetEnabled() {
+		t.Error("master authorized networks must be enabled when the public endpoint is off")
+	}
+	if n := len(ip.GetAuthorizedNetworksConfig().GetCidrBlocks()); n != 0 {
+		t.Errorf("authorized-networks CIDR list = %d entries, want empty (operators use the DNS endpoint)", n)
+	}
+	if !c.GetDnsEndpointConfig().GetAllowExternalTraffic() {
+		t.Error("the DNS endpoint must allow external traffic for operator access")
+	}
+}
+
 func TestNewRequiresProject(t *testing.T) {
 	if _, err := New(planck.Config{}); err == nil {
 		t.Fatal("expected New to require a project")
