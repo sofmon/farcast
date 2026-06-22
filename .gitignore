@@ -1,0 +1,11 @@
+# Built binaries (not checked in). The farcast CLI builds to ./farcast; the
+# Planck harness is run via `go run` (see docs/runbooks/phase-1-validation.md).
+/farcast
+
+# The Planck harness binary, if built into the package dir. (Don't ignore a
+# bare "planck" — that's the source directory; only the binary at this path.)
+/planck/planck
+
+# One-off local build artifacts (e.g. from validation runs).
+/x_farcast
+/x_planck
