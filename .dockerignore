@@ -1,0 +1,10 @@
+# Keep the build context lean: the FatLine image build (fatline/Containerfile)
+# needs only Go sources + go.mod/go.sum + vendor/. Exclude VCS, session state,
+# and built binaries so they neither bloat the context nor bust the build cache.
+.git
+.claude
+/bin/
+/farcast
+/planck/planck
+/fatline/fatline
+/shrike/shrike

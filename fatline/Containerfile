@@ -1,0 +1,20 @@
+# FatLine data-plane image. Build from the REPOSITORY ROOT (the build context
+# needs the root go.mod + vendor/ + every package fatline imports):
+#
+#   docker build -f fatline/Containerfile -t <registry>/fatline:<tag> .
+#
+# `farcast connect` deploys this image (its --fatline-image flag). The runtime
+# shape matches fatline/deploy's securityContext: a static binary on distroless
+# nonroot (uid 65532), so the workload runs as non-root with a read-only root
+# filesystem. Args (--tunnel-listen/--egress-listen/--cert/--key/--ca) are
+# supplied by the Deployment, not baked in here.
+
+FROM golang:1.26 AS build
+WORKDIR /src
+COPY . .
+# Static (CGO off) and vendored, so the build is hermetic — no module fetch.
+RUN CGO_ENABLED=0 go build -mod=vendor -trimpath -o /fatline ./fatline/cmd/fatline
+
+FROM gcr.io/distroless/static:nonroot
+COPY --from=build /fatline /fatline
+ENTRYPOINT ["/fatline"]

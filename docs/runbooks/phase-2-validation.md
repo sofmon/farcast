@@ -39,12 +39,15 @@ go vet ./...
 gofmt -l . | grep -v '^vendor/' || echo "gofmt clean"
 golangci-lint run ./...    # if installed
 
-go build -o farcast ./farsight/cli/cmd/farcast
-go build -o fatline ./fatline/cmd/fatline
-go build -o shrike  ./shrike/cmd/shrike
+# Build into ./bin/ — `go build -o fatline …` at the root would land the binary
+# *inside* the fatline/ source dir (Go writes -o <existing-dir> as dir/<name>).
+mkdir -p bin
+go build -o ./bin/farcast ./farsight/cli/cmd/farcast
+go build -o ./bin/fatline ./fatline/cmd/fatline
+go build -o ./bin/shrike  ./shrike/cmd/shrike
 ```
 
-✅ Expect: tests pass, vet/lint clean, three binaries built. The `go test`
+✅ Expect: tests pass, vet/lint clean, three binaries in `./bin/`. The `go test`
 run alone already proves the FatLine mTLS tunnel handshake, the per-instance CA
 mint/verify, the deny-by-default allowlist (under `-race`), and Shrike's
 violation table + wire round-trip.
@@ -69,11 +72,11 @@ apps:
 EOF
 
 # Start Shrike (declared policy from the manifest; status on :18132):
-./shrike --socket "$SOCK" --manifest "$TMP/sample-manifest.yaml" --status-listen 127.0.0.1:18132 &
+./bin/shrike --socket "$SOCK" --manifest "$TMP/sample-manifest.yaml" --status-listen 127.0.0.1:18132 &
 SHRIKE_PID=$!
 
 # Start FatLine's egress proxy, shipping decisions to the Shrike socket:
-./fatline --egress-listen 127.0.0.1:18131 --manifest "$TMP/sample-manifest.yaml" --shrike-socket "$SOCK" &
+./bin/fatline --egress-listen 127.0.0.1:18131 --manifest "$TMP/sample-manifest.yaml" --shrike-socket "$SOCK" &
 FATLINE_PID=$!
 sleep 1
 ```
@@ -126,11 +129,11 @@ The *public-path* tunnel (across a real load balancer) is what Part B validates.
 ## A3. `farcast connect` — the no-cloud surface
 
 ```bash
-./farcast help connect                 # usage renders; no "not yet implemented"
-./farcast connect                      # → usage error, exit 2
+./bin/farcast help connect                 # usage renders; no "not yet implemented"
+./bin/farcast connect                      # → usage error, exit 2
 echo "exit=$?"
-./farcast connect --carrier cp-forward foo   # → unsupported carrier, exit 2
-./farcast connect ghost                # → "no such instance" (run install first), exit 1
+./bin/farcast connect --carrier cp-forward foo   # → unsupported carrier, exit 2
+./bin/farcast connect ghost                # → "no such instance" (run install first), exit 1
 ```
 
 ✅ Expect the exit codes above. The full `connect` bootstrap needs a real cluster
@@ -167,20 +170,9 @@ echo "exit=$?"
 ## B1. Build & push a FatLine image
 
 `connect` deploys a FatLine container; you must supply its image. There is no
-published image yet, so build one. Add this `Containerfile` at the repo root
-(distroless, non-root uid 65532 to match the deploy's security context):
-
-```dockerfile
-# Containerfile
-FROM golang:1.26 AS build
-WORKDIR /src
-COPY . .
-RUN CGO_ENABLED=0 go build -o /fatline ./fatline/cmd/fatline
-
-FROM gcr.io/distroless/static:nonroot
-COPY --from=build /fatline /fatline
-ENTRYPOINT ["/fatline"]
-```
+published image yet, so build the one the repo ships: [`fatline/Containerfile`](../../fatline/Containerfile)
+(distroless, non-root uid 65532 to match the deploy's security context). **Build
+from the repo root** — the context needs the root `go.mod` + `vendor/`.
 
 Push it to Artifact Registry in the **same project** (so the Autopilot node SA can
 pull it without extra grants):
@@ -191,7 +183,7 @@ gcloud artifacts repositories create farcast \
 gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
 
 export FATLINE_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/farcast/fatline:0.1.0"
-docker build -f Containerfile -t "$FATLINE_IMAGE" .
+docker build -f fatline/Containerfile -t "$FATLINE_IMAGE" .
 docker push "$FATLINE_IMAGE"
 ```
 
@@ -201,7 +193,7 @@ SA `roles/artifactregistry.reader` — see Troubleshooting.)
 ## B2. Connect — bootstrap FatLine + provision the carrier
 
 ```bash
-./farcast connect "$INSTANCE" --fatline-image "$FATLINE_IMAGE" --yes
+./bin/farcast connect "$INSTANCE" --fatline-image "$FATLINE_IMAGE" --yes
 ```
 
 This mints the per-instance mTLS identity (the **CA key stays local**), applies
@@ -249,7 +241,7 @@ admits only a holder of an operator cert signed by the per-instance CA.
 ```bash
 CERTS="$FARCAST_CONFIG_HOME/instances/$INSTANCE/fatline"
 # The carrier endpoint (IP:8443) straight from connect's own status JSON:
-LB=$(./farcast connect "$INSTANCE" --status --output json | sed -n 's/.*"endpoint":"\([^"]*\)".*/\1/p')
+LB=$(./bin/farcast connect "$INSTANCE" --status --output json | sed -n 's/.*"endpoint":"\([^"]*\)".*/\1/p')
 NAME="$INSTANCE.fatline.farcast"
 echo "LB=$LB  server-name=$NAME"
 
@@ -271,8 +263,8 @@ an unauthenticated peer with the IP gets nothing.
 ## B5. Reconnect & scripted status
 
 ```bash
-./farcast connect "$INSTANCE" --status                 # re-dials the stored carrier; no re-deploy, no cost prompt
-./farcast connect "$INSTANCE" --status --output json   # one JSON object for automation
+./bin/farcast connect "$INSTANCE" --status                 # re-dials the stored carrier; no re-deploy, no cost prompt
+./bin/farcast connect "$INSTANCE" --status --output json   # one JSON object for automation
 ```
 
 ✅ Expect: both report `connected: true` against the same endpoint, and `--status`
@@ -284,7 +276,7 @@ neither re-deploys nor re-prompts for cost (idempotent reconnect).
 load balancer:
 
 ```bash
-./farcast release "$INSTANCE" --yes
+./bin/farcast release "$INSTANCE" --yes
 ```
 
 Then **confirm no billable forwarding rule lingers**:

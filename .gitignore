@@ -2,9 +2,15 @@
 # Planck harness is run via `go run` (see docs/runbooks/phase-1-validation.md).
 /farcast
 
-# The Planck harness binary, if built into the package dir. (Don't ignore a
-# bare "planck" — that's the source directory; only the binary at this path.)
+# Module harness binaries, if built into the package dir. (Don't ignore a bare
+# "planck"/"fatline"/"shrike" — those are source directories; only the binary at
+# these paths, e.g. from `go build -o fatline ./fatline/cmd/fatline`.)
 /planck/planck
+/fatline/fatline
+/shrike/shrike
+
+# The Phase 2 validation runbook builds farcast/fatline/shrike into ./bin/.
+/bin/
 
 # One-off local build artifacts (e.g. from validation runs).
 /x_farcast
