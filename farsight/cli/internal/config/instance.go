@@ -17,6 +17,19 @@ const (
 	metadataFile    = "metadata.yaml"
 	credentialsFile = "credentials.yaml"
 	kubeconfigFile  = "kubeconfig.yaml"
+	fatlineSubdir   = "fatline"
+)
+
+// Data-plane mTLS material file names (under <instance>/fatline/). The CA
+// private key (ca.key) is the crown jewel: it stays here and is never shipped
+// to the cluster.
+const (
+	caCertFile     = "ca.crt"
+	caKeyFile      = "ca.key"
+	clientCertFile = "client.crt"
+	clientKeyFile  = "client.key"
+	serverCertFile = "server.crt"
+	serverKeyFile  = "server.key"
 )
 
 // Instance lifecycle states recorded in metadata.yaml.
@@ -36,6 +49,14 @@ type CostLimit struct {
 	Period   string  `yaml:"period"`
 }
 
+// Carrier records how the operator's tunnel reaches FatLine's data plane,
+// bound by `farcast connect` (2.3, ADR 0005). Type is e.g. "nlb".
+type Carrier struct {
+	Type       string `yaml:"type"`
+	Endpoint   string `yaml:"endpoint"`    // host:port the tunnel client dials
+	ServerName string `yaml:"server_name"` // pinned TLS server identity (SAN)
+}
+
 // InstanceMetadata is the non-secret record for an installed instance.
 type InstanceMetadata struct {
 	Name      string    `yaml:"name"`
@@ -49,6 +70,22 @@ type InstanceMetadata struct {
 	Version   string    `yaml:"farcast_version,omitempty"`
 	CreatedAt time.Time `yaml:"created_at"`
 	UpdatedAt time.Time `yaml:"updated_at"`
+
+	// FatLineDeployed records that connect has applied FatLine into the cluster
+	// (and, with Carrier set, provisioned its billable point of presence).
+	FatLineDeployed bool     `yaml:"fatline_deployed,omitempty"`
+	Carrier         *Carrier `yaml:"carrier,omitempty"`
+}
+
+// MTLSMaterial is a per-instance data-plane mTLS identity, PEM-encoded. It is a
+// plain byte holder so the config store stays independent of FatLine's crypto.
+type MTLSMaterial struct {
+	CACertPEM     []byte
+	CAKeyPEM      []byte
+	ClientCertPEM []byte
+	ClientKeyPEM  []byte
+	ServerCertPEM []byte
+	ServerKeyPEM  []byte
 }
 
 // InstanceCredentials is the secret credential material for an instance. An
@@ -167,6 +204,89 @@ func (d Dir) LoadInstanceCredentials(name string) (*InstanceCredentials, error) 
 // SaveInstanceKubeconfig writes kubeconfig.yaml (0600) for an instance.
 func (d Dir) SaveInstanceKubeconfig(name string, kubeconfig []byte) error {
 	return d.writeInstanceFile(name, kubeconfigFile, kubeconfig)
+}
+
+// InstanceKubeconfigPath returns the path to an instance's kubeconfig (so the
+// connect bootstrap can hand it to kubectl).
+func (d Dir) InstanceKubeconfigPath(name string) string {
+	return filepath.Join(d.instanceDir(name), kubeconfigFile)
+}
+
+func (d Dir) fatlineDir(name string) string {
+	return filepath.Join(d.instanceDir(name), fatlineSubdir)
+}
+
+// InstanceMTLSExists reports whether the data-plane mTLS identity has been
+// minted for an instance (keyed on the CA certificate's presence).
+func (d Dir) InstanceMTLSExists(name string) (bool, error) {
+	_, err := os.Stat(filepath.Join(d.fatlineDir(name), caCertFile))
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// SaveInstanceMTLS writes the per-instance mTLS material under <instance>/fatline/
+// (dir 0700, files 0600). The CA private key is included here — on the operator's
+// machine — but the caller must never push it to the cluster.
+func (d Dir) SaveInstanceMTLS(name string, m MTLSMaterial) error {
+	dir := d.fatlineDir(name)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("create fatline directory: %w", err)
+	}
+	files := []struct {
+		name string
+		data []byte
+	}{
+		{caCertFile, m.CACertPEM},
+		{caKeyFile, m.CAKeyPEM},
+		{clientCertFile, m.ClientCertPEM},
+		{clientKeyFile, m.ClientKeyPEM},
+		{serverCertFile, m.ServerCertPEM},
+		{serverKeyFile, m.ServerKeyPEM},
+	}
+	for _, f := range files {
+		if err := os.WriteFile(filepath.Join(dir, f.name), f.data, 0o600); err != nil {
+			return fmt.Errorf("write %s: %w", f.name, err)
+		}
+	}
+	return nil
+}
+
+// LoadInstanceMTLS reads the per-instance mTLS material.
+func (d Dir) LoadInstanceMTLS(name string) (MTLSMaterial, error) {
+	dir := d.fatlineDir(name)
+	read := func(file string) ([]byte, error) {
+		b, err := os.ReadFile(filepath.Join(dir, file))
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", file, err)
+		}
+		return b, nil
+	}
+	var m MTLSMaterial
+	var err error
+	if m.CACertPEM, err = read(caCertFile); err != nil {
+		return MTLSMaterial{}, err
+	}
+	if m.CAKeyPEM, err = read(caKeyFile); err != nil {
+		return MTLSMaterial{}, err
+	}
+	if m.ClientCertPEM, err = read(clientCertFile); err != nil {
+		return MTLSMaterial{}, err
+	}
+	if m.ClientKeyPEM, err = read(clientKeyFile); err != nil {
+		return MTLSMaterial{}, err
+	}
+	if m.ServerCertPEM, err = read(serverCertFile); err != nil {
+		return MTLSMaterial{}, err
+	}
+	if m.ServerKeyPEM, err = read(serverKeyFile); err != nil {
+		return MTLSMaterial{}, err
+	}
+	return m, nil
 }
 
 // writeInstanceFile writes data to <instance>/<file> at 0600. The instance

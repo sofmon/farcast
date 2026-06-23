@@ -37,6 +37,10 @@ fatline/
 ├── event/                          ← PUBLIC leaf: Event, Kind, Sink, SlogSink, BufferedSink (the Shrike seam)
 ├── tunnel/                         ← PUBLIC: client tunnel library (the 2.3 `connect` import surface)
 │   └── tunnel.go                   ←   Connect(ctx, endpoint, ClientIdentity) → *Conn; Conn; ClientIdentity
+├── identity/                       ← PUBLIC: operator-side mTLS mint/load for `connect`  (2.3)
+│   └── identity.go                 ←   Mint(instance) → Material; (*Material).DialTLS; OperatorURI/ServerName
+├── deploy/                         ← PUBLIC: renders FatLine's own K8s workload YAML      (2.3)
+│   └── deploy.go                   ←   Render(Config) → apply stream (Namespace/Secret/Deployment/Service)
 ├── cmd/
 │   └── fatline/
 │       └── main.go                 ← thin server entry: load mTLS + allowlist, Serve until SIGINT
@@ -52,6 +56,7 @@ The wiring mirrors [Planck](../planck/README.md)'s [`database/sql`](https://pkg.
 - **`fatline`** (root, public) declares `Server`, `Config`, `New`, `Serve`, `Status`, `ReloadAllowlist`, `ConnStatus`, and the `Egress` seam. TechnoCore and tests import it for the types.
 - **`fatline/event`** (public leaf) holds the `Event`/`Sink` Shrike seam. It is a separate leaf because Shrike lives *outside* `fatline/` yet `internal/proxy` also depends on it — a leaf keeps that shared dependency cycle-free.
 - **`fatline/tunnel`** (public) is the **client** side — the dialer that presents the operator's certificate and returns an `*http.Client` routed through the instance. It is public, not internal, because it is the one thing `farcast connect` (2.3) and the FarSight client (Phase 7) consume.
+- **`fatline/identity`** and **`fatline/deploy`** (public, added 2.3) are the operator-side bootstrap surface `farcast connect` consumes: `identity` mints the per-instance CA + operator/server leaves and assembles the dial credential (wrapping `internal/crypto` so it stays internal); `deploy` renders FatLine's own Autopilot-compliant workload YAML. Neither depends on a Kubernetes client ([ADR 0006](../docs/adr/0006-connect-bootstrap-kubectl.md)).
 - **`fatline/internal/allowlist`** and **`fatline/internal/router`** hold the two shared-mutable-state paths [ADR 0002](../docs/adr/0002-backend-language-strategy.md) singles out for race tests — the dynamic allowlist and the session table — so they are first-class packages, not buried in `proxy`.
 - **`fatline/internal/proxy`** is the egress hot loop, behind a language-neutral `Egress` interface so the benchmark-gated Rust data plane ([ADR 0002](../docs/adr/0002-backend-language-strategy.md)) can drop in later without caller churn.
 

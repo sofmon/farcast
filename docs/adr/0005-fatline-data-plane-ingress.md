@@ -1,6 +1,6 @@
 # ADR 0005 — FatLine Data-Plane Ingress: an mTLS-Gated Point of Presence, Built Deferred-Hybrid
 
-**Status:** Accepted for the Phase 2.1 artifact (deferred-hybrid sequencing + the four locked invariants). The choice of the eventual external **carrier** (and its cost) is a **proposed default** pending ratification at Phase 2.3.
+**Status:** Accepted. The Phase 2.1 artifact shipped deferred-hybrid (the four locked invariants); at **Phase 2.3 the carrier was ratified** — `farcast connect` binds the public mTLS-gated L4 NLB by default and surfaces its standing ~$18/mo against the cost limit (see the 2026-06-23 ratification note below). The CA-key-stays-local mint and the kubectl-not-client-go bootstrap mechanism are recorded in [ADR 0006](0006-connect-bootstrap-kubectl.md).
 
 **Date:** 2026-06-23
 
@@ -95,4 +95,10 @@ How the operator's client reaches FatLine:
 
 ---
 
-*This ADR is a living record. Revisit it when `farcast connect` (2.3) ratifies and binds the carrier, when the FarSight GUI (Phase 7) exercises the public PoP at scale, when the threat model hardens (ADR 0002 open input), or when the second cloud provider (8.1) arrives.*
+## Ratification (2026-06-23, Phase 2.3)
+
+`farcast connect` was implemented and the carrier **ratified as proposed**: the default (and only wired) carrier is the **public mTLS-gated L4 passthrough NLB** (A1). `connect` provisions it on first connect behind a confirmation gate that surfaces the standing **~$18/mo** against the instance's cost limit (`--yes` to skip, required non-interactively), and never relaxes the mTLS client-cert verification (decision #5 holds). The A2 control-plane port-forward fallback remains **documented but unbound** — the carrier seam (`fatline/deploy` Service type + the CLI's `--carrier` flag) reserves it for a later phase. The operator's per-instance CA **private key never leaves the machine**; only the CA certificate and the server leaf+key are injected into the in-cluster Secret. The deploy/inject mechanism (kubectl subprocess, no vendored Kubernetes client) is [ADR 0006](0006-connect-bootstrap-kubectl.md).
+
+---
+
+*This ADR is a living record. Revisit it when the FarSight GUI (Phase 7) exercises the public PoP at scale, when the A2 control-plane fallback is bound, when the threat model hardens (ADR 0002 open input), or when the second cloud provider (8.1) arrives.*

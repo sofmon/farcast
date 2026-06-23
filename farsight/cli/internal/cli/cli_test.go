@@ -122,17 +122,17 @@ func TestBadFlag(t *testing.T) {
 }
 
 func TestStubNotImplementedHuman(t *testing.T) {
-	_, errOut, code := runCLI(t, "connect")
+	_, errOut, code := runCLI(t, "run")
 	if code != 1 {
 		t.Fatalf("exit = %d, want 1", code)
 	}
-	if !strings.Contains(errOut, "not yet implemented") || !strings.Contains(errOut, "2.3") {
+	if !strings.Contains(errOut, "not yet implemented") || !strings.Contains(errOut, "4.3") {
 		t.Errorf("unexpected stub error:\n%s", errOut)
 	}
 }
 
 func TestStubNotImplementedJSON(t *testing.T) {
-	out, _, code := runCLI(t, "-o", "json", "connect")
+	out, _, code := runCLI(t, "-o", "json", "run")
 	if code != 1 {
 		t.Fatalf("exit = %d, want 1", code)
 	}

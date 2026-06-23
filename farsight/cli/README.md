@@ -6,7 +6,7 @@
 
 This document specifies two phases of the CLI. **Phase 1.1 — the CLI scaffold** (implemented): the command framework, the two commands that work from day one (`version`, `help`), local configuration handling, and the human/JSON output model. **Phase 1.3 — `farcast install`** (implemented): the first command that does real, billable work — interactively provisioning a cloud instance through Planck under a mandatory cost limit. The scaffold is what makes `install` a small, uniform addition.
 
-> **Status.** **Phase 1.1 (scaffold) — implemented** (`go test -race`, `go vet`, and `golangci-lint` all clean): argument parsing and subcommand routing, `farcast version`, `farcast help`, local config file handling, and human + JSON output formatting. **Phase 1.3 (`farcast install`) — implemented** (`go test -race`, `go vet`, `golangci-lint` all clean): interactive provisioning through [Planck](../../planck/README.md), a mandatory cost limit, a management-API + DNS-endpoint health check, and record-before-create local persistence of instance metadata + credentials + kubeconfig. **Phase 1.4 (`farcast release`) — implemented** (`go test -race`, `go vet`, `golangci-lint` all clean): the destructive counterpart that tears the cluster down through Planck and removes local state, deleting the cloud resource before the record so a failure never strands billable infrastructure. Every other command is **registered but stubbed** — it appears in `help` and routes correctly, but exits non-zero with a "not yet implemented" message naming its [`PLAN.md`](../../PLAN.md) phase (`connect` → 2.3, `run`/`ps`/`logs`/`costs` → 4.3, and so on).
+> **Status.** **Phase 1.1 (scaffold) — implemented** (`go test -race`, `go vet`, and `golangci-lint` all clean): argument parsing and subcommand routing, `farcast version`, `farcast help`, local config file handling, and human + JSON output formatting. **Phase 1.3 (`farcast install`) — implemented** (`go test -race`, `go vet`, `golangci-lint` all clean): interactive provisioning through [Planck](../../planck/README.md), a mandatory cost limit, a management-API + DNS-endpoint health check, and record-before-create local persistence of instance metadata + credentials + kubeconfig. **Phase 1.4 (`farcast release`) — implemented** (`go test -race`, `go vet`, `golangci-lint` all clean): the destructive counterpart that tears the cluster down through Planck and removes local state, deleting the cloud resource before the record so a failure never strands billable infrastructure. **Phase 2.3 (`farcast connect`) — implemented** (`go test -race`, `go vet`, `golangci-lint` all clean): it mints the per-instance mTLS identity (CA key kept local), bootstrap-deploys FatLine via kubectl ([ADR 0006](../../docs/adr/0006-connect-bootstrap-kubectl.md)), provisions its public mTLS load-balancer carrier under a cost-confirmation gate ([ADR 0005](../../docs/adr/0005-fatline-data-plane-ingress.md)), dials the tunnel, and reports status. The orchestration is unit-tested against a fake cluster runner and an injected tunnel dial; the real public-NLB path is `//go:build integration`, never in CI (cost pillar). Every remaining command is **registered but stubbed** — it appears in `help` and routes correctly, but exits non-zero with a "not yet implemented" message naming its [`PLAN.md`](../../PLAN.md) phase (`run`/`ps`/`logs`/`costs` → 4.3, and so on).
 
 ---
 
@@ -68,7 +68,7 @@ farcast [global flags] <command> [command flags] [arguments]
 | `help` | ✅ works | Help for `farcast` or a specific command | 1.1 |
 | `install` | ✅ works | Provision a new instance on a cloud provider (interactive) | 1.3 |
 | `release` | ✅ works | Destroy an instance and clean up local state | 1.4 |
-| `connect` | ⏳ stub | Open a FatLine tunnel to an instance | 2.3 |
+| `connect` | ✅ works | Open a FatLine tunnel to an instance | 2.3 |
 | `run` | ⏳ stub | Deploy a Git repository to an instance | 4.3 |
 | `ps` | ⏳ stub | List running applications | 4.3 |
 | `logs` | ⏳ stub | Stream an application's logs | 4.3 |
@@ -349,6 +349,104 @@ JSON (`--output json`):
 
 ---
 
+## `farcast connect` — open a FatLine tunnel (Phase 2.3)
+
+`farcast connect <instance>` is where the operator's machine stops being a point of presence and the *instance* becomes one. It establishes the [FatLine](../../fatline/README.md) mutually-authenticated tunnel into a running instance, reports the boundary's status, and persists the operator's data-plane identity so every later command (`run`, `ps`, `logs`, …, phase 4.3) routes its instance traffic through FatLine rather than the public internet.
+
+Unlike `install`/`release`, which drive the *control plane* (the Kubernetes API, over Google IAM), `connect` drives the *data plane*: FatLine, authenticated by FarCast's **own per-instance CA**, never Google IAM ([ADR 0005](../../docs/adr/0005-fatline-data-plane-ingress.md)). The two planes stay separate by design ([ADR 0004](../../docs/adr/0004-private-control-plane.md)).
+
+The first `connect` to a fresh instance does a one-time **bootstrap**: mint the instance's mTLS identity, deploy FatLine into the cluster, and provision its public point of presence. Subsequent connects reuse all of it and simply re-dial. Every step is idempotent, so an interrupted bootstrap is resumed, not duplicated.
+
+### What it carries — the carrier ([ADR 0005](../../docs/adr/0005-fatline-data-plane-ingress.md))
+
+The default carrier is a **single public, mTLS-gated L4 passthrough load balancer** per instance (a GKE `Service{type: LoadBalancer}` fronting the FatLine Pod). Google forwards raw TCP and never terminates TLS, so the cloud carries **ciphertext + SNI only**; the entire boundary is FatLine's `RequireAndVerifyClientCert` — an unauthenticated peer with the IP gets a TCP connect and a `ClientHello`, then is dropped at certificate verification, before any byte is routed. It is a locked door on a public street.
+
+That load balancer is a **standing ~$18/mo cost** (a real 30–50% bump on the ~$37–51/mo Autopilot baseline). Because cost control is a non-negotiable pillar, `connect` surfaces it and **requires confirmation** before provisioning — the same "last step before money is spent" gate as `install`. The carrier sits behind a thin, swappable seam (ADR 0005 invariant #4); the documented control-plane-port-forward fallback (A2) is a later binding against that seam, not a rewrite — `connect`'s mTLS identity and core are carrier-independent.
+
+### The bootstrap flow
+
+1. **Resolve the instance** — load `metadata.yaml`, `credentials.yaml`, `kubeconfig.yaml`. An instance that was never `install`ed, or is not `running`, is an error directing the operator to `install` first.
+2. **Ensure the data-plane identity** — on first connect, mint a fresh **per-instance CA** and from it an **operator client leaf** (URI SAN `farcast://<instance>/operator`) and a **FatLine server leaf** (DNS SAN `<instance>.fatline.farcast`, the pinned server name). Persist all of it under the instance dir at `0600` (see [Local identity store](#local-identity-store)). On later connects, load it. **The CA private key never leaves the operator's machine** — only the CA *certificate* and the server leaf+key are pushed to the cluster, so a compromise of the in-cluster Secret reads a rotatable leaf, never the power to mint identities.
+3. **Cost gate** — if FatLine is not yet deployed (or the carrier not yet provisioned), show the standing LB cost (~$18/mo, counted against the instance's cost limit) and require a yes. `--yes` skips it; it is required when non-interactive. *This is the point where money starts.*
+4. **Deploy FatLine** — render FatLine's Autopilot-compliant workload ([`fatline/deploy`](#supporting-modules)) — `Namespace`, the mTLS `Secret` (CA cert + server leaf+key; **not** the CA key), `Deployment`, and the `Service{type: LoadBalancer}` — and apply it through **kubectl over the stored kubeconfig** (no vendored Kubernetes client — see [Decisions](#decisions)). Idempotent (`kubectl apply`).
+5. **Await the point of presence** — wait for the Deployment to roll out and the Service to be assigned its external IP (the LB ingress), with progress on stderr.
+6. **Dial & verify** — `tunnel.Connect(ctx, "https://<lb-ip>:8443", ClientIdentity{client leaf, per-instance CA, pinned server name})`. `Connect` performs the mTLS handshake and probes FatLine's status endpoint, so a bad cert or unreachable instance fails *here*, not on first use.
+7. **Record & report** — persist the carrier (endpoint, server name, type) and `fatline_deployed: true` into `metadata.yaml`; print the connection status.
+
+### Command surface
+
+```
+farcast connect <instance> [flags]
+```
+
+| Flag | Meaning |
+|---|---|
+| `<instance>` | The instance to connect to (positional, required). |
+| `--carrier <nlb>` | Data-plane carrier (default `nlb`, the public mTLS load balancer). The seam reserves `cp-forward` (control-plane fallback) for a later phase. |
+| `--status` | Don't bootstrap or provision anything — just dial the already-bound carrier and report status (re-connect / health probe). Fails if the instance was never connected. |
+| `--yes`, `-y` | Skip the LB-cost confirmation; required when non-interactive. |
+
+Global flags (`--output`, `--verbose`, `--config`) apply. With `--output json` the command prints one JSON result and never prompts (so the cost gate must be pre-answered with `--yes`).
+
+### Connection status reporting
+
+`connect` (and `connect --status`) renders FatLine's `ConnStatus` — the boundary's live health, fetched over the tunnel itself:
+
+Human:
+
+```
+✓ connected to "prod"
+  carrier:     public mTLS NLB  34.120.0.5:8443
+  identity:    farcast://prod/operator
+  active:      0 streams
+  allowlist:   2 hosts (api.stripe.com, api.openai.com)
+  cost:        load balancer ~$18/mo (within limit: USD 50/month)
+```
+
+JSON (`--output json`):
+
+```json
+{"name":"prod","connected":true,"carrier":"nlb","endpoint":"34.120.0.5:8443","identity":"farcast://prod/operator","active":0,"allowlist":["api.stripe.com","api.openai.com"]}
+```
+
+### "All subsequent commands route through FatLine"
+
+The CLI is stateless between invocations — there is no daemon. `connect` makes routing possible by **persisting the operator's identity and the carrier endpoint**; each later command (`run`/`ps`/`logs`/`costs`, phase 4.3) re-loads them and re-dials the tunnel for its duration via the same `fatline/tunnel` library, using `Conn.HTTPClient()` for its instance API calls. So 2.3 delivers the mechanism and the status surface; the commands that consume it land in 4.3. (With the public-NLB carrier the endpoint is a stable IP, so each re-dial is direct and stateless — no port-forward to keep alive.)
+
+### Local identity store
+
+`connect` extends the [instance store](#configuration--credential-storage) with the data-plane mTLS material, under the same `0700`/`0600` rules:
+
+```
+instances/<instance-name>/
+├── metadata.yaml        (0600)  + carrier {type, endpoint, server_name}, fatline_deployed
+├── credentials.yaml     (0600)  (unchanged — cloud credential)
+├── kubeconfig.yaml      (0600)  (unchanged — control-plane access)
+└── fatline/             (0700)  data-plane mTLS identity
+    ├── ca.crt           (0600)  per-instance CA certificate
+    ├── ca.key           (0600)  per-instance CA private key — the crown jewel, NEVER pushed to the cluster
+    ├── client.crt       (0600)  operator client leaf (SAN farcast://<instance>/operator)
+    ├── client.key       (0600)
+    ├── server.crt       (0600)  FatLine server leaf (SAN <instance>.fatline.farcast) — pushed to the cluster Secret
+    └── server.key       (0600)
+```
+
+The CA key's locality is the security crux: it is what keeps the data-plane trust root sovereign and off the cloud. The metadata/credentials/identity split means a status-only command never opens the CA key.
+
+### Supporting modules
+
+`connect` is an orchestrator; the reusable capability lives in three small, testable seams:
+
+- **[`fatline/identity`](../../fatline/README.md)** *(new, public)* — the operator-side mint/load surface wrapping FatLine's `internal/crypto` (which stays internal): mint a per-instance CA, issue the operator client + FatLine server leaves, and assemble a `tunnel.ClientIdentity` from stored PEMs. This is what lets the CLI handle mTLS material without importing FatLine internals.
+- **[`fatline/deploy`](../../fatline/README.md)** *(new, public)* — renders FatLine's own Kubernetes workload (Namespace, Secret, Deployment, Service) as an Autopilot-compliant apply stream. FatLine owns the shape of how it is deployed; this is the one-off precursor to Planck's general manifest translator (4.2).
+- **`farsight/cli/internal/cluster`** *(new)* — a minimal **kubectl-subprocess** wrapper (apply via stdin, await rollout, read the Service external IP) over the stored kubeconfig. The exec boundary is injectable, so the orchestration is unit-tested with a fake runner; the real cloud path is integration-gated.
+
+### Testing
+
+Mirrors `install`/`release` and [Planck's strategy](../../planck/README.md): the orchestration — identity mint/persist, manifest rendering, the cost gate, the kubectl call sequence, status rendering, the record-before-provision ordering — is unit-tested against a **fake cluster runner** and an **in-process mTLS FatLine** (the same `httptest`-over-mTLS harness FatLine's `tunnel` e2e test uses), with `t.TempDir()` state and asserted `0600` perms — **no real cloud, no LB cost**. The end-to-end public-NLB path sits behind `//go:build integration` and is **never in CI** (cost pillar), exactly like Planck's create/delete tests.
+
+---
+
 ## Diagnostics
 
 Diagnostic logging is for the operator debugging the CLI, not for command output. It is plain text on **stderr**, gated by `--verbose`, built on the standard library's `log/slog` with a text handler. It is intentionally **not** the farcast SDK logger: the SDK is for in-instance applications and emitting JSON to stdout, which is the opposite of what an operator CLI wants. Keeping them separate also keeps the root module free of a dependency on the `sdk/go` module.
@@ -372,12 +470,15 @@ farsight/cli/
     │   ├── help.go            ← help command
     │   ├── install.go         ← farcast install: provision via Planck, persist state  (1.3)
     │   ├── prompt.go          ← stdlib interactive prompts + TTY detection  (1.3)
-    │   └── release.go         ← farcast release: tear down via Planck, remove state  (1.4)
+    │   ├── release.go         ← farcast release: tear down via Planck, remove state  (1.4)
+    │   └── connect.go         ← farcast connect: mint identity, bootstrap FatLine, dial tunnel  (2.3)
     ├── output/                ← human/JSON printer, error formatting, exit codes
     │   └── output.go
+    ├── cluster/               ← kubectl-subprocess wrapper: apply, await rollout, read LB IP  (2.3)
+    │   └── cluster.go
     ├── config/                ← local config + credential store, permission enforcement
     │   ├── config.go          ← config dir resolution, perms, config.yaml load/save
-    │   └── instance.go        ← per-instance metadata / credentials / kubeconfig store  (1.3)
+    │   └── instance.go        ← per-instance metadata / credentials / kubeconfig / mTLS store  (1.3, +2.3)
     └── buildinfo/             ← Version/Commit/Date (ldflags), ReadBuildInfo fallback
         └── buildinfo.go
 ```
@@ -443,6 +544,8 @@ The choices made for the scaffold, with rationale:
 5. **Record before create (1.3).** Local state is written before `CreateCluster`, so an interruption never leaves an untracked, billable cluster — a cost-pillar safety property, at the cost of a possible orphaned *record* (which `release` cleans up).
 6. **Dependency-free interaction & health check (1.3).** Prompting and TTY detection use the standard library (`os.ModeCharDevice`), not a prompt library; the health check uses the GKE management API plus the IAM-gated DNS endpoint ([ADR 0004](../../docs/adr/0004-private-control-plane.md)), not a vendored Kubernetes client or a raw public-IP dial — consistent with principle 1, since every dependency is attack surface against stored credentials.
 7. **Release deletes the cloud resource before local state (1.4).** The inverse of record-before-create: `release` tears the cluster down first and only then removes the local record, so a failure never strands a billable cluster with no way to find it again. `DeleteCluster` is idempotent, so re-running `release` converges. The interactive confirmation requires **retyping the instance name** — stronger than install's y/N, because the operation is destructive; `--yes` skips it.
+8. **`connect` deploys via kubectl subprocess, not a vendored Kubernetes client (2.3, [ADR 0006](../../docs/adr/0006-connect-bootstrap-kubectl.md)).** Consistent with principle 1 and decision 6: a vendored `client-go` is a large supply-chain surface against stored cloud credentials. The stored kubeconfig already drives the control plane through an **external auth-plugin exec** (`gke-gcloud-auth-plugin`), so shelling to `kubectl` for the one-off FatLine bootstrap adds an external-tool runtime dependency, not a Go dependency — the same line the kubeconfig already draws. The exec boundary is injectable, so orchestration is unit-tested without a cluster.
+9. **`connect` mints the data-plane identity locally; the CA private key never leaves the machine (2.3).** The per-instance CA is the sovereign data-plane trust root ([ADR 0005](../../docs/adr/0005-fatline-data-plane-ingress.md)). `connect` mints it (and the operator client + FatLine server leaves) on first connect and pushes only the CA *certificate* + server leaf+key to the cluster Secret — never the CA key. The default carrier is the public mTLS-gated load balancer; its **standing ~$18/mo cost is confirmed against the cost limit** before provisioning (the carrier was ratified at 2.3 per [ADR 0005](../../docs/adr/0005-fatline-data-plane-ingress.md)).
 
 ---
 
@@ -456,7 +559,7 @@ The choices made for the scaffold, with rationale:
 | 1.2 | [Planck](../../planck/README.md) provider adapter (GKE Autopilot) — done |
 | **1.3** | `install`: interactive provisioning, mandatory cost limit, health check, instance store — **done** |
 | **1.4** (this) | `release`: confirmed teardown via Planck, delete-before-cleanup, local removal — **done** |
-| 2.3 | `connect` (route subsequent commands through [FatLine](../../fatline/README.md)) |
+| **2.3** (this) | `connect`: mint the per-instance mTLS identity, bootstrap-deploy FatLine, provision its public mTLS carrier ([ADR 0005](../../docs/adr/0005-fatline-data-plane-ingress.md)), dial the tunnel, report status — the seam later commands route through |
 | 3.3 | `storage ls` / `storage cp` |
 | 4.3 | `run`, `ps`, `logs`, `costs` |
 | 6.2 | `chat` (terminal AI via [AllThing](../../allthing/README.md)) |
