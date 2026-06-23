@@ -18,6 +18,7 @@ import (
 	"github.com/sofmon/farcast/fatline"
 	fcrypto "github.com/sofmon/farcast/fatline/internal/crypto"
 	"github.com/sofmon/farcast/manifest/parser"
+	"github.com/sofmon/farcast/shrike"
 )
 
 func main() {
@@ -37,6 +38,7 @@ func run(args []string) error {
 		caPath       = fs.String("ca", "", "client CA certificate PEM (required for the tunnel)")
 		manifestPath = fs.String("manifest", "", "path to a ./farcast manifest whose external hosts seed the egress allowlist")
 		endpoint     = fs.String("endpoint", "", "externally advertised endpoint, reported in status")
+		shrikeSocket = fs.String("shrike-socket", "", "if set, stream egress events to a Shrike sidecar at this Unix socket (else log via slog)")
 	)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -79,6 +81,15 @@ func run(args []string) error {
 		cfg.Allowlist = flattenExternal(m)
 	}
 
+	// Optionally ship egress decisions to a Shrike sidecar; otherwise FatLine's
+	// default slog sink logs them. The data plane never depends on Shrike being
+	// up — DialSink drops-and-counts when the sidecar is absent (2.2).
+	var ds *shrike.DialSink
+	if *shrikeSocket != "" {
+		ds = shrike.NewDialSink(*shrikeSocket)
+		cfg.Events = ds
+	}
+
 	srv, err := fatline.New(cfg)
 	if err != nil {
 		return err
@@ -87,9 +98,13 @@ func run(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	fmt.Fprintf(os.Stderr, "fatline: serving (tunnel=%q egress=%q, %d allowlisted hosts)\n",
-		*tunnelListen, *egressListen, len(cfg.Allowlist))
-	return srv.Serve(ctx)
+	fmt.Fprintf(os.Stderr, "fatline: serving (tunnel=%q egress=%q, %d allowlisted hosts, shrike=%q)\n",
+		*tunnelListen, *egressListen, len(cfg.Allowlist), *shrikeSocket)
+	err = srv.Serve(ctx)
+	if ds != nil {
+		_ = ds.Close()
+	}
+	return err
 }
 
 // flattenExternal collects every app's declared external hosts into one
