@@ -29,6 +29,11 @@ build/push the image, ~3–5 min for `connect`, ~3–5 min for `release`.
 
 # Part A — Local validation (free)
 
+> **Shortcut.** [`phase-2-part-a.sh`](phase-2-part-a.sh) runs everything in Part A
+> automatically and stops with a clear message on the first failure (macOS bash):
+> `bash docs/runbooks/phase-2-part-a.sh`. The steps below are what it does, for
+> when you want to run them by hand.
+
 ## A0. Build everything and run the guardrails
 
 From the repo root:
@@ -115,13 +120,13 @@ kill $FATLINE_PID $SHRIKE_PID 2>/dev/null; rm -rf "$TMP"
 ## A2. The mTLS tunnel & per-instance CA
 
 The tunnel server, the client dialer, and the per-instance-CA crypto are exercised
-by the test suite (`fatline/tunnel`, `fatline/internal/crypto`,
-`fatline/identity`): a good client connects, a foreign-CA or no-cert peer is
-rejected at the handshake, and the operator URI-SAN identity is enforced. Re-run
-just those if you want to see them in isolation:
+by the test suite (the tunnel Connect e2e lives in the root `fatline` package,
+plus `fatline/internal/crypto` and `fatline/identity`): a good client connects, a
+foreign-CA or no-cert peer is rejected at the handshake, and the operator URI-SAN
+identity is enforced. Re-run just those if you want to see them in isolation:
 
 ```bash
-go test ./fatline/tunnel/... ./fatline/internal/crypto/... ./fatline/identity/... -v 2>&1 | grep -E '^(=== RUN|--- (PASS|FAIL))' | head -40
+go test ./fatline ./fatline/internal/crypto/... ./fatline/identity/... -v 2>&1 | grep -E '^(=== RUN|--- (PASS|FAIL))' | head -40
 ```
 
 The *public-path* tunnel (across a real load balancer) is what Part B validates.
