@@ -103,16 +103,54 @@ func (c *releaseCommand) Run(ctx context.Context, env *Env, args []string) error
 		return fmt.Errorf("destroying cluster %q failed: %w; the instance is kept — re-run 'farcast release %s'",
 			meta.Cluster, err, name)
 	}
+
+	// The instance's image registry goes with it (ADR 0007). Nothing sovereign
+	// is lost — every image in it is derivable from Git — while keeping it would
+	// leave billable storage nobody is watching, which the cost pillar does not
+	// tolerate. The cluster goes first because it is the expensive resource;
+	// this delete follows the same discipline, before local state is removed, so
+	// a failure leaves a record to re-run against. Both deletes are idempotent,
+	// so a re-run converges.
+	registry, err := deleteRegistry(ctx, p, meta)
+	if err != nil {
+		return fmt.Errorf("cluster destroyed but destroying the image registry %q failed: %w; the instance is kept — re-run 'farcast release %s'",
+			registryRefFor(meta).Name, err, name)
+	}
+
 	if err := env.ConfigDir.RemoveInstance(name); err != nil {
-		return fmt.Errorf("cluster destroyed but removing local state failed: %w", err)
+		return fmt.Errorf("cloud resources destroyed but removing local state failed: %w", err)
 	}
 
 	return env.Printer.Print(releaseResult{
 		Name:     name,
 		Provider: meta.Provider,
 		Cluster:  meta.Cluster,
+		Registry: registry,
 		Status:   "released",
 	})
+}
+
+// deleteRegistry removes the instance's image registry and returns the name of
+// what it destroyed.
+//
+// A provider with no registry capability has nothing to delete, which is success
+// rather than an error — the same reasoning that lets install skip it. Deleting
+// an absent registry is likewise success (the provider contract), so this is
+// safe to repeat after a partial teardown. The returned name is empty when
+// nothing was recorded to name: the delete is still attempted for an instance
+// whose record predates registries, but the report claims only what is known.
+func deleteRegistry(ctx context.Context, p planck.Provider, meta *config.InstanceMetadata) (string, error) {
+	rp, ok := p.(planck.RegistryProvider)
+	if !ok {
+		return "", nil
+	}
+	if err := rp.DeleteRegistry(ctx, registryRefFor(meta)); err != nil {
+		return "", err
+	}
+	if meta.Registry == nil {
+		return "", nil
+	}
+	return meta.Registry.Repository, nil
 }
 
 // confirm decides whether to proceed with destruction. With --yes it proceeds
@@ -140,19 +178,30 @@ func printReleaseSummary(w io.Writer, meta *config.InstanceMetadata) {
 	fprintf(w, "  provider:  %s\n", meta.Provider)
 	fprintf(w, "  region:    %s\n", meta.Region)
 	fprintf(w, "  cluster:   %s\n", meta.Cluster)
-	fprintln(w, "This deletes the cloud cluster and cannot be undone.")
+	// Named only when the instance is recorded as owning one, so the summary
+	// never promises to destroy something that was never created. Release still
+	// attempts the (idempotent) delete either way.
+	if meta.Registry != nil && meta.Registry.Repository != "" {
+		fprintf(w, "  registry:  %s (and every image in it)\n", meta.Registry.Repository)
+	}
+	fprintln(w, "This deletes the cloud cluster and the instance's images, and cannot be undone.")
 }
 
 type releaseResult struct {
 	Name     string `json:"name"`
 	Provider string `json:"provider"`
 	Cluster  string `json:"cluster"`
+	Registry string `json:"registry,omitempty"`
 	Status   string `json:"status"`
 }
 
 func (r releaseResult) Human(w io.Writer) error {
-	_, err := fmt.Fprintf(w,
-		"✓ instance %q released\n  provider:    %s\n  cluster:     %s (deleted)\n  state:       removed\n",
-		r.Name, r.Provider, r.Cluster)
-	return err
+	fprintf(w, "✓ instance %q released\n", r.Name)
+	fprintf(w, "  provider:    %s\n", r.Provider)
+	fprintf(w, "  cluster:     %s (deleted)\n", r.Cluster)
+	if r.Registry != "" {
+		fprintf(w, "  registry:    %s (deleted)\n", r.Registry)
+	}
+	fprintln(w, "  state:       removed")
+	return nil
 }

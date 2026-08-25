@@ -25,6 +25,11 @@ func recordInstance(t *testing.T, dir config.Dir, name, provider string) {
 		Region:   "us-central1",
 		Cluster:  "farcast-" + name,
 		Status:   config.InstanceRunning,
+		Registry: &config.Registry{
+			Prefix:     "us-central1-docker.pkg.dev/proj-1/farcast-" + name,
+			Repository: "farcast-" + name,
+			Location:   "us-central1",
+		},
 	}
 	if err := dir.SaveInstanceMetadata(name, meta); err != nil {
 		t.Fatalf("SaveInstanceMetadata: %v", err)
@@ -52,6 +57,102 @@ func TestReleaseSuccess(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "released") {
 		t.Errorf("result missing 'released':\n%s", out.String())
+	}
+}
+
+func TestReleaseDeletesTheInstanceRegistry(t *testing.T) {
+	f := &fakeProvider{}
+	prov := registerFake(t, f)
+	env, out, _, dir := newInstallEnv(t, output.ModeHuman)
+	recordInstance(t, dir, "prod", prov)
+
+	cmd := &releaseCommand{assumeYes: true}
+	if err := cmd.Run(context.Background(), env, []string{"prod"}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(f.regDeleted) != 1 {
+		t.Fatalf("DeleteRegistry called %d times, want 1", len(f.regDeleted))
+	}
+	if got := f.regDeleted[0]; got.Name != "farcast-prod" || got.Location != "us-central1" {
+		t.Errorf("deleted registry ref = %+v, want the recorded repository", got)
+	}
+	if exists, _ := dir.InstanceExists("prod"); exists {
+		t.Error("local state should be removed after a successful release")
+	}
+	if !strings.Contains(out.String(), "registry:") || !strings.Contains(out.String(), "farcast-prod (deleted)") {
+		t.Errorf("result missing the deleted registry:\n%s", out.String())
+	}
+}
+
+func TestReleaseRegistryFailureKeepsState(t *testing.T) {
+	f := &fakeProvider{regDeleteErr: errors.New("api error")}
+	prov := registerFake(t, f)
+	env, _, _, dir := newInstallEnv(t, output.ModeHuman)
+	recordInstance(t, dir, "stuck", prov)
+
+	cmd := &releaseCommand{assumeYes: true}
+	err := cmd.Run(context.Background(), env, []string{"stuck"})
+	if err == nil || !strings.Contains(err.Error(), "re-run") {
+		t.Fatalf("err = %v, want a registry failure with a retry hint", err)
+	}
+	if !strings.Contains(err.Error(), "farcast-stuck") {
+		t.Errorf("err = %v, should name the registry it could not destroy", err)
+	}
+	// The cluster went first and the record is kept, so a re-run converges
+	// (both deletes are idempotent).
+	if f.deleteCalls != 1 {
+		t.Errorf("DeleteCluster called %d times, want 1", f.deleteCalls)
+	}
+	if exists, _ := dir.InstanceExists("stuck"); !exists {
+		t.Fatal("local state must be kept when a cloud delete fails")
+	}
+	meta, lerr := dir.LoadInstanceMetadata("stuck")
+	if lerr != nil {
+		t.Fatalf("state should be readable after a failed delete: %v", lerr)
+	}
+	if meta.Status != config.InstanceDeleting {
+		t.Errorf("status = %q, want deleting", meta.Status)
+	}
+}
+
+func TestReleaseWithoutRegistryCapability(t *testing.T) {
+	f := &fakeProvider{}
+	prov := registerProvider(t, clusterOnlyProvider{f})
+	env, out, _, dir := newInstallEnv(t, output.ModeHuman)
+	recordInstance(t, dir, "prod", prov)
+
+	cmd := &releaseCommand{assumeYes: true}
+	if err := cmd.Run(context.Background(), env, []string{"prod"}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(f.regDeleted) != 0 {
+		t.Error("a provider without the capability must not be asked to delete a registry")
+	}
+	if exists, _ := dir.InstanceExists("prod"); exists {
+		t.Error("local state should still be removed")
+	}
+	if strings.Contains(out.String(), "registry:") {
+		t.Errorf("nothing to report when there is no registry:\n%s", out.String())
+	}
+}
+
+func TestReleaseSummaryNamesTheRegistry(t *testing.T) {
+	meta := &config.InstanceMetadata{
+		Name:     "prod",
+		Cluster:  "farcast-prod",
+		Registry: &config.Registry{Repository: "farcast-prod"},
+	}
+	var buf strings.Builder
+	printReleaseSummary(&buf, meta)
+	if !strings.Contains(buf.String(), "registry:  farcast-prod") {
+		t.Errorf("the destruction summary must name the registry:\n%s", buf.String())
+	}
+
+	// An instance whose record predates the registry promises nothing.
+	buf.Reset()
+	printReleaseSummary(&buf, &config.InstanceMetadata{Name: "old", Cluster: "farcast-old"})
+	if strings.Contains(buf.String(), "registry:") {
+		t.Errorf("no registry line without a recorded registry:\n%s", buf.String())
 	}
 }
 

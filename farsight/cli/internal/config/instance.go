@@ -57,6 +57,28 @@ type Carrier struct {
 	ServerName string `yaml:"server_name"` // pinned TLS server identity (SAN)
 }
 
+// Registry records the instance-owned container image registry (ADR 0007) and
+// what was last deployed out of it. The instance owning its registry is what
+// keeps a third party out of the runtime path: every image the cluster runs was
+// built on the operator's machine, from Git, and pushed here.
+//
+// Nothing secret lives in this record — the push credential is minted in-process
+// per command and never stored (that is the whole point of ADR 0007 decision 5).
+// Prefix is what every image reference is derived from; Puller is kept so the
+// grant that lets the cluster pull is auditable from local state alone, without
+// opening a cloud console.
+type Registry struct {
+	Prefix     string `yaml:"prefix,omitempty"`     // image-path prefix, e.g. us-central1-docker.pkg.dev/proj/farcast-prod
+	Repository string `yaml:"repository,omitempty"` // the cloud repository's own name, e.g. farcast-prod
+	Location   string `yaml:"location,omitempty"`   // region the repository lives in
+	Puller     string `yaml:"puller,omitempty"`     // principal granted pull access on it
+
+	// FatLineDigest is the digest-pinned reference (host/repo@sha256:…) the
+	// cluster was last told to run. Deploys pin digests rather than tags, so
+	// this records exactly what is running — a tag could be rewritten under it.
+	FatLineDigest string `yaml:"fatline_digest,omitempty"`
+}
+
 // InstanceMetadata is the non-secret record for an installed instance.
 type InstanceMetadata struct {
 	Name      string    `yaml:"name"`
@@ -75,6 +97,12 @@ type InstanceMetadata struct {
 	// (and, with Carrier set, provisioned its billable point of presence).
 	FatLineDeployed bool     `yaml:"fatline_deployed,omitempty"`
 	Carrier         *Carrier `yaml:"carrier,omitempty"`
+
+	// Registry is the instance's own image registry (ADR 0007). It is a pointer
+	// so metadata written before instances had one still loads — such an
+	// instance converges on its next `farcast connect`, which re-ensures the
+	// registry and fills this in.
+	Registry *Registry `yaml:"registry,omitempty"`
 }
 
 // MTLSMaterial is a per-instance data-plane mTLS identity, PEM-encoded. It is a

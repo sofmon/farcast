@@ -9,14 +9,15 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
 	"github.com/sofmon/farcast/planck"
 )
 
-// fakeProvider is a programmable planck.Provider for exercising install without
-// a cloud.
+// fakeProvider is a programmable planck.Provider — and planck.RegistryProvider
+// — for exercising install/connect/release without a cloud.
 type fakeProvider struct {
 	validateErr error
 	created     *planck.ClusterSpec
@@ -26,6 +27,15 @@ type fakeProvider struct {
 	statusErr   error
 	deleteErr   error
 	deleteCalls int
+
+	// Instance registry (ADR 0007).
+	ensured      []planck.RegistrySpec
+	registry     *planck.Registry // overrides the derived default
+	ensureErr    error
+	regDeleted   []planck.RegistryRef
+	regDeleteErr error
+	token        planck.RegistryToken
+	tokenErr     error
 }
 
 func (*fakeProvider) Name() string                     { return "fake" }
@@ -62,10 +72,57 @@ func (f *fakeProvider) ClusterStatus(context.Context, planck.ClusterRef) (planck
 	return f.status, nil
 }
 
+func (f *fakeProvider) EnsureRegistry(_ context.Context, spec planck.RegistrySpec) (*planck.Registry, error) {
+	f.ensured = append(f.ensured, spec)
+	if f.ensureErr != nil {
+		return nil, f.ensureErr
+	}
+	if f.registry != nil {
+		return f.registry, nil
+	}
+	return derivedRegistry(spec), nil
+}
+
+func (f *fakeProvider) DeleteRegistry(_ context.Context, ref planck.RegistryRef) error {
+	f.regDeleted = append(f.regDeleted, ref)
+	return f.regDeleteErr
+}
+
+func (f *fakeProvider) RegistryToken(context.Context) (planck.RegistryToken, error) {
+	if f.tokenErr != nil {
+		return planck.RegistryToken{}, f.tokenErr
+	}
+	if f.token.Username != "" {
+		return f.token, nil
+	}
+	return planck.RegistryToken{Username: "oauth2accesstoken", Password: "tok", Expiry: time.Unix(1, 0).UTC()}, nil
+}
+
+// derivedRegistry mirrors what the GKE adapter returns: the repository named
+// after the instance, in the instance's region, with a repo-scoped puller.
+func derivedRegistry(spec planck.RegistrySpec) *planck.Registry {
+	repo := "farcast-" + spec.Name
+	return &planck.Registry{
+		Ref:    planck.RegistryRef{Name: repo, Location: spec.Location},
+		Prefix: spec.Location + "-docker.pkg.dev/proj-1/" + repo,
+		Puller: "serviceAccount:1234-compute@developer.gserviceaccount.com",
+	}
+}
+
+// clusterOnlyProvider hides the registry capability: embedding the interface
+// promotes only planck.Provider's methods, so the RegistryProvider type
+// assertion fails — a cloud that can run a cluster but not host images.
+type clusterOnlyProvider struct{ planck.Provider }
+
 func registerFake(t *testing.T, f *fakeProvider) string {
 	t.Helper()
+	return registerProvider(t, f)
+}
+
+func registerProvider(t *testing.T, p planck.Provider) string {
+	t.Helper()
 	name := "fake-" + strings.ReplaceAll(t.Name(), "/", "-")
-	planck.Register(name, func(planck.Config) (planck.Provider, error) { return f, nil })
+	planck.Register(name, func(planck.Config) (planck.Provider, error) { return p, nil })
 	return name
 }
 
@@ -245,6 +302,94 @@ func TestInstallRejectsBadName(t *testing.T) {
 	err := cmd.Run(context.Background(), env, nil)
 	if _, ok := errors.AsType[*usageError](err); !ok {
 		t.Fatalf("err = %v, want usageError for a bad name", err)
+	}
+}
+
+func TestInstallEnsuresTheInstanceRegistry(t *testing.T) {
+	f := &fakeProvider{}
+	prov := registerFake(t, f)
+	env, out, _, dir := newInstallEnv(t, output.ModeHuman)
+	cmd := &installCommand{name: "prod", provider: prov, project: "proj-1", region: "us-central1", costLimit: 50, assumeYes: true}
+
+	if err := cmd.Run(context.Background(), env, nil); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(f.ensured) != 1 {
+		t.Fatalf("EnsureRegistry called %d times, want 1", len(f.ensured))
+	}
+	spec := f.ensured[0]
+	if spec.Name != "prod" || spec.Location != "us-central1" || spec.Cluster.Name != "farcast-prod" {
+		t.Errorf("registry spec = %+v, want the instance name, region and cluster", spec)
+	}
+	if spec.Labels["farcast-instance"] != "prod" {
+		t.Errorf("registry labels = %v, want the instance labels", spec.Labels)
+	}
+	meta, err := dir.LoadInstanceMetadata("prod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Registry == nil {
+		t.Fatal("the registry was not recorded in metadata")
+	}
+	if meta.Registry.Prefix != "us-central1-docker.pkg.dev/proj-1/farcast-prod" ||
+		meta.Registry.Repository != "farcast-prod" ||
+		meta.Registry.Location != "us-central1" ||
+		meta.Registry.Puller == "" {
+		t.Errorf("recorded registry = %+v", meta.Registry)
+	}
+	// Free, so it is stated plainly rather than gated.
+	if !strings.Contains(out.String(), "registry:") || !strings.Contains(out.String(), "farcast-prod") {
+		t.Errorf("result missing the registry line:\n%s", out.String())
+	}
+}
+
+func TestInstallRegistryFailureLeavesTheInstanceUsable(t *testing.T) {
+	f := &fakeProvider{ensureErr: errors.New("permission denied on artifactregistry.repositories.create")}
+	prov := registerFake(t, f)
+	env, _, errb, dir := newInstallEnv(t, output.ModeHuman)
+	cmd := &installCommand{name: "prod", provider: prov, project: "proj-1", costLimit: 10, assumeYes: true}
+
+	// The cluster is already created and billable, so a registry failure must
+	// not abort the install.
+	if err := cmd.Run(context.Background(), env, nil); err != nil {
+		t.Fatalf("Run: %v, want the install to succeed without a registry", err)
+	}
+	meta, err := dir.LoadInstanceMetadata("prod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Status != config.InstanceRunning {
+		t.Errorf("status = %q, want running", meta.Status)
+	}
+	if meta.Registry != nil {
+		t.Errorf("no registry should be recorded when the ensure failed: %+v", meta.Registry)
+	}
+	if !strings.Contains(errb.String(), "Warning") || !strings.Contains(errb.String(), "connect") {
+		t.Errorf("expected a warning naming the connect retry:\n%s", errb.String())
+	}
+}
+
+func TestInstallWithoutRegistryCapabilitySkipsSilently(t *testing.T) {
+	f := &fakeProvider{}
+	prov := registerProvider(t, clusterOnlyProvider{f})
+	env, out, errb, dir := newInstallEnv(t, output.ModeHuman)
+	cmd := &installCommand{name: "prod", provider: prov, project: "proj-1", costLimit: 10, assumeYes: true}
+
+	if err := cmd.Run(context.Background(), env, nil); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(f.ensured) != 0 {
+		t.Error("a provider without the capability must not be asked for a registry")
+	}
+	if strings.Contains(errb.String(), "Warning") {
+		t.Errorf("an unsupported registry must be skipped in silence:\n%s", errb.String())
+	}
+	if strings.Contains(out.String(), "registry:") {
+		t.Errorf("no registry line without a registry:\n%s", out.String())
+	}
+	meta, _ := dir.LoadInstanceMetadata("prod")
+	if meta.Registry != nil {
+		t.Errorf("registry recorded for a provider that has none: %+v", meta.Registry)
 	}
 }
 

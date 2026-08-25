@@ -68,6 +68,61 @@ func TestInstanceMetadataRoundTrip(t *testing.T) {
 	}
 }
 
+func TestInstanceRegistryRoundTrip(t *testing.T) {
+	d := testDir(t)
+	if err := d.CreateInstance("prod"); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+	in := &InstanceMetadata{
+		Name:    "prod",
+		Cluster: "farcast-prod",
+		Status:  InstanceRunning,
+		Registry: &Registry{
+			Prefix:        "us-central1-docker.pkg.dev/proj-1/farcast-prod",
+			Repository:    "farcast-prod",
+			Location:      "us-central1",
+			Puller:        "serviceAccount:1234-compute@developer.gserviceaccount.com",
+			FatLineDigest: "us-central1-docker.pkg.dev/proj-1/farcast-prod/system/fatline@sha256:abc",
+		},
+	}
+	if err := d.SaveInstanceMetadata("prod", in); err != nil {
+		t.Fatalf("SaveInstanceMetadata: %v", err)
+	}
+	out, err := d.LoadInstanceMetadata("prod")
+	if err != nil {
+		t.Fatalf("LoadInstanceMetadata: %v", err)
+	}
+	if out.Registry == nil {
+		t.Fatal("registry lost in the round trip")
+	}
+	if *out.Registry != *in.Registry {
+		t.Errorf("registry round-trip mismatch:\n got %+v\nwant %+v", out.Registry, in.Registry)
+	}
+}
+
+// Metadata written before instances owned a registry must still load — such an
+// instance converges on its next connect rather than becoming unreadable.
+func TestLoadInstanceMetadataWithoutRegistry(t *testing.T) {
+	d := testDir(t)
+	if err := d.CreateInstance("old"); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+	legacy := "name: old\nprovider: gke\nregion: us-central1\ncluster: farcast-old\nstatus: running\n"
+	if err := d.writeInstanceFile("old", metadataFile, []byte(legacy)); err != nil {
+		t.Fatal(err)
+	}
+	out, err := d.LoadInstanceMetadata("old")
+	if err != nil {
+		t.Fatalf("LoadInstanceMetadata: %v", err)
+	}
+	if out.Registry != nil {
+		t.Errorf("registry = %+v, want nil for pre-registry metadata", out.Registry)
+	}
+	if out.Cluster != "farcast-old" {
+		t.Errorf("cluster = %q", out.Cluster)
+	}
+}
+
 func TestSaveInstanceSecretsAre0600(t *testing.T) {
 	d := testDir(t)
 	if err := d.CreateInstance("prod"); err != nil {

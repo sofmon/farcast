@@ -2,7 +2,10 @@ module github.com/sofmon/farcast
 
 go 1.26
 
+toolchain go1.27.0
+
 require (
+	cloud.google.com/go/auth v0.18.2
 	cloud.google.com/go/container v1.52.0
 	github.com/goccy/go-yaml v1.19.2
 	google.golang.org/api v0.274.0
@@ -10,7 +13,6 @@ require (
 )
 
 require (
-	cloud.google.com/go/auth v0.18.2 // indirect
 	cloud.google.com/go/auth/oauth2adapt v0.2.8 // indirect
 	cloud.google.com/go/compute/metadata v0.9.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect

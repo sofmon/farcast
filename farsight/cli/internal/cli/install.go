@@ -169,7 +169,7 @@ func (c *installCommand) Run(ctx context.Context, env *Env, args []string) error
 	cluster, err := p.CreateCluster(ctx, planck.ClusterSpec{
 		Name:     clusterName,
 		Location: region,
-		Labels:   map[string]string{"managed-by": "farcast", "farcast-instance": c.name},
+		Labels:   instanceLabels(c.name),
 	})
 	if err != nil {
 		meta.Status = config.InstanceError
@@ -185,6 +185,12 @@ func (c *installCommand) Run(ctx context.Context, env *Env, args []string) error
 	if err := env.ConfigDir.SaveInstanceKubeconfig(c.name, cluster.Kubeconfig); err != nil {
 		return err
 	}
+
+	// The instance's own image registry (ADR 0007). It is instance identity,
+	// like the cluster and the CA, and it must exist before the first image
+	// push — which precedes the first connect. The result lands in meta and is
+	// persisted by the finalizing save below.
+	c.ensureRegistry(ctx, env, p, meta)
 
 	healthy := healthCheck(ctx, p, cluster)
 	if healthy {
@@ -210,10 +216,41 @@ func (c *installCommand) Run(ctx context.Context, env *Env, args []string) error
 		Region:     meta.Region,
 		Cluster:    meta.Cluster,
 		Endpoint:   meta.Endpoint,
+		Registry:   registryPrefix(meta),
 		Status:     meta.Status,
 		CostLimit:  costLimitResult(meta.CostLimit),
 		ConfigPath: env.ConfigDir.InstancePath(c.name),
 	})
+}
+
+// ensureRegistry creates the instance's image registry and grants its cluster
+// pull access on it (ADR 0007), recording the result in meta.
+//
+// It reports rather than returns failure, on purpose. The cluster above is
+// already created and already billable, so aborting the install here would
+// strand it — the exact outcome the record-before-create ordering exists to
+// prevent. An instance without a registry is still a usable instance: the next
+// `farcast connect` re-ensures it. A provider that cannot host images is skipped
+// in silence; it is still a perfectly good provider for a cluster.
+func (c *installCommand) ensureRegistry(ctx context.Context, env *Env, p planck.Provider, meta *config.InstanceMetadata) {
+	rp, ok := p.(planck.RegistryProvider)
+	if !ok {
+		return
+	}
+	reg, err := rp.EnsureRegistry(ctx, registrySpec(meta))
+	if err != nil {
+		fprintf(env.Err, "Warning: the instance's image registry could not be created: %v\n", err)
+		fprintf(env.Err, "The instance is usable; 'farcast connect %s' will try again.\n", meta.Name)
+		return
+	}
+	recordRegistry(meta, reg)
+}
+
+// instanceLabels are the cloud resource labels every resource an instance owns
+// carries, so one instance reads as one recognisable group in a console and in
+// a bill — which is what makes per-instance cost attribution possible at all.
+func instanceLabels(name string) map[string]string {
+	return map[string]string{"managed-by": "farcast", "farcast-instance": name}
 }
 
 // resolveInputs fills required values from flags, prompting when interactive
@@ -345,6 +382,7 @@ type installResult struct {
 	Region     string          `json:"region"`
 	Cluster    string          `json:"cluster"`
 	Endpoint   string          `json:"endpoint"`
+	Registry   string          `json:"registry,omitempty"`
 	Status     string          `json:"status"`
 	CostLimit  costLimitResult `json:"cost_limit"`
 	ConfigPath string          `json:"config_path"`
@@ -357,11 +395,19 @@ type costLimitResult struct {
 }
 
 func (r installResult) Human(w io.Writer) error {
-	_, err := fmt.Fprintf(w,
-		"✓ instance %q installed\n"+
-			"  provider:    %s\n  region:      %s\n  cluster:     %s\n  endpoint:    %s\n"+
-			"  cost limit:  %s %.2f / %s\n  state:       %s\n  config:      %s\n",
-		r.Name, r.Provider, r.Region, r.Cluster, r.Endpoint,
-		r.CostLimit.Currency, r.CostLimit.Amount, r.CostLimit.Period, r.Status, r.ConfigPath)
-	return err
+	fprintf(w, "✓ instance %q installed\n", r.Name)
+	fprintf(w, "  provider:    %s\n", r.Provider)
+	fprintf(w, "  region:      %s\n", r.Region)
+	fprintf(w, "  cluster:     %s\n", r.Cluster)
+	fprintf(w, "  endpoint:    %s\n", r.Endpoint)
+	if r.Registry != "" {
+		// Stated plainly, with no confirmation gate: image storage at this
+		// scale is effectively free (ADR 0007 decision 8), and the operator
+		// should still see every cloud resource their instance owns.
+		fprintf(w, "  registry:    %s (instance images, %s/mo)\n", r.Registry, registryMonthlyCost)
+	}
+	fprintf(w, "  cost limit:  %s %.2f / %s\n", r.CostLimit.Currency, r.CostLimit.Amount, r.CostLimit.Period)
+	fprintf(w, "  state:       %s\n", r.Status)
+	fprintf(w, "  config:      %s\n", r.ConfigPath)
+	return nil
 }
