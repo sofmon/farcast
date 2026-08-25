@@ -46,10 +46,14 @@ service-account key you create below.
 
 ---
 
-## 1. Enable the GKE API
+## 1. Enable the APIs
+
+GKE for the cluster; Artifact Registry for the instance's own image registry and
+Cloud Resource Manager to look up the project number that identifies the node
+service account ([ADR 0007](../adr/0007-instance-owned-image-registry.md)).
 
 ```bash
-gcloud services enable container.googleapis.com --project "$PROJECT_ID"
+gcloud services enable container.googleapis.com artifactregistry.googleapis.com cloudresourcemanager.googleapis.com --project "$PROJECT_ID"
 ```
 
 ## 2. Create the installer service account + key
@@ -68,13 +72,22 @@ gcloud projects add-iam-policy-binding "$PROJECT_ID" \
 gcloud projects add-iam-policy-binding "$PROJECT_ID" \
   --member "serviceAccount:$SA" --role "roles/iam.serviceAccountUser"
 
+# Own the instance's image registry (create/delete it, and grant the cluster's
+# nodes pull access ON THAT REPOSITORY — never a project-wide role):
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member "serviceAccount:$SA" --role "roles/artifactregistry.admin"
+
 # Download a key (this is the credential FarCast will use and store):
 gcloud iam service-accounts keys create "$KEY" --iam-account "$SA"
 chmod 600 "$KEY"
 ```
 
-> `roles/container.admin` + `roles/iam.serviceAccountUser` is the minimal pair for
-> create/delete. If your SA is already Owner/Editor you can skip the bindings.
+> `roles/container.admin` + `roles/iam.serviceAccountUser` are the minimal pair for
+> cluster create/delete; `roles/artifactregistry.admin` is the narrowest predefined
+> role that can create a repository (`repoAdmin` cannot) and it also carries the
+> repository-level `setIamPolicy` the node-SA pull grant needs — so the stored
+> credential never holds project-IAM power. If your SA is already Owner/Editor you
+> can skip the bindings.
 
 ## 3. Build the binaries
 

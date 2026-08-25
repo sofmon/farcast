@@ -50,6 +50,7 @@ farcast/
 │   │       └── main.go
 │   ├── planck.go                   ← Package doc & provider registry
 │   ├── types.go                    ← Provider interface & lifecycle types
+│   ├── registry.go                 ← Optional instance-registry capability
 │   ├── providers/                  ← Bundled adapter registration
 │   └── internal/
 │       ├── providers/              ← Cloud adapters (GKE implemented; EKS, AKS planned)
@@ -119,6 +120,8 @@ farcast/
 │       │   └── farcast/
 │       │       └── main.go
 │       └── internal/
+│           ├── image/              ← Image build & push, no container engine
+│           └── oci/                ← Stdlib OCI distribution client
 │
 ├── sdk/                            ← FarCast libraries (syscall-like APIs)
 │   ├── README.md
@@ -335,17 +338,17 @@ Each module folder contains its own `README.md` with:
 
 ## Status
 
-> This project is in early development. Phases 0–2 are implemented. Phase 0 (foundation): the manifest parser and the Go SDK (core interfaces + logging). Phase 1 (provisioning): the FarSight CLI with `install`/`release`, driving Planck's GKE Autopilot provider with a private control plane. Phase 2 (connection): FatLine's core proxy (mTLS tunnel, deny-by-default egress), Shrike's policy engine, and `farcast connect`. The remaining modules are in specification.
+> This project is in early development. Phases 0–2 are implemented. Phase 0 (foundation): the manifest parser and the Go SDK (core interfaces + logging). Phase 1 (provisioning): the FarSight CLI with `install`/`release`, driving Planck's GKE Autopilot provider with a private control plane — and giving every instance its own container image registry, created at install and deleted at release. Phase 2 (connection): FatLine's core proxy (mTLS tunnel, deny-by-default egress), Shrike's policy engine, and `farcast connect`, which builds FatLine's image from a local checkout with the Go toolchain, pushes it to that registry, and deploys it pinned by digest — no container engine anywhere. The remaining modules are in specification.
 
 | Module | Spec | Implementation |
 |---|---|---|
 | TechnoCore | 🔲 Draft | 🔲 Not started |
-| Planck | 🟡 In progress | 🟡 GKE Autopilot provider (create/destroy) |
+| Planck | 🟡 In progress | 🟡 GKE Autopilot provider (create/destroy), instance image registry |
 | FatLine | 🟡 In progress | 🟡 Core proxy: mTLS tunnel, deny-by-default egress |
 | DataSphere | 🔲 Draft | 🔲 Not started |
 | Shrike | 🟡 In progress | 🟡 Policy engine |
 | AllThing | 🔲 Draft | 🔲 Not started |
-| FarSight | 🟡 In progress | 🟡 CLI: `install`, `release`, `connect` |
+| FarSight | 🟡 In progress | 🟡 CLI: `install`, `release`, `connect`; engine-less image build |
 | SDK | 🟡 In progress | 🟡 Go: logging live, interfaces stubbed |
 | Manifest Spec | ✅ Complete | ✅ Parser + tests |
 

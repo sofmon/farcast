@@ -22,10 +22,11 @@ getting a public IP, and the mTLS handshake across the open internet.
 
 **Cost & time.** Part A: free, ~5 min. Part B: the instance itself (empty
 Autopilot) is cheap, but the **load balancer bills ~$18/mo while it exists** —
-budget the test to a single session and run Step B6 to delete it. Time: ~5 min to
-build/push the image, ~3–5 min for `connect`, ~3–5 min for the `release` teardown
-to finish (the command itself returns once the deletion is accepted; the cluster
-shows `STOPPING` while it completes).
+budget the test to a single session and run Step B6 to delete it. The instance's
+image registry is storage-only and rounds to $0. Time: ~3–5 min for `connect`
+(including the image build and push it performs itself), ~3–5 min for the
+`release` teardown to finish (the command itself returns once the deletion is
+accepted; the cluster shows `STOPPING` while it completes).
 
 ---
 
@@ -174,38 +175,38 @@ echo "exit=$?"
   kubectl version --client && gke-gcloud-auth-plugin --version
   ```
 
-## B1. Build & push a FatLine image
+## B1. Have a checkout and a Go toolchain (no image step)
 
-`connect` deploys a FatLine container; you must supply its image. There is no
-published image yet, so build the one the repo ships: [`fatline/Containerfile`](../../fatline/Containerfile)
-(distroless, non-root uid 65532 to match the deploy's security context). **Build
-from the repo root** — the context needs the root `go.mod` + `vendor/`.
-
-Push it to Artifact Registry in the **same project** (so the Autopilot node SA can
-pull it without extra grants):
+There is nothing to build by hand and no container engine to install. `connect`
+compiles FatLine from *this* checkout with the local Go toolchain and pushes it
+into the instance's own registry through an in-process OCI client
+([ADR 0007](../adr/0007-instance-owned-image-registry.md)). All you need is what
+you already have to build `./bin/farcast`:
 
 ```bash
-gcloud artifacts repositories create farcast \
-  --repository-format=docker --location="$REGION" --project "$PROJECT_ID" 2>/dev/null || true
-gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
-
-export FATLINE_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/farcast/fatline:0.1.0"
-docker build -f fatline/Containerfile -t "$FATLINE_IMAGE" .
-docker push "$FATLINE_IMAGE"
+go version          # the toolchain connect will compile with
+git -C . rev-parse --show-toplevel   # the checkout it will build from
 ```
 
-✅ Expect a pushed image. (If your nodes can't pull it in Step B2, grant the node
-SA `roles/artifactregistry.reader` — see Troubleshooting.)
+The registry itself is created by `farcast install` (and re-ensured by
+`connect`) as `farcast-$INSTANCE` in `$REGION`, inside your own project — the
+cluster pulls only from it, and `release` deletes it. Confirm the installer SA
+carries `roles/artifactregistry.admin` and that `artifactregistry.googleapis.com`
++ `cloudresourcemanager.googleapis.com` are enabled (Phase 1 runbook steps 1–2);
+without them `install`/`connect` will say so plainly.
 
 ## B2. Connect — bootstrap FatLine + provision the carrier
 
 ```bash
-./bin/farcast connect "$INSTANCE" --fatline-image "$FATLINE_IMAGE" --yes
+./bin/farcast connect "$INSTANCE" --yes
 ```
 
-This mints the per-instance mTLS identity (the **CA key stays local**), applies
-the FatLine workload via kubectl, waits for the load balancer's public IP, then
-dials the tunnel. It **blocks a few minutes** while the LB is assigned. ✅ Expect:
+This mints the per-instance mTLS identity (the **CA key stays local**), ensures
+the instance's registry, finds no FatLine image there yet and so compiles one
+from this checkout and pushes it (`--yes` covers that confirmation too), applies
+the FatLine workload via kubectl — pinned to the digest it just pushed — waits
+for the load balancer's public IP, then dials the tunnel. It **blocks a few
+minutes** while the LB is assigned. ✅ Expect:
 
 ```
 ✓ connected to "validate"
@@ -213,7 +214,9 @@ dials the tunnel. It **blocks a few minutes** while the LB is assigned. ✅ Expe
   identity:    farcast://validate/operator
   active:      0 streams
   allowlist:   0 hosts (deny-by-default)
-  cost:        load balancer ~$18/mo (limit: USD 50/monthly)
+  registry:    us-central1-docker.pkg.dev/<project>/farcast-validate
+  image:       …/system/fatline@sha256:…        ← a digest, not a tag
+  cost:        load balancer ~$18/mo + registry ~$0/mo (limit: USD 50/monthly)
 ```
 
 > The allowlist is **empty by design** in 2.3 — `connect` deploys FatLine with no
@@ -232,6 +235,17 @@ kubectl get secret fatline-mtls -n farcast-system -o jsonpath='{.data}' | tr ','
 **LoadBalancer** with an external IP, and the `fatline-mtls` Secret carrying
 **`ca.crt`, `server.crt`, `server.key`** — and crucially **no `ca.key`** (the CA
 private key never leaves your machine).
+
+Confirm the cluster runs a **digest-pinned image from the instance's own
+registry** — no third-party feed, and a reference nobody can re-point:
+
+```bash
+kubectl get deploy fatline -n farcast-system -o jsonpath='{.spec.template.spec.containers[0].image}'; echo
+gcloud artifacts docker images list "${REGION}-docker.pkg.dev/${PROJECT_ID}/farcast-${INSTANCE}" --project "$PROJECT_ID"
+```
+
+✅ Expect the Deployment's image to be `…/farcast-$INSTANCE/system/fatline@sha256:…`
+(a digest, not a tag), and the registry listing to show that image.
 
 Confirm the CA key is local-only:
 
@@ -294,9 +308,11 @@ until both checks come back empty):
 ```bash
 gcloud compute forwarding-rules list --project "$PROJECT_ID"   # expect: none from this instance
 gcloud container clusters list --project "$PROJECT_ID"          # STOPPING at first, then gone
+gcloud artifacts repositories list --project "$PROJECT_ID"      # 'farcast-validate' gone
 ```
 
-✅ Expect: no cluster, no forwarding rules → no lingering LB charge.
+✅ Expect: no cluster, no forwarding rules, no registry → nothing of this instance
+left billing.
 
 ---
 
@@ -306,7 +322,9 @@ gcloud container clusters list --project "$PROJECT_ID"          # STOPPING at fi
 |---|---|
 | `kubectl not found on PATH` | Install `kubectl` + `gke-gcloud-auth-plugin` (B0). The CLI shells to kubectl by design ([ADR 0006](../adr/0006-connect-bootstrap-kubectl.md)). |
 | `connect` prompts for cost / refuses non-interactively | The LB is billable. Pass `--yes` (required when not a TTY or in `--output json`). |
-| Deployment stuck `ImagePullBackOff` | The node SA can't pull `$FATLINE_IMAGE`. Grant it: `gcloud projects add-iam-policy-binding "$PROJECT_ID" --member "serviceAccount:$(gcloud iam service-accounts list --filter='displayName:Compute Engine default' --format='value(email)' --project "$PROJECT_ID")" --role roles/artifactregistry.reader`, or push to a public registry. |
+| Deployment stuck `ImagePullBackOff` | The node SA can't pull from the instance registry. `connect` grants `roles/artifactregistry.reader` on that one repository automatically, so this means the grant did not happen: check the installer SA has `roles/artifactregistry.admin` (Phase 1 step 2) and re-run `connect` — the ensure is idempotent. Inspect with `gcloud artifacts repositories get-iam-policy "farcast-$INSTANCE" --location "$REGION" --project "$PROJECT_ID"`. |
+| `connect` says the image is not in the registry and there is no checkout | It builds FatLine from a farcast checkout; run it from one, or pass `--source <dir>`. Non-interactively it also needs `--yes` to build. |
+| `ensure the image registry … permission denied` | The stored installer credential predates [ADR 0007](../adr/0007-instance-owned-image-registry.md). Add `roles/artifactregistry.admin` (Phase 1 step 2). A *reconnect* only warns and continues; a first connect needs it. |
 | `FatLine rollout` times out | `kubectl get pods -n farcast-system` then `kubectl describe`/`logs`. Usually the image (above) or Autopilot scheduling (give it a minute). |
 | Load balancer IP never assigned | LB quota/region capacity; `kubectl describe svc fatline -n farcast-system` for events. Re-run `connect` — it is idempotent (won't re-prompt cost once `fatline_deployed` is recorded). |
 | Positive curl in B4 fails TLS | Wrong server name (must be `$INSTANCE.fatline.farcast`) or you skipped `--connect-to`. The cert's SAN is the synthetic name, pinned independently of the IP. |
@@ -320,11 +338,13 @@ gcloud container clusters list --project "$PROJECT_ID"          # STOPPING at fi
 - [ ] `connect`'s no-cloud surface returns the right exit codes.
 
 **Part B (end-to-end, billable):**
+- [ ] `farcast install` creates the instance's registry (`farcast-<instance>`) and `connect` finds no image, builds one from the checkout with no container engine, and pushes it there.
+- [ ] The deployed Deployment image is a **digest** in the instance's own registry — no `ghcr.io`, no third-party feed.
 - [ ] `farcast connect` reports `connected` with a public NLB endpoint.
 - [ ] kubectl shows the FatLine Deployment/Service/Secret; the Secret has **no `ca.key`**; `ca.key` exists only locally at `0600`.
 - [ ] mTLS boundary: the operator cert gets status JSON; no-cert is rejected at the handshake.
 - [ ] `connect --status` reconnects idempotently (no re-deploy, no cost prompt).
-- [ ] `release` removes the cluster and leaves **no forwarding rule** (no lingering LB charge).
+- [ ] `release` removes the cluster and the registry, leaving **no forwarding rule** (no lingering LB charge).
 
 If Part A passes you've validated the security boundary itself; if Part B passes
 the operator can reach a real instance through it — the Phase 2 deliverable.

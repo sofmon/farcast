@@ -64,7 +64,7 @@ Build the CLI framework. No commands work yet, but the structure is in place.
 
 ### 1.2 Planck — first cloud provider adapter
 
-**Status: ✅ Complete** — GCP first: a GKE Autopilot adapter behind the provider interface in [`planck/`](planck/README.md) — credential validation, create with readiness wait, status, destroy — provisioning a private control plane per [ADR 0003](docs/adr/0003-gke-autopilot.md) and [ADR 0004](docs/adr/0004-private-control-plane.md).
+**Status: ✅ Complete** — GCP first: a GKE Autopilot adapter behind the provider interface in [`planck/`](planck/README.md) — credential validation, create with readiness wait, status, destroy — provisioning a private control plane per [ADR 0003](docs/adr/0003-gke-autopilot.md) and [ADR 0004](docs/adr/0004-private-control-plane.md). The adapter also realizes the optional registry capability: the instance's own Artifact Registry repository, ensured and torn down alongside the cluster ([ADR 0007](docs/adr/0007-instance-owned-image-registry.md)).
 
 Pick one cloud provider to start (GCP or AWS — whichever you're most comfortable testing against). Implement just enough to create and destroy a managed K8s cluster.
 
@@ -76,7 +76,7 @@ Pick one cloud provider to start (GCP or AWS — whichever you're most comfortab
 
 ### 1.3 FarSight CLI — `farcast install`
 
-**Status: ✅ Complete** — the guided install flow in [`farsight/cli/`](farsight/cli/README.md): provider selection, credential validation, the mandatory cost limit (no default, no "unlimited"), Planck provisioning, a post-create health check, and locally stored credentials, metadata, and cost limit.
+**Status: ✅ Complete** — the guided install flow in [`farsight/cli/`](farsight/cli/README.md): provider selection, credential validation, the mandatory cost limit (no default, no "unlimited"), Planck provisioning, the instance's own image registry, a post-create health check, and locally stored credentials, metadata, and cost limit.
 
 Wire the CLI to Planck. The guided install flow:
 
@@ -90,7 +90,7 @@ Wire the CLI to Planck. The guided install flow:
 
 ### 1.4 FarSight CLI — `farcast release`
 
-**Status: ✅ Complete** — `farcast release <instance>` with confirmation prompt and local-config cleanup in [`farsight/cli/`](farsight/cli/README.md). Known limitation: release returns once GCP *accepts* the delete — the cluster keeps deleting (`STOPPING`) for several minutes after the command reports "(deleted)".
+**Status: ✅ Complete** — `farcast release <instance>` with confirmation prompt, image-registry teardown, and local-config cleanup in [`farsight/cli/`](farsight/cli/README.md). Known limitation: release returns once GCP *accepts* the delete — the cluster keeps deleting (`STOPPING`) for several minutes after the command reports "(deleted)".
 
 The counterpart to install — tear everything down.
 
@@ -130,7 +130,7 @@ Shrike needs to exist alongside FatLine from the start, even if minimal.
 
 ### 2.3 FarSight CLI — `farcast connect`
 
-**Status: ✅ Complete** — [`farcast connect`](farsight/cli/README.md) mints the per-instance mTLS identity (the CA key stays local), deploys FatLine into the cluster via the kubeconfig ([ADR 0006](docs/adr/0006-connect-bootstrap-kubectl.md)), binds the public mTLS load-balancer carrier (~$18/month, confirmed against the cost limit — [ADR 0005](docs/adr/0005-fatline-data-plane-ingress.md)), and dials it to report status. Other CLI commands do not route through the tunnel yet — that arrives with the commands that need it. The default `--fatline-image` is not published anywhere; build it locally from `fatline/Containerfile`.
+**Status: ✅ Complete** — [`farcast connect`](farsight/cli/README.md) mints the per-instance mTLS identity (the CA key stays local), deploys FatLine into the cluster via the kubeconfig ([ADR 0006](docs/adr/0006-connect-bootstrap-kubectl.md)), binds the public mTLS load-balancer carrier (~$18/month, confirmed against the cost limit — [ADR 0005](docs/adr/0005-fatline-data-plane-ingress.md)), and dials it to report status. Other CLI commands do not route through the tunnel yet — that arrives with the commands that need it. The default `--fatline-image` now comes from the instance's own registry (`system/fatline`, tagged with the CLI's version): `connect` re-ensures that registry, preflights the image, offers to compile it from a farcast checkout with the local Go toolchain and push it there when it is missing — no container engine anywhere — and deploys it pinned by digest ([ADR 0007](docs/adr/0007-instance-owned-image-registry.md)). `fatline/Containerfile` is retained as an independently verifiable reference build.
 
 Wire the client side of FatLine into the CLI.
 
@@ -193,7 +193,8 @@ Translate a `./farcast` manifest into K8s resources.
 
 - Parse manifest → create a K8s namespace named after the top-level `name`, then generate Deployment, Service, and ConfigMap resources for each entry in `apps[]` within that namespace
 - Sensible defaults for resources (start conservative, TechnoCore will adapt later)
-- Build each app's container image from its `containerfile` path, using the app's `context` directory (or the Containerfile's directory when `context` is omitted); report a clear error if a referenced Containerfile is missing
+- Each app's container image comes from its `containerfile` path, using the app's `context` directory (or the Containerfile's directory when `context` is omitted), and lands in the instance's own registry under `app/<deployment>/<app>`, deployed by digest — the same registry, path convention, and pull grant `connect` already uses ([ADR 0007](docs/adr/0007-instance-owned-image-registry.md)); report a clear error if a referenced Containerfile is missing
+- Unlike FarCast's own system images, app Containerfiles execute arbitrary build steps and so need a builder — which builder runs them is deferred to its own 4.2-era ADR
 - Inject SDK as sidecar or init container
 
 ### 4.3 FarSight CLI — `farcast run`
