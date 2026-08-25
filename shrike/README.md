@@ -74,7 +74,7 @@ FatLine emits the decision event **before** answering the caller, so a `Deny` Sh
 
 ---
 
-## Interfaces (proposed)
+## Interfaces
 
 ```go
 package shrike
@@ -85,16 +85,15 @@ package shrike
 type Monitor struct { /* … */ }
 
 type Config struct {
-    // Policy is the declared egress contract (manifest external). Anything not
-    // in it that an app reaches is, by definition, a violation.
-    Policy   policy.Policy
+    // Declared is the egress contract (manifest external). Anything not in it
+    // that an app reaches is, by definition, a violation.
+    Declared []parser.External
     // Alerter receives raised alerts. Nil logs via slog (denials escalate).
-    Alerter  Alerter
+    Alerter Alerter
     // AlertWindow rate-limits repeated alerts for the same violation class
     // (default 1m): the first is raised immediately, repeats are coalesced into
     // the running count and re-raised at most once per window.
     AlertWindow time.Duration
-    Logger   *slog.Logger
 }
 
 func New(cfg Config) *Monitor
@@ -133,7 +132,7 @@ package policy // internal
 // permits, with the operator-facing reason each was declared for.
 type Policy struct { /* … */ }
 func New(decls []parser.External) Policy
-func (p Policy) Declared(host string) (parser.External, bool) // is this host in the contract?
+func (p Policy) Declared(host string) (reason string, ok bool) // is this host in the contract?
 func (p Policy) Hosts() []string
 ```
 

@@ -63,6 +63,9 @@ Build the CLI framework. No commands work yet, but the structure is in place.
 - Output formatting (human-readable and JSON modes)
 
 ### 1.2 Planck — first cloud provider adapter
+
+**Status: ✅ Complete** — GCP first: a GKE Autopilot adapter behind the provider interface in [`planck/`](planck/README.md) — credential validation, create with readiness wait, status, destroy — provisioning a private control plane per [ADR 0003](docs/adr/0003-gke-autopilot.md) and [ADR 0004](docs/adr/0004-private-control-plane.md).
+
 Pick one cloud provider to start (GCP or AWS — whichever you're most comfortable testing against). Implement just enough to create and destroy a managed K8s cluster.
 
 - Cloud credential validation
@@ -72,6 +75,9 @@ Pick one cloud provider to start (GCP or AWS — whichever you're most comfortab
 - Provider interface so the second provider is easy to add later
 
 ### 1.3 FarSight CLI — `farcast install`
+
+**Status: ✅ Complete** — the guided install flow in [`farsight/cli/`](farsight/cli/README.md): provider selection, credential validation, the mandatory cost limit (no default, no "unlimited"), Planck provisioning, a post-create health check, and locally stored credentials, metadata, and cost limit.
+
 Wire the CLI to Planck. The guided install flow:
 
 - `farcast install` starts the interactive process
@@ -83,13 +89,16 @@ Wire the CLI to Planck. The guided install flow:
 - Credentials, instance metadata, and cost limit stored locally
 
 ### 1.4 FarSight CLI — `farcast release`
+
+**Status: ✅ Complete** — `farcast release <instance>` with confirmation prompt and local-config cleanup in [`farsight/cli/`](farsight/cli/README.md). Known limitation: release returns once GCP *accepts* the delete — the cluster keeps deleting (`STOPPING`) for several minutes after the command reports "(deleted)".
+
 The counterpart to install — tear everything down.
 
 - `farcast release <instance>` destroys the cloud resources
 - Confirmation prompt (this is destructive)
 - Clean up local configuration
 
-**Phase 1 deliverable:** `farcast install` creates a real K8s cluster on a cloud provider. `farcast release` destroys it. The operator has a working instance (empty, but alive).
+**Phase 1 deliverable** ✅ **achieved:** `farcast install` creates a real K8s cluster on a cloud provider. `farcast release` destroys it (asynchronously — GCP finishes the delete after the command returns). The operator has a working instance (empty, but alive). Validated live against GCP: all six success criteria in [the Phase 1 runbook](docs/runbooks/phase-1-validation.md) passed.
 
 ---
 
@@ -98,6 +107,9 @@ The counterpart to install — tear everything down.
 *Goal: establish the encrypted network boundary before anything runs on the instance.*
 
 ### 2.1 FatLine — core proxy
+
+**Status: ✅ Complete** — the mTLS tunnel, deny-by-default egress proxy, and per-instance CA in [`fatline/`](fatline/README.md); the allowlist is built from parsed manifest `external` declarations (a single shared allowlist until per-app identity lands in 4.4).
+
 The network boundary must exist before any application traffic flows.
 
 - TLS/mTLS tunnel between client and instance
@@ -106,6 +118,9 @@ The network boundary must exist before any application traffic flows.
 - Basic connection lifecycle (establish, maintain, teardown)
 
 ### 2.2 Shrike — policy engine (minimal)
+
+**Status: ✅ Complete** — the policy engine in [`shrike/`](shrike/README.md): it consumes FatLine's egress-decision stream and raises severity-ranked, de-duplicated alerts. Blocking stayed inline in FatLine (fail-closed); Shrike never sits in the data path and fails open. It runs in-process or as a Unix-socket sidecar — but the two-container Pod that co-schedules it with FatLine is Planck work (4.2), so `farcast connect` today deploys FatLine alone.
+
 Shrike needs to exist alongside FatLine from the start, even if minimal.
 
 - Read manifest `external` declarations
@@ -114,13 +129,16 @@ Shrike needs to exist alongside FatLine from the start, even if minimal.
 - Shrike as a sidecar/middleware on FatLine — not a separate network hop
 
 ### 2.3 FarSight CLI — `farcast connect`
+
+**Status: ✅ Complete** — [`farcast connect`](farsight/cli/README.md) mints the per-instance mTLS identity (the CA key stays local), deploys FatLine into the cluster via the kubeconfig ([ADR 0006](docs/adr/0006-connect-bootstrap-kubectl.md)), binds the public mTLS load-balancer carrier (~$18/month, confirmed against the cost limit — [ADR 0005](docs/adr/0005-fatline-data-plane-ingress.md)), and dials it to report status. Other CLI commands do not route through the tunnel yet — that arrives with the commands that need it. The default `--fatline-image` is not published anywhere; build it locally from `fatline/Containerfile`.
+
 Wire the client side of FatLine into the CLI.
 
 - `farcast connect <instance>` establishes a FatLine tunnel
 - All subsequent CLI commands route through FatLine
 - Connection status reporting
 
-**Phase 2 deliverable:** the operator can `farcast connect` to their instance through an encrypted tunnel. All traffic is deny-by-default. Shrike monitors and blocks undeclared connections.
+**Phase 2 deliverable** ✅ **achieved (validated locally):** the operator can `farcast connect` to their instance through an encrypted tunnel. All traffic is deny-by-default: FatLine blocks undeclared connections, and Shrike monitors and alerts on them. [The Phase 2 runbook](docs/runbooks/phase-2-validation.md) Part A (local, free) passes end-to-end; Part B (`connect` against a real GKE instance) has not been run yet.
 
 ---
 

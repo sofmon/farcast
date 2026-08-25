@@ -6,7 +6,7 @@ Planck is the module that turns "a cloud account" into "a running Kubernetes clu
 
 This document specifies **Phase 1.2 — the first cloud provider adapter**: the `Provider` interface and one concrete implementation that can validate credentials, create a managed Kubernetes cluster with sensible defaults, wait for it to be ready, and destroy it. The manifest-to-workload translator is a later phase and is described only in outline here.
 
-> **Status.** Phase 1.2 — **implemented**. The cloud-agnostic `Provider` interface, the provider registry, and the **GKE Autopilot** adapter ([ADR 0003](../docs/adr/0003-gke-autopilot.md)) are built and green (`gofmt`, `go vet`, `go test -race`, `golangci-lint` all clean). The adapter is wired to the real Google Cloud SDK (`cloud.google.com/go/container/apiv1`, vendored): credential validation, cluster create / status / delete with readiness waiting, all driveable through the `cmd/planck` harness. Client construction is lazy — `Open`/`New` is creds-free and credential resolution surfaces through `Validate` — and accepts only a service-account key (`option.WithAuthCredentialsJSON(option.ServiceAccount, …)`). The adapter provisions a **private control plane** (no public IP; IAM-gated DNS-based endpoint — [ADR 0004](../docs/adr/0004-private-control-plane.md)): it sets `ControlPlaneEndpointsConfig` (public off / internal on / DNS on) at create and returns a DNS-endpoint kubeconfig (no embedded CA). Live cluster create/delete is covered by an opt-in integration test (`//go:build integration`, never in CI). **Out of scope (later phases):** the manifest→K8s **translator** (4.2), wiring into `farcast install` (1.3), cost monitoring/enforcement (TechnoCore, 4.1), and the second/third providers (8.1).
+> **Status.** Phase 1.2 — **implemented**. The cloud-agnostic `Provider` interface, the provider registry, and the **GKE Autopilot** adapter ([ADR 0003](../docs/adr/0003-gke-autopilot.md)) are built and green (`gofmt`, `go vet`, `go test -race`, `golangci-lint` all clean). The adapter is wired to the real Google Cloud SDK (`cloud.google.com/go/container/apiv1`, vendored): credential validation, cluster create (with readiness waiting) / status / delete (returns on the cloud's acceptance; completion is asynchronous), all driveable through the `cmd/planck` harness. Client construction is lazy — `Open`/`New` is creds-free and credential resolution surfaces through `Validate` — and accepts only a service-account key (`option.WithAuthCredentialsJSON(option.ServiceAccount, …)`). The adapter provisions a **private control plane** (no public IP; IAM-gated DNS-based endpoint — [ADR 0004](../docs/adr/0004-private-control-plane.md)): it sets `ControlPlaneEndpointsConfig` (public off / internal on / DNS on) at create and returns a DNS-endpoint kubeconfig (no embedded CA; it authenticates through a `gke-gcloud-auth-plugin` exec hook, so any `kubectl` use of it requires that plugin installed). Live cluster create/delete is covered by an opt-in integration test (`//go:build integration`, never in CI). **Out of scope (later phases):** the manifest→K8s **translator** (4.2), wiring into `farcast install` (1.3), cost monitoring/enforcement (TechnoCore, 4.1), and the second/third providers (8.1).
 
 ---
 
@@ -80,7 +80,8 @@ type Provider interface {
 	// ClusterStatus reports the current state of the referenced cluster.
 	ClusterStatus(ctx context.Context, ref ClusterRef) (ClusterStatus, error)
 
-	// DeleteCluster tears the cluster down and blocks until removal completes.
+	// DeleteCluster requests teardown and returns once the cloud accepts the
+	// delete operation — removal completes asynchronously.
 	// Deleting an absent cluster is not an error (idempotent cleanup).
 	DeleteCluster(ctx context.Context, ref ClusterRef) error
 }
@@ -160,9 +161,9 @@ func Providers() []string                            // registered provider name
 
 **ClusterStatus** — maps the cloud's native status enum onto `ClusterStatus`, so callers (and TechnoCore later) reason in FarCast terms.
 
-**DeleteCluster** — issues the delete and blocks until the cloud confirms removal. Deleting an already-absent cluster succeeds silently, so `farcast release` (1.4) and failed-install cleanup are safe to re-run.
+**DeleteCluster** — issues the delete and returns once the cloud *accepts* the operation; removal completes asynchronously (GKE reports the cluster `STOPPING` for a few more minutes). Blocking until removal completes — the counterpart of create's readiness wait — is a known gap. Deleting an already-absent cluster succeeds silently, so `farcast release` (1.4) and failed-install cleanup are safe to re-run.
 
-All four are long-running and fully `ctx`-governed: a cancelled install or a `farcast` Ctrl-C propagates down and aborts the cloud operation's polling promptly.
+All four honour `ctx` for cancellation and deadlines (create's readiness polling is minutes-long): a cancelled install or a `farcast` Ctrl-C propagates down and aborts the cloud operation's polling promptly.
 
 ---
 

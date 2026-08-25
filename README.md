@@ -48,17 +48,26 @@ farcast/
 │   ├── cmd/
 │   │   └── planck/
 │   │       └── main.go
+│   ├── planck.go                   ← Package doc & provider registry
+│   ├── types.go                    ← Provider interface & lifecycle types
+│   ├── providers/                  ← Bundled adapter registration
 │   └── internal/
-│       ├── providers/              ← EKS, GKE, AKS adapters
+│       ├── providers/              ← Cloud adapters (GKE implemented; EKS, AKS planned)
 │       └── translator/             ← Manifest → K8s workload
 │
 ├── fatline/                        ← Networking, routing, proxy & encryption
 │   ├── README.md
+│   ├── Containerfile               ← Distroless data-plane image
 │   ├── docs/
 │   ├── cmd/
 │   │   └── fatline/
 │   │       └── main.go
+│   ├── identity/                   ← Per-instance CA & certificate minting
+│   ├── tunnel/                     ← mTLS tunnel
+│   ├── deploy/                     ← Bootstrap deployment manifests
+│   ├── event/                      ← Wire events
 │   └── internal/
+│       ├── allowlist/
 │       ├── proxy/
 │       ├── router/
 │       └── crypto/
@@ -134,7 +143,8 @@ farcast/
 │
 └── docs/                           ← Project-wide docs
     ├── hyperion-reference.md       ← Naming lore
-    └── adr/                        ← Architecture Decision Records
+    ├── adr/                        ← Architecture Decision Records
+    └── runbooks/                   ← Live validation runbooks
 ```
 
 ---
@@ -275,7 +285,7 @@ install → bind → run → release
 
 ```bash
 # Install an instance (cost limit is mandatory)
-farcast install --name my-instance --cost-limit 100/month
+farcast install --name my-instance --cost-limit 100
 
 # Run a repository on an instance
 farcast run github.com/username/repo
@@ -292,6 +302,8 @@ farcast connect my-instance
 # Terminate an instance
 farcast release my-instance
 ```
+
+*Implemented today: `install`, `connect`, `release` (plus `version` and `help`). `run`, `ps`, and `costs` are registered but stubbed until Phase 4.*
 
 Full CLI reference → [`farsight/cli/README.md`](farsight/cli/README.md)
 
@@ -323,17 +335,17 @@ Each module folder contains its own `README.md` with:
 
 ## Status
 
-> This project is in early development. Phase 0 (foundation) is complete: the manifest parser and the Go SDK (core interfaces + logging) are implemented. The remaining modules are in specification.
+> This project is in early development. Phases 0–2 are implemented. Phase 0 (foundation): the manifest parser and the Go SDK (core interfaces + logging). Phase 1 (provisioning): the FarSight CLI with `install`/`release`, driving Planck's GKE Autopilot provider with a private control plane. Phase 2 (connection): FatLine's core proxy (mTLS tunnel, deny-by-default egress), Shrike's policy engine, and `farcast connect`. The remaining modules are in specification.
 
 | Module | Spec | Implementation |
 |---|---|---|
 | TechnoCore | 🔲 Draft | 🔲 Not started |
-| Planck | 🔲 Draft | 🔲 Not started |
-| FatLine | 🔲 Draft | 🔲 Not started |
+| Planck | 🟡 In progress | 🟡 GKE Autopilot provider (create/destroy) |
+| FatLine | 🟡 In progress | 🟡 Core proxy: mTLS tunnel, deny-by-default egress |
 | DataSphere | 🔲 Draft | 🔲 Not started |
-| Shrike | 🔲 Draft | 🔲 Not started |
+| Shrike | 🟡 In progress | 🟡 Policy engine |
 | AllThing | 🔲 Draft | 🔲 Not started |
-| FarSight | 🟡 In progress | 🟡 CLI scaffold |
+| FarSight | 🟡 In progress | 🟡 CLI: `install`, `release`, `connect` |
 | SDK | 🟡 In progress | 🟡 Go: logging live, interfaces stubbed |
 | Manifest Spec | ✅ Complete | ✅ Parser + tests |
 

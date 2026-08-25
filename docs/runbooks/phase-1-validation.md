@@ -12,9 +12,16 @@ real `DeleteCluster`, and local state round-tripping across two commands.
 **Cost & time.** A short create→delete cycle of an *empty* Autopilot cluster is
 cheap — the first zonal/Autopilot cluster's management fee is covered by the GKE
 free tier, and an empty cluster runs no billable Pods. Budget **~5–10 min** for
-create and **~3–5 min** for delete. The mandatory cost limit is only *recorded* in
+create; `release` itself returns in seconds, with GCP finishing the delete over
+**~3–5 min** in the background. The mandatory cost limit is only *recorded* in
 Phase 1 (TechnoCore enforces it in 4.1), so it will not stop anything — `release`
 is what guarantees no lingering charges.
+
+> **Status.** Executed end-to-end against a real GCP project on **2026-08-24** — all six
+> success criteria passed, including live confirmation of the private control plane
+> (a `*.gke.goog` DNS endpoint, no public control-plane IP). One behavioural note from
+> the live run: `release` returns once GCP *accepts* the delete — the cluster stays
+> `STOPPING` for a few more minutes (see Steps 8–9).
 
 ---
 
@@ -108,7 +115,7 @@ success:
 
 ```
 ✓ instance "validate" installed
-  provider:    gke (Autopilot)
+  provider:    gke
   region:      us-central1
   cluster:     farcast-validate
   endpoint:    <uid>.us-central1.gke.goog        ← a DNS endpoint, not an IP
@@ -157,7 +164,8 @@ instance — you only name it:
 ./farcast release "$INSTANCE" --yes
 ```
 
-This blocks while the cluster is deleted. ✅ Expect:
+This returns as soon as GCP **accepts** the delete — the cluster then finishes deleting in
+the background, showing as `STOPPING` for another ~3–5 minutes (see Step 9). ✅ Expect:
 
 ```
 ✓ instance "validate" released
@@ -169,11 +177,13 @@ This blocks while the cluster is deleted. ✅ Expect:
 ## 9. Verify teardown & clean up
 
 ```bash
-gcloud container clusters list --project "$PROJECT_ID"     # 'farcast-validate' gone
+gcloud container clusters list --project "$PROJECT_ID"     # STOPPING at first, then gone
 ls "$FARCAST_CONFIG_HOME/instances/"                        # 'validate' gone
 ```
 
-✅ Expect: no `farcast-validate` cluster (no lingering charges), no local record.
+✅ Expect: the local record gone immediately. The cluster may still be listed as `STOPPING`
+for a few minutes after `release` returns — re-run the list until `farcast-validate` is gone
+(no lingering charges).
 
 Optional final cleanup once you're satisfied:
 
@@ -228,7 +238,7 @@ go run ./planck/cmd/planck delete --provider gke --project "$PROJECT_ID" --locat
 - [ ] `farcast install` finishes with `state: running` and a `*.gke.goog` endpoint.
 - [ ] `gcloud` shows the cluster `RUNNING`, Autopilot, **no public control-plane IP**.
 - [ ] Local state exists with `0700`/`0600` perms and `status: running`.
-- [ ] `farcast release` deletes the cluster and removes local state.
-- [ ] `gcloud` shows the cluster gone; no lingering billable resources.
+- [ ] `farcast release` succeeds (delete accepted by GCP) and removes local state.
+- [ ] `gcloud` shows the cluster gone — `STOPPING` at first, absent a few minutes later; no lingering billable resources.
 
 If all six pass, Phase 1 is validated end-to-end and you're clear to start Phase 2.

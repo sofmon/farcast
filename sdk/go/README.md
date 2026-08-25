@@ -115,7 +115,7 @@ Later phases introduce endpoint variables for the remaining capabilities (for ex
 
 ## Logging — `farcast.Log()`
 
-The first real implementation (phase 0.3). Structured JSON to stdout, four levels, automatic identity, and request-scoped context propagation. It is also the **standard logging mechanism for FarCast's own modules** — TechnoCore, Planck, FatLine, and the rest emit the same record shape, so an operator reads one consistent log stream across the whole instance.
+The first real implementation (phase 0.3). Structured JSON to stdout, four levels, automatic identity, and request-scoped context propagation. It is also the **intended standard logging mechanism for FarCast's own modules** — TechnoCore, Planck, FatLine, and the rest are to emit the same record shape, so an operator reads one consistent log stream across the whole instance. (Today the modules that log at all — FatLine, Shrike, and the FarSight CLI — use bare `slog`, and the rest are still scaffolds; they adopt this record shape as they are wired into an instance.)
 
 ### The interface
 
@@ -298,7 +298,7 @@ type NetAPI interface {
 }
 ```
 
-Implementation: lands with FatLine ([`PLAN.md`](../../PLAN.md) phase 2 onward).
+Implementation: FatLine's core proxy shipped in phase 2, but `Net()` stays a stub until applications get the FatLine data path — the sidecar templating and per-app allowlists of [`PLAN.md`](../../PLAN.md) phases 4.2/4.4.
 
 ### AI — `farcast.AI()`
 
@@ -355,7 +355,7 @@ Per [`../../AGENTS.md`](../../AGENTS.md) ("Language guardrails") and [ADR 0002](
 | Logging — `Log()` | phase 0.2 | **phase 0.3** |
 | Config — `Config()` | phase 0.2 | phase 5.3 |
 | Storage — `Storage()` | phase 0.2 | phase 3.2 |
-| Net — `Net()` | phase 0.2 | with FatLine (phase 2+) |
+| Net — `Net()` | phase 0.2 | with the app data path (phase 4.2/4.4; FatLine core shipped in phase 2) |
 | AI — `AI()` | phase 0.2 | phase 6.3 |
 | Secrets — `Secrets()` | phase 5.3 | phase 5.3 |
 

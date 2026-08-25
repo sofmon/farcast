@@ -23,7 +23,9 @@ getting a public IP, and the mTLS handshake across the open internet.
 **Cost & time.** Part A: free, ~5 min. Part B: the instance itself (empty
 Autopilot) is cheap, but the **load balancer bills ~$18/mo while it exists** —
 budget the test to a single session and run Step B6 to delete it. Time: ~5 min to
-build/push the image, ~3–5 min for `connect`, ~3–5 min for `release`.
+build/push the image, ~3–5 min for `connect`, ~3–5 min for the `release` teardown
+to finish (the command itself returns once the deletion is accepted; the cluster
+shows `STOPPING` while it completes).
 
 ---
 
@@ -284,11 +286,14 @@ load balancer:
 ./bin/farcast release "$INSTANCE" --yes
 ```
 
-Then **confirm no billable forwarding rule lingers**:
+`release` returns once GCP has **accepted** the deletion — the cluster keeps
+showing `STOPPING` for a few more minutes while it (and the LB's forwarding rule)
+are actually removed. Then **confirm no billable forwarding rule lingers** (re-run
+until both checks come back empty):
 
 ```bash
 gcloud compute forwarding-rules list --project "$PROJECT_ID"   # expect: none from this instance
-gcloud container clusters list --project "$PROJECT_ID"          # 'farcast-validate' gone
+gcloud container clusters list --project "$PROJECT_ID"          # STOPPING at first, then gone
 ```
 
 ✅ Expect: no cluster, no forwarding rules → no lingering LB charge.
