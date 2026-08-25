@@ -54,8 +54,9 @@ type provider struct {
 	defaultLocation string
 	pollInterval    time.Duration
 
-	mu  sync.Mutex
-	api clusterAPI // built lazily on first use; see client
+	mu     sync.Mutex
+	api    clusterAPI  // built lazily on first use; see client
+	regAPI registryAPI // built lazily on first use; see registry.go (ADR 0007)
 }
 
 var _ planck.Provider = (*provider)(nil)
