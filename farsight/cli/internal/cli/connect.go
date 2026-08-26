@@ -2,24 +2,19 @@ package cli
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"strings"
 	"time"
 
-	"github.com/sofmon/farcast/farsight/cli/internal/buildinfo"
-	"github.com/sofmon/farcast/farsight/cli/internal/cluster"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
-	"github.com/sofmon/farcast/farsight/cli/internal/image"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
 	"github.com/sofmon/farcast/fatline"
 	"github.com/sofmon/farcast/fatline/deploy"
 	"github.com/sofmon/farcast/fatline/identity"
 	"github.com/sofmon/farcast/fatline/tunnel"
 	"github.com/sofmon/farcast/planck"
-	_ "github.com/sofmon/farcast/planck/providers" // register cloud adapters (gke)
 )
 
 // nlbMonthlyUSD is the standing cost estimate for the public mTLS load balancer
@@ -32,80 +27,22 @@ const nlbMonthlyUSD = 18
 // would train the operator to click through the gate that matters.
 const registryMonthlyCost = "~$0"
 
-const (
-	// fatlineImagePath is where FarCast's own images live inside an instance
-	// registry (ADR 0007 decision 6: system/<component>). Phase-4 application
-	// images land under app/<deployment>/<app> beside it, which is why the one
-	// path segment is spent now rather than migrated later.
-	fatlineImagePath = "system/fatline"
-
-	// fatlinePackage and fatlineBinary describe the build the CLI performs when
-	// that image is missing: one statically linked Go binary laid onto a
-	// digest-pinned distroless base. There are no Containerfile steps to
-	// execute, which is precisely why no container engine is needed (ADR 0007
-	// decision 5).
-	fatlinePackage = "./fatline/cmd/fatline"
-	fatlineBinary  = "/fatline"
-)
-
-// clusterApplier is the slice of the cluster client connect needs (injectable).
-type clusterApplier interface {
-	Apply(ctx context.Context, manifests []byte) error
-	RolloutStatus(ctx context.Context, namespace, name string, timeout time.Duration) error
-	WaitExternalIP(ctx context.Context, namespace, name string, timeout time.Duration) (string, error)
-}
-
 // tunnelConn is the slice of *tunnel.Conn connect needs (injectable).
 type tunnelConn interface {
 	Status(ctx context.Context) (fatline.ConnStatus, error)
 	Close() error
 }
 
-// imageBuilder is the slice of *image.Builder connect needs (injectable): look
-// a reference up, and — when it is missing — build and push it.
-type imageBuilder interface {
-	Resolve(ctx context.Context, ref, user, pass string) (string, error)
-	BuildAndPush(ctx context.Context, opts image.Options, user, pass string) (string, error)
-}
-
-// registryAccess is the instance's ensured registry plus the ability to mint a
-// credential for it.
-//
-// The credential is minted on demand rather than up front, and only by the paths
-// that actually push or pull: it lives in memory for one registry call and is
-// never written anywhere (ADR 0007 decision 5), because a push credential for
-// the instance's registry is a supply-chain foothold on everything the cluster
-// runs. Not minting one on a reconnect also means one less cloud call and one
-// less way for a reconnect to fail.
-type registryAccess struct {
-	provider planck.RegistryProvider
-	registry *planck.Registry
-}
-
-// credentials mints the short-lived push/pull credential. For Artifact Registry
-// the username is a fixed literal and the password is a ~60-minute OAuth2 token
-// derived in-process from the stored service-account key.
-func (a *registryAccess) credentials(ctx context.Context) (user, pass string, err error) {
-	tok, err := a.provider.RegistryToken(ctx)
-	if err != nil {
-		return "", "", fmt.Errorf("mint a registry credential: %w", err)
-	}
-	return tok.Username, tok.Password, nil
-}
-
 type connectCommand struct {
-	carrier      string
-	statusOnly   bool
-	assumeYes    bool
-	fatlineImage string
-	sourceDir    string
+	// The image resolution and cluster-apply machinery connect shares with
+	// redeploy: the two must not drift on where FatLine's image comes from.
+	fatlineDeployer
+
+	carrier    string
+	statusOnly bool
 
 	// Seams, overridable in tests; defaulted by newConnectCommand / ensureDefaults.
-	newCluster   func(kubeconfigPath string) clusterApplier
-	dial         func(ctx context.Context, endpoint string, id tunnel.ClientIdentity) (tunnelConn, error)
-	openProvider func(meta *config.InstanceMetadata, creds *config.InstanceCredentials) (planck.Provider, error)
-	newBuilder   func(progress func(string)) imageBuilder
-	findSource   func(dir string) (string, error)
+	dial func(ctx context.Context, endpoint string, id tunnel.ClientIdentity) (tunnelConn, error)
 }
 
 func newConnectCommand() *connectCommand {
@@ -115,11 +52,9 @@ func newConnectCommand() *connectCommand {
 }
 
 func (c *connectCommand) ensureDefaults() {
+	c.fatlineDeployer.ensureDefaults()
 	if c.carrier == "" {
 		c.carrier = "nlb"
-	}
-	if c.newCluster == nil {
-		c.newCluster = func(kc string) clusterApplier { return cluster.New(kc) }
 	}
 	if c.dial == nil {
 		c.dial = func(ctx context.Context, endpoint string, id tunnel.ClientIdentity) (tunnelConn, error) {
@@ -129,23 +64,6 @@ func (c *connectCommand) ensureDefaults() {
 			}
 			return conn, nil
 		}
-	}
-	if c.openProvider == nil {
-		c.openProvider = func(meta *config.InstanceMetadata, creds *config.InstanceCredentials) (planck.Provider, error) {
-			return planck.Open(meta.Provider, planck.Config{
-				Project:     meta.Project,
-				Location:    meta.Region,
-				Credentials: []byte(creds.ServiceAccountKey),
-			})
-		}
-	}
-	if c.newBuilder == nil {
-		c.newBuilder = func(progress func(string)) imageBuilder {
-			return &image.Builder{Progress: progress}
-		}
-	}
-	if c.findSource == nil {
-		c.findSource = image.FindSource
 	}
 }
 
@@ -164,6 +82,9 @@ no container engine involved — deploys FatLine into the cluster, and provision
 its public point of presence: a standing ~$18/month load balancer, confirmed
 against the cost limit. Later connects reuse all of it and re-dial.
 
+To change what an already-connected instance runs, use 'farcast redeploy': this
+command opens the tunnel, that one replaces the workload inside it.
+
 Flags:
   --carrier <nlb>   Data-plane carrier (default nlb: public mTLS load balancer)
   --status          Only dial the bound carrier and report status (no bootstrap,
@@ -181,56 +102,8 @@ With --output json the command prints one JSON result and never prompts.`)
 func (c *connectCommand) SetFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.carrier, "carrier", "nlb", "data-plane carrier (nlb: public mTLS load balancer)")
 	fs.BoolVar(&c.statusOnly, "status", false, "only dial the bound carrier and report status")
-	fs.BoolVar(&c.assumeYes, "yes", false, "skip the load-balancer cost and build confirmations")
-	fs.BoolVar(&c.assumeYes, "y", false, "skip the load-balancer cost and build confirmations")
-	// The default is empty rather than a ref: it depends on the instance, which
-	// is not known until Run loads its metadata (see resolveImage).
-	fs.StringVar(&c.fatlineImage, "fatline-image", "", "FatLine container image to deploy (default: the instance registry's system/fatline)")
-	fs.StringVar(&c.sourceDir, "source", "", "farcast checkout to build FatLine's image from (default: auto-detected)")
-}
-
-// instanceFatlineImage is the default image reference: the instance's own
-// registry, at the fixed system path, tagged with this CLI's version.
-//
-// There is deliberately no central fallback. The ghcr.io default this replaces
-// made every instance's network boundary depend on an artifact feed Sofmon
-// controls — a standing central dependency and a supply-chain injection point
-// aimed at FatLine itself (ADR 0007 decision 4). The tag is what the operator
-// reads; the digest is what gets deployed.
-func instanceFatlineImage(prefix string) string {
-	return prefix + "/" + fatlineImagePath + ":" + imageTag(buildinfo.Get().Version)
-}
-
-// imageTag renders a build version as a valid OCI tag.
-//
-// A tag is [A-Za-z0-9_][A-Za-z0-9._-]{0,127}, which a Go build version does not
-// always satisfy: a source build carries a pseudo-version, and one built from a
-// tree with uncommitted files ends in "+dirty" — a '+' no registry will accept.
-// Folding the unrepresentable characters is right rather than lax, because the
-// tag is only the human-readable label here; the digest is what is deployed and
-// recorded (ADR 0007 decision 4), so the tag never has to be an exact identity.
-func imageTag(version string) string {
-	var b strings.Builder
-	for _, r := range version {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '_', r == '-':
-			b.WriteRune(r)
-		default:
-			b.WriteByte('-')
-		}
-	}
-	tag := b.String()
-	if tag == "" {
-		return "unknown"
-	}
-	// The first character may not be '.' or '-'.
-	if c := tag[0]; c == '.' || c == '-' {
-		tag = "v" + tag
-	}
-	if len(tag) > 128 {
-		tag = tag[:128]
-	}
-	return tag
+	c.setYesFlag(fs, "skip the load-balancer cost and build confirmations")
+	c.setImageFlags(fs)
 }
 
 func (c *connectCommand) Run(ctx context.Context, env *Env, args []string) error {
@@ -243,6 +116,13 @@ func (c *connectCommand) Run(ctx context.Context, env *Env, args []string) error
 	}
 	if c.carrier != "nlb" {
 		return usagef("unsupported carrier %q (only \"nlb\" is implemented in this phase)", c.carrier)
+	}
+	// The same opposed intents redeploy rejects: "deploy exactly this" versus
+	// "build from here and deploy that". Image resolution is shared between the
+	// two commands, and it answers --fatline-image before it ever considers
+	// --source, so accepting both here would silently honour one of them.
+	if c.fatlineImage != "" && c.sourceDir != "" {
+		return usagef("--fatline-image deploys an image as given and --source builds a new one; pass one or the other")
 	}
 	name := args[0]
 
@@ -262,7 +142,8 @@ func (c *connectCommand) Run(ctx context.Context, env *Env, args []string) error
 	// reconnect does not bootstrap. Saying so is the point: silently accepting
 	// --fatline-image on a reconnect would report success while the old image
 	// keeps running, which is exactly the wrong answer when the flag is being
-	// used to roll out a FatLine fix.
+	// used to roll out a FatLine fix. `farcast redeploy` is the command that
+	// does honour them against a connected instance.
 	if c.statusOnly || connected {
 		switch {
 		case c.fatlineImage != "" && c.statusOnly:
@@ -271,9 +152,10 @@ func (c *connectCommand) Run(ctx context.Context, env *Env, args []string) error
 			return usagef("--status only dials the bound carrier and reports; it builds nothing, so --source has no effect")
 		case c.fatlineImage != "":
 			return usagef("FatLine is already deployed for %q, and --fatline-image only applies to the first connect; "+
-				"changing the running image is not yet supported (release and reinstall, or update it in the cluster directly)", name)
+				"run 'farcast redeploy %s --fatline-image …' to change the running image", name, name)
 		case c.sourceDir != "":
-			return usagef("FatLine is already deployed for %q, so there is nothing to build; --source only applies to the first connect", name)
+			return usagef("FatLine is already deployed for %q, so this connect builds nothing; --source only applies to the first connect; "+
+				"run 'farcast redeploy %s --source …' to rebuild FatLine's image and roll it out", name, name)
 		}
 	}
 
@@ -281,7 +163,7 @@ func (c *connectCommand) Run(ctx context.Context, env *Env, args []string) error
 	// not-connected checks above so that a --status probe never mints anything:
 	// the instance's CA is its trust root, and a read-only health query has no
 	// business creating one as a side effect.
-	mtls, err := c.ensureIdentity(env, name, connected)
+	mtls, err := ensureIdentity(env, name, connected)
 	if err != nil {
 		return err
 	}
@@ -349,7 +231,11 @@ func (c *connectCommand) needsRegistry(connected bool) bool {
 
 // ensureIdentity mints the per-instance mTLS material on first connect (the CA
 // key never leaves this machine) and loads it thereafter.
-func (c *connectCommand) ensureIdentity(env *Env, name string, connected bool) (config.MTLSMaterial, error) {
+//
+// Minting is connect's alone: every other command passes connected=true and so
+// can only ever take the load-or-explain path below. A trust root is created
+// once, deliberately, by the command whose job is to establish the boundary.
+func ensureIdentity(env *Env, name string, connected bool) (config.MTLSMaterial, error) {
 	exists, err := env.ConfigDir.InstanceMTLSExists(name)
 	if err != nil {
 		return config.MTLSMaterial{}, fmt.Errorf("check identity for %q: %w", name, err)
@@ -386,120 +272,6 @@ func (c *connectCommand) ensureIdentity(env *Env, name string, connected bool) (
 	return m, nil
 }
 
-// ensureRegistry ensures the instance's image registry and mints a credential
-// for it, recording the result locally.
-//
-// connect re-ensures on every run instead of trusting install to have done it
-// (ADR 0007 decision 1): an instance installed before instances had registries
-// converges here, rather than failing later as an unexplained ImagePullBackOff
-// inside the cluster. The ensure is idempotent, and it is not cost-gated — the
-// registry is cents at most (decision 8), unlike the load balancer below.
-func (c *connectCommand) ensureRegistry(ctx context.Context, env *Env, name string, meta *config.InstanceMetadata) (*registryAccess, error) {
-	creds, err := env.ConfigDir.LoadInstanceCredentials(name)
-	if err != nil {
-		return nil, fmt.Errorf("load credentials for %q: %w", name, err)
-	}
-	p, err := c.openProvider(meta, creds)
-	if err != nil {
-		return nil, err
-	}
-	rp, ok := p.(planck.RegistryProvider)
-	if !ok {
-		return nil, fmt.Errorf("provider %q has no image registry: %w", meta.Provider, planck.ErrRegistryUnsupported)
-	}
-	reg, err := rp.EnsureRegistry(ctx, registrySpec(meta))
-	if err != nil {
-		return nil, fmt.Errorf("ensure the image registry for %q: %w", name, err)
-	}
-	recordRegistry(meta, reg)
-	meta.UpdatedAt = time.Now().UTC()
-	if err := env.ConfigDir.SaveInstanceMetadata(name, meta); err != nil {
-		return nil, fmt.Errorf("record the image registry: %w", err)
-	}
-	return &registryAccess{provider: rp, registry: reg}, nil
-}
-
-// resolveImage decides what the cluster will be told to run.
-//
-// The default comes from the instance's own registry and is deployed **pinned
-// by digest**: a Deployment that names a tag can be redirected by whoever can
-// write that tag, so pinning is what makes a registry-write compromise unable to
-// swap FatLine under a running instance (ADR 0007 decision 4). A preflight miss
-// is not a failure but an invitation — with a checkout present the CLI builds
-// and pushes the image in place, since the operator's machine is FarCast's build
-// anchor.
-func (c *connectCommand) resolveImage(ctx context.Context, env *Env, reg *registryAccess) (string, error) {
-	if c.fatlineImage != "" {
-		return c.fatlineImage, nil // the operator named it; deploy exactly that
-	}
-	if reg == nil { // guarded by needsRegistry; belt and braces
-		return "", errors.New("no image registry for this instance and no --fatline-image given")
-	}
-	ref := instanceFatlineImage(reg.registry.Prefix)
-	user, pass, err := reg.credentials(ctx)
-	if err != nil {
-		return "", err
-	}
-	b := c.newBuilder(c.progressTo(env))
-
-	pinned, err := b.Resolve(ctx, ref, user, pass)
-	switch {
-	case err == nil:
-		return pinned, nil
-	case !errors.Is(err, image.ErrNotFound):
-		// Only a literal "absent" counts as a miss. Building over a permission
-		// failure would bury it under a long, doomed push.
-		return "", fmt.Errorf("look up %s: %w", ref, err)
-	}
-
-	source, err := c.findSource(c.sourceDir)
-	if err != nil {
-		return "", fmt.Errorf("%s is not in the instance's registry yet and there is no farcast checkout to build it from "+
-			"(run connect from a farcast checkout, or pass --source <dir>): %w", ref, err)
-	}
-	ok, err := c.confirmBuild(env, ref, source)
-	if err != nil {
-		return "", err
-	}
-	if !ok {
-		fprintln(env.Err, "Aborted.")
-		return "", fmt.Errorf("%s is not in the instance's registry and building it was declined", ref)
-	}
-	return b.BuildAndPush(ctx, image.Options{
-		SourceDir:  source,
-		Package:    fatlinePackage,
-		Ref:        ref,
-		BinaryPath: fatlineBinary,
-		Entrypoint: []string{fatlineBinary},
-	}, user, pass)
-}
-
-// confirmBuild gates building FatLine's image from source. It is not a cost
-// gate — registry storage is ~$0 (ADR 0007 decision 8) — it is a consent gate:
-// the build compiles *this* checkout and pushes the result into the one place
-// the instance runs code from, so the operator should know it is happening and
-// from where.
-func (c *connectCommand) confirmBuild(env *Env, ref, source string) (bool, error) {
-	if c.assumeYes {
-		return true, nil
-	}
-	if !isInteractive(env) {
-		return false, usagef("%s is not in the instance's registry yet; pass --yes to build it from %s and push it there", ref, source)
-	}
-	fprintf(env.Err, "FatLine's image %s is not in the instance's registry yet.\n", ref)
-	fprintf(env.Err, "It would be compiled from %s with the local Go toolchain (no container engine) and pushed there.\n", source)
-	return newPrompter(env.In, env.Err).yesNo("Build and push it now?")
-}
-
-// progressTo returns the sink for build progress: stderr while the operator is
-// watching, nothing otherwise — stdout carries only the command's result.
-func (c *connectCommand) progressTo(env *Env) func(string) {
-	if !isInteractive(env) && !env.Verbose {
-		return nil
-	}
-	return func(line string) { fprintf(env.Err, "  %s\n", line) }
-}
-
 // bootstrap deploys FatLine and provisions its public carrier. It records the
 // (billable) load balancer before waiting for its IP, so an interrupted wait
 // never strands an unrecorded cost — the same cost-pillar ordering as install.
@@ -520,13 +292,7 @@ func (c *connectCommand) bootstrap(ctx context.Context, env *Env, name string, m
 		return err
 	}
 
-	manifests, err := deploy.Render(deploy.Config{
-		Image:         img,
-		Carrier:       deploy.CarrierLoadBalancer,
-		CACertPEM:     mtls.CACertPEM,
-		ServerCertPEM: mtls.ServerCertPEM,
-		ServerKeyPEM:  mtls.ServerKeyPEM,
-	})
+	manifests, err := renderWorkload(img, deploy.CarrierLoadBalancer, mtls)
 	if err != nil {
 		return err
 	}
@@ -552,7 +318,7 @@ func (c *connectCommand) bootstrap(ctx context.Context, env *Env, name string, m
 		fprintf(env.Err, "Re-run 'farcast connect %s' to record it; 'farcast release %s' still tears the instance down.\n", name, name)
 	}
 
-	if err := cl.RolloutStatus(ctx, deploy.DefaultNamespace, deploy.DefaultName, 3*time.Minute); err != nil {
+	if err := cl.RolloutStatus(ctx, deploy.DefaultNamespace, deploy.DefaultName, fatlineRolloutTimeout); err != nil {
 		return fmt.Errorf("FatLine rollout: %w", err)
 	}
 	if isInteractive(env) || env.Verbose {

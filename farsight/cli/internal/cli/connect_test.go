@@ -24,11 +24,13 @@ import (
 )
 
 type fakeCluster struct {
-	applied  [][]byte
-	rollouts int
-	ip       string
-	ipErr    error
-	applyErr error
+	applied    [][]byte
+	rollouts   int
+	ip         string
+	ipCalls    int
+	ipErr      error
+	applyErr   error
+	rolloutErr error
 }
 
 func (f *fakeCluster) Apply(_ context.Context, m []byte) error {
@@ -38,10 +40,11 @@ func (f *fakeCluster) Apply(_ context.Context, m []byte) error {
 
 func (f *fakeCluster) RolloutStatus(_ context.Context, _, _ string, _ time.Duration) error {
 	f.rollouts++
-	return nil
+	return f.rolloutErr
 }
 
 func (f *fakeCluster) WaitExternalIP(_ context.Context, _, _ string, _ time.Duration) (string, error) {
+	f.ipCalls++
 	if f.ipErr != nil {
 		return "", f.ipErr
 	}
@@ -175,6 +178,27 @@ func installedInstance(t *testing.T, dir config.Dir, name string) *config.Instan
 	return meta
 }
 
+// connectedInstance is an installed instance that has been through a first
+// connect: its mTLS material exists and its carrier is bound. That is the state
+// a reconnect re-dials — and the precondition redeploy refuses to work without.
+func connectedInstance(t *testing.T, dir config.Dir, name string) *config.InstanceMetadata {
+	t.Helper()
+	meta := installedInstance(t, dir, name)
+	mat, err := identity.Mint(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dir.SaveInstanceMTLS(name, toConfigMTLS(mat)); err != nil {
+		t.Fatal(err)
+	}
+	meta.FatLineDeployed = true
+	meta.Carrier = &config.Carrier{Type: "nlb", Endpoint: "9.9.9.9:8443", ServerName: identity.ServerName(name)}
+	if err := dir.SaveInstanceMetadata(name, meta); err != nil {
+		t.Fatal(err)
+	}
+	return meta
+}
+
 func TestConnectBootstrapsAndReports(t *testing.T) {
 	dir := config.Dir(t.TempDir())
 	const name = "prod"
@@ -282,20 +306,7 @@ func TestConnectStatusOnlyBeforeBootstrap(t *testing.T) {
 func TestConnectReconnectSkipsBootstrap(t *testing.T) {
 	dir := config.Dir(t.TempDir())
 	const name = "prod"
-	meta := installedInstance(t, dir, name)
-
-	mat, err := identity.Mint(name)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := dir.SaveInstanceMTLS(name, toConfigMTLS(mat)); err != nil {
-		t.Fatal(err)
-	}
-	meta.FatLineDeployed = true
-	meta.Carrier = &config.Carrier{Type: "nlb", Endpoint: "9.9.9.9:8443", ServerName: identity.ServerName(name)}
-	if err := dir.SaveInstanceMetadata(name, meta); err != nil {
-		t.Fatal(err)
-	}
+	connectedInstance(t, dir, name)
 
 	fc := &fakeCluster{}
 	fp := &fakeProvider{}
@@ -326,7 +337,7 @@ func TestConnectReconnectSkipsBootstrap(t *testing.T) {
 	if len(fb.resolved) != 0 || len(fb.built) != 0 {
 		t.Fatalf("a reconnect must not touch images: resolved=%v built=%v", fb.resolved, fb.built)
 	}
-	meta, _ = dir.LoadInstanceMetadata(name)
+	meta, _ := dir.LoadInstanceMetadata(name)
 	if meta.Registry == nil || meta.Registry.Prefix == "" {
 		t.Fatalf("the re-ensured registry was not recorded: %+v", meta.Registry)
 	}
@@ -484,20 +495,7 @@ func TestConnectMissingImageNonInteractiveRequiresYes(t *testing.T) {
 func TestConnectStatusDoesNoRegistryWork(t *testing.T) {
 	dir := config.Dir(t.TempDir())
 	const name = "prod"
-	meta := installedInstance(t, dir, name)
-
-	mat, err := identity.Mint(name)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := dir.SaveInstanceMTLS(name, toConfigMTLS(mat)); err != nil {
-		t.Fatal(err)
-	}
-	meta.FatLineDeployed = true
-	meta.Carrier = &config.Carrier{Type: "nlb", Endpoint: "9.9.9.9:8443", ServerName: identity.ServerName(name)}
-	if err := dir.SaveInstanceMetadata(name, meta); err != nil {
-		t.Fatal(err)
-	}
+	connectedInstance(t, dir, name)
 
 	fc := &fakeCluster{}
 	c := newConnectCommand()
@@ -527,20 +525,7 @@ func TestConnectStatusDoesNoRegistryWork(t *testing.T) {
 func TestConnectRegistryFailureDoesNotBreakReconnect(t *testing.T) {
 	dir := config.Dir(t.TempDir())
 	const name = "prod"
-	meta := installedInstance(t, dir, name)
-
-	mat, err := identity.Mint(name)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := dir.SaveInstanceMTLS(name, toConfigMTLS(mat)); err != nil {
-		t.Fatal(err)
-	}
-	meta.FatLineDeployed = true
-	meta.Carrier = &config.Carrier{Type: "nlb", Endpoint: "9.9.9.9:8443", ServerName: identity.ServerName(name)}
-	if err := dir.SaveInstanceMetadata(name, meta); err != nil {
-		t.Fatal(err)
-	}
+	connectedInstance(t, dir, name)
 
 	// The stored installer credential predates ADR 0007's role, so the
 	// defensive ensure is refused — a working reconnect must survive it.
@@ -679,19 +664,7 @@ func TestConnectRejectsImageFlagsOnReconnect(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := config.Dir(t.TempDir())
 			const name = "prod"
-			meta := installedInstance(t, dir, name)
-			mat, err := identity.Mint(name)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := dir.SaveInstanceMTLS(name, toConfigMTLS(mat)); err != nil {
-				t.Fatal(err)
-			}
-			meta.FatLineDeployed = true
-			meta.Carrier = &config.Carrier{Type: "nlb", Endpoint: "9.9.9.9:8443", ServerName: identity.ServerName(name)}
-			if err := dir.SaveInstanceMetadata(name, meta); err != nil {
-				t.Fatal(err)
-			}
+			connectedInstance(t, dir, name)
 
 			fc := &fakeCluster{}
 			c := testConnect(&fakeProvider{}, &fakeBuilder{})
@@ -700,7 +673,7 @@ func TestConnectRejectsImageFlagsOnReconnect(t *testing.T) {
 			tc.apply(c)
 
 			env, _ := testEnv(dir, output.ModeHuman)
-			err = c.Run(context.Background(), env, []string{name})
+			err := c.Run(context.Background(), env, []string{name})
 			if err == nil {
 				t.Fatal("reconnect accepted an image flag it cannot honour")
 			}
@@ -746,19 +719,7 @@ func TestConnectStatusMintsNothing(t *testing.T) {
 func TestConnectStatusRejectsImageFlags(t *testing.T) {
 	dir := config.Dir(t.TempDir())
 	const name = "prod"
-	meta := installedInstance(t, dir, name)
-	mat, err := identity.Mint(name)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := dir.SaveInstanceMTLS(name, toConfigMTLS(mat)); err != nil {
-		t.Fatal(err)
-	}
-	meta.FatLineDeployed = true
-	meta.Carrier = &config.Carrier{Type: "nlb", Endpoint: "9.9.9.9:8443", ServerName: identity.ServerName(name)}
-	if err := dir.SaveInstanceMetadata(name, meta); err != nil {
-		t.Fatal(err)
-	}
+	connectedInstance(t, dir, name)
 
 	c := testConnect(&fakeProvider{}, &fakeBuilder{})
 	c.statusOnly = true
@@ -831,5 +792,33 @@ func TestImageTagIsAlwaysValid(t *testing.T) {
 		if ref.Tag != got {
 			t.Errorf("imageTag(%q) round-tripped to %q", v, ref.Tag)
 		}
+	}
+}
+
+// TestConnectRejectsBothImageFlags mirrors redeploy's guard. Image resolution is
+// shared between the two commands and answers --fatline-image before it looks at
+// --source, so accepting both would silently honour one — the outcome the guard
+// exists to prevent, and the reason it must not live in only one command.
+func TestConnectRejectsBothImageFlags(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	const name = "prod"
+	installedInstance(t, dir, name)
+
+	fc := &fakeCluster{ip: "34.0.0.1"}
+	c := testConnect(&fakeProvider{}, &fakeBuilder{})
+	c.newCluster = func(string) clusterApplier { return fc }
+	c.dial = connectedDial()
+	c.assumeYes = true
+	c.fatlineImage = "example.test/repo/fatline:2"
+	c.sourceDir = t.TempDir()
+
+	env, _ := testEnv(dir, output.ModeHuman)
+	if err := c.Run(context.Background(), env, []string{name}); err == nil {
+		t.Fatal("accepted --fatline-image together with --source")
+	} else if !strings.Contains(err.Error(), "one or the other") {
+		t.Errorf("err = %v, want it to name the conflict", err)
+	}
+	if fc.applied != nil {
+		t.Error("applied a workload despite the usage error")
 	}
 }

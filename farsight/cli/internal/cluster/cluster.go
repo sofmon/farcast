@@ -38,7 +38,7 @@ func (r execRunner) Run(ctx context.Context, stdin []byte, args ...string) ([]by
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	if err := cmd.Run(); err != nil {
 		if errors.Is(err, exec.ErrNotFound) {
-			return nil, errors.New("kubectl not found on PATH — farcast connect needs kubectl and the gke-gcloud-auth-plugin")
+			return nil, errors.New("kubectl not found on PATH — deploying into an instance needs kubectl and the gke-gcloud-auth-plugin")
 		}
 		if msg := strings.TrimSpace(errb.String()); msg != "" {
 			return nil, fmt.Errorf("kubectl %s: %s", strings.Join(args, " "), msg)
