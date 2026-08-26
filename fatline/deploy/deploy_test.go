@@ -164,3 +164,41 @@ func TestRenderSecretIsReadableByTheNonRootContainer(t *testing.T) {
 		t.Error("secret is mounted 0400: root-only, unreadable by the non-root container")
 	}
 }
+
+// TestRenderMTLSHashTracksTheMaterial: rotating the mTLS material must change
+// the pod template, or nothing restarts. Kubernetes updates a mounted Secret in
+// place and FatLine loads its certificate once at start-up, so without this
+// fingerprint a rotation would update the Secret, leave the Deployment spec
+// byte-identical, and let the rollout report success while the old certificate
+// kept serving.
+func TestRenderMTLSHashTracksTheMaterial(t *testing.T) {
+	render := func(serverCert string) string {
+		out, err := Render(Config{
+			Image:         "example.test/repo/fatline@sha256:" + strings.Repeat("a", 64),
+			Carrier:       CarrierLoadBalancer,
+			CACertPEM:     []byte("ca"),
+			ServerCertPEM: []byte(serverCert),
+			ServerKeyPEM:  []byte("key"),
+		})
+		if err != nil {
+			t.Fatalf("Render: %v", err)
+		}
+		return string(out)
+	}
+	first, rotated, same := render("leaf-1"), render("leaf-2"), render("leaf-1")
+
+	if !strings.Contains(first, "farcast.sofmon.com/mtls-hash:") {
+		t.Fatal("pod template carries no mTLS fingerprint; a rotation would restart nothing")
+	}
+	hash := func(manifest string) string {
+		_, rest, _ := strings.Cut(manifest, "farcast.sofmon.com/mtls-hash: ")
+		line, _, _ := strings.Cut(rest, "\n")
+		return strings.TrimSpace(line)
+	}
+	if hash(first) == hash(rotated) {
+		t.Error("rotating the server leaf left the fingerprint unchanged; the Pod would keep the old certificate")
+	}
+	if hash(first) != hash(same) {
+		t.Error("identical material produced different fingerprints; every redeploy would churn the Pod")
+	}
+}

@@ -13,7 +13,9 @@ package deploy
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"text/template"
@@ -101,12 +103,31 @@ func Render(c Config) ([]byte, error) {
 		CACert:     base64.StdEncoding.EncodeToString(c.CACertPEM),
 		ServerCert: base64.StdEncoding.EncodeToString(c.ServerCertPEM),
 		ServerKey:  base64.StdEncoding.EncodeToString(c.ServerKeyPEM),
+		MTLSHash:   mtlsHash(c.CACertPEM, c.ServerCertPEM, c.ServerKeyPEM),
 	}
 	var buf bytes.Buffer
 	if err := workloadTemplate.Execute(&buf, data); err != nil {
 		return nil, fmt.Errorf("deploy: render workload: %w", err)
 	}
 	return buf.Bytes(), nil
+}
+
+// mtlsHash fingerprints the mTLS material so a change to it reaches the running
+// process.
+//
+// Kubernetes updates a mounted Secret in place, and FatLine reads its
+// certificate once at start-up — so rotating the material while the Deployment
+// spec stays byte-identical would update the Secret, restart nothing, and let
+// `kubectl rollout status` report success against a Pod still serving the old
+// certificate. Carrying the fingerprint in the pod template makes any change to
+// the material a spec change, which is what actually triggers a rolling
+// restart.
+func mtlsHash(parts ...[]byte) string {
+	h := sha256.New()
+	for _, p := range parts {
+		_, _ = h.Write(p)
+	}
+	return hex.EncodeToString(h.Sum(nil))[:32]
 }
 
 type templateData struct {
@@ -118,6 +139,7 @@ type templateData struct {
 	EgressPort int
 	SecretName string
 	MountPath  string
+	MTLSHash   string
 	CACert     string
 	ServerCert string
 	ServerKey  string
@@ -165,6 +187,12 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: fatline
+      annotations:
+        # Fingerprint of the mounted mTLS material. It exists to make a
+        # certificate rotation restart the Pod: without it the Deployment spec
+        # would be unchanged, apply would be a no-op, and the old certificate
+        # would keep serving while the rollout reported success.
+        farcast.sofmon.com/mtls-hash: {{.MTLSHash}}
     spec:
       automountServiceAccountToken: false
       securityContext:
