@@ -302,11 +302,14 @@ farcast costs my-instance
 # Connect to a FarCast instance via FarSight
 farcast connect my-instance
 
+# Re-apply FatLine's workload to a connected instance
+farcast redeploy my-instance
+
 # Terminate an instance
 farcast release my-instance
 ```
 
-*Implemented today: `install`, `connect`, `release` (plus `version` and `help`). `run`, `ps`, and `costs` are registered but stubbed until Phase 4.*
+*Implemented today: `install`, `connect`, `redeploy`, `release` (plus `version` and `help`). `run`, `ps`, and `costs` are registered but stubbed until Phase 4.*
 
 Full CLI reference → [`farsight/cli/README.md`](farsight/cli/README.md)
 
@@ -348,7 +351,7 @@ Each module folder contains its own `README.md` with:
 | DataSphere | 🔲 Draft | 🔲 Not started |
 | Shrike | 🟡 In progress | 🟡 Policy engine |
 | AllThing | 🔲 Draft | 🔲 Not started |
-| FarSight | 🟡 In progress | 🟡 CLI: `install`, `release`, `connect`; engine-less image build |
+| FarSight | 🟡 In progress | 🟡 CLI: `install`, `release`, `connect`, `redeploy`; engine-less image build |
 | SDK | 🟡 In progress | 🟡 Go: logging live, interfaces stubbed |
 | Manifest Spec | ✅ Complete | ✅ Parser + tests |
 

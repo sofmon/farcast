@@ -4,9 +4,9 @@
 
 `farcast` is the command line face of [FarSight](../README.md), the FarCast UX layer. The same downloadable "farcast" app provides a GUI (the tiling browser), a server (UX composition inside an instance), and this CLI. The CLI is what operators and automation use to provision instances, deploy repositories, connect through FatLine, and monitor spending.
 
-This document specifies the CLI phase by phase — the scaffold (1.1) and each command landed since: `install` (1.3), `release` (1.4), and `connect` (2.3). **Phase 1.1 — the CLI scaffold** (implemented): the command framework, the two commands that work from day one (`version`, `help`), local configuration handling, and the human/JSON output model. **Phase 1.3 — `farcast install`** (implemented): the first command that does real, billable work — interactively provisioning a cloud instance through Planck under a mandatory cost limit. The scaffold is what makes `install` a small, uniform addition.
+This document specifies the CLI phase by phase — the scaffold (1.1) and each command landed since: `install` (1.3), `release` (1.4), and `connect` + `redeploy` (2.3). **Phase 1.1 — the CLI scaffold** (implemented): the command framework, the two commands that work from day one (`version`, `help`), local configuration handling, and the human/JSON output model. **Phase 1.3 — `farcast install`** (implemented): the first command that does real, billable work — interactively provisioning a cloud instance through Planck under a mandatory cost limit. The scaffold is what makes `install` a small, uniform addition.
 
-> **Status.** **Phase 1.1 (scaffold) — implemented** (`go test -race`, `go vet`, and `golangci-lint` all clean): argument parsing and subcommand routing, `farcast version`, `farcast help`, local config file handling, and human + JSON output formatting. **Phase 1.3 (`farcast install`) — implemented** (`go test -race`, `go vet`, `golangci-lint` all clean): interactive provisioning through [Planck](../../planck/README.md), a mandatory cost limit, a management-API + DNS-endpoint health check, the instance's own container image registry ([ADR 0007](../../docs/adr/0007-instance-owned-image-registry.md)), and record-before-create local persistence of instance metadata + credentials + kubeconfig. **Phase 1.4 (`farcast release`) — implemented** (`go test -race`, `go vet`, `golangci-lint` all clean): the destructive counterpart that tears the cluster down through Planck, deletes the instance's registry with it, and removes local state, initiating the cloud delete before removing the record so a failed delete call never strands billable infrastructure (deletion completes asynchronously — see the 1.4 known limitation). **Phase 2.3 (`farcast connect`) — implemented** (`go test -race`, `go vet`, `golangci-lint` all clean): it mints the per-instance mTLS identity (CA key kept local), re-ensures the instance's registry and sources FatLine's image from it — compiling and pushing that image itself, from a farcast checkout, with **no container engine on the operator's machine** ([ADR 0007](../../docs/adr/0007-instance-owned-image-registry.md)) — bootstrap-deploys FatLine via kubectl **pinned to the image's digest** ([ADR 0006](../../docs/adr/0006-connect-bootstrap-kubectl.md)), provisions its public mTLS load-balancer carrier under a cost-confirmation gate ([ADR 0005](../../docs/adr/0005-fatline-data-plane-ingress.md)), dials the tunnel, and reports status. The orchestration is unit-tested against a fake cluster runner, a fake registry provider, a fake image builder and an injected tunnel dial; the real public-NLB path is `//go:build integration`, never in CI (cost pillar), as is the one test that pulls from a real public registry. Every remaining command is **registered but stubbed** — it appears in `help` and routes correctly, but exits non-zero with a "not yet implemented" message naming its [`PLAN.md`](../../PLAN.md) phase (`run`/`ps`/`logs`/`costs` → 4.3, and so on).
+> **Status.** **Phase 1.1 (scaffold) — implemented** (`go test -race`, `go vet`, and `golangci-lint` all clean): argument parsing and subcommand routing, `farcast version`, `farcast help`, local config file handling, and human + JSON output formatting. **Phase 1.3 (`farcast install`) — implemented** (`go test -race`, `go vet`, `golangci-lint` all clean): interactive provisioning through [Planck](../../planck/README.md), a mandatory cost limit, a management-API + DNS-endpoint health check, the instance's own container image registry ([ADR 0007](../../docs/adr/0007-instance-owned-image-registry.md)), and record-before-create local persistence of instance metadata + credentials + kubeconfig. **Phase 1.4 (`farcast release`) — implemented** (`go test -race`, `go vet`, `golangci-lint` all clean): the destructive counterpart that tears the cluster down through Planck, deletes the instance's registry with it, and removes local state, initiating the cloud delete before removing the record so a failed delete call never strands billable infrastructure (deletion completes asynchronously — see the 1.4 known limitation). **Phase 2.3 (`farcast connect`) — implemented** (`go test -race`, `go vet`, `golangci-lint` all clean): it mints the per-instance mTLS identity (CA key kept local), re-ensures the instance's registry and sources FatLine's image from it — compiling and pushing that image itself, from a farcast checkout, with **no container engine on the operator's machine** ([ADR 0007](../../docs/adr/0007-instance-owned-image-registry.md)) — bootstrap-deploys FatLine via kubectl **pinned to the image's digest** ([ADR 0006](../../docs/adr/0006-connect-bootstrap-kubectl.md)), provisions its public mTLS load-balancer carrier under a cost-confirmation gate ([ADR 0005](../../docs/adr/0005-fatline-data-plane-ingress.md)), dials the tunnel, and reports status. The orchestration is unit-tested against a fake cluster runner, a fake registry provider, a fake image builder and an injected tunnel dial; the real public-NLB path is `//go:build integration`, never in CI (cost pillar), as is the one test that pulls from a real public registry. **`farcast redeploy` — implemented** (same clean bar): the operational counterpart to the bootstrap — it re-renders and re-applies FatLine's workload for an already-connected instance, resolving the image through the *same* code `connect` uses, so a FatLine security fix rolls out without `release` and a reinstall; it never re-provisions the carrier and never re-mints the CA, and it re-applies even when the digest is unchanged (the failure it was built for lived in the workload template, not the image). Every remaining command is **registered but stubbed** — it appears in `help` and routes correctly, but exits non-zero with a "not yet implemented" message naming its [`PLAN.md`](../../PLAN.md) phase (`run`/`ps`/`logs`/`costs` → 4.3, and so on).
 
 ---
 
@@ -69,6 +69,7 @@ farcast [global flags] <command> [command flags] [arguments]
 | `install` | ✅ works | Provision a new instance on a cloud provider (interactive) | 1.3 |
 | `release` | ✅ works | Destroy an instance and clean up local state | 1.4 |
 | `connect` | ✅ works | Open a FatLine tunnel to an instance | 2.3 |
+| `redeploy` | ✅ works | Re-apply FatLine's workload to a connected instance | 2.3 |
 | `run` | ⏳ stub | Deploy a Git repository to an instance | 4.3 |
 | `ps` | ⏳ stub | List running applications | 4.3 |
 | `logs` | ⏳ stub | Stream an application's logs | 4.3 |
@@ -136,12 +137,13 @@ Usage:
   farcast [global flags] <command> [command flags] [arguments]
 
 Commands:
-  version     Print version information
-  help        Show help for farcast or a command
-  install     Provision a new instance on a cloud provider
-  release     Destroy an instance and clean up local state
-  connect     Open a FatLine tunnel to an instance
-  run         Deploy a Git repository to an instance         (not yet implemented — phase 4.3)
+  version    Print version information
+  help       Show help for farcast or a command
+  install    Provision a new instance on a cloud provider
+  release    Destroy an instance and clean up local state
+  connect    Open a FatLine tunnel to an instance
+  redeploy   Re-apply FatLine's workload to a connected instance
+  run        Deploy a Git repository to an instance   (not yet implemented — phase 4.3)
   …
 
 Global flags:
@@ -421,7 +423,10 @@ already running; it renders and applies nothing. So `--fatline-image` or
 `--source` on an already-connected instance is refused with a usage error rather
 than silently ignored — reporting success while the previous image kept serving
 is the worst possible answer when the flag is being used to roll out a FatLine
-fix. Changing the image of a running instance is not yet a supported operation.
+fix. Changing what a connected instance runs is
+[`farcast redeploy`](#farcast-redeploy--replace-a-connected-instances-fatline-workload-phase-23)'s
+job, and the refusal names it: `connect` opens the tunnel, `redeploy` changes
+what runs inside it.
 
 **A registry failure stops only a connect that needs the registry.** `--status` does no registry work whatsoever — a health probe must not depend on it. A reconnect to an instance already running FatLine, or a connect carrying an explicit `--fatline-image`, degrades a failed ensure to a stderr warning and carries on; that is what keeps an instance installed before ADR 0007 — whose stored installer credential predates `roles/artifactregistry.admin` — reconnectable.
 
@@ -449,8 +454,8 @@ farcast connect <instance> [flags]
 | `--carrier <nlb>` | Data-plane carrier (default `nlb`, the public mTLS load balancer). The seam reserves `cp-forward` (control-plane fallback) for a later phase. |
 | `--status` | Don't bootstrap or provision anything — just dial the already-bound carrier and report status (re-connect / health probe). Does **no registry work at all**. Fails if the instance was never connected. |
 | `--yes`, `-y` | Skip the LB-cost confirmation **and** the build-and-push confirmation; required when non-interactive. |
-| `--fatline-image <ref>` | FatLine container image to deploy. Defaults to the **instance's own registry** — `<prefix>/system/fatline:<version>`, which `connect` builds and pushes when it is not there yet. An explicit ref is deployed exactly as given, with no preflight and no registry access. First connect only: refused on a reconnect, which deploys nothing. |
-| `--source <dir>` | The farcast checkout to build FatLine's image from (default: auto-detected by walking up from the working directory). Read only when the image has to be built, so likewise refused on a reconnect. |
+| `--fatline-image <ref>` | FatLine container image to deploy. Defaults to the **instance's own registry** — `<prefix>/system/fatline:<version>`, which `connect` builds and pushes when it is not there yet. An explicit ref is deployed exactly as given, with no preflight and no registry access. First connect only: refused on a reconnect, which deploys nothing — use `farcast redeploy --fatline-image` to change what a connected instance runs. |
+| `--source <dir>` | The farcast checkout to build FatLine's image from (default: auto-detected by walking up from the working directory). Naming it explicitly is a request to *build*: the image is compiled and pushed without a preflight, even if the reference already resolves ([why](#why---source-forces-a-rebuild)). Likewise refused on a reconnect (`farcast redeploy --source` is what rebuilds for a connected instance). |
 
 Global flags (`--output`, `--verbose`, `--config`) apply. With `--output json` the command prints one JSON result and never prompts (so the cost gate must be pre-answered with `--yes`).
 
@@ -524,6 +529,103 @@ The two image packages are tested a layer down. `oci` runs against an `httptest`
 
 ---
 
+## `farcast redeploy` — replace a connected instance's FatLine workload (Phase 2.3)
+
+`farcast redeploy <instance>` re-renders and re-applies FatLine's workload for an instance that is **already connected**. It is how a fix to the network boundary reaches a running instance — a new image, a changed manifest, or both — without touching the carrier, the mTLS identity, or anything else the instance is.
+
+It exists because the alternative was destroying the instance. The first live Phase 2 Part B deploy crash-looped: FatLine's mTLS `Secret` was mounted root-only and the non-root container could not read its own key (fixed in `e4c066e`). Rolling that fix out took hand-editing `fatline_deployed: false` into the instance's `metadata.yaml` to trick `connect` into bootstrapping again, because `connect` skips its bootstrap entirely once the instance is deployed and bound. The only supported alternative was `release` plus a reinstall — destroying an entire instance to patch the thing guarding it. That is the wrong price to attach to a security fix, because it is the price that makes an operator postpone one.
+
+The division of labour is the point: **`connect` opens the tunnel, `redeploy` changes what runs inside it.** Redeploy never provisions a carrier and never mints a CA, so nothing it does is billable-new and the instance's public endpoint and trust root are exactly what they were.
+
+### Flow
+
+1. **Resolve the instance** — load `metadata.yaml` (its `credentials.yaml` and `kubeconfig.yaml` are read by the steps below that need them). An instance being released is refused, as it is by `connect`. An instance that was never connected — no `fatline_deployed`, no carrier — is refused too, directed at `farcast connect <instance>`: redeploy replaces a workload, it does not create one, and inventing a carrier here would duplicate connect's bootstrap (billable half included) behind a verb that promises not to.
+2. **Load the data-plane identity** — the per-instance CA certificate and FatLine's server leaf, **loaded, never minted**. FatLine is already running and already trusts a CA; a fresh one would only produce certificates it must reject, and would overwrite the record of what it actually trusts. Missing material is therefore reported as unrecoverable (the same message `connect` gives a deployed instance), never replaced.
+3. **Ensure the instance's registry** — the same idempotent ensure `install` and `connect` run ([above](#the-instances-registry)). It comes first because the image may have to be built and pushed into it. A failure stops only a redeploy that needs it: with an explicit `--fatline-image` nothing is looked up or pushed, so the ensure degrades to a stderr warning.
+4. **Resolve FatLine's image** — *identical* to connect's resolution, from the same code: default to `<prefix>/system/fatline:<version>` in the instance's own registry, preflight it, offer to compile and push it from a farcast checkout when it is missing, and deploy pinned by digest; an explicit `--fatline-image` is deployed exactly as given ([above](#where-fatlines-image-comes-from-adr-0007)), and an explicit `--source` skips the preflight and rebuilds ([below](#why---source-forces-a-rebuild)). The two commands share one implementation rather than two copies, because that path is the supply chain for the instance's network boundary and a second, subtly different copy of those rules is how an unpinned deploy eventually arrives.
+5. **Confirm the change** — show what will change and ask ([below](#the-consent-gate-and-why-there-is-no-cost-gate)). `--yes` skips it; non-interactive without `--yes` is a usage error.
+6. **Render & apply** — render the workload for the carrier the instance is **already bound to**, never a default, and apply it through the same kubectl seam `connect` uses. Re-rendering a bound instance with a different Service type would tear down the point of presence the operator reaches it through and, for the load balancer, replace a standing billable resource and its public IP as a side effect of a workload change nobody asked to be one.
+7. **Wait, then record** — wait for the rollout, and write the deployed digest into `metadata.yaml` **only once that rollout has succeeded**. This is the one ordering redeploy deliberately inverts from `connect`, which records before waiting because it is racing to record a billable load balancer; nothing here becomes billable. FatLine runs a single replica under the default strategy, so a rollout that never goes ready leaves the *previous* image serving traffic — recording early would name an image that never served a byte, on the exact path this command exists for. A failed rollout leaves the record alone and — when local state records what was there — names the image still serving and the `kubectl describe pod` that explains why the new one is not.
+8. **Report** — old digest → new digest, the fact that the digest did not change, or just the image when local state had nothing to compare against.
+
+### Command surface
+
+```
+farcast redeploy <instance> [flags]
+```
+
+| Flag | Meaning |
+|---|---|
+| `<instance>` | The instance to redeploy (positional, required). Must already be connected. |
+| `--yes`, `-y` | Skip the change confirmation **and** the build-and-push confirmation; required when non-interactive. |
+| `--fatline-image <ref>` | FatLine container image to deploy. Defaults to the instance's own registry — `<prefix>/system/fatline:<version>` — which redeploy builds and pushes when it is not there yet. An explicit ref is deployed exactly as given, with no preflight and no registry lookup. |
+| `--source <dir>` | The farcast checkout to build FatLine's image from (default: auto-detected by walking up from the working directory). Naming it explicitly **forces** the rebuild-and-push ([below](#why---source-forces-a-rebuild)). |
+
+Global flags (`--output`, `--verbose`, `--config`) apply. With `--output json` the command prints one JSON result and never prompts (so the change gate must be pre-answered with `--yes`). There is deliberately **no `--carrier` flag**: the carrier is whatever the instance is already bound to, and changing it is `connect`'s business, not a workload update's.
+
+### Why `--source` forces a rebuild
+
+With neither image flag, redeploy preflights the instance-registry reference and deploys the digest it finds there, building only if the image is absent — connect's behaviour exactly. `--source <dir>` overrides that: it is read as a request to *build*, so the checkout is compiled and pushed with no preflight at all.
+
+It has to be, because the default tag is derived from the **CLI's** version, and that does not move when FatLine's own code does. Against a connected instance the preflight therefore always hits the image already sitting in the registry. Without the force, an operator who had just patched a FatLine bug would redeploy their own stale image and be told it worked — on precisely the class of fix this command exists to ship.
+
+That makes the two image flags opposed intents — "deploy exactly this" against "build from here and deploy that" — so passing both is a usage error rather than a silent choice between them.
+
+### The consent gate, and why there is no cost gate
+
+Redeploy asks before it applies, and what it asks about is the *change*, not the money:
+
+```
+this replaces the image "prod" runs: …/system/fatline@sha256:9f2c… → …/system/fatline@sha256:41ab….
+Re-apply FatLine's workload now? [y/N]:
+```
+
+There is **no ~$18/mo confirmation** here, and that is a deliberate protection of the gate that matters. The load balancer already exists and a redeploy makes nothing new billable, so re-asking the cost question would attach the cost prompt to an operation whose honest answer is always "nothing changes" — which is how a gate that guards real money ([ADR 0005](../../docs/adr/0005-fatline-data-plane-ingress.md)) gets trained into a reflex. One prompt, one meaning.
+
+Building the image from source keeps its own separate confirmation (the one `connect` uses), and it is asked *first*, because a push changes nothing about what the instance is running. Only the apply does — so the operator is asked about the apply with the resulting digest in hand rather than in the abstract. `--yes` covers both.
+
+**An unchanged digest still re-applies.** The failure this command was built for was a workload-*template* defect with the image byte-identical, so a redeploy that no-opped on a matching digest would be useless for exactly the case it exists for. It says so rather than pretending something moved:
+
+```
+"prod" already runs …/system/fatline@sha256:41ab… — image unchanged; re-applying the workload template.
+Re-apply FatLine's workload now? [y/N]:
+```
+
+### Output
+
+Human:
+
+```
+✓ redeployed FatLine to "prod"
+  carrier:     public mTLS NLB  34.120.0.5:8443 (unchanged)
+  registry:    us-central1-docker.pkg.dev/<project>/farcast-prod
+  previous:    us-central1-docker.pkg.dev/<project>/farcast-prod/system/fatline@sha256:9f2c…
+  image:       us-central1-docker.pkg.dev/<project>/farcast-prod/system/fatline@sha256:41ab…
+  rollout:     complete
+```
+
+The image lines report exactly as much as local state supports — three cases, never one dressed as another:
+
+- **The digest moved** → `previous:` then `image:`, as above.
+- **Nothing recorded to compare against** → `image:` alone, with no `previous:` line and no "unchanged" claim: local state does not know what the instance was running, so calling it unchanged would be a guess dressed as a fact.
+- **The digest did not move** → the two lines collapse into one that says what actually happened:
+
+```
+  image:       us-central1-docker.pkg.dev/<project>/farcast-prod/system/fatline@sha256:41ab… (unchanged; the workload template was re-applied)
+```
+
+`rollout: complete` is a fact the command waited for, not a hope: it is printed only after the Deployment reports its new Pods ready, so a crash-looping FatLine fails the command instead of being reported as a success — and, because the digest is recorded only after that wait, local state keeps naming the image that is still serving.
+
+JSON (`--output json`):
+
+```json
+{"name":"prod","carrier":"nlb","endpoint":"34.120.0.5:8443","registry":"us-central1-docker.pkg.dev/<project>/farcast-prod","previous_image":"…/system/fatline@sha256:9f2c…","image":"…/system/fatline@sha256:41ab…","image_changed":true,"status":"redeployed"}
+```
+
+`previous_image` is omitted for an instance whose local state does not record what it was running — the redeploy still proceeds, and says so. `image_changed` is `false` both there and when the digest did not move, so it answers "did the image move?" and never stands in for "did anything happen?" — the workload was re-applied either way.
+
+---
+
 ## Diagnostics
 
 Diagnostic logging is for the operator debugging the CLI, not for command output. It is plain text on **stderr**, gated by `--verbose`, built on the standard library's `log/slog` with a text handler. It is intentionally **not** the farcast SDK logger: the SDK is for in-instance applications and emitting JSON to stdout, which is the opposite of what an operator CLI wants. Keeping them separate also keeps the root module free of a dependency on the `sdk/go` module.
@@ -549,7 +651,10 @@ farsight/cli/
     │   ├── install.go         ← farcast install: provision via Planck, persist state  (1.3)
     │   ├── prompt.go          ← stdlib interactive prompts + TTY detection  (1.3)
     │   ├── release.go         ← farcast release: tear down via Planck, remove state  (1.4)
-    │   └── connect.go         ← farcast connect: mint identity, bootstrap FatLine, dial tunnel  (2.3)
+    │   ├── connect.go         ← farcast connect: mint identity, bootstrap FatLine, dial tunnel  (2.3)
+    │   ├── fatline.go         ← shared by connect + redeploy: image resolution, build gate,
+    │   │                        registry ensure, workload render  (2.3)
+    │   └── redeploy.go        ← farcast redeploy: re-render and re-apply FatLine's workload  (2.3)
     ├── output/                ← human/JSON printer, error formatting, exit codes
     │   └── output.go
     ├── cluster/               ← kubectl-subprocess wrapper: apply, await rollout, read LB IP  (2.3)
@@ -617,6 +722,7 @@ Per [AGENTS.md](../../AGENTS.md) and [ADR 0002](../../docs/adr/0002-backend-lang
 - **Config** — path resolution (flag/env/default precedence) and permission enforcement, using `t.TempDir()`; a too-permissive directory is rejected or repaired.
 - **`install`** — flag/prompt precedence; a missing or non-positive `--cost-limit` is rejected (the headline guarantee); unattended mode with a missing required flag exits `2`; the record-before-create ordering and `running`/`unreachable`/`error` state transitions are exercised against a **fake `planck.Provider`** (registered via `planck.Register`), with `t.TempDir()` for state and asserted `0700`/`0600` perms — no real cloud calls.
 - **`release`** — loads the recorded instance and tears it down via the fake `planck.Provider`, then removes local state; covers the delete-before-cleanup ordering (a `DeleteCluster` failure keeps the record), idempotent re-release of an already-gone cluster, the destructive confirmation (and `--yes`), and the unknown-instance error.
+- **`redeploy`** — shares connect's fakes, and covers what is specific to it: the refusal for an instance that was never connected or is being released, an explicit image deployed as given, the preflight-hit and preflight-miss (build) paths, `--source` forcing a rebuild over a resolvable reference (and preflighting nothing), the two image flags together as a usage error, an unchanged digest that still re-renders and re-applies, the recorded digest being updated on success — and *not* updated when the rollout fails, so the record keeps naming the image still serving — the consent gate as a usage error when non-interactive without `--yes`, one JSON result with no prompt, and, guarding the decision that matters most, that it never mints an mTLS identity and never waits for an external IP, so the trust root and the carrier are provably untouched.
 - Commands are tested by calling `Run` with buffers for `Out`/`Err` — no process spawning.
 
 ---
@@ -636,6 +742,12 @@ The choices made for the scaffold, with rationale:
 9. **`connect` mints the data-plane identity locally; the CA private key never leaves the machine (2.3).** The per-instance CA is the sovereign data-plane trust root ([ADR 0005](../../docs/adr/0005-fatline-data-plane-ingress.md)). `connect` mints it (and the operator client + FatLine server leaves) on first connect and pushes only the CA *certificate* + server leaf+key to the cluster Secret — never the CA key. The default carrier is the public mTLS-gated load balancer; its **standing ~$18/mo cost is confirmed against the cost limit** before provisioning (the carrier was ratified at 2.3 per [ADR 0005](../../docs/adr/0005-fatline-data-plane-ingress.md)).
 10. **The instance owns its image registry, and the default image reference moves there (1.3/2.3, [ADR 0007](../../docs/adr/0007-instance-owned-image-registry.md)).** Kubernetes has exactly one way to put code into a Pod — the kubelet pulls from a registry — so the only open question is *whose*. A Sofmon-published default (`ghcr.io/sofmon/farcast/fatline:<version>`, the first 2.3 cut) made every instance's network boundary depend on a third party's artifact feed: a standing central dependency, and a supply-chain injection point aimed at FatLine itself. It is **deleted, not deprecated**. `install` creates `farcast-<instance>` in the instance's own project and region and grants that cluster's nodes a repository-scoped `roles/artifactregistry.reader`; `connect` re-ensures it and defaults `--fatline-image` to `<prefix>/system/fatline:<version>`; `release` deletes it. Deploys **pin the digest**, never the tag, so whoever can write the tag cannot redirect a running Deployment. The capability is an *optional* Planck interface (`RegistryProvider`) promising an image-path prefix plus a credential — not "one repository object" — so a second cloud can realize the same contract without a caller changing.
 11. **The CLI builds and pushes FarCast's own images itself — no container engine, and no new dependency (2.3, [ADR 0007](../../docs/adr/0007-instance-owned-image-registry.md)).** FatLine's image is a static Go binary laid onto a digest-pinned distroless base, with no `RUN` steps to execute, so there is nothing an engine would do here that the CLI cannot: the compile shells to the **Go toolchain** (already a prerequisite for having a `farcast` binary at all, behind an injectable seam), and image assembly and push ride an OCI-distribution client the CLI owns, on `net/http` + `encoding/json` + `archive/tar` + `compress/gzip` + `crypto/sha256`. Requiring docker or podman would add an engine — on macOS, a Linux VM — to a tool whose premise is a small trusted base, and would write a push credential for the instance's registry into some other tool's credential store. Vendoring a registry library instead would have dragged seven to nine modules, docker's config and credential-helper packages among them, into the binary that holds the operator's cloud credentials and the instance's CA key. Both were measured and rejected: this feature ships with the vendored module count **unchanged at 31**. The cost lands as code FarCast owns — wire-protocol correctness is now ours to test, which is what the `oci` package's `httptest` suite and its opt-in run against a real registry are for.
+12. **Changing a connected instance's FatLine is its own top-level command, and it is consent-gated, not cost-gated (2.3).** Three choices, taken together:
+    - **A verb, not a flag.** `farcast redeploy <instance>` rather than `connect --redeploy`. It matches the `farcast <verb>` tree this CLI is built on (decision 1 — `storage` is the only two-level case) and keeps the two concerns legible: `connect` opens the tunnel, `redeploy` changes what runs inside it. A flag would have made the bootstrap-or-not branch inside `connect` a third mode of one command that already has two.
+    - **It re-applies even when the image digest is unchanged.** The failure that motivated it was a workload-*template* defect — FatLine's mTLS `Secret` mounted root-only, unreadable by the non-root container — with the image byte-identical, so a redeploy that no-opped on a matching digest would be useless for exactly the case it exists for. When the digest has not moved it says so plainly rather than implying something did.
+    - **A consent gate, not a cost gate.** The load balancer already exists and a redeploy makes nothing new billable, so re-prompting the ~$18/mo confirmation ([ADR 0005](../../docs/adr/0005-fatline-data-plane-ingress.md)) would attach the money prompt to an operation whose answer is always "nothing changes" — the way a gate that guards real money gets trained into a reflex. The prompt shows the change instead (old digest → new, or template-only); `--yes` waives it and a non-interactive session without `--yes` is a usage error, exactly as connect's gates behave.
+
+    It never re-provisions the carrier and never re-mints the CA — those stay `connect`'s, because the carrier is the standing cost and the per-instance CA is the sovereign trust root, and neither should move because someone rolled a new image. The reason this is a command at all is that the alternative was `release` plus a reinstall: destroying an entire instance to patch its network boundary is the price that makes an operator postpone a security fix.
 
 ---
 
@@ -650,6 +762,7 @@ The choices made for the scaffold, with rationale:
 | **1.3** | `install`: interactive provisioning, mandatory cost limit, health check, instance store, the instance's own image registry ([ADR 0007](../../docs/adr/0007-instance-owned-image-registry.md)) — **done** |
 | **1.4** | `release`: confirmed teardown via Planck, cluster *and* registry deleted before local cleanup, local removal — **done** |
 | **2.3** | `connect`: mint the per-instance mTLS identity, put FatLine's image in the instance's registry — compiled and pushed by the CLI, no container engine ([ADR 0007](../../docs/adr/0007-instance-owned-image-registry.md)) — bootstrap-deploy FatLine pinned to that digest, provision its public mTLS carrier ([ADR 0005](../../docs/adr/0005-fatline-data-plane-ingress.md)), dial the tunnel, report status — the seam later commands route through — **done** |
+| **2.3** | `redeploy`: re-render and re-apply FatLine's workload for a connected instance — a FatLine fix rolls out without destroying the instance; carrier and mTLS identity untouched — **done** |
 | 3.3 | `storage ls` / `storage cp` |
 | 4.3 | `run`, `ps`, `logs`, `costs` |
 | 6.2 | `chat` (terminal AI via [AllThing](../../allthing/README.md)) |

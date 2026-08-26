@@ -8,4 +8,4 @@ FarSight is the UX layer of FarCast. It ships as a single downloadable app calle
 - **cli/** — Go command line interface for operators and automation
 - **server/** — Go server running inside the FarCast instance for UX composition
 
-The CLI is specified and implemented through Phase 2.3 (`install`, `release`, `connect`) — see [`cli/README.md`](cli/README.md). The client (Electron GUI, Phase 7) and server components are scaffold-only; their specifications will follow.
+The CLI is specified and implemented through Phase 2.3 (`install`, `release`, `connect`, `redeploy`) — see [`cli/README.md`](cli/README.md). The client (Electron GUI, Phase 7) and server components are scaffold-only; their specifications will follow.

@@ -233,6 +233,22 @@ minutes** while the LB is assigned. ✅ Expect:
 > manifest, so egress denies by default; per-app allowlists arrive in 4.4. The
 > tunnel and status are what 2.3 proves.
 
+> **Rolling out a FatLine fix — `redeploy`, not `release`.** Once an instance is
+> connected, `connect` skips its bootstrap, so a change to FatLine (a patched
+> binary, a corrected workload template) reaches it through
+> [`farcast redeploy`](../../farsight/cli/README.md):
+> `./bin/farcast redeploy "$INSTANCE" --source . --yes` rebuilds the image from
+> this checkout and rolls it out; without `--source` it deploys the image already
+> in the instance's registry — and re-applies the workload **even when the digest
+> has not moved**, which is what fixes a workload-*template* defect. `--source` is
+> what *forces* the rebuild: the image tag tracks the CLI's version, not FatLine's,
+> so a preflight would otherwise resolve the image already there. The carrier and
+> the mTLS identity are never touched — same endpoint, same trust root, nothing new
+> billable, and so no cost prompt (only a confirmation of what will change, waived
+> by `--yes`). If `connect` never got as far as binding the carrier there is
+> nothing to replace: re-run `connect`, which resumes the bootstrap without
+> re-charging for the load balancer.
+
 ## B3. Verify the deployment independently (kubectl)
 
 ```bash
@@ -339,7 +355,7 @@ left billing.
 | Deployment stuck `ImagePullBackOff` | The node SA can't pull from the instance registry. `connect` grants `roles/artifactregistry.reader` on that one repository automatically, so this means the grant did not happen: check the installer SA has `roles/artifactregistry.admin` (Phase 1 step 2) and re-run `connect` — the ensure is idempotent. Inspect with `gcloud artifacts repositories get-iam-policy "farcast-$INSTANCE" --location "$REGION" --project "$PROJECT_ID"`. |
 | `connect` says the image is not in the registry and there is no checkout | It builds FatLine from a farcast checkout; run it from one, or pass `--source <dir>`. Non-interactively it also needs `--yes` to build. |
 | `ensure the image registry … permission denied` | The stored installer credential predates [ADR 0007](../adr/0007-instance-owned-image-registry.md). Add `roles/artifactregistry.admin` (Phase 1 step 2). A *reconnect* only warns and continues; a first connect needs it. |
-| `FatLine rollout` times out | `kubectl get pods -n farcast-system` then `kubectl describe`/`logs`. Usually the image (above) or Autopilot scheduling (give it a minute). |
+| `FatLine rollout` times out | `kubectl get pods -n farcast-system` then `kubectl describe`/`logs`. Usually the image (above) or Autopilot scheduling (give it a minute). Once you have a fix, roll it out with `./bin/farcast redeploy "$INSTANCE" --source . --yes` (see B2) — `--source` forces the rebuild, and the workload is re-applied even if the digest has not moved. A `redeploy` whose own rollout fails leaves the **previous** image serving (one replica, default strategy); it says which image that is and does not record the new digest, so local state still names what is actually serving. If the first `connect` never bound the carrier there is no deployment to replace yet: re-run `connect`. |
 | Load balancer IP never assigned | LB quota/region capacity; `kubectl describe svc fatline -n farcast-system` for events. Re-run `connect` — it is idempotent (won't re-prompt cost once `fatline_deployed` is recorded). |
 | Positive curl in B4 fails TLS | Wrong server name (must be `$INSTANCE.fatline.farcast`) or you skipped `--connect-to`. The cert's SAN is the synthetic name, pinned independently of the IP. |
 | Interrupted `connect` after the LB was created | The LB is recorded (`fatline_deployed: true`) before the IP wait, so re-running `connect` resumes without re-charging — and `release` always cleans it up. |

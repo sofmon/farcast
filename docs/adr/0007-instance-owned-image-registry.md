@@ -65,7 +65,7 @@ The operator's stated principle (2026-08-25): *nothing the instance runs should 
 **Per-module implications**
 
 - **Planck** — gains the optional `RegistryProvider` capability (GKE adapter: Artifact Registry REST over the vendored auth stack); node-SA discovery lives here (the cluster object reports `default`; the email derives from the project number looked up via Cloud Resource Manager).
-- **FarSight CLI** — `install`/`connect`/`release` call ensure/preflight/delete; owns the image build/push seam (Go-toolchain Runner + the stdlib `internal/oci` data plane, in-process token auth); `--fatline-image` default recomputed; deploys by digest.
+- **FarSight CLI** — `install`/`connect`/`redeploy`/`release` call ensure/preflight/delete; owns the image build/push seam (Go-toolchain Runner + the stdlib `internal/oci` data plane, in-process token auth); `--fatline-image` default recomputed; deploys by digest. (`farcast redeploy` — replacing a connected instance's FatLine workload — landed just after this ADR and reaches the registry through the *same* resolution code as `connect`, so ensure, preflight, build-and-push and the digest pin cannot drift between the first deploy and every one after it. One rule is redeploy's alone: an explicit `--source` forces a rebuild, since the tag derives from the CLI's version and a preflight against a connected instance would otherwise resolve the image already there.)
 - **FatLine** — the canonical image is assembled by the CLI (single pinned distroless base); `fatline/Containerfile` becomes the digest-pinned reference build; the deploy renders `image@sha256:…`.
 - **Shrike / TechnoCore (later)** — 4.4 attribution reads the `app/<deployment>/<app>` path; 4.1 cost breakdown gets registry storage as an attributable line.
 
