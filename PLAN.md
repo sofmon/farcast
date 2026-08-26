@@ -138,7 +138,7 @@ Wire the client side of FatLine into the CLI.
 - All subsequent CLI commands route through FatLine
 - Connection status reporting
 
-**Phase 2 deliverable** ✅ **achieved (validated locally):** the operator can `farcast connect` to their instance through an encrypted tunnel. All traffic is deny-by-default: FatLine blocks undeclared connections, and Shrike monitors and alerts on them. [The Phase 2 runbook](docs/runbooks/phase-2-validation.md) Part A (local, free) passes end-to-end; Part B (`connect` against a real GKE instance) has not been run yet.
+**Phase 2 deliverable** ✅ **achieved:** the operator can `farcast connect` to their instance through an encrypted tunnel. All traffic is deny-by-default: FatLine blocks undeclared connections, and Shrike monitors and alerts on them. [The Phase 2 runbook](docs/runbooks/phase-2-validation.md) passes end-to-end — Part A locally, and **Part B against real GKE on 2026-08-25**: the instance's own registry, an image compiled and pushed with no container engine, a digest-pinned deploy, the public mTLS carrier, the tunnel, an idempotent reconnect, and a teardown that left nothing billing.
 
 ---
 

@@ -28,6 +28,16 @@ image registry is storage-only and rounds to $0. Time: ~3–5 min for `connect`
 `release` teardown to finish (the command itself returns once the deletion is
 accepted; the cluster shows `STOPPING` while it completes).
 
+> **Status.** Part A passes and **Part B was executed end-to-end against real GCP on
+> 2026-08-25** — install → registry → engine-free image build/push → digest-pinned
+> deploy → public mTLS carrier → tunnel → reconnect → teardown, finishing with zero
+> billable resources left in the project. Three defects were found and fixed in the
+> process (an invalid image tag derived from a dev build's `+dirty` version; the mTLS
+> Secret mounted root-only so the non-root container crash-looped; and the Part B
+> `curl` check below, which cannot work on macOS). Two behaviours are normal rather
+> than faults and are noted in Troubleshooting: a transient GKE `Internal` error, and
+> `release` refusing while Autopilot has an operation in flight.
+
 ---
 
 # Part A — Local validation (free)
@@ -266,20 +276,22 @@ LB=$(./bin/farcast connect "$INSTANCE" --status --output json | sed -n 's/.*"end
 NAME="$INSTANCE.fatline.farcast"
 echo "LB=$LB  server-name=$NAME"
 
-# POSITIVE — present the operator client cert, trust only the per-instance CA,
-# pin the server name while connecting to the LB IP:
-curl -sS --cacert "$CERTS/ca.crt" --cert "$CERTS/client.crt" --key "$CERTS/client.key" \
-  --connect-to "$NAME:8443:$LB" "https://$NAME:8443/_fatline/status"; echo
+# POSITIVE — the operator's own client, which is what actually holds the
+# identity. (Do NOT use curl for this half on macOS: the system curl is built
+# against LibreSSL, which cannot load FatLine's ed25519 client certificate and
+# fails with "unsupported algorithm" — a client limitation that looks alarmingly
+# like a server problem. A curl linked against OpenSSL 3 works if you have one.)
+./bin/farcast connect "$INSTANCE" --status
 
 # NEGATIVE — no client certificate → dropped at the handshake:
 curl -sS --cacert "$CERTS/ca.crt" \
   --connect-to "$NAME:8443:$LB" "https://$NAME:8443/_fatline/status"; echo "  ← expect a TLS error"
 ```
 
-✅ Expect: the **positive** call returns the FatLine status JSON
-(`{"connected":true,...}`); the **negative** call fails at the TLS layer
-(certificate-required / handshake error). That asymmetry is the whole boundary:
-an unauthenticated peer with the IP gets nothing.
+✅ Expect: the **positive** call reports `connected` against the carrier; the
+**negative** call fails at the TLS layer (`sslv3 alert handshake failure` — the
+server demanding a certificate the caller cannot produce). That asymmetry is the
+whole boundary: an unauthenticated peer holding the public IP gets nothing.
 
 ## B5. Reconnect & scripted status
 
@@ -320,6 +332,8 @@ left billing.
 
 | Symptom | Cause & fix |
 |---|---|
+| `release` fails `CLUSTER_ALREADY_HAS_OPERATION` | Normal, not a fault: Autopilot runs `RESIZE_CLUSTER` for several minutes after a deploy, and GKE refuses a delete while any operation is in flight. `release` keeps the local record and says to re-run — wait for `gcloud container operations list --filter="status!=DONE"` to come back empty (this took ~9 min in the live run), then re-run `release`. |
+| `install` fails `code = Internal` from `container.googleapis.com` | A transient Google 5xx during credential validation. Nothing is created (validation precedes every write), so simply re-run. FarCast does not yet retry these automatically. |
 | `kubectl not found on PATH` | Install `kubectl` + `gke-gcloud-auth-plugin` (B0). The CLI shells to kubectl by design ([ADR 0006](../adr/0006-connect-bootstrap-kubectl.md)). |
 | `connect` prompts for cost / refuses non-interactively | The LB is billable. Pass `--yes` (required when not a TTY or in `--output json`). |
 | Deployment stuck `ImagePullBackOff` | The node SA can't pull from the instance registry. `connect` grants `roles/artifactregistry.reader` on that one repository automatically, so this means the grant did not happen: check the installer SA has `roles/artifactregistry.admin` (Phase 1 step 2) and re-run `connect` — the ensure is idempotent. Inspect with `gcloud artifacts repositories get-iam-policy "farcast-$INSTANCE" --location "$REGION" --project "$PROJECT_ID"`. |
