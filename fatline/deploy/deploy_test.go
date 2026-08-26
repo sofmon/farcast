@@ -132,3 +132,35 @@ func keys(m map[string]map[string]any) []string {
 	}
 	return out
 }
+
+// TestRenderSecretIsReadableByTheNonRootContainer pins the pairing that makes
+// the mTLS material usable: the pod runs as 65532 and must not run as root, so
+// the secret has to be group-readable and the volume group-owned. A 0400 mount
+// leaves it root-only and FatLine crash-loops on "permission denied" reading
+// its own server certificate — which is exactly what the first live deploy did.
+func TestRenderSecretIsReadableByTheNonRootContainer(t *testing.T) {
+	out, err := Render(Config{
+		Image:         "example.test/repo/fatline@sha256:" + strings.Repeat("a", 64),
+		Carrier:       CarrierLoadBalancer,
+		CACertPEM:     []byte("ca"),
+		ServerCertPEM: []byte("crt"),
+		ServerKeyPEM:  []byte("key"),
+	})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"runAsUser: 65532",
+		"runAsGroup: 65532",
+		"fsGroup: 65532",
+		"defaultMode: 288", // 0440
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("rendered manifest is missing %q — the container could not read its own key", want)
+		}
+	}
+	if strings.Contains(got, "defaultMode: 256") {
+		t.Error("secret is mounted 0400: root-only, unreadable by the non-root container")
+	}
+}

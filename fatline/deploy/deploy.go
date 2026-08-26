@@ -170,6 +170,13 @@ spec:
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
+        runAsGroup: 65532
+        # The mTLS material is mounted 0440 and owned by this group. Without
+        # fsGroup the kubelet leaves the secret owned by root, and FatLine —
+        # which runs as 65532 and must not run as root — cannot read the key it
+        # was given. (Caught by the first live deploy: permission denied on
+        # server.crt, crash-looping.)
+        fsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
       containers:
@@ -204,7 +211,10 @@ spec:
         - name: mtls
           secret:
             secretName: {{.SecretName}}
-            defaultMode: 256
+            # 0440: readable by the running user's group, never world-readable,
+            # never writable. Paired with fsGroup above — 0400 would be
+            # root-only and the non-root container could not read it.
+            defaultMode: 288
 ---
 apiVersion: v1
 kind: Service
