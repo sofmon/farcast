@@ -198,7 +198,39 @@ func (c *connectCommand) SetFlags(fs *flag.FlagSet) {
 // aimed at FatLine itself (ADR 0007 decision 4). The tag is what the operator
 // reads; the digest is what gets deployed.
 func instanceFatlineImage(prefix string) string {
-	return prefix + "/" + fatlineImagePath + ":" + buildinfo.Get().Version
+	return prefix + "/" + fatlineImagePath + ":" + imageTag(buildinfo.Get().Version)
+}
+
+// imageTag renders a build version as a valid OCI tag.
+//
+// A tag is [A-Za-z0-9_][A-Za-z0-9._-]{0,127}, which a Go build version does not
+// always satisfy: a source build carries a pseudo-version, and one built from a
+// tree with uncommitted files ends in "+dirty" — a '+' no registry will accept.
+// Folding the unrepresentable characters is right rather than lax, because the
+// tag is only the human-readable label here; the digest is what is deployed and
+// recorded (ADR 0007 decision 4), so the tag never has to be an exact identity.
+func imageTag(version string) string {
+	var b strings.Builder
+	for _, r := range version {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '_', r == '-':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	tag := b.String()
+	if tag == "" {
+		return "unknown"
+	}
+	// The first character may not be '.' or '-'.
+	if c := tag[0]; c == '.' || c == '-' {
+		tag = "v" + tag
+	}
+	if len(tag) > 128 {
+		tag = tag[:128]
+	}
+	return tag
 }
 
 func (c *connectCommand) Run(ctx context.Context, env *Env, args []string) error {

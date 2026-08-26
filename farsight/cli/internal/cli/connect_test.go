@@ -15,6 +15,7 @@ import (
 	"github.com/sofmon/farcast/farsight/cli/internal/buildinfo"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/image"
+	"github.com/sofmon/farcast/farsight/cli/internal/oci"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
 	"github.com/sofmon/farcast/fatline"
 	"github.com/sofmon/farcast/fatline/identity"
@@ -802,5 +803,33 @@ func TestConnectRefusesToRemintForADeployedInstance(t *testing.T) {
 	}
 	if exists {
 		t.Error("a replacement CA was written for a deployed instance")
+	}
+}
+
+// TestImageTagIsAlwaysValid: the default image reference is built from the CLI's
+// own version, and a source build's version is a Go pseudo-version — which ends
+// in "+dirty" for a tree with uncommitted files. '+' is not legal in an OCI tag,
+// so an unsanitised version made the default reference unusable for exactly the
+// operators most likely to have one. (Caught by the first live Part B run.)
+func TestImageTagIsAlwaysValid(t *testing.T) {
+	for _, v := range []string{
+		"v0.0.0-20260825182830-5d80f8cc5d00+dirty", // the case that failed live
+		"v1.2.3",
+		"dev",
+		"1.0.0+build.5",
+		"-leading-dash",
+		".leading-dot",
+		"",
+		strings.Repeat("x", 200),
+	} {
+		got := imageTag(v)
+		ref, err := oci.ParseReference("example.test/repo/system/fatline:" + got)
+		if err != nil {
+			t.Errorf("imageTag(%q) = %q, which is not a usable tag: %v", v, got, err)
+			continue
+		}
+		if ref.Tag != got {
+			t.Errorf("imageTag(%q) round-tripped to %q", v, ref.Tag)
+		}
 	}
 }
