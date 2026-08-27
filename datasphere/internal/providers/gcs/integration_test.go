@@ -437,35 +437,34 @@ func TestIntegrationStreaming(t *testing.T) {
 		t.Errorf("listed size = %d, want %d", infos[0].Size, streamed)
 	}
 
-	// The question this test exists to answer, RECORDED rather than asserted.
+	// ANSWERED 2026-08-27 against live GCS, and kept as a regression check.
 	//
-	// Start a resumable session and abandon it without sending a byte or
-	// aborting it, then look at what the bucket reports. On S3 the equivalent —
-	// an incomplete multipart upload — famously IS billed until aborted, and is
-	// invisible to an ordinary listing, which is why buckets there need a
-	// lifecycle rule. Whether GCS does the same is not something this adapter's
-	// documentation settles, and the answer changes whether `storage usage`
-	// owes the operator an "incomplete uploads" line. Either outcome is fine
-	// here; not knowing is not.
+	// An unfinalized resumable session is invisible to objects.list, reports
+	// zero in `gcloud storage du`, has no enumeration endpoint at all (unlike
+	// S3's ListMultipartUploads), and — the part that matters — does NOT block
+	// bucket deletion: a bucket holding 8 MiB of in-flight session data deleted
+	// cleanly. So an interrupted `cp` cannot strand a teardown, which is the
+	// failure mode this was worried about.
+	//
+	// The design consequence is the one that was not obvious: because there is
+	// no way to enumerate them, `storage usage` CANNOT report an "incomplete
+	// uploads" line on GCS the way it could on S3. That deferred figure is not
+	// deferred, it is unavailable.
 	orphan := strings.Repeat("ab", 16) + "/" + strings.Repeat("cd", 16)
 	session, err := p.startResumable(ctx, name, datasphere.StreamObject{Name: orphan, Size: -1})
 	if err != nil {
-		t.Logf("FINDING: could not even start a session to abandon: %v", err)
-	} else {
-		t.Logf("FINDING: abandoned resumable session at %s (never finalized, never aborted)", session)
-		after, err := p.List(ctx, name, "")
-		if err != nil {
-			t.Fatalf("List after abandoning a session: %v", err)
-		}
-		var bytesHeld int64
-		for _, info := range after {
-			bytesHeld += info.Size
-		}
-		t.Logf("FINDING: the bucket now lists %d object(s), %d bytes. If that is unchanged, an abandoned session is invisible to List — which says nothing about whether it BILLS.", len(after), bytesHeld)
-		t.Logf("FINDING: check the bucket's billed size in the console before deleting it, and record the answer in docs/runbooks/phase-3-validation.md.")
-		// Abandoning it is the point, so the session is deliberately left for
-		// the cleanup below to remove along with the bucket.
+		t.Fatalf("startResumable: %v", err)
 	}
+	t.Logf("abandoned resumable session (never finalized, never aborted): %s", session)
+	after, err := p.List(ctx, name, "")
+	if err != nil {
+		t.Fatalf("List after abandoning a session: %v", err)
+	}
+	if len(after) != 1 {
+		t.Errorf("List reports %d object(s) after abandoning a session, want 1 — an abandoned session became visible, which would change what teardown has to clean up", len(after))
+	}
+	// The bucket must still delete with the session outstanding. t.Cleanup does
+	// that below, and would fail the test if it could not.
 
 	if err := p.Delete(ctx, name, object); err != nil {
 		t.Fatalf("Delete: %v", err)
