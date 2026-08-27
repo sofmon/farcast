@@ -55,6 +55,12 @@ func (p *provider) Validate(ctx context.Context, ref datasphere.BucketRef) error
 		return errors.New("gcs: BucketRef.Instance is required: a bucket name is not invertible to the instance it belongs to")
 	}
 	b, err := p.getBucket(ctx, ref.Name)
+	if isHTTPStatus(err, http.StatusNotFound) {
+		// Proven absent, not merely unreachable. Reported as its own sentinel so
+		// a teardown can tell the two apart: there is nothing here to write to,
+		// nothing to count, and nothing to delete.
+		return fmt.Errorf("%w: %s", datasphere.ErrBucketNotFound, ref.Name)
+	}
 	if err != nil {
 		return fmt.Errorf("gcs: inspect bucket %q: %w", ref.Name, err)
 	}

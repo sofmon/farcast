@@ -111,9 +111,10 @@ type softDeletePolicy struct {
 
 // objectResource is the subset of a GCS object this adapter reads or writes.
 type objectResource struct {
-	Name     string            `json:"name,omitempty"`
-	Size     string            `json:"size,omitempty"`
-	Metadata map[string]string `json:"metadata,omitempty"`
+	Name        string            `json:"name,omitempty"`
+	Size        string            `json:"size,omitempty"`
+	TimeCreated string            `json:"timeCreated,omitempty"`
+	Metadata    map[string]string `json:"metadata,omitempty"`
 }
 
 // objectListPage is one page of an object listing.

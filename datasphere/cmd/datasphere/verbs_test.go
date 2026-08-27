@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -117,6 +118,29 @@ func (f *harnessFake) Put(_ context.Context, _ string, obj datasphere.Object) er
 	defer f.mu.Unlock()
 	f.objects[obj.Name] = obj
 	return nil
+}
+
+func (f *harnessFake) PutStream(ctx context.Context, bucket string, obj datasphere.StreamObject) error {
+	data, err := io.ReadAll(obj.Data)
+	if err != nil {
+		return err
+	}
+	return f.Put(ctx, bucket, datasphere.Object{Name: obj.Name, Data: data, Meta: obj.Meta})
+}
+
+func (f *harnessFake) GetStream(ctx context.Context, bucket, name string, offset, length int64) (io.ReadCloser, error) {
+	obj, err := f.Get(ctx, bucket, name)
+	if err != nil {
+		return nil, err
+	}
+	if offset > int64(len(obj.Data)) {
+		offset = int64(len(obj.Data))
+	}
+	data := obj.Data[offset:]
+	if length >= 0 && length < int64(len(data)) {
+		data = data[:length]
+	}
+	return io.NopCloser(bytes.NewReader(data)), nil
 }
 
 func (f *harnessFake) Get(_ context.Context, _, name string) (*datasphere.Object, error) {

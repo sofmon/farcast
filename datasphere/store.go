@@ -1,13 +1,16 @@
 package datasphere
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/sofmon/farcast/datasphere/internal/crypto"
 )
@@ -117,7 +120,7 @@ func (s *Store) Write(ctx context.Context, key string, data []byte) error {
 	return s.provider.Put(ctx, s.bucket, Object{
 		Name: stored,
 		Data: blob,
-		Meta: map[string]string{MetaName: base64.StdEncoding.EncodeToString(sealedName)},
+		Meta: map[string]string{MetaName: encodeMirror(sealedName)},
 	})
 }
 
@@ -146,11 +149,39 @@ func (s *Store) Delete(ctx context.Context, key string) error {
 // alongside the names that did resolve: the caller sees what could be read and
 // is told, loudly, what could not.
 func (s *Store) List(ctx context.Context, prefix string) ([]string, error) {
+	entries, err := s.ListEntries(ctx, prefix)
+	if entries == nil {
+		// A provider failure carries nothing back. The distinction from an
+		// empty listing is load-bearing: "no objects" and "could not look" are
+		// different answers, and an empty slice would conflate them.
+		return nil, err
+	}
+	names := make([]string, len(entries))
+	for i, e := range entries {
+		names[i] = e.Key
+	}
+	return names, err
+}
+
+// Entry is one listing entry with its logical name recovered, and everything
+// an operator listing needs beside it. Size is the stored (ciphertext) size —
+// what the cloud bills — and Created is when the cloud recorded the object.
+type Entry struct {
+	Key     string
+	Stored  string
+	Size    int64
+	Created time.Time
+}
+
+// ListEntries is List with the sizes and timestamps kept, sorted by logical
+// key. It is what `storage ls --long` and usage reporting read; List is the
+// name-only projection of it that the frozen SDK contract asks for.
+func (s *Store) ListEntries(ctx context.Context, prefix string) ([]Entry, error) {
 	infos, err := s.provider.List(ctx, s.bucket, crypto.TokenPrefix(s.tokenKey, prefix))
 	if err != nil {
 		return nil, err
 	}
-	names := make([]string, 0, len(infos))
+	entries := make([]Entry, 0, len(infos))
 	var failures []error
 	for _, info := range infos {
 		name, err := s.logicalName(ctx, info)
@@ -161,11 +192,81 @@ func (s *Store) List(ctx context.Context, prefix string) ([]string, error) {
 		if !strings.HasPrefix(name, prefix) {
 			continue
 		}
-		names = append(names, name)
+		entries = append(entries, Entry{Key: name, Stored: info.Name, Size: info.Size, Created: info.Created})
 	}
-	sort.Strings(names)
-	return names, errors.Join(failures...)
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Key < entries[j].Key })
+	return entries, errors.Join(failures...)
 }
+
+// WriteStream stores everything r yields under key, as a chunked v2 blob, with
+// neither this process nor the cloud ever holding more than a frame.
+//
+// It is an upsert, exactly as Write is. The sealed name is minted before the
+// upload begins because a streaming upload must declare its metadata before it
+// can send a body.
+func (s *Store) WriteStream(ctx context.Context, key string, r io.Reader) error {
+	stored, err := s.StoredName(key)
+	if err != nil {
+		return err
+	}
+	kek, err := s.keys.ActiveKEK()
+	if err != nil {
+		return err
+	}
+	sealedName, err := crypto.SealName(s.nameKey, stored, key, rand.Reader)
+	if err != nil {
+		return err
+	}
+
+	// The crypto layer writes a blob; the provider reads one. A pipe joins them
+	// without either side buffering the object.
+	blobReader, blobWriter := io.Pipe()
+	go func() {
+		blobWriter.CloseWithError(crypto.SealStream(
+			crypto.Key{ID: kek.ID.raw(), Material: kek.key},
+			stored, key, sealedName, crypto.DefaultChunkExp,
+			r, blobWriter, rand.Reader,
+		))
+	}()
+	// Closing the read half unblocks the sealer if the provider gave up early,
+	// so a failed upload cannot leave that goroutine wedged on a write.
+	defer func() { _ = blobReader.Close() }()
+
+	return s.provider.PutStream(ctx, s.bucket, StreamObject{
+		Name: stored,
+		Data: blobReader,
+		Size: -1,
+		Meta: map[string]string{MetaName: base64.StdEncoding.EncodeToString(sealedName)},
+	})
+}
+
+// ReadStream writes the plaintext stored under key to w, one frame at a time,
+// and accepts either blob format.
+//
+// It carries one caveat Read does not, and callers must honour it: v2
+// authenticates per frame, so damage is detected when the reader reaches it —
+// after earlier frames have already reached w. A non-nil error therefore means
+// **the output is incomplete and must not be used**. Anything writing to a
+// durable destination should stage it and commit only on success.
+func (s *Store) ReadStream(ctx context.Context, key string, w io.Writer) error {
+	stored, err := s.StoredName(key)
+	if err != nil {
+		return err
+	}
+	body, err := s.provider.GetStream(ctx, s.bucket, stored, 0, -1)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = body.Close() }()
+	return crypto.OpenStream(s.keys.lookup(), key, body, w)
+}
+
+// encodeMirror renders a sealed name for the provider metadata map.
+func encodeMirror(sealed []byte) string { return base64.StdEncoding.EncodeToString(sealed) }
+
+// bytesReader is bytes.NewReader, named here so rekey.go does not have to
+// import bytes for one call.
+func bytesReader(b []byte) io.Reader { return bytes.NewReader(b) }
 
 // StoredName returns the opaque path a logical key is stored under.
 //
@@ -192,13 +293,28 @@ func (s *Store) logicalName(ctx context.Context, info ObjectInfo) (string, error
 			}
 		}
 	}
-	obj, err := s.provider.Get(ctx, s.bucket, info.Name)
+	// Only the header is needed, so only the header is fetched. Reading the
+	// whole object here would mean downloading gigabytes of a streamed blob to
+	// recover a name that lives in its first kilobyte — and this fallback runs
+	// precisely when something is already wrong.
+	head, err := s.header(ctx, info.Name)
 	if err != nil {
 		return "", fmt.Errorf("datasphere: recover name of stored object %s: %w", info.Name, err)
 	}
-	name, err := crypto.HeaderName(s.nameKey, info.Name, obj.Data)
+	name, err := crypto.HeaderName(s.nameKey, info.Name, head)
 	if err != nil {
 		return "", fmt.Errorf("datasphere: recover name of stored object %s: %w", info.Name, err)
 	}
 	return name, nil
+}
+
+// header fetches at most a blob's header. A short object simply yields fewer
+// bytes, which is not an error — the header parser is what judges it.
+func (s *Store) header(ctx context.Context, stored string) ([]byte, error) {
+	body, err := s.provider.GetStream(ctx, s.bucket, stored, 0, crypto.MaxHeaderLen)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = body.Close() }()
+	return io.ReadAll(io.LimitReader(body, crypto.MaxHeaderLen))
 }

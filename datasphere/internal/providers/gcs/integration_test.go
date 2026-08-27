@@ -30,9 +30,13 @@
 package gcs
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"testing"
@@ -281,4 +285,231 @@ func TestIntegrationBucketLifecycle(t *testing.T) {
 	if err := p.DeleteBucket(ctx, ref); err != nil {
 		t.Errorf("DeleteBucket on an absent bucket: %v", err)
 	}
+}
+
+// TestIntegrationStreaming exercises the Phase 3.3 wire paths against the live
+// service: a resumable upload large enough to span several windows, a ranged
+// read, the newly-added creation timestamp in the list projection, and the one
+// billing question this adapter could not answer from documentation.
+//
+// The unit tests drive all of this through a fake transport, which pins what
+// the adapter SENDS. Only a real run can say what Google does with it — and
+// resumable upload is the one protocol here with edges (the 308 handling, the
+// committed-offset query, the zero-length terminator) that a fake cannot
+// falsify, because the fake is built from the same understanding as the code.
+//
+//	FARCAST_GCS_TEST_PROJECT=my-proj \
+//	FARCAST_GCS_TEST_CREDENTIALS=/path/to/sa-key.json \
+//	FARCAST_GCS_TEST_LOCATION=europe-west1 \
+//	FARCAST_GCS_TEST_BUCKET=1 \
+//	go test -tags integration -timeout 20m -run TestIntegrationStreaming ./datasphere/internal/providers/gcs/
+func TestIntegrationStreaming(t *testing.T) {
+	if os.Getenv("FARCAST_GCS_TEST_BUCKET") != "1" {
+		t.Skip("set FARCAST_GCS_TEST_BUCKET=1 to run the streaming lifecycle (creates a real bucket and moves ~20 MiB)")
+	}
+	cfg := testConfig(t)
+	if cfg.Location == "" {
+		t.Skip("set FARCAST_GCS_TEST_LOCATION: EnsureBucket requires an explicit single region")
+	}
+	opaque, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	// The resumable session probe below reaches past the Provider interface on
+	// purpose: abandoning a session is not something a caller can ask for, and
+	// whether an abandoned one bills is exactly what this test exists to learn.
+	p, ok := opaque.(*provider)
+	if !ok {
+		t.Fatalf("New returned %T, want *provider", opaque)
+	}
+
+	instance := fmt.Sprintf("its-%d", time.Now().Unix())
+	name, err := datasphere.MintBucketName(instance)
+	if err != nil {
+		t.Fatalf("MintBucketName(%q): %v", instance, err)
+	}
+	ref := datasphere.BucketRef{Name: name, Location: cfg.Location, Instance: instance}
+
+	// Registered before the first create, for the same reason the lifecycle
+	// test registers its own: a bucket leaked by a mid-test failure is billable
+	// storage nobody is watching.
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+		if err := p.DeleteBucket(ctx, ref); err != nil && !errors.Is(err, datasphere.ErrRetentionForced) {
+			t.Errorf("cleanup DeleteBucket(%q): %v — DELETE THIS BUCKET BY HAND", name, err)
+		}
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+
+	if _, err := p.EnsureBucket(ctx, datasphere.BucketSpec{Name: name, Instance: instance, Location: cfg.Location}); err != nil && !errors.Is(err, datasphere.ErrRetentionForced) {
+		t.Fatalf("EnsureBucket(%q): %v", name, err)
+	}
+
+	// Comfortably over the 8 MiB buffer AND over two 8 MiB upload windows, so
+	// the Content-Range arithmetic is exercised across a middle window rather
+	// than just a first and a last.
+	const streamed = 20 << 20
+	object := strings.Repeat("f6", 16) + "/" + strings.Repeat("07", 16)
+	want := patternDigest(streamed)
+
+	if err := p.PutStream(ctx, name, datasphere.StreamObject{
+		Name: object,
+		Data: newPatternReader(streamed),
+		Size: -1,
+		Meta: map[string]string{datasphere.MetaName: "c3RyZWFtaW5nLW5hbWU="},
+	}); err != nil {
+		t.Fatalf("PutStream of %d bytes: %v", streamed, err)
+	}
+
+	// Read it back without ever holding it: hashing as it streams is the only
+	// honest way to assert byte-exactness on an object this size.
+	body, err := p.GetStream(ctx, name, object, 0, -1)
+	if err != nil {
+		t.Fatalf("GetStream: %v", err)
+	}
+	digest := sha256.New()
+	n, err := io.Copy(digest, body)
+	_ = body.Close()
+	if err != nil {
+		t.Fatalf("streaming read after %d bytes: %v", n, err)
+	}
+	if n != streamed {
+		t.Errorf("read %d bytes, want %d", n, streamed)
+	}
+	if got := hex.EncodeToString(digest.Sum(nil)); got != want {
+		t.Errorf("streamed round trip digest = %s, want %s", got, want)
+	}
+
+	// A ranged read of just the head. This is what Store.List's name-recovery
+	// fallback does, and on an object this size the difference between a range
+	// and a full fetch is the difference between a kilobyte and 20 MiB.
+	const head = 1168 // the largest a blob header can be in any version
+	partial, err := p.GetStream(ctx, name, object, 0, head)
+	if err != nil {
+		t.Fatalf("ranged GetStream: %v", err)
+	}
+	prefix, err := io.ReadAll(partial)
+	_ = partial.Close()
+	if err != nil {
+		t.Fatalf("read ranged body: %v", err)
+	}
+	if len(prefix) != head {
+		t.Errorf("ranged read returned %d bytes, want exactly %d — if this is the whole object, something stripped the Range header", len(prefix), head)
+	}
+	if !bytes.Equal(prefix, patternPrefix(head)) {
+		t.Error("ranged read returned the wrong bytes; the offset arithmetic is wrong")
+	}
+
+	// A range from a non-zero offset, which is the case a proxy-stripped Range
+	// header would silently corrupt rather than merely slow down.
+	const at, span = 1 << 20, 4096
+	middle, err := p.GetStream(ctx, name, object, at, span)
+	if err != nil {
+		t.Fatalf("offset GetStream: %v", err)
+	}
+	chunk, err := io.ReadAll(middle)
+	_ = middle.Close()
+	if err != nil {
+		t.Fatalf("read offset body: %v", err)
+	}
+	if !bytes.Equal(chunk, patternRange(at, span)) {
+		t.Errorf("range [%d,%d) returned the wrong bytes", at, at+span)
+	}
+
+	// ObjectInfo.Created is newly in the list projection and has never run
+	// against the service.
+	infos, err := p.List(ctx, name, "")
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(infos) != 1 {
+		t.Fatalf("List returned %d objects, want 1", len(infos))
+	}
+	if infos[0].Created.IsZero() {
+		t.Error("ObjectInfo.Created is zero: the service did not return timeCreated under the adapter's field mask, so `storage ls` ages and usage growth rates are dead")
+	} else if age := time.Since(infos[0].Created); age < 0 || age > time.Hour {
+		t.Errorf("Created = %s, which is %s ago — that is not this test's object", infos[0].Created, age)
+	}
+	if infos[0].Size != streamed {
+		t.Errorf("listed size = %d, want %d", infos[0].Size, streamed)
+	}
+
+	// The question this test exists to answer, RECORDED rather than asserted.
+	//
+	// Start a resumable session and abandon it without sending a byte or
+	// aborting it, then look at what the bucket reports. On S3 the equivalent —
+	// an incomplete multipart upload — famously IS billed until aborted, and is
+	// invisible to an ordinary listing, which is why buckets there need a
+	// lifecycle rule. Whether GCS does the same is not something this adapter's
+	// documentation settles, and the answer changes whether `storage usage`
+	// owes the operator an "incomplete uploads" line. Either outcome is fine
+	// here; not knowing is not.
+	orphan := strings.Repeat("ab", 16) + "/" + strings.Repeat("cd", 16)
+	session, err := p.startResumable(ctx, name, datasphere.StreamObject{Name: orphan, Size: -1})
+	if err != nil {
+		t.Logf("FINDING: could not even start a session to abandon: %v", err)
+	} else {
+		t.Logf("FINDING: abandoned resumable session at %s (never finalized, never aborted)", session)
+		after, err := p.List(ctx, name, "")
+		if err != nil {
+			t.Fatalf("List after abandoning a session: %v", err)
+		}
+		var bytesHeld int64
+		for _, info := range after {
+			bytesHeld += info.Size
+		}
+		t.Logf("FINDING: the bucket now lists %d object(s), %d bytes. If that is unchanged, an abandoned session is invisible to List — which says nothing about whether it BILLS.", len(after), bytesHeld)
+		t.Logf("FINDING: check the bucket's billed size in the console before deleting it, and record the answer in docs/runbooks/phase-3-validation.md.")
+		// Abandoning it is the point, so the session is deliberately left for
+		// the cleanup below to remove along with the bucket.
+	}
+
+	if err := p.Delete(ctx, name, object); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+}
+
+// patternReader emits a deterministic byte pattern without allocating the
+// whole stream, so a multi-megabyte upload costs no memory on either side.
+type patternReader struct{ remaining, offset int64 }
+
+func newPatternReader(n int64) *patternReader { return &patternReader{remaining: n} }
+
+func (r *patternReader) Read(p []byte) (int, error) {
+	if r.remaining <= 0 {
+		return 0, io.EOF
+	}
+	if int64(len(p)) > r.remaining {
+		p = p[:r.remaining]
+	}
+	for i := range p {
+		p[i] = patternAt(r.offset + int64(i))
+	}
+	r.offset += int64(len(p))
+	r.remaining -= int64(len(p))
+	return len(p), nil
+}
+
+// patternAt is the pattern's definition; everything else here derives from it.
+func patternAt(i int64) byte { return byte((i*31 + 7) & 0xFF) }
+
+func patternPrefix(n int) []byte { return patternRange(0, n) }
+
+func patternRange(at int64, n int) []byte {
+	out := make([]byte, n)
+	for i := range out {
+		out[i] = patternAt(at + int64(i))
+	}
+	return out
+}
+
+// patternDigest is the expected hash of the streamed object, computed the same
+// way the read side computes the actual one.
+func patternDigest(n int64) string {
+	digest := sha256.New()
+	_, _ = io.Copy(digest, newPatternReader(n))
+	return hex.EncodeToString(digest.Sum(nil))
 }

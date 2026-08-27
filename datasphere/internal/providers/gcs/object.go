@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/sofmon/farcast/datasphere"
 )
@@ -82,12 +83,13 @@ func (p *provider) Get(ctx context.Context, bucket, name string) (*datasphere.Ob
 // what it is called.
 func (p *provider) List(ctx context.Context, bucket, prefix string) ([]datasphere.ObjectInfo, error) {
 	var out []datasphere.ObjectInfo
-	err := p.eachPage(ctx, bucket, prefix, "items(name,size,metadata),nextPageToken", func(items []objectResource) error {
+	err := p.eachPage(ctx, bucket, prefix, "items(name,size,timeCreated,metadata),nextPageToken", func(items []objectResource) error {
 		for _, item := range items {
 			out = append(out, datasphere.ObjectInfo{
-				Name: item.Name,
-				Size: parseSize(item.Size),
-				Meta: item.Metadata,
+				Name:    item.Name,
+				Size:    parseSize(item.Size),
+				Created: parseTime(item.TimeCreated),
+				Meta:    item.Metadata,
 			})
 		}
 		return nil
@@ -200,6 +202,17 @@ func metaFromHeader(header http.Header) map[string]string {
 		meta[strings.ToLower(strings.TrimPrefix(key, metaHeaderPrefix))] = values[0]
 	}
 	return meta
+}
+
+// parseTime reads a listing entry's RFC 3339 creation time. Like parseSize it
+// is informational, so a timestamp the cloud renders unparseably leaves the
+// field zero rather than failing a listing the recovery flows depend on.
+func parseTime(value string) time.Time {
+	t, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return time.Time{}
+	}
+	return t.UTC()
 }
 
 // parseSize reads a listing entry's size. It is informational — it feeds

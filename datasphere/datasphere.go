@@ -67,6 +67,19 @@ var (
 	// billable bucket behind a freshly minted name.
 	ErrNotOwned = errors.New("datasphere: bucket is not this instance's")
 
+	// ErrBucketNotFound reports that a bucket was inspected and PROVEN absent,
+	// as distinct from an inspection that merely failed — the same distinction
+	// ErrNotOwned draws, for the same reason.
+	//
+	// It exists because teardown needs it. DeleteBucket treats an absent bucket
+	// as success, but a caller that validates first would never reach that: a
+	// free, already-deleted bucket would permanently block the teardown of the
+	// billable cluster beside it, and "re-run once it can be reached" would
+	// name a condition that never arrives. A proven-absent bucket is nothing to
+	// gate on and nothing to delete; an unreachable one is still a reason to
+	// stop.
+	ErrBucketNotFound = errors.New("datasphere: bucket does not exist")
+
 	// ErrRetentionForced reports that the cloud is holding — and billing for —
 	// copies of objects the operator ordered destroyed, because a policy
 	// outside FarCast's control forces a soft-delete retention window that the

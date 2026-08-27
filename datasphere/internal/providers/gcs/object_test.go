@@ -260,8 +260,8 @@ func TestListFieldMaskPrefixAndPagination(t *testing.T) {
 	// The mask is what makes one list call per page enough: names, sizes, and
 	// the metadata map carrying each object's sealed name. Drop "metadata" and
 	// every listing degrades into a per-object fetch.
-	if got := q.Get("fields"); got != "items(name,size,metadata),nextPageToken" {
-		t.Errorf("fields = %q, want items(name,size,metadata),nextPageToken", got)
+	if got := q.Get("fields"); got != "items(name,size,timeCreated,metadata),nextPageToken" {
+		t.Errorf("fields = %q, want items(name,size,timeCreated,metadata),nextPageToken", got)
 	}
 	// The prefix is a query VALUE. url.Values' percent-encoding of "/" is
 	// correct and equivalent to a raw one, because the server decodes query

@@ -3,6 +3,8 @@ package datasphere
 import (
 	"context"
 	"fmt"
+	"io"
+	"time"
 )
 
 // Provider is one cloud's object storage. Every method honours ctx for
@@ -71,6 +73,23 @@ type Provider interface {
 
 	// Delete removes an object. Deleting an absent object is not an error.
 	Delete(ctx context.Context, bucket, name string) error
+
+	// PutStream stores an object of unbounded size from a reader, atomically:
+	// it becomes visible complete or not at all. An interrupted call must not
+	// leave anything an operator would be billed for without being told.
+	//
+	// Streaming is part of the Provider proper rather than an optional
+	// capability because optionality here would be fake — every real object
+	// store has it (GCS resumable upload, S3 multipart) — and because
+	// GetStream is a correctness requirement of Store.List, not a large-file
+	// convenience: the name-recovery fallback would otherwise download a whole
+	// object to read its header.
+	PutStream(ctx context.Context, bucket string, obj StreamObject) error
+
+	// GetStream returns a reader over a byte range of an object; length -1
+	// means "to the end of the object". A missing object is ErrObjectNotFound.
+	// The caller closes the reader.
+	GetStream(ctx context.Context, bucket, name string, offset, length int64) (io.ReadCloser, error)
 }
 
 // BucketSpec describes the bucket to ensure. The caller mints and records the
@@ -108,12 +127,30 @@ type Object struct {
 	Meta map[string]string
 }
 
-// ObjectInfo is one listing entry. Size is the stored (ciphertext) size; it
-// feeds `storage ls` and usage reporting in 3.3 without new adapter surface.
-type ObjectInfo struct {
+// StreamObject is an object supplied as a stream. Size is -1 when the length
+// is not known up front, which is the normal case for a pipe; an adapter that
+// needs a total length is responsible for discovering it.
+type StreamObject struct {
 	Name string
+	Data io.Reader
 	Size int64
 	Meta map[string]string
+}
+
+// ObjectInfo is one listing entry. Size is the stored (ciphertext) size; it
+// feeds `storage ls` and usage reporting without new adapter surface.
+//
+// Created is when the cloud recorded the object. It rides the same listing
+// projection at no extra cost and leaks nothing new — creation and access
+// timestamps were already among the things the provider observes and this
+// module has always said so. It is what makes `storage ls` show an age and
+// `storage usage` report a growth rate on its first run rather than its
+// second. A provider that does not report one leaves it zero.
+type ObjectInfo struct {
+	Name    string
+	Size    int64
+	Created time.Time
+	Meta    map[string]string
 }
 
 // Config carries credentials and account scoping — the same neutral shape as

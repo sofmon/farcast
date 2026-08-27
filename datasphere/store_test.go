@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"slices"
 	"strings"
 	"sync"
@@ -94,6 +95,34 @@ func (f *fakeProvider) Put(_ context.Context, bucket string, obj Object) error {
 	}
 	f.objects[obj.Name] = copyObject(obj)
 	return nil
+}
+
+// PutStream and GetStream back onto the same map. They are real
+// implementations rather than stubs because the streaming Store methods are
+// exactly as obliged to keep plaintext and logical names away from a Provider
+// as the buffered ones are, and TestProviderNeverSeesPlaintextOrNames scans
+// everything they record.
+func (f *fakeProvider) PutStream(ctx context.Context, bucket string, obj StreamObject) error {
+	data, err := io.ReadAll(obj.Data)
+	if err != nil {
+		return err
+	}
+	return f.Put(ctx, bucket, Object{Name: obj.Name, Data: data, Meta: obj.Meta})
+}
+
+func (f *fakeProvider) GetStream(ctx context.Context, bucket, name string, offset, length int64) (io.ReadCloser, error) {
+	obj, err := f.Get(ctx, bucket, name)
+	if err != nil {
+		return nil, err
+	}
+	if offset > int64(len(obj.Data)) {
+		offset = int64(len(obj.Data))
+	}
+	data := obj.Data[offset:]
+	if length >= 0 && length < int64(len(data)) {
+		data = data[:length]
+	}
+	return io.NopCloser(bytes.NewReader(data)), nil
 }
 
 func (f *fakeProvider) Get(_ context.Context, bucket, name string) (*Object, error) {

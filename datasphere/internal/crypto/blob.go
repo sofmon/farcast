@@ -1,6 +1,7 @@
 package crypto
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -37,12 +38,16 @@ import (
 // fallback can reach the sealed name without decrypting a body, and so a
 // header-only rekey can splice new wrap fields in.
 type Header struct {
+	Version    byte
 	KeyID      [KeyIDLen]byte
 	WrapNonce  []byte
 	WrappedDEK []byte
 	SealedName []byte
-	Body       []byte // data nonce ‖ ciphertext ‖ tag
-	BodyOffset int    // where Body starts within the blob
+	// Body is everything after the sealed name. For Version that is the data
+	// nonce, ciphertext and tag; for Version2 it is the salt, the frame-size
+	// exponent, and the frames.
+	Body       []byte
+	BodyOffset int // where Body starts within the blob
 }
 
 // Seal builds the v1 blob for logicalKey, wrapping a fresh single-use DEK
@@ -104,7 +109,7 @@ func Seal(kek Key, nameKey []byte, storedPath, logicalKey string, plaintext []by
 	blob[offVersion] = Version
 	copy(blob[offKeyID:], kek.ID[:])
 	copy(blob[offWrapNonce:], wrapNonce)
-	copy(blob[offWrappedDEK:], kekGCM.Seal(nil, wrapNonce, dek, wrapAAD(kek.ID)))
+	copy(blob[offWrappedDEK:], kekGCM.Seal(nil, wrapNonce, dek, wrapAAD(Version, kek.ID)))
 	binary.BigEndian.PutUint16(blob[offNameLen:], uint16(len(sealedName)))
 
 	blob = append(blob, sealedName...)
@@ -124,6 +129,17 @@ func Open(lookup KeyLookup, logicalKey string, b []byte) ([]byte, error) {
 	h, err := ParseHeader(b)
 	if err != nil {
 		return nil, err
+	}
+	if h.Version == Version2 {
+		// A streamed object read through the buffered API. Honour it rather
+		// than refusing: which API wrote an object is not something a caller
+		// should have to remember, and the size cap still applies.
+		var out cappedBuffer
+		out.limit = MaxPlaintext
+		if err := OpenStream(lookup, logicalKey, bytes.NewReader(b), &out); err != nil {
+			return nil, err
+		}
+		return out.Bytes(), nil
 	}
 	dek, err := h.unwrap(lookup)
 	if err != nil {
@@ -168,10 +184,40 @@ func HeaderName(nameKey []byte, storedPath string, b []byte) (string, error) {
 // current headers. It is not compromise recovery: everything a cloud already
 // saw stays exposed to whoever captured it.
 func Rekey(lookup KeyLookup, newKEK Key, b []byte, rnd io.Reader) ([]byte, error) {
-	h, err := ParseHeader(b)
+	if _, err := ParseHeader(b); err != nil {
+		return nil, err
+	}
+	prefix, err := RekeyPrefix(lookup, newKEK, b[:HeaderLen], rnd)
 	if err != nil {
 		return nil, err
 	}
+	out := make([]byte, len(b))
+	copy(out, b)
+	copy(out, prefix)
+	return out, nil
+}
+
+// RekeyPrefix rewrites the wrap fields inside a blob's fixed 75-byte prefix,
+// which is where all of them live in every version.
+//
+// It exists so a rekey sweep never has to hold an object. A cloud object
+// cannot be patched in place, so rewriting a header still costs a full
+// re-upload — but with this the bytes flow through rather than through memory,
+// and a five-gigabyte object costs no more RAM than a five-kilobyte one.
+func RekeyPrefix(lookup KeyLookup, newKEK Key, prefix []byte, rnd io.Reader) ([]byte, error) {
+	if len(prefix) < HeaderLen {
+		return nil, ErrIntegrity
+	}
+	version := prefix[offVersion]
+	if string(prefix[offMagic:offMagic+len(Magic)]) != string(Magic[:]) || (version != Version && version != Version2) {
+		return nil, ErrIntegrity
+	}
+	h := Header{
+		Version:    version,
+		WrapNonce:  prefix[offWrapNonce : offWrapNonce+NonceLen],
+		WrappedDEK: prefix[offWrappedDEK : offWrappedDEK+WrappedDEKLen],
+	}
+	copy(h.KeyID[:], prefix[offKeyID:offKeyID+KeyIDLen])
 	newGCMKEK, err := newGCM(newKEK.Material)
 	if err != nil {
 		return nil, err
@@ -186,11 +232,11 @@ func Rekey(lookup KeyLookup, newKEK Key, b []byte, rnd io.Reader) ([]byte, error
 		return nil, fmt.Errorf("datasphere: read wrap nonce: %w", err)
 	}
 
-	out := make([]byte, len(b))
-	copy(out, b)
+	out := make([]byte, HeaderLen)
+	copy(out, prefix[:HeaderLen])
 	copy(out[offKeyID:], newKEK.ID[:])
 	copy(out[offWrapNonce:], nonce)
-	copy(out[offWrappedDEK:], newGCMKEK.Seal(nil, nonce, dek, wrapAAD(newKEK.ID)))
+	copy(out[offWrappedDEK:], newGCMKEK.Seal(nil, nonce, dek, wrapAAD(h.Version, newKEK.ID)))
 	return out, nil
 }
 
@@ -206,17 +252,26 @@ func ParseHeader(b []byte) (Header, error) {
 	if len(b) < HeaderLen {
 		return Header{}, ErrIntegrity
 	}
-	if string(b[offMagic:offMagic+len(Magic)]) != string(Magic[:]) || b[offVersion] != Version {
+	version := b[offVersion]
+	if string(b[offMagic:offMagic+len(Magic)]) != string(Magic[:]) || (version != Version && version != Version2) {
 		return Header{}, ErrIntegrity
 	}
 	nameLen := int(binary.BigEndian.Uint16(b[offNameLen:]))
 	bodyOffset := HeaderLen + nameLen
-	// A sealed name is at minimum a nonce and a tag; a body is at minimum a
-	// nonce and a tag over an empty plaintext (a zero-byte object is legal).
-	if nameLen < NonceLen+TagLen || len(b) < bodyOffset+NonceLen+TagLen {
+	// A sealed name is at minimum a nonce and a tag. Everything past it is
+	// version-specific and checked by whichever opener handles it — the shared
+	// parse deliberately stops here, because stopping here is what keeps it
+	// usable on a format this build has never seen.
+	if nameLen < NonceLen+TagLen || len(b) < bodyOffset {
+		return Header{}, ErrIntegrity
+	}
+	if version == Version && len(b)-bodyOffset < NonceLen+TagLen {
+		// A v1 body is at minimum a nonce and a tag over an empty plaintext;
+		// a zero-byte object is legal.
 		return Header{}, ErrIntegrity
 	}
 	h := Header{
+		Version:    version,
 		WrapNonce:  b[offWrapNonce : offWrapNonce+NonceLen],
 		WrappedDEK: b[offWrappedDEK : offWrappedDEK+WrappedDEKLen],
 		SealedName: b[HeaderLen:bodyOffset],
@@ -237,7 +292,7 @@ func (h Header) unwrap(lookup KeyLookup) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	dek, err := kekGCM.Open(nil, h.WrapNonce, h.WrappedDEK, wrapAAD(h.KeyID))
+	dek, err := kekGCM.Open(nil, h.WrapNonce, h.WrappedDEK, wrapAAD(h.Version, h.KeyID))
 	if err != nil {
 		return nil, ErrIntegrity
 	}
@@ -257,9 +312,9 @@ func dataAAD(logicalKey string) []byte {
 // wrapAAD binds a wrapped DEK to the format version and to the key ID the
 // header advertises, so the header's routing field cannot be edited to point
 // at another key without the unwrap failing.
-func wrapAAD(id [KeyIDLen]byte) []byte {
+func wrapAAD(version byte, id [KeyIDLen]byte) []byte {
 	aad := make([]byte, 0, len(Magic)+1+KeyIDLen)
 	aad = append(aad, Magic[:]...)
-	aad = append(aad, Version)
+	aad = append(aad, version)
 	return append(aad, id[:]...)
 }

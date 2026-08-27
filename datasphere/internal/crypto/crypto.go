@@ -47,10 +47,20 @@ var (
 	ErrInvalidKey = errors.New("datasphere: invalid object key")
 )
 
-// Version is the blob format this package writes. It is the first byte after
-// the magic and is bound into both AADs, so a downgrade cannot pass
-// authentication.
+// Version is the buffered blob format: whole objects, held in memory. It is
+// the first byte after the magic and is bound into every AAD, so a downgrade
+// cannot pass authentication.
 const Version byte = 0x01
+
+// Version2 is the chunked, streaming blob format. Bytes 0 through the end of
+// the sealed name are laid out identically to Version — same fields, same
+// offsets — and everything v2 adds comes after. That ordering is the whole
+// reason ParseHeader, HeaderName and Rekey are one version-free
+// implementation, which is in turn what makes the promise hold that a bucket
+// plus a keys file reconstruct every logical name with no local state: a
+// recovery tool written today reads names out of formats that do not exist
+// yet.
+const Version2 byte = 0x02
 
 // Magic marks a DataSphere blob. It is a plaintext header field — it tells
 // recovery tooling what it is looking at — and is bound into both AADs so it
@@ -71,6 +81,27 @@ const (
 	TagLen = 16
 	// WrappedDEKLen is a wrapped 256-bit DEK: ciphertext plus tag.
 	WrappedDEKLen = KeyLen + TagLen
+	// SaltLen is the per-object frame-nonce salt v2 carries.
+	SaltLen = 8
+)
+
+// Frame sizing for the chunked format. The size is stored as an exponent so
+// one range check bounds it, and it is range-checked before it sizes any
+// allocation — a hostile header must not be able to ask for a 4 GiB buffer.
+const (
+	// MinChunkExp and MaxChunkExp bound the frame size to 64 KiB … 64 MiB.
+	MinChunkExp = 16
+	MaxChunkExp = 26
+	// DefaultChunkExp is 1 MiB. Read granularity is one frame, so a smaller
+	// frame makes a small ranged read cheaper; the 16-byte tag per frame costs
+	// 15 parts per million at this size.
+	DefaultChunkExp = 20
+
+	// MaxHeaderLen is the largest a header can be in any version: the fixed
+	// 75-byte prefix, the longest possible sealed name, the salt, and the
+	// exponent. A reader fetches exactly this many bytes and is guaranteed a
+	// complete header in one request.
+	MaxHeaderLen = HeaderLen + NonceLen + 1056 + TagLen + SaltLen + 1
 )
 
 // Header field offsets in a v1 blob. The header is fixed-width up to the

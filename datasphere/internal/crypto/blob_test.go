@@ -217,7 +217,7 @@ func TestAADLayoutsFrozen(t *testing.T) {
 			if got := hex.EncodeToString(dataAAD(v.logical)); got != v.dataAAD {
 				t.Errorf("dataAAD(%q) = %s, want the frozen vector %s", v.logical, got, v.dataAAD)
 			}
-			if got := hex.EncodeToString(wrapAAD(mustKeyID(t, v.keyID))); got != v.wrapAAD {
+			if got := hex.EncodeToString(wrapAAD(Version, mustKeyID(t, v.keyID))); got != v.wrapAAD {
 				t.Errorf("wrapAAD = %s, want the frozen vector %s", got, v.wrapAAD)
 			}
 		})
@@ -226,8 +226,8 @@ func TestAADLayoutsFrozen(t *testing.T) {
 	// Stated as structure as well, so that a change which edited both the code
 	// and the literals in step would still have to argue with the spec's words.
 	id := mustKeyID(t, goldenKEK1IDHex)
-	if want := append(append([]byte("FCDS"), 0x01), id[:]...); !bytes.Equal(wrapAAD(id), want) {
-		t.Errorf("wrapAAD = %x, want magic‖version‖key ID = %x", wrapAAD(id), want)
+	if want := append(append([]byte("FCDS"), 0x01), id[:]...); !bytes.Equal(wrapAAD(Version, id), want) {
+		t.Errorf("wrapAAD = %x, want magic‖version‖key ID = %x", wrapAAD(Version, id), want)
 	}
 	if want := append([]byte("FCDS"), append([]byte{0x01}, "a/b"...)...); !bytes.Equal(dataAAD("a/b"), want) {
 		t.Errorf("dataAAD = %x, want magic‖version‖logical key = %x", dataAAD("a/b"), want)
@@ -929,7 +929,11 @@ func TestParseHeaderRejectsMalformedBlobs(t *testing.T) {
 		{"shorter than the fixed header", good[:HeaderLen-1]},
 		{"header only, no name or body", good[:HeaderLen]},
 		{"bad magic", edit(func(b []byte) { b[offMagic] = 'X' })},
-		{"unknown version", edit(func(b []byte) { b[offVersion] = 0x02 })},
+		// 0x02 is the streaming format and is legitimately parseable; the
+		// unknown-version case has to reach past every version this build
+		// knows, which is the point of the check.
+		{"unknown version", edit(func(b []byte) { b[offVersion] = 0x03 })},
+		{"far future version", edit(func(b []byte) { b[offVersion] = 0xff })},
 		{"version zero", edit(func(b []byte) { b[offVersion] = 0x00 })},
 		{"sealed-name length zero", edit(func(b []byte) { binary.BigEndian.PutUint16(b[offNameLen:], 0) })},
 		{"sealed-name length below a nonce and tag", edit(func(b []byte) {
