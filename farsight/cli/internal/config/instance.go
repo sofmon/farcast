@@ -18,6 +18,12 @@ const (
 	credentialsFile = "credentials.yaml"
 	kubeconfigFile  = "kubeconfig.yaml"
 	fatlineSubdir   = "fatline"
+	// datasphereSubdir holds the instance's storage keyring. It sits beside
+	// the FatLine material because the two are the instance's crown jewels and
+	// the operator's backup gesture — copy the instance directory offline —
+	// has to cover both in one motion.
+	datasphereSubdir = "datasphere"
+	keyringFile      = "keys.yaml"
 )
 
 // Data-plane mTLS material file names (under <instance>/fatline/). The CA
@@ -79,6 +85,46 @@ type Registry struct {
 	FatLineDigest string `yaml:"fatline_digest,omitempty"`
 }
 
+// Storage records the instance's DataSphere bucket (phase 3.3).
+//
+// It is a pointer so metadata written before instances had storage still
+// loads; such an instance converges the next time a storage command runs,
+// which mints a name, records it here, and only then creates the bucket.
+//
+// Bucket carries 32 bits of randomness that exist NOWHERE else once minted,
+// and the name is deliberately not derivable from the instance name — its
+// instance segment may have been truncated to fit the cloud's length cap. That
+// is why this record is written BEFORE the call that creates the bucket: a
+// record with no bucket behind it is converged by the next ensure, while a
+// bucket with no record is billable storage nobody is watching, under a name
+// nobody can reconstruct.
+//
+// Nothing secret lives here. The keyring is a separate 0600 file in the
+// instance directory, and it is the file whose loss is the permanent loss of
+// everything the bucket holds.
+type Storage struct {
+	Bucket   string `yaml:"bucket"`
+	Location string `yaml:"location,omitempty"`
+
+	// Provider is the STORAGE provider ("gcs"), a different registry from
+	// InstanceMetadata.Provider, the compute provider ("gke"). It is recorded
+	// rather than re-derived so a later change to the compute-to-storage
+	// default table cannot silently repoint an existing instance at a
+	// different cloud's storage.
+	Provider string `yaml:"provider,omitempty"`
+
+	// RecordedAt is when the name was minted and written — before any create
+	// call. CreatedAt is when the bucket was first confirmed to exist.
+	//
+	// The two differ exactly in the window the ordering exists to survive, and
+	// the distinction is load-bearing beyond bookkeeping: while CreatedAt is
+	// empty the recorded name is only an intent, so a name conflict may safely
+	// be resolved by minting another. Once CreatedAt is set the name has held
+	// real data, and minting past a conflict would abandon it.
+	RecordedAt time.Time `yaml:"recorded_at,omitempty"`
+	CreatedAt  time.Time `yaml:"created_at,omitempty"`
+}
+
 // InstanceMetadata is the non-secret record for an installed instance.
 type InstanceMetadata struct {
 	Name      string    `yaml:"name"`
@@ -103,6 +149,10 @@ type InstanceMetadata struct {
 	// instance converges on its next `farcast connect`, which re-ensures the
 	// registry and fills this in.
 	Registry *Registry `yaml:"registry,omitempty"`
+
+	// Storage is the instance's DataSphere bucket (3.3), pointer-typed for the
+	// same reason Registry is.
+	Storage *Storage `yaml:"storage,omitempty"`
 }
 
 // MTLSMaterial is a per-instance data-plane mTLS identity, PEM-encoded. It is a
@@ -238,6 +288,77 @@ func (d Dir) SaveInstanceKubeconfig(name string, kubeconfig []byte) error {
 // connect bootstrap can hand it to kubectl).
 func (d Dir) InstanceKubeconfigPath(name string) string {
 	return filepath.Join(d.instanceDir(name), kubeconfigFile)
+}
+
+// datasphereDir is where an instance's storage keyring lives.
+func (d Dir) datasphereDir(name string) string {
+	return filepath.Join(d.instanceDir(name), datasphereSubdir)
+}
+
+// InstanceKeyringPath is the path to an instance's DataSphere keyring. It is
+// returned rather than read because losing this file is unrecoverable, so the
+// caller that owns the operation owns the read, the write, and the warning.
+func (d Dir) InstanceKeyringPath(name string) string {
+	return filepath.Join(d.datasphereDir(name), keyringFile)
+}
+
+// InstanceKeyringExists reports whether an instance has a storage keyring yet.
+func (d Dir) InstanceKeyringExists(name string) (bool, error) {
+	_, err := os.Stat(d.InstanceKeyringPath(name))
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// LoadInstanceKeyring reads an instance's keyring bytes, refusing a file that
+// is readable by anyone else on the machine — the same permission discipline
+// the credential store applies, on a file that is strictly more dangerous to
+// lose control of.
+func (d Dir) LoadInstanceKeyring(name string) ([]byte, error) {
+	path := d.InstanceKeyringPath(name)
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if perm := info.Mode().Perm(); perm&0o077 != 0 {
+		return nil, fmt.Errorf("keyring %s is mode %04o; it must not be readable by other accounts on this machine", path, perm)
+	}
+	return os.ReadFile(path)
+}
+
+// CreateInstanceKeyring writes a new keyring, refusing to overwrite an
+// existing one. The refusal is the point: overwriting this file is the
+// key-loss catastrophe in one command.
+func (d Dir) CreateInstanceKeyring(name string, data []byte) error {
+	dir := d.datasphereDir(name)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("create %s: %w", dir, err)
+	}
+	path := d.InstanceKeyringPath(name)
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = file.Close() }()
+	if _, err := file.Write(data); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	return nil
+}
+
+// SaveInstanceKeyring replaces an instance's keyring. Every caller of this
+// must have merged rather than replaced its contents — see
+// datasphere.Keyring.Merge — because a keyring written over another loses
+// every key the other held.
+func (d Dir) SaveInstanceKeyring(name string, data []byte) error {
+	if err := os.MkdirAll(d.datasphereDir(name), 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(d.InstanceKeyringPath(name), data, 0o600)
 }
 
 func (d Dir) fatlineDir(name string) string {

@@ -15,6 +15,20 @@ type Command interface {
 	Run(ctx context.Context, env *Env, args []string) error
 }
 
+// subFlagged is a command whose flags live one level down — `storage`, the
+// CLI's only two-level command, and `storage key` below it.
+//
+// The router parses one flag set for the whole line so that flags may appear
+// before, after, or between operands (parseInterspersed). A group registers no
+// flags of its own, so without this the router's flag set has never heard of
+// -l or --out and rejects `farcast storage ls -l prod:` outright, before the
+// group is ever reached. The group cannot know which subcommand is meant
+// until it sees the operands, so it is handed them here — before parsing —
+// and contributes that subcommand's flags to the same set.
+type subFlagged interface {
+	SetSubFlags(fs *flag.FlagSet, args []string)
+}
+
 // Registry holds the available commands in registration order.
 type Registry struct {
 	order  []string

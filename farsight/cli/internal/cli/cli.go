@@ -71,6 +71,11 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	cfs.Usage = func() {}
 	opts.registerCommon(cfs)
 	cmd.SetFlags(cfs)
+	if g, ok := cmd.(subFlagged); ok {
+		// A two-level command's flags belong to its subcommand; without them
+		// here, parsing the line rejects every flag `storage` accepts.
+		g.SetSubFlags(cfs, rest[1:])
+	}
 	cmdArgs, err := parseInterspersed(cfs, rest[1:])
 	if err != nil {
 		fprintf(stderr, "farcast %s: %v\nRun 'farcast help %s' for usage.\n", name, err, name)
@@ -164,7 +169,7 @@ func defaultRegistry() *Registry {
 	reg.Register(newStub("ps", "List running applications", "4.3"))
 	reg.Register(newStub("logs", "Stream an application's logs", "4.3"))
 	reg.Register(newStub("costs", "Show spending and distance to the cost limit", "4.3"))
-	reg.Register(newStub("storage", "Manage instance storage (ls, cp)", "3.3"))
+	reg.Register(newStorageCommand())
 	reg.Register(newStub("chat", "Terminal AI chat through AllThing", "6.2"))
 
 	return reg
