@@ -341,14 +341,14 @@ Each module folder contains its own `README.md` with:
 
 ## Status
 
-> This project is in early development. Phases 0–2 are implemented. Phase 0 (foundation): the manifest parser and the Go SDK (core interfaces + logging). Phase 1 (provisioning): the FarSight CLI with `install`/`release`, driving Planck's GKE Autopilot provider with a private control plane — and giving every instance its own container image registry, created at install and deleted at release. Phase 2 (connection): FatLine's core proxy (mTLS tunnel, deny-by-default egress), Shrike's policy engine, and `farcast connect`, which builds FatLine's image from a local checkout with the Go toolchain, pushes it to that registry, and deploys it pinned by digest — no container engine anywhere. The remaining modules are in specification.
+> This project is in early development. Phases 0–2 are implemented, and Phase 3.1 with them. Phase 0 (foundation): the manifest parser and the Go SDK (core interfaces + logging). Phase 1 (provisioning): the FarSight CLI with `install`/`release`, driving Planck's GKE Autopilot provider with a private control plane — and giving every instance its own container image registry, created at install and deleted at release. Phase 2 (connection): FatLine's core proxy (mTLS tunnel, deny-by-default egress), Shrike's policy engine, and `farcast connect`, which builds FatLine's image from a local checkout with the Go toolchain, pushes it to that registry, and deploys it pinned by digest — no container engine anywhere. Phase 3.1 (storage) has landed too: DataSphere's encrypting store, blob format, operator-held keyring and GCS adapter, validated live against GCP — the provider holds only opaque name tokens and ciphertext. The remaining modules are in specification.
 
 | Module | Spec | Implementation |
 |---|---|---|
 | TechnoCore | 🔲 Draft | 🔲 Not started |
 | Planck | 🟡 In progress | 🟡 GKE Autopilot provider (create/destroy), instance image registry |
 | FatLine | 🟡 In progress | 🟡 Core proxy: mTLS tunnel, deny-by-default egress |
-| DataSphere | 🔲 Draft | 🔲 Not started |
+| DataSphere | 🟡 In progress | 🟡 Encrypting store, blob format v1, keyring, GCS adapter (3.1, validated live) |
 | Shrike | 🟡 In progress | 🟡 Policy engine |
 | AllThing | 🔲 Draft | 🔲 Not started |
 | FarSight | 🟡 In progress | 🟡 CLI: `install`, `release`, `connect`, `redeploy`; engine-less image build |

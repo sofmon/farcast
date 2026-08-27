@@ -154,6 +154,8 @@ Start with one object storage provider (matching the cloud from Phase 1).
 - Key management (operator-held keys, never stored with the cloud provider)
 - Basic operations: put, get, list, delete
 
+**Status: ✅ Complete** — the `Provider` interface and registry, the encrypting `Store`, envelope encryption with single-use DEKs, HMAC-tokenized object names, the operator-held keyring, and a GCS adapter in [`datasphere/`](datasphere/README.md), plus the `cmd/datasphere` harness. Blob format v1 is frozen by golden vectors whose HKDF and HMAC values were reproduced from an independent implementation. `go test -race`, `go vet`, `gofmt` and `golangci-lint` all clean; zero new vendored modules (31 before, 31 after — the two official GCS clients measured at +18 and +1). **Validated live against GCP on 2026-08-27:** all nine success criteria in [the Phase 3 runbook](docs/runbooks/phase-3-validation.md) passed, with `gcloud` independently confirming the cloud holds only opaque tokens and ciphertext. Both open wire questions are settled — object metadata *is* returned in the default list projection, and the `farcast-*` IAM condition works and does not block the credentials probe. Known gap: the run used a dedicated storage service account, while production puts the grant on the installer account; that combination lands with 3.3.
+
 ### 3.2 SDK — Storage implementation
 Wire the `farcast.Storage()` interface to DataSphere.
 
