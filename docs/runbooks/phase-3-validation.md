@@ -17,11 +17,11 @@ few kilobytes for a few minutes, so the cost is effectively zero — but a *leak
 bucket is billable storage nobody is watching, which is why step 9 is not optional.
 Budget **~15 minutes**.
 
-> **Status.** Executed end-to-end against a real GCP project on **2026-08-27** — all
-> nine success criteria passed, including live confirmation that the cloud holds only
-> opaque tokens and `FCDS`-prefixed ciphertext. The two assumptions this run existed to
-> settle are both settled, one of them against the prediction written into this runbook.
-> See [Findings](#findings-from-the-2026-08-27-run) at the end.
+> **Status.** Executed end-to-end against a real GCP project on **2026-08-27**, in two
+> passes: Phase 3.1 (all nine success criteria) and then Phase 3.3's streaming surface.
+> The cloud was confirmed to hold only opaque tokens and `FCDS`-prefixed ciphertext,
+> and every assumption either phase shipped on is now settled — three of them against
+> the prediction written into this runbook. See [Findings](#findings-from-the-2026-08-27-run).
 
 ---
 
@@ -66,7 +66,15 @@ gcloud projects add-iam-policy-binding "$PROJECT_ID" --member "serviceAccount:${
 ```
 
 > **Verified 2026-08-27: this condition works, and it does *not* block
-> `storage.buckets.list`.** GCP accepted the expression as written, and every
+> `storage.buckets.list`.** It was also verified on the **installer** service account —
+> the shape production uses, where one account holds container, Artifact Registry and
+> conditional storage grants together.
+>
+> One operational wrinkle: `add-iam-policy-binding` immediately after
+> `service-accounts create` can fail with `Service account … does not exist` while IAM
+> propagates, even though the account exists enough to mint a key. Retry it.
+>
+> Original note follows. GCP accepted the expression as written, and every
 > operation in this runbook — the project-level credentials probe, bucket create,
 > adopt, object CRUD, and teardown — succeeded under it. An earlier draft of this
 > runbook warned that the project-level list might 403; that prediction was wrong, and
@@ -393,3 +401,65 @@ Expect a refusal naming the object count and bytes, with nothing destroyed.
   cover them; neither has been executed. Two answers wait on that: whether an
   abandoned resumable session is billable, and whether the service honours
   `Range` the way the adapter assumes.
+
+
+---
+
+## Findings from the Phase 3.3 pass (2026-08-27)
+
+**1. The streaming path works against the real service.** A 20 MiB resumable upload
+spanning three windows, a streamed read-back hashed byte-for-byte, and ranged reads at
+offset 0 and at 1 MiB all passed. This is the protocol a fake transport cannot falsify,
+because the fake is built from the same understanding as the code.
+
+**2. `ObjectInfo.Created` is populated from a real listing.** The `timeCreated` field was
+newly added to the projection and had never run against GCS. `farcast storage usage` now
+reports a real write window.
+
+**3. The abandoned-session question is ANSWERED — and better than feared.** A resumable
+session holding 8 MiB of never-finalized data is:
+
+- invisible to `objects.list`,
+- reported as **0 bytes** by `gcloud storage du`,
+- **not enumerable at all** — GCS exposes no equivalent of S3's `ListMultipartUploads`,
+- and, decisively, **does not block bucket deletion**: a bucket holding an outstanding
+  session deleted cleanly.
+
+So an interrupted `cp` cannot strand a teardown, which is what actually mattered. **The
+design consequence is the one that was not obvious:** because they cannot be enumerated,
+`farcast storage usage` *cannot* report an "incomplete uploads" line on GCS. That figure
+was listed as deferred; it is not deferred, it is unavailable, and the spec now says so.
+
+**4. The v2 framing overhead is exact against real objects.** A 64 MiB upload stored as
+67,110,048 bytes — 1,184 bytes of overhead, which is 144 of header plus 65 frame tags:
+64 full frames **plus the zero-length terminator**. The self-terminating rule, confirmed
+on the wire rather than in a unit test.
+
+**5. A 64 MiB round trip through `farcast storage cp` is byte-exact**, and the object
+cannot fit the buffered format, so this exercised the chunked path end to end.
+
+**6. The teardown gate behaves as specified.** `release` refuses while the bucket holds
+data, naming the count and bytes; `--yes` does **not** imply `--delete-data`; and the
+gate still works with `keys.yaml` removed — an operator who has lost their keyring can
+still see what they are paying for and stop paying it.
+
+**7. A cluster-delete failure leaves the data intact and the record in place.** Observed
+for real (a credential without `container.clusters.delete`): nothing was destroyed, the
+bucket and both objects survived, and the record was kept for a re-run.
+
+**8. The production credential shape works.** The same bucket was reached and torn down
+through the **installer** service account carrying container, Artifact Registry and
+conditional storage grants together — closing the gap the 3.1 pass explicitly left open.
+
+**9. `farcast storage` needs no cluster and no tunnel.** This pass ran against an
+instance record with no cluster behind it at all, which is the claim
+[Decisions 13](../../farsight/cli/README.md#decisions) makes.
+
+### Still not covered
+
+- **Scale.** Two objects. The multi-page listing path and the multi-megabyte listing cap
+  are still unexercised against real GCS.
+- **A forced retention window.** No org policy on this project forces soft delete back
+  on, so `ErrRetentionForced` remains unit-tested only.
+- **`storage key rekey` against a real bucket.** The keyring verbs were exercised only
+  by unit tests in this pass.
