@@ -15,3 +15,10 @@
 # One-off local build artifacts (e.g. from validation runs).
 /x_farcast
 /x_planck
+
+# Local-only operator context. HANDOVER.md carries the live GCP project, the
+# cluster's DNS endpoint, the service-account key path, and account emails;
+# .claude/ is this machine's agent settings. Neither belongs in a public repo,
+# and neither has ever been tracked — this makes that survive a `git add -A`.
+/HANDOVER.md
+/.claude/
