@@ -6,7 +6,7 @@ DataSphere is the module that turns "a cloud bucket" into "the instance's privat
 
 This document specifies **Phase 3.1 — the first storage provider adapter**: the `Provider` interface, the encrypting `Store` above it, the operator-held keyring, and one concrete adapter (GCS) that can ensure and destroy the instance's bucket and put, get, list, and delete objects. Wiring into the SDK (3.2) and the operator CLI (3.3) are later phases and are described only in outline here.
 
-> **Status.** Phase 3.1 — **implemented, unit-tested, and validated against a real bucket on 2026-08-27.** Everything specified below exists under `datasphere/`: the blob format is frozen by golden vectors whose HKDF and HMAC values were reproduced independently, the GCS adapter is driven end-to-end over a fake transport, and the whole stack has now been walked against live GCS via [`docs/runbooks/phase-3-validation.md`](../docs/runbooks/phase-3-validation.md) — all nine success criteria passed, with `gcloud` independently confirming that the cloud holds only opaque tokens and `FCDS`-prefixed ciphertext. Both assumptions this module shipped on are settled: **object metadata is returned in the default list projection** (so `List` is one call per page, as claimed), and the recommended **`farcast-*` IAM condition works** and does not block the credentials probe. `X-Goog-Meta-*` turns out not to be sent on media downloads — the one best-effort path, which nothing depends on. The frozen upstream contract is [`sdk/go/storage.go`](../sdk/go/README.md)'s `StorageAPI` (`Read`/`Write`/`List(prefix)`/`Delete`, key-addressed, `[]byte` values), which 3.2 wires to the `Store` defined here — the two are deliberately signature-identical. **Out of scope (later phases):** the SDK wiring and the in-cluster key-delivery decision (3.2 — see [Key management](#key-management)), `farcast storage` CLI commands, streaming/large objects, key export and rotation tooling, usage reporting (3.3), per-app isolation (4.x), secrets (5.3), and the second storage provider (8.2).
+> **Status.** Phase 3.1 — **implemented, unit-tested, and validated against a real bucket on 2026-08-27.** Everything specified below exists under `datasphere/`: the blob format is frozen by golden vectors whose HKDF and HMAC values were reproduced independently, the GCS adapter is driven end-to-end over a fake transport, and the whole stack has now been walked against live GCS via [`docs/runbooks/phase-3-validation.md`](../docs/runbooks/phase-3-validation.md) — all nine success criteria passed, with `gcloud` independently confirming that the cloud holds only opaque tokens and `FCDS`-prefixed ciphertext. Both assumptions this module shipped on are settled: **object metadata is returned in the default list projection** (so `List` is one call per page, as claimed), and the recommended **`farcast-*` IAM condition works** and does not block the credentials probe. `X-Goog-Meta-*` turns out not to be sent on media downloads — the one best-effort path, which nothing depends on. **Phase 3.3 is implemented** — the streaming v2 format (golden-vectored against an independent implementation), the `Provider` streaming pair, `BucketUsage`, `Store.Rekey`, the passphrase-armored keyring export, and the hand-rolled GCS resumable-upload path. Its live validation against a real bucket has **not** run; the operator-facing half lives in [`farsight/cli/README.md`](../farsight/cli/README.md). The frozen upstream contract is [`sdk/go/storage.go`](../sdk/go/README.md)'s `StorageAPI` (`Read`/`Write`/`List(prefix)`/`Delete`, key-addressed, `[]byte` values), which 3.2 wires to the `Store` defined here — the two are deliberately signature-identical. **Out of scope (later phases):** the SDK wiring and the in-cluster key-delivery decision (3.2 — see [Key management](#key-management)), `farcast storage` CLI commands, streaming/large objects, key export and rotation tooling, usage reporting (3.3), per-app isolation (4.x), secrets (5.3), and the second storage provider (8.2).
 
 ---
 
@@ -95,8 +95,20 @@ type Provider interface {
 
 	// Delete removes an object. Deleting an absent object is not an error.
 	Delete(ctx context.Context, bucket, name string) error
+
+	// PutStream stores an object of unbounded size from a reader, atomically:
+	// the object becomes visible complete or not at all. An interrupted call
+	// must leave nothing an operator would be billed for without being told.
+	// (3.3)
+	PutStream(ctx context.Context, bucket string, obj StreamObject) error
+
+	// GetStream returns a reader over a byte range of an object; length -1
+	// means "to the end". A missing object is ErrObjectNotFound. (3.3)
+	GetStream(ctx context.Context, bucket, name string, offset, length int64) (io.ReadCloser, error)
 }
 ```
+
+**Why streaming widens the `Provider` rather than riding an optional capability** (3.3). Planck's registry is optional because a compute cloud without image hosting is still a complete compute provider. Streaming is not like that on either count. Every real object store has it — GCS resumable upload, S3 multipart — so optionality would be fake in the same way bucket lifecycle's would be. And `GetStream` is not only for large objects: `Store.List`'s **already-shipped** name-recovery fallback fetches an object whose metadata mirror is unreadable, which for a 5 GiB v2 object means downloading 5 GiB to read 1,168 bytes of header. That fallback is load-bearing for the module's reconstruct-every-name promise, so a ranged read is a correctness requirement of shipped behaviour, not a 3.3 optimization.
 
 Bucket lifecycle sits in the `Provider` proper — a deliberate departure from Planck's optional `RegistryProvider` capability, argued in [Decisions](#decisions) (5).
 
@@ -136,6 +148,16 @@ type Bucket struct {
 type Object struct {
 	Name string
 	Data []byte
+	Meta map[string]string
+}
+
+// StreamObject is an object supplied as a stream. Size is -1 when unknown,
+// which is the normal case for a pipe; an adapter that needs a total length up
+// front is responsible for buffering to discover it. (3.3)
+type StreamObject struct {
+	Name string
+	Data io.Reader
+	Size int64
 	Meta map[string]string
 }
 
@@ -209,6 +231,38 @@ func (s *Store) StoredName(key string) (string, error)
 func (s *Store) Bucket() string
 ```
 
+**Streaming (3.3).** Two methods, and deliberately not four: there is no streaming `List` or `Delete` because neither ever held an object in memory.
+
+```go
+// WriteStream stores r under key as a v2 chunked blob, holding one frame in
+// memory regardless of size. It is an upsert, like Write.
+func (s *Store) WriteStream(ctx context.Context, key string, r io.Reader) error
+
+// ReadStream writes the authenticated plaintext of key to w, one frame at a
+// time, and accepts either format — v1 objects stream as a single frame.
+func (s *Store) ReadStream(ctx context.Context, key string, w io.Writer) error
+```
+
+`ReadStream` carries one caveat the `[]byte` API does not have and callers must be told: authentication is **per frame**, so a truncation or a tampered tail is detected only when the reader reaches it — after earlier frames have already been written to `w`. `Read`'s all-or-nothing guarantee cannot survive streaming, by arithmetic rather than by choice. Every consumer must therefore treat a non-nil error as *the output is incomplete and must not be used*, and `farcast storage cp` writes to a temporary file and renames only on success, so a failed download never leaves a plausible-looking partial file at the destination.
+
+```go
+// BucketUsage reports what a bucket physically holds — object count and stored
+// bytes — over a Provider, with no keyring and nothing decrypted.
+//
+// It is a package function rather than a Store method on purpose. Store.List
+// reports what the KEYRING can name; a teardown gate or a spend report built on
+// that would announce an empty bucket while billable ciphertext sat in it, and
+// would stop working entirely for the operator who has lost keys.yaml and most
+// needs to see what they are still paying for. A divergence between this count
+// and Store.List's is itself worth reporting.
+func BucketUsage(ctx context.Context, p Provider, bucket string) (Usage, error)
+
+type Usage struct {
+	Objects     int64
+	StoredBytes int64
+}
+```
+
 `Write` is an **upsert**: writing an existing key atomically replaces it (the Provider contract above carries the atomicity). Lost-update protection — generations, preconditions, compare-and-swap — is explicitly out of 3.1's scope; if 3.2's multi-writer reality demands it, it arrives as an interface addition, not a reinterpretation.
 
 Logical keys are opaque byte strings: non-empty UTF-8, at most 1024 bytes and 30 `/`-separated segments, no empty segments, no trailing `/`. **No normalization, ever** — no Unicode folding, no slash collapsing, no trimming. The key's exact bytes participate in authentication (below), so a "helpful" canonicalization applied on write but not read would turn valid data unreadable; a golden test vector with a non-normalized Unicode key pins this.
@@ -244,6 +298,39 @@ Frozen by golden test vectors (fixed hex literals a refactor cannot regenerate) 
 Fixed overhead ≈ 131 bytes plus the sealed name. `Write` rejects plaintext over **64 MiB** (`ErrTooLarge`): honest for a `[]byte` API that holds whole objects in memory, far under GCM's per-invocation limit, and covering what a key-value API is for. Large files arrive with 3.3's `storage cp` as a chunked **v2 format behind the version byte** (per-chunk counter nonces under a fresh per-object DEK — safe only because DEKs are single-use; the v2 design must re-run the wrap-budget arithmetic). No v1 migration will be required.
 
 `Read` returns either the exact authenticated plaintext or an error — never partial output. Bad magic, unknown version, parse failure, or any GCM failure is `ErrIntegrity`; a key ID missing from the keyring is `ErrUnknownKey`.
+
+### Blob format v2 — streaming (Phase 3.3)
+
+v1 holds a whole object in memory, so it caps at 64 MiB. v2 is the chunked format the version byte was reserved for: `Store.WriteStream` and `Store.ReadStream` move objects of arbitrary size without either end ever holding more than one frame.
+
+**v1 is not touched.** `Write`/`Read` keep emitting and accepting v1 byte-for-byte, no golden vector moves, and no stored object is ever rewritten. A reader dispatches on the version byte; a writer chooses by which API was called, not by size.
+
+**The header is v1's, extended after the sealed name — and that ordering is the whole point:**
+
+| bytes | len | field |
+|---|---|---|
+| 0–3 | 4 | magic `FCDS` |
+| 4 | 1 | version `0x02` |
+| 5–12 | 8 | key ID of the KEK the DEK is wrapped under |
+| 13–24 | 12 | wrap nonce |
+| 25–72 | 48 | wrapped DEK (32 B + 16 B tag) |
+| 73–74 | 2 | sealed-name length *L* (uint16 BE) |
+| 75 … | *L* | sealed name — **identical construction to v1** |
+| 75+*L* … | 8 | frame salt (random, once per seal) |
+| 83+*L* | 1 | chunk-size exponent *e*; frame plaintext size *P* = 1 ≪ *e* |
+| 84+*L* … | var | frame 0, frame 1, … |
+
+Bytes 0 through 74+*L* are the same fields at the same offsets in v1, v2, and every version after. That is not tidiness — it is the mechanism holding up this module's promise that *the bucket plus the keys file alone reconstruct every logical name with no local state*. `ParseHeader`, `HeaderName` and `Rekey` stay **one version-free implementation**; a recovery tool written today reads a name out of a format that does not exist yet. Putting the extension fields *before* the sealed name would have moved it to offset 87 and forced a version branch into the one path that must never need one.
+
+`MaxHeaderLen` = 75 + 1084 + 9 = **1168** bytes (1084 = 12 + 1056 + 16, the longest sealed name), so a reader fetches `Range: bytes=0-1167` and is guaranteed a complete header in one request.
+
+- **Frames.** `frameᵢ = GCM-Seal(DEK, nonceᵢ, plaintextᵢ, frameAAD)`, so a frame is its plaintext plus 16 bytes. Every frame but the last carries exactly *P* bytes; the last carries 0 to *P*. Default *e* = 20 (**1 MiB**), bounded to *e* ∈ [16, 26] (64 KiB – 64 MiB) and range-checked before *P* sizes any allocation — a hostile header must not be able to ask for a 4 GiB buffer. Tag overhead at the default is **15 ppm**.
+- **Nonces are `salt ‖ uint32 BE frame index`.** Under one DEK the salt is fixed and the counter strictly increases, so no nonce repeats *by construction* rather than statistically. The salt is fresh per seal and is what preserves v1's defense-in-depth: two seals that erroneously shared a DEK collide only if their salts also collide (2⁻⁶⁴), instead of colliding on frame 0 with certainty. The counter cannot wrap — GCS caps an object at 5 TiB, which at the *smallest* legal frame size is 2²⁶ frames against a 2³² counter, a 51× margin, and the writer refuses index 2³² regardless.
+- **AAD.** Frame AAD is `magic ‖ version ‖ e ‖ frame index ‖ final flag ‖ logical-key bytes`; wrap AAD is `magic ‖ version ‖ key ID`. The frame AAD **still excludes the key ID**, so rekey stays a header rewrite for v2 exactly as for v1. The version byte differs from v1's, so a wrapped DEK cannot be replayed across formats.
+- **Length is derived, never stored.** The frame count and the plaintext length come from the object's ciphertext length and *e*. A stored length field would be a second cloud-writable source of truth; deriving it means the **final flag** does the work: truncating the object makes a reader treat a `final=0` frame as final, and extending it makes the real final frame parse as non-final. Both are tag failures. Reordering and replay fail on the frame index. A zero-byte object is legal — one frame, zero plaintext.
+- **The nonce-budget ledger, re-run as v1 required.** Frame seals: collision structurally impossible (single-use DEK, non-wrapping counter). **KEK wraps: one per `WriteStream`, not one per frame** — this is the number that mattered, and it means a 5 GiB file costs *one* wrap, leaving v1's ~2³² writes per KEK unchanged. Wrapping per frame would have burned that budget 5,120× faster on a single large file and turned rotation from hygiene into an operational requirement. Name seals: unbounded by construction, as before.
+
+**What the cloud additionally sees:** the frame size (a plaintext header byte) and, from the object's length, the frame count. Both were already inferable from the ciphertext size. Padding remains rejected on the cost pillar.
 
 ### Name privacy
 
@@ -315,9 +402,11 @@ GCS bucket names are **globally unique across all of Google Cloud** — a namesp
 
 Matching the Phase 1 cloud. The adapter is **hand-issued REST over the vendored auth stack** — the exact pattern of the registry capability ([ADR 0007](../docs/adr/0007-instance-owned-image-registry.md) decision 2, [`planck/internal/providers/gke/registry.go`](../planck/internal/providers/gke/registry.go)) — under the same **zero-new-vendored-module budget** (31 before, 31 must remain after).
 
-- **Surface: ~8 JSON-API calls**, all `net/http` + `encoding/json`: `buckets.insert` (labels, PAP, UBLA, versioning, soft-delete-zero in the body), `buckets.get` (ownership inspect; also the soft-delete re-check at Validate and teardown), `buckets.patch` (the teardown-time soft-delete reset), `buckets.delete`, `objects.insert` via **`uploadType=multipart`** (stdlib `mime/multipart`; a JSON metadata part carrying `farcast-name` plus the media part, in one atomic request — `uploadType=media` cannot set metadata, so multipart is load-bearing, not an optimization), `objects.get?alt=media`, `objects.list` (`prefix`, `pageToken`, `prettyPrint=false`, `fields=items(name,size,metadata),nextPageToken`, under its own multi-megabyte response cap — a full page of long names and their sealed-name mirrors is *not* kilobytes, and sharing the error-envelope cap made long-keyed buckets permanently unlistable), `objects.delete` (404 ⇒ success).
+- **Surface: ~10 JSON-API calls** (8 shipped at 3.1, plus resumable upload and ranged reads at 3.3); all `net/http` + `encoding/json`: `buckets.insert` (labels, PAP, UBLA, versioning, soft-delete-zero in the body), `buckets.get` (ownership inspect; also the soft-delete re-check at Validate and teardown), `buckets.patch` (the teardown-time soft-delete reset), `buckets.delete`, `objects.insert` via **`uploadType=multipart`** (stdlib `mime/multipart`; a JSON metadata part carrying `farcast-name` plus the media part, in one atomic request — `uploadType=media` cannot set metadata, so multipart is load-bearing, not an optimization), `objects.get?alt=media`, `objects.list` (`prefix`, `pageToken`, `prettyPrint=false`, `fields=items(name,size,metadata),nextPageToken`, under its own multi-megabyte response cap — a full page of long names and their sealed-name mirrors is *not* kilobytes, and sharing the error-envelope cap made long-keyed buckets permanently unlistable), `objects.delete` (404 ⇒ success).
 - **Auth stays vendored.** Credential resolution, token minting, and refresh live inside `cloud.google.com/go/auth` (`httptransport.NewClient` owns the `Authorization` header) — the half [ADR 0006](../docs/adr/0006-connect-bootstrap-kubectl.md) refused to re-own. A configured key is loaded as a service account *and nothing else*, so an external-account credential file cannot redirect token minting (the guard the registry adapter already applies).
 - **Named wire traps, each with a test:** the `/` separators in tokenized object names must be percent-encoded in the URL *path* on object endpoints — a raw `/` changes the route. In the `prefix` *query parameter*, standard percent-encoding as produced by `url.Values` is correct and equivalent to a raw `/` (the server decodes query values; the only real query-side bug is double-encoding). And the metadata-returned-in-default-list-projection assumption behind one-round-trip `List` must be verified against a real bucket in the first integration run, before the List cost claims freeze.
+- **Streaming: resumable upload and ranged reads (3.3).** Two more calls, and the revisit trigger this spec set for itself has now fired. `PutStream` buffers up to **8 MiB**; if the stream ends inside that window it goes out as the shipped single `uploadType=multipart` request, so a small streaming write costs exactly one call and nothing changes for the common case. Above it, a resumable session: `POST …?uploadType=resumable` for a session URI, then `PUT`s with `Content-Range`, then completion. `GetStream` is `objects.get?alt=media` with a `Range` header. **Named traps, each owed a test:** Go's `net/http` treats `308 Resume Incomplete` as a redirect, so the client sends `X-GUploader-No-308` *and* sets `CheckRedirect` to `http.ErrUseLastResponse` — belt and braces, because the bare 308 works today only by accident of GCS omitting `Location`. A resend queries the committed offset first (`Content-Range: bytes */*`) and never blindly re-PUTs; a `200`/`201` to that query means the upload finished and the acknowledgement was lost, which is success. A `404` means the session is gone — restart from zero under a **fresh DEK**, never resume an old one over a possibly-different byte stream. A stream ending exactly on a window boundary still needs its zero-length terminator or the object is never finalized. The abort (`DELETE <session>`) runs on `context.WithoutCancel`, because the overwhelmingly common reason to abort is that the context died. And a `200` in answer to a `Range` request is an **error**, not a fallback: it means a proxy stripped the header, and accepting it turns a 1,168-byte header probe into a 5 TiB download at the wrong offset. Whether an abandoned resumable session is billable storage on GCS is **unverified** and goes in the Phase 3 runbook — on S3 the equivalent famously is.
+- **The dependency verdict, on the measurement already taken.** Decision 8 named streaming as the trigger to re-open the trade, and it is re-opened here and closed the same way. `cloud.google.com/go/storage` is +18 modules and 18 forced upgrades of modules the shipped Planck provider already depends on; `google.golang.org/api/storage/v1` is +1 (`github.com/google/uuid`) with no version churn and is the only official option that implements resumable upload. Against +1, the counter-argument is the CLI's own precedent: it hand-rolled a **3,097-line** OCI distribution client, chunked blob upload and all, rather than vendor into the binary that holds the operator's cloud credentials and the instance's CA key ([`farsight/cli` decision 11](../farsight/cli/README.md)). Resumable upload is a fraction of that. **Hand-rolled; the budget stays at 31.** The cost lands as code FarCast owns and must test — which is what the named traps above are.
 - **Retries are owed, and bounded:** hand-rolling means the adapter carries its own jittered exponential backoff on 429/5xx, ctx-honouring, whole-request only — every operation here is safely retryable (uploads are atomic per stored name, deletes are absent-is-success), and a partial resume of a multipart body must never exist (a truncated ciphertext would fail `ErrIntegrity` only at read time, long after the write).
 - **The measurement clause — MEASURED, 2026-08-27** (ADR 0007's inspect-the-diff discipline; intuition has failed in both directions before). Both candidates were run through `go mod tidy && go mod vendor` in throwaway copies, after a control run confirmed the 31-module baseline is stable under `tidy` on its own:
 
@@ -381,6 +470,8 @@ Storage costs real money and the blob format is data at rest, so the pyramid is 
 11. **A forced retention window is reported as an error accompanying a *successful* operation** (added at implementation). The spec requires teardown to say, before the record is cleared, that an org policy is still holding and billing for ciphertext the operator ordered destroyed — but `DeleteBucket` returns only `error`, and the frozen interface is worth more than the convenience of widening it. So `ErrRetentionForced` is delivered the way `io.EOF` is: a classifiable sentinel wrapped around a result that did succeed. A caller that classifies it warns and proceeds; a caller that does not treats it as failure and retries, which is harmless because every operation it accompanies is idempotent. Both behaviours are safe, and neither reports "nothing left billing" while retained copies bill for days. Rejected: a `Notices` field (two mechanisms for one concern), a logger on `Config` (the shape is deliberately neutral data), and silence (the failure this exists to prevent).
 12. **The sealed name in the header is authenticated where it is read, not on every read** (added at implementation, amending the draft). `Read` opens the body and never touches the header's sealed name, so a bit flip there returns the correct plaintext with no error; `HeaderName` — the path `List` falls back to, and the path recovery tooling uses — returns `ErrIntegrity` on the same damaged bytes. This was found by the tamper suite, which now asserts that boundary explicitly rather than papering over it. Verifying it on every read was considered and rejected: the sealed name is a *mirror* of a name the reader already supplied, and the body is bound to that logical key by the data AAD, so a damaged mirror cannot ever produce wrong plaintext — only an unrecoverable name. Refusing an otherwise perfectly authenticated object because a copy of its label was scratched trades data availability for no confidentiality at all, and it would put an HKDF and a GCM open in front of every read to buy it. The damage is still detected, loudly, on the path where it matters: `List` reports it in its joined error.
 13. **`Validate` returns a plain yes or no; the forced-retention notice does not ride on it** (added at implementation). The spec has the adapter re-check soft delete at `Validate`, and the first implementation returned `ErrRetentionForced` from there. That is a trap: `Validate` is the enforcement point the composition root runs *before* constructing a `Store`, so a caller that treats a validation error as fatal — the only sane way to treat one — converts an org-policy warning into a total storage outage. The safe-fallback argument that justifies the sentinel on `EnsureBucket` and `DeleteBucket` (an unaware caller retries an idempotent operation) collapses here. Nothing is lost by the removal: every storage path ensures defensively (decision 9), and `EnsureBucket` reports the window from the same read.
+14. **v2 is one chunked object per logical key, and its extension fields go *after* the sealed name** (3.3). Rejected: a manifest object plus N chunk objects, which needs no new adapter surface at all and was genuinely tempting on the dependency axis — but it concentrates an arbitrarily large object's only DEK in a 225-byte manifest whose loss orphans every chunk (billing, unlistable, unreadable), it makes a plain concurrent overwrite able to destroy *both* writers' data and the prior value, and its teardown gate would report an empty bucket while gigabytes sat in it. One object per key keeps v1's blast radius — losing an object loses exactly that object. Within that, the extension fields sit after the sealed name rather than before it so bytes 0–74+*L* are identical in every version forever: `ParseHeader`, `HeaderName` and `Rekey` stay one version-free implementation, which is the only thing holding up the promise that the bucket plus the keys file reconstruct every logical name with no local state.
+15. **Streaming widens the `Provider`, and resumable upload is hand-rolled** (3.3). Optionality would be fake — every real object store streams — and `GetStream` is a correctness requirement of *shipped* behaviour, not a large-file feature: `Store.List`'s name-recovery fallback would otherwise download 5 GiB to read a 1,168-byte header. On the dependency half, decision 8's revisit trigger fired and closed the same way: +18 modules and 18 forced upgrades for `cloud.google.com/go/storage`, +1 for the generated client, against a CLI precedent of hand-rolling 3,097 lines of OCI distribution client rather than vendoring into the credential-holding binary. The budget stays at 31 and the named wire traps become ours to test.
 
 ---
 
@@ -390,7 +481,7 @@ Storage costs real money and the blob format is data at rest, so the pyramid is 
 |---|---|
 | **3.1** (this) | ✅ `Provider` + registry, the encrypting `Store`, blob format v1, keyring format, the GCS adapter, `cmd/datasphere`, the test pyramid. Live validation pending — see [the runbook](../docs/runbooks/phase-3-validation.md) |
 | 3.2 | SDK wiring (`farcast.Storage()` → `Store`) **behind the key-delivery ADR** (in-cluster mechanism; blocked until it resolves); SDK error sentinels |
-| 3.3 | `farcast storage ls`/`cp` (streaming via the chunked v2 format), keygen at first use, `key export`/`import` (merge-only)/`rotate`, usage reporting, the `InstanceMetadata` `storage:` block plus the mint/record/retry ensure path and bucket delete wired into the CLI, Phase 3 runbook |
+| **3.3** (next) | **Blob format v2** (chunked, streaming) and the `Provider` streaming pair; `BucketUsage`; hand-rolled GCS resumable upload and ranged reads. In the CLI: `farcast storage ls`/`cp`/`rm`/`usage`, the keyring lifecycle (`key export`/`import` (merge-only)/`rotate`/`rekey`), keygen at first use, the `InstanceMetadata` `storage:` block plus the mint/record/retry ensure path, and the bucket teardown wired into `release` behind a refuse-while-data-remains gate |
 | 4.x | Per-app namespace scoping and TechnoCore cost attribution keyed on the bucket's labels |
 | 5.3 | Secrets riding the same `Store` under `system/` |
 | 8.2 | S3 adapter behind the same interface — S3's global namespace and 2 KB metadata cap are already accommodated (tags for labels, the 1024-byte key cap bounding the sealed-name mirror) |

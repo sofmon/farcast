@@ -260,6 +260,21 @@ export FARCAST_GCS_TEST_PROJECT="$PROJECT_ID" FARCAST_GCS_TEST_LOCATION="$REGION
 go test -tags=integration -v ./datasphere/internal/providers/gcs/
 ```
 
+That now includes `TestIntegrationStreaming` (Phase 3.3), which is the only
+thing that exercises the resumable-upload protocol against the real service —
+its 308 handling, its committed-offset query and its zero-length terminator are
+edges a fake transport cannot falsify, because the fake is built from the same
+understanding as the code. It moves ~20 MiB, spanning three upload windows.
+
+**It also answers a question this project could not settle from documentation.**
+The test starts a resumable session and abandons it, then logs what the bucket
+reports. On S3 the equivalent — an incomplete multipart upload — famously *is*
+billed until aborted and is invisible to an ordinary listing, which is why S3
+buckets need a lifecycle rule for it. Whether GCS behaves the same decides
+whether `farcast storage usage` owes the operator an "incomplete uploads" line.
+Look for the lines the test logs as `FINDING:`, **check the bucket's billed size
+in the cloud console before you delete it**, and record the answer below.
+
 ---
 
 ## Success criteria
@@ -328,6 +343,39 @@ a billable resource nobody is watching.
 **9. Nothing was left billing.** `gcloud storage buckets list` returns empty, and the
 bucket 404s.
 
+## 11. Phase 3.3 — streaming, on the same bucket
+
+The harness is 3.1's and has no streaming verbs; the 3.3 surface is the
+`farcast` CLI itself. With an installed instance:
+
+```bash
+mkfile -n 64m big.bin 2>/dev/null || head -c 67108864 /dev/urandom > big.bin
+```
+
+```bash
+farcast storage cp ./big.bin validate:app/big.bin && farcast storage ls -l validate: && farcast storage cp validate:app/big.bin ./big.out && cmp big.bin big.out && echo "round trip byte-exact"
+```
+
+A 64 MiB file cannot fit the buffered format, so this proves the chunked v2 path
+end to end. Then confirm what the cloud holds is still opaque:
+
+```bash
+gcloud storage ls -r "gs://$BUCKET" --project "$PROJECT_ID" && gcloud storage cat "$(gcloud storage ls "gs://$BUCKET/**" --project "$PROJECT_ID" | head -1)" | head -c 16 | xxd
+```
+
+Expect an opaque token path and an `FCDS` magic followed by version `02`.
+
+Then the teardown gate, which should now refuse:
+
+```bash
+farcast release validate
+```
+
+Expect a refusal naming the object count and bytes, with nothing destroyed.
+`farcast release validate --delete-data` is what proceeds.
+
+---
+
 ### Not covered by this run
 
 - **The production credential shape.** This run used a dedicated `farcast-storage`
@@ -337,5 +385,11 @@ bucket 404s.
 - **A forced retention window.** No org policy on this project forces soft delete back
   on, so the `ErrRetentionForced` path was never triggered live. It is covered by unit
   tests only.
-- **Scale.** Three objects, all small. The multi-page listing path, the 64 MiB object
-  cap, and the multi-megabyte listing cap were not exercised against real GCS.
+- **Scale.** Three objects, all small. The multi-page listing path and the
+  multi-megabyte listing cap were not exercised against real GCS.
+- **Everything in Phase 3.3** — the streaming format, the resumable-upload
+  protocol, ranged reads, `ObjectInfo.Created` in the list projection, and the
+  `farcast storage` commands. Sections 11 and the gated integration run above
+  cover them; neither has been executed. Two answers wait on that: whether an
+  abandoned resumable session is billable, and whether the service honours
+  `Range` the way the adapter assumes.

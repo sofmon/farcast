@@ -170,6 +170,8 @@ Operator tools for managing storage.
 - `farcast storage cp <local> <remote>` and vice versa
 - Storage usage reporting
 
+**Status: ✅ Complete (unit-tested; live validation of the streaming path pending)** — `farcast storage ls`/`cp`/`rm`/`usage` and `storage key list`/`export`/`import`/`rotate`/`rekey` in [`farsight/cli/`](farsight/cli/README.md), on DataSphere's new chunked **blob format v2** (streaming, arbitrary size) with a hand-rolled GCS resumable-upload path and ranged reads. The keyring is minted at first storage use; the bucket is minted, recorded-before-create and ensured lazily; and `farcast release` now refuses while the bucket holds data unless `--delete-data` is given. `go test -race`, `go vet`, `gofmt` and `golangci-lint` clean; zero new vendored modules (31 before, 31 after). v2's golden vectors were reproduced from an independent implementation before being frozen.
+
 **Phase 3 deliverable:** applications and operators can store and retrieve files. Everything is encrypted at rest. The cloud provider sees only encrypted blobs.
 
 ---

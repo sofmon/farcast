@@ -139,6 +139,96 @@ plaintext.
 `Write` refuses a plaintext over **64 MiB**. Larger objects arrive as a chunked v2
 format behind the version byte; no v1 migration will be required.
 
+## Blob format v2 — chunked, streaming
+
+v1 holds a whole object in memory and caps at 64 MiB. v2 is what the version
+byte was reserved for: objects of any size, with neither end ever holding more
+than one frame.
+
+**v1 is untouched.** No stored object is ever rewritten and no v1 vector moves.
+A reader dispatches on the version byte; a writer chooses by which API was
+called, not by size.
+
+### Layout
+
+| bytes | len | field |
+|---|---|---|
+| 0–3 | 4 | magic `FCDS` |
+| 4 | 1 | version `0x02` |
+| 5–12 | 8 | key ID |
+| 13–24 | 12 | wrap nonce |
+| 25–72 | 48 | wrapped DEK |
+| 73–74 | 2 | sealed-name length *L* |
+| 75 … | *L* | sealed name — **identical construction to v1** |
+| 75+*L* … | 8 | frame salt |
+| 83+*L* | 1 | frame-size exponent *e*; frame plaintext size *P* = 1 ≪ *e* |
+| 84+*L* … | var | frames |
+
+Bytes 0 through 74+*L* are the same fields at the same offsets as v1, and must
+stay so in every future version. That is what keeps header parsing, name
+recovery and rekey a single version-free implementation — the mechanism behind
+"the bucket plus the keys file reconstruct every logical name with no local
+state". Extension fields go **after** the sealed name, never before it.
+
+`MaxHeaderLen` = 75 + 1084 + 9 = **1168**, so a reader fetches `bytes=0-1167`
+and is guaranteed a whole header in one request.
+
+*e* is bounded to **[16, 26]** (64 KiB – 64 MiB) and **must be range-checked
+before it sizes any allocation** — it is cloud-writable plaintext. Default 20
+(1 MiB), where the 16-byte tag per frame costs 15 ppm.
+
+### Frames, and why the format is self-terminating
+
+```
+frameᵢ = AES-256-GCM-Seal(DEK, nonceᵢ, plaintextᵢ, frameAAD(e, i, final, logicalKey))
+nonceᵢ = salt(8) ‖ uint32_be(i)
+```
+
+Every frame but the last carries exactly *P* bytes; **the last carries strictly
+fewer**. A plaintext whose length is an exact multiple of *P* therefore ends in
+a zero-plaintext frame — 16 bytes of tag and nothing else.
+
+That rule is the whole design. A reader never needs the object's length, so it
+can never be lied to about it: read *P*+16 bytes, and a short read is the final
+frame. Truncating the object leaves a full frame last, so the reader runs out of
+input still expecting more; extending it is caught by an explicit
+trailing-bytes check; reordering or replay fails on the frame index in the AAD;
+and a frame lifted from another object fails because DEKs are single-use.
+
+One DEK covers the whole object and is wrapped **once**, so a 5 GiB file costs
+one KEK wrap rather than five thousand — which is what leaves v1's ~2³² writes
+per KEK intact instead of burning it thousands of times faster on one file.
+
+The counter cannot wrap: at the smallest legal frame size, a cloud's 5 TiB
+object cap is 2²⁶ frames against a 2³² counter, and the writer refuses index
+2³² regardless. The salt is fresh per seal and preserves v1's defense in depth
+— two seals that erroneously shared a DEK collide only if their salts also
+collide (2⁻⁶⁴), rather than colliding on frame 0 with certainty.
+
+### AAD
+
+```
+frame AAD := "FCDS" ‖ 0x02 ‖ e ‖ uint32_be(index) ‖ final(0x00|0x01) ‖ logicalKey
+wrap  AAD := "FCDS" ‖ 0x02 ‖ keyID
+name  AAD := storedPath bytes            (unchanged from v1)
+```
+
+The frame AAD **still excludes the key ID**, so rekey remains a header rewrite
+for streamed objects too. The version byte differs from v1's, so a wrapped DEK
+cannot be replayed across formats.
+
+### The one guarantee streaming gives up
+
+v1 returns the exact plaintext or an error, never both. v2 cannot: it
+authenticates per frame, so a reader learns of damage when it reaches it —
+after earlier frames have already been handed to the caller. That is
+arithmetic, not a choice.
+
+Every consumer must treat a non-nil error as **the output is incomplete and
+must not be used**. Anything writing to a durable destination must stage and
+commit only on success; `farcast storage cp` writes to a temporary file beside
+the target and renames it only once the last frame authenticates.
+
 ## Additional authenticated data
 
 ```

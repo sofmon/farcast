@@ -74,10 +74,10 @@ farcast [global flags] <command> [command flags] [arguments]
 | `ps` | ⏳ stub | List running applications | 4.3 |
 | `logs` | ⏳ stub | Stream an application's logs | 4.3 |
 | `costs` | ⏳ stub | Show spending and distance to the cost limit | 4.3 |
-| `storage` | ⏳ stub | Manage instance storage (`ls`, `cp`) | 3.3 |
+| `storage` | ✅ works | The instance's encrypted disk: `ls`, `cp`, `rm`, `usage`, `key …` | 3.3 |
 | `chat` | ⏳ stub | Terminal AI chat through AllThing | 6.2 |
 
-Stubbed commands route correctly and print a clear "not yet implemented (phase N)" message to stderr, exiting non-zero. This mirrors the SDK's `ErrNotImplemented` pattern: the whole surface is visible and navigable before the features land. `install` is the canonical verb for creating an instance — the CLI, the root README, and the [instance lifecycle](../../README.md#instance-lifecycle) (`install → bind → run → release`) all use it.
+*Legend: ✅ works · 📋 specified, not yet implemented · ⏳ stub.* Stubbed commands route correctly and print a clear "not yet implemented (phase N)" message to stderr, exiting non-zero. This mirrors the SDK's `ErrNotImplemented` pattern: the whole surface is visible and navigable before the features land. `install` is the canonical verb for creating an instance — the CLI, the root README, and the [instance lifecycle](../../README.md#instance-lifecycle) (`install → bind → run → release`) all use it.
 
 ### Global flags
 
@@ -178,7 +178,11 @@ FarCast has **zero central dependency** ([AGENTS.md](../../AGENTS.md)): there is
         │                                      name + endpoint, status, cost limit, registry,
         │                                      timestamps
         ├── credentials.yaml          (0600)  secret: cloud provider credential (SA key JSON)
-        └── kubeconfig.yaml           (0600)  secret: cluster-access kubeconfig
+        ├── kubeconfig.yaml           (0600)  secret: cluster-access kubeconfig
+        └── datasphere/               (0700)  storage keys  (3.3)
+            └── keys.yaml             (0600)  secret: the instance's DataSphere keyring —
+                                               the one file whose loss is permanent, total
+                                               loss of everything in the bucket
 ```
 
 **Security.** Credentials are secrets the cloud provider would love and an attacker would love more:
@@ -626,6 +630,100 @@ JSON (`--output json`):
 
 ---
 
+## `farcast storage` — the instance's encrypted disk (Phase 3.3)
+
+`farcast storage` is how an operator puts data into an instance and gets it back out. Everything it writes is encrypted before the cloud sees it and stored under an opaque name, by [DataSphere](../../datasphere/README.md) — the CLI does not get a say in that, because the encrypting `Store` is the only path there is.
+
+Two things make this group unlike the rest of the CLI. It is the first command family that touches **data that derives from nothing** — a cluster is re-provisionable and every registry image rebuilds from Git, but a deleted object is gone, and soft delete is disabled on the bucket by design. And it depends on a local file, `keys.yaml`, whose loss is the permanent loss of everything in the bucket. Both facts shape every decision below.
+
+**It needs no cluster and no tunnel.** Storage runs entirely on the operator's machine: the recorded bucket, the stored cloud credentials, and the local keyring. `farcast storage` therefore works on an instance that has never been `connect`ed, and it is why Phase 3.3 is not blocked on 3.2's in-cluster key-delivery ADR.
+
+### Addressing: `<instance>:<key>`, scp-style
+
+```
+prod:app/reports/q3.csv     one object
+prod:app/reports/           a /-aligned prefix
+prod:                       the whole bucket
+./q3.csv    -               a local file; stdin/stdout
+```
+
+An operand is **remote** iff its first `:` falls before any `/`, the text before it is a valid instance name, and that instance exists in local state. Everything else is local. If both readings are genuinely available — an instance `prod` exists *and* a local file named `prod:x` exists — it is a **usage error** telling the operator to write `./prod:x`. Guessing here either uploads the wrong bytes or overwrites the wrong file, and neither is recoverable.
+
+### The verb tree
+
+Two levels for the data verbs, as [Decisions](#decisions) 1 reserved; **three only for `key`**.
+
+```
+farcast storage ls    <instance>[:prefix]   [-l|--long] [--tokens]
+farcast storage cp    <src> <dst>           [-r] [--force|--skip-existing]
+farcast storage rm    <instance>:<key>…     [-r] [-y]
+farcast storage usage <instance>
+
+farcast storage key list   <instance>
+farcast storage key export <instance> --out <path> --passphrase-file <path>
+farcast storage key import <instance> <file>       --passphrase-file <path>
+farcast storage key rotate <instance>       [-y]
+farcast storage key rekey  <instance>       [--dry-run] [-y]
+```
+
+`key` earns the third level because **the noun changes**: `ls`/`cp`/`rm`/`usage` address objects in a bucket; `export`/`import`/`rotate`/`rekey` address the file whose loss destroys all of them. Flattening them would put a keyring verb in the same tab-completion neighbourhood as `storage rm`, and `storage rotate` reads as though it rotates data. The cost is one dispatcher instantiated twice.
+
+No command in the group takes cloud flags. Provider, project, region and credentials all come from the recorded instance, exactly as `release`, `connect` and `redeploy` take none, and there is no `--bucket`: the record is the sole authority.
+
+### `cp`, and the two ways it can lose data
+
+`cp` streams in both directions through DataSphere's v2 chunked format, so file size is not a consideration in either direction. Exactly one operand may be remote; two remote or two local operands are a usage error rather than a guess.
+
+- **It never overwrites silently**, in either direction. An existing destination — a local file or a remote key — stops the copy and names what is there; `--force` replaces, `--skip-existing` skips. This is stricter than `cp(1)` on purpose: the remote side has no undelete.
+- **A failed download leaves nothing at the destination.** Downloads land in a temporary file alongside the target and are renamed only after the final frame authenticates. This is load-bearing rather than tidy: v2 authenticates per frame, so a truncated or tampered object is detected only when the reader reaches the damage, and a partial file that looks plausible is worse than no file.
+- **Local files it creates are `0600`**, matching the credential store's discipline — decrypted plaintext is not something to leave world-readable.
+- **A recursive download must not be a path-traversal primitive.** A logical key is any non-normalized UTF-8 byte string and may contain `..`, a leading `/`, or bytes illegal in the local filesystem — and, after 3.2, may have been written by an application inside the instance. `cp -r prod: ./out` refuses any key that does not map to a safe relative path under the destination, names it, and continues with the rest. It never mangles silently and never writes outside the destination root.
+
+### `rm`, and `release`'s new gate
+
+`rm` on an exact key is unceremonious. `rm -r` on a prefix shows what will go and requires confirmation, and says plainly that deletes are immediate and final because soft delete is disabled on the bucket.
+
+`farcast release` gains one flag, `--delete-data`, and one gate:
+
+**`release` refuses while the instance bucket still holds data.** The gate is **data-triggered, not configuration-triggered** — a bucket with zero objects produces no gate, no flag and no extra prompt, so a test instance that installed, connected and released without writing anything behaves exactly as it does today. With data present, `release` names the object count and stored bytes and stops, pointing at `storage cp`; `--delete-data` is what proceeds.
+
+`--delete-data` is a **scope** flag, not a consent flag. `--yes` says "don't ask me" and never implies it: the confirmation an operator clicks through daily must not be able to destroy the one thing that derives from nothing.
+
+The count comes from `datasphere.BucketUsage` over the `Provider` — **never through the `Store`, and with no keyring**. An operator who has lost `keys.yaml` still needs to be able to stop paying, and a gate built on what the keyring can *name* would report an empty bucket while billable ciphertext sat in it.
+
+Ordering inside `release` follows the shipped discipline, with the data last: probe and gate **before anything is destroyed**, then cluster → registry → bucket → local state. A failure part-way leaves the data intact and the record in place, so a re-run converges.
+
+### The keyring, and when it is minted
+
+The keyring lives at `<instance>/datasphere/keys.yaml` (`0700` directory, `0600` file), beside the mTLS CA key — the two crown jewels in one directory, so the backup gesture is one gesture.
+
+It is minted at **first storage use**, not at `install`: the install flow is shipped and validated, and an instance that never stores anything never needs one. The mint is a deliberate step rather than a side effect, and it prints DataSphere's mandated sentence verbatim — *loss of `keys.yaml` is permanent, unrecoverable loss of all stored data — FarCast keeps no copy anywhere, by design* — naming the instance directory as the thing to back up.
+
+- **`key export`** writes a passphrase-armored copy (stdlib `crypto/pbkdf2` + AES-256-GCM, versioned format). The passphrase is read from a terminal, never a flag.
+- **`key import` is merge-only** — it adds entries the live keyring lacks and never overwrites or drops one, refusing outright if an id appears on both sides with different material. This is `datasphere.Keyring.Merge`'s semantics surfaced as a command, and it is a security control: a blob's key ID is cloud-writable, so a tampering cloud can make any object demand a key the keyring lacks, and the natural overwrite-restore would destroy every key added since the backup. The output says `removed: nothing — import is merge-only, by design`, in every mode, to teach the invariant to whoever is about to look for a `--force` that does not exist.
+- **`key rotate`** prepends a new KEK. Its output must state the scope in DataSphere's mandated terms: everything the cloud already saw **stays exposed** to whoever captured it, future data is protected once the cloud credentials are rotated too, and names stay exposed until name-key rotation exists. Rotation is nonce hygiene and keyring retirement, **not** compromise recovery, and an operator who believes otherwise has been actively misled.
+- **`key rekey`** sweeps objects, rewriting each header's key ID and wrap fields under the active KEK without touching a body — possible because the data AAD excludes the key ID. It is resumable, reports a cursor when interrupted, and every object stays readable throughout because old keys remain in `keys.yaml`. It is also the most expensive command in the CLI: a full read and write of every object. `--dry-run` prints the cost first.
+
+### `usage`, and surfacing spend honestly
+
+Object count and stored bytes cannot tell an operator what storage costs, so `usage` reports the object count, the stored bytes the provider actually bills, the window over which they were written, and a monthly estimate. It deliberately takes **no prefix**: scoping to one would mean mapping stored names back to logical ones, which needs the keyring — and the whole point of `usage` is that it still works for the operator who has lost theirs. A silently ignored operand would be worse than an unsupported one, so a prefix is refused with that reason.
+
+Three further figures are specified but **not yet implemented**, and each is worth having: the **envelope overhead** FarCast itself adds (~131 bytes plus a padded sealed name per object — a real, permanent, billed cost of the privacy pillar that no other tool can compute), any **incomplete uploads** left by an interrupted `cp` (billed, and invisible to `ls`), and the report's own cost in list operations.
+
+Every figure carries its price basis: estimates are prefixed `~` and the output names the built-in price table's `as_of` date with a pointer to live pricing. A stale price presented as fact is worse than no price. `usage` also states its own cost in list operations, and runs without a keyring, so the operator who lost `keys.yaml` can still see what they are paying.
+
+Cost is **surfaced, never gated**, per [ADR 0007](../../docs/adr/0007-instance-owned-image-registry.md) decision 8: gating cents trains an operator to click through the ~$18/mo carrier gate that guards real money.
+
+### The `storage:` record, and the ensure path
+
+`InstanceMetadata` gains a pointer-typed `storage:` block mirroring `registry:` — `bucket`, `location`, `provider`, `recorded_at`, `created_at` — so pre-3.3 metadata still loads and converges on the next storage command.
+
+The bucket is ensured **lazily, at first storage use**, never at `install`: an empty bucket costs $0.00 and serves nothing, and the registry's defensive-ensure precedent already proves lazy convergence. The record is written **before** the create call, because the name's 32 bits of entropy exist nowhere else and the name is deliberately not re-derivable from the instance (its instance segment may have been truncated to fit GCS's 63-character cap).
+
+The mint/record/retry loop belongs here, in the record-owning caller, never in the adapter — which mints nothing. On `ErrNotOwned` it mints a new suffix, updates the record and retries, bounded at 3 attempts. **With one hard exception:** if `created_at` is set, the bucket was ensured successfully before, and `ErrNotOwned` now means something changed rather than a name collision — auto-minting past it would abandon the operator's data under a name nothing points at any more. That case stops and asks the operator to look. Any other error keeps the record and fails, so a re-run converges.
+
+---
+
 ## Diagnostics
 
 Diagnostic logging is for the operator debugging the CLI, not for command output. It is plain text on **stderr**, gated by `--verbose`, built on the standard library's `log/slog` with a text handler. It is intentionally **not** the farcast SDK logger: the SDK is for in-instance applications and emitting JSON to stdout, which is the opposite of what an operator CLI wants. Keeping them separate also keeps the root module free of a dependency on the `sdk/go` module.
@@ -654,7 +752,9 @@ farsight/cli/
     │   ├── connect.go         ← farcast connect: mint identity, bootstrap FatLine, dial tunnel  (2.3)
     │   ├── fatline.go         ← shared by connect + redeploy: image resolution, build gate,
     │   │                        registry ensure, workload render  (2.3)
-    │   └── redeploy.go        ← farcast redeploy: re-render and re-apply FatLine's workload  (2.3)
+    │   ├── redeploy.go        ← farcast redeploy: re-render and re-apply FatLine's workload  (2.3)
+    │   ├── storage.go         ← farcast storage: ls, cp, rm, usage; the <instance>:<key> locator  (3.3)
+    │   └── storagekey.go      ← farcast storage key: export, import, rotate, rekey  (3.3)
     ├── output/                ← human/JSON printer, error formatting, exit codes
     │   └── output.go
     ├── cluster/               ← kubectl-subprocess wrapper: apply, await rollout, read LB IP  (2.3)
@@ -749,6 +849,12 @@ The choices made for the scaffold, with rationale:
 
     It never re-provisions the carrier and never re-mints the CA — those stay `connect`'s, because the carrier is the standing cost and the per-instance CA is the sovereign trust root, and neither should move because someone rolled a new image. The reason this is a command at all is that the alternative was `release` plus a reinstall: destroying an entire instance to patch its network boundary is the price that makes an operator postpone a security fix.
 
+13. **Storage is operator-side, addressed scp-style, and its destructive edges are gated on data rather than configuration (3.3).** Four choices that hang together:
+    - **It needs no cluster and no tunnel.** `farcast storage` runs against the recorded bucket with the stored cloud credentials and the local keyring, so it works on an instance that was never `connect`ed — and it is why 3.3 is not blocked on 3.2's in-cluster key-delivery ADR. Serving storage to in-cluster applications is a different problem with a different trust model.
+    - **`<instance>:<key>`, with ambiguity as a usage error.** One addressing form for the whole group, in the shape operators already have from `scp`. When both readings of an operand are genuinely available it refuses rather than guesses, because a wrong guess either uploads the wrong bytes or overwrites the wrong file, and neither is recoverable.
+    - **`key` is the CLI's only third level**, because the noun changes: the data verbs address objects in a bucket, the key verbs address the file whose loss destroys all of them. Flattening would seat a keyring verb next to `storage rm` in tab completion, and `storage rotate` would read as though it rotates data.
+    - **`release` refuses while the bucket holds data, and `--delete-data` is a scope flag, not a consent flag.** Stored data is the first thing in FarCast that derives from nothing, and soft delete is off by design. The gate is **data-triggered**, so an empty bucket produces no gate at all and a test instance behaves exactly as it does today; and `--yes` never implies `--delete-data`, so the confirmation an operator clicks through daily cannot destroy the irreplaceable thing. The count comes from `datasphere.BucketUsage` over the `Provider` with **no keyring**, because an operator who has lost `keys.yaml` still needs to be able to stop paying — and a gate built on what the keyring can *name* would announce an empty bucket while billable ciphertext sat in it.
+
 ---
 
 ## Roadmap
@@ -763,7 +869,7 @@ The choices made for the scaffold, with rationale:
 | **1.4** | `release`: confirmed teardown via Planck, cluster *and* registry deleted before local cleanup, local removal — **done** |
 | **2.3** | `connect`: mint the per-instance mTLS identity, put FatLine's image in the instance's registry — compiled and pushed by the CLI, no container engine ([ADR 0007](../../docs/adr/0007-instance-owned-image-registry.md)) — bootstrap-deploy FatLine pinned to that digest, provision its public mTLS carrier ([ADR 0005](../../docs/adr/0005-fatline-data-plane-ingress.md)), dial the tunnel, report status — the seam later commands route through — **done** |
 | **2.3** | `redeploy`: re-render and re-apply FatLine's workload for a connected instance — a FatLine fix rolls out without destroying the instance; carrier and mTLS identity untouched — **done** |
-| 3.3 | `storage ls` / `storage cp` |
+| **3.3** (next) | `storage ls`/`cp`/`rm`/`usage` and `storage key export`/`import`/`rotate`/`rekey`; the keyring minted at first storage use; the `storage:` record and its mint/record/retry ensure path; bucket teardown wired into `release` behind a refuse-while-data-remains gate — **done**, unit-tested; live validation of the streaming path pending |
 | 4.3 | `run`, `ps`, `logs`, `costs` |
 | 6.2 | `chat` (terminal AI via [AllThing](../../allthing/README.md)) |
 
