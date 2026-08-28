@@ -279,7 +279,40 @@ type StorageAPI interface {
 }
 ```
 
-Streaming variants for large objects (`io.Reader`/`io.WriteCloser`) are expected to join this interface in its implementation phase. Implementation: phase 3.2.
+**These four methods are frozen.** Applications implement `StorageAPI` to fake storage in their own tests, so a fifth method would break every one of them. Capabilities that are not universal arrive as *separate optional interfaces* discovered with a type assertion — which is why the streaming variants once sketched here are not folded into this interface, and why `Status` is not either.
+
+#### Storage can be sealed, and every application must expect it
+
+DataSphere's keys never rest on cloud infrastructure, so the in-cluster keyholder holds them **in memory only**. Any restart — a node upgrade, an eviction, a rollout — leaves storage *sealed* until an operator unseals it ([ADR 0008](../../docs/adr/0008-in-cluster-key-delivery.md)). This is a normal state of a healthy instance, not a failure, and it can last as long as it takes a human to respond.
+
+```go
+data, err := farcast.Storage().Read(ctx, key)
+switch {
+case errors.Is(err, farcast.ErrStorageSealed):
+    // Intact but unreadable right now. Wait and retry, or fail upward.
+    // Never answer a seal by writing.
+case errors.Is(err, farcast.ErrObjectNotFound):
+    // There is genuinely no such object.
+}
+```
+
+`ErrStorageSealed` is deliberately distinct from `ErrNotImplemented` (which means *this build never can*) and from `ErrObjectNotFound` (which means *there is no such object*). An application that read a seal as absence and started over would be silent data loss by a second route; the distinction is fixed now, before any application exists, because every application ever written inherits it.
+
+The optional pre-attempt seam lets a long-running job check once rather than discovering a seal on its first write:
+
+```go
+type StorageStatusAPI interface {
+	StorageAPI
+	Status(ctx context.Context) (StorageStatus, error)
+}
+
+// Reports ErrNotImplemented when s has no status seam — e.g. a fake in your tests.
+func StorageStatusOf(ctx context.Context, s StorageAPI) (StorageStatus, error)
+```
+
+Checking is never *required*: every method reports a seal on its own, and a status that says ready can be stale by the time the next call runs, so code must still classify the error from the operation itself.
+
+Implementation: phase 3.2.
 
 ### Net — `farcast.Net()`
 
@@ -325,6 +358,7 @@ Implementation: phase 6.3.
   var ErrNotImplemented = errors.New("farcast: capability not implemented")
   ```
 
+- **Storage sentinels.** `ErrStorageSealed`, `ErrObjectNotFound`, `ErrIntegrity`, `ErrInvalidKey`, `ErrTooLarge`, `ErrPermission`, and `ErrStorageUnavailable`. The set is deliberately small: each is inherited by every application ever written against this SDK, so one added carelessly can never be withdrawn. DataSphere's own vocabulary is wider — sentinels describing an *operator's* problem (a bucket proved to belong to another instance, a retention policy still billing for deleted objects) do not cross into this module, because an application cannot act on them and an error it cannot act on is one it may branch on wrongly. `ErrStorageUnavailable` is the total-mapping catch-all: an answer this build does not understand must never collapse into "no such object" or "never will work", since both are wrong in ways that cost data.
 - **Sentinel errors with `errors.Is`.** Following the same pattern as the manifest parser (see [`manifest/parser/parser.go`](../../manifest/parser/parser.go)), the SDK exposes sentinel errors and supports `errors.Is` for classification rather than string matching.
 - **`context.Context` is the first argument** of every I/O method. Cancellation and deadlines are honoured; the request ID propagates. `farcast.Log()` and `farcast.Config()` accessors themselves never fail — only their I/O-performing methods (and only Config's `Require`) return errors.
 - **Accessors never return nil.** `farcast.Log()` and the others always return a usable value, so call sites need no nil checks.
