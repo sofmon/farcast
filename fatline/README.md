@@ -290,6 +290,8 @@ Per [AGENTS.md](../AGENTS.md) and [ADR 0002](../docs/adr/0002-backend-language-s
 
 ## Known limitations
 
+**Recovery of in-cluster storage runs through a single FatLine replica.** [ADR 0008](../docs/adr/0008-in-cluster-key-delivery.md) makes the operator's unseal push travel over this tunnel, and FatLine today is `replicas: 1` with no PodDisruptionBudget — so the same node-upgrade window that seals storage drains FatLine too, and recovery time is bounded below by FatLine's own reschedule rather than by the operator's response. Worse, if TechnoCore's cost-limit shutdown stops FatLine, storage cannot be unsealed at all while the instance still bills. FatLine needs the same PDB and second replica `datasphered` gets, and 4.1 must classify both last-to-die; fixing either alone fixes nothing. The keeper fleet the same ADR plans turns this from an improvement into a prerequisite: no keeper, however many devices are enrolled, can re-seed through a drained tunnel.
+
 These are deliberately accepted-and-documented in 2.1, not oversights:
 
 - **SNI allowlisting is defense-in-depth, not a cryptographic guarantee.** It is bypassable under Encrypted ClientHello (ECH hides `server_name`), no-SNI connections, and domain-fronting (the `CONNECT` host and SNI match an allowed name while the HTTP `Host` header *inside* the TLS targets a different origin on a shared frontend — invisible because FatLine never decrypts). IP-literal `CONNECT` authority is hard-denied (the manifest forbids IPs, so no IP can ever be a member).

@@ -163,6 +163,8 @@ Wire the `farcast.Storage()` interface to DataSphere.
 - Applications can store/retrieve files without knowing the cloud provider
 - Encryption is transparent to the application
 
+**Unblocked by [ADR 0008](docs/adr/0008-in-cluster-key-delivery.md) (proposed):** an in-cluster keyholder that holds only *derived per-scope* material, in memory, pushed by the operator over the FatLine tunnel — sealed by default after any restart. The master KEK and the unrotatable name key never enter the cluster. The ADR proves that autonomous recovery is impossible under the invariant, states the availability cost plainly rather than engineering around it, and fixes the one irreversible piece now: the SDK's `ErrStorageSealed` contract, which every application ever written inherits. 3.2 ships the keyholder with two replicas and a PodDisruptionBudget, so the common restarts — a single OOM, one node's auto-repair, a rollout — do not seal storage at all.
+
 ### 3.3 FarSight CLI — storage commands
 Operator tools for managing storage.
 
@@ -191,6 +193,8 @@ The kernel comes online. It manages what runs inside the instance and enforces c
 - **Per-application cost attribution — break down spending by app**
 - **Cost threshold warnings — alert operator at 50%, 75%, 90% of limit**
 - **Protective shutdown — when limit is reached, stop highest-cost apps first; if spending cannot be contained, shut down all apps but keep TechnoCore alive to report status**
+- **Last-to-die classification for `datasphered` and FatLine** ([ADR 0008](docs/adr/0008-in-cluster-key-delivery.md)) — a cost shutdown that stops FatLine makes storage impossible to unseal while the instance still bills
+- **FatLine gets the PodDisruptionBudget and second replica `datasphered` already has** — every unseal and every keeper reseed rides that tunnel, so a single drained replica is the floor on recovery
 
 ### 4.2 Planck — manifest-to-workload translator
 Translate a `./farcast` manifest into K8s resources.
@@ -249,7 +253,18 @@ Complete the SDK's environment capabilities.
 - `farcast.Secrets()` — secure secret storage and retrieval
 - Secrets encrypted at rest via DataSphere, never in plaintext in K8s
 
-**Phase 5 deliverable:** TechnoCore actively manages resources. Applications start with defaults and TechnoCore adjusts automatically. The manifest stays minimal because the OS is smart enough to figure it out.
+### 5.4 FarSight CLI — `farcast keeper` (desktop)
+Unattended recovery on the operator's own hardware, per the keeper fleet planned in [ADR 0008](docs/adr/0008-in-cluster-key-delivery.md): an operator-owned device that re-seeds a restart-sealed `datasphered` without waking anyone. Running FarCast as a server requires at least two enrolled keeper devices — the product stance the ADR records.
+
+- `farcast keeper enroll` / `revoke` / `status` — each device gets its own `farcast://<instance>/keeper/<device>` leaf from the operator-held CA, authorized for reseed and status only
+- The keeper daemon is a mode of the same `farcast` binary — no new machine dependencies
+- Outbound-only: the keeper dials FatLine, never listens; every reseed lands in a local append-only ledger kept off every cloud-backup path by construction, and `keeper status` reconciles the fleet's ledgers against the cluster's witnessed restarts — detection by audit, flagged on divergence
+- The bundle is a distinct artifact from the keyring — derived scope keys and IDs only, provisioned from the operator's machine (armored, in the `key export` pattern), never through the instance; the master KEK and the name key are never on the keeper path. Bundle, leaf key and ledger are device-bound and excluded from OS backup — a platform that cannot guarantee this cannot be a keeper
+- Reseed budget: beyond the expected restart cadence the keeper refuses without interactive confirmation
+- A deliberate `seal` is an operator hold — a keeper never clears it
+- Prerequisite: 4.1's FatLine PDB and second replica — no keeper can re-seed through a drained tunnel
+
+**Phase 5 deliverable:** TechnoCore actively manages resources. Applications start with defaults and TechnoCore adjusts automatically. The manifest stays minimal because the OS is smart enough to figure it out. And the first keeper stands watch: a second operator device clears a restart-seal unattended.
 
 ---
 
@@ -325,7 +340,15 @@ GUI version of `farcast install`.
 - Progress reporting
 - Instance management dashboard
 
-**Phase 7 deliverable:** users can download the "farcast" app, install FarCast to a cloud provider via a GUI, and interact with running applications through a tiling browser — all traffic proxied through FatLine.
+### 7.5 FarSight mobile — the keeper in your pocket
+The first mobile FarSight is deliberately small: it makes a phone a keeper ([ADR 0008](docs/adr/0008-in-cluster-key-delivery.md)) before it grows any GUI ambition.
+
+- Keeper duty within mobile background-execution limits: outbound-only checks, push-woken where the OS allows (the push is a contentless doorbell — in the availability path, never the key path — and a redundant nudge over the jittered poll, never the sole wake path)
+- The bundle held in the no-user-presence protection class, hardware-backed and excluded from iCloud/Google backup by construction — a phone that cannot guarantee the exclusion cannot be a keeper; a presence-gated full keyring copy is a separate, optional decision
+- Reseed notifications and an emergency seal action
+- Stated honestly: a phone improves the odds of a short sealed window, it is not an SLO — a mains-powered desktop keeper anchors the fleet
+
+**Phase 7 deliverable:** users can download the "farcast" app, install FarCast to a cloud provider via a GUI, and interact with running applications through a tiling browser — all traffic proxied through FatLine. The first mobile FarSight ships alongside it — a keeper before it is a GUI.
 
 ---
 
@@ -379,11 +402,11 @@ Phase 3: DataSphere (1st provider) → SDK Storage → storage CLI
               ↓
 Phase 4: TechnoCore → Planck (translator) → farcast run → Shrike (per-app)
               ↓
-Phase 5: TechnoCore (adaptive) → SDK Config/Secrets
+Phase 5: TechnoCore (adaptive) → SDK Config/Secrets → farcast keeper (desktop)
               ↓
 Phase 6: AllThing (1st provider) → Chat → SDK AI → System integration
               ↓
-Phase 7: FarSight client (Electron) → FarSight server → Tiling UI
+Phase 7: FarSight client (Electron) → FarSight server → Tiling UI → Mobile keeper
               ↓
 Phase 8: 2nd cloud provider → 2nd storage → 2nd AI → Node/Python SDK → Hardening
 ```
