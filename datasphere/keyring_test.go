@@ -224,7 +224,9 @@ func TestParseKeyringRejects(t *testing.T) {
 		name string
 		data []byte
 	}{
-		{"unknown version", file(2, entry("0102030405060708", goodNameKey), entry(goodID, goodKey))},
+		// Version 2 is the scopes schema; an unknown version has to be one
+		// this build has never written.
+		{"unknown version", file(3, entry("0102030405060708", goodNameKey), entry(goodID, goodKey))},
 		{"missing version", file(0, entry("0102030405060708", goodNameKey), entry(goodID, goodKey))},
 		{"non-hex id", file(1, entry("0102030405060708", goodNameKey), entry("zzzzzzzzzzzzzzzz", goodKey))},
 		{"short id", file(1, entry("0102030405060708", goodNameKey), entry("11121314151617", goodKey))},

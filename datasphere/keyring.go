@@ -34,8 +34,20 @@ const (
 	KeysDirMode  = 0o700
 	KeysFileMode = 0o600
 
-	// keyringVersion is the keys.yaml schema this package writes and accepts.
+	// keyringVersion is the keys.yaml schema a keyring without scopes writes.
 	keyringVersion = 1
+
+	// keyringVersionScopes is written only once a keyring carries scopes.
+	//
+	// The bump is conditional on purpose. A file with no scopes marshals
+	// byte-identically to what every previous build wrote, so no existing
+	// keyring moves and no golden vector changes. A file that HAS grown
+	// scopes is refused outright by an older binary rather than parsed with
+	// the scope material silently dropped — which would leave the operator
+	// holding a keyring that looks complete and cannot read a whole subtree.
+	// Failing closed on the most dangerous file in the system is the only
+	// acceptable direction.
+	keyringVersionScopes = 2
 )
 
 // KeyLossWarning is the sentence every keygen and every key-related failure
@@ -119,6 +131,10 @@ func (e KeyEntry) String() string {
 type Keyring struct {
 	nameKeys []KeyEntry
 	keys     []KeyEntry
+
+	// scopes are named subtrees with their own key material, so that a
+	// cluster can be given one subtree's keys without ever holding these.
+	scopes []Scope
 }
 
 // Seams for deterministic tests. Production always reads crypto/rand and the
@@ -178,6 +194,53 @@ func (k Keyring) NameKeys() []KeyEntry { return append([]KeyEntry(nil), k.nameKe
 // KEKs returns the key-encryption keys, active first.
 func (k Keyring) KEKs() []KeyEntry { return append([]KeyEntry(nil), k.keys...) }
 
+// Scopes returns the keyring's scopes. The slice is a copy; the key material
+// inside it is not.
+func (k Keyring) Scopes() []Scope { return append([]Scope(nil), k.scopes...) }
+
+// ScopeNamed returns the scope with that name.
+func (k Keyring) ScopeNamed(name string) (Scope, bool) {
+	for _, s := range k.scopes {
+		if s.Name == name {
+			return s, true
+		}
+	}
+	return Scope{}, false
+}
+
+// ScopeOwning returns the scope whose prefix contains the logical key. Keys
+// outside every scope belong to the master keyring — the operator's own.
+func (k Keyring) ScopeOwning(key string) (Scope, bool) {
+	for _, s := range k.scopes {
+		if s.Owns(key) {
+			return s, true
+		}
+	}
+	return Scope{}, false
+}
+
+// AddScope returns a keyring carrying one more scope.
+//
+// A duplicate name, or a prefix that overlaps one already present, is refused:
+// a key addressable under two scopes would be stored twice under two different
+// name keys, and neither copy would be visible from the other scope.
+func (k Keyring) AddScope(s Scope) (Keyring, error) {
+	if err := s.Valid(); err != nil {
+		return Keyring{}, err
+	}
+	for _, existing := range k.scopes {
+		if existing.Name == s.Name {
+			return Keyring{}, fmt.Errorf("%w: scope %q already exists", ErrKeyringInvalid, s.Name)
+		}
+		if scopesOverlap(existing.Prefix, s.Prefix) {
+			return Keyring{}, fmt.Errorf("%w: scope %q prefix %q overlaps scope %q prefix %q",
+				ErrKeyringInvalid, s.Name, s.Prefix, existing.Name, existing.Prefix)
+		}
+	}
+	k.scopes = append(append([]Scope(nil), k.scopes...), s)
+	return k, nil
+}
+
 // AddKEK prepends a key-encryption key, making it the one that wraps new
 // writes and leaving every existing entry in place to keep decrypting older
 // blobs. This is the whole of rotation's shape; the sweep that retires the old
@@ -210,7 +273,49 @@ func (k Keyring) Merge(other Keyring) (Keyring, error) {
 	if err != nil {
 		return Keyring{}, err
 	}
-	return Keyring{nameKeys: names, keys: keks}, nil
+	scopes, err := mergeScopes(k.scopes, other.scopes)
+	if err != nil {
+		return Keyring{}, err
+	}
+	return Keyring{nameKeys: names, keys: keks, scopes: scopes}, nil
+}
+
+// mergeScopes applies the merge-only rule to scopes. A scope present on both
+// sides has its key lists merged, so an import can add a rotated scope KEK
+// without discarding the entry that still decrypts older objects. A scope
+// whose prefix differs between the two files is refused: the same name over
+// two subtrees means one of the files is wrong, and picking either would make
+// part of the data unaddressable.
+func mergeScopes(live, incoming []Scope) ([]Scope, error) {
+	out := append([]Scope(nil), live...)
+	at := make(map[string]int, len(out))
+	for i, s := range out {
+		at[s.Name] = i
+	}
+	for _, s := range incoming {
+		i, ok := at[s.Name]
+		if !ok {
+			for _, existing := range out {
+				if scopesOverlap(existing.Prefix, s.Prefix) {
+					return nil, fmt.Errorf("%w: incoming scope %q prefix %q overlaps scope %q prefix %q",
+						ErrKeyringInvalid, s.Name, s.Prefix, existing.Name, existing.Prefix)
+				}
+			}
+			at[s.Name] = len(out)
+			out = append(out, s)
+			continue
+		}
+		if out[i].Prefix != s.Prefix {
+			return nil, fmt.Errorf("%w: scope %q appears with two prefixes (%q and %q); refusing to merge",
+				ErrKeyringInvalid, s.Name, out[i].Prefix, s.Prefix)
+		}
+		merged, err := out[i].keys.Merge(s.keys)
+		if err != nil {
+			return nil, fmt.Errorf("scope %q: %w", s.Name, err)
+		}
+		out[i].keys = merged
+	}
+	return out, nil
 }
 
 func mergeEntries(live, incoming []KeyEntry, what string) ([]KeyEntry, error) {
@@ -245,7 +350,28 @@ func (k Keyring) Valid() error {
 	if err := validEntries(k.nameKeys, "name key"); err != nil {
 		return err
 	}
-	return validEntries(k.keys, "key")
+	if err := validEntries(k.keys, "key"); err != nil {
+		return err
+	}
+	seen := make(map[string]struct{}, len(k.scopes))
+	for _, s := range k.scopes {
+		if err := s.Valid(); err != nil {
+			return err
+		}
+		if _, dup := seen[s.Name]; dup {
+			return fmt.Errorf("%w: duplicate scope %q", ErrKeyringInvalid, s.Name)
+		}
+		seen[s.Name] = struct{}{}
+	}
+	for i, a := range k.scopes {
+		for _, b := range k.scopes[i+1:] {
+			if scopesOverlap(a.Prefix, b.Prefix) {
+				return fmt.Errorf("%w: scope %q prefix %q overlaps scope %q prefix %q",
+					ErrKeyringInvalid, a.Name, a.Prefix, b.Name, b.Prefix)
+			}
+		}
+	}
+	return nil
 }
 
 func validEntries(entries []KeyEntry, what string) error {
@@ -271,7 +397,12 @@ func (k Keyring) String() string {
 		}
 		return "[" + strings.Join(out, " ") + "]"
 	}
-	return fmt.Sprintf("Keyring{NameKeys:%s Keys:%s Material:<redacted>}", ids(k.nameKeys), ids(k.keys))
+	names := make([]string, len(k.scopes))
+	for i, s := range k.scopes {
+		names[i] = s.Name
+	}
+	return fmt.Sprintf("Keyring{NameKeys:%s Keys:%s Scopes:[%s] Material:<redacted>}",
+		ids(k.nameKeys), ids(k.keys), strings.Join(names, " "))
 }
 
 // raw drops the KeyID's name for the crypto layer, which deliberately knows
@@ -296,6 +427,18 @@ type keyringFile struct {
 	Version  int            `yaml:"version"`
 	NameKeys []keyEntryFile `yaml:"name_keys"`
 	Keys     []keyEntryFile `yaml:"keys"`
+	Scopes   []scopeFile    `yaml:"scopes,omitempty"`
+}
+
+// scopeFile is a scope's on-disk shape. Its key lists use the same entry shape
+// as the master's, so one parser and one redaction discipline cover both.
+type scopeFile struct {
+	Name       string         `yaml:"name"`
+	Prefix     string         `yaml:"prefix"`
+	Created    time.Time      `yaml:"created"`
+	Derivation string         `yaml:"derivation,omitempty"`
+	NameKeys   []keyEntryFile `yaml:"name_keys"`
+	Keys       []keyEntryFile `yaml:"keys"`
 }
 
 type keyEntryFile struct {
@@ -311,8 +454,13 @@ func ParseKeyring(data []byte) (Keyring, error) {
 	if err := yaml.Unmarshal(data, &file); err != nil {
 		return Keyring{}, fmt.Errorf("%w: %s", ErrKeyringInvalid, yamlErrorMessage(data, err))
 	}
-	if file.Version != keyringVersion {
-		return Keyring{}, fmt.Errorf("%w: unsupported version %d (this build writes %d)", ErrKeyringInvalid, file.Version, keyringVersion)
+	if file.Version != keyringVersion && file.Version != keyringVersionScopes {
+		return Keyring{}, fmt.Errorf("%w: unsupported version %d (this build writes %d, or %d once scopes are present)",
+			ErrKeyringInvalid, file.Version, keyringVersion, keyringVersionScopes)
+	}
+	if file.Version == keyringVersion && len(file.Scopes) > 0 {
+		return Keyring{}, fmt.Errorf("%w: version %d file carries scopes, which are version %d — refusing rather than guessing which half is right",
+			ErrKeyringInvalid, keyringVersion, keyringVersionScopes)
 	}
 	nameKeys, err := parseEntries(file.NameKeys, "name key")
 	if err != nil {
@@ -322,11 +470,53 @@ func ParseKeyring(data []byte) (Keyring, error) {
 	if err != nil {
 		return Keyring{}, err
 	}
-	k := Keyring{nameKeys: nameKeys, keys: keys}
+	scopes, err := parseScopes(file.Scopes)
+	if err != nil {
+		return Keyring{}, err
+	}
+	k := Keyring{nameKeys: nameKeys, keys: keys, scopes: scopes}
 	if err := k.Valid(); err != nil {
 		return Keyring{}, err
 	}
 	return k, nil
+}
+
+func parseScopes(entries []scopeFile) ([]Scope, error) {
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	out := make([]Scope, 0, len(entries))
+	for i, s := range entries {
+		// Named by position until the name is proved well-formed: a
+		// mis-indented file can put key material in the name field, and
+		// nothing on a parse path may echo bytes it has not vetted.
+		if err := ValidateScopeName(s.Name); err != nil {
+			return nil, fmt.Errorf("scope %d: %w", i+1, err)
+		}
+		if err := ValidateScopePrefix(s.Prefix); err != nil {
+			return nil, fmt.Errorf("scope %q: %w", s.Name, err)
+		}
+		nameKeys, err := parseEntries(s.NameKeys, "name key")
+		if err != nil {
+			return nil, fmt.Errorf("scope %q: %w", s.Name, err)
+		}
+		keys, err := parseEntries(s.Keys, "key")
+		if err != nil {
+			return nil, fmt.Errorf("scope %q: %w", s.Name, err)
+		}
+		scope := Scope{
+			Name:       s.Name,
+			Prefix:     s.Prefix,
+			Created:    s.Created.UTC(),
+			Derivation: s.Derivation,
+			keys:       Keyring{nameKeys: nameKeys, keys: keys},
+		}
+		if err := scope.Valid(); err != nil {
+			return nil, fmt.Errorf("scope %q: %w", s.Name, err)
+		}
+		out = append(out, scope)
+	}
+	return out, nil
 }
 
 func parseEntries(entries []keyEntryFile, what string) ([]KeyEntry, error) {
@@ -382,16 +572,39 @@ func (k Keyring) Marshal() ([]byte, error) {
 	if err := k.Valid(); err != nil {
 		return nil, err
 	}
+	version := keyringVersion
+	if len(k.scopes) > 0 {
+		version = keyringVersionScopes
+	}
 	file := keyringFile{
-		Version:  keyringVersion,
+		Version:  version,
 		NameKeys: marshalEntries(k.nameKeys),
 		Keys:     marshalEntries(k.keys),
+		Scopes:   marshalScopes(k.scopes),
 	}
 	out, err := yaml.Marshal(file)
 	if err != nil {
 		return nil, fmt.Errorf("datasphere: encode keyring: %w", err)
 	}
 	return out, nil
+}
+
+func marshalScopes(scopes []Scope) []scopeFile {
+	if len(scopes) == 0 {
+		return nil
+	}
+	out := make([]scopeFile, len(scopes))
+	for i, s := range scopes {
+		out[i] = scopeFile{
+			Name:       s.Name,
+			Prefix:     s.Prefix,
+			Created:    s.Created.UTC(),
+			Derivation: s.Derivation,
+			NameKeys:   marshalEntries(s.keys.nameKeys),
+			Keys:       marshalEntries(s.keys.keys),
+		}
+	}
+	return out
 }
 
 func marshalEntries(entries []KeyEntry) []keyEntryFile {
