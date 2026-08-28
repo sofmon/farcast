@@ -1,8 +1,8 @@
 # ADR 0008 — In-Cluster Key Delivery: Sealed by Default, Unsealed by the Operator
 
-**Status:** Proposed (2026-08-27). Unblocks Phase 3.2, which [`datasphere/README.md`](../../datasphere/README.md) explicitly froze pending this decision.
+**Status:** Accepted (2026-08-28), drafted 2026-08-27. Unblocks Phase 3.2, which [`datasphere/README.md`](../../datasphere/README.md) explicitly froze pending this decision. Ratified together with the **keeper fleet** planned in *Consequences* and phased at 5.4/7.5 — the operator-hardware answer to the availability cost this decision accepts, and the reason the two-device requirement is a product stance rather than a footnote. One mechanism was corrected before ratification: scope-key **ids stay random** (decision 3), because deriving them would have made the id a verifier for the master over a public prefix — the offline key-check oracle the module's key-id rule forbids.
 
-**Date:** 2026-08-27
+**Date:** 2026-08-28
 
 **Relates to:** Resolves the 3.2 boundary fixed by [`datasphere/README.md`](../../datasphere/README.md) ("Key management") and its decision 6. Constrained by [ADR 0003](0003-gke-autopilot.md) (Autopilot manages and restarts nodes), [ADR 0004](0004-private-control-plane.md) (private control plane), [ADR 0005](0005-fatline-data-plane-ingress.md) (the mTLS tunnel this delivery rides) and [ADR 0007](0007-instance-owned-image-registry.md) (where the in-cluster image comes from). Serves the two pillars of [AGENTS.md](../../AGENTS.md), and is where two of its principles collide.
 
