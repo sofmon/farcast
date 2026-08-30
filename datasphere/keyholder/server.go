@@ -35,8 +35,12 @@ const (
 // bytes, encoding named by Content-Type", so the sealed form can arrive
 // alongside the plain one without the route changing.
 const (
-	ContentTypeBundle = "application/vnd.farcast.bundle"
+	ContentTypeSealed = "application/vnd.farcast.sealed-bundle"
 )
+
+// SealChallengePath is where a pusher fetches the single-use challenge it must
+// answer before this process will accept key material.
+const SealChallengePath = "/v1/seal-challenge"
 
 // DefaultMaxObjectBytes caps a single object. It matches the blob format's own
 // object cap; streaming for larger objects is an interface decision the frozen
@@ -60,6 +64,9 @@ type Config struct {
 	Vault *Vault
 	// Stores builds a Store for a scope.
 	Stores StoreFor
+	// Challenger opens sealed bundles. Nil mints one, which is the normal
+	// case: the recipient key must be per process and must not outlive it.
+	Challenger *Challenger
 	// MaxObjectBytes caps a single object; zero means DefaultMaxObjectBytes.
 	MaxObjectBytes int64
 	// Log receives structured events. Key material never reaches it, and
@@ -73,9 +80,10 @@ type Config struct {
 // keepers (mTLS, may change the seal state), and applications (may read and
 // write plaintext).
 type Server struct {
-	cfg Config
-	max int64
-	log *slog.Logger
+	cfg        Config
+	challenger *Challenger
+	max        int64
+	log        *slog.Logger
 }
 
 // NewServer validates the configuration and returns the surface.
@@ -97,7 +105,14 @@ func NewServer(cfg Config) (*Server, error) {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Server{cfg: cfg, max: max, log: log}, nil
+	challenger := cfg.Challenger
+	if challenger == nil {
+		var err error
+		if challenger, err = NewChallenger(); err != nil {
+			return nil, err
+		}
+	}
+	return &Server{cfg: cfg, challenger: challenger, max: max, log: log}, nil
 }
 
 // StatusHandler serves the probes and the seal state.
@@ -149,6 +164,17 @@ func (s *Server) ControlHandler() http.Handler {
 		writeJSON(w, http.StatusOK, stateBody(s.cfg.Instance, s.cfg.Vault.State()))
 	})
 
+	mux.HandleFunc("GET "+SealChallengePath, func(w http.ResponseWriter, _ *http.Request) {
+		ch, err := s.challenger.Issue()
+		if err != nil {
+			s.log.Warn("challenge refused", "error", err)
+			writeJSONWithCode(w, http.StatusTooManyRequests, CodeBadRequest,
+				errorResponse{Code: CodeBadRequest, Message: "cannot issue a challenge"})
+			return
+		}
+		writeJSON(w, http.StatusOK, ch)
+	})
+
 	mux.HandleFunc("POST /v1/unseal", func(w http.ResponseWriter, r *http.Request) {
 		intent := Intent(r.URL.Query().Get("intent"))
 		switch intent {
@@ -162,9 +188,25 @@ func (s *Server) ControlHandler() http.Handler {
 			return
 		}
 
-		payload, err := io.ReadAll(http.MaxBytesReader(w, r.Body, s.max))
+		// The envelope is the only way in. The boundary is Open below,
+		// which refuses anything that is not a well-formed envelope
+		// answering a live challenge; this check exists so that posting a
+		// bare bundle is refused as the mistake it is rather than as an
+		// opaque cryptographic failure.
+		if ct := r.Header.Get("Content-Type"); ct != ContentTypeSealed {
+			s.fail(w, r, fmt.Errorf("%w: unseal requires %s", datasphere.ErrBundleInvalid, ContentTypeSealed))
+			return
+		}
+		sealed, err := io.ReadAll(http.MaxBytesReader(w, r.Body, s.max))
 		if err != nil {
 			s.fail(w, r, fmt.Errorf("%w: unreadable body", datasphere.ErrBundleInvalid))
+			return
+		}
+		payload, err := s.challenger.Open(sealed, s.cfg.Instance)
+		clear(sealed)
+		if err != nil {
+			s.log.Warn("unseal envelope refused", "intent", intent)
+			s.fail(w, r, err)
 			return
 		}
 		bundle, err := datasphere.ParseBundle(payload)

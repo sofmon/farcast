@@ -126,8 +126,7 @@ func TestStateAnswersWhileSealedWithoutMaterial(t *testing.T) {
 func TestControlUnsealAndRefusals(t *testing.T) {
 	t.Run("happy path", func(t *testing.T) {
 		h := newHarness(t)
-		payload := marshalBundle(t, "prod", 5)
-		w := do(h.control, "POST", "/v1/unseal?intent=operator-unseal", nil, payload)
+		w := h.push(t, "prod", 5, IntentOperator)
 		if w.Code != http.StatusOK {
 			t.Fatalf("unseal = %d: %s", w.Code, w.Body)
 		}
@@ -136,9 +135,48 @@ func TestControlUnsealAndRefusals(t *testing.T) {
 		}
 	})
 
+	// The envelope is the only way in: a bare bundle over the same
+	// authenticated session must be refused, or every protection the
+	// envelope carries becomes optional in practice.
+	t.Run("a bare bundle is refused", func(t *testing.T) {
+		h := newHarness(t)
+		w := do(h.control, "POST", "/v1/unseal?intent=operator-unseal", nil, marshalBundle(t, "prod", 1))
+		if w.Code == http.StatusOK {
+			t.Fatal("an unsealed bundle was accepted")
+		}
+		if h.vault.Ready() {
+			t.Fatal("a bare bundle loaded key material")
+		}
+	})
+
+	// A challenge is single-use, so a captured push cannot be replayed.
+	t.Run("a replayed envelope is refused", func(t *testing.T) {
+		h := newHarness(t)
+		cw := do(h.control, "GET", SealChallengePath, nil, nil)
+		var ch Challenge
+		if err := json.Unmarshal(cw.Body.Bytes(), &ch); err != nil {
+			t.Fatalf("decode challenge: %v", err)
+		}
+		sealed, err := SealBundle(marshalBundle(t, "prod", 4), "prod", ch)
+		if err != nil {
+			t.Fatalf("SealBundle: %v", err)
+		}
+		hdr := map[string]string{"Content-Type": ContentTypeSealed}
+		if w := do(h.control, "POST", "/v1/unseal?intent=operator-unseal", hdr, sealed); w.Code != http.StatusOK {
+			t.Fatalf("first push = %d: %s", w.Code, w.Body)
+		}
+		h.vault.Seal(false, "")
+		if w := do(h.control, "POST", "/v1/unseal?intent=operator-unseal", hdr, sealed); w.Code == http.StatusOK {
+			t.Fatal("a replayed envelope was accepted")
+		}
+		if h.vault.Ready() {
+			t.Fatal("a replay loaded key material")
+		}
+	})
+
 	t.Run("foreign instance", func(t *testing.T) {
 		h := newHarness(t)
-		w := do(h.control, "POST", "/v1/unseal?intent=operator-unseal", nil, marshalBundle(t, "staging", 1))
+		w := h.push(t, "staging", 1, IntentOperator)
 		if w.Code != http.StatusConflict || w.Header().Get(HeaderCode) != CodeInstanceMismatch {
 			t.Fatalf("= %d/%q, want 409/%s", w.Code, w.Header().Get(HeaderCode), CodeInstanceMismatch)
 		}
@@ -148,7 +186,7 @@ func TestControlUnsealAndRefusals(t *testing.T) {
 		h := newHarness(t)
 		h.unseal(t, 1)
 		h.vault.Seal(true, "maintenance")
-		w := do(h.control, "POST", "/v1/unseal?intent=restart-reseed", nil, marshalBundle(t, "prod", 2))
+		w := h.push(t, "prod", 2, IntentReseed)
 		if w.Code != http.StatusConflict || w.Header().Get(HeaderCode) != CodeOperatorHold {
 			t.Fatalf("= %d/%q, want 409/%s", w.Code, w.Header().Get(HeaderCode), CodeOperatorHold)
 		}
@@ -159,7 +197,7 @@ func TestControlUnsealAndRefusals(t *testing.T) {
 		h := newHarness(t)
 		h.unseal(t, 1)
 		h.vault.Seal(true, "maintenance")
-		w := do(h.control, "POST", "/v1/unseal", nil, marshalBundle(t, "prod", 2))
+		w := h.push(t, "prod", 2, "")
 		if w.Header().Get(HeaderCode) != CodeOperatorHold {
 			t.Fatalf("an unseal with no stated intent cleared a hold: %d/%q", w.Code, w.Header().Get(HeaderCode))
 		}
@@ -168,7 +206,7 @@ func TestControlUnsealAndRefusals(t *testing.T) {
 	t.Run("old generation", func(t *testing.T) {
 		h := newHarness(t)
 		h.unseal(t, 9)
-		w := do(h.control, "POST", "/v1/unseal?intent=operator-unseal", nil, marshalBundle(t, "prod", 8))
+		w := h.push(t, "prod", 8, IntentOperator)
 		if w.Code != http.StatusConflict || w.Header().Get(HeaderCode) != CodeGenerationOld {
 			t.Fatalf("= %d/%q, want 409/%s", w.Code, w.Header().Get(HeaderCode), CodeGenerationOld)
 		}
@@ -385,6 +423,27 @@ func marshalBundle(t *testing.T, instance string, generation uint64) []byte {
 		t.Fatalf("Marshal: %v", err)
 	}
 	return out
+}
+
+// push performs a real unseal: fetch the single-use challenge, seal the bundle
+// to this process, and post it. Tests go through the same path an operator
+// does, so nothing is proved against a shortcut that production cannot take.
+func (h *harness) push(t *testing.T, instance string, generation uint64, intent Intent) *httptest.ResponseRecorder {
+	t.Helper()
+	cw := do(h.control, "GET", SealChallengePath, nil, nil)
+	if cw.Code != http.StatusOK {
+		t.Fatalf("challenge = %d: %s", cw.Code, cw.Body)
+	}
+	var ch Challenge
+	if err := json.Unmarshal(cw.Body.Bytes(), &ch); err != nil {
+		t.Fatalf("decode challenge: %v", err)
+	}
+	sealed, err := SealBundle(marshalBundle(t, instance, generation), h.srv.cfg.Instance, ch)
+	if err != nil {
+		t.Fatalf("SealBundle: %v", err)
+	}
+	return do(h.control, "POST", "/v1/unseal?intent="+string(intent),
+		map[string]string{"Content-Type": ContentTypeSealed}, sealed)
 }
 
 // safeMessage is the guard that stops a logical name escaping in an error

@@ -81,6 +81,11 @@ func classify(err error) (status int, code string) {
 		return http.StatusConflict, CodeGenerationOld
 	case errors.Is(err, ErrInstanceMismatch):
 		return http.StatusConflict, CodeInstanceMismatch
+	case errors.Is(err, ErrEnvelopeInvalid):
+		// One status and one code for every envelope failure, matching the
+		// single error the opener returns: which check refused is not a
+		// caller's business.
+		return http.StatusForbidden, CodeBadRequest
 	case errors.Is(err, datasphere.ErrBundleInvalid), errors.Is(err, datasphere.ErrKeyringInvalid):
 		return http.StatusBadRequest, CodeBadRequest
 
