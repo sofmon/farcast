@@ -15,7 +15,11 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -84,3 +88,95 @@ func (c *Conn) Close() error {
 	c.client.CloseIdleConnections()
 	return nil
 }
+
+// DialStream opens an opaque, full-duplex byte stream to a named in-instance
+// service through the tunnel.
+//
+// FatLine relays the bytes and does not terminate them, so a TLS session run
+// over the returned connection is end-to-end between this process and the
+// service — which is what lets an operator hand key material to the DataSphere
+// keyholder without it ever existing in FatLine's address space.
+//
+// The caller names a ROUTE, never an address. FatLine expands the name against
+// a closed table fixed at deploy time, so an operator credential reaches the
+// services FarCast deployed and is not a general port-forward into the
+// cluster. Pass a negative ordinal for a route that addresses a single service;
+// a non-negative one selects a replica of a StatefulSet.
+//
+// The returned connection's deadline methods are no-ops: the stream's lifetime
+// is governed by ctx, and cancelling it tears the stream down.
+func (c *Conn) DialStream(ctx context.Context, route string, ordinal int) (net.Conn, error) {
+	if route == "" {
+		return nil, fmt.Errorf("fatline: stream route is required")
+	}
+	target := c.endpoint + fatline.StreamPathPrefix + url.PathEscape(route)
+	if ordinal >= 0 {
+		target += "?ordinal=" + strconv.Itoa(ordinal)
+	}
+
+	// The request body is a pipe so the caller can keep writing after the
+	// response headers arrive — that is what makes the stream duplex rather
+	// than request-then-response.
+	pr, pw := io.Pipe()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, pr)
+	if err != nil {
+		_ = pw.CloseWithError(err)
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		_ = pw.CloseWithError(err)
+		return nil, fmt.Errorf("fatline: dial stream %q: %w", route, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		_ = resp.Body.Close()
+		_ = pw.Close()
+		return nil, fmt.Errorf("fatline: dial stream %q: %s", route, resp.Status)
+	}
+	// A relay that fell back to HTTP/1.1 would not be duplex, and the
+	// symptom is a hang rather than an error — so it is refused here.
+	if resp.ProtoMajor != 2 {
+		_ = resp.Body.Close()
+		_ = pw.Close()
+		return nil, fmt.Errorf("fatline: dial stream %q: relay negotiated HTTP/%d, which cannot carry a duplex stream", route, resp.ProtoMajor)
+	}
+	return &streamConn{w: pw, r: resp.Body}, nil
+}
+
+// streamConn adapts the relayed HTTP/2 stream to net.Conn so a TLS session can
+// run over it.
+type streamConn struct {
+	w *io.PipeWriter
+	r io.ReadCloser
+}
+
+func (s *streamConn) Read(p []byte) (int, error)  { return s.r.Read(p) }
+func (s *streamConn) Write(p []byte) (int, error) { return s.w.Write(p) }
+
+func (s *streamConn) Close() error {
+	werr := s.w.Close()
+	rerr := s.r.Close()
+	if werr != nil {
+		return werr
+	}
+	return rerr
+}
+
+// CloseWrite half-closes the stream, so the far side sees a clean EOF while
+// this side keeps reading.
+func (s *streamConn) CloseWrite() error { return s.w.Close() }
+
+func (*streamConn) LocalAddr() net.Addr  { return streamAddr{} }
+func (*streamConn) RemoteAddr() net.Addr { return streamAddr{} }
+
+// Deadlines are no-ops: the stream lives and dies with the request context.
+func (*streamConn) SetDeadline(time.Time) error      { return nil }
+func (*streamConn) SetReadDeadline(time.Time) error  { return nil }
+func (*streamConn) SetWriteDeadline(time.Time) error { return nil }
+
+type streamAddr struct{}
+
+func (streamAddr) Network() string { return "fatline-stream" }
+func (streamAddr) String() string  { return "fatline-stream" }

@@ -55,6 +55,11 @@ type Config struct {
 
 	// Allowlist is the egress policy: declared external hosts, deny-by-default.
 	Allowlist []parser.External
+	// StreamRoutes are the in-instance services the operator may reach
+	// through the tunnel, as a closed list fixed at deploy time. Empty means
+	// the relay refuses everything, which is the correct default: an
+	// instance with nothing to reach inward exposes no inward path.
+	StreamRoutes []StreamRoute
 	// Events receives egress decisions; Shrike (2.2) implements this. Nil logs
 	// via slog.
 	Events event.Sink
@@ -81,6 +86,11 @@ type Server struct {
 func New(cfg Config) (*Server, error) {
 	if cfg.TunnelListen == "" && cfg.EgressListen == "" {
 		return nil, errors.New("fatline: no listen address configured (set TunnelListen and/or EgressListen)")
+	}
+	// A malformed route table is refused here rather than on the first
+	// relay: the operator finds out at deploy time, not during a recovery.
+	if err := validateStreamRoutes(cfg.StreamRoutes); err != nil {
+		return nil, err
 	}
 	al := allowlist.New(cfg.Allowlist)
 
@@ -171,6 +181,7 @@ func (s *Server) ingressHandler() http.Handler {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(s.Status())
 	})
+	mux.HandleFunc("POST "+StreamPathPrefix+"{route}", s.streamHandler)
 	return mux
 }
 
