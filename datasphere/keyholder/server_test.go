@@ -358,12 +358,18 @@ func TestExoticKeysRoundTripByteExactly(t *testing.T) {
 	h.unseal(t, 1)
 
 	keys := []string{
-		"app/café",              // NFC
-		"app/café",             // NFD — a different key, and must stay one
+		// NFC and NFD of the same word, written as escapes: literal bytes
+		// can be normalized by an editor or a tool, which would collapse
+		// them into one key and make this test prove nothing.
+		"app/caf\u00e9",
+		"app/cafe\u0301",
 		"app/a b/c+d&e=f?g#h",   // characters a URL would mangle
 		"app/../literal",        // ".." is a literal segment here, not traversal
 		"app/tab\tand\nnewline", // bytes a header could not carry unencoded
 		"app/\U0001F511",        // outside the BMP
+	}
+	if keys[0] == keys[1] {
+		t.Fatal("guard: the NFC and NFD forms collapsed; this test would prove nothing")
 	}
 	for _, k := range keys {
 		body := []byte("value for " + k)
