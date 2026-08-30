@@ -2,6 +2,7 @@ package farcast
 
 import (
 	"context"
+	"sync"
 	"time"
 )
 
@@ -104,11 +105,19 @@ func StorageStatusOf(ctx context.Context, s StorageAPI) (StorageStatus, error) {
 
 // Storage returns the storage capability.
 //
-// Implementation lands in a later phase; until then this returns a stub
-// whose methods yield ErrNotImplemented.
+// It is configured from the environment on first use. Outside a FarCast
+// instance — or in a build the platform has not wired storage into — the
+// methods yield ErrNotImplemented, so an application compiles and runs
+// against the full surface before storage exists.
 func Storage() StorageAPI {
-	return storageStub{}
+	storageOnce.Do(func() { storageCapability = newStorageFromEnv() })
+	return storageCapability
 }
+
+var (
+	storageOnce       sync.Once
+	storageCapability StorageAPI
+)
 
 var _ StorageAPI = storageStub{}
 

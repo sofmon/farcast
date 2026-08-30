@@ -312,6 +312,21 @@ func StorageStatusOf(ctx context.Context, s StorageAPI) (StorageStatus, error)
 
 Checking is never *required*: every method reports a seal on its own, and a status that says ready can be stale by the time the next call runs, so code must still classify the error from the operation itself.
 
+#### Configuration
+
+The platform injects these when it runs an application; absent them the capability is the stub and every method reports `ErrNotImplemented`.
+
+| Variable | Meaning |
+|---|---|
+| `FARCAST_STORAGE_ENDPOINT` | the keyholder's data path (https) |
+| `FARCAST_STORAGE_STATUS_ENDPOINT` | its status endpoint, used only to tell a seal from an outage |
+| `FARCAST_STORAGE_SCOPE` | the scope this application may address |
+| `FARCAST_STORAGE_CA` | the instance CA, in PEM, used to verify the keyholder |
+
+A configuration that is *present but unusable* — an unreadable CA, a plain-`http` endpoint — is neither the stub nor a seal. It reports `ErrStorageUnavailable`, because telling an application "this build never supports storage" would make it stop trying, and telling it "sealed" would make it wait for an operator who has nothing to unseal.
+
+Without a usable CA the SDK refuses to talk to the keyholder at all rather than falling back to the system roots: system roots would accept anything that answers on that address.
+
 Implementation: phase 3.2.
 
 ### Net — `farcast.Net()`
