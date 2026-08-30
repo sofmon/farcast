@@ -19,6 +19,8 @@
 //	datasphere get <key> [file]   ...
 //	datasphere ls  [prefix]       ...  [--tokens]
 //	datasphere rm  <key>          ...
+//	datasphere serve              --instance NAME --bucket B --provider gcs --project P --location R
+//	                              [--listen :8443] [--status-listen :8444] [--unseal-listen :9443]
 //
 // Use "-" as a file operand to read from stdin or write to stdout.
 package main
@@ -71,13 +73,21 @@ func run(args []string, out, errw io.Writer) int {
 	fs.StringVar(&opt.creds, "credentials", "", "path to a credentials JSON file (optional)")
 	fs.StringVar(&opt.keys, "keys", "keys.yaml", "path to the instance keyring")
 	fs.BoolVar(&opt.tokens, "tokens", false, "ls: also print the opaque name each key is stored under")
+	var sopt serveOptions
+	serveFlags(fs, &sopt)
 	if err := fs.Parse(hoistFlags(args[2:])); err != nil {
 		return 2
 	}
 	operands := fs.Args()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	if cmd != "serve" {
+		// Every other verb is a one-shot operation; serve runs until it is
+		// signalled, so it must not carry a deadline.
+		ctx, cancel = context.WithTimeout(ctx, 30*time.Minute)
+		defer cancel()
+	}
 
 	switch cmd {
 	case "keygen":
@@ -90,6 +100,20 @@ func run(args []string, out, errw io.Writer) int {
 		return ensureBucket(ctx, opt, out, errw)
 	case "delete-bucket":
 		return deleteBucket(ctx, opt, out, errw)
+	case "serve":
+		// The keyholder never reads a keyring from disk — that is the whole
+		// point of it — so being handed one is a misunderstanding worth
+		// naming rather than ignoring.
+		given := false
+		fs.Visit(func(f *flag.Flag) {
+			if f.Name == "keys" {
+				given = true
+			}
+		})
+		if given {
+			return fail(errw, "datasphere: serve takes no --keys: the keyholder holds only what is pushed to it, in memory\n")
+		}
+		return serve(ctx, opt, sopt, out, errw)
 	case "put", "get", "ls", "rm":
 		return object(ctx, cmd, opt, operands, out, errw)
 	default:
@@ -401,6 +425,8 @@ func usage(errw io.Writer) {
   datasphere get <key> [file]   ...
   datasphere ls  [prefix]       ...  [--tokens]
   datasphere rm  <key>          ...
+  datasphere serve              --instance NAME --bucket B --provider gcs --project P --location R
+                                [--listen :8443] [--status-listen :8444] [--unseal-listen :9443]
 
 Use "-" as a file operand for stdin/stdout.
 `)
