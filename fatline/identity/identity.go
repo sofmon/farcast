@@ -34,6 +34,44 @@ func ServerName(instance string) string {
 	return instance + ".fatline.farcast"
 }
 
+// KeyholderServerName is the DataSphere keyholder's pinned identity (a DNS
+// SAN), distinct from FatLine's so that the two are separately verifiable and
+// a leaf minted for one cannot stand in for the other.
+func KeyholderServerName(instance string) string {
+	return instance + ".datasphered.farcast"
+}
+
+// KeeperURI is the identity a keeper device presents (phase 5.4). Each device
+// is named so that one can be revoked without revoking the fleet.
+func KeeperURI(instance, device string) string {
+	return "farcast://" + instance + "/keeper/" + device
+}
+
+// IssueKeyholderServer issues a server leaf for the in-cluster keyholder from
+// an already-minted CA.
+//
+// It exists as a separate issuance rather than a second leaf out of Mint
+// because the keyholder is deployed later than the tunnel and may be
+// redeployed independently — and because an instance that never uses in-cluster
+// storage should never have had this leaf minted at all.
+//
+// The CA private key is an argument and is never retained: it lives on the
+// operator's machine and this function is a pure transformation over it.
+func IssueKeyholderServer(caCertPEM, caKeyPEM []byte, instance string) (certPEM, keyPEM []byte, err error) {
+	if instance == "" {
+		return nil, nil, errors.New("identity: empty instance name")
+	}
+	ca, err := fcrypto.LoadCA(caCertPEM, caKeyPEM)
+	if err != nil {
+		return nil, nil, err
+	}
+	leaf, err := ca.IssueServer(KeyholderServerName(instance))
+	if err != nil {
+		return nil, nil, err
+	}
+	return leaf.CertPEM, leaf.KeyPEM, nil
+}
+
 // Material is a per-instance mTLS identity, PEM-encoded for storage. CAKeyPEM is
 // the crown jewel — it stays on the operator's machine; ClusterSecret carries
 // only what FatLine needs in-cluster.
