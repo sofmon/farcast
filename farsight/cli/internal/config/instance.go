@@ -125,6 +125,32 @@ type Storage struct {
 	CreatedAt  time.Time `yaml:"created_at,omitempty"`
 }
 
+// Keyholder records the in-cluster DataSphere keyholder.
+//
+// Nothing secret lives here either. The scope's key material is in the keyring
+// beside it; this block records only what was deployed and how far the seal
+// state has advanced, so an operator can tell what SHOULD be running from what
+// the cluster reports is running.
+type Keyholder struct {
+	Deployed bool   `yaml:"deployed,omitempty"`
+	Image    string `yaml:"image,omitempty"` // digest-pinned
+	Replicas int    `yaml:"replicas,omitempty"`
+
+	// Scope and ScopePrefix name the slice of storage the keyholder serves.
+	// They are recorded before the scope's keys are ever pushed: material
+	// handed to a cluster and not written down here is material whose data
+	// nobody can find again.
+	Scope       string `yaml:"scope,omitempty"`
+	ScopePrefix string `yaml:"scope_prefix,omitempty"`
+
+	// Generation is the highest bundle generation this machine has pushed. A
+	// keyholder refuses anything older, so this is what an operator compares
+	// against when a replica reports an unexpected number.
+	Generation uint64 `yaml:"generation,omitempty"`
+
+	RecordedAt time.Time `yaml:"recorded_at,omitempty"`
+}
+
 // InstanceMetadata is the non-secret record for an installed instance.
 type InstanceMetadata struct {
 	Name      string    `yaml:"name"`
@@ -153,6 +179,10 @@ type InstanceMetadata struct {
 	// Storage is the instance's DataSphere bucket (3.3), pointer-typed for the
 	// same reason Registry is.
 	Storage *Storage `yaml:"storage,omitempty"`
+
+	// Keyholder is the in-cluster process that serves storage to
+	// applications; nil until `farcast storage deploy` has run.
+	Keyholder *Keyholder `yaml:"keyholder,omitempty"`
 }
 
 // MTLSMaterial is a per-instance data-plane mTLS identity, PEM-encoded. It is a
@@ -298,6 +328,18 @@ func (d Dir) datasphereDir(name string) string {
 // InstanceKeyringPath is the path to an instance's DataSphere keyring. It is
 // returned rather than read because losing this file is unrecoverable, so the
 // caller that owns the operation owns the read, the write, and the warning.
+// InstanceUnsealLedgerPath is the append-only record of every unseal this
+// machine has performed.
+//
+// It is deliberately local and deliberately append-only. Every push of key
+// material into a cluster leaves a mark on hardware the cloud cannot reach or
+// erase, so a fleet's ledgers can be reconciled against what the cluster says
+// it restarted. Phase 5.4 reads it; 3.2 only writes it, so that when a keeper
+// arrives the history is already there.
+func (d Dir) InstanceUnsealLedgerPath(name string) string {
+	return filepath.Join(d.datasphereDir(name), "unseal-ledger.jsonl")
+}
+
 func (d Dir) InstanceKeyringPath(name string) string {
 	return filepath.Join(d.datasphereDir(name), keyringFile)
 }
