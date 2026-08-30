@@ -24,6 +24,7 @@ import (
 
 	"github.com/sofmon/farcast/fatline/event"
 	"github.com/sofmon/farcast/fatline/internal/allowlist"
+	"github.com/sofmon/farcast/fatline/internal/netcopy"
 )
 
 // DialFunc dials an upstream address. It is injectable for tests.
@@ -119,30 +120,13 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	defer func() { _ = upstream.Close() }()
 
 	clientSrc := io.MultiReader(bytes.NewReader(buffered), clientConn)
-	up, down := splice(upstream, clientConn, clientSrc)
+	up, down := netcopy.Duplex(upstream, clientConn, clientSrc)
 	p.events.Emit(event.Event{Kind: event.Close, Host: host, Port: port, Proto: "connect", SNI: sni, BytesUp: up, BytesDown: down})
 }
 
 // splice copies bidirectionally between the client and the upstream, returning
 // bytes sent up (client→upstream) and down (upstream→client). It waits for both
 // directions, so the byte counts are safely published through the channel.
-func splice(upstream net.Conn, clientDst io.Writer, clientSrc io.Reader) (up, down int64) {
-	done := make(chan struct{}, 2)
-	go func() {
-		up, _ = io.Copy(upstream, clientSrc)
-		if cw, ok := upstream.(interface{ CloseWrite() error }); ok {
-			_ = cw.CloseWrite()
-		}
-		done <- struct{}{}
-	}()
-	go func() {
-		down, _ = io.Copy(clientDst, upstream)
-		done <- struct{}{}
-	}()
-	<-done
-	<-done
-	return up, down
-}
 
 // peekSNI reads the TLS ClientHello off conn, returns the SNI and the exact
 // bytes consumed (to be replayed). It never terminates the handshake: it aborts
