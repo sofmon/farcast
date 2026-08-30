@@ -15,6 +15,10 @@ const digest = "@sha256:" + "0123456789abcdef0123456789abcdef0123456789abcdef012
 func sampleConfig() Config {
 	return Config{
 		Image:         "us-central1-docker.pkg.dev/proj/farcast-prod/system/datasphered" + digest,
+		Instance:      "prod",
+		Bucket:        "farcast-prod-0a1b2c3d",
+		Project:       "example-project",
+		Location:      "us-central1",
 		CACertPEM:     []byte("CA-PEM"),
 		ServerCertPEM: []byte("SRV-CRT"),
 		ServerKeyPEM:  []byte("SRV-KEY"),
@@ -647,4 +651,55 @@ func keys(m map[string]map[string]any) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// A keyholder with no bucket would start, pass its probes, and refuse every
+// write — a failure that looks like a bug in the application. It is caught at
+// render time instead.
+func TestRenderRequiresAStorageTarget(t *testing.T) {
+	for _, mutate := range []func(Config) Config{
+		func(c Config) Config { c.Instance = ""; return c },
+		func(c Config) Config { c.Bucket = ""; return c },
+		func(c Config) Config { c.Instance, c.Bucket = "", ""; return c },
+	} {
+		if _, err := Render(mutate(sampleConfig())); err == nil {
+			t.Error("Render accepted a config with no storage target")
+		}
+	}
+}
+
+// The target must reach the container, or the keyholder refuses to start and
+// the Pod crash-loops with a message nobody sees until they read the logs.
+func TestRenderPassesTheStorageTargetAsArguments(t *testing.T) {
+	out, err := Render(sampleConfig())
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	for _, want := range []string{
+		"--instance=prod",
+		"--bucket=farcast-prod-0a1b2c3d",
+		"--provider=gcs",
+		"--project=example-project",
+		"--location=us-central1",
+	} {
+		if !strings.Contains(string(out), want) {
+			t.Errorf("rendered workload is missing %q", want)
+		}
+	}
+}
+
+// An empty project or location must be omitted rather than passed as an empty
+// flag, which the adapter would read as a deliberate blank.
+func TestRenderOmitsEmptyOptionalTargetFields(t *testing.T) {
+	c := sampleConfig()
+	c.Project, c.Location = "", ""
+	out, err := Render(c)
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	for _, unwanted := range []string{"--project=", "--location="} {
+		if strings.Contains(string(out), unwanted) {
+			t.Errorf("rendered workload carries an empty %q", unwanted)
+		}
+	}
 }

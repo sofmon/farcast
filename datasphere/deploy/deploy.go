@@ -57,6 +57,8 @@ const (
 	// DefaultUnsealPort receives the operator's (later the keeper's) bundle
 	// push over the FatLine tunnel — decision 4.
 	DefaultUnsealPort = 9443
+	// DefaultProvider is the cloud storage adapter the keyholder opens.
+	DefaultProvider = "gcs"
 
 	secretName = "datasphered-mtls"
 	// digestMarker pins the image by content. ADR 0008 decision 1: deployed
@@ -82,6 +84,16 @@ type Config struct {
 	StatusPort int    // default DefaultStatusPort
 	UnsealPort int    // default DefaultUnsealPort
 
+	// The storage target the keyholder serves. It is passed as arguments
+	// rather than environment values because these are not secrets and
+	// because `kubectl describe pod` is where an operator looks first when a
+	// keyholder is pointed at the wrong bucket.
+	Instance string // required
+	Bucket   string // required
+	Provider string // default "gcs"
+	Project  string
+	Location string
+
 	CACertPEM     []byte
 	ServerCertPEM []byte
 	ServerKeyPEM  []byte
@@ -106,6 +118,9 @@ func (c *Config) withDefaults() {
 	if c.UnsealPort == 0 {
 		c.UnsealPort = DefaultUnsealPort
 	}
+	if c.Provider == "" {
+		c.Provider = DefaultProvider
+	}
 }
 
 // Render produces the Kubernetes apply stream (Namespace, Secret, StatefulSet,
@@ -126,6 +141,11 @@ func Render(c Config) ([]byte, error) {
 	if len(c.CACertPEM) == 0 || len(c.ServerCertPEM) == 0 || len(c.ServerKeyPEM) == 0 {
 		return nil, errors.New("deploy: incomplete mTLS material (need CA cert + server leaf+key)")
 	}
+	// A keyholder with no bucket would start, pass its probes and refuse every
+	// write, so the omission is caught here rather than in the cluster.
+	if c.Instance == "" || c.Bucket == "" {
+		return nil, errors.New("deploy: datasphered needs both an instance and a bucket to serve")
+	}
 	if c.Replicas < 1 {
 		return nil, fmt.Errorf("deploy: replicas must be at least 1, got %d", c.Replicas)
 	}
@@ -134,6 +154,11 @@ func Render(c Config) ([]byte, error) {
 	}
 
 	data := templateData{
+		Instance:      c.Instance,
+		Bucket:        c.Bucket,
+		Provider:      c.Provider,
+		Project:       c.Project,
+		Location:      c.Location,
 		Namespace:     c.Namespace,
 		Name:          c.Name,
 		StatusService: c.Name + "-status",
@@ -194,6 +219,11 @@ func mtlsHash(parts ...[]byte) string {
 }
 
 type templateData struct {
+	Instance      string
+	Bucket        string
+	Provider      string
+	Project       string
+	Location      string
 	Namespace     string
 	Name          string
 	StatusService string
@@ -330,6 +360,15 @@ spec:
             - --listen=:{{.DataPort}}
             - --status-listen=:{{.StatusPort}}
             - --unseal-listen=:{{.UnsealPort}}
+            - --instance={{.Instance}}
+            - --bucket={{.Bucket}}
+            - --provider={{.Provider}}
+{{- if .Project}}
+            - --project={{.Project}}
+{{- end}}
+{{- if .Location}}
+            - --location={{.Location}}
+{{- end}}
           env:
             # A panic in the process that holds the derived bundle must not
             # print goroutine stacks — and, with core dumps disabled, must not
