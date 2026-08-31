@@ -101,7 +101,7 @@ func decodeHeader(v string) string {
 
 func (f *fakeKeyholder) client(t *testing.T) *storageClient {
 	t.Helper()
-	c, err := newStorageClient(f.data.URL, f.status.URL, "app", certPEM(t, f.data.Certificate()))
+	c, err := newStorageClient(f.data.URL, f.status.URL, "app", certPEM(t, f.data.Certificate()), "")
 	if err != nil {
 		t.Fatalf("newStorageClient: %v", err)
 	}
@@ -286,7 +286,7 @@ func TestBrokenConfigurationIsNeitherStubNorSeal(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := newStorageClient(tc.endpoint, tc.status, tc.scope, []byte(tc.ca))
+			_, err := newStorageClient(tc.endpoint, tc.status, tc.scope, []byte(tc.ca), "")
 			if err == nil {
 				t.Fatal("an unusable configuration was accepted")
 			}
@@ -335,7 +335,7 @@ func TestUntrustedPeerIsRefusedBeforeAnyPayloadIsSent(t *testing.T) {
 	// trusting one would trust the impostor too and this test would pass
 	// without verifying anything.
 	_ = real
-	c, err := newStorageClient(impostor.data.URL, impostor.status.URL, "app", freshCAPEM(t))
+	c, err := newStorageClient(impostor.data.URL, impostor.status.URL, "app", freshCAPEM(t), "")
 	if err != nil {
 		t.Fatalf("newStorageClient: %v", err)
 	}
@@ -463,4 +463,36 @@ func TestStorageFromEnvHasThreeDistinctOutcomes(t *testing.T) {
 			t.Errorf("Write through the env-built client: %v", err)
 		}
 	})
+}
+
+// The address an application dials and the identity the keyholder must present
+// are different things. A keyholder's certificate carries a synthetic,
+// instance-scoped name verified against the instance's own CA; the address is
+// whatever the platform routes to — a cluster Service, a port-forward, a
+// future carrier. Conflating them makes the client unusable from inside a
+// cluster, which is the only place it will ever actually run.
+func TestServerNameIsSeparableFromTheAddress(t *testing.T) {
+	f := newFakeKeyholder(t)
+
+	// The fake's certificate is issued for "example.com"/127.0.0.1, never for
+	// this name, so a client that verifies against it must fail.
+	c, err := newStorageClient(f.data.URL, f.status.URL, "app",
+		certPEM(t, f.data.Certificate()), "p32.datasphered.farcast")
+	if err != nil {
+		t.Fatalf("newStorageClient: %v", err)
+	}
+	f.phase = "unsealed"
+	if err := c.Write(context.Background(), "app/doc", []byte("v")); err == nil {
+		t.Fatal("the client accepted a peer that does not present the pinned name")
+	}
+	if f.sawBody {
+		t.Fatal("a payload reached a peer whose identity was not verified")
+	}
+
+	// With no override the endpoint's own host is the identity, which is what
+	// every existing caller relies on.
+	plain := f.client(t)
+	if err := plain.Write(context.Background(), "app/doc", []byte("v")); err != nil {
+		t.Errorf("an un-overridden client failed: %v", err)
+	}
 }

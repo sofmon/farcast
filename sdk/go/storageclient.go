@@ -22,6 +22,18 @@ const (
 	envStorageStatus   = "FARCAST_STORAGE_STATUS_ENDPOINT"
 	envStorageScope    = "FARCAST_STORAGE_SCOPE"
 	envStorageCA       = "FARCAST_STORAGE_CA"
+
+	// envStorageServerName pins the identity the keyholder must present,
+	// separately from the address used to reach it.
+	//
+	// The two are not the same thing and must not be conflated. A keyholder's
+	// certificate carries a synthetic instance-scoped name verified against
+	// the instance's own CA — never a name in public DNS — while the address
+	// an application dials is whatever the platform routes it to: a cluster
+	// Service, a port-forward, a future carrier. FatLine's tunnel client
+	// already separates them for exactly this reason (ADR 0005's
+	// carrier-independent server identity); this is the same split.
+	envStorageServerName = "FARCAST_STORAGE_SERVER_NAME"
 )
 
 // Header names on the keyholder's data path. The logical key travels
@@ -82,6 +94,7 @@ func newStorageFromEnv() StorageAPI {
 		strings.TrimSpace(os.Getenv(envStorageStatus)),
 		strings.TrimSpace(os.Getenv(envStorageScope)),
 		[]byte(os.Getenv(envStorageCA)),
+		strings.TrimSpace(os.Getenv(envStorageServerName)),
 	)
 	if err != nil {
 		return storageBroken{err: err}
@@ -89,7 +102,7 @@ func newStorageFromEnv() StorageAPI {
 	return client
 }
 
-func newStorageClient(endpoint, status, scope string, caPEM []byte) (*storageClient, error) {
+func newStorageClient(endpoint, status, scope string, caPEM []byte, serverName string) (*storageClient, error) {
 	if _, err := url.Parse(endpoint); err != nil || !strings.HasPrefix(endpoint, "https://") {
 		return nil, fmt.Errorf("%w: %s must be an https URL", ErrStorageUnavailable, envStorageEndpoint)
 	}
@@ -103,15 +116,19 @@ func newStorageClient(endpoint, status, scope string, caPEM []byte) (*storageCli
 		// system roots would accept exactly that. Refuse instead.
 		return nil, fmt.Errorf("%w: %s holds no certificate, so the keyholder cannot be verified", ErrStorageUnavailable, envStorageCA)
 	}
+	// An empty override means the endpoint's own host is the identity, which
+	// is right when the two coincide and wrong the moment they do not.
+	tlsCfg := &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS13}
+	if serverName != "" {
+		tlsCfg.ServerName = serverName
+	}
 	return &storageClient{
 		endpoint: strings.TrimRight(endpoint, "/"),
 		status:   strings.TrimRight(status, "/"),
 		scope:    scope,
 		http: &http.Client{
-			Timeout: storageTimeout,
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS13},
-			},
+			Timeout:   storageTimeout,
+			Transport: &http.Transport{TLSClientConfig: tlsCfg},
 		},
 	}, nil
 }

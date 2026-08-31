@@ -322,6 +322,7 @@ The platform injects these when it runs an application; absent them the capabili
 | `FARCAST_STORAGE_STATUS_ENDPOINT` | its status endpoint, used only to tell a seal from an outage |
 | `FARCAST_STORAGE_SCOPE` | the scope this application may address |
 | `FARCAST_STORAGE_CA` | the instance CA, in PEM, used to verify the keyholder |
+| `FARCAST_STORAGE_SERVER_NAME` | the identity the keyholder must present, when it differs from the endpoint host |
 
 A configuration that is *present but unusable* — an unreadable CA, a plain-`http` endpoint — is neither the stub nor a seal. It reports `ErrStorageUnavailable`, because telling an application "this build never supports storage" would make it stop trying, and telling it "sealed" would make it wait for an operator who has nothing to unseal.
 
