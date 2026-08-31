@@ -54,6 +54,13 @@ type Config struct {
 	TunnelPort int     // default DefaultTunnelPort
 	EgressPort int     // default DefaultEgressPort
 
+	// StreamRoutes are the in-instance services the operator may reach
+	// through the tunnel, each as name=host:port[=ordinals]. They are fixed
+	// here, at deploy time, because a caller names a route and never an
+	// address — that is what keeps an operator credential from becoming a
+	// general port-forward into the cluster.
+	StreamRoutes []string
+
 	CACertPEM     []byte
 	ServerCertPEM []byte
 	ServerKeyPEM  []byte
@@ -92,18 +99,19 @@ func Render(c Config) ([]byte, error) {
 	}
 
 	data := templateData{
-		Namespace:  c.Namespace,
-		Name:       c.Name,
-		Image:      c.Image,
-		Carrier:    string(c.Carrier),
-		TunnelPort: c.TunnelPort,
-		EgressPort: c.EgressPort,
-		SecretName: secretName,
-		MountPath:  tlsMountPath,
-		CACert:     base64.StdEncoding.EncodeToString(c.CACertPEM),
-		ServerCert: base64.StdEncoding.EncodeToString(c.ServerCertPEM),
-		ServerKey:  base64.StdEncoding.EncodeToString(c.ServerKeyPEM),
-		MTLSHash:   mtlsHash(c.CACertPEM, c.ServerCertPEM, c.ServerKeyPEM),
+		Namespace:    c.Namespace,
+		Name:         c.Name,
+		Image:        c.Image,
+		Carrier:      string(c.Carrier),
+		TunnelPort:   c.TunnelPort,
+		EgressPort:   c.EgressPort,
+		SecretName:   secretName,
+		MountPath:    tlsMountPath,
+		CACert:       base64.StdEncoding.EncodeToString(c.CACertPEM),
+		ServerCert:   base64.StdEncoding.EncodeToString(c.ServerCertPEM),
+		ServerKey:    base64.StdEncoding.EncodeToString(c.ServerKeyPEM),
+		StreamRoutes: c.StreamRoutes,
+		MTLSHash:     mtlsHash(c.CACertPEM, c.ServerCertPEM, c.ServerKeyPEM),
 	}
 	var buf bytes.Buffer
 	if err := workloadTemplate.Execute(&buf, data); err != nil {
@@ -131,18 +139,19 @@ func mtlsHash(parts ...[]byte) string {
 }
 
 type templateData struct {
-	Namespace  string
-	Name       string
-	Image      string
-	Carrier    string
-	TunnelPort int
-	EgressPort int
-	SecretName string
-	MountPath  string
-	MTLSHash   string
-	CACert     string
-	ServerCert string
-	ServerKey  string
+	StreamRoutes []string
+	Namespace    string
+	Name         string
+	Image        string
+	Carrier      string
+	TunnelPort   int
+	EgressPort   int
+	SecretName   string
+	MountPath    string
+	MTLSHash     string
+	CACert       string
+	ServerCert   string
+	ServerKey    string
 }
 
 // workloadTemplate renders an Autopilot-compliant FatLine workload: resource
@@ -216,6 +225,9 @@ spec:
             - --cert={{.MountPath}}/server.crt
             - --key={{.MountPath}}/server.key
             - --ca={{.MountPath}}/ca.crt
+{{- range .StreamRoutes}}
+            - --stream-route={{.}}
+{{- end}}
           ports:
             - name: tunnel
               containerPort: {{.TunnelPort}}

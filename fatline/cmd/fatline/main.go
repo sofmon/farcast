@@ -13,6 +13,8 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 
 	"github.com/sofmon/farcast/fatline"
@@ -38,8 +40,11 @@ func run(args []string) error {
 		caPath       = fs.String("ca", "", "client CA certificate PEM (required for the tunnel)")
 		manifestPath = fs.String("manifest", "", "path to a ./farcast manifest whose external hosts seed the egress allowlist")
 		endpoint     = fs.String("endpoint", "", "externally advertised endpoint, reported in status")
+		streamRoutes routeFlag
 		shrikeSocket = fs.String("shrike-socket", "", "if set, stream egress events to a Shrike sidecar at this Unix socket (else log via slog)")
 	)
+	fs.Var(&streamRoutes, "stream-route",
+		"in-instance service the operator may reach through the tunnel, as name=host:port[=ordinals] (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -47,7 +52,13 @@ func run(args []string) error {
 		return fmt.Errorf("set --tunnel-listen and/or --egress-listen")
 	}
 
+	routes, err := streamRoutes.routes()
+	if err != nil {
+		return err
+	}
+
 	cfg := fatline.Config{
+		StreamRoutes: routes,
 		TunnelListen: *tunnelListen,
 		EgressListen: *egressListen,
 		Endpoint:     *endpoint,
@@ -115,4 +126,38 @@ func flattenExternal(m *parser.Manifest) []parser.External {
 		out = append(out, app.External...)
 	}
 	return out
+}
+
+// routeFlag collects repeatable --stream-route values.
+//
+// The spec is name=host:port[=ordinals]. A caller of the relay names the ROUTE
+// and never the address, so this is the only place an in-instance address is
+// ever written down — fixed at deploy time, not chosen by whoever dials.
+type routeFlag []string
+
+func (r *routeFlag) String() string { return strings.Join(*r, ",") }
+
+func (r *routeFlag) Set(v string) error {
+	*r = append(*r, v)
+	return nil
+}
+
+func (r *routeFlag) routes() ([]fatline.StreamRoute, error) {
+	out := make([]fatline.StreamRoute, 0, len(*r))
+	for _, spec := range *r {
+		parts := strings.Split(spec, "=")
+		if len(parts) < 2 || len(parts) > 3 || parts[0] == "" || parts[1] == "" {
+			return nil, fmt.Errorf("fatline: --stream-route wants name=host:port[=ordinals], got %q", spec)
+		}
+		route := fatline.StreamRoute{Name: parts[0], Addr: parts[1]}
+		if len(parts) == 3 {
+			n, err := strconv.Atoi(parts[2])
+			if err != nil || n < 0 {
+				return nil, fmt.Errorf("fatline: --stream-route %q has a bad ordinal count", spec)
+			}
+			route.Ordinals = n
+		}
+		out = append(out, route)
+	}
+	return out, nil
 }

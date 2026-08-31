@@ -5,6 +5,8 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	dsdeploy "github.com/sofmon/farcast/datasphere/deploy"
+	"github.com/sofmon/farcast/farsight/cli/internal/keyholder"
 	"strings"
 	"time"
 
@@ -380,8 +382,29 @@ func renderWorkload(img string, carrier deploy.Carrier, mtls config.MTLSMaterial
 	return deploy.Render(deploy.Config{
 		Image:         img,
 		Carrier:       carrier,
+		StreamRoutes:  systemStreamRoutes(),
 		CACertPEM:     mtls.CACertPEM,
 		ServerCertPEM: mtls.ServerCertPEM,
 		ServerKeyPEM:  mtls.ServerKeyPEM,
 	})
+}
+
+// systemStreamRoutes is the closed set of in-instance services the operator may
+// reach through the tunnel.
+//
+// The keyholder's route is configured whether or not a keyholder is deployed
+// yet: FatLine is deployed by `connect`, long before `storage deploy` runs, and
+// a route to something absent fails as an honest "cannot reach the service"
+// rather than as an unknown route — which would send an operator looking for a
+// misconfiguration in the wrong component.
+//
+// Each replica is addressed through the headless Service, so an unseal reaches
+// one specific pod rather than whichever the load balancer picks.
+func systemStreamRoutes() []string {
+	return []string{
+		fmt.Sprintf("%s=%s-{ordinal}.%s-unseal.%s.svc.cluster.local:%d=%d",
+			keyholder.StreamRoute,
+			dsdeploy.DefaultName, dsdeploy.DefaultName, dsdeploy.DefaultNamespace,
+			dsdeploy.DefaultUnsealPort, keyholderReplicas),
+	}
 }
