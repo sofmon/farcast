@@ -2,6 +2,7 @@ package deploy
 
 import (
 	"encoding/base64"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -53,7 +54,7 @@ func TestRenderDocuments(t *testing.T) {
 		t.Fatal(err)
 	}
 	docs := docsByKind(t, out)
-	for _, want := range []string{"Namespace", "Secret", "Deployment", "Service"} {
+	for _, want := range []string{"Namespace", "Secret", "Deployment", "PodDisruptionBudget", "Service"} {
 		if _, ok := docs[want]; !ok {
 			t.Fatalf("missing %s document; got kinds %v", want, keys(docs))
 		}
@@ -200,5 +201,122 @@ func TestRenderMTLSHashTracksTheMaterial(t *testing.T) {
 	}
 	if hash(first) != hash(same) {
 		t.Error("identical material produced different fingerprints; every redeploy would churn the Pod")
+	}
+}
+
+// nested walks a rendered document by key path, failing rather than panicking
+// on a missing or wrongly-typed level.
+func nested(t *testing.T, doc map[string]any, path ...string) any {
+	t.Helper()
+	var cur any = doc
+	for i, k := range path {
+		m, ok := cur.(map[string]any)
+		if !ok {
+			t.Fatalf("%v: level %q is not a map", path[:i], k)
+		}
+		cur, ok = m[k]
+		if !ok {
+			t.Fatalf("%v: missing key %q", path[:i], k)
+		}
+	}
+	return cur
+}
+
+// The tunnel is the only path an unseal push can take (ADR 0008), so a single
+// replica makes storage recovery wait on FatLine's own reschedule. ADR 0009
+// decision 11 buys the second replica; this test is what keeps someone from
+// "optimizing" ~$4/month back into an unrecoverable instance.
+func TestRenderRunsTwoReplicasByDefault(t *testing.T) {
+	out, err := Render(sampleConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	docs := docsByKind(t, out)
+	if got := nested(t, docs["Deployment"], "spec", "replicas"); got != uint64(2) && got != 2 {
+		t.Errorf("replicas=%v (%T), want 2 — the recovery floor, not a tuning default", got, got)
+	}
+}
+
+// A PodDisruptionBudget whose selector does not match the Deployment's pods is
+// a document that protects nothing while reporting success. The budget and the
+// workload it guards are rendered from the same template, so the only way to
+// catch a divergence is to compare them.
+func TestRenderPodDisruptionBudgetGuardsTheTunnel(t *testing.T) {
+	out, err := Render(sampleConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	docs := docsByKind(t, out)
+
+	if got := nested(t, docs["PodDisruptionBudget"], "spec", "minAvailable"); got != uint64(1) && got != 1 {
+		t.Errorf("minAvailable=%v (%T), want 1 — a drain must wait, not take the last tunnel", got, got)
+	}
+
+	budget := nested(t, docs["PodDisruptionBudget"], "spec", "selector", "matchLabels")
+	workload := nested(t, docs["Deployment"], "spec", "selector", "matchLabels")
+	if fmt.Sprint(budget) != fmt.Sprint(workload) {
+		t.Errorf("PDB selector %v does not match the Deployment's pod selector %v; the budget guards nothing", budget, workload)
+	}
+}
+
+// DoNotSchedule is the reflex and the wrong answer on Autopilot: with one
+// schedulable node the second replica stays Pending forever, which is the
+// single-replica state the constraint was added to prevent. datasphered made
+// the same call for the same reason.
+func TestRenderSpreadsRepicasSoftly(t *testing.T) {
+	out, err := Render(sampleConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	if !strings.Contains(s, "whenUnsatisfiable: ScheduleAnyway") {
+		t.Error("topology spread must be soft; a hard constraint strands the second replica")
+	}
+	if strings.Contains(s, "whenUnsatisfiable: DoNotSchedule") {
+		t.Error("DoNotSchedule leaves the second replica Pending when only one node fits")
+	}
+}
+
+func TestRenderRejectsAReplicaCountBelowOne(t *testing.T) {
+	c := sampleConfig()
+	c.Replicas = -1
+	if _, err := Render(c); err == nil {
+		t.Fatal("expected an error for a negative replica count")
+	}
+}
+
+// One replica is still renderable — tests and the ClusterIP fallback want it —
+// but only when asked for explicitly.
+func TestRenderHonoursAnExplicitReplicaCount(t *testing.T) {
+	c := sampleConfig()
+	c.Replicas = 1
+	out, err := Render(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	docs := docsByKind(t, out)
+	if got := nested(t, docs["Deployment"], "spec", "replicas"); got != uint64(1) && got != 1 {
+		t.Errorf("replicas=%v, want 1", got)
+	}
+}
+
+// The exported request constants exist so an operator-facing cost estimate can
+// be computed from the same numbers the manifest asks for. That only holds if
+// the rendered YAML really carries them — a template that hardcoded "100m"
+// while the constant said something else would quote a price for a workload
+// that was never deployed.
+func TestRenderedRequestsMatchTheExportedConstants(t *testing.T) {
+	out, err := Render(sampleConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	for _, want := range []string{
+		fmt.Sprintf("cpu: %dm", RequestCPUMilli),
+		fmt.Sprintf("memory: %dMi", RequestMemMiB),
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("rendered workload does not request %q; the cost estimate would quote a workload nobody deployed", want)
+		}
 	}
 }

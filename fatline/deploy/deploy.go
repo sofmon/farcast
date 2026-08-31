@@ -41,6 +41,27 @@ const (
 	DefaultEgressPort = 3128
 	secretName        = "fatline-mtls"
 	tlsMountPath      = "/etc/fatline/tls"
+
+	// DefaultReplicas is two for the same reason datasphered runs two
+	// (ADR 0008 decision 6, ADR 0009 decision 11), and the reason is not
+	// throughput. Every unseal push — and every keeper reseed at 5.4 — rides
+	// this tunnel, so a single replica makes recovery time a function of
+	// FatLine's own reschedule during exactly the node-drain window that
+	// sealed storage in the first place. The marginal replica is ~$4/month
+	// against an instance floor of roughly $73; the alternative is an
+	// instance that cannot be unsealed while it keeps billing.
+	//
+	// Not a tuning knob. Config.Replicas exists so tests can render one, not
+	// so a deployment can quietly go back to being unrecoverable.
+	DefaultReplicas = 2
+
+	// RequestCPUMilli and RequestMemMiB are the container's declared resource
+	// requests, and they are exported because Autopilot bills requests: the
+	// operator-facing cost estimate is computed from these very constants
+	// (technocore/pricing), so the number quoted in a confirmation prompt
+	// cannot drift from the number the manifest actually asks for.
+	RequestCPUMilli = 100
+	RequestMemMiB   = 128
 )
 
 // Config parameterizes the rendered FatLine workload. The Secret carries the CA
@@ -53,6 +74,7 @@ type Config struct {
 	Carrier    Carrier // default CarrierLoadBalancer
 	TunnelPort int     // default DefaultTunnelPort
 	EgressPort int     // default DefaultEgressPort
+	Replicas   int     // default DefaultReplicas
 
 	// StreamRoutes are the in-instance services the operator may reach
 	// through the tunnel, each as name=host:port[=ordinals]. They are fixed
@@ -82,10 +104,13 @@ func (c *Config) withDefaults() {
 	if c.EgressPort == 0 {
 		c.EgressPort = DefaultEgressPort
 	}
+	if c.Replicas == 0 {
+		c.Replicas = DefaultReplicas
+	}
 }
 
 // Render produces the Kubernetes apply stream (Namespace, Secret, Deployment,
-// Service) as multi-document YAML for `kubectl apply -f -`.
+// PodDisruptionBudget, Service) as multi-document YAML for `kubectl apply -f -`.
 func Render(c Config) ([]byte, error) {
 	c.withDefaults()
 	if c.Image == "" {
@@ -97,21 +122,27 @@ func Render(c Config) ([]byte, error) {
 	if c.Carrier != CarrierLoadBalancer && c.Carrier != CarrierClusterIP {
 		return nil, fmt.Errorf("deploy: unknown carrier %q", c.Carrier)
 	}
+	if c.Replicas < 1 {
+		return nil, fmt.Errorf("deploy: replicas must be at least 1, got %d", c.Replicas)
+	}
 
 	data := templateData{
-		Namespace:    c.Namespace,
-		Name:         c.Name,
-		Image:        c.Image,
-		Carrier:      string(c.Carrier),
-		TunnelPort:   c.TunnelPort,
-		EgressPort:   c.EgressPort,
-		SecretName:   secretName,
-		MountPath:    tlsMountPath,
-		CACert:       base64.StdEncoding.EncodeToString(c.CACertPEM),
-		ServerCert:   base64.StdEncoding.EncodeToString(c.ServerCertPEM),
-		ServerKey:    base64.StdEncoding.EncodeToString(c.ServerKeyPEM),
-		StreamRoutes: c.StreamRoutes,
-		MTLSHash:     mtlsHash(c.CACertPEM, c.ServerCertPEM, c.ServerKeyPEM),
+		Namespace:       c.Namespace,
+		Name:            c.Name,
+		Image:           c.Image,
+		Carrier:         string(c.Carrier),
+		TunnelPort:      c.TunnelPort,
+		EgressPort:      c.EgressPort,
+		Replicas:        c.Replicas,
+		RequestCPUMilli: RequestCPUMilli,
+		RequestMemMiB:   RequestMemMiB,
+		SecretName:      secretName,
+		MountPath:       tlsMountPath,
+		CACert:          base64.StdEncoding.EncodeToString(c.CACertPEM),
+		ServerCert:      base64.StdEncoding.EncodeToString(c.ServerCertPEM),
+		ServerKey:       base64.StdEncoding.EncodeToString(c.ServerKeyPEM),
+		StreamRoutes:    c.StreamRoutes,
+		MTLSHash:        mtlsHash(c.CACertPEM, c.ServerCertPEM, c.ServerKeyPEM),
 	}
 	var buf bytes.Buffer
 	if err := workloadTemplate.Execute(&buf, data); err != nil {
@@ -146,12 +177,18 @@ type templateData struct {
 	Carrier      string
 	TunnelPort   int
 	EgressPort   int
+	Replicas     int
 	SecretName   string
 	MountPath    string
 	MTLSHash     string
 	CACert       string
 	ServerCert   string
 	ServerKey    string
+
+	// Rendered from the exported constants rather than written into the
+	// template, so the cost estimate and the manifest quote one number.
+	RequestCPUMilli int
+	RequestMemMiB   int
 }
 
 // workloadTemplate renders an Autopilot-compliant FatLine workload: resource
@@ -188,7 +225,12 @@ metadata:
     app.kubernetes.io/name: fatline
     app.kubernetes.io/managed-by: farcast
 spec:
-  replicas: 1
+  replicas: {{.Replicas}}
+  # Two by default (ADR 0009 decision 11). maxUnavailable defaults to 25%,
+  # which rounds DOWN to 0 at two replicas, and maxSurge rounds UP to 1 — so a
+  # certificate rotation or image bump adds a pod before it removes one and the
+  # tunnel never goes to zero during a rollout. Stated because the property is
+  # a consequence of the replica count, and would silently disappear at one.
   selector:
     matchLabels:
       app.kubernetes.io/name: fatline
@@ -216,6 +258,18 @@ spec:
         fsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
+      # ScheduleAnyway, matching datasphered's constraint and its reasoning: on
+      # Autopilot a hard DoNotSchedule leaves the second replica Pending when
+      # only one node fits, which is the single-replica outage this constraint
+      # was added to prevent. Co-located replicas still survive a pod OOM and a
+      # rollout; a Pending replica survives nothing.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: fatline
       containers:
         - name: fatline
           image: {{.Image}}
@@ -235,8 +289,8 @@ spec:
               containerPort: {{.EgressPort}}
           resources:
             requests:
-              cpu: 100m
-              memory: 128Mi
+              cpu: {{.RequestCPUMilli}}m
+              memory: {{.RequestMemMiB}}Mi
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -255,6 +309,26 @@ spec:
             # never writable. Paired with fsGroup above — 0400 would be
             # root-only and the non-root container could not read it.
             defaultMode: 288
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{.Name}}
+  namespace: {{.Namespace}}
+  labels:
+    app.kubernetes.io/name: fatline
+    app.kubernetes.io/managed-by: farcast
+spec:
+  # The counterpart to datasphered's PDB, and useless without it — a drain that
+  # respects storage's budget but takes the tunnel leaves an instance that is
+  # unsealable rather than sealed. minAvailable: 1 makes a node drain wait for
+  # a replacement instead of taking the last tunnel. Like datasphered's, it
+  # constrains voluntary disruption only: it does not survive a full pool walk
+  # or a zonal loss.
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: fatline
 ---
 apiVersion: v1
 kind: Service
