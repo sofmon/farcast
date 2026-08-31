@@ -47,6 +47,12 @@ type Session struct {
 	// be told — a forced retention window, a freshly created bucket and its
 	// price model.
 	Notices []string
+	// provider and scopes back StoreFor: a scoped Store is built on demand
+	// and reused, because an ls of a large prefix would otherwise rebuild one
+	// per object.
+	provider datasphere.Provider
+	scopes   map[string]*datasphere.Store
+
 	// KeyringMinted and BucketCreated report what this call brought into
 	// existence, so a caller can say so exactly once.
 	KeyringMinted bool
@@ -121,7 +127,60 @@ func Open(ctx context.Context, opt Options) (*Session, error) {
 		return nil, err
 	}
 	session.Store = store
+	session.provider = provider
+	session.scopes = map[string]*datasphere.Store{}
 	return session, nil
+}
+
+// StoreFor returns the Store that owns a logical key.
+//
+// An instance's storage is not one key space. Objects an application writes
+// live under a scope with its OWN name key and KEK, so the master Store cannot
+// even compute their stored names — a scoped object read through it comes back
+// as "not found", and a listing of it as an integrity failure. Choosing the
+// right keyring per key is what makes the module's promise true once scopes
+// exist: the bucket plus the keys file reconstruct every logical name.
+//
+// Keys outside every scope belong to the operator's own master keyring.
+func (s *Session) StoreFor(key string) (*datasphere.Store, error) {
+	scope, ok := s.Keyring.ScopeOwning(key)
+	if !ok {
+		return s.Store, nil
+	}
+	if cached, ok := s.scopes[scope.Name]; ok {
+		return cached, nil
+	}
+	store, err := datasphere.NewStore(s.provider, s.Bucket, scope.Keyring())
+	if err != nil {
+		return nil, fmt.Errorf("open scope %q: %w", scope.Name, err)
+	}
+	s.scopes[scope.Name] = store
+	return store, nil
+}
+
+// KeySpaces returns every (prefix, Store) an instance holds: the master's whole
+// key space first, then one per scope.
+//
+// A listing that consulted only the master would silently omit everything an
+// application ever wrote — the objects would be there, billed and irrecoverable
+// from the operator's own tooling.
+func (s *Session) KeySpaces() ([]KeySpace, error) {
+	spaces := []KeySpace{{Prefix: "", Store: s.Store}}
+	for _, scope := range s.Keyring.Scopes() {
+		store, err := s.StoreFor(scope.Prefix)
+		if err != nil {
+			return nil, err
+		}
+		spaces = append(spaces, KeySpace{Prefix: scope.Prefix, Scope: scope.Name, Store: store})
+	}
+	return spaces, nil
+}
+
+// KeySpace is one keyring's view of the bucket.
+type KeySpace struct {
+	Prefix string
+	Scope  string
+	Store  *datasphere.Store
 }
 
 // storageProviderFor picks the storage provider for an instance, preferring

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -290,7 +291,13 @@ func (c *storageLsCommand) Run(ctx context.Context, env *Env, args []string) err
 		return err
 	}
 
-	entries, listErr := session.Store.ListEntries(ctx, loc.Key)
+	// A listing spans every key space the instance holds — the operator's own
+	// and one per scope — because an instance's storage is not a single key
+	// space once applications have written to it. Consulting only the master
+	// keyring would silently omit everything an application ever wrote, while
+	// still billing for it, and would report those objects as integrity
+	// failures rather than as somebody else's key space.
+	entries, listErr := listAcrossScopes(ctx, session, loc.Key)
 	if listErr != nil {
 		// Names that did resolve are still reported: hiding them would turn one
 		// unreadable object into an unusable listing.
@@ -544,7 +551,11 @@ func (c *storageRmCommand) Run(ctx context.Context, env *Env, args []string) err
 		}
 	}
 	for _, key := range targets {
-		if err := session.Store.Delete(ctx, key); err != nil {
+		store, serr := session.StoreFor(key)
+		if serr != nil {
+			return serr
+		}
+		if err := store.Delete(ctx, key); err != nil {
 			return fmt.Errorf("delete %q: %w", key, err)
 		}
 	}
@@ -619,7 +630,11 @@ func expandPrefixes(ctx context.Context, session *storage.Session, prefixes []st
 	seen := map[string]bool{}
 	var out []string
 	for _, prefix := range prefixes {
-		entries, err := session.Store.ListEntries(ctx, prefix)
+		listStore, serr := session.StoreFor(prefix)
+		if serr != nil {
+			return nil, serr
+		}
+		entries, err := listStore.ListEntries(ctx, prefix)
 		if err != nil {
 			return nil, err
 		}
@@ -730,7 +745,11 @@ func (c *storageCpCommand) upload(ctx context.Context, env *Env, src, dst locato
 		if err != nil {
 			return err
 		}
-		err = session.Store.WriteStream(ctx, item.key, file)
+		store, serr := session.StoreFor(item.key)
+		if serr != nil {
+			return serr
+		}
+		err = store.WriteStream(ctx, item.key, file)
 		_ = file.Close()
 		if err != nil {
 			return fmt.Errorf("upload %s: %w", item.path, err)
@@ -813,7 +832,11 @@ func downloadTo(ctx context.Context, session *storage.Session, key, target strin
 	if err := staged.Chmod(0o600); err != nil {
 		return err
 	}
-	if err := session.Store.ReadStream(ctx, key, staged); err != nil {
+	store, serr := session.StoreFor(key)
+	if serr != nil {
+		return serr
+	}
+	if err := store.ReadStream(ctx, key, staged); err != nil {
 		return fmt.Errorf("download %q: %w", key, err)
 	}
 	if err := staged.Close(); err != nil {
@@ -910,7 +933,11 @@ func localTarget(root, prefix, key string, recursive bool) (string, error) {
 // file. The listing carries no plaintext, so the keyring is not involved beyond
 // deriving the name.
 func objectExists(ctx context.Context, session *storage.Session, key string) (bool, error) {
-	stored, err := session.Store.StoredName(key)
+	nameStore, nerr := session.StoreFor(key)
+	if nerr != nil {
+		return false, nerr
+	}
+	stored, err := nameStore.StoredName(key)
 	if err != nil {
 		return false, err
 	}
@@ -948,4 +975,68 @@ func (r storageCpResult) Human(w io.Writer) error {
 	}
 	fprintln(w, "")
 	return nil
+}
+
+// listAcrossScopes lists a prefix in whichever key spaces can contain it.
+//
+// A prefix inside a scope is listed with that scope's keyring alone. A prefix
+// that contains scopes — the bucket root, most often — is listed once per key
+// space, so nothing an application wrote is invisible to the operator who owns
+// the keys to it.
+func listAcrossScopes(ctx context.Context, session *storage.Session, prefix string) ([]datasphere.Entry, error) {
+	spaces, err := session.KeySpaces()
+	if err != nil {
+		return nil, err
+	}
+	var entries []datasphere.Entry
+	var errs []error
+	scoped := scopePrefixes(session)
+	for _, space := range spaces {
+		if !spaceCanHold(space.Prefix, prefix, scoped) {
+			continue
+		}
+		found, err := space.Store.ListEntries(ctx, prefix)
+		if err != nil {
+			errs = append(errs, err)
+		}
+		entries = append(entries, found...)
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Key < entries[j].Key })
+	return entries, errors.Join(errs...)
+}
+
+// scopePrefixes lists the prefixes that belong to a scope rather than to the
+// operator's own key space.
+func scopePrefixes(session *storage.Session) []string {
+	scopes := session.Keyring.Scopes()
+	out := make([]string, 0, len(scopes))
+	for _, s := range scopes {
+		out = append(out, s.Prefix)
+	}
+	return out
+}
+
+// spaceCanHold reports whether a key space could hold objects under a
+// requested prefix.
+//
+// Three cases, and getting any of them wrong loses data from a listing:
+//
+//   - A SCOPE's space is consulted when its prefix and the request overlap in
+//     either direction — the request may sit inside the scope ("app/x" under
+//     "app/") or contain it ("" or "a" containing "app/").
+//   - The MASTER's space is consulted unless the request sits entirely inside
+//     some scope, where the master keyring could only produce name-recovery
+//     failures for objects that are not its own.
+//   - A scope whose prefix diverges from the request entirely is skipped, so
+//     an ls of one scope does not report another's objects as corrupt.
+func spaceCanHold(spacePrefix, requested string, scopes []string) bool {
+	if spacePrefix != "" {
+		return strings.HasPrefix(spacePrefix, requested) || strings.HasPrefix(requested, spacePrefix)
+	}
+	for _, scope := range scopes {
+		if strings.HasPrefix(requested, scope) {
+			return false
+		}
+	}
+	return true
 }
