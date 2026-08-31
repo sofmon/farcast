@@ -1,0 +1,202 @@
+package cli
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"io"
+	"strings"
+	"time"
+
+	dsdeploy "github.com/sofmon/farcast/datasphere/deploy"
+	"github.com/sofmon/farcast/farsight/cli/internal/config"
+	"github.com/sofmon/farcast/fatline/identity"
+)
+
+// keyholderMonthlyUSD is the standing Autopilot cost of the keyholder's two
+// replicas at the requests the workload declares (100m CPU, 128Mi each).
+//
+// It is an ESTIMATE and is printed as one. Autopilot bills a Pod's requests,
+// and raises any Pod below its per-Pod minimum — which differs between
+// clusters that support bursting and clusters that do not — so the real figure
+// can be several times this on a cluster without bursting. The operator is
+// told the number and told it is approximate; the bill is the authority.
+const keyholderMonthlyUSD = 4
+
+// keyholderReplicas is what the workload deploys. Two survives the common
+// events — a single-pod OOM, one node's repair, a rollout, an eviction — and
+// does not survive a full pool walk. Both halves of that are true.
+const keyholderReplicas = 2
+
+type storageDeployCommand struct {
+	deployer fatlineDeployer
+	image    string
+}
+
+func (*storageDeployCommand) Name() string { return "deploy" }
+func (*storageDeployCommand) Synopsis() string {
+	return "Deploy the in-cluster keyholder that serves storage to applications"
+}
+
+func (*storageDeployCommand) Usage() string {
+	return strings.TrimSpace(`
+Usage: farcast storage deploy <instance> [--datasphered-image REF] [--source DIR] [-y]
+
+Deploy the keyholder: the one in-cluster process that holds DataSphere key
+material, and holds it only in memory.
+
+It comes up SEALED and stays sealed until you run 'farcast storage unseal'.
+That is not a defect — key material never rests on cloud infrastructure, so it
+has to arrive from this machine, and any restart returns the replica to the
+same state. Applications receive ErrStorageSealed meanwhile.
+
+Two replicas run behind a PodDisruptionBudget, spread across hosts. That
+survives a single pod's OOM, one node's repair, a rollout and an eviction; it
+does not survive every node being replaced at once.
+
+This command changes the cluster. 'farcast storage unseal' deliberately does
+not, so the command you reach for during an outage cannot make one worse.`)
+}
+
+func (c *storageDeployCommand) SetFlags(fs *flag.FlagSet) {
+	fs.StringVar(&c.image, "datasphered-image", "", "keyholder container image (default: the instance registry's system/datasphered)")
+	fs.StringVar(&c.deployer.sourceDir, "source", "", "farcast checkout to build the image from (default: auto-detected)")
+	c.deployer.setYesFlag(fs, "skip the cost confirmation")
+}
+
+func (c *storageDeployCommand) Run(ctx context.Context, env *Env, args []string) error {
+	if len(args) != 1 {
+		return usagef("storage deploy takes one instance argument")
+	}
+	name := args[0]
+	c.deployer.component = keyholderComponent
+	c.deployer.fatlineImage = c.image
+	c.deployer.ensureDefaults()
+
+	meta, err := env.ConfigDir.LoadInstanceMetadata(name)
+	if err != nil {
+		return fmt.Errorf("load instance %q: %w", name, err)
+	}
+	if !meta.FatLineDeployed {
+		// The keyholder is only reachable through the tunnel, so deploying it
+		// into an instance with no tunnel would produce something nobody can
+		// ever unseal.
+		return fmt.Errorf("instance %q is not connected; run 'farcast connect %s' first — "+
+			"the keyholder is reachable only through the FatLine tunnel", name, name)
+	}
+	if meta.Storage == nil || meta.Storage.Bucket == "" {
+		return fmt.Errorf("instance %q has no storage bucket recorded; run a 'farcast storage' command first "+
+			"so the bucket is minted and recorded", name)
+	}
+
+	ok, err := c.confirmCost(env, meta)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		fprintln(env.Err, "Aborted.")
+		return nil
+	}
+
+	reg, err := c.deployer.ensureRegistry(ctx, env, name, meta)
+	if err != nil {
+		return err
+	}
+	img, err := c.deployer.resolveImage(ctx, env, reg)
+	if err != nil {
+		return err
+	}
+
+	mtls, err := env.ConfigDir.LoadInstanceMTLS(name)
+	if err != nil {
+		return fmt.Errorf("load the mTLS identity for %q: %w", name, err)
+	}
+	// The keyholder gets its OWN server leaf, distinct from FatLine's, so the
+	// operator's session verifies that it is talking to the keyholder and not
+	// to the tunnel that carried it. The CA private key never leaves here.
+	certPEM, keyPEM, err := identity.IssueKeyholderServer(mtls.CACertPEM, mtls.CAKeyPEM, name)
+	if err != nil {
+		return fmt.Errorf("issue the keyholder's server identity: %w", err)
+	}
+
+	manifests, err := dsdeploy.Render(dsdeploy.Config{
+		Image:         img,
+		Replicas:      keyholderReplicas,
+		Instance:      name,
+		Bucket:        meta.Storage.Bucket,
+		Provider:      meta.Storage.Provider,
+		Project:       meta.Project,
+		Location:      meta.Storage.Location,
+		CACertPEM:     mtls.CACertPEM,
+		ServerCertPEM: certPEM,
+		ServerKeyPEM:  keyPEM,
+	})
+	if err != nil {
+		return err
+	}
+
+	// Recorded BEFORE the apply, like every other billable thing this CLI
+	// creates: a workload running in a cluster that local state does not know
+	// about is one nobody will think to tear down.
+	previous := meta.Keyholder
+	meta.Keyholder = &config.Keyholder{
+		Deployed: true, Image: img, Replicas: keyholderReplicas,
+		RecordedAt: time.Now().UTC(),
+	}
+	if previous != nil {
+		meta.Keyholder.Scope = previous.Scope
+		meta.Keyholder.ScopePrefix = previous.ScopePrefix
+		meta.Keyholder.Generation = previous.Generation
+	}
+	meta.UpdatedAt = time.Now().UTC()
+	if err := env.ConfigDir.SaveInstanceMetadata(name, meta); err != nil {
+		return fmt.Errorf("record the keyholder before deploying it: %w", err)
+	}
+
+	cl := c.deployer.newCluster(env.ConfigDir.InstanceKubeconfigPath(name))
+	if isInteractive(env) || env.Verbose {
+		fprintf(env.Err, "Deploying the keyholder to %q…\n", name)
+	}
+	if err := cl.Apply(ctx, manifests); err != nil {
+		return fmt.Errorf("deploy the keyholder: %w", err)
+	}
+
+	// Deliberately NO rollout wait. Every replica comes up sealed and a sealed
+	// replica never becomes Ready, so waiting for readiness here would block
+	// until it timed out — on the happy path — and teach the operator to
+	// interrupt the tool. The next step is the unseal, and it is said plainly.
+	return env.Printer.Print(deployResult{
+		Instance: name, Image: img, Replicas: keyholderReplicas,
+	})
+}
+
+func (c *storageDeployCommand) confirmCost(env *Env, meta *config.InstanceMetadata) (bool, error) {
+	if c.deployer.assumeYes {
+		return true, nil
+	}
+	if !isInteractive(env) {
+		return false, usagef("deploying the keyholder adds ~$%d/month of standing compute (%d replicas); pass --yes to confirm",
+			keyholderMonthlyUSD, keyholderReplicas)
+	}
+	fprintf(env.Err, "Deploying the keyholder to %q runs %d replicas continuously (~$%d/month estimated, "+
+		"against the cost limit %s %.0f/%s).\n",
+		meta.Name, keyholderReplicas, keyholderMonthlyUSD,
+		meta.CostLimit.Currency, meta.CostLimit.Amount, meta.CostLimit.Period)
+	fprintf(env.Err, "The figure is an estimate from the workload's declared requests; a cluster without "+
+		"bursting support raises small Pods to its own minimum and can cost several times this.\n")
+	return newPrompter(env.In, env.Err).yesNo("Deploy it?")
+}
+
+type deployResult struct {
+	Instance string `json:"instance"`
+	Image    string `json:"image"`
+	Replicas int    `json:"replicas"`
+}
+
+func (r deployResult) Human(w io.Writer) error {
+	fmt.Fprintf(w, "Keyholder deployed to %q (%d replicas)\n", r.Instance, r.Replicas)
+	fmt.Fprintf(w, "  image  %s\n", r.Image)
+	fmt.Fprintf(w, "\nEvery replica is SEALED and will not become ready until you unseal it.\n")
+	fmt.Fprintf(w, "Run: farcast storage unseal %s\n", r.Instance)
+	return nil
+}

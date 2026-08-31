@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -9,6 +10,7 @@ import (
 	"github.com/sofmon/farcast/datasphere"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
+	"github.com/sofmon/farcast/planck"
 )
 
 func keyholderInstance(t *testing.T, deployed bool) (config.Dir, *Env) {
@@ -201,5 +203,195 @@ func TestPartialFailureIsNeverReportedAsSuccess(t *testing.T) {
 	}
 	if !strings.Contains(partialFailure("seal", 1, 2).Error(), "may still hold") {
 		t.Error("a partial seal must warn that key material may still be held")
+	}
+}
+
+// The keyholder is reachable only through the tunnel, so deploying it into an
+// instance with no tunnel would produce something nobody could ever unseal.
+func TestDeployRefusesWithoutATunnel(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	if err := os.Chmod(string(dir), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := dir.CreateInstance("prod"); err != nil {
+		t.Fatal(err)
+	}
+	meta := &config.InstanceMetadata{Name: "prod", Provider: "gke", Region: "us-central1", Status: "running"}
+	if err := dir.SaveInstanceMetadata("prod", meta); err != nil {
+		t.Fatal(err)
+	}
+	env, _ := testEnv(dir, output.ModeHuman)
+
+	err := (&storageDeployCommand{}).Run(context.Background(), env, []string{"prod"})
+	if err == nil {
+		t.Fatal("deploy proceeded with no tunnel")
+	}
+	if !strings.Contains(err.Error(), "farcast connect") {
+		t.Errorf("the refusal should name the fix: %q", err)
+	}
+}
+
+// A keyholder with no bucket would start, pass its probes and refuse every
+// write — a failure that reads as an application bug.
+func TestDeployRefusesWithoutABucket(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	if err := os.Chmod(string(dir), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := dir.CreateInstance("prod"); err != nil {
+		t.Fatal(err)
+	}
+	meta := &config.InstanceMetadata{
+		Name: "prod", Provider: "gke", Region: "us-central1", Status: "running",
+		FatLineDeployed: true,
+	}
+	if err := dir.SaveInstanceMetadata("prod", meta); err != nil {
+		t.Fatal(err)
+	}
+	env, _ := testEnv(dir, output.ModeHuman)
+
+	err := (&storageDeployCommand{}).Run(context.Background(), env, []string{"prod"})
+	if err == nil || !strings.Contains(err.Error(), "bucket") {
+		t.Fatalf("deploy should refuse without a bucket, got %v", err)
+	}
+}
+
+// Non-interactive runs must not provision standing compute without consent.
+func TestDeployRequiresConsentForStandingCost(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	if err := os.Chmod(string(dir), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := dir.CreateInstance("prod"); err != nil {
+		t.Fatal(err)
+	}
+	meta := &config.InstanceMetadata{
+		Name: "prod", Provider: "gke", Region: "us-central1", Status: "running",
+		FatLineDeployed: true,
+		Storage:         &config.Storage{Bucket: "b", Provider: "gcs"},
+	}
+	if err := dir.SaveInstanceMetadata("prod", meta); err != nil {
+		t.Fatal(err)
+	}
+	env, _ := testEnv(dir, output.ModeHuman)
+
+	err := (&storageDeployCommand{}).Run(context.Background(), env, []string{"prod"})
+	if err == nil {
+		t.Fatal("deploy provisioned standing compute with no confirmation")
+	}
+	if !strings.Contains(err.Error(), "--yes") || !strings.Contains(err.Error(), "month") {
+		t.Errorf("the gate should name the cost and the flag: %q", err)
+	}
+	// And nothing was recorded, because nothing was created.
+	after, _ := dir.LoadInstanceMetadata("prod")
+	if after.Keyholder != nil {
+		t.Error("a declined deploy recorded a keyholder")
+	}
+}
+
+// The two system workloads must not share an image path, or one would
+// overwrite the other in the instance's registry.
+func TestSystemComponentsHaveDistinctImagePaths(t *testing.T) {
+	if fatlineComponent.ImagePath == keyholderComponent.ImagePath {
+		t.Fatal("FatLine and the keyholder share an image path")
+	}
+	if fatlineComponent.BinaryPath == keyholderComponent.BinaryPath {
+		t.Fatal("FatLine and the keyholder share a binary path")
+	}
+	a := instanceSystemImage("reg.example/proj/inst", fatlineComponent)
+	b := instanceSystemImage("reg.example/proj/inst", keyholderComponent)
+	if a == b {
+		t.Fatalf("both components resolve to %s", a)
+	}
+	if !strings.Contains(b, "system/datasphered") {
+		t.Errorf("the keyholder image is not under system/: %s", b)
+	}
+}
+
+// deployableInstance is connected AND has a bucket recorded — everything the
+// keyholder deploy needs before it reaches the cluster.
+func deployableInstance(t *testing.T, dir config.Dir, name string) *config.InstanceMetadata {
+	t.Helper()
+	meta := connectedInstance(t, dir, name)
+	meta.Storage = &config.Storage{Bucket: "farcast-" + name + "-0a1b2c3d", Provider: "gcs", Location: "us-central1"}
+	if err := dir.SaveInstanceMetadata(name, meta); err != nil {
+		t.Fatal(err)
+	}
+	return meta
+}
+
+func testStorageDeploy(fp *fakeProvider, fb *fakeBuilder) *storageDeployCommand {
+	c := &storageDeployCommand{}
+	c.deployer.openProvider = func(*config.InstanceMetadata, *config.InstanceCredentials) (planck.Provider, error) {
+		return fp, nil
+	}
+	c.deployer.newBuilder = func(func(string)) imageBuilder { return fb }
+	return c
+}
+
+// The keyholder is recorded BEFORE the apply, like every other billable thing
+// this CLI creates. A workload running in a cluster that local state does not
+// know about is one nobody will think to tear down — so an apply that FAILS
+// must still leave the record behind.
+func TestDeployRecordsTheKeyholderBeforeApplying(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	const name = "prod"
+	deployableInstance(t, dir, name)
+
+	fc := &fakeCluster{applyErr: errors.New("the API server said no")}
+	c := testStorageDeploy(&fakeProvider{}, &fakeBuilder{})
+	c.deployer.assumeYes = true
+	c.deployer.newCluster = func(string) clusterApplier { return fc }
+
+	env, _ := testEnv(dir, output.ModeHuman)
+	if err := c.Run(context.Background(), env, []string{name}); err == nil {
+		t.Fatal("a failed apply reported success")
+	}
+
+	after, err := dir.LoadInstanceMetadata(name)
+	if err != nil {
+		t.Fatalf("LoadInstanceMetadata: %v", err)
+	}
+	if after.Keyholder == nil || !after.Keyholder.Deployed {
+		t.Fatal("a failed apply left no record; a workload the cluster may be running would be untracked")
+	}
+	if after.Keyholder.Image == "" {
+		t.Error("the recorded keyholder does not name the image the cluster was told to run")
+	}
+	if after.Keyholder.Replicas != keyholderReplicas {
+		t.Errorf("recorded %d replicas, want %d", after.Keyholder.Replicas, keyholderReplicas)
+	}
+}
+
+// The happy path deploys a digest-pinned image and does NOT wait for readiness:
+// every replica comes up sealed and a sealed replica never becomes Ready, so a
+// rollout wait would block until it timed out on the happy path.
+func TestDeployDoesNotWaitForReadiness(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	const name = "prod"
+	deployableInstance(t, dir, name)
+
+	fc := &fakeCluster{}
+	c := testStorageDeploy(&fakeProvider{}, &fakeBuilder{})
+	c.deployer.assumeYes = true
+	c.deployer.newCluster = func(string) clusterApplier { return fc }
+
+	env, out := testEnv(dir, output.ModeHuman)
+	if err := c.Run(context.Background(), env, []string{name}); err != nil {
+		t.Fatalf("deploy: %v", err)
+	}
+	if fc.rollouts != 0 {
+		t.Errorf("deploy waited for a rollout %d times; sealed replicas never become Ready", fc.rollouts)
+	}
+	if len(fc.applied) != 1 {
+		t.Fatalf("applied %d manifests, want 1", len(fc.applied))
+	}
+	rendered := string(fc.applied[0])
+	if !strings.Contains(rendered, "kind: StatefulSet") || !strings.Contains(rendered, "system/datasphered") {
+		t.Error("the applied manifest is not the keyholder workload")
+	}
+	// The operator is told the next step, because nothing works until it runs.
+	if !strings.Contains(out.String(), "SEALED") || !strings.Contains(out.String(), "storage unseal "+name) {
+		t.Errorf("the operator was not told to unseal: %q", out.String())
 	}
 }

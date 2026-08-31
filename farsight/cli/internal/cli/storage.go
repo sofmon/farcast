@@ -100,16 +100,17 @@ func newStorageCommand() Command {
 	subs.Register(&storageCpCommand{})
 	subs.Register(&storageRmCommand{})
 	subs.Register(&storageUsageCommand{})
+	subs.Register(&storageDeployCommand{})
 	subs.Register(&storageStateCommand{})
 	subs.Register(&storageSealCommand{})
 	subs.Register(&storageUnsealCommand{})
 	subs.Register(newStorageKeyCommand())
 	return &group{
 		name:     "storage",
-		synopsis: "The instance's encrypted disk (ls, cp, rm, usage, state, unseal, seal, key)",
+		synopsis: "The instance's encrypted disk (ls, cp, rm, usage, deploy, state, unseal, seal, key)",
 		subs:     subs,
 		usage: `
-Usage: farcast storage <ls|cp|rm|usage|state|unseal|seal|key> [flags] [arguments]
+Usage: farcast storage <ls|cp|rm|usage|deploy|state|unseal|seal|key> [flags] [arguments]
 
 The instance's encrypted disk. Everything stored is encrypted before the cloud
 sees it, under an opaque name; the provider holds ciphertext and nothing else.
@@ -126,6 +127,7 @@ Subcommands:
   cp      Copy between local files and an instance, in either direction
   rm      Delete objects
   usage   Report what storage holds and what it costs
+  deploy  Deploy the in-cluster keyholder
   state   Report each keyholder replica's seal state
   unseal  Hand the keyholder its key material
   seal    Make the keyholder forget its key material
