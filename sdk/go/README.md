@@ -6,7 +6,7 @@ The Go SDK is the library an application imports to talk to the FarCast environm
 
 This document is the specification for the Go SDK. It describes the full capability surface, the way each capability reaches its backing module, and — in detail — the logging capability that is implemented first.
 
-> **Status.** [`PLAN.md`](../../PLAN.md) phases **0.2** (core interfaces) and **0.3** (logging implementation) are done: the package, interface types, capability accessors, context helpers, and error sentinels are in place, and logging is a working structured logger (`go test -race`, `go vet`, and `golangci-lint` all clean). The remaining capabilities (Config, Storage, Net, AI, Secrets) return stubs until they are wired to their modules in later phases; see the [roadmap](#roadmap).
+> **Status.** [`PLAN.md`](../../PLAN.md) phases **0.2** (core interfaces) and **0.3** (logging implementation) are done: the package, interface types, capability accessors, context helpers, and error sentinels are in place, and logging is a working structured logger (`go test -race`, `go vet`, and `golangci-lint` all clean). **Storage is wired** as of phase 3.2: `farcast.Storage()` talks to the instance's DataSphere keyholder, with `ErrStorageSealed` as a first-class application state. The remaining capabilities (Config, Net, AI, Secrets) return stubs until they are wired to their modules in later phases; see the [roadmap](#roadmap).
 
 ---
 
@@ -403,7 +403,7 @@ Per [`../../AGENTS.md`](../../AGENTS.md) ("Language guardrails") and [ADR 0002](
 |---|---|---|
 | Logging — `Log()` | phase 0.2 | **phase 0.3** |
 | Config — `Config()` | phase 0.2 | phase 5.3 |
-| Storage — `Storage()` | phase 0.2 | phase 3.2 |
+| Storage — `Storage()` | phase 0.2 | ✅ phase 3.2 |
 | Net — `Net()` | phase 0.2 | with the app data path (phase 4.2/4.4; FatLine core shipped in phase 2) |
 | AI — `AI()` | phase 0.2 | phase 6.3 |
 | Secrets — `Secrets()` | phase 5.3 | phase 5.3 |

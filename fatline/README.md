@@ -91,6 +91,18 @@ An in-instance app's outbound traffic is a standard forward-proxy flow. FatLine 
 
 ---
 
+### The inward stream relay (3.2)
+
+The operator sometimes has to reach a service *inside* the instance that must not be reachable from outside it — today the DataSphere keyholder, which is handed key material and must never expose that path to the internet. `POST /_fatline/dial/{route}` relays an opaque, full-duplex byte stream to such a service.
+
+Three properties make it safe to carry the crown jewels over a process whose day job is parsing hostile bytes:
+
+- **FatLine copies; it never terminates.** The caller runs its own TLS session end-to-end with the service, so what crosses this address space is ciphertext under keys FatLine does not hold. There is no code path here that interprets the payload — the relay shares one `netcopy.Duplex` with the egress `CONNECT` path, so there is a single implementation to audit for that property.
+- **A caller names a ROUTE, never an address.** Routes are a closed list fixed at deploy time and validated at construction; ordinals address one StatefulSet replica within a configured range, in canonical decimal only. An operator leaf is a credential for reaching what FarCast deployed, not a general port-forward into the cluster's network.
+- **It is HTTP/2, not `CONNECT` with a hijack.** This listener negotiates h2, and Go's HTTP/2 server does not implement `http.Hijacker` — so a hijacking design would fail at run time as a *hang* rather than an error. The client refuses a relay that fell back to HTTP/1.1 for the same reason.
+
+Shrike still witnesses that a relay happened: the event carries the route name and byte counts, and never a payload byte.
+
 ## The interfaces
 
 The public server root:
