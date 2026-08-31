@@ -14,7 +14,7 @@ FarCast is a cloud operating system where privacy is the foundational principle.
 
 **Deny by default.** All connections — inbound and outbound — are denied unless explicitly declared in an application's `./farcast` manifest. The operator reviews external access declarations before running an app. FatLine enforces the boundary, Shrike monitors compliance at runtime.
 
-**The cloud provider is blind.** FatLine encrypts all traffic in transit. DataSphere encrypts all data at rest. The cloud provider carries encrypted packets and stores encrypted blobs — it never sees plaintext.
+**The cloud provider is blind to content.** FatLine encrypts all traffic in transit. DataSphere encrypts all data at rest. The cloud provider carries encrypted packets and stores encrypted blobs — it never sees plaintext or a logical name. It does still see metadata: how many objects there are, how large each one is, the shape of the namespace, and when things are read and written. Say "blind to content" rather than "blind"; the difference is documented in [DataSphere's *What the cloud still sees*](datasphere/README.md#what-the-cloud-still-sees), and overstating it is the one thing this project treats as worse than not promising at all.
 
 **Cost control is mandatory, not optional.** Every instance must have a cost limit set at creation — there is no way to skip it. TechnoCore monitors cloud spending continuously, breaks costs down per application, warns as spending approaches the limit, and takes protective action when the limit is reached (stop high-cost apps first, then the entire instance if needed, keeping only TechnoCore alive). The two non-negotiable pillars of FarCast are: (1) security/privacy, (2) cost control. Everything else is secondary.
 
@@ -42,7 +42,7 @@ FarCast is a cloud operating system where privacy is the foundational principle.
 - **Shrike** monitors FatLine traffic and enforces policy. It does not control the boundary — it watches it and intervenes on violations. Think policeman, not wall.
 - **TechnoCore** is the kernel. It manages instance lifecycle, adapts application resources (CPU, memory, replicas) based on observed behaviour, and enforces cost limits. It is the last thing to shut down — if cost limits are breached, TechnoCore stops apps but stays alive to report status.
 - **Planck** translates application requirements into cloud-native K8s workloads. It is the compute abstraction.
-- **DataSphere** proxies storage and enforces encryption-at-rest. The cloud provider only sees encrypted blobs.
+- **DataSphere** proxies storage and enforces encryption-at-rest. The cloud provider only sees encrypted blobs — under opaque names, but with their sizes, count and tree shape visible.
 - **AllThing** abstracts cloud AI services (Gemini, Claude, OpenAI). Starts as a chat interface in FarSight, evolves into the AI backbone for the entire system (TechnoCore resource decisions, Shrike traffic analysis, etc.).
 - **FarSight** is the entire UX layer — GUI (tiling browser), CLI, and a server-side component for UX composition.
 - **SDK** provides syscall-like libraries so applications can interact with the FarCast environment (storage, networking, AI, config, secrets).

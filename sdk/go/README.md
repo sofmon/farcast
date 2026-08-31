@@ -268,6 +268,31 @@ Implementation: phase 5.3.
 
 Object storage through [DataSphere](../../datasphere/README.md). Reads and writes are encrypted transparently — the application sees plaintext, the cloud sees only encrypted blobs. The application addresses objects by key and never knows whether the backend is S3, GCS, or anything else.
 
+#### What the cloud can still infer about your data
+
+The cloud sees only encrypted blobs — but not *only* blobs. It also sees how many objects your application stores, how large each one is (to within a constant), how deep and how branched your key namespace is, which keys share a prefix, and when each object is read and written. **Names and contents are hidden; shape, size and timing are not.**
+
+One consequence is worth spelling out, because it is the case where size *is* content: an object whose value is drawn from a small set of differing lengths — a flag, an enum, a short token — is effectively identified by its stored size alone. `"true"` and `"false"` differ by one byte and stay distinguishable forever.
+
+If that matters for your data, pad it yourself before writing — deterministically, to a fixed length, in your own layer where you know the shape of what you are storing:
+
+```go
+const slot = 64 // every value in this namespace is stored at one size
+
+func put(ctx context.Context, key string, v []byte) error {
+    if len(v) > slot {
+        return fmt.Errorf("value exceeds the %d-byte slot", slot)
+    }
+    padded := make([]byte, slot)
+    copy(padded, v)                       // deterministic, not random
+    return farcast.Storage().Write(ctx, key, padded)
+}
+```
+
+Pad deterministically rather than randomly. A random pad redrawn on each write is recovered by an observer who watches the same key over time — the stored name is stable, so repeated writes are repeated samples of the same value plus noise, and the minimum converges on the truth. A fixed slot leaks the slot and nothing more, however many times you write it.
+
+See DataSphere's [*What the cloud still sees*](../../datasphere/README.md#what-the-cloud-still-sees) for the full list.
+
 ```go
 func Storage() StorageAPI
 
