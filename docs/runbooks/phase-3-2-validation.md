@@ -246,3 +246,26 @@ Then confirm `farcast release "$INSTANCE"` still tears the instance down cleanly
 - **NetworkPolicy isolation.** In 3.2 any pod in the cluster can reach the keyholder's data port; access control is network reachability plus the declared scope. The policy that contains this is 4.2's, and per-application identity is 4.x's. This is stated in the SDK README rather than implied.
 - **The keeper fleet.** Phases 5.4 and 7.5. The protocol carries the intent and the ledger already, so 5.4 adds a driver rather than a format.
 - **The real standing cost.** The cost gate prints an estimate derived from the workload's declared requests. Autopilot raises Pods below its per-Pod minimum, and that minimum differs between clusters with and without bursting support — so **read the actual bill after one cycle** and, if it disagrees materially, amend ADR 0008 decision 6 with the measured figure rather than the estimated one.
+
+
+---
+
+## Findings from the 2026-08-31 run
+
+Nine of the ten success criteria passed. Criterion 5 — the crux — did not, and its cause is **not yet established**.
+
+**Passed.** `storage deploy` returned in 53 s without waiting for readiness. Two replicas landed on different nodes behind the PDB. Both came up `restart-sealed`, Running, `0/1` Ready, with **zero restarts** — liveness is not seal-gated. With every replica sealed the data Service had no endpoints while the status Service still answered from an in-cluster pod. `unseal` reported `2 of 2`, both pods became Ready, and the ledger recorded both pushes. The **real SDK** worked against the real cluster: the status seam reported `ready`, a write/read round-tripped byte-exact, and an out-of-scope read was refused with `ErrPermission` — which is stronger than this runbook originally planned, and retires the "SDK client never exercised" caveat below.
+
+**Four defects found and fixed.**
+
+1. **Workload Identity was never implemented.** Both replicas crash-looped on a 403: no ServiceAccount, no `serviceAccountName`, no binding. ADR 0008 decision 8 named the shape and nothing built it. The keyholder now has its own ServiceAccount and `storage deploy` prints the exact bucket-scoped grant — see step 1a.
+2. **FatLine had no stream route.** Every unseal answered `404`: `Config.StreamRoutes` existed but neither the flag nor the rendered argument did, so the relay was unreachable in any real deployment. Unit tests missed it because they built the config directly. Fixed across the binary, the renderer and `connect`/`redeploy`.
+3. **The SDK could not verify an in-cluster keyholder.** The certificate carries the synthetic SAN `<instance>.datasphered.farcast`, but an application dials a Kubernetes Service name, and the client derived the verified identity from the endpoint host. `FARCAST_STORAGE_SERVER_NAME` now separates the two, as FatLine's tunnel already did.
+4. **This runbook contained two commands that do not exist** (`farcast instance-path`, and `storage cp … -` for stdout — which would have created a file named `-` and "passed" while proving nothing), and a `curl` step that **cannot work on macOS**: the instance CA is Ed25519 and the system curl is LibreSSL. Use the SDK, or a curl built against OpenSSL.
+
+**Open: criterion 5.** After the SDK wrote `app/sdk-written`, the operator's CLI could not list or read it. The CLI was scope-blind, which is now fixed and tested at every layer — but the fix was *not* confirmed against the cluster, and the live evidence is contradictory:
+
+- The keyholder, re-unsealed at generation 2 from `keys.yaml`, listed both the generation-1 and generation-2 objects — so the scope recorded on disk **is** the scope that wrote them.
+- Yet a probe computing `StoredName` from that same `keys.yaml` produced a different stored name than the object's actual path, and `ls app/` returned empty with no name-recovery warnings, meaning nothing matched the tokenized prefix.
+
+Those two cannot both be true, so one of the observations is wrong and the instance was destroyed before it could be settled. **The next live run should re-test criterion 5 first**, and if it fails, capture: the scope key ids from `keys.yaml`, the key id in the stored blob's header, and the tokenized prefix the CLI actually queries.
