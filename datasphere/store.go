@@ -280,6 +280,22 @@ func (s *Store) StoredName(key string) (string, error) {
 	return crypto.TokenPath(s.tokenKey, key), nil
 }
 
+// StoredPrefix returns the opaque prefix a listing of this logical prefix
+// actually queries the provider with.
+//
+// It is the companion to StoredName and exists for the same reason: the
+// transparency surface. When a listing comes back empty there is otherwise
+// nothing to distinguish "the prefix is genuinely empty" from "this keyring
+// tokenizes it to somewhere nothing was ever written" — and those two have
+// very different remedies. A tool that cannot show what it asked for cannot be
+// debugged against a bucket it can only read through a keyring.
+//
+// The result narrows a listing rather than naming an object, so it is empty
+// when the prefix has no /-aligned part to narrow with.
+func (s *Store) StoredPrefix(prefix string) string {
+	return crypto.TokenPrefix(s.tokenKey, prefix)
+}
+
 // Bucket is the bucket this Store writes to.
 func (s *Store) Bucket() string { return s.bucket }
 

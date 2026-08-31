@@ -351,3 +351,45 @@ func TestScopeZeroWipesMaterial(t *testing.T) {
 		t.Error("Zero left the name key in the heap — the key that can never be rotated")
 	}
 }
+
+// StoredPrefix must report exactly what a listing queries, and it must differ
+// per keyring — that difference is the whole diagnostic value: an empty
+// listing under one keyring and a populated one under another is visible only
+// if the queried prefix can be shown.
+func TestStoredPrefixReportsWhatListingQueries(t *testing.T) {
+	master := testKeyring(t)
+	scope := mustScope(t, "app", "app/")
+	fake := newFakeProvider()
+
+	masterStore, err := NewStore(fake, "farcast-test-bucket", master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scopedStore, err := NewStore(fake, "farcast-test-bucket", scope.Keyring())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mp, sp := masterStore.StoredPrefix("app/"), scopedStore.StoredPrefix("app/")
+	if mp == "" || sp == "" {
+		t.Fatalf("a /-aligned prefix must narrow a listing: master=%q scope=%q", mp, sp)
+	}
+	if mp == sp {
+		t.Fatal("two keyrings tokenized the same prefix identically")
+	}
+
+	// It is the prefix the object actually lands under.
+	ctx := context.Background()
+	if err := scopedStore.Write(ctx, "app/doc", []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	stored := mustStoredName(t, scopedStore, "app/doc")
+	if !strings.HasPrefix(stored, sp) {
+		t.Errorf("StoredPrefix(%q) = %q, which does not prefix the stored name %q", "app/", sp, stored)
+	}
+
+	// A prefix with nothing to align on narrows nothing, and says so.
+	if got := scopedStore.StoredPrefix("app"); got != "" {
+		t.Errorf("StoredPrefix(%q) = %q, want empty", "app", got)
+	}
+}
