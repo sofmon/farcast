@@ -15,6 +15,7 @@ import (
 	dskeyholder "github.com/sofmon/farcast/datasphere/keyholder"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
+	"github.com/sofmon/farcast/farsight/cli/internal/storage"
 )
 
 // reproProvider is an in-memory object store shared by the operator's Store and
@@ -103,7 +104,12 @@ func (p *reproProvider) GetStream(ctx context.Context, bucket, name string, offs
 // This is the reproduction for the open criterion 5: after an application
 // writes through the keyholder, the operator's own CLI must be able to list and
 // read that object from a keys.yaml it loads fresh from disk.
-func TestScopedObjectIsVisibleToTheOperatorCLI(t *testing.T) {
+// reproSession builds the exact state the 2026-08-31 live run reached: an
+// instance whose keyring was rewritten mid-sequence to carry a scope, an
+// object written outside every scope by the operator, and one written inside
+// the scope by the keyholder from a bundle that crossed its wire form.
+func reproSession(t *testing.T) (*storage.Session, *reproProvider, config.Dir) {
+	t.Helper()
 	ctx := context.Background()
 
 	dir := config.Dir(t.TempDir())
@@ -207,9 +213,16 @@ func TestScopedObjectIsVisibleToTheOperatorCLI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openSession: %v", err)
 	}
+	return session, provider, dir
+
+}
+
+func TestScopedObjectIsVisibleToTheOperatorCLI(t *testing.T) {
+	session, _, _ := reproSession(t)
+	ctx := context.Background()
 
 	t.Run("ls of the scope prefix finds it", func(t *testing.T) {
-		entries, err := listAcrossScopes(ctx, session, "app/")
+		entries, _, err := listAcrossScopes(ctx, session, "app/")
 		if err != nil {
 			t.Errorf("listing reported: %v", err)
 		}
@@ -219,7 +232,7 @@ func TestScopedObjectIsVisibleToTheOperatorCLI(t *testing.T) {
 	})
 
 	t.Run("ls of the root spans both key spaces", func(t *testing.T) {
-		entries, _ := listAcrossScopes(ctx, session, "")
+		entries, _, _ := listAcrossScopes(ctx, session, "")
 		got := keysOf(entries)
 		for _, want := range []string{"app/sdk-written", "system/operator.txt"} {
 			if !contains(got, want) {
@@ -268,4 +281,45 @@ func contains(haystack []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+// --explain is the diagnostic the first live run lacked. An empty listing is
+// unreadable without it: nothing distinguished "the prefix holds nothing" from
+// "this keyring tokenizes it somewhere nothing was written", which is exactly
+// what a scope mismatch looks like from outside.
+func TestExplainReportsWhatEachKeySpaceQueried(t *testing.T) {
+	ctx := context.Background()
+	session, _, _ := reproSession(t)
+
+	_, reports, err := listAcrossScopes(ctx, session, "app/")
+	if err != nil {
+		t.Fatalf("listing: %v", err)
+	}
+	if len(reports) != 1 {
+		t.Fatalf("listing %q consulted %d key spaces, want only the scope's", "app/", len(reports))
+	}
+	r := reports[0]
+	if r.Space != "app" {
+		t.Errorf("space = %q, want the scope", r.Space)
+	}
+	if r.Queried == "" {
+		t.Error("the queried prefix is empty; the diagnostic reports nothing actionable")
+	}
+	if r.Objects != 1 || r.Recovered != 1 {
+		t.Errorf("objects=%d recovered=%d, want 1/1", r.Objects, r.Recovered)
+	}
+
+	// The root spans both, and each reports a DIFFERENT queried prefix —
+	// which is the fact that identifies a mismatched keyring.
+	_, rootReports, _ := listAcrossScopes(ctx, session, "")
+	if len(rootReports) != 2 {
+		t.Fatalf("root listing consulted %d key spaces, want 2", len(rootReports))
+	}
+	seen := map[string]bool{}
+	for _, rr := range rootReports {
+		seen[rr.Space] = true
+	}
+	if !seen["master"] || !seen["app"] {
+		t.Errorf("root listing did not name both key spaces: %v", seen)
+	}
 }

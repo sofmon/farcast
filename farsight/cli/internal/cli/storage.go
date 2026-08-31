@@ -251,8 +251,9 @@ func reportSession(env *Env, session *storage.Session) {
 // ---------------------------------------------------------------- ls
 
 type storageLsCommand struct {
-	long   bool
-	tokens bool
+	long    bool
+	tokens  bool
+	explain bool
 }
 
 func (*storageLsCommand) Name() string     { return "ls" }
@@ -267,6 +268,14 @@ List the logical keys stored under a prefix, sorted.
 Flags:
   -l, --long     Show stored size and age alongside each key
       --tokens   Also show the opaque name each key is stored under
+      --explain  Report which key spaces were consulted and what was queried
+
+--explain answers the question an empty listing cannot: what did this actually
+ask the provider for? An instance's storage is several key spaces — the
+operator's own, and one per application scope — and a keyring that does not
+address the data written under a prefix produces exactly the same empty output
+as a prefix that holds nothing. Printing the queried prefix and the raw object
+count under it separates the two.
 
 --tokens is the transparency surface: hold the stored name next to the logical
 one and see for yourself that the cloud holds neither the name nor the data.`)
@@ -276,6 +285,7 @@ func (c *storageLsCommand) SetFlags(fs *flag.FlagSet) {
 	fs.BoolVar(&c.long, "long", false, "show size and age")
 	fs.BoolVar(&c.long, "l", false, "show size and age")
 	fs.BoolVar(&c.tokens, "tokens", false, "also show the opaque stored name")
+	fs.BoolVar(&c.explain, "explain", false, "report which key spaces were consulted and what was queried")
 }
 
 func (c *storageLsCommand) Run(ctx context.Context, env *Env, args []string) error {
@@ -297,7 +307,10 @@ func (c *storageLsCommand) Run(ctx context.Context, env *Env, args []string) err
 	// keyring would silently omit everything an application ever wrote, while
 	// still billing for it, and would report those objects as integrity
 	// failures rather than as somebody else's key space.
-	entries, listErr := listAcrossScopes(ctx, session, loc.Key)
+	entries, reports, listErr := listAcrossScopes(ctx, session, loc.Key)
+	if c.explain {
+		explainSpaces(env, loc.Key, reports)
+	}
 	if listErr != nil {
 		// Names that did resolve are still reported: hiding them would turn one
 		// unreadable object into an unusable listing.
@@ -983,11 +996,12 @@ func (r storageCpResult) Human(w io.Writer) error {
 // that contains scopes — the bucket root, most often — is listed once per key
 // space, so nothing an application wrote is invisible to the operator who owns
 // the keys to it.
-func listAcrossScopes(ctx context.Context, session *storage.Session, prefix string) ([]datasphere.Entry, error) {
+func listAcrossScopes(ctx context.Context, session *storage.Session, prefix string) ([]datasphere.Entry, []spaceReport, error) {
 	spaces, err := session.KeySpaces()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	var reports []spaceReport
 	var entries []datasphere.Entry
 	var errs []error
 	scoped := scopePrefixes(session)
@@ -1000,9 +1014,60 @@ func listAcrossScopes(ctx context.Context, session *storage.Session, prefix stri
 			errs = append(errs, err)
 		}
 		entries = append(entries, found...)
+
+		report := spaceReport{Space: space.Scope, Prefix: space.Prefix, Recovered: len(found)}
+		if report.Space == "" {
+			report.Space = "master"
+		}
+		report.Queried = space.Store.StoredPrefix(prefix)
+		// The raw provider count separates "nothing is stored under the prefix
+		// this keyring computes" from "objects are there and their names could
+		// not be recovered". Those look identical in a listing and have
+		// opposite remedies.
+		if infos, perr := session.Provider.List(ctx, session.Bucket, report.Queried); perr == nil {
+			report.Objects = len(infos)
+		}
+		reports = append(reports, report)
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Key < entries[j].Key })
-	return entries, errors.Join(errs...)
+	return entries, reports, errors.Join(errs...)
+}
+
+// spaceReport is what --explain shows for one key space.
+type spaceReport struct {
+	Space     string
+	Prefix    string
+	Queried   string
+	Objects   int
+	Recovered int
+}
+
+// explainSpaces reports what a listing actually asked the provider.
+//
+// An empty listing is otherwise unreadable: it could mean the prefix holds
+// nothing, or that this keyring tokenizes it to a place nothing was ever
+// written — which is what a scope mismatch looks like from the outside. The
+// queried prefix is the one fact that separates them, and until now nothing
+// printed it.
+func explainSpaces(env *Env, prefix string, reports []spaceReport) {
+	fprintf(env.Err, "Listing %q across %d key space(s):\n", prefix, len(reports))
+	for _, r := range reports {
+		owns := r.Prefix
+		if owns == "" {
+			owns = "(everything outside every scope)"
+		}
+		fprintf(env.Err, "  %-12s owns %-14s queried %-34s %d object(s) under it, %d name(s) recovered\n",
+			r.Space, owns, quotedOrEmpty(r.Queried), r.Objects, r.Recovered)
+	}
+	fprintf(env.Err, "\nIf a key space queried a prefix with 0 objects under it, that keyring does not\n"+
+		"address the data written there — compare its key ids against the writer's.\n")
+}
+
+func quotedOrEmpty(s string) string {
+	if s == "" {
+		return "(whole bucket)"
+	}
+	return s
 }
 
 // scopePrefixes lists the prefixes that belong to a scope rather than to the
