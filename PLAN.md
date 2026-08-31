@@ -191,10 +191,12 @@ The kernel comes online. It manages what runs inside the instance and enforces c
 - Lifecycle management: deploy, start, stop, restart
 - Health checking
 - Basic resource monitoring (CPU/memory observation — not yet adaptive)
-- **Cost monitoring — query cloud provider billing APIs, track spending against the instance cost limit**
-- **Per-application cost attribution — break down spending by app**
-- **Cost threshold warnings — alert operator at 50%, 75%, 90% of limit**
-- **Protective shutdown — when limit is reached, stop highest-cost apps first; if spending cannot be contained, shut down all apps but keep TechnoCore alive to report status**
+- **Cost monitoring on two figures ([ADR 0009](docs/adr/0009-technocore-kernel-and-cost-metering.md)) — `expected`, metered locally from Pod requests in real time, and `confirmed`, the provider's own number for a closed window, pulled by the operator's machine and pushed in**
+- **`expected` enforces, `confirmed` corrects — the correction is clamped and a missing `confirmed` is never read as zero, so the late external signal cannot disable the guard**
+- **Per-application cost attribution — break down spending by app; `confirmed` is instance-level, so attribution always comes from `expected`**
+- **Cost threshold warnings — alert operator at 50%, 75%, 90% of limit, plus a projection warning as soon as the burn rate implies the limit will be reached before the period ends**
+- **Floor check at deploy time — a limit below the instance's own standing cost is reported when it is set, not discovered at 90%**
+- **Protective shutdown — when the limit is reached, stop highest-cost apps first; if spending cannot be contained, stop all apps, keep TechnoCore alive to report status, and report the instance floor with the levers that remain rather than acting on them**
 - **Last-to-die classification for `datasphered` and FatLine** ([ADR 0008](docs/adr/0008-in-cluster-key-delivery.md)) — a cost shutdown that stops FatLine makes storage impossible to unseal while the instance still bills
 - **FatLine gets the PodDisruptionBudget and second replica `datasphered` already has** — every unseal and every keeper reseed rides that tunnel, so a single drained replica is the floor on recovery
 
