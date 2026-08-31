@@ -113,6 +113,33 @@ func (s Scope) Zero() {
 	}
 }
 
+// Clone returns a scope holding its OWN copy of the key material.
+//
+// Scope values share their key bytes when copied — a Scope is a struct of
+// slices, so assigning one aliases the material rather than duplicating it.
+// That is what makes Zero effective across every holder of a scope, and it is
+// exactly why anything that intends to OUTLIVE the value it was given must
+// clone first. A holder that skipped this keeps serving from bytes its
+// provider is entitled to wipe, and the failure is silent: encryption and
+// decryption stay self-consistent against the zeroed key, so the data looks
+// fine from inside and is readable by anyone from outside.
+func (s Scope) Clone() Scope {
+	out := s
+	out.keys = Keyring{
+		nameKeys: cloneEntries(s.keys.nameKeys),
+		keys:     cloneEntries(s.keys.keys),
+	}
+	return out
+}
+
+func cloneEntries(entries []KeyEntry) []KeyEntry {
+	out := make([]KeyEntry, len(entries))
+	for i, e := range entries {
+		out[i] = KeyEntry{ID: e.ID, Created: e.Created, key: append([]byte(nil), e.key...)}
+	}
+	return out
+}
+
 // Zeroed reports whether this scope's material has been wiped.
 //
 // It answers a boolean and never exposes a byte, so it is safe for a

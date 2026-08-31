@@ -211,15 +211,18 @@ func TestScopeResolution(t *testing.T) {
 // scopes are gone and nothing resolves.
 func TestSealDropsScopes(t *testing.T) {
 	v := New("prod")
-	b := mustBundle(t, "prod", 1)
-	if err := v.Unseal(b, IntentOperator); err != nil {
+	if err := v.Unseal(mustBundle(t, "prod", 1), IntentOperator); err != nil {
 		t.Fatalf("Unseal: %v", err)
 	}
 	if len(v.State().Scopes) != 1 {
 		t.Fatal("guard: scope did not load")
 	}
-	// Hold the scope the vault took, so the wipe is observable after the seal.
-	held := b.Scopes()[0]
+	// Hold the scope the VAULT took — not the caller's bundle, which the vault
+	// no longer shares material with — so the wipe is observable after the seal.
+	held, err := v.Scope("app/x")
+	if err != nil {
+		t.Fatalf("Scope: %v", err)
+	}
 	if held.Zeroed() {
 		t.Fatal("guard: scope material is already zero before the seal")
 	}
@@ -286,4 +289,41 @@ func allZero(b []byte) bool {
 		}
 	}
 	return true
+}
+
+// A bundle's key material is shared, not copied, by Bundle.Scopes(). The vault
+// must therefore take OWNERSHIP of what it installs — otherwise the caller
+// wiping its bundle (which it should, and the HTTP handler does) zeroes the
+// keys the vault is now serving from.
+//
+// The failure is silent and catastrophic: the keyholder keeps working, because
+// it encrypts and decrypts consistently with the zeroed key, so every object it
+// writes is protected by a key of all zeros. The operator's own keyring can no
+// longer address that data, and anyone holding the ciphertext can read it.
+func TestUnsealTakesOwnershipOfKeyMaterial(t *testing.T) {
+	v := New("prod")
+	b := mustBundle(t, "prod", 1)
+	if err := v.Unseal(b, IntentOperator); err != nil {
+		t.Fatalf("Unseal: %v", err)
+	}
+
+	before, err := v.Scope("app/x")
+	if err != nil {
+		t.Fatalf("Scope: %v", err)
+	}
+	if before.Zeroed() {
+		t.Fatal("guard: the vault's material is already zero before the wipe")
+	}
+
+	// The caller wipes its copy, exactly as the unseal handler does on return.
+	b.Zero()
+
+	after, err := v.Scope("app/x")
+	if err != nil {
+		t.Fatalf("Scope after the caller wiped its bundle: %v", err)
+	}
+	if after.Zeroed() {
+		t.Fatal("the vault is serving zeroed key material: every object it writes " +
+			"would be encrypted under a key of all zeros, and the operator's keyring could not address it")
+	}
 }

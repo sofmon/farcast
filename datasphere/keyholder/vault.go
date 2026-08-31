@@ -180,12 +180,19 @@ func (v *Vault) Unseal(b *datasphere.Bundle, intent Intent) error {
 		return nil
 	}
 
-	scopes := b.Scopes()
-	for _, s := range scopes {
+	// Clone: a bundle shares its key bytes with everything it was copied
+	// into, and the pusher is entitled to wipe its bundle the moment the push
+	// returns. A vault that stored the caller's slices would keep serving from
+	// material zeroed out from under it — consistently, and therefore
+	// invisibly, under a key of all zeros.
+	scopes := make([]datasphere.Scope, 0, len(b.Scopes()))
+	for _, s := range b.Scopes() {
 		if err := s.Valid(); err != nil {
 			return err
 		}
+		scopes = append(scopes, s.Clone())
 	}
+	v.dropLocked()
 	v.scopes = scopes
 	v.generation = b.Generation()
 	v.phase = PhaseUnsealed
