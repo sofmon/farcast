@@ -32,6 +32,11 @@ const (
 	fatlinePackage = "./fatline/cmd/fatline"
 	fatlineBinary  = "/fatline"
 
+	// datasphered is the DataSphere keyholder's component identity.
+	dispheredImagePath = "system/datasphered"
+	dispheredPackage   = "./datasphere/cmd/datasphere"
+	dispheredBinary    = "/datasphere"
+
 	// fatlineRolloutTimeout bounds the wait for FatLine's Pods to become ready.
 	// Both the first deploy and a redeploy use it, so an operator never has to
 	// learn two different patience budgets for the same workload.
@@ -91,7 +96,40 @@ func (a *registryAccess) credentials(ctx context.Context) (user, pass string, er
 // always pinned by digest (ADR 0007 decision 4). A second, subtly different copy
 // of those rules is exactly how a tag-pinned deploy or an unconfirmed build
 // would eventually sneak in.
+// systemComponent describes one of FarCast's own in-cluster workloads: where
+// its image lives in the instance registry, and what to compile if it is not
+// there yet. Declaring it once keeps the image path, the package and the
+// entrypoint from drifting apart between the command that first deploys a
+// component and the one that replaces it.
+type systemComponent struct {
+	Name       string
+	ImagePath  string
+	Package    string
+	BinaryPath string
+}
+
+var (
+	fatlineComponent = systemComponent{
+		Name: "fatline", ImagePath: fatlineImagePath,
+		Package: fatlinePackage, BinaryPath: fatlineBinary,
+	}
+	keyholderComponent = systemComponent{
+		Name: "datasphered", ImagePath: dispheredImagePath,
+		Package: dispheredPackage, BinaryPath: dispheredBinary,
+	}
+)
+
+// instanceSystemImage is the tagged reference a component's image takes inside
+// an instance's own registry (ADR 0007 decision 6: system/<component>).
+func instanceSystemImage(prefix string, c systemComponent) string {
+	return prefix + "/" + c.ImagePath + ":" + imageTag(buildinfo.Get().Version)
+}
+
 type fatlineDeployer struct {
+	// component is which system workload this deployer builds and deploys.
+	// Zero means FatLine, so every existing caller is unchanged.
+	component systemComponent
+
 	assumeYes    bool
 	fatlineImage string
 	sourceDir    string
@@ -104,6 +142,9 @@ type fatlineDeployer struct {
 }
 
 func (d *fatlineDeployer) ensureDefaults() {
+	if d.component.Name == "" {
+		d.component = fatlineComponent
+	}
 	if d.newCluster == nil {
 		d.newCluster = func(kc string) clusterApplier { return cluster.New(kc) }
 	}
@@ -194,7 +235,7 @@ func (d *fatlineDeployer) resolveImage(ctx context.Context, env *Env, reg *regis
 	if reg == nil { // guarded by each command's needs-the-registry rule; belt and braces
 		return "", errors.New("no image registry for this instance and no --fatline-image given")
 	}
-	ref := instanceFatlineImage(reg.registry.Prefix)
+	ref := instanceSystemImage(reg.registry.Prefix, d.component)
 	user, pass, err := reg.credentials(ctx)
 	if err != nil {
 		return "", err
@@ -236,10 +277,10 @@ func (d *fatlineDeployer) resolveImage(ctx context.Context, env *Env, reg *regis
 	}
 	return b.BuildAndPush(ctx, image.Options{
 		SourceDir:  source,
-		Package:    fatlinePackage,
+		Package:    d.component.Package,
 		Ref:        ref,
-		BinaryPath: fatlineBinary,
-		Entrypoint: []string{fatlineBinary},
+		BinaryPath: d.component.BinaryPath,
+		Entrypoint: []string{d.component.BinaryPath},
 	}, user, pass)
 }
 
@@ -255,7 +296,7 @@ func (d *fatlineDeployer) confirmBuild(env *Env, ref, source string) (bool, erro
 	if !isInteractive(env) {
 		return false, usagef("%s is not in the instance's registry yet; pass --yes to build it from %s and push it there", ref, source)
 	}
-	fprintf(env.Err, "FatLine's image %s is not in the instance's registry yet.\n", ref)
+	fprintf(env.Err, "%s's image %s is not in the instance's registry yet.\n", d.component.Name, ref)
 	fprintf(env.Err, "It would be compiled from %s with the local Go toolchain (no container engine) and pushed there.\n", source)
 	return newPrompter(env.In, env.Err).yesNo("Build and push it now?")
 }
@@ -278,7 +319,7 @@ func (d *fatlineDeployer) progressTo(env *Env) func(string) {
 // aimed at FatLine itself (ADR 0007 decision 4). The tag is what the operator
 // reads; the digest is what gets deployed.
 func instanceFatlineImage(prefix string) string {
-	return prefix + "/" + fatlineImagePath + ":" + imageTag(buildinfo.Get().Version)
+	return instanceSystemImage(prefix, fatlineComponent)
 }
 
 // imageTag renders a build version as a valid OCI tag.
