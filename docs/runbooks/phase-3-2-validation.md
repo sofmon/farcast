@@ -154,7 +154,15 @@ farcast storage cp "$INSTANCE:app/hello" /tmp/hello.readback
 cat /tmp/hello.readback
 ```
 
-Expect the object to list, and the file to contain `hello from inside the cluster`. That proves the keyring on this laptop and the bundle in the cluster are the same key material, and that the stateless name-recovery promise survives scoping.
+Expect the object to list, and the file to contain `hello from inside the cluster`.
+
+**If the listing is empty, do not guess — ask what it queried:**
+
+```bash
+farcast storage ls "$INSTANCE:app/" --explain
+```
+
+That reports, per key space, the prefix it owns, the opaque prefix it queried, how many objects the provider holds under it, and how many names were recovered. A key space that queried a prefix with **0 objects under it** does not address the data written there, and its key ids should be compared against the writer's — which is the single fact the 2026-08-31 run could not obtain. That proves the keyring on this laptop and the bundle in the cluster are the same key material, and that the stateless name-recovery promise survives scoping.
 
 ## 6. Confirm the cloud sees only opaque names
 
