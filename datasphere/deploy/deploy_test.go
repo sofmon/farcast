@@ -2,6 +2,7 @@ package deploy
 
 import (
 	"encoding/base64"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -718,5 +719,26 @@ func TestRenderGivesTheKeyholderItsOwnServiceAccount(t *testing.T) {
 	// from its ServiceAccount out of band.
 	if !strings.Contains(string(out), "automountServiceAccountToken: false") {
 		t.Error("a projected token was mounted; decision 1 forbids every volume")
+	}
+}
+
+// The exported request constants exist so an operator-facing cost estimate can
+// be computed from the same numbers the manifest asks for. That only holds if
+// the rendered YAML really carries them — a template that hardcoded "100m"
+// while the constant said something else would quote a price for a workload
+// that was never deployed.
+func TestRenderedRequestsMatchTheExportedConstants(t *testing.T) {
+	out, err := Render(sampleConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	for _, want := range []string{
+		fmt.Sprintf("cpu: %dm", RequestCPUMilli),
+		fmt.Sprintf("memory: %dMi", RequestMemMiB),
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("rendered workload does not request %q; the cost estimate would quote a workload nobody deployed", want)
+		}
 	}
 }

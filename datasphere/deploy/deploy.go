@@ -48,6 +48,15 @@ const (
 	// Autopilot restart, and the second is what makes the common events
 	// survivable.
 	DefaultReplicas = 2
+
+	// RequestCPUMilli and RequestMemMiB are the container's declared resource
+	// requests, and they are exported because Autopilot bills requests: the
+	// operator-facing cost estimate is computed from these very constants
+	// (technocore/pricing), so the number quoted in a confirmation prompt
+	// cannot drift from the number the manifest actually asks for.
+	RequestCPUMilli = 100
+	RequestMemMiB   = 128
+
 	// DefaultDataPort carries the SDK's storage calls, mTLS-terminated in
 	// userspace.
 	DefaultDataPort = 8443
@@ -154,25 +163,27 @@ func Render(c Config) ([]byte, error) {
 	}
 
 	data := templateData{
-		Instance:      c.Instance,
-		Bucket:        c.Bucket,
-		Provider:      c.Provider,
-		Project:       c.Project,
-		Location:      c.Location,
-		Namespace:     c.Namespace,
-		Name:          c.Name,
-		StatusService: c.Name + "-status",
-		UnsealService: c.Name + "-unseal",
-		Image:         c.Image,
-		Replicas:      c.Replicas,
-		DataPort:      c.DataPort,
-		StatusPort:    c.StatusPort,
-		UnsealPort:    c.UnsealPort,
-		SecretName:    secretName,
-		CACert:        base64.StdEncoding.EncodeToString(c.CACertPEM),
-		ServerCert:    base64.StdEncoding.EncodeToString(c.ServerCertPEM),
-		ServerKey:     base64.StdEncoding.EncodeToString(c.ServerKeyPEM),
-		MTLSHash:      mtlsHash(c.CACertPEM, c.ServerCertPEM, c.ServerKeyPEM),
+		Instance:        c.Instance,
+		Bucket:          c.Bucket,
+		Provider:        c.Provider,
+		Project:         c.Project,
+		Location:        c.Location,
+		Namespace:       c.Namespace,
+		Name:            c.Name,
+		StatusService:   c.Name + "-status",
+		UnsealService:   c.Name + "-unseal",
+		Image:           c.Image,
+		Replicas:        c.Replicas,
+		RequestCPUMilli: RequestCPUMilli,
+		RequestMemMiB:   RequestMemMiB,
+		DataPort:        c.DataPort,
+		StatusPort:      c.StatusPort,
+		UnsealPort:      c.UnsealPort,
+		SecretName:      secretName,
+		CACert:          base64.StdEncoding.EncodeToString(c.CACertPEM),
+		ServerCert:      base64.StdEncoding.EncodeToString(c.ServerCertPEM),
+		ServerKey:       base64.StdEncoding.EncodeToString(c.ServerKeyPEM),
+		MTLSHash:        mtlsHash(c.CACertPEM, c.ServerCertPEM, c.ServerKeyPEM),
 	}
 	var buf bytes.Buffer
 	if err := workloadTemplate.Execute(&buf, data); err != nil {
@@ -238,6 +249,11 @@ type templateData struct {
 	CACert        string
 	ServerCert    string
 	ServerKey     string
+
+	// Rendered from the exported constants rather than written into the
+	// template, so the cost estimate and the manifest quote one number.
+	RequestCPUMilli int
+	RequestMemMiB   int
 }
 
 // workloadTemplate renders the keyholder. The Namespace document is
@@ -449,8 +465,8 @@ spec:
             failureThreshold: 3
           resources:
             requests:
-              cpu: 100m
-              memory: 128Mi
+              cpu: {{.RequestCPUMilli}}m
+              memory: {{.RequestMemMiB}}Mi
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

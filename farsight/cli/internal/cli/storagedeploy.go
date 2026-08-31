@@ -11,17 +11,26 @@ import (
 	dsdeploy "github.com/sofmon/farcast/datasphere/deploy"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/fatline/identity"
+	"github.com/sofmon/farcast/technocore/pricing"
 )
 
-// keyholderMonthlyUSD is the standing Autopilot cost of the keyholder's two
-// replicas at the requests the workload declares (100m CPU, 128Mi each).
+// keyholderMonthlyUSD is the standing Autopilot cost of ALL of the keyholder's
+// replicas at the requests the workload declares, and keyholderMonthlyUSDMax
+// is the same fleet on a cluster without bursting support, where Autopilot
+// raises every small Pod to a five-times-higher per-Pod floor.
 //
-// It is an ESTIMATE and is printed as one. Autopilot bills a Pod's requests,
-// and raises any Pod below its per-Pod minimum — which differs between
-// clusters that support bursting and clusters that do not — so the real figure
-// can be several times this on a cluster without bursting. The operator is
-// told the number and told it is approximate; the bill is the authority.
-const keyholderMonthlyUSD = 4
+// Both are ESTIMATES and are printed as such — a model of a published rate
+// card, not a bill. They are computed from datasphere/deploy's own exported
+// requests so the figure quoted here cannot drift from the manifest applied.
+//
+// This used to be a hand-written 4, copied from ADR 0008 decision 6 — where
+// "~$4/month" is the cost of the SECOND replica, not of the pair. The prompt
+// therefore understated the standing cost by half. Deriving it removes the
+// class of error rather than the instance.
+var (
+	keyholderMonthlyUSD    = pricing.WorkloadMonthlyUSD(keyholderReplicas, dsdeploy.RequestCPUMilli, dsdeploy.RequestMemMiB)
+	keyholderMonthlyUSDMax = float64(keyholderReplicas) * pricing.PodMonthlyUSDNoBursting(dsdeploy.RequestCPUMilli, dsdeploy.RequestMemMiB)
+)
 
 // keyholderReplicas is what the workload deploys. Two survives the common
 // events — a single-pod OOM, one node's repair, a rollout, an eviction — and
@@ -177,15 +186,17 @@ func (c *storageDeployCommand) confirmCost(env *Env, meta *config.InstanceMetada
 		return true, nil
 	}
 	if !isInteractive(env) {
-		return false, usagef("deploying the keyholder adds ~$%d/month of standing compute (%d replicas); pass --yes to confirm",
+		return false, usagef("deploying the keyholder adds ~$%.0f/month of standing compute (%d replicas); pass --yes to confirm",
 			keyholderMonthlyUSD, keyholderReplicas)
 	}
-	fprintf(env.Err, "Deploying the keyholder to %q runs %d replicas continuously (~$%d/month estimated, "+
+	fprintf(env.Err, "Deploying the keyholder to %q runs %d replicas continuously (~$%.0f/month estimated, "+
 		"against the cost limit %s %.0f/%s).\n",
 		meta.Name, keyholderReplicas, keyholderMonthlyUSD,
 		meta.CostLimit.Currency, meta.CostLimit.Amount, meta.CostLimit.Period)
-	fprintf(env.Err, "The figure is an estimate from the workload's declared requests; a cluster without "+
-		"bursting support raises small Pods to its own minimum and can cost several times this.\n")
+	fprintf(env.Err, "That figure models %s prices as of %s from the workload's declared requests. On a cluster "+
+		"without bursting support Autopilot raises small Pods to a higher floor, which puts the same fleet "+
+		"nearer $%.0f/month.\n",
+		pricing.Region, pricing.AsOf, keyholderMonthlyUSDMax)
 	return newPrompter(env.In, env.Err).yesNo("Deploy it?")
 }
 

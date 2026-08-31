@@ -15,6 +15,7 @@ import (
 	"github.com/sofmon/farcast/fatline/identity"
 	"github.com/sofmon/farcast/fatline/tunnel"
 	"github.com/sofmon/farcast/planck"
+	"github.com/sofmon/farcast/technocore/pricing"
 )
 
 // nlbMonthlyUSD is the standing cost estimate for the public mTLS load balancer
@@ -26,6 +27,14 @@ const nlbMonthlyUSD = 18
 // pulls are free, so it rounds to zero against the ~$18/mo carrier. Gating cents
 // would train the operator to click through the gate that matters.
 const registryMonthlyCost = "~$0"
+
+// fatlineMonthlyUSD is what FatLine's own Pods cost, standing, at the requests
+// its manifest declares. It is surfaced next to the carrier because it is the
+// same order of magnitude as nothing else connect creates, and because ADR 0009
+// decision 11 doubled it: the tunnel now runs two replicas so that a node drain
+// cannot leave storage unsealable. An operator agreeing to a standing cost
+// should see the whole standing cost, not the largest line of it.
+var fatlineMonthlyUSD = pricing.WorkloadMonthlyUSD(deploy.DefaultReplicas, deploy.RequestCPUMilli, deploy.RequestMemMiB)
 
 // tunnelConn is the slice of *tunnel.Conn connect needs (injectable).
 type tunnelConn interface {
@@ -348,10 +357,14 @@ func (c *connectCommand) confirmCost(env *Env, meta *config.InstanceMetadata) (b
 		return true, nil
 	}
 	if !isInteractive(env) {
-		return false, usagef("connecting provisions a public load balancer (~$%d/mo); pass --yes to confirm", nlbMonthlyUSD)
+		return false, usagef("connecting provisions a public load balancer (~$%d/mo) and runs FatLine continuously (~$%.0f/mo); pass --yes to confirm",
+			nlbMonthlyUSD, fatlineMonthlyUSD)
 	}
-	fprintf(env.Err, "Connecting %q provisions a public mTLS load balancer (~$%d/month, against the cost limit %s %.0f/%s).\n",
-		meta.Name, nlbMonthlyUSD, meta.CostLimit.Currency, meta.CostLimit.Amount, meta.CostLimit.Period)
+	fprintf(env.Err, "Connecting %q provisions a public mTLS load balancer (~$%d/month) and runs FatLine's %d replicas "+
+		"continuously (~$%.0f/month) — ~$%.0f/month standing, against the cost limit %s %.0f/%s.\n",
+		meta.Name, nlbMonthlyUSD, deploy.DefaultReplicas, fatlineMonthlyUSD,
+		float64(nlbMonthlyUSD)+fatlineMonthlyUSD,
+		meta.CostLimit.Currency, meta.CostLimit.Amount, meta.CostLimit.Period)
 	return newPrompter(env.In, env.Err).yesNo("Provision it and connect?")
 }
 
@@ -490,7 +503,7 @@ func (r connectResult) Human(w io.Writer) error {
 	if r.Image != "" {
 		fprintf(w, "  image:       %s\n", r.Image)
 	}
-	fprintf(w, "  cost:        load balancer ~$%d/mo + registry %s/mo (limit: %s %.0f/%s)\n",
-		nlbMonthlyUSD, registryMonthlyCost, r.costLimit.Currency, r.costLimit.Amount, r.costLimit.Period)
+	fprintf(w, "  cost:        load balancer ~$%d/mo + FatLine ~$%.0f/mo + registry %s/mo (limit: %s %.0f/%s)\n",
+		nlbMonthlyUSD, fatlineMonthlyUSD, registryMonthlyCost, r.costLimit.Currency, r.costLimit.Amount, r.costLimit.Period)
 	return nil
 }
