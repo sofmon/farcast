@@ -167,6 +167,8 @@ func (c *storageDeployCommand) Run(ctx context.Context, env *Env, args []string)
 	// interrupt the tool. The next step is the unseal, and it is said plainly.
 	return env.Printer.Print(deployResult{
 		Instance: name, Image: img, Replicas: keyholderReplicas,
+		Project: meta.Project, Bucket: meta.Storage.Bucket,
+		Namespace: dsdeploy.DefaultNamespace, ServiceAccount: dsdeploy.DefaultName,
 	})
 }
 
@@ -188,9 +190,13 @@ func (c *storageDeployCommand) confirmCost(env *Env, meta *config.InstanceMetada
 }
 
 type deployResult struct {
-	Instance string `json:"instance"`
-	Image    string `json:"image"`
-	Replicas int    `json:"replicas"`
+	Instance       string `json:"instance"`
+	Image          string `json:"image"`
+	Replicas       int    `json:"replicas"`
+	Project        string `json:"project,omitempty"`
+	Bucket         string `json:"bucket,omitempty"`
+	Namespace      string `json:"namespace,omitempty"`
+	ServiceAccount string `json:"service_account,omitempty"`
 }
 
 func (r deployResult) Human(w io.Writer) error {
@@ -198,5 +204,25 @@ func (r deployResult) Human(w io.Writer) error {
 	fmt.Fprintf(w, "  image  %s\n", r.Image)
 	fmt.Fprintf(w, "\nEvery replica is SEALED and will not become ready until you unseal it.\n")
 	fmt.Fprintf(w, "Run: farcast storage unseal %s\n", r.Instance)
+
+	// The keyholder reads and writes the bucket with a cloud-side identity
+	// (ADR 0008 decision 8). FarCast does not grant it: doing so needs
+	// permission to change a bucket's IAM, which the operator's credential is
+	// not required to carry and which this CLI deliberately never asks for.
+	// Without the binding the replicas crash-loop on a 403 at start-up, so the
+	// command that creates them is where the grant belongs.
+	if r.Project != "" && r.Bucket != "" {
+		fmt.Fprintf(w, "\nThe keyholder needs read/write access to the bucket under its own identity.\n")
+		fmt.Fprintf(w, "If you have not granted it for this instance yet, run:\n\n")
+		fmt.Fprintf(w, "  PROJNUM=$(gcloud projects describe %s --format='value(projectNumber)')\n", r.Project)
+		fmt.Fprintf(w, "  PRINCIPAL=\"principal://iam.googleapis.com/projects/$PROJNUM/locations/global/workloadIdentityPools/%s.svc.id.goog/subject/ns/%s/sa/%s\"\n",
+			r.Project, r.Namespace, r.ServiceAccount)
+		fmt.Fprintf(w, "  gcloud storage buckets add-iam-policy-binding gs://%s \\\n", r.Bucket)
+		fmt.Fprintf(w, "    --member \"$PRINCIPAL\" --role roles/storage.objectAdmin\n")
+		fmt.Fprintf(w, "  gcloud storage buckets add-iam-policy-binding gs://%s \\\n", r.Bucket)
+		fmt.Fprintf(w, "    --member \"$PRINCIPAL\" --role roles/storage.legacyBucketReader\n")
+		fmt.Fprintf(w, "\nThe grant is on the BUCKET, not the project, and object access is\n")
+		fmt.Fprintf(w, "separated from bucket reads so the keyholder cannot delete its own bucket.\n")
+	}
 	return nil
 }
