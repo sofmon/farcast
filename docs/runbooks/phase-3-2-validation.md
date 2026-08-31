@@ -283,3 +283,32 @@ Those two cannot both be true, so one of the observations is wrong and the insta
 That makes the scope-blind CLI the whole of the reproducible defect, and it is now fixed and guarded. The unexplained residue is the `StoredName` mismatch observed during the walk, which did not reproduce and is most consistent with a measurement error at the time — the probe was run against a binary that was mid-change, and the stored paths were being paired with objects by eye.
 
 **Criterion 5 nevertheless remains formally unverified**, because a passing local reproduction is not a live confirmation. The next run should test it first. If it fails again, capture in one pass: the scope key ids from `keys.yaml`, the key id in the stored blob's header, and the tokenized prefix the CLI actually queries — the last of which nothing currently prints, and which is why the first run could not be settled.
+
+
+---
+
+## Findings from the 2026-08-31 second run
+
+**Criterion 5 is closed, and closing it exposed a critical confidentiality bug that the first run had merely disguised.**
+
+### The keyholder was encrypting everything under an all-zero key
+
+The tell was visible the moment the second run reproduced the symptom: the application object landed at **the same stored path as the first run's** — `6cb5a4cd…/75d34182…` — on a different instance, with a different keyring, in a different bucket. Tokenized names are keyed on the scope's name key, so two independently minted scopes cannot agree on a path. A constant path means a constant key.
+
+The chain: `Bundle.Scopes()` copies the slice but *shares* the key bytes; `Vault.Unseal` stored those shared slices; and the unseal handler's `defer bundle.Zero()` then wiped the material the vault had just installed. The keyholder went on working perfectly — it encrypted and decrypted consistently against the zeroed key — so nothing failed, nothing logged, and every object it wrote was protected by a key of all zeros and readable by anyone holding the ciphertext.
+
+This is the exact failure the module exists to prevent, and only a live run surfaced it: every unit test passed, because in-process tests never wipe a bundle after installing it.
+
+The fix gives the vault **ownership**: `Scope.Clone()` deep-copies key material, and `Vault.Unseal` clones what it installs, so a pusher wiping its bundle — which it should — no longer reaches into the vault. `TestUnsealTakesOwnershipOfKeyMaterial` fails against the old behaviour.
+
+Note the two defects compounded: the CLI's scope-blindness (fixed after run 1) and this ownership bug produced the *same* symptom, so fixing the first could not clear it. The first run's contradictory evidence — a keyholder that could read its own objects while the operator's keyring could not address them — is fully explained by it.
+
+### Criterion 5, retested after the fix
+
+`ls app/` lists the object, `cp` downloads it byte-exact, and the root listing spans both key spaces. Objects written *before* the fix remain unrecoverable by the real keyring, which is correct.
+
+### Everything else
+
+Steps 1–4 and 6–10 passed as in the first run: deploy returns without waiting for readiness, replicas land on separate nodes behind the PDB, sealed replicas are Running-but-not-Ready with zero restarts, a fully sealed fleet leaves the data Service with no endpoints while the status Service still answers, unseal reports `2 of 2`, one replica can be lost without interrupting service, an operator hold is reported with its reason and **does not survive a restart**, generations advance monotonically, and `gcloud` shows only opaque names over `FCDS` ciphertext.
+
+One operational wrinkle: **`farcast connect` can fail on its first attempt** while the load balancer's backends are still coming into service — `connection refused` against an endpoint that already has a public IP. The carrier is recorded before the probe runs, so nothing is lost; wait and re-run `connect`, which is idempotent. It became reachable about 45 seconds later.
