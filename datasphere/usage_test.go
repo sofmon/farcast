@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -225,5 +226,72 @@ func TestBucketUsageSeesObjectsTheKeyringCannotName(t *testing.T) {
 	}
 	if usage.StoredBytes != stored {
 		t.Errorf("StoredBytes = %d, want the %d bytes the provider actually holds", usage.StoredBytes, stored)
+	}
+}
+
+// The distribution is the measurement any future size-hiding decision needs,
+// and it must be exact: a padding lattice chosen from a wrong histogram is a
+// frozen format change made on bad data.
+func TestBucketUsageReportsTheSizeDistribution(t *testing.T) {
+	ctx := context.Background()
+	fake := newFakeProvider()
+	sizes := []int{
+		10, 900, 1024, // <=1K  (boundary is inclusive)
+		1025, 2000, // <=2K
+		70000,     // <=128K
+		100 << 20, // larger than the last bound
+	}
+	for i, n := range sizes {
+		if err := fake.Put(ctx, "b", Object{Name: fmt.Sprintf("o%02d", i), Data: make([]byte, n)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	usage, err := BucketUsage(ctx, fake, "b")
+	if err != nil {
+		t.Fatalf("BucketUsage: %v", err)
+	}
+	if usage.Objects != int64(len(sizes)) {
+		t.Fatalf("Objects = %d, want %d", usage.Objects, len(sizes))
+	}
+
+	// Every object lands in exactly one band, and the bands reconcile with the
+	// totals — otherwise the histogram silently disagrees with the bill.
+	var objects, bytes int64
+	for _, b := range usage.Sizes {
+		if b.Objects == 0 {
+			t.Errorf("an empty bucket was reported: %+v", b)
+		}
+		objects += b.Objects
+		bytes += b.Bytes
+	}
+	if objects != usage.Objects {
+		t.Errorf("buckets hold %d objects, total is %d", objects, usage.Objects)
+	}
+	if bytes != usage.StoredBytes {
+		t.Errorf("buckets hold %d bytes, total is %d", bytes, usage.StoredBytes)
+	}
+
+	byLabel := map[string]int64{}
+	for _, b := range usage.Sizes {
+		byLabel[b.Label()] = b.Objects
+	}
+	if byLabel["<=1K"] != 3 {
+		t.Errorf("<=1K held %d objects, want 3 (the bound is inclusive)", byLabel["<=1K"])
+	}
+	if byLabel["<=2K"] != 2 {
+		t.Errorf("<=2K held %d, want 2", byLabel["<=2K"])
+	}
+	if byLabel["larger"] != 1 {
+		t.Errorf("the open-ended band held %d, want 1", byLabel["larger"])
+	}
+}
+
+func TestBucketUsageOnAnEmptyBucketReportsNoBuckets(t *testing.T) {
+	usage, err := BucketUsage(context.Background(), newFakeProvider(), "b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(usage.Sizes) != 0 {
+		t.Errorf("an empty bucket reported %d size bands", len(usage.Sizes))
 	}
 }

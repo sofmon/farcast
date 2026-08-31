@@ -445,6 +445,7 @@ func (*storageUsageCommand) Run(ctx context.Context, env *Env, args []string) er
 	return env.Printer.Print(storageUsageResult{
 		Instance: loc.Instance, Bucket: session.Bucket, Location: session.Location,
 		Objects: usage.Objects, StoredBytes: usage.StoredBytes,
+		Sizes:      usageSizeBands(usage.Sizes),
 		MonthlyUSD: monthlyStorageUSD(usage.StoredBytes), PricesAsOf: priceTableAsOf,
 		Oldest: stamp(usage.Oldest), Newest: stamp(usage.Newest),
 	})
@@ -482,6 +483,8 @@ type storageUsageResult struct {
 	PricesAsOf  string  `json:"prices_as_of"`
 	Oldest      string  `json:"oldest,omitempty"`
 	Newest      string  `json:"newest,omitempty"`
+
+	Sizes []usageSizeBand `json:"sizes,omitempty"`
 }
 
 func (r storageUsageResult) Human(w io.Writer) error {
@@ -497,6 +500,23 @@ func (r storageUsageResult) Human(w io.Writer) error {
 	}
 	fprintf(w, "  cost      ~$%.4f / month at $%.3f/GiB-month\n", r.MonthlyUSD, usdPerGiBMonth)
 	fprintf(w, "  prices as of %s — verify against %s\n", r.PricesAsOf, pricingReference)
+	if len(r.Sizes) > 0 {
+		// The provider already sees every one of these sizes exactly, so
+		// showing their shape gives nothing away — and it answers the question
+		// an operator otherwise cannot ask: what does my storage look like from
+		// the outside?
+		fprintln(w, "\n  object sizes (what the provider can see)")
+		widest := int64(0)
+		for _, b := range r.Sizes {
+			if b.Objects > widest {
+				widest = b.Objects
+			}
+		}
+		for _, b := range r.Sizes {
+			bar := strings.Repeat("#", int((b.Objects*24+widest-1)/widest))
+			fprintf(w, "    %-8s %6d  %s\n", b.Label, b.Objects, bar)
+		}
+	}
 	return nil
 }
 
@@ -1104,4 +1124,24 @@ func spaceCanHold(spacePrefix, requested string, scopes []string) bool {
 		}
 	}
 	return true
+}
+
+// usageSizeBand is one band of the stored-size distribution.
+//
+// It is reported so that a future decision about size-hiding is made on a
+// measured distribution rather than an assumed one: a padding lattice cannot
+// be chosen without knowing where objects actually cluster, and the first real
+// workload is the only place that answer exists.
+type usageSizeBand struct {
+	Label   string `json:"label"`
+	Objects int64  `json:"objects"`
+	Bytes   int64  `json:"bytes"`
+}
+
+func usageSizeBands(sizes []datasphere.SizeBucket) []usageSizeBand {
+	out := make([]usageSizeBand, len(sizes))
+	for i, b := range sizes {
+		out[i] = usageSizeBand{Label: b.Label(), Objects: b.Objects, Bytes: b.Bytes}
+	}
+	return out
 }
