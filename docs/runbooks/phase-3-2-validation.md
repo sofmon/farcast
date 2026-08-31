@@ -9,6 +9,7 @@ Everything below was designed against fakes. The claims that matter here are the
 ## Prerequisites
 
 - An instance that has completed [the Phase 3 runbook](phase-3-validation.md): installed, connected, with a bucket minted and recorded.
+- **The installer service account must carry the conditional storage grant** from that runbook's step 2. A project whose service account has only `container.admin` and `artifactregistry.admin` will fail at bucket creation with a `storage.buckets.create` 403 — observed on the 2026-08-31 run, because a previous teardown had removed it.
 - `farcast connect <instance>` reports a working tunnel. **Nothing here works without it** — the keyholder is reachable only through FatLine, and an unseal cannot be delivered while the tunnel is down.
 - A farcast checkout, so the CLI can compile and push the keyholder image if the instance registry does not have it yet.
 
@@ -17,10 +18,17 @@ Everything below was designed against fakes. The claims that matter here are the
 ```bash
 INSTANCE=<your-instance-name>
 NS=farcast-system
-KUBECONFIG_PATH="$(farcast --json instances 2>/dev/null | true)"   # or the path connect recorded
+
+# The CLI keeps instance state under the OS config dir, or FARCAST_CONFIG_HOME
+# when that is set. On macOS that is ~/Library/Application Support/farcast.
+FARCAST_STATE="${FARCAST_CONFIG_HOME:-$HOME/Library/Application Support/farcast}"
+INSTANCE_DIR="$FARCAST_STATE/instances/$INSTANCE"
+
+export KUBECONFIG="$INSTANCE_DIR/kubeconfig.yaml"
+kubectl config current-context    # confirm it points at this instance's cluster
 ```
 
-Use the kubeconfig `farcast connect` wrote for this instance; every `kubectl` below assumes `KUBECONFIG` points at it.
+Every `kubectl` below assumes `KUBECONFIG` points at the file `farcast connect` wrote for this instance.
 
 ## 1. Deploy the keyholder
 
@@ -40,6 +48,25 @@ kubectl -n "$NS" get pods -l app.kubernetes.io/name=datasphered -o wide
 ```
 
 Expect two pods on **different nodes** (the hostname topology spread), a PodDisruptionBudget with `minAvailable: 1`, and three Services.
+
+## 1a. Grant the keyholder access to its own bucket
+
+**Found on the 2026-08-31 run: without this the replicas crash-loop on a 403 and nothing else in the runbook can proceed.**
+
+The keyholder reads and writes the bucket under its *own* cloud identity — a dedicated `datasphered` ServiceAccount resolved through Workload Identity, with no token mounted. FarCast does not create the binding: granting it needs permission to change a bucket's IAM, which the operator's credential is not required to carry and which the CLI deliberately never asks for. `storage deploy` prints the exact commands; run them once per instance.
+
+```bash
+PROJNUM=$(gcloud projects describe "$PROJECT" --format='value(projectNumber)')
+PRINCIPAL="principal://iam.googleapis.com/projects/$PROJNUM/locations/global/workloadIdentityPools/$PROJECT.svc.id.goog/subject/ns/$NS/sa/datasphered"
+gcloud storage buckets add-iam-policy-binding "gs://$BUCKET" --member "$PRINCIPAL" --role roles/storage.objectAdmin
+gcloud storage buckets add-iam-policy-binding "gs://$BUCKET" --member "$PRINCIPAL" --role roles/storage.legacyBucketReader
+```
+
+The grant is on the **bucket**, not the project, and object access is separated from bucket reads so the keyholder cannot delete the bucket it serves. Then restart the pods so they pick it up:
+
+```bash
+kubectl -n "$NS" delete pod -l app.kubernetes.io/name=datasphered
+```
 
 ## 2. Confirm it came up sealed, and that a sealed pod is *not* Ready
 
@@ -96,7 +123,7 @@ Expect both replicas `unsealed`, both pods `1/1`, and the data Service now carry
 Confirm the push was recorded locally:
 
 ```bash
-cat "$(farcast --json instance-path "$INSTANCE" 2>/dev/null || echo ~/Library/Application\ Support/farcast/instances/$INSTANCE)/datasphere/unseal-ledger.jsonl"
+cat "$INSTANCE_DIR/datasphere/unseal-ledger.jsonl"
 ```
 
 Expect one line per replica, with the generation and `"result":"ok"`. This is the record phase 5.4's keeper audit reads; it must exist from the first push.
@@ -109,7 +136,7 @@ Port-forward the data path and write an object as an application would:
 
 ```bash
 kubectl -n "$NS" port-forward svc/datasphered 8443:8443 &
-CA="$(farcast --json instance-path "$INSTANCE")/fatline/ca.crt"   # or wherever connect recorded it
+CA="$INSTANCE_DIR/fatline/ca.crt"
 
 printf 'hello from inside the cluster' | curl -sS --cacert "$CA" \
   --connect-to "$INSTANCE.datasphered.farcast:8443:127.0.0.1:8443" \
@@ -123,10 +150,11 @@ Now read it back **from the operator's machine, through the ordinary CLI**:
 
 ```bash
 farcast storage ls "$INSTANCE:app/"
-farcast storage cp "$INSTANCE:app/hello" -
+farcast storage cp "$INSTANCE:app/hello" /tmp/hello.readback
+cat /tmp/hello.readback
 ```
 
-Expect the object to list and to print `hello from inside the cluster`. That proves the keyring on this laptop and the bundle in the cluster are the same key material, and that the stateless name-recovery promise survives scoping.
+Expect the object to list, and the file to contain `hello from inside the cluster`. That proves the keyring on this laptop and the bundle in the cluster are the same key material, and that the stateless name-recovery promise survives scoping.
 
 ## 6. Confirm the cloud sees only opaque names
 
