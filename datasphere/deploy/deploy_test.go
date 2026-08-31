@@ -158,8 +158,8 @@ func TestRenderDocuments(t *testing.T) {
 			t.Fatalf("missing %s document; got %v", want, keys(docs))
 		}
 	}
-	if len(docs) != 7 {
-		t.Errorf("rendered %d documents, want 7: %v", len(docs), keys(docs))
+	if len(docs) != 8 {
+		t.Errorf("rendered %d documents, want 8: %v", len(docs), keys(docs))
 	}
 	// A Deployment cannot give per-ordinal DNS, so the keyholder is a
 	// StatefulSet — see TestRenderPodManagementPolicyMustBeParallel.
@@ -701,5 +701,22 @@ func TestRenderOmitsEmptyOptionalTargetFields(t *testing.T) {
 		if strings.Contains(string(out), unwanted) {
 			t.Errorf("rendered workload carries an empty %q", unwanted)
 		}
+	}
+}
+
+// The keyholder needs its own cloud identity: a grant on the namespace default
+// account would hand the instance's storage to anything running beside it.
+func TestRenderGivesTheKeyholderItsOwnServiceAccount(t *testing.T) {
+	out, docs := render(t, sampleConfig())
+	if _, ok := docs["ServiceAccount/datasphered"]; !ok {
+		t.Fatal("no ServiceAccount rendered")
+	}
+	if !strings.Contains(string(out), "serviceAccountName: datasphered") {
+		t.Error("the pod does not use the ServiceAccount that was rendered for it")
+	}
+	// And still no token is mounted: the metadata server identifies the Pod
+	// from its ServiceAccount out of band.
+	if !strings.Contains(string(out), "automountServiceAccountToken: false") {
+		t.Error("a projected token was mounted; decision 1 forbids every volume")
 	}
 }

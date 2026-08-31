@@ -252,6 +252,26 @@ metadata:
   labels:
     app.kubernetes.io/managed-by: farcast
 ---
+# The keyholder's own cloud identity.
+#
+# It gets a dedicated ServiceAccount rather than the namespace default so that
+# the bucket grant names THIS workload: a binding on the default account would
+# hand the instance's storage to anything that happens to run in the namespace.
+#
+# No token is mounted (automountServiceAccountToken is false below). On GKE the
+# metadata server identifies a Pod from its ServiceAccount out of band, so
+# Workload Identity resolves without a projected token — which is what lets
+# ADR 0008 decision 1's "no volumes of any kind" hold while decision 8's
+# cloud-side bucket credential still works.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{.Name}}
+  namespace: {{.Namespace}}
+  labels:
+    app.kubernetes.io/name: {{.Name}}
+    app.kubernetes.io/managed-by: farcast
+---
 apiVersion: v1
 kind: Secret
 metadata:
@@ -352,6 +372,7 @@ spec:
           labelSelector:
             matchLabels:
               app.kubernetes.io/name: datasphered
+      serviceAccountName: {{.Name}}
       containers:
         - name: datasphered
           image: {{.Image}}
