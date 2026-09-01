@@ -75,6 +75,7 @@ farcast [global flags] <command> [command flags] [arguments]
 | `logs` | ⏳ stub | Stream an application's logs | 4.3 |
 | `costs` | ⏳ stub | Show spending and distance to the cost limit | 4.3 |
 | `storage` | ✅ works | The instance's encrypted disk: `ls`, `cp`, `rm`, `usage`, `key …` | 3.3 |
+| `kernel` | ✅ works | Deploy TechnoCore, which meters the instance and enforces its cost limit | 4.1 |
 | `chat` | ⏳ stub | Terminal AI chat through AllThing | 6.2 |
 
 *Legend: ✅ works · 📋 specified, not yet implemented · ⏳ stub.* Stubbed commands route correctly and print a clear "not yet implemented (phase N)" message to stderr, exiting non-zero. This mirrors the SDK's `ErrNotImplemented` pattern: the whole surface is visible and navigable before the features land. `install` is the canonical verb for creating an instance — the CLI, the root README, and the [instance lifecycle](../../README.md#instance-lifecycle) (`install → bind → run → release`) all use it.
@@ -242,6 +243,7 @@ FarCast treats cost control as a safeguard, not a dashboard ([root README](../..
 
 - **No default and no skip.** Omitting `--cost-limit` unattended is a usage error; interactively, the prompt repeats until a valid positive amount is given.
 - The limit is persisted in `metadata.yaml`. **Enforcement belongs to TechnoCore** ([phase 4.1](../../technocore/README.md)); 1.3 *captures and persists* the ceiling so the enforcement loop and every cost-aware command have an authoritative value to read. Recording it at install time is what makes "no instance without a limit" a property of the system rather than a habit.
+- **A limit below the instance floor is flagged where the number is chosen.** An instance costs something standing still — the Autopilot cluster's own managed workloads, the load-balancer carrier, and the system tier's Pods — so a limit under that total is one TechnoCore would reach before a single application ran, and could not fix, because it never stops the tunnel or the key holder. `install` prints the breakdown against the **fully provisioned** floor rather than what happens to be deployed at that moment: an instance installed today runs almost nothing, and checking against *that* would pass a figure the operator is guaranteed to breach two commands later. It warns rather than refuses — the figures model a published rate card and the cluster line has never been checked against an invoice ([ADR 0009](../../docs/adr/0009-technocore-kernel-and-cost-metering.md) decisions 4 and 10) — and a deliberately low limit is legitimate for an instance meant to be torn down within the month.
 
 For 1.3 the limit is a monthly USD amount (`{amount, currency: USD, period: monthly}` in metadata, with currency/period fixed); generalizing currency and window is a later refinement.
 
@@ -723,6 +725,30 @@ Cost is **surfaced, never gated**, per [ADR 0007](../../docs/adr/0007-instance-o
 The bucket is ensured **lazily, at first storage use**, never at `install`: an empty bucket costs $0.00 and serves nothing, and the registry's defensive-ensure precedent already proves lazy convergence. The record is written **before** the create call, because the name's 32 bits of entropy exist nowhere else and the name is deliberately not re-derivable from the instance (its instance segment may have been truncated to fit GCS's 63-character cap).
 
 The mint/record/retry loop belongs here, in the record-owning caller, never in the adapter — which mints nothing. On `ErrNotOwned` it mints a new suffix, updates the record and retries, bounded at 3 attempts. **With one hard exception:** if `created_at` is set, the bucket was ensured successfully before, and `ErrNotOwned` now means something changed rather than a name collision — auto-minting past it would abandon the operator's data under a name nothing points at any more. That case stops and asks the operator to look. Any other error keeps the record and fails, so a re-run converges.
+
+---
+
+## `farcast kernel` — the in-cluster kernel (Phase 4.1)
+
+`farcast kernel deploy <instance>` builds and pushes TechnoCore's image to the instance's own registry ([ADR 0007](../../docs/adr/0007-instance-owned-image-registry.md)), then applies its workload: a ServiceAccount, a ClusterRole bound per-namespace, a Role pinned to one ConfigMap, and a single-replica Deployment.
+
+### What it deploys, and what that costs
+
+One replica at 100m/128Mi — about $4/month, derived from [`technocore/deploy`](../../technocore/deploy/)'s own declared requests so the figure in the prompt cannot drift from the manifest applied. The gate names that, names what the kernel will do once running, and — when the instance's limit is below its floor — prints the breakdown and says why a shutdown cannot close the gap.
+
+### The limit it enforces is the instance's own
+
+The cost limit reaches the container as arguments rendered from `metadata.yaml`, so a kernel can never be deployed enforcing a number the operator never chose. What was deployed is recorded back into `metadata.yaml` **before** the apply, like every other billable thing this CLI creates: a workload the local state does not know about is one nobody will think to tear down. The record includes the limit the *deployed* kernel is enforcing, which is not necessarily the instance's current limit — when they diverge, the cluster is still acting on the old one until the next deploy.
+
+### It refuses more than it accepts
+
+- An instance that is **not connected** — there is nothing to meter yet, and a cost enforcer with nothing to enforce against is a standing charge for nothing.
+- An instance with **no recorded cost limit** — the kernel would meter it and never act, which is the one configuration that looks like cost control and is not.
+- Anything the manifest itself refuses: an image that is not digest-pinned, a zero limit, a metered namespace under `kube-*` ([ADR 0003](../../docs/adr/0003-gke-autopilot.md) puts the managed namespaces out of bounds).
+
+### What the kernel may do once it is running
+
+Stop **applications** and nothing else. `datasphered` and FatLine carry `farcast.sofmon.com/tier: system` and are classified last-to-die: stopping them would make storage impossible to unseal while the instance kept billing ([ADR 0008](../../docs/adr/0008-in-cluster-key-delivery.md)). A workload carrying no tier label is protected rather than stopped, and counted in the report — the two mistakes are not equally bad, so the tie goes to not stopping.
 
 ---
 

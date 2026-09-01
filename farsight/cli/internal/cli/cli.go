@@ -170,6 +170,7 @@ func defaultRegistry() *Registry {
 	reg.Register(newStub("logs", "Stream an application's logs", "4.3"))
 	reg.Register(newStub("costs", "Show spending and distance to the cost limit", "4.3"))
 	reg.Register(newStorageCommand())
+	reg.Register(newKernelCommand())
 	reg.Register(newStub("chat", "Terminal AI chat through AllThing", "6.2"))
 
 	return reg
