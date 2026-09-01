@@ -151,6 +151,34 @@ type Keyholder struct {
 	RecordedAt time.Time `yaml:"recorded_at,omitempty"`
 }
 
+// Kernel records the in-cluster TechnoCore.
+//
+// Nothing secret lives here. It exists for the same reason the Keyholder block
+// does: a workload running in a cluster that local state does not know about
+// is one nobody will think to tear down — and for the kernel there is a second
+// reason, which is that its cost limit is the one the cluster is enforcing.
+// When the recorded limit and the instance's limit diverge, the cluster is
+// still acting on the old one until it is redeployed.
+type Kernel struct {
+	Deployed bool   `yaml:"deployed,omitempty"`
+	Image    string `yaml:"image,omitempty"` // digest-pinned
+	Replicas int    `yaml:"replicas,omitempty"`
+
+	// Namespaces is what the deployed kernel meters and may act in. It is
+	// recorded because the RoleBindings that grant it were rendered from this
+	// list: a namespace added later is one the kernel cannot see until the
+	// next deploy.
+	Namespaces []string `yaml:"namespaces,omitempty"`
+
+	// Limit is the cost limit the deployed kernel is enforcing, which is not
+	// necessarily the instance's current limit.
+	Limit    float64 `yaml:"limit,omitempty"`
+	Currency string  `yaml:"currency,omitempty"`
+	Period   string  `yaml:"period,omitempty"`
+
+	RecordedAt time.Time `yaml:"recorded_at,omitempty"`
+}
+
 // InstanceMetadata is the non-secret record for an installed instance.
 type InstanceMetadata struct {
 	Name      string    `yaml:"name"`
@@ -183,6 +211,9 @@ type InstanceMetadata struct {
 	// Keyholder is the in-cluster process that serves storage to
 	// applications; nil until `farcast storage deploy` has run.
 	Keyholder *Keyholder `yaml:"keyholder,omitempty"`
+
+	// Kernel records the in-cluster TechnoCore, if one has been deployed.
+	Kernel *Kernel `yaml:"kernel,omitempty"`
 }
 
 // MTLSMaterial is a per-instance data-plane mTLS identity, PEM-encoded. It is a
