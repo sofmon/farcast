@@ -176,7 +176,24 @@ type Kernel struct {
 	Currency string  `yaml:"currency,omitempty"`
 	Period   string  `yaml:"period,omitempty"`
 
+	// Confirmations are the provider figures this machine has pushed into the
+	// instance, kept locally because the operator's machine is the author.
+	// The kernel is granted read-only access to them in the cluster, so this
+	// record — not the cluster's copy — is what a later push appends to.
+	Confirmations []KernelConfirmation `yaml:"confirmations,omitempty"`
+
 	RecordedAt time.Time `yaml:"recorded_at,omitempty"`
+}
+
+// KernelConfirmation is one closed window's confirmed cost, as pushed.
+//
+// Nothing secret is here either: the provider computed every number in it
+// before FarCast did.
+type KernelConfirmation struct {
+	Start time.Time `yaml:"start"`
+	End   time.Time `yaml:"end"`
+	USD   float64   `yaml:"usd"`
+	AsOf  time.Time `yaml:"as_of,omitempty"`
 }
 
 // InstanceMetadata is the non-secret record for an installed instance.
