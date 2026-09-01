@@ -29,12 +29,13 @@ var technocoreComponent = systemComponent{
 func newKernelCommand() Command {
 	subs := NewRegistry()
 	subs.Register(&kernelDeployCommand{})
+	subs.Register(&kernelConfirmCommand{})
 	return &group{
 		name:     "kernel",
-		synopsis: "The in-cluster kernel that enforces the cost limit (deploy)",
+		synopsis: "The in-cluster kernel that enforces the cost limit (deploy, confirm)",
 		subs:     subs,
 		usage: `
-Usage: farcast kernel <deploy> [flags] [arguments]
+Usage: farcast kernel <deploy|confirm> [flags] [arguments]
 
 TechnoCore, the kernel: it watches what an instance runs, meters what that
 costs, and enforces the cost limit the instance was installed with.

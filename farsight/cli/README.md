@@ -75,7 +75,7 @@ farcast [global flags] <command> [command flags] [arguments]
 | `logs` | ⏳ stub | Stream an application's logs | 4.3 |
 | `costs` | ⏳ stub | Show spending and distance to the cost limit | 4.3 |
 | `storage` | ✅ works | The instance's encrypted disk: `ls`, `cp`, `rm`, `usage`, `key …` | 3.3 |
-| `kernel` | ✅ works | Deploy TechnoCore, which meters the instance and enforces its cost limit | 4.1 |
+| `kernel` | ✅ works | Deploy TechnoCore and push the provider's confirmed costs to it: `deploy`, `confirm` | 4.1 |
 | `chat` | ⏳ stub | Terminal AI chat through AllThing | 6.2 |
 
 *Legend: ✅ works · 📋 specified, not yet implemented · ⏳ stub.* Stubbed commands route correctly and print a clear "not yet implemented (phase N)" message to stderr, exiting non-zero. This mirrors the SDK's `ErrNotImplemented` pattern: the whole surface is visible and navigable before the features land. `install` is the canonical verb for creating an instance — the CLI, the root README, and the [instance lifecycle](../../README.md#instance-lifecycle) (`install → bind → run → release`) all use it.
@@ -745,6 +745,18 @@ The cost limit reaches the container as arguments rendered from `metadata.yaml`,
 - An instance that is **not connected** — there is nothing to meter yet, and a cost enforcer with nothing to enforce against is a standing charge for nothing.
 - An instance with **no recorded cost limit** — the kernel would meter it and never act, which is the one configuration that looks like cost control and is not.
 - Anything the manifest itself refuses: an image that is not digest-pinned, a zero limit, a metered namespace under `kube-*` ([ADR 0003](../../docs/adr/0003-gke-autopilot.md) puts the managed namespaces out of bounds).
+
+### `farcast kernel confirm` — the confirmed half of the two-signal model
+
+The kernel meters continuously from declared resource requests. That figure is **`expected`**, and it is what protective action fires on. `farcast kernel confirm <instance> --amount <n>` supplies **`confirmed`**: the provider's own number for a window that has closed, which arrives late, never drives an action, and exists to correct the estimate and calibrate the model behind it.
+
+This is [ADR 0009](../../docs/adr/0009-technocore-kernel-and-cost-metering.md)'s channel B1 — the operator's machine already holds the cloud credential, so it reads the bill and pushes the number. No billing credential ever enters the cluster: reading billing in-cluster would need a grant scoped to a *billing account*, which spans every project the operator owns.
+
+**Windows must not overlap, and the default continues from where the last push ended** — with no `--from` it starts at the end of the last window pushed this period, and with no `--to` it ends at today's UTC midnight. Running it daily therefore appends one window per day with no bookkeeping. A second run on the same day has an empty window and says so rather than failing, because a cron job doing exactly the right thing should not be noisy.
+
+An overlap is refused *here*, not left to the kernel: the kernel's only recourse would be to skip the window in silence, which looks identical to a confirmation that worked. Refusing at the point of entry means the operator finds out while they still have the invoice open. The push is recorded locally before it is applied, and rolled back if the apply fails — a confirmation the cluster never received would be skipped by the next push and the window would go unconfirmed forever.
+
+**Zero is a real answer.** An idle window genuinely cost nothing, so `--amount 0` is accepted and is distinct from omitting the flag — the same distinction the kernel keeps between "no confirmation yet" and "confirmed zero", carried through to the command line.
 
 ### What the kernel may do once it is running
 
