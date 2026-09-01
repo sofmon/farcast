@@ -31,10 +31,17 @@ import (
 // leave a runaway workload unbilled for an hour.
 const DefaultInterval = 30 * time.Second
 
-// PodLister is the slice of the Kubernetes client this loop needs. It is an
+// Cluster is the slice of the Kubernetes client this loop needs. It is an
 // interface so the loop is tested against fixtures rather than a cluster.
-type PodLister interface {
+//
+// Pods and Deployments are both listed, and for different jobs: pods are what
+// Autopilot bills, so they are what the meter reads; deployments are what can
+// actually be stopped, because deleting a pod only makes its controller
+// create another one.
+type Cluster interface {
 	ListPods(ctx context.Context, namespace, selector string) ([]kube.Pod, error)
+	ListDeployments(ctx context.Context, namespace, selector string) ([]kube.Deployment, error)
+	Scale(ctx context.Context, namespace, name string, replicas int) error
 }
 
 // ManagedBy selects the workloads FarCast created. A kernel that metered
@@ -44,7 +51,7 @@ const ManagedBy = "app.kubernetes.io/managed-by=farcast"
 
 // Reconciler meters an instance against its cost limit.
 type Reconciler struct {
-	Pods       PodLister
+	Cluster    Cluster
 	Namespaces []string
 	Ledger     *cost.Ledger
 	Limit      float64
@@ -68,8 +75,27 @@ type Workload struct {
 	Name      string
 	App       string
 	Tier      tier.Tier
+	// Labels are kept so a deployment's selector can claim this pod without
+	// a second API call.
+	Labels    map[string]string
 	CPUMilli  int
 	MemMiB    int
+	HourlyUSD float64
+}
+
+// Target is a workload a cost shutdown could act on: a Deployment, with the
+// cost of the pods its selector claims.
+//
+// The distinction from Workload is the whole point. A Workload is a pod —
+// what bills. A Target is a Deployment — what can be stopped. Conflating them
+// produces a shutdown that deletes pods and watches their controllers put
+// them straight back.
+type Target struct {
+	Namespace string
+	Name      string
+	Tier      tier.Tier
+	Replicas  int
+	Pods      int
 	HourlyUSD float64
 }
 
@@ -103,16 +129,24 @@ type Report struct {
 	RateByApp     map[string]float64
 	Accrual       cost.Accrual
 	Assessment    cost.Assessment
+
+	// Targets are the deployments this tick saw, with the cost of the pods
+	// each one claims.
+	Targets []Target
 }
 
-// Stoppable returns the workloads a cost shutdown may stop, most expensive
-// first. It is the ordering [ADR 0009] decision 6 specifies, computed once
-// here rather than re-derived at each call site.
-func (r Report) Stoppable() []Workload {
-	var out []Workload
-	for _, w := range r.Workloads {
-		if w.Tier.Stoppable() {
-			out = append(out, w)
+// Stoppable returns the deployments a cost shutdown may stop, most expensive
+// first, excluding any already scaled to zero.
+//
+// The ordering is [ADR 0009] decision 6's, computed once here rather than
+// re-derived at each call site with a subtly different opinion. It matters
+// because a shutdown is not atomic: if only some scale calls succeed, the
+// ones that did should be the ones that were costing the most.
+func (r Report) Stoppable() []Target {
+	var out []Target
+	for _, t := range r.Targets {
+		if t.Tier.Stoppable() && t.Replicas > 0 {
+			out = append(out, t)
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -122,16 +156,6 @@ func (r Report) Stoppable() []Workload {
 		return out[i].Name < out[j].Name
 	})
 	return out
-}
-
-// AtFloor reports that every stoppable workload is already stopped and
-// spending is still over the limit. There is nothing further the kernel may
-// do: what remains is the instance's own standing cost, and the levers that
-// would reduce it — dropping the load-balancer carrier, releasing the
-// instance — destroy operator-visible capability or data. Decision 8 says a
-// kernel reports that rather than taking either.
-func (r Report) AtFloor() bool {
-	return r.Assessment.Level.Acts() && len(r.Stoppable()) == 0
 }
 
 // Reconcile observes the instance once and accrues the elapsed interval.
@@ -144,7 +168,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, now time.Time) (Report, erro
 	}
 
 	for _, ns := range r.Namespaces {
-		pods, err := r.Pods.ListPods(ctx, ns, r.Selector)
+		pods, err := r.Cluster.ListPods(ctx, ns, r.Selector)
 		if err != nil {
 			return Report{}, fmt.Errorf("kernel: list pods in %s: %w", ns, err)
 		}
@@ -161,6 +185,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, now time.Time) (Report, erro
 				Name:      p.Metadata.Name,
 				App:       appOf(p),
 				Tier:      tier.Of(p.Metadata.Labels),
+				Labels:    p.Metadata.Labels,
 				CPUMilli:  cpu,
 				MemMiB:    mem,
 				HourlyUSD: pricing.PodHourlyUSD(cpu, mem),
@@ -178,6 +203,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, now time.Time) (Report, erro
 		}
 	}
 
+	if err := r.collectTargets(ctx, &rep); err != nil {
+		return Report{}, err
+	}
+
 	billed := r.billableInterval(now)
 	rep.Billed = billed
 	rep.Reconstructed = r.Interval > 0 && billed > 2*r.Interval
@@ -193,6 +222,40 @@ func (r *Reconciler) Reconcile(ctx context.Context, now time.Time) (Report, erro
 	_, periodEnd := r.Ledger.Period()
 	rep.Assessment = cost.Assess(rep.Accrual.Total, r.Limit, rep.RateHourlyUSD, now, periodEnd)
 	return rep, nil
+}
+
+// collectTargets lists the deployments in each namespace and attributes the
+// pods already metered to whichever one claims them.
+//
+// A pod matching no deployment is simply not attributed: datasphered's pods
+// belong to a StatefulSet, and the system tier is never stopped anyway, so
+// there is nothing to gain from teaching this to walk owner references.
+func (r *Reconciler) collectTargets(ctx context.Context, rep *Report) error {
+	for _, ns := range r.Namespaces {
+		deps, err := r.Cluster.ListDeployments(ctx, ns, r.Selector)
+		if err != nil {
+			return fmt.Errorf("kernel: list deployments in %s: %w", ns, err)
+		}
+		for _, d := range deps {
+			t := Target{
+				Namespace: ns,
+				Name:      d.Metadata.Name,
+				Tier:      tier.Of(d.Metadata.Labels),
+				Replicas:  d.Status.Replicas,
+			}
+			if d.Spec.Replicas != nil {
+				t.Replicas = *d.Spec.Replicas
+			}
+			for _, w := range rep.Workloads {
+				if w.Namespace == ns && d.Spec.Selector.Matches(w.Labels) {
+					t.Pods++
+					t.HourlyUSD += w.HourlyUSD
+				}
+			}
+			rep.Targets = append(rep.Targets, t)
+		}
+	}
+	return nil
 }
 
 // billableInterval is how long to charge for.

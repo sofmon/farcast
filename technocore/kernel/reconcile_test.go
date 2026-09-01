@@ -3,6 +3,7 @@ package kernel
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -17,18 +18,52 @@ var (
 	stop  = time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
 )
 
-type fakePods struct {
-	byNS map[string][]kube.Pod
-	err  error
-	seen []string
+type fakeCluster struct {
+	byNS    map[string][]kube.Pod
+	depsNS  map[string][]kube.Deployment
+	err     error
+	depErr  error
+	scaleAt map[string]error
+	seen    []string
+	scaled  []string
 }
 
-func (f *fakePods) ListPods(_ context.Context, ns, selector string) ([]kube.Pod, error) {
+func (f *fakeCluster) ListPods(_ context.Context, ns, selector string) ([]kube.Pod, error) {
 	f.seen = append(f.seen, ns+"|"+selector)
 	if f.err != nil {
 		return nil, f.err
 	}
 	return f.byNS[ns], nil
+}
+
+func (f *fakeCluster) ListDeployments(_ context.Context, ns, _ string) ([]kube.Deployment, error) {
+	if f.depErr != nil {
+		return nil, f.depErr
+	}
+	return f.depsNS[ns], nil
+}
+
+func (f *fakeCluster) Scale(_ context.Context, ns, name string, replicas int) error {
+	key := ns + "/" + name
+	f.scaled = append(f.scaled, fmt.Sprintf("%s=%d", key, replicas))
+	return f.scaleAt[key]
+}
+
+// deployment builds a Deployment claiming pods labelled app.kubernetes.io/name=app.
+func deployment(name, ns, app string, tr tier.Tier, replicas int) kube.Deployment {
+	labels := map[string]string{"app.kubernetes.io/name": app}
+	if tr != tier.Unknown {
+		labels[tier.Label] = string(tr)
+	}
+	r := replicas
+	return kube.Deployment{
+		Metadata: kube.ObjectMeta{Name: name, Namespace: ns, Labels: labels},
+		Spec: kube.DeploymentSpec{
+			Replicas: &r,
+			Selector: &kube.LabelSelector{MatchLabels: map[string]string{"app.kubernetes.io/name": app}},
+		},
+		Status: kube.DeploymentStatus{Replicas: replicas},
+	}
 }
 
 func pod(name, ns, app string, tr tier.Tier, phase, cpu, mem string) kube.Pod {
@@ -45,14 +80,14 @@ func pod(name, ns, app string, tr tier.Tier, phase, cpu, mem string) kube.Pod {
 	}
 }
 
-func reconciler(t *testing.T, pods *fakePods, namespaces ...string) *Reconciler {
+func reconciler(t *testing.T, pods *fakeCluster, namespaces ...string) *Reconciler {
 	t.Helper()
 	l, err := cost.NewLedger(start, stop)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return &Reconciler{
-		Pods: pods, Namespaces: namespaces, Ledger: l,
+		Cluster: pods, Namespaces: namespaces, Ledger: l,
 		Limit: 50, Interval: 30 * time.Second, Selector: ManagedBy,
 	}
 }
@@ -61,7 +96,7 @@ func reconciler(t *testing.T, pods *fakePods, namespaces ...string) *Reconciler 
 // so any interval would be invented. Billing one on the first tick is how a
 // restarting kernel double-charges.
 func TestTheFirstReconcileObservesButDoesNotBill(t *testing.T) {
-	f := &fakePods{byNS: map[string][]kube.Pod{
+	f := &fakeCluster{byNS: map[string][]kube.Pod{
 		"farcast-apps": {pod("web-1", "farcast-apps", "web", tier.App, kube.PodRunning, "100m", "128Mi")},
 	}}
 	r := reconciler(t, f, "farcast-apps")
@@ -89,7 +124,7 @@ func TestTheFirstReconcileObservesButDoesNotBill(t *testing.T) {
 }
 
 func TestSubsequentReconcilesBillTheElapsedInterval(t *testing.T) {
-	f := &fakePods{byNS: map[string][]kube.Pod{
+	f := &fakeCluster{byNS: map[string][]kube.Pod{
 		"farcast-apps": {pod("web-1", "farcast-apps", "web", tier.App, kube.PodRunning, "100m", "128Mi")},
 	}}
 	r := reconciler(t, f, "farcast-apps")
@@ -117,7 +152,7 @@ func TestSubsequentReconcilesBillTheElapsedInterval(t *testing.T) {
 // throughout is the approximation ADR 0009 records — and it must be reported,
 // not hidden, because it is the one number in the ledger that was inferred.
 func TestARestartGapIsBilledAndFlagged(t *testing.T) {
-	f := &fakePods{byNS: map[string][]kube.Pod{
+	f := &fakeCluster{byNS: map[string][]kube.Pod{
 		"farcast-apps": {pod("web-1", "farcast-apps", "web", tier.App, kube.PodRunning, "100m", "128Mi")},
 	}}
 	r := reconciler(t, f, "farcast-apps")
@@ -139,7 +174,7 @@ func TestARestartGapIsBilledAndFlagged(t *testing.T) {
 // A zero or corrupt Last must not bill from the epoch — that would blow every
 // threshold at once, on an instance that had done nothing wrong.
 func TestBillingIsFlooredAtThePeriodStart(t *testing.T) {
-	f := &fakePods{byNS: map[string][]kube.Pod{
+	f := &fakeCluster{byNS: map[string][]kube.Pod{
 		"farcast-apps": {pod("web-1", "farcast-apps", "web", tier.App, kube.PodRunning, "100m", "128Mi")},
 	}}
 	r := reconciler(t, f, "farcast-apps")
@@ -157,7 +192,7 @@ func TestBillingIsFlooredAtThePeriodStart(t *testing.T) {
 // Time going backwards (a corrected clock, a replayed checkpoint) must not
 // produce a negative interval or a credit.
 func TestTimeGoingBackwardsBillsNothing(t *testing.T) {
-	f := &fakePods{byNS: map[string][]kube.Pod{
+	f := &fakeCluster{byNS: map[string][]kube.Pod{
 		"farcast-apps": {pod("web-1", "farcast-apps", "web", tier.App, kube.PodRunning, "100m", "128Mi")},
 	}}
 	r := reconciler(t, f, "farcast-apps")
@@ -174,7 +209,7 @@ func TestTimeGoingBackwardsBillsNothing(t *testing.T) {
 }
 
 func TestTerminalPodsAreNotMetered(t *testing.T) {
-	f := &fakePods{byNS: map[string][]kube.Pod{
+	f := &fakeCluster{byNS: map[string][]kube.Pod{
 		"farcast-apps": {
 			pod("a", "farcast-apps", "web", tier.App, kube.PodRunning, "100m", "128Mi"),
 			pod("b", "farcast-apps", "web", tier.App, kube.PodSucceeded, "100m", "128Mi"),
@@ -197,7 +232,7 @@ func TestTerminalPodsAreNotMetered(t *testing.T) {
 // never appear in the stoppable set, and applications must come out most
 // expensive first.
 func TestStoppableExcludesTheSystemTierAndOrdersByCost(t *testing.T) {
-	f := &fakePods{byNS: map[string][]kube.Pod{
+	f := &fakeCluster{byNS: map[string][]kube.Pod{
 		"farcast-system": {
 			pod("fatline-1", "farcast-system", "fatline", tier.System, kube.PodRunning, "100m", "128Mi"),
 			pod("technocore-1", "farcast-system", "technocore", tier.Kernel, kube.PodRunning, "100m", "128Mi"),
@@ -208,6 +243,14 @@ func TestStoppableExcludesTheSystemTierAndOrdersByCost(t *testing.T) {
 			pod("nolabel", "farcast-apps", "mystery", tier.Unknown, kube.PodRunning, "100m", "128Mi"),
 		},
 	}}
+	f.depsNS = map[string][]kube.Deployment{
+		"farcast-system": {deployment("fatline", "farcast-system", "fatline", tier.System, 2)},
+		"farcast-apps": {
+			deployment("small", "farcast-apps", "small", tier.App, 1),
+			deployment("big", "farcast-apps", "big", tier.App, 1),
+			deployment("mystery", "farcast-apps", "mystery", tier.Unknown, 1),
+		},
+	}
 	r := reconciler(t, f, "farcast-system", "farcast-apps")
 	rep, err := r.Reconcile(context.Background(), start)
 	if err != nil {
@@ -216,7 +259,7 @@ func TestStoppableExcludesTheSystemTierAndOrdersByCost(t *testing.T) {
 
 	got := rep.Stoppable()
 	if len(got) != 2 {
-		t.Fatalf("stoppable = %d workloads, want 2 (the two apps)", len(got))
+		t.Fatalf("stoppable = %d targets, want 2 (the two app deployments)", len(got))
 	}
 	if got[0].Name != "big" || got[1].Name != "small" {
 		t.Errorf("stoppable order = %s, %s; want the expensive one first", got[0].Name, got[1].Name)
@@ -225,6 +268,16 @@ func TestStoppableExcludesTheSystemTierAndOrdersByCost(t *testing.T) {
 		if w.Tier == tier.System || w.Tier == tier.Kernel {
 			t.Errorf("%s is %q and must never be stoppable", w.Name, w.Tier)
 		}
+	}
+	// The unlabelled deployment is protected, not stopped.
+	for _, w := range got {
+		if w.Name == "mystery" {
+			t.Error("an unlabelled deployment must not be stoppable")
+		}
+	}
+	// Each target carries the cost of the pods its selector claims.
+	if got[0].Pods != 1 || got[0].HourlyUSD <= got[1].HourlyUSD {
+		t.Errorf("target costs did not follow the pods: %+v vs %+v", got[0], got[1])
 	}
 
 	// The unlabelled pod is metered and protected, and its existence is
@@ -242,7 +295,7 @@ func TestStoppableExcludesTheSystemTierAndOrdersByCost(t *testing.T) {
 // further a kernel may do, and decision 8 says it reports rather than reaching
 // for the levers that destroy data.
 func TestAtFloorWhenNothingStoppableRemains(t *testing.T) {
-	f := &fakePods{byNS: map[string][]kube.Pod{
+	f := &fakeCluster{byNS: map[string][]kube.Pod{
 		"farcast-system": {pod("fatline-1", "farcast-system", "fatline", tier.System, kube.PodRunning, "100m", "128Mi")},
 	}}
 	r := reconciler(t, f, "farcast-system")
@@ -263,9 +316,14 @@ func TestAtFloorWhenNothingStoppableRemains(t *testing.T) {
 }
 
 func TestNotAtFloorWhileApplicationsRemain(t *testing.T) {
-	f := &fakePods{byNS: map[string][]kube.Pod{
-		"farcast-apps": {pod("web", "farcast-apps", "web", tier.App, kube.PodRunning, "100m", "128Mi")},
-	}}
+	f := &fakeCluster{
+		byNS: map[string][]kube.Pod{
+			"farcast-apps": {pod("web", "farcast-apps", "web", tier.App, kube.PodRunning, "100m", "128Mi")},
+		},
+		depsNS: map[string][]kube.Deployment{
+			"farcast-apps": {deployment("web", "farcast-apps", "web", tier.App, 1)},
+		},
+	}
 	r := reconciler(t, f, "farcast-apps")
 	r.Limit = 0.0001
 	if _, err := r.Reconcile(context.Background(), start); err != nil {
@@ -280,7 +338,7 @@ func TestNotAtFloorWhileApplicationsRemain(t *testing.T) {
 // A pod whose requests do not parse is a pod whose cost is unknown. Metering
 // it as zero would be the flattering answer; the loop refuses instead.
 func TestAnUnparseableRequestFailsTheTick(t *testing.T) {
-	f := &fakePods{byNS: map[string][]kube.Pod{
+	f := &fakeCluster{byNS: map[string][]kube.Pod{
 		"farcast-apps": {pod("web", "farcast-apps", "web", tier.App, kube.PodRunning, "100 potatoes", "128Mi")},
 	}}
 	r := reconciler(t, f, "farcast-apps")
@@ -290,7 +348,7 @@ func TestAnUnparseableRequestFailsTheTick(t *testing.T) {
 }
 
 func TestAListFailureFailsTheTick(t *testing.T) {
-	f := &fakePods{err: errors.New("api server said no")}
+	f := &fakeCluster{err: errors.New("api server said no")}
 	r := reconciler(t, f, "farcast-apps")
 	if _, err := r.Reconcile(context.Background(), start); err == nil {
 		t.Fatal("expected the list failure to surface")
@@ -305,7 +363,7 @@ func TestAttributionFallsBackToTheWorkloadName(t *testing.T) {
 		Spec:     kube.PodSpec{Containers: []kube.Container{{Name: "c"}}},
 		Status:   kube.PodStatus{Phase: kube.PodRunning},
 	}
-	f := &fakePods{byNS: map[string][]kube.Pod{"farcast-apps": {p}}}
+	f := &fakeCluster{byNS: map[string][]kube.Pod{"farcast-apps": {p}}}
 	r := reconciler(t, f, "farcast-apps")
 	rep, err := r.Reconcile(context.Background(), start)
 	if err != nil {
