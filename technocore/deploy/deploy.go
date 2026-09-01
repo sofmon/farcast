@@ -315,6 +315,11 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: technocore
+        # The kernel selects pods by this label (technocore/kernel.ManagedBy).
+        # It is on the workload above as well, but a controller does not copy
+        # its own labels onto the pods it creates — so without it here the
+        # meter sees nothing at all and reports $0 forever.
+        app.kubernetes.io/managed-by: farcast
         farcast.sofmon.com/tier: kernel
     spec:
       serviceAccountName: {{.Name}}

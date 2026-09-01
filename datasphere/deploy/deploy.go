@@ -355,6 +355,11 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: datasphered
+        # The kernel selects pods by this label (technocore/kernel.ManagedBy).
+        # It is on the workload above as well, but a controller does not copy
+        # its own labels onto the pods it creates — so without it here the
+        # meter sees nothing at all and reports $0 forever.
+        app.kubernetes.io/managed-by: farcast
         # On the pod too, not only the StatefulSet: TechnoCore reads pods to
         # meter and workloads to scale, and a label on one of the two is a
         # classification with a hole in it.
