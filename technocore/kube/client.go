@@ -34,12 +34,10 @@ var (
 	ErrConflict     = errors.New("kube: conflict")
 )
 
-// APIError carries the server's own Status object alongside the sentinel, so a
-// log line can say what the API server said rather than what this package
-// guessed.
+// APIError carries the server's own Status object, so a log line can say what
+// the API server said rather than what this package guessed.
 type APIError struct {
 	Status Status
-	kind   error
 }
 
 func (e *APIError) Error() string {
@@ -47,10 +45,34 @@ func (e *APIError) Error() string {
 	if msg == "" {
 		msg = e.Status.Reason
 	}
+	if msg == "" {
+		msg = http.StatusText(e.Status.Code)
+	}
 	return fmt.Sprintf("kube: api error %d: %s", e.Status.Code, msg)
 }
 
-func (e *APIError) Unwrap() error { return e.kind }
+// Unwrap derives the sentinel from the status code rather than from a stored
+// field.
+//
+// That is not a stylistic choice. APIError is exported, so callers construct
+// one — in a fake, in a test, in a wrapper — and a sentinel held in an
+// unexported field would make every externally-built APIError silently fail
+// errors.Is. The type would look usable and behave wrongly, which is the worst
+// available combination. Deriving it means an APIError built anywhere unwraps
+// the same way.
+func (e *APIError) Unwrap() error {
+	switch e.Status.Code {
+	case http.StatusNotFound:
+		return ErrNotFound
+	case http.StatusForbidden:
+		return ErrForbidden
+	case http.StatusUnauthorized:
+		return ErrUnauthorized
+	case http.StatusConflict:
+		return ErrConflict
+	}
+	return nil
+}
 
 // Client talks to the Kubernetes API server over HTTPS and JSON.
 //
@@ -158,6 +180,42 @@ func (c *Client) Scale(ctx context.Context, namespace, name string, replicas int
 	return c.do(ctx, http.MethodPatch, path, "", "application/merge-patch+json", []byte(body), nil)
 }
 
+// GetConfigMap reads a ConfigMap. A missing one is ErrNotFound, which callers
+// are expected to treat as "no checkpoint yet" rather than as a failure.
+func (c *Client) GetConfigMap(ctx context.Context, namespace, name string) (*ConfigMap, error) {
+	var out ConfigMap
+	path := fmt.Sprintf("/api/v1/namespaces/%s/configmaps/%s",
+		url.PathEscape(namespace), url.PathEscape(name))
+	if err := c.get(ctx, path, "", &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// SaveConfigMap writes a ConfigMap, creating it if it does not exist.
+//
+// An update carries the ResourceVersion the caller read, so a concurrent
+// writer produces ErrConflict rather than silently overwriting. TechnoCore
+// runs a single replica precisely so this never happens; the check is what
+// makes a second replica fail loudly instead of quietly double-counting a
+// cost ledger.
+func (c *Client) SaveConfigMap(ctx context.Context, namespace string, cm ConfigMap) error {
+	cm.Kind, cm.APIVersion = "ConfigMap", "v1"
+	cm.Metadata.Namespace = namespace
+	body, err := json.Marshal(cm)
+	if err != nil {
+		return fmt.Errorf("kube: encode configmap: %w", err)
+	}
+	base := fmt.Sprintf("/api/v1/namespaces/%s/configmaps", url.PathEscape(namespace))
+	one := base + "/" + url.PathEscape(cm.Metadata.Name)
+
+	err = c.do(ctx, http.MethodPut, one, "", "application/json", body, nil)
+	if errors.Is(err, ErrNotFound) {
+		return c.do(ctx, http.MethodPost, base, "", "application/json", body, nil)
+	}
+	return err
+}
+
 func (c *Client) get(ctx context.Context, path, selector string, out any) error {
 	return c.do(ctx, http.MethodGet, path, selector, "", nil, out)
 }
@@ -238,18 +296,7 @@ func apiError(code int, payload []byte) error {
 	if err := json.Unmarshal(payload, &st); err != nil || st.Code == 0 {
 		st = Status{Code: code, Message: strings.TrimSpace(string(payload))}
 	}
-	var kind error
-	switch code {
-	case http.StatusNotFound:
-		kind = ErrNotFound
-	case http.StatusForbidden:
-		kind = ErrForbidden
-	case http.StatusUnauthorized:
-		kind = ErrUnauthorized
-	case http.StatusConflict:
-		kind = ErrConflict
-	}
-	return &APIError{Status: st, kind: kind}
+	return &APIError{Status: st}
 }
 
 func net(host, port string) string {

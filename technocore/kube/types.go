@@ -9,9 +9,13 @@ import "time"
 // newer than this struct is a non-event.
 
 type ObjectMeta struct {
-	Name              string            `json:"name"`
-	Namespace         string            `json:"namespace"`
-	UID               string            `json:"uid"`
+	Name      string `json:"name"`
+	Namespace string `json:"namespace"`
+	UID       string `json:"uid"`
+	// ResourceVersion drives optimistic concurrency on writes. It is read
+	// so that a second writer gets a conflict rather than silently winning —
+	// TechnoCore runs one replica, and this is what makes a second one loud.
+	ResourceVersion   string            `json:"resourceVersion,omitempty"`
 	Labels            map[string]string `json:"labels"`
 	Annotations       map[string]string `json:"annotations"`
 	CreationTimestamp time.Time         `json:"creationTimestamp"`
@@ -141,7 +145,8 @@ type PodList struct {
 }
 
 type DeploymentSpec struct {
-	Replicas *int `json:"replicas"`
+	Replicas *int           `json:"replicas"`
+	Selector *LabelSelector `json:"selector"`
 }
 
 type DeploymentStatus struct {
@@ -169,4 +174,39 @@ type Status struct {
 	Message string `json:"message"`
 	Reason  string `json:"reason"`
 	Code    int    `json:"code"`
+}
+
+// LabelSelector is a Deployment's claim on pods.
+type LabelSelector struct {
+	MatchLabels map[string]string `json:"matchLabels"`
+}
+
+// Matches reports whether a pod's labels satisfy the selector.
+//
+// A nil or empty selector matches NOTHING, which is the opposite of the
+// Kubernetes API's own convention for an empty selector in some contexts. The
+// reason is the use this package puts it to: attributing pods to the workload
+// a cost shutdown would scale. An empty selector that matched everything would
+// attribute every pod in the namespace to one deployment, and the shutdown
+// would stop a workload believing it was stopping far more than it was.
+func (s *LabelSelector) Matches(labels map[string]string) bool {
+	if s == nil || len(s.MatchLabels) == 0 {
+		return false
+	}
+	for k, v := range s.MatchLabels {
+		if labels[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
+// ConfigMap is where the cost ledger is checkpointed. It is the one piece of
+// cloud-resident state TechnoCore keeps, and it discloses nothing: the
+// provider computed every number in it before TechnoCore did.
+type ConfigMap struct {
+	Kind       string            `json:"kind,omitempty"`
+	APIVersion string            `json:"apiVersion,omitempty"`
+	Metadata   ObjectMeta        `json:"metadata"`
+	Data       map[string]string `json:"data"`
 }

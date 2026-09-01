@@ -286,3 +286,131 @@ func TestInClusterRefusesOutsideACluster(t *testing.T) {
 		t.Fatal("InCluster must refuse when the environment says otherwise")
 	}
 }
+
+// A nil or empty selector must match nothing. Matching everything would
+// attribute every pod in a namespace to one deployment, and a cost shutdown
+// would then stop one workload believing it had stopped far more.
+func TestAnEmptySelectorMatchesNothing(t *testing.T) {
+	labels := map[string]string{"app": "web"}
+	var nilSel *LabelSelector
+	if nilSel.Matches(labels) {
+		t.Error("a nil selector must not match")
+	}
+	if (&LabelSelector{}).Matches(labels) {
+		t.Error("an empty selector must not match")
+	}
+	if (&LabelSelector{MatchLabels: map[string]string{}}).Matches(labels) {
+		t.Error("a selector with no labels must not match")
+	}
+}
+
+func TestSelectorMatchesOnEveryLabel(t *testing.T) {
+	sel := &LabelSelector{MatchLabels: map[string]string{"app": "web", "tier": "front"}}
+	if !sel.Matches(map[string]string{"app": "web", "tier": "front", "extra": "ok"}) {
+		t.Error("a superset of the selector's labels must match")
+	}
+	// Every label must match, not any: a pod matching half a selector belongs
+	// to a different workload.
+	if sel.Matches(map[string]string{"app": "web"}) {
+		t.Error("a partial match must not match")
+	}
+	if sel.Matches(map[string]string{"app": "web", "tier": "back"}) {
+		t.Error("a differing value must not match")
+	}
+	if sel.Matches(nil) {
+		t.Error("a pod with no labels must not match")
+	}
+}
+
+func TestGetConfigMapReportsAMissingOneAsNotFound(t *testing.T) {
+	s := server(t, http.StatusNotFound, `{"kind":"Status","code":404,"reason":"NotFound"}`, nil)
+	_, err := client(t, s.URL, tokenFileWith(t, "t")).GetConfigMap(context.Background(), "farcast-system", "ledger")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound so a caller can read it as \"no checkpoint yet\"", err)
+	}
+}
+
+func TestSaveConfigMapUpdatesThenFallsBackToCreate(t *testing.T) {
+	var calls []string
+	var lastBody string
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b := make([]byte, r.ContentLength)
+		if r.ContentLength > 0 {
+			_, _ = r.Body.Read(b)
+		}
+		lastBody = string(b)
+		calls = append(calls, r.Method+" "+r.URL.Path)
+		if r.Method == http.MethodPut {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"kind":"Status","code":404,"reason":"NotFound"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(s.Close)
+
+	cm := ConfigMap{Metadata: ObjectMeta{Name: "ledger"}, Data: map[string]string{"k": "v"}}
+	if err := client(t, s.URL, tokenFileWith(t, "t")).SaveConfigMap(context.Background(), "farcast-system", cm); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"PUT /api/v1/namespaces/farcast-system/configmaps/ledger",
+		"POST /api/v1/namespaces/farcast-system/configmaps",
+	}
+	if len(calls) != 2 || calls[0] != want[0] || calls[1] != want[1] {
+		t.Errorf("calls = %v, want %v", calls, want)
+	}
+	if !strings.Contains(lastBody, `"kind":"ConfigMap"`) {
+		t.Errorf("the created object does not declare its kind: %s", lastBody)
+	}
+}
+
+// TechnoCore runs one replica so the ledger has one writer. The
+// resourceVersion check is what makes a second one fail loudly rather than
+// silently overwrite a cost ledger with a stale copy.
+func TestSaveConfigMapSurfacesAConcurrentWriter(t *testing.T) {
+	s := server(t, http.StatusConflict, `{"kind":"Status","code":409,"reason":"Conflict","message":"stale"}`, nil)
+	cm := ConfigMap{Metadata: ObjectMeta{Name: "ledger", ResourceVersion: "42"}}
+	err := client(t, s.URL, tokenFileWith(t, "t")).SaveConfigMap(context.Background(), "farcast-system", cm)
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("err = %v, want ErrConflict", err)
+	}
+}
+
+func TestSaveConfigMapSendsTheResourceVersionItRead(t *testing.T) {
+	var seen capture
+	s := server(t, 200, `{}`, &seen)
+	cm := ConfigMap{Metadata: ObjectMeta{Name: "ledger", ResourceVersion: "1234"}, Data: map[string]string{"a": "b"}}
+	if err := client(t, s.URL, tokenFileWith(t, "t")).SaveConfigMap(context.Background(), "farcast-system", cm); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(seen.body, `"resourceVersion":"1234"`) {
+		t.Errorf("body = %q, want the resourceVersion carried for optimistic concurrency", seen.body)
+	}
+}
+
+// APIError is exported, so callers construct one — in a fake, in a wrapper, in
+// a test. A sentinel held in an unexported field would make every
+// externally-built APIError silently fail errors.Is: usable-looking and
+// wrong. This is the test that keeps it derived.
+func TestAnExternallyConstructedAPIErrorUnwrapsCorrectly(t *testing.T) {
+	cases := map[int]error{
+		http.StatusNotFound:     ErrNotFound,
+		http.StatusForbidden:    ErrForbidden,
+		http.StatusUnauthorized: ErrUnauthorized,
+		http.StatusConflict:     ErrConflict,
+	}
+	for code, want := range cases {
+		err := error(&APIError{Status: Status{Code: code}})
+		if !errors.Is(err, want) {
+			t.Errorf("code %d built outside the package does not unwrap to %v", code, want)
+		}
+	}
+	if errors.Is(&APIError{Status: Status{Code: 500}}, ErrNotFound) {
+		t.Error("a 500 must not unwrap to a sentinel it is not")
+	}
+	// An error with nothing to say still says its code.
+	if got := (&APIError{Status: Status{Code: 503}}).Error(); !strings.Contains(got, "503") {
+		t.Errorf("Error() = %q, want the status code", got)
+	}
+}
