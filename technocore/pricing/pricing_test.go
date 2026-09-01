@@ -77,3 +77,14 @@ func TestMonthIsSevenThirtyHours(t *testing.T) {
 		t.Fatalf("HoursPerMonth = %d, want 730 (365*24/12)", HoursPerMonth)
 	}
 }
+
+// The hourly figure is the monthly one over the billing convention, and the
+// floors apply to it identically — a tiny Pod is not free by the hour either.
+func TestPodHourlyUSDIsTheMonthlyFigureOverTheConvention(t *testing.T) {
+	closeTo(t, PodHourlyUSD(100, 128)*HoursPerMonth, PodMonthlyUSD(100, 128), "hourly scaled to a month")
+	// 0.1 vCPU * $0.0445 + 0.125 GiB * $0.0049, by hand.
+	closeTo(t, PodHourlyUSD(100, 128), 0.0050625, "100m/128Mi per hour")
+	if PodHourlyUSD(1, 1) != PodHourlyUSD(BurstingMinCPUMilli, BurstingMinMemMiB) {
+		t.Error("the per-Pod floor must apply to the hourly figure too")
+	}
+}

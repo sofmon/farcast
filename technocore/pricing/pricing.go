@@ -84,6 +84,15 @@ func podMonthlyUSD(cpuMilli, memMiB, minCPUMilli, minMemMiB int) float64 {
 	return (vcpu*VCPUHourUSD + gib*GiBHourUSD) * HoursPerMonth
 }
 
+// PodHourlyUSD is one Pod's cost per hour, floors applied.
+//
+// It exists so that callers metering elapsed time do not each divide a monthly
+// figure by HoursPerMonth — the kind of arithmetic that is correct in four
+// places and subtly wrong in the fifth.
+func PodHourlyUSD(cpuMilli, memMiB int) float64 {
+	return PodMonthlyUSD(cpuMilli, memMiB) / HoursPerMonth
+}
+
 // WorkloadMonthlyUSD is the standing cost of replicas identical Pods.
 //
 // Its whole reason to exist is that "the cost of this workload" and "the cost

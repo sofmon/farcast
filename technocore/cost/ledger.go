@@ -234,6 +234,9 @@ func (l *Ledger) Accrued() Accrual {
 	return a
 }
 
+// Period is the half-open window this ledger accounts for.
+func (l *Ledger) Period() (start, end time.Time) { return l.periodStart, l.periodEnd }
+
 // ByApp is the per-application breakdown, always from the local model:
 // a provider's figure is instance-level and can never be attributed.
 func (l *Ledger) ByApp() map[string]float64 {
