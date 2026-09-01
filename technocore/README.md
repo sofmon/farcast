@@ -17,4 +17,20 @@
 
 Workloads carry `farcast.sofmon.com/tier` — `kernel`, `system` or `app`. A cost shutdown scales down `app` workloads only, most expensive first. `datasphered` and FatLine are `system` and are never stopped by one: at ADR 0003's rates the whole system tier is about $15/month against an instance floor near $73, so stopping it saves a fifth of the bill and makes the instance unsealable while the rest keeps billing ([ADR 0008](../docs/adr/0008-in-cluster-key-delivery.md)'s recovery-floor finding). When every application is stopped and spending is still over the limit, TechnoCore reports the floor and names the levers that remain — releasing the load-balancer carrier, or releasing the instance. Both destroy operator-visible capability; a kernel does not take them on its own.
 
-*Implementation details to follow as 4.1 lands.*
+## Packages
+
+| Package | What it is |
+|---|---|
+| [`pricing`](pricing/) | The Autopilot rate card from [ADR 0003](../docs/adr/0003-gke-autopilot.md), and the arithmetic that turns declared Pod requests into money. No dependencies, no cluster access — the sums only. |
+| [`kube`](kube/) | A hand-rolled, standard-library Kubernetes client scoped to what a kernel needs: list pods and deployments, read requests and conditions, patch the scale subresource. Polls; does not watch. |
+| [`tier`](tier/) | The `farcast.sofmon.com/tier` classification and the rule that only applications are stoppable by a cost shutdown. |
+| [`cost`](cost/) | The `expected`/`confirmed` ledger, the calibration clamp, and threshold assessment against the limit. |
+| [`kernel`](kernel/) | The reconcile loop that joins them: observe, meter, assess. |
+
+### Two things in here that look like details and are not
+
+**The ServiceAccount token is re-read on every request.** A projected token is rotated by the kubelet while the pod runs, so a client that reads it once works perfectly until it abruptly does not — 401s an hour in, from a process that has been healthy since start-up.
+
+**An unlabelled workload is protected, not stopped.** It could be a mislabelled application, where stopping it saves money, or a system component whose label was lost, where stopping it costs an instance nobody can unseal while it carries on billing. Those two mistakes are not equally bad, so the tie goes to not stopping — and the kernel reports what it could not classify rather than guessing. The cost is real and stated: on an instance whose workloads carry no labels, a cost shutdown does nothing but say so.
+
+*Deploy manifest, RBAC and the operator-side commands follow as 4.1 lands.*
