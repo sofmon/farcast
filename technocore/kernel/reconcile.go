@@ -61,6 +61,11 @@ type Reconciler struct {
 	Limit      float64
 	Interval   time.Duration
 
+	// Confirmations supplies the provider's own figures for closed windows.
+	// Nil means none are available, which is a state the reports name rather
+	// than a failure: the instance runs on `expected` alone.
+	Confirmations ConfirmationSource
+
 	// Period names the accounting window the limit applies to — "monthly" or
 	// "daily", as captured at install. It is what Roll uses to open the next
 	// ledger when the current one ends.
@@ -118,6 +123,13 @@ type Report struct {
 	Billed time.Duration
 	// Rolled is set when this tick opened a new accounting period.
 	Rolled bool
+
+	// ConfirmationsApplied counts the provider figures this tick took in;
+	// ConfirmationsRefused counts how many of those the clamp would not let
+	// calibrate the model. A refusal is the most interesting thing the cost
+	// system can learn, so it is counted rather than buried in the accrual.
+	ConfirmationsApplied int
+	ConfirmationsRefused int
 
 	// Reconstructed is set when Billed substantially exceeded the reconcile
 	// interval — the gap after a restart or a stall, accrued by assuming the
@@ -189,6 +201,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, now time.Time) (Report, erro
 		Since:      r.Last,
 		RateByTier: map[tier.Tier]float64{},
 		RateByApp:  map[string]float64{},
+	}
+
+	// Confirmations are applied before anything is metered, so this tick's
+	// assessment already reflects them. Applying them afterwards would leave
+	// one tick's worth of decisions made against a figure the provider had
+	// already corrected.
+	if err := r.applyConfirmations(ctx, &rep); err != nil {
+		return Report{}, err
 	}
 
 	for _, ns := range r.Namespaces {
