@@ -28,11 +28,12 @@ func closeTo(t *testing.T, got, want float64, what string) {
 }
 
 // accrue runs one app at a flat hourly rate for n whole hours from the period
-// start, one hour per bucket.
+// start, one hour per bucket. Each call ends at the hour boundary it fills,
+// so hour i's spend lands in hour i's bucket.
 func accrueHours(l *Ledger, app string, usdPerHour float64, n int) {
 	for i := range n {
-		at := periodStart.Add(time.Duration(i) * time.Hour)
-		l.Accrue(at, app, usdPerHour, time.Hour)
+		endsAt := periodStart.Add(time.Duration(i+1) * time.Hour)
+		l.Accrue(endsAt, app, usdPerHour, time.Hour)
 	}
 }
 
@@ -79,7 +80,9 @@ func TestNoConfirmationIsDistinctFromConfirmedZero(t *testing.T) {
 	// whose provider has confirmed, correctly, that it cost nothing.
 	idle := newLedger(t)
 	for i := 5; i < 10; i++ {
-		idle.Accrue(periodStart.Add(time.Duration(i)*time.Hour), "web", 1, time.Hour)
+		// Ends at the boundary it fills, so hour i's spend is in hour i's
+		// bucket and hours 0-4 are genuinely idle.
+		idle.Accrue(periodStart.Add(time.Duration(i+1)*time.Hour), "web", 1, time.Hour)
 	}
 	if _, err := idle.Confirm(Confirmation{Start: periodStart, End: periodStart.Add(5 * time.Hour), USD: 0}); err != nil {
 		t.Fatal(err)
@@ -243,4 +246,57 @@ func mustConfirm(t *testing.T, l *Ledger, start, end time.Time, usd float64) {
 	if _, err := l.Confirm(Confirmation{Start: start, End: end, USD: usd}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// A restart gap is billed as one multi-hour interval. Lumping it into a single
+// bucket would make the model's per-window figures fiction — and those figures
+// are exactly what a confirmation is compared against, so the distortion would
+// surface as a phantom drift, or as a discrepancy against a provider that was
+// right all along.
+func TestALongIntervalIsSpreadAcrossTheHoursItSpans(t *testing.T) {
+	l := newLedger(t)
+	// Six hours at $1/h, billed in one call, as a restarted kernel would.
+	l.Accrue(periodStart.Add(6*time.Hour), "web", 1, 6*time.Hour)
+
+	closeTo(t, l.Accrued().Total, 6, "period total")
+	// Every hour it spanned carries its own hour's worth.
+	for i := range 6 {
+		from := periodStart.Add(time.Duration(i) * time.Hour)
+		closeTo(t, l.expectedIn(from, from.Add(time.Hour)), 1, "hour "+string(rune('0'+i)))
+	}
+	// And nothing landed outside the interval.
+	closeTo(t, l.expectedIn(periodStart.Add(6*time.Hour), periodEnd), 0, "after the interval")
+}
+
+// A confirmation covering part of a restart gap must compare against the model
+// for that part alone. Before the accrual was spread this was the case that
+// produced a spurious discrepancy.
+func TestAConfirmationOverlappingARestartGapComparesFairly(t *testing.T) {
+	l := newLedger(t)
+	l.Accrue(periodStart.Add(6*time.Hour), "web", 1, 6*time.Hour)
+
+	// The provider confirms the first three hours at exactly what the model
+	// says they cost.
+	d, err := l.Confirm(Confirmation{Start: periodStart, End: periodStart.Add(3 * time.Hour), USD: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d != nil {
+		t.Fatalf("an exactly-correct confirmation was refused: %s", d)
+	}
+	a := l.Accrued()
+	closeTo(t, a.Calibration, 1, "calibration")
+	closeTo(t, a.Total, 6, "total")
+}
+
+// A partial hour lands proportionally, so a reconcile that straddles a
+// boundary does not credit a whole hour to either side.
+func TestAPartialHourIsSplitProportionally(t *testing.T) {
+	l := newLedger(t)
+	// 30 minutes ending 15 minutes into hour 1: 15 min in hour 0, 15 in hour 1.
+	l.Accrue(periodStart.Add(75*time.Minute), "web", 4, 30*time.Minute)
+
+	closeTo(t, l.expectedIn(periodStart, periodStart.Add(time.Hour)), 1, "hour 0")
+	closeTo(t, l.expectedIn(periodStart.Add(time.Hour), periodStart.Add(2*time.Hour)), 1, "hour 1")
+	closeTo(t, l.Accrued().Total, 2, "total")
 }

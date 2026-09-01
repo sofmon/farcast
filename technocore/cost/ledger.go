@@ -134,18 +134,31 @@ func NewLedger(start, end time.Time) (*Ledger, error) {
 
 // Accrue records that app ran for d at usdPerHour, ending at now.
 //
-// The whole interval is attributed to the bucket containing now rather than
-// split across bucket boundaries. At a reconcile interval measured in seconds
-// against buckets measured in hours the error is bounded by one interval per
-// hour boundary, and it never accumulates — the period total is exact
-// regardless of how the interval fell.
+// The amount is spread across every hour bucket the interval [now-d, now)
+// actually spans, in proportion to how much of each it covers.
+//
+// Attributing the whole interval to the bucket containing now would be simpler
+// and is wrong in the one case that matters. A reconcile every 30 seconds
+// barely notices the difference — but a restart gap is billed as a single
+// multi-hour interval, and lumping six hours into one bucket makes the model's
+// per-window figures fiction. Those figures are exactly what a confirmation is
+// compared against, so the distortion would surface as a phantom drift, or as
+// a discrepancy against a provider that was right all along.
 func (l *Ledger) Accrue(now time.Time, app string, usdPerHour float64, d time.Duration) {
 	if d <= 0 || usdPerHour <= 0 {
 		return
 	}
-	amount := usdPerHour * d.Hours()
-	l.hourly[hourKey(now)] += amount
-	l.apps[app] += amount
+	l.apps[app] += usdPerHour * d.Hours()
+
+	for cur := now.Add(-d); cur.Before(now); {
+		h := hourKey(cur)
+		next := time.Unix((h+1)*3600, 0).UTC()
+		if next.After(now) {
+			next = now
+		}
+		l.hourly[h] += usdPerHour * next.Sub(cur).Hours()
+		cur = next
+	}
 }
 
 // Confirm records the provider's figure for a closed window.
