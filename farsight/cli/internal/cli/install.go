@@ -313,6 +313,14 @@ func (c *installCommand) printSummary(w io.Writer, region, clusterName string) {
 	fprintf(w, "  cluster:     %s\n", clusterName)
 	fprintf(w, "  cost limit:  %s %.2f / %s\n", costCurrency, c.costLimit, costPeriod)
 	fprintln(w, "This creates billable cloud resources.")
+
+	// The floor check belongs here, at the moment the number is chosen. An
+	// instance installed today runs almost nothing, so checking the limit
+	// against what is deployed *now* would pass a figure the operator is
+	// guaranteed to breach two commands later — the floor that matters is the
+	// fully provisioned one.
+	warnIfBelowFloor(w, config.CostLimit{Amount: c.costLimit, Currency: costCurrency, Period: costPeriod},
+		floorFull(&config.InstanceMetadata{}), "a fully provisioned instance")
 }
 
 // healthCheck confirms the instance is alive without assuming a public control-
