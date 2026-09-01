@@ -25,12 +25,18 @@ Workloads carry `farcast.sofmon.com/tier` — `kernel`, `system` or `app`. A cos
 | [`kube`](kube/) | A hand-rolled, standard-library Kubernetes client scoped to what a kernel needs: list pods and deployments, read requests and conditions, patch the scale subresource. Polls; does not watch. |
 | [`tier`](tier/) | The `farcast.sofmon.com/tier` classification and the rule that only applications are stoppable by a cost shutdown. |
 | [`cost`](cost/) | The `expected`/`confirmed` ledger, the calibration clamp, and threshold assessment against the limit. |
-| [`kernel`](kernel/) | The reconcile loop that joins them: observe, meter, assess. |
+| [`kernel`](kernel/) | The reconcile loop that joins them: observe, meter, assess, act — plus the ConfigMap checkpoint that makes the accounting survive a restart. |
 
 ### Two things in here that look like details and are not
 
 **The ServiceAccount token is re-read on every request.** A projected token is rotated by the kubelet while the pod runs, so a client that reads it once works perfectly until it abruptly does not — 401s an hour in, from a process that has been healthy since start-up.
 
 **An unlabelled workload is protected, not stopped.** It could be a mislabelled application, where stopping it saves money, or a system component whose label was lost, where stopping it costs an instance nobody can unseal while it carries on billing. Those two mistakes are not equally bad, so the tie goes to not stopping — and the kernel reports what it could not classify rather than guessing. The cost is real and stated: on an instance whose workloads carry no labels, a cost shutdown does nothing but say so.
+
+**A cost shutdown stops Deployments, not Pods.** Deleting a pod only makes its controller create another one, so the meter reads pods — which is what Autopilot bills — and the shutdown scales deployments, which is what can actually be stopped. The two are attributed to each other through the deployment's own selector.
+
+**Everything the kernel writes is a zero.** There is no code path that scales anything up. Bringing an application back after a shutdown is an operator decision, and a `confirmed` correction that dropped accrued spend below the limit leaves the applications stopped and the operator informed — which is the right way round.
+
+**The floor means "nothing left to stop", not "nothing was stopped".** An instance whose every scale call was refused has a permissions problem and plenty left to stop; reporting that as the floor would tell the operator the kernel had done all it could when it had done nothing.
 
 *Deploy manifest, RBAC and the operator-side commands follow as 4.1 lands.*
