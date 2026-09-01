@@ -239,6 +239,34 @@ Why this shape:
 
 ---
 
+## The translator — `./farcast` → workloads (Phase 4.2)
+
+[`translate.Render`](translate/) turns a parsed manifest into an apply stream: one Namespace, then a ConfigMap, Deployment, Service and NetworkPolicy for each app. It renders plain YAML, like every other module's deploy package, and knows nothing about how the images were built — [ADR 0010](../docs/adr/0010-application-image-builds.md) settles that separately, and the translator simply refuses anything that is not digest-pinned.
+
+### What it refuses
+
+A translation that guessed would deploy something other than what was built, so the refusals are the load-bearing part: an app with no image, an image carrying a tag rather than a digest, a duplicate app name, a name that is not a DNS label, and a namespace that is `farcast-system` or `kube-*` — FarCast's own components live in one and [ADR 0003](../docs/adr/0003-gke-autopilot.md) puts the others out of bounds.
+
+### Three labels that are not decoration
+
+Every workload **and every pod template** carries `app.kubernetes.io/managed-by: farcast` and `farcast.sofmon.com/tier: app`.
+
+Both halves matter, and the pod half is the one that is easy to miss: a controller does not copy its own labels onto the pods it creates, and TechnoCore meters *pods*. The 4.1 validation walk found exactly this failure on a live cluster — the kernel reconciled cleanly, reported `pods=0`, and would have metered `$0` for the life of the instance while every log line looked healthy. The tier label matters for the opposite reason: an unclassified workload is *protected* from a cost shutdown, so an app missing it cannot be stopped by the mechanism deployed to stop it.
+
+### Deny-by-default, made real
+
+Each app gets a NetworkPolicy with both `Ingress` and `Egress` types. Ingress is its own deployment only. Egress is DNS, FatLine's forward proxy, and — when storage is wired up — the keyholder, and nothing else.
+
+That is what turns [ADR 0005](../docs/adr/0005-fatline-data-plane-ingress.md)'s boundary from advisory into structural: an application that ignores `FARCAST_FATLINE_PROXY` does not reach the internet by another route, it fails. Services are `ClusterIP` and never `LoadBalancer` for the same reason — an instance has exactly one point of presence, and a translator that published apps directly would hand each one a way around the boundary and a standing bill nobody approved.
+
+### Where translated apps differ from FarCast's own workloads
+
+Deliberately, in three places. Applications get **no `runAsNonRoot`** (Autopilot permits root, and requiring otherwise would reject a large share of ordinary images for a property FarCast cannot supply on the operator's behalf) and **no `readOnlyRootFilesystem`** (applications write to `/tmp`). What is *not* relaxed is `allowPrivilegeEscalation: false`, dropping all capabilities, and the `RuntimeDefault` seccomp profile — none of which stops an ordinary application from running.
+
+They also get **no Kubernetes identity at all**: `automountServiceAccountToken: false` and no ServiceAccount. An app talks to FarCast's services over the network with what is in its ConfigMap; a projected token would be the difference between an application compromise and a cluster compromise.
+
+---
+
 ## First adapter: GKE Autopilot
 
 The first cloud is **Google Kubernetes Engine in Autopilot mode** — decided in [ADR 0003](../docs/adr/0003-gke-autopilot.md) after a cost, egress-security, and in-cluster-control analysis. Google manages the nodes; FarCast pays per running Pod request; and the deny-by-default network boundary is enforced by always-on NetworkPolicy rather than privileged containers. Cluster creation is a single call against one mature first-party Go SDK, with no VPC/IAM/node-group scaffolding to stand up first.
@@ -311,7 +339,7 @@ Cluster creation costs real money and takes minutes, so the test pyramid is spli
 | 1.3 | `farcast install` wires the CLI to `planck.Open` + `CreateCluster`, with the mandatory cost limit |
 | 1.4 | `farcast release` → `DeleteCluster` |
 | 2.3 (ADR 0007) | optional `RegistryProvider` — the instance's own image registry (GKE: Artifact Registry), ensured at `install`, re-ensured at `connect`, deleted at `release` |
-| 4.2 | `internal/translator` — `./farcast` manifest → K8s namespace + Deployment/Service/ConfigMap per app, plus the per-app deny-by-default egress NetworkPolicy |
+| 4.2 | [`translate`](translate/) — `./farcast` manifest → K8s namespace + ConfigMap/Deployment/Service/NetworkPolicy per app. Exported, not `internal/translator` as this row first said: the operator CLI has to render these workloads and Go's internal rule would put them out of its reach. Every other module's deploy package settled on the same shape. |
 | 5+ | Optional Standard/Spot hybrid node pool as a TechnoCore cost optimization (ADR 0003) |
 | 8.1 | Second cloud provider adapter behind the same interface — including the image-registry contract on ECR |
 
