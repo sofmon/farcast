@@ -52,12 +52,21 @@ The grants are exactly the verbs [`kube`](kube/) calls, and the shape is as impo
 | `deployments/scale` | `patch` | The only thing the kernel ever writes to a workload. |
 | `configmaps` | `create` | To make its ledger the first time. |
 | `configmaps` (named `technocore-ledger`) | `get`, `update`, `patch` | To maintain it, and nothing else in the namespace. |
+| `configmaps` (named `technocore-confirmed`) | `get` | To read the provider figures the operator pushes — and never to write one. |
 
 There is no `watch` (the loop polls), no `delete`, and no `get` on anything it does not own. Those absences are each a design decision rather than an oversight, and a test fails if any of them appears.
 
 **The rules are a ClusterRole that is never bound cluster-wide.** A ClusterRole is a rule set, not a grant; binding it with a *RoleBinding* grants it in one namespace only. That is how the kernel reads pods in the namespaces FarCast owns and nowhere else — a `ClusterRoleBinding` would hand it every pod in the cluster, including the managed ones [ADR 0003](../docs/adr/0003-gke-autopilot.md) puts out of bounds.
 
 **Create cannot be restricted by name.** Kubernetes does not know an object's name at authorization time, so `create` is namespace-scoped and every verb afterwards is pinned to the single ledger object. Without that pin the kernel could read and rewrite any ConfigMap in the namespace it shares with FatLine and `datasphered`.
+
+### How `confirmed` arrives
+
+The operator's machine already holds the cloud credential, so it reads the bill and pushes the number: `farcast kernel confirm` writes a `technocore-confirmed` ConfigMap and the kernel picks it up on its next reconcile. Reading billing in-cluster would need a grant scoped to a *billing account*, which spans every project the operator owns and not just FarCast's.
+
+**The kernel is granted `get` on that object and nothing else**, and the asymmetry is the security property: it cannot author a confirmation, so it cannot fabricate the one input that corrects its own estimate. Together with [ADR 0009](../docs/adr/0009-technocore-kernel-and-cost-metering.md) decision 5's clamp, a confirmed figure is untrusted input twice over — the kernel did not write it, and it cannot move the estimate more than a factor of two in either direction.
+
+Confirmations are applied *before* anything is metered on each tick, so the assessment already reflects them. Re-reading the same document every tick is a no-op: a window already in the ledger comes back as an overlap and is skipped, and one belonging to a period that has rolled away is skipped too. Neither is a fault — both happen on every tick once the operator has pushed anything at all.
 
 ### One replica, replaced rather than overlapped
 

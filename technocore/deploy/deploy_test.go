@@ -169,17 +169,19 @@ func TestTheLedgerRoleIsPinnedToItsOwnConfigMap(t *testing.T) {
 	}
 	role := ofKind(t, out, "Role")[0]
 	rules := at(t, role, "rules").([]any)
-	if len(rules) != 2 {
-		t.Fatalf("ledger Role has %d rules, want 2 (unnamed create, named maintenance)", len(rules))
+	if len(rules) != 3 {
+		t.Fatalf("ledger Role has %d rules, want 3 (unnamed create, named maintenance, named read)", len(rules))
 	}
 
 	var named, unnamed map[string]any
 	for _, r := range rules {
 		m := r.(map[string]any)
-		if _, ok := m["resourceNames"]; ok {
-			named = m
-		} else {
+		if _, ok := m["resourceNames"]; !ok {
 			unnamed = m
+			continue
+		}
+		if fmt.Sprint(m["resourceNames"]) == "[technocore-ledger]" {
+			named = m
 		}
 	}
 	if named == nil || unnamed == nil {
@@ -195,6 +197,30 @@ func TestTheLedgerRoleIsPinnedToItsOwnConfigMap(t *testing.T) {
 		if v == "list" {
 			t.Error("list on configmaps would defeat the resourceName pin")
 		}
+	}
+}
+
+// The kernel reads the operator's confirmations and must never be able to
+// write one. A kernel that could author a confirmation could fabricate the one
+// input that corrects its own estimate — which, with the calibration clamp,
+// is what makes a confirmed figure untrusted input twice over rather than once.
+func TestTheKernelCanReadConfirmationsButNeverWriteThem(t *testing.T) {
+	out, err := Render(sampleConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rule map[string]any
+	for _, r := range at(t, ofKind(t, out, "Role")[0], "rules").([]any) {
+		m := r.(map[string]any)
+		if fmt.Sprint(m["resourceNames"]) == "[technocore-confirmed]" {
+			rule = m
+		}
+	}
+	if rule == nil {
+		t.Fatal("no rule grants the kernel access to the confirmations it is supposed to read")
+	}
+	if fmt.Sprint(rule["verbs"]) != "[get]" {
+		t.Errorf("confirmations verbs = %v, want exactly [get]", rule["verbs"])
 	}
 }
 

@@ -261,6 +261,14 @@ rules:
     resources: ["configmaps"]
     resourceNames: ["{{.Name}}-ledger"]
     verbs: ["get", "update", "patch"]
+  # The confirmations the operator pushes: GET ONLY, and the asymmetry is the
+  # security property. The kernel cannot author a confirmation, so it cannot
+  # fabricate one that would loosen its own guard — which, together with the
+  # calibration clamp, makes a confirmed figure untrusted input twice over.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["{{.Name}}-confirmed"]
+    verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

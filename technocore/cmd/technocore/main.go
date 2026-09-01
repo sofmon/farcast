@@ -99,6 +99,7 @@ func run(args []string) error {
 		Selector:   kernel.ManagedBy,
 	}
 	store := kernel.NewConfigMapStore(client)
+	r.Confirmations = kernel.NewConfigMapConfirmations(client)
 
 	// A checkpoint that cannot be read is a failure, not a fresh start:
 	// carrying on from zero would silently reset the meter and the limit
@@ -165,6 +166,13 @@ func (s *supervisor) observe(rep kernel.Report, err error) {
 	}
 
 	a := rep.Assessment
+	if rep.ConfirmationsApplied > 0 {
+		s.log.Info("took in confirmed figures from the provider",
+			"applied", rep.ConfirmationsApplied, "refused_by_clamp", rep.ConfirmationsRefused,
+			"confirmed_through", rep.Accrual.ConfirmedThrough.Format(time.RFC3339),
+			"calibration", fmt.Sprintf("%.3f", rep.Accrual.Calibration))
+	}
+
 	s.log.Info("reconciled",
 		"pods", len(rep.Workloads), "unclassified", rep.Unclassified,
 		"rate_per_hour", round(rep.RateHourlyUSD),
