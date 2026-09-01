@@ -26,6 +26,8 @@ Workloads carry `farcast.sofmon.com/tier` — `kernel`, `system` or `app`. A cos
 | [`tier`](tier/) | The `farcast.sofmon.com/tier` classification and the rule that only applications are stoppable by a cost shutdown. |
 | [`cost`](cost/) | The `expected`/`confirmed` ledger, the calibration clamp, and threshold assessment against the limit. |
 | [`kernel`](kernel/) | The reconcile loop that joins them: observe, meter, assess, act — plus the ConfigMap checkpoint that makes the accounting survive a restart. |
+| [`deploy`](deploy/) | The kernel's own Namespace, ServiceAccount, RBAC and Deployment, rendered as a YAML apply stream. |
+| [`cmd/technocore`](cmd/technocore/) | The in-cluster entrypoint: `technocore serve`. |
 
 ### Two things in here that look like details and are not
 
@@ -39,4 +41,28 @@ Workloads carry `farcast.sofmon.com/tier` — `kernel`, `system` or `app`. A cos
 
 **The floor means "nothing left to stop", not "nothing was stopped".** An instance whose every scale call was refused has a permissions problem and plenty left to stop; reporting that as the floor would tell the operator the kernel had done all it could when it had done nothing.
 
-*Deploy manifest, RBAC and the operator-side commands follow as 4.1 lands.*
+### What the kernel is allowed to do
+
+The grants are exactly the verbs [`kube`](kube/) calls, and the shape is as important as the list:
+
+| Resource | Verbs | Why |
+|---|---|---|
+| `pods` | `list` | The meter reads what Autopilot bills. |
+| `deployments` | `list` | The shutdown reads what can be stopped. |
+| `deployments/scale` | `patch` | The only thing the kernel ever writes to a workload. |
+| `configmaps` | `create` | To make its ledger the first time. |
+| `configmaps` (named `technocore-ledger`) | `get`, `update`, `patch` | To maintain it, and nothing else in the namespace. |
+
+There is no `watch` (the loop polls), no `delete`, and no `get` on anything it does not own. Those absences are each a design decision rather than an oversight, and a test fails if any of them appears.
+
+**The rules are a ClusterRole that is never bound cluster-wide.** A ClusterRole is a rule set, not a grant; binding it with a *RoleBinding* grants it in one namespace only. That is how the kernel reads pods in the namespaces FarCast owns and nowhere else — a `ClusterRoleBinding` would hand it every pod in the cluster, including the managed ones [ADR 0003](../docs/adr/0003-gke-autopilot.md) puts out of bounds.
+
+**Create cannot be restricted by name.** Kubernetes does not know an object's name at authorization time, so `create` is namespace-scoped and every verb afterwards is pinned to the single ledger object. Without that pin the kernel could read and rewrite any ConfigMap in the namespace it shares with FatLine and `datasphered`.
+
+### One replica, replaced rather than overlapped
+
+The kernel is a meter with a single ledger, so its Deployment is `replicas: 1` with `strategy: Recreate`. A rolling update would run two kernels for a few seconds; both would meter the same instance into their own in-memory ledgers and race to write the same checkpoint, and the period's spending would become whichever wrote last.
+
+It carries **no PodDisruptionBudget**, deliberately: a single-replica workload behind `minAvailable: 1` makes every node drain hang forever, which would block the auto-upgrades ADR 0003 accepts. The checkpoint is what makes the kernel's own reschedule survivable — the successor bills the gap it slept through — so it does not need one.
+
+*The operator-side deploy command follows as 4.1 lands.*
