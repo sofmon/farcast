@@ -118,6 +118,16 @@ func (c *installCommand) Run(ctx context.Context, env *Env, args []string) error
 		return fmt.Errorf("instance %q already exists; choose another name or run 'farcast release %s' first", c.name, c.name)
 	}
 
+	// The floor check runs on EVERY install path, before the confirmation gate
+	// and regardless of --yes.
+	//
+	// It lived inside printSummary until the 2026-09-01 runbook walk, which is
+	// to say it ran only when a human was watching. Unattended installs — the
+	// place a limit that cannot be met would sit unnoticed for months — never
+	// saw it. Information about money is not a prompt decoration.
+	warnIfBelowFloor(env.Err, config.CostLimit{Amount: c.costLimit, Currency: costCurrency, Period: costPeriod},
+		floorFull(&config.InstanceMetadata{}), "a fully provisioned instance")
+
 	// Confirm before spending money.
 	if !c.assumeYes {
 		if !interactive {
@@ -313,14 +323,6 @@ func (c *installCommand) printSummary(w io.Writer, region, clusterName string) {
 	fprintf(w, "  cluster:     %s\n", clusterName)
 	fprintf(w, "  cost limit:  %s %.2f / %s\n", costCurrency, c.costLimit, costPeriod)
 	fprintln(w, "This creates billable cloud resources.")
-
-	// The floor check belongs here, at the moment the number is chosen. An
-	// instance installed today runs almost nothing, so checking the limit
-	// against what is deployed *now* would pass a figure the operator is
-	// guaranteed to breach two commands later — the floor that matters is the
-	// fully provisioned one.
-	warnIfBelowFloor(w, config.CostLimit{Amount: c.costLimit, Currency: costCurrency, Period: costPeriod},
-		floorFull(&config.InstanceMetadata{}), "a fully provisioned instance")
 }
 
 // healthCheck confirms the instance is alive without assuming a public control-

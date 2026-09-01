@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"math"
+	"os"
 	"strings"
 	"testing"
 
@@ -126,5 +127,35 @@ func TestWarnIfBelowFloorIgnoresAnAbsentLimit(t *testing.T) {
 		if warnIfBelowFloor(&buf, config.CostLimit{Amount: amount, Currency: "USD"}, floorFull(&config.InstanceMetadata{}), "x") {
 			t.Errorf("limit %v produced a floor warning", amount)
 		}
+	}
+}
+
+// Found by the 2026-09-01 runbook walk: the floor check was inside
+// printSummary, which runs only when a human is being prompted. An unattended
+// `install --yes` — the exact place a limit that cannot be met would sit
+// unnoticed for months — never saw it.
+//
+// The earlier tests covered the function and not its placement, which is how a
+// correct function ends up on a path nobody takes.
+func TestTheFloorCheckRunsOnTheUnattendedInstallPath(t *testing.T) {
+	src, err := os.ReadFile("install.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(src)
+
+	call := strings.Index(body, "warnIfBelowFloor(")
+	if call < 0 {
+		t.Fatal("install.go no longer performs a floor check at all")
+	}
+	gate := strings.Index(body, "if !c.assumeYes {")
+	if gate < 0 {
+		t.Fatal("install.go no longer has a confirmation gate")
+	}
+	if call > gate {
+		t.Error("the floor check happens after the --yes gate; an unattended install would skip it")
+	}
+	if strings.Contains(body[strings.Index(body, "func (c *installCommand) printSummary"):], "warnIfBelowFloor(") {
+		t.Error("the floor check is back inside printSummary, which only runs when a human is prompted")
 	}
 }
