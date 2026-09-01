@@ -316,6 +316,10 @@ metadata:
   labels:
     app.kubernetes.io/name: datasphered
     app.kubernetes.io/managed-by: farcast
+    # Classified last-to-die (ADR 0008, ADR 0009 decision 6). A cost shutdown
+    # that stopped the keyholder would take storage down while the instance
+    # carried on billing for everything else.
+    farcast.sofmon.com/tier: system
 spec:
   replicas: {{.Replicas}}
   # The headless Service below governs this set's DNS. It is what gives each
@@ -351,6 +355,10 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: datasphered
+        # On the pod too, not only the StatefulSet: TechnoCore reads pods to
+        # meter and workloads to scale, and a label on one of the two is a
+        # classification with a hole in it.
+        farcast.sofmon.com/tier: system
       annotations:
         # Fingerprint of the mTLS material. It exists to make a certificate
         # rotation restart the Pods: without it the StatefulSet spec would be

@@ -224,6 +224,10 @@ metadata:
   labels:
     app.kubernetes.io/name: fatline
     app.kubernetes.io/managed-by: farcast
+    # Classified last-to-die (ADR 0008, ADR 0009 decision 6). TechnoCore's
+    # cost shutdown stops applications only: stopping the tunnel would leave
+    # storage impossible to unseal while the instance carried on billing.
+    farcast.sofmon.com/tier: system
 spec:
   replicas: {{.Replicas}}
   # Two by default (ADR 0009 decision 11). maxUnavailable defaults to 25%,
@@ -238,6 +242,10 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: fatline
+        # On the pod too, not only the Deployment: TechnoCore reads pods to
+        # meter and workloads to scale, and a label on one of the two is a
+        # classification with a hole in it.
+        farcast.sofmon.com/tier: system
       annotations:
         # Fingerprint of the mounted mTLS material. It exists to make a
         # certificate rotation restart the Pod: without it the Deployment spec
