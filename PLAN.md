@@ -267,6 +267,7 @@ Unattended recovery on the operator's own hardware, per the keeper fleet planned
 - Reseed budget: beyond the expected restart cadence the keeper refuses without interactive confirmation
 - A deliberate `seal` is an operator hold — a keeper never clears it
 - Prerequisite: 4.1's FatLine PDB and second replica — no keeper can re-seed through a drained tunnel
+- **Planned ADR — thin-device storage through the keyholder.** [ADR 0010](docs/adr/0010-application-image-builds.md) makes *deployment* machine-independent; storage is the remaining capability that still requires the keyring locally, because `farcast storage` encrypts client-side. Routing it through the in-cluster keyholder — which already holds the scope keys and already serves exactly this to applications — would let a tablet or phone read and write storage with only an mTLS leaf. That keeps the operator's stated goal (same capability from any device) without putting the **unrotatable name key** on every device, which `storage rekey` could never undo. The ADR must settle what the keyholder will serve to an operator leaf versus an application one, and what that does to [ADR 0008](docs/adr/0008-in-cluster-key-delivery.md)'s solicitation-oracle analysis.
 
 **Phase 5 deliverable:** TechnoCore actively manages resources. Applications start with defaults and TechnoCore adjusts automatically. The manifest stays minimal because the OS is smart enough to figure it out. And the first keeper stands watch: a second operator device clears a restart-seal unattended.
 
