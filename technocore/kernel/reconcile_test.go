@@ -377,3 +377,106 @@ func TestAttributionFallsBackToTheWorkloadName(t *testing.T) {
 		t.Error("a pod with no declared requests is still billed at Autopilot's floor")
 	}
 }
+
+// A limit applies to a period. When one ends the kernel opens the next; the
+// alternative is a monthly limit that trips once and stays tripped forever.
+func TestRollOpensTheNextPeriod(t *testing.T) {
+	f := runningApp()
+	r := reconciler(t, f, "farcast-apps")
+	r.Period = cost.PeriodMonthly
+	if _, err := r.Reconcile(context.Background(), start); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(context.Background(), start.Add(24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if r.Ledger.Accrued().Total <= 0 {
+		t.Fatal("test setup: nothing accrued")
+	}
+
+	// Still inside September: nothing rolls.
+	rolled, err := r.Roll(start.Add(24 * time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rolled {
+		t.Fatal("rolled inside the period")
+	}
+
+	// October.
+	rolled, err = r.Roll(stop.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rolled {
+		t.Fatal("the period ended and did not roll")
+	}
+	if got := r.Ledger.Accrued().Total; got != 0 {
+		t.Errorf("the new period opened with %.4f already spent", got)
+	}
+	newStart, newEnd := r.Ledger.Period()
+	if !newStart.Equal(stop) || !newEnd.Equal(stop.AddDate(0, 1, 0)) {
+		t.Errorf("new period = [%v, %v), want October", newStart, newEnd)
+	}
+}
+
+// The hours between a period boundary and the first tick after it belong to
+// the new period, and must be billed there exactly once — not dropped, and not
+// billed to the period that already closed.
+func TestTheHoursAcrossARolloverLandInTheNewPeriod(t *testing.T) {
+	f := runningApp()
+	r := reconciler(t, f, "farcast-apps")
+	r.Period = cost.PeriodMonthly
+	if _, err := r.Reconcile(context.Background(), stop.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	// Reconcile rolls first, so the caller does nothing special.
+	rep, err := r.Reconcile(context.Background(), stop.Add(3*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.Rolled {
+		t.Fatal("the tick that crossed the boundary did not roll")
+	}
+	// Last was an hour before the boundary; the floor clips it to the
+	// boundary, so three hours are billed, not four.
+	if rep.Billed != 3*time.Hour {
+		t.Errorf("billed %v across the rollover, want 3h", rep.Billed)
+	}
+	// And they landed in the NEW period. Rolling after metering instead of
+	// before would have billed them to the period that had already closed.
+	newStart, _ := r.Ledger.Period()
+	if !newStart.Equal(stop) {
+		t.Fatalf("ledger period starts %v, want the new period", newStart)
+	}
+	if rep.Accrual.Total <= 0 {
+		t.Error("the hours across the boundary were billed to the closed period, not the open one")
+	}
+}
+
+// A reconciler with no configured period never rolls: a missing configuration
+// must not silently reset an instance's accounting mid-month.
+func TestAReconcilerWithoutAPeriodNeverRolls(t *testing.T) {
+	r := reconciler(t, runningApp(), "farcast-apps") // Period unset
+	if _, err := r.Reconcile(context.Background(), start); err != nil {
+		t.Fatal(err)
+	}
+	rep, err := r.Reconcile(context.Background(), stop.Add(72*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Rolled {
+		t.Error("rolled without a configured period")
+	}
+	if got, _ := r.Ledger.Period(); !got.Equal(start) {
+		t.Errorf("the ledger's period moved to %v", got)
+	}
+}
+
+func TestRollRefusesAnUnknownPeriod(t *testing.T) {
+	r := reconciler(t, runningApp(), "farcast-apps")
+	r.Period = "fortnightly"
+	if _, err := r.Roll(stop.Add(time.Hour)); err == nil {
+		t.Fatal("an unknown period must not roll into a window nobody chose")
+	}
+}

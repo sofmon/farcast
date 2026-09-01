@@ -49,6 +49,10 @@ type Cluster interface {
 // managed add-ons as though an application had asked for them.
 const ManagedBy = "app.kubernetes.io/managed-by=farcast"
 
+// DefaultNamespace is where FarCast's own workloads live, and the namespace a
+// kernel meters when told nothing else.
+const DefaultNamespace = "farcast-system"
+
 // Reconciler meters an instance against its cost limit.
 type Reconciler struct {
 	Cluster    Cluster
@@ -56,6 +60,11 @@ type Reconciler struct {
 	Ledger     *cost.Ledger
 	Limit      float64
 	Interval   time.Duration
+
+	// Period names the accounting window the limit applies to — "monthly" or
+	// "daily", as captured at install. It is what Roll uses to open the next
+	// ledger when the current one ends.
+	Period string
 
 	// Selector narrows what is metered. Empty means everything in the listed
 	// namespaces, which is almost never what a caller wants.
@@ -107,6 +116,9 @@ type Report struct {
 	// Billed is the interval this tick accrued for. It is the elapsed time
 	// since the last reconcile, which after a restart is the whole gap.
 	Billed time.Duration
+	// Rolled is set when this tick opened a new accounting period.
+	Rolled bool
+
 	// Reconstructed is set when Billed substantially exceeded the reconcile
 	// interval — the gap after a restart or a stall, accrued by assuming the
 	// observed workload set ran throughout. The approximation is reported
@@ -160,7 +172,19 @@ func (r Report) Stoppable() []Target {
 
 // Reconcile observes the instance once and accrues the elapsed interval.
 func (r *Reconciler) Reconcile(ctx context.Context, now time.Time) (Report, error) {
+	// Rolling happens BEFORE anything is metered, not after. A tick that
+	// crosses a period boundary would otherwise bill its whole interval to
+	// the period that has already closed — a small error at a 30-second
+	// cadence, and a silent one, which is the kind this package exists to
+	// avoid. Rolling first means the interval lands where the floor at the
+	// new period's start puts it, which is the new period.
+	rolled, err := r.Roll(now)
+	if err != nil {
+		return Report{}, err
+	}
+
 	rep := Report{
+		Rolled:     rolled,
 		At:         now,
 		Since:      r.Last,
 		RateByTier: map[tier.Tier]float64{},
@@ -317,4 +341,41 @@ func appOf(p kube.Pod) string {
 		}
 	}
 	return p.Metadata.Name
+}
+
+// Roll opens a new ledger when now has passed the end of the current period,
+// reporting whether it did. Reconcile calls it first thing on every tick; it
+// is exported so a caller can roll explicitly, and it is a no-op inside a
+// period.
+//
+// A Reconciler with no Period never rolls. That is the shape a test or a
+// one-shot observation wants, and it keeps a missing configuration from
+// silently resetting an instance's accounting.
+//
+// The old ledger is dropped rather than archived: a limit applies to a period,
+// and the kernel's job is enforcing the current one. What the previous period
+// cost is a question for the bill, and for `farcast costs` at 4.3.
+//
+// Last is deliberately NOT reset. It stays where it was, in the period that
+// just ended, and billableInterval's floor at the new period's start does the
+// rest — so the hours between the boundary and the first tick of the new
+// period are billed to the new period exactly once, with no special case.
+func (r *Reconciler) Roll(now time.Time) (bool, error) {
+	if r.Period == "" {
+		return false, nil
+	}
+	_, end := r.Ledger.Period()
+	if now.Before(end) {
+		return false, nil
+	}
+	start, newEnd, err := cost.PeriodFor(now, r.Period)
+	if err != nil {
+		return false, fmt.Errorf("kernel: roll the accounting period: %w", err)
+	}
+	ledger, err := cost.NewLedger(start, newEnd)
+	if err != nil {
+		return false, fmt.Errorf("kernel: roll the accounting period: %w", err)
+	}
+	r.Ledger = ledger
+	return true, nil
 }
