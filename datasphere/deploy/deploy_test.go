@@ -154,13 +154,14 @@ func TestRenderDocuments(t *testing.T) {
 		"Service/datasphered",
 		"Service/datasphered-status",
 		"Service/datasphered-unseal",
+		"NetworkPolicy/datasphered",
 	} {
 		if _, ok := docs[want]; !ok {
 			t.Fatalf("missing %s document; got %v", want, keys(docs))
 		}
 	}
-	if len(docs) != 8 {
-		t.Errorf("rendered %d documents, want 8: %v", len(docs), keys(docs))
+	if len(docs) != 9 {
+		t.Errorf("rendered %d documents, want 9: %v", len(docs), keys(docs))
 	}
 	// A Deployment cannot give per-ordinal DNS, so the keyholder is a
 	// StatefulSet — see TestRenderPodManagementPolicyMustBeParallel.
@@ -740,5 +741,123 @@ func TestRenderedRequestsMatchTheExportedConstants(t *testing.T) {
 		if !strings.Contains(s, want) {
 			t.Errorf("rendered workload does not request %q; the cost estimate would quote a workload nobody deployed", want)
 		}
+	}
+}
+
+// networkPolicyRules returns the ingress rules, keyed by the single port each
+// one opens.
+func networkPolicyRules(t *testing.T, docs map[string]map[string]any) map[int64]map[string]any {
+	t.Helper()
+	np, ok := docs["NetworkPolicy/datasphered"]
+	if !ok {
+		t.Fatal("no NetworkPolicy document")
+	}
+	rules, ok := dig(np, "spec", "ingress").([]any)
+	if !ok {
+		t.Fatal("the policy has no ingress rules, which denies everything including the probes")
+	}
+	out := map[int64]map[string]any{}
+	for _, r := range rules {
+		m := r.(map[string]any)
+		ports, ok := m["ports"].([]any)
+		if !ok || len(ports) != 1 {
+			t.Fatalf("every rule should open exactly one port: %v", m)
+		}
+		out[num(t, dig(ports[0].(map[string]any), "port"))] = m
+	}
+	return out
+}
+
+// The control this policy exists to be. The SDK's storage client authenticates
+// the server and presents no client certificate, so the data port cannot tell
+// one caller from another — until this policy, anything that could route to it
+// could read and write the instance's storage.
+func TestDataPortIsReachableOnlyByFarCastApplications(t *testing.T) {
+	_, docs := render(t, sampleConfig())
+	rule, ok := networkPolicyRules(t, docs)[8443]
+	if !ok {
+		t.Fatal("no ingress rule for the data port")
+	}
+
+	from, ok := rule["from"].([]any)
+	if !ok || len(from) != 1 {
+		// Two elements would mean OR, admitting any pod in any FarCast
+		// namespace — including one that is not an application at all.
+		t.Fatalf("the data rule must have exactly one `from` element so both selectors AND together, got %v", rule["from"])
+	}
+	sel := from[0].(map[string]any)
+	if _, ok := sel["namespaceSelector"]; !ok {
+		t.Error("the data rule does not constrain the namespace")
+	}
+	if _, ok := sel["podSelector"]; !ok {
+		t.Error("the data rule does not constrain the pod")
+	}
+	if got := dig(sel, "podSelector", "matchLabels", "farcast.sofmon.com/tier"); got != "app" {
+		t.Errorf("data port admits tier %v, want only app", got)
+	}
+	if got := dig(sel, "namespaceSelector", "matchLabels", "app.kubernetes.io/managed-by"); got != "farcast" {
+		t.Errorf("data port admits namespaces managed by %v, want farcast", got)
+	}
+}
+
+// The unseal port is where key material lands, which makes it the one worth
+// narrowing hardest. The operator's push arrives through FatLine's stream
+// relay, so FatLine is the only legitimate source.
+func TestUnsealPortIsReachableOnlyByFatLine(t *testing.T) {
+	_, docs := render(t, sampleConfig())
+	rule, ok := networkPolicyRules(t, docs)[9443]
+	if !ok {
+		t.Fatal("no ingress rule for the unseal port")
+	}
+	from := rule["from"].([]any)
+	if len(from) != 1 {
+		t.Fatalf("the unseal rule must name exactly one source, got %v", from)
+	}
+	sel := from[0].(map[string]any)
+	if got := dig(sel, "podSelector", "matchLabels", "app.kubernetes.io/name"); got != "fatline" {
+		t.Errorf("unseal port admits %v, want fatline", got)
+	}
+	if got := dig(sel, "namespaceSelector", "matchLabels", "kubernetes.io/metadata.name"); got != "farcast-system" {
+		t.Errorf("unseal port admits namespace %v, want farcast-system", got)
+	}
+}
+
+// The footgun this rule exists to avoid. Kubelet probes originate from the
+// NODE, not from a pod, so no selector can express them — and a policy that
+// selected these pods while omitting the status port would deny liveness and
+// readiness, and Kubernetes would kill the keyholder for failing the probes
+// the policy had just blocked. Storage would die on a cluster nobody touched.
+func TestTheStatusPortStaysOpenSoProbesSurvive(t *testing.T) {
+	_, docs := render(t, sampleConfig())
+	rule, ok := networkPolicyRules(t, docs)[8444]
+	if !ok {
+		t.Fatal("no ingress rule for the status port; liveness and readiness probes would be denied")
+	}
+	if _, restricted := rule["from"]; restricted {
+		t.Errorf("the status rule restricts its source (%v); kubelet probes come from the node and would be denied", rule["from"])
+	}
+}
+
+// Declaring Egress would silence the keyholder's own traffic — the bucket it
+// serves and the metadata server that mints its Workload Identity token — and
+// the failure would look like a broken provider rather than a policy.
+func TestThePolicyDoesNotTouchTheKeyholdersOwnEgress(t *testing.T) {
+	_, docs := render(t, sampleConfig())
+	np := docs["NetworkPolicy/datasphered"]
+	types, ok := dig(np, "spec", "policyTypes").([]any)
+	if !ok || len(types) != 1 || types[0] != "Ingress" {
+		t.Fatalf("policyTypes = %v, want exactly [Ingress]", types)
+	}
+	if _, ok := dig(np, "spec", "egress").([]any); ok {
+		t.Error("the policy declares egress rules; the keyholder's own traffic is not this policy's business")
+	}
+}
+
+// The policy must select the keyholder's pods and only those.
+func TestThePolicySelectsTheKeyholder(t *testing.T) {
+	_, docs := render(t, sampleConfig())
+	np := docs["NetworkPolicy/datasphered"]
+	if got := dig(np, "spec", "podSelector", "matchLabels", "app.kubernetes.io/name"); got != "datasphered" {
+		t.Errorf("policy selects %v, want datasphered", got)
 	}
 }

@@ -395,6 +395,28 @@ The schema bump is conditional: a keyring with no scopes still marshals as versi
 
 ---
 
+## Who may reach the keyholder (Phase 4.2)
+
+The keyholder's workload carries a NetworkPolicy, and it is a control rather than tidiness.
+
+**The SDK's storage client authenticates the server and presents no client certificate.** [`sdk/go/storageclient.go`](../sdk/go/storage.go) builds a `tls.Config` with `RootCAs` and no `Certificates`: an application verifies that it is talking to *the* keyholder, and the keyholder cannot tell one application from another. Until this policy existed, anything that could route to the data port could read and write the instance's storage. **The network is the control**, and the policy is it.
+
+| Port | Who may reach it | Why |
+|---|---|---|
+| status | anyone | Kubelet probes come from the **node**, not a pod, so no selector can express them. It exposes what [ADR 0008](../docs/adr/0008-in-cluster-key-delivery.md) decision 7 deliberately made reportable: seal state, generation, scope names — metadata, never key material and never object content. |
+| data | FarCast applications only | A namespace FarCast manages **and** a pod classified `farcast.sofmon.com/tier: app`. |
+| unseal | FatLine only | The operator's push arrives through the tunnel's stream relay, so FatLine is the only legitimate source — and this is the port where key material lands. |
+
+Three details are easy to get wrong and each is pinned by a test:
+
+- **The status rule must have no source.** A policy that selected these pods while omitting the status port would deny liveness and readiness, and Kubernetes would kill the keyholder for failing the probes the policy had just blocked. Storage would die on a cluster nobody touched, because of a security improvement.
+- **The data rule's two selectors sit in one `from` element**, which means AND. Two elements would mean OR and would admit any pod in any FarCast namespace.
+- **The policy declares `Ingress` only.** Adding `Egress` would silence the keyholder's own traffic — the bucket it serves and the metadata server that mints its Workload Identity token — and the failure would look like a broken provider rather than a policy.
+
+And the selectors name labels that *other modules* render: FatLine's pod label, and the namespace and pod labels [Planck's translator](../planck/README.md) stamps on an application. A selector that does not match what those packages emit is a policy that silently admits nobody — storage timing out for every application while the keyholder looks healthy. `TestThePolicyAdmitsWhatTheOtherModulesActuallyRender` renders all three and compares them, because the 4.1 validation walk found this exact shape once already: a selector and a label that were each correct and never met.
+
+---
+
 ## The instance bucket
 
 GCS bucket names are **globally unique across all of Google Cloud** — a namespace shared with every stranger on the platform. That makes deterministic names an attack surface: `farcast-<instance>` can be squatted (denial at best; at worst an adoption bug writes the operator's ciphertext into a bucket a stranger can read, delete, and watch), and a probeable name confirms the instance's existence to anyone. Planck's registry needed ownership discipline even in a *per-project* namespace; a global one inverts the presumption — every unrecorded collision is hostile until proven otherwise.
