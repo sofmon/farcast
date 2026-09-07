@@ -246,6 +246,66 @@ farcast release "$INSTANCE" --delete-data
 - **Multi-app manifests.** One application is enough to prove the mechanism; per-app attribution across several is `farcast costs` at 4.3.
 - **A build that legitimately needs longer than its deadline.** The 30-minute bound is untested against a genuinely large build.
 
-## Findings
+## Findings from the 2026-09-07 walk
 
-*(to be filled in by the walk)*
+Instance `p42`, `USD 100 / monthly`, us-central1. Scope agreed up front: criteria 1–10, teardown the same day, criterion 11 (private repository) skipped.
+
+**All ten criteria passed — after seven defects were found and fixed.** Every one was invisible to the test suite, and four of them were in code that had been mutation-tested. The build alone took four attempts, each failing for a different reason.
+
+### The build's egress policy blocked DNS — twice, in two packages
+
+The policy excludes link-local so a hostile Containerfile cannot reach the cloud metadata server. **GKE Autopilot runs NodeLocal DNSCache, which listens on a link-local address.** The build died with `lookup github.com: i/o timeout`, which reads like a network outage and is a policy.
+
+The same bug was in [`planck/translate`](../../planck/README.md), for applications, and it made a *different* criterion unreadable: with DNS broken, "blocked from the internet" and "cannot resolve" look identical, so the egress test proved nothing until DNS worked. Both now allow exactly `169.254.20.10/32` on port 53.
+
+### Denying the metadata server and granting the push are the same channel
+
+After DNS was fixed the build cloned, resolved its Containerfile, ran, and failed at push with `Unauthenticated request`. The builder pushes under Workload Identity, and a Workload Identity token is minted by asking the metadata server — the address the policy was blocking to stop a hostile Containerfile stealing credentials.
+
+**These cannot both hold.** The code comment claiming the token "is reached over a path the kubelet provides rather than this one" was simply wrong. `169.254.169.254/32` is now reachable on port 80 and nothing else link-local is, with the concession stated: Workload Identity scopes what that address returns to *this* ServiceAccount, so a hostile Containerfile can mint a token that pushes to one repository — the capability the build already has. On a cluster without Workload Identity this would expose the node's service account and be a much worse trade.
+
+### Kaniko's `--dockerfile` is relative to the context, not the repository
+
+With `--context-sub-path` set, a repository-relative Containerfile path fails with `please provide a valid path to a Dockerfile` — a message that points at the flag rather than at the sub-path that changed its meaning. The manifest expresses both paths repository-relative, so [`planck/build`](../../planck/README.md) now does the translation and refuses a Containerfile outside its own context.
+
+### Applications were pointed at a Service port that did not exist
+
+The most consequential finding. `FARCAST_FATLINE_PROXY` named `fatline.farcast-system:3128`, and FatLine's Service publishes **only** the tunnel port. An application's sole route out resolved and connected to nothing.
+
+The obvious fix is the dangerous one: that Service is a **public LoadBalancer** ([ADR 0005](../adr/0005-fatline-data-plane-ingress.md)), so adding the proxy port to it would put an open forward proxy on the internet. FatLine now renders a separate `fatline-egress` ClusterIP, and a test fails if the proxy port ever appears on the public Service.
+
+This also separated two names that had been conflated: the **Service** an application connects to (`fatline-egress`) and the **pod label** its NetworkPolicy selects (`fatline`). Using one for the other yields a policy that permits nothing.
+
+### The kernel never read the namespace list — and a redeploy erased it
+
+Two defects in sequence, both producing the `$0` failure the 4.1 walk found.
+
+`farcast kernel meter` wrote a correct ConfigMap and **`main.go` never assigned `Reconciler.Discover`**, so the kernel ignored it. Every unit test passed throughout: they exercise the source and the reconciler, and the gap was between `main.go` and both.
+
+With that fixed, `kernel deploy` seeded the list from `--namespaces` alone, **silently discarding everything `kernel meter` had added**. A routine redeploy — an image bump, a changed limit — would have stopped counting every application on the instance. Deploy now seeds the union; narrowing is only ever the explicit `--remove`.
+
+**This is the third wiring gap of the same shape in Phase 4** (the floor check ran only on the interactive path; `RenderNamespaceBinding` had no caller). The pattern is a correct component with no call site, and no unit test of either side can see it. Each now has an assertion on the call site itself.
+
+### Two operational observations, not defects
+
+- **`connect` can fail on a first run and succeed on retry.** It waits for the load balancer's *address*, not for it to serve, so the first dial times out against a healthy instance.
+- **`farcast release` can fail on a transient token timeout, and correctly refuses to continue** — it will not delete a cluster while it cannot confirm the bucket is empty, saying so and leaving the instance intact. A re-run completed it. The right behaviour, and worth knowing that a failed teardown leaves a billing instance until you retry.
+- **Granting the keyholder's bucket access after `storage deploy` costs a crash loop and a failed first unseal.** Known from 3.2; the grant should precede the deploy. The new keyholder NetworkPolicy did *not* contribute — unseal succeeded through it once the pods settled.
+
+### Criteria results
+
+| # | Criterion | Result |
+|---|---|---|
+| 1 | Tagged builder refused, digest reported | ✅ |
+| 2 | Build Pod admitted by Autopilot with the granted capabilities | ✅ ADR 0010's premise holds |
+| 3 | Push succeeds under Workload Identity | ✅ after the metadata-server fix |
+| 4 | Digest arrives through the Pod's termination message | ✅ `@sha256:c84d3ef…` |
+| 5 | Kaniko executes the `RUN` step | ✅ `Running: [/bin/sh -c mkdir -p /opt && echo …]` |
+| 6 | `kernel meter` binds and lists without restarting the kernel | ✅ same pod before and after |
+| 7 | The application runs and prints the file its `RUN` created | ✅ `built by farcast, inside the instance` |
+| 8 | No direct internet; FatLine's proxy reachable | ✅ after the egress Service and DNS fixes |
+| 9 | Keyholder admits FarCast applications, refuses outsiders | ✅ both halves |
+| 10 | The kernel meters the application | ✅ `pods=6`, `rate_per_hour=0.0304` — six pods at the rate card, exactly |
+| 11 | Private repository | ⏸️ skipped by decision |
+
+**The model matched the cluster again**: 6 pods × `$0.0050625/hour` = `$0.0304`, to four decimal places.
