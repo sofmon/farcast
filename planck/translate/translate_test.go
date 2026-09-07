@@ -369,3 +369,91 @@ func TestNamespaceDefaultsToTheManifestNameAndIsOverridable(t *testing.T) {
 		t.Errorf("deployment namespace = %v, want staging", got)
 	}
 }
+
+// Found on the 4.2 walk, on a live cluster, and it made another criterion
+// unreadable: with DNS broken an application cannot reach anything, so
+// "blocked from the internet" and "cannot resolve" look identical and the
+// egress test proves nothing.
+//
+// GKE Autopilot runs NodeLocal DNSCache, which listens on a LINK-LOCAL
+// address. A rule permitting DNS "to the kube-system namespace" is correct on
+// a cluster without the cache and silently wrong on one with it.
+func TestDNSReachesTheNodeLocalCacheAsWellAsKubeDNS(t *testing.T) {
+	_, docs := render(t, sampleConfig())
+	rules := at(t, pick(t, docs, "NetworkPolicy", "api"), "spec", "egress").([]any)
+
+	var dns map[string]any
+	for _, r := range rules {
+		m := r.(map[string]any)
+		for _, p := range m["ports"].([]any) {
+			if fmt.Sprint(p.(map[string]any)["port"]) == "53" {
+				dns = m
+			}
+		}
+	}
+	if dns == nil {
+		t.Fatal("no DNS rule; an application would resolve nothing")
+	}
+
+	var viaNamespace, viaNodeLocal bool
+	for _, d := range dns["to"].([]any) {
+		m := d.(map[string]any)
+		if _, ok := m["namespaceSelector"]; ok {
+			viaNamespace = true
+		}
+		if b, ok := m["ipBlock"].(map[string]any); ok && fmt.Sprint(b["cidr"]) == NodeLocalDNS {
+			viaNodeLocal = true
+		}
+	}
+	if !viaNamespace {
+		t.Error("DNS does not reach kube-dns directly")
+	}
+	if !viaNodeLocal {
+		t.Errorf("DNS does not reach %s; on GKE Autopilot that is where it lives", NodeLocalDNS)
+	}
+	if !strings.HasSuffix(NodeLocalDNS, "/32") {
+		t.Errorf("NodeLocalDNS = %q; it must stay a single address", NodeLocalDNS)
+	}
+}
+
+// The Service an application is pointed at and the pod label its policy
+// selects are different names, and conflating them yields a configuration
+// that looks right and permits nothing.
+//
+// Found on the 4.2 walk: FARCAST_FATLINE_PROXY named "fatline", which is the
+// tunnel's public Service and does not publish the proxy port.
+func TestTheProxyAddressIsTheEgressServiceAndThePolicySelectsThePods(t *testing.T) {
+	_, docs := render(t, sampleConfig())
+
+	proxy := at(t, pick(t, docs, "ConfigMap", "api"), "data").(map[string]any)["FARCAST_FATLINE_PROXY"].(string)
+	if !strings.Contains(proxy, FatLineService) {
+		t.Errorf("proxy = %q, want the egress Service %q", proxy, FatLineService)
+	}
+	if FatLineService == FatLineWorkload {
+		t.Error("the Service and the workload must not share a name; the tunnel's Service does not publish the proxy port")
+	}
+
+	// The policy selects PODS, which carry the workload's name, not the
+	// Service's.
+	rules := at(t, pick(t, docs, "NetworkPolicy", "api"), "spec", "egress").([]any)
+	var found bool
+	for _, r := range rules {
+		for _, d := range r.(map[string]any)["to"].([]any) {
+			m := d.(map[string]any)
+			ps, ok := m["podSelector"].(map[string]any)
+			if !ok {
+				continue
+			}
+			labels := ps["matchLabels"].(map[string]any)
+			if labels["app.kubernetes.io/name"] == FatLineWorkload {
+				found = true
+			}
+			if labels["app.kubernetes.io/name"] == FatLineService {
+				t.Error("the policy selects pods by the SERVICE name; no pod carries it and the rule permits nothing")
+			}
+		}
+	}
+	if !found {
+		t.Errorf("no egress rule selects FatLine's pods (%q)", FatLineWorkload)
+	}
+}

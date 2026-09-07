@@ -162,12 +162,20 @@ spec:
     - from:
         - podSelector: {}
   egress:
-    # DNS. Without it nothing below resolves, and the failure looks like a
-    # broken application rather than a policy.
+    # DNS, by both paths a GKE cluster may use. The namespaceSelector covers
+    # a cluster whose pods talk to kube-dns directly; the ipBlock covers
+    # NodeLocal DNSCache, which listens on a LINK-LOCAL address on the node
+    # and is what GKE Autopilot actually runs.
+    #
+    # Without the second one an application resolves nothing — not even
+    # FatLine's proxy — and the failure looks like a broken application
+    # rather than a policy. Found on the 4.2 walk.
     - to:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: kube-system
+        - ipBlock:
+            cidr: {{$.NodeLocalDNS}}
       ports:
         - protocol: UDP
           port: 53
@@ -183,7 +191,7 @@ spec:
               kubernetes.io/metadata.name: {{$.SystemNamespace}}
           podSelector:
             matchLabels:
-              app.kubernetes.io/name: {{$.FatLineService}}
+              app.kubernetes.io/name: {{$.FatLineWorkload}}
       ports:
         - protocol: TCP
           port: {{$.FatLineEgressPort}}

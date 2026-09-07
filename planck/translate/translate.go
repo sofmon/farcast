@@ -35,7 +35,16 @@ const (
 	// application's outbound traffic must use. Nothing else is reachable:
 	// the NetworkPolicy denies it and FatLine's allowlist enforces the hosts
 	// (ADR 0005).
-	FatLineService    = "fatline"
+	// FatLineService is the ClusterIP Service carrying the forward proxy —
+	// NOT the tunnel's Service, which is a public load balancer and does not
+	// publish this port at all. The 4.2 walk found applications pointed at a
+	// Service port that did not exist.
+	FatLineService = "fatline-egress"
+
+	// FatLineWorkload is the pod label the egress NetworkPolicy selects on.
+	// The Service name and the workload name differ, and conflating them
+	// produces a policy that permits nothing.
+	FatLineWorkload   = "fatline"
 	FatLineEgressPort = 3128
 
 	// StorageService and StoragePort are the keyholder's data path.
@@ -43,6 +52,18 @@ const (
 	StoragePort          = 8443
 	StorageStatusService = "datasphered-status"
 	StorageStatusPort    = 8444
+
+	// NodeLocalDNS is the link-local address GKE's NodeLocal DNSCache listens
+	// on, and applications must be allowed to reach it or they resolve
+	// nothing at all.
+	//
+	// Found on the 4.2 walk, twice: the build hit it first and the
+	// application hit it again. A policy that permits DNS "to the kube-system
+	// namespace" is correct on a cluster without the cache and silently wrong
+	// on one with it — and the symptom is an application that cannot even
+	// find FatLine's proxy, which reads like a broken app rather than a
+	// policy.
+	NodeLocalDNS = "169.254.20.10/32"
 
 	// RequestCPUMilli and RequestMemMiB are the conservative starting
 	// requests every translated application gets, matching what FarCast's own
@@ -133,6 +154,7 @@ func Render(c Config) ([]byte, error) {
 		Instance:             c.Instance,
 		SystemNamespace:      SystemNamespace,
 		FatLineService:       FatLineService,
+		FatLineWorkload:      FatLineWorkload,
 		FatLineEgressPort:    FatLineEgressPort,
 		StorageService:       StorageService,
 		StoragePort:          StoragePort,
@@ -141,6 +163,7 @@ func Render(c Config) ([]byte, error) {
 		StorageScope:         c.StorageScope,
 		StorageServerName:    c.StorageServerName,
 		StorageCA:            indentPEM(c.StorageCAPEM),
+		NodeLocalDNS:         NodeLocalDNS,
 		HasStorage:           c.StorageScope != "" && len(c.StorageCAPEM) > 0,
 		RequestCPUMilli:      RequestCPUMilli,
 		RequestMemMiB:        RequestMemMiB,
@@ -235,11 +258,13 @@ type templateData struct {
 	Instance             string
 	SystemNamespace      string
 	FatLineService       string
+	FatLineWorkload      string
 	StorageService       string
 	StorageStatusService string
 	StorageScope         string
 	StorageServerName    string
 	StorageCA            string
+	NodeLocalDNS         string
 	HasStorage           bool
 	FatLineEgressPort    int
 	StoragePort          int
