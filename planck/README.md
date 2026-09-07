@@ -267,6 +267,39 @@ They also get **no Kubernetes identity at all**: `automountServiceAccountToken: 
 
 ---
 
+## The build Job — Containerfile → image, inside the instance (Phase 4.2)
+
+[ADR 0010](../docs/adr/0010-application-image-builds.md) chose to build applications *inside* the instance rather than on the operator's machine, so that running and updating software is not tied to one prepared laptop. [`build.Render`](build/) is that decision's workload: a ServiceAccount, a NetworkPolicy, and an ephemeral Job.
+
+### The one place FarCast cannot copy its own hardening
+
+Every other FarCast container gets `readOnlyRootFilesystem: true` and drops all capabilities. The builder gets neither, and both exceptions are load-bearing rather than lax:
+
+- **No read-only root.** Kaniko builds by extracting image layers into its *own* root filesystem and running the Containerfile's steps against them. A read-only root does not make it safer; it makes it non-functional.
+- **Capabilities dropped, then added back one at a time** — `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID`, `SETGID`, `SETUID`, `MKNOD`, `SYS_CHROOT`. Every one is in Autopilot's permitted set ([ADR 0003](../docs/adr/0003-gke-autopilot.md)); a capability outside it makes the Pod inadmissible, so the test checks membership rather than trusting the list.
+
+**Kaniko never asks for privileged mode.** That is the whole reason an in-cluster builder is possible on Autopilot at all, and it is what ADR 0010's first draft got wrong.
+
+### What a build may reach — and why it is coarser than an application's
+
+A build is the one FarCast workload that runs code the *operator* wrote rather than code FarCast compiled, so its egress is what an untrusted Containerfile can reach. It is denied all ingress — it serves nothing — and allowed DNS plus outbound TLS, with the cluster's own ranges and link-local excluded so a Containerfile cannot reach another pod, a Service, or the cloud metadata server.
+
+**This is a bound, not a boundary, and the difference matters.** Kubernetes NetworkPolicy cannot express a hostname, so a build can reach any public address on 443 — where an *application* is confined to FatLine's proxy and its manifest's declared hosts. A build is therefore less contained than the thing it produces. Narrowing it needs a hostname-aware path (routing the build's egress through FatLine), which is not what 4.2 does.
+
+### Bounded, one-shot, and reported back
+
+`backoffLimit: 0` — a Containerfile that does not compile does not compile twice, and retrying spends money to reach the same error. `activeDeadlineSeconds` bounds a hung build, which is a cost control first: Autopilot charges the whole request whether it is used or not. `ttlSecondsAfterFinished` deletes the Job once its logs have had time to be read.
+
+The digest Kaniko pushed comes back through `--digest-file=/dev/termination-log`, which Kubernetes surfaces in the Pod's status — so the caller reads it from the API server without parsing logs or mounting a volume. It is then resolved and pinned before deployment ([ADR 0007](../docs/adr/0007-instance-owned-image-registry.md) decision 4).
+
+### What the caller still has to supply
+
+- **A digest-pinned builder image.** There is deliberately no default: Kaniko was archived by Google in June 2025 and continues as a Chainguard fork, so the pinned reference is a recorded constant to be reviewed rather than a digest this package invented.
+- **The push grant.** The `farcast-builder` ServiceAccount needs `roles/artifactregistry.writer` on the instance's repository, through Workload Identity — the same shape [ADR 0008](../docs/adr/0008-in-cluster-key-delivery.md) decision 8 uses for the keyholder's bucket, and like it, printed for the operator rather than applied by FarCast.
+- **A repository-scoped, read-only Git credential**, when the repository is private. It reaches the builder as environment from a Secret and never as an argument — arguments are visible in `kubectl describe`. A public repository needs no credential and none is rendered.
+
+---
+
 ## First adapter: GKE Autopilot
 
 The first cloud is **Google Kubernetes Engine in Autopilot mode** — decided in [ADR 0003](../docs/adr/0003-gke-autopilot.md) after a cost, egress-security, and in-cluster-control analysis. Google manages the nodes; FarCast pays per running Pod request; and the deny-by-default network boundary is enforced by always-on NetworkPolicy rather than privileged containers. Cluster creation is a single call against one mature first-party Go SDK, with no VPC/IAM/node-group scaffolding to stand up first.
@@ -340,6 +373,7 @@ Cluster creation costs real money and takes minutes, so the test pyramid is spli
 | 1.4 | `farcast release` → `DeleteCluster` |
 | 2.3 (ADR 0007) | optional `RegistryProvider` — the instance's own image registry (GKE: Artifact Registry), ensured at `install`, re-ensured at `connect`, deleted at `release` |
 | 4.2 | [`translate`](translate/) — `./farcast` manifest → K8s namespace + ConfigMap/Deployment/Service/NetworkPolicy per app. Exported, not `internal/translator` as this row first said: the operator CLI has to render these workloads and Go's internal rule would put them out of its reach. Every other module's deploy package settled on the same shape. |
+| 4.2 | [`build`](build/) — the ephemeral Kaniko Job that turns an application's Containerfile into an image in the instance's own registry ([ADR 0010](../docs/adr/0010-application-image-builds.md)) |
 | 5+ | Optional Standard/Spot hybrid node pool as a TechnoCore cost optimization (ADR 0003) |
 | 8.1 | Second cloud provider adapter behind the same interface — including the image-registry contract on ECR |
 
