@@ -113,3 +113,71 @@ func (c *Client) serviceExternalIP(ctx context.Context, namespace, name string) 
 func durArg(d time.Duration) string {
 	return fmt.Sprintf("%ds", int(d.Seconds()))
 }
+
+// JobResult is how a build Job ended.
+type JobResult struct {
+	Succeeded bool
+	// Message is the container's termination message, which is where the
+	// build reports the digest it pushed. Kubernetes surfaces it in the Pod's
+	// status, so reading it needs no log parsing and no shared volume.
+	Message string
+}
+
+// WaitJob blocks until a Job succeeds or fails.
+//
+// It polls both conditions rather than using `kubectl wait --for=condition=complete`,
+// because that call cannot express "or failed": a build that fails would sit
+// there until the timeout and be reported as a timeout, which is the wrong
+// diagnosis for a Containerfile that does not compile.
+func (c *Client) WaitJob(ctx context.Context, namespace, name string, timeout time.Duration) (JobResult, error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		out, err := c.runner.Run(ctx, nil, "get", "job", name, "-n", namespace,
+			"-o", "jsonpath={.status.succeeded}/{.status.failed}")
+		if err != nil {
+			return JobResult{}, err
+		}
+		succeeded, failed, _ := strings.Cut(strings.TrimSpace(string(out)), "/")
+		switch {
+		case succeeded != "" && succeeded != "0":
+			msg, _ := c.jobMessage(ctx, namespace, name)
+			return JobResult{Succeeded: true, Message: msg}, nil
+		case failed != "" && failed != "0":
+			msg, _ := c.jobMessage(ctx, namespace, name)
+			return JobResult{Succeeded: false, Message: msg}, nil
+		}
+		if time.Now().After(deadline) {
+			return JobResult{}, fmt.Errorf("cluster: job %s/%s neither succeeded nor failed after %s", namespace, name, timeout)
+		}
+		select {
+		case <-ctx.Done():
+			return JobResult{}, ctx.Err()
+		case <-time.After(5 * time.Second):
+		}
+	}
+}
+
+// jobMessage reads the terminated container's message from the Job's Pod.
+//
+// A missing message is not an error: a Pod that was evicted, or a container
+// that died before writing, leaves nothing there, and the caller's own
+// "no digest" failure is a better diagnosis than one about jsonpath.
+func (c *Client) jobMessage(ctx context.Context, namespace, job string) (string, error) {
+	out, err := c.runner.Run(ctx, nil, "get", "pods", "-n", namespace,
+		"-l", "job-name="+job,
+		"-o", "jsonpath={.items[0].status.containerStatuses[0].state.terminated.message}")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// JobLogs returns the build's output, for a failure the operator has to read.
+func (c *Client) JobLogs(ctx context.Context, namespace, job string, lines int) (string, error) {
+	out, err := c.runner.Run(ctx, nil, "logs", "-n", namespace,
+		"job/"+job, fmt.Sprintf("--tail=%d", lines))
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
