@@ -269,6 +269,14 @@ rules:
     resources: ["configmaps"]
     resourceNames: ["{{.Name}}-confirmed"]
     verbs: ["get"]
+  # The namespaces to meter, written by the operator when an application is
+  # deployed. GET ONLY, for the same reason as the confirmations above: a
+  # kernel that could edit its own metering scope could narrow it, and the
+  # symptom of a narrowed scope is spending that stops being counted.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["{{.Name}}-namespaces"]
+    verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

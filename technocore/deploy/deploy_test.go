@@ -169,20 +169,57 @@ func TestTheLedgerRoleIsPinnedToItsOwnConfigMap(t *testing.T) {
 	}
 	role := ofKind(t, out, "Role")[0]
 	rules := at(t, role, "rules").([]any)
-	if len(rules) != 3 {
-		t.Fatalf("ledger Role has %d rules, want 3 (unnamed create, named maintenance, named read)", len(rules))
-	}
 
+	// The property, not a count: exactly one rule may be unnamed, it may
+	// grant only create, and every other rule must be pinned to a specific
+	// object. Asserting a rule count instead would have to be edited every
+	// time a ConfigMap is added, and an assertion that gets edited to pass is
+	// not an assertion.
 	var named, unnamed map[string]any
+	unnamedCount := 0
 	for _, r := range rules {
 		m := r.(map[string]any)
 		if _, ok := m["resourceNames"]; !ok {
 			unnamed = m
+			unnamedCount++
 			continue
 		}
 		if fmt.Sprint(m["resourceNames"]) == "[technocore-ledger]" {
 			named = m
 		}
+		// No pinned rule may grant list: listing defeats the pin by
+		// returning every ConfigMap in the namespace.
+		for _, v := range m["verbs"].([]any) {
+			if v == "list" || v == "watch" {
+				t.Errorf("rule %v grants %v, which defeats the resourceName pin", m["resourceNames"], v)
+			}
+		}
+	}
+	if unnamedCount != 1 {
+		t.Fatalf("ledger Role has %d unnamed rules, want exactly 1 (create, which cannot be name-restricted)", unnamedCount)
+	}
+
+	// Exactly one object may be written, and it is the kernel's own ledger.
+	// The confirmations and the metered-namespace list are the OPERATOR's
+	// inputs: a kernel that could edit either could correct its own estimate
+	// or narrow its own scope, and a narrowed scope looks identical to an
+	// instance that is not spending anything.
+	writable := map[string]bool{}
+	for _, r := range rules {
+		m := r.(map[string]any)
+		names, ok := m["resourceNames"]
+		if !ok {
+			continue
+		}
+		for _, v := range m["verbs"].([]any) {
+			switch v {
+			case "update", "patch", "create", "delete", "deletecollection":
+				writable[fmt.Sprint(names)] = true
+			}
+		}
+	}
+	if len(writable) != 1 || !writable["[technocore-ledger]"] {
+		t.Errorf("writable pinned objects = %v, want only [technocore-ledger]", writable)
 	}
 	if named == nil || unnamed == nil {
 		t.Fatal("expected one named and one unnamed configmap rule")
@@ -344,5 +381,65 @@ func TestTheCostLimitReachesTheContainer(t *testing.T) {
 		if !strings.Contains(string(out), want) {
 			t.Errorf("missing argument %q", want)
 		}
+	}
+}
+
+// Applying this binding is what makes an application visible to the cost
+// meter at all. It lives in TechnoCore's package rather than the translator
+// that creates application namespaces: a translator writing its own version
+// would be a second copy of the kernel's permission model, free to drift from
+// the ClusterRole it references.
+func TestRenderNamespaceBindingGrantsTheKernelInOneNamespace(t *testing.T) {
+	out, err := RenderNamespaceBinding("demo", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	docs := docs(t, out)
+	if len(docs) != 1 {
+		t.Fatalf("rendered %d documents, want exactly one RoleBinding", len(docs))
+	}
+	rb := docs[0]
+	if k, _ := rb["kind"].(string); k != "RoleBinding" {
+		t.Fatalf("kind = %v, want RoleBinding — a ClusterRoleBinding would grant the whole cluster", k)
+	}
+	if got := at(t, rb, "metadata", "namespace"); got != "demo" {
+		t.Errorf("bound in %v, want demo", got)
+	}
+	if got := at(t, rb, "roleRef", "kind"); got != "ClusterRole" {
+		t.Errorf("roleRef kind = %v, want ClusterRole (the rule set)", got)
+	}
+	if got := at(t, rb, "roleRef", "name"); got != DefaultName {
+		t.Errorf("roleRef name = %v, want %q", got, DefaultName)
+	}
+	subjects := at(t, rb, "subjects").([]any)
+	s0 := subjects[0].(map[string]any)
+	if s0["name"] != DefaultName || s0["namespace"] != DefaultNamespace {
+		t.Errorf("subject = %v, want the kernel's ServiceAccount in %q", s0, DefaultNamespace)
+	}
+}
+
+func TestRenderNamespaceBindingNeedsANamespace(t *testing.T) {
+	if _, err := RenderNamespaceBinding("", "", ""); err == nil {
+		t.Fatal("expected an error without a namespace")
+	}
+}
+
+// The binding names the ClusterRole the workload renders. If the two spellings
+// ever diverge the binding references a role that does not exist, and the
+// kernel is refused in every application namespace.
+func TestTheBindingReferencesTheClusterRoleTheWorkloadRenders(t *testing.T) {
+	workload, err := Render(sampleConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cr := ofKind(t, workload, "ClusterRole")[0]
+	roleName := at(t, cr, "metadata", "name")
+
+	out, err := RenderNamespaceBinding("demo", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := at(t, docs(t, out)[0], "roleRef", "name"); got != roleName {
+		t.Errorf("the binding references ClusterRole %v; the workload renders %v", got, roleName)
 	}
 }
