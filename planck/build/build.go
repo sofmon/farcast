@@ -116,7 +116,7 @@ func (c *Config) withDefaults() {
 		c.Namespace = Namespace
 	}
 	if c.JobName == "" {
-		c.JobName = jobName(c.Deployment, c.App)
+		c.JobName = JobName(c.Deployment, c.App)
 	}
 	if c.Ref == "" {
 		c.Ref = "refs/heads/main"
@@ -126,9 +126,13 @@ func (c *Config) withDefaults() {
 	}
 }
 
-// jobName is stable for a given app so a re-run replaces rather than
-// accumulates, and short enough to stay a valid DNS label.
-func jobName(deployment, app string) string {
+// JobName is the Job a build runs as. It is stable for a given app so a re-run
+// replaces rather than accumulates, and short enough to stay a valid DNS label.
+//
+// Exported because the caller has to wait on, and read the digest from, the
+// same Job this package created — and a second implementation of the name is
+// the join that silently watches the wrong object.
+func JobName(deployment, app string) string {
 	n := "build-" + deployment + "-" + app
 	if len(n) > 63 {
 		n = n[:63]
