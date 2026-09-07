@@ -86,10 +86,18 @@ A namespace the operator asked for but the kernel cannot list is almost always a
 - **Every namespace refusing is a fault.** The tick fails. Carrying on would report `$0` for an instance that is still spending, which is the failure this component exists to prevent.
 - **An incomplete tick never claims the instance floor.** `Report.Complete()` gates it, in both `Report.AtFloor()` and the shutdown's own result: a namespace the kernel could not read may hold the very workloads it would be saying it has run out of ways to stop.
 
+### The kernel publishes what it saw, so nothing models it twice
+
+`farcast costs` reports spending by reading the kernel's own checkpoint — the rate, the pod count, the level, and the limit **the cluster is actually enforcing**, all written as an `Observation` alongside the ledger.
+
+It would be easy for the CLI to list pods and price them itself. That is the mistake: two implementations of the same arithmetic eventually quote two different numbers, and the one an operator reads would not be the one enforcement acts on. The same reasoning is why the observation carries the kernel's limit rather than the operator's recorded one — when a limit has been changed locally and not redeployed, the cluster is still acting on its own, and a report that quietly showed the local figure would be describing an enforcement that is not happening.
+
+The observation rides the checkpoint's schedule rather than adding a write per tick, so it is as stale as the last checkpoint and carries the timestamp that says so. It also carries `Incomplete` and the unreadable namespaces, because a figure built on a partial picture is a floor and not a total.
+
 ### One replica, replaced rather than overlapped
 
 The kernel is a meter with a single ledger, so its Deployment is `replicas: 1` with `strategy: Recreate`. A rolling update would run two kernels for a few seconds; both would meter the same instance into their own in-memory ledgers and race to write the same checkpoint, and the period's spending would become whichever wrote last.
 
 It carries **no PodDisruptionBudget**, deliberately: a single-replica workload behind `minAvailable: 1` makes every node drain hang forever, which would block the auto-upgrades ADR 0003 accepts. The checkpoint is what makes the kernel's own reschedule survivable — the successor bills the gap it slept through — so it does not need one.
 
-*The operator-side deploy command follows as 4.1 lands.*
+*The operator-side commands are `farcast kernel deploy|meter|confirm` (4.1) and `farcast costs` (4.3).*

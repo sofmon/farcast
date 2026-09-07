@@ -87,6 +87,11 @@ type Reconciler struct {
 	// forgot an outage's worth of spending would under-report in the
 	// flattering direction.
 	Last time.Time
+
+	// Observed is the last reconcile's view, kept so the next checkpoint can
+	// publish it. It is what `farcast costs` reads, and it is deliberately the
+	// kernel's own figures rather than a second model of them.
+	Observed Observation
 }
 
 // Workload is one metered pod, as the kernel sees it.
@@ -308,6 +313,16 @@ func (r *Reconciler) Reconcile(ctx context.Context, now time.Time) (Report, erro
 	rep.Accrual = r.Ledger.Accrued()
 	_, periodEnd := r.Ledger.Period()
 	rep.Assessment = cost.Assess(rep.Accrual.Total, r.Limit, rep.RateHourlyUSD, now, periodEnd)
+	r.Observed = Observation{
+		At:            now,
+		Pods:          len(rep.Workloads),
+		Unclassified:  rep.Unclassified,
+		RateHourlyUSD: rep.RateHourlyUSD,
+		Level:         rep.Assessment.Level.String(),
+		Limit:         r.Limit,
+		Incomplete:    !rep.Complete(),
+		Unreachable:   rep.Unreachable,
+	}
 	return rep, nil
 }
 

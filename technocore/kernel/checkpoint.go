@@ -39,7 +39,44 @@ type Checkpoint struct {
 	// invisible — an instance that forgot a day of spending would
 	// under-report, in the flattering direction.
 	Last time.Time `json:"last_reconcile"`
+
+	// Observed is what the kernel saw the last time it looked, published so
+	// an operator's machine can report spending without modelling it a second
+	// time.
+	//
+	// The rate lives here rather than being recomputed by whatever asks,
+	// because two implementations of the same arithmetic eventually quote
+	// two different numbers — and the one an operator would act on is not
+	// necessarily the one enforcement uses. It is written on the checkpoint's
+	// own schedule, so it is as old as the last checkpoint and says when it
+	// was taken.
+	Observed Observation `json:"observed,omitzero"`
 }
+
+// Observation is one reconcile's view of the cluster, as the kernel saw it.
+type Observation struct {
+	At            time.Time `json:"at,omitzero"`
+	Pods          int       `json:"pods,omitempty"`
+	Unclassified  int       `json:"unclassified,omitempty"`
+	RateHourlyUSD float64   `json:"rate_per_hour,omitempty"`
+
+	// Level is the assessment the kernel is acting on, and Limit the figure it
+	// is acting against. Both are the KERNEL's, not local state's: when a
+	// limit has been changed locally and not redeployed, this is the one still
+	// being enforced.
+	Level string  `json:"level,omitempty"`
+	Limit float64 `json:"limit,omitempty"`
+
+	// Incomplete records that at least one metered namespace could not be
+	// read. A report built on a partial picture must say so — the missing
+	// namespace may hold the most expensive thing running.
+	Incomplete  bool     `json:"incomplete,omitempty"`
+	Unreachable []string `json:"unreachable,omitempty"`
+}
+
+// CheckpointKey is where the checkpoint lives inside its ConfigMap, exported
+// so a reader outside this package cannot disagree with the writer about it.
+func CheckpointKey() string { return checkpointKey }
 
 // CheckpointStore persists a Checkpoint.
 type CheckpointStore interface {
@@ -157,14 +194,19 @@ func (r *Reconciler) Restore(ctx context.Context, store CheckpointStore) (bool, 
 	}
 	r.Ledger = ledger
 	r.Last = cp.Last
+	// Carried across the restart so a report asked in the gap before the first
+	// reconcile shows the last thing that was true, timestamped, rather than
+	// an instance that appears to be running nothing.
+	r.Observed = cp.Observed
 	return true, nil
 }
 
 // Save writes the reconciler's current state.
 func (r *Reconciler) Save(ctx context.Context, store CheckpointStore) error {
 	return store.Save(ctx, Checkpoint{
-		Version: CheckpointVersion,
-		Ledger:  r.Ledger.Snapshot(),
-		Last:    r.Last,
+		Version:  CheckpointVersion,
+		Ledger:   r.Ledger.Snapshot(),
+		Last:     r.Last,
+		Observed: r.Observed,
 	})
 }
