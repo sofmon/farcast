@@ -212,13 +212,14 @@ Translate a `./farcast` manifest into K8s resources.
 ### 4.3 FarSight CLI — `farcast run`
 The core command that makes FarCast useful.
 
-- `farcast run github.com/user/repo` fetches the repo
-- Reads `./farcast` manifest
-- Displays external service declarations for operator review
-- Operator approves → Planck deploys → TechnoCore monitors
-- `farcast ps` lists running applications
-- `farcast logs <app>` streams application logs
-- `farcast costs` shows current spending, per-app breakdown, and distance to limit
+- `farcast run <instance> github.com/user/repo` — **the instance fetches the repo, not this machine** ([ADR 0010](docs/adr/0010-application-image-builds.md) decision 6). An ephemeral Job clones at the ref, prints `./farcast`, and reports the resolved commit and a digest of the manifest it parsed; decision 11 gives that read its own workload, with a ServiceAccount that has no registry grant and a policy that blocks the metadata server the builder is allowed
+- Reads `./farcast` manifest — `--manifest <path>` for a repository that keeps it elsewhere; paths inside stay repository-relative either way
+- **Displays external service declarations for operator review**, alongside the commit and manifest digest, which are what a machine that cannot reach the repository can check out of band later
+- Operator approves → **every app is built pinned to the commit that was read**, one build at a time, then Planck deploys → the namespace is added to what TechnoCore meters, with its RoleBinding, in the same apply
+- The two third-party images this puts in the instance (Kaniko, and something with git in it) are digest-pinned, reviewed once, and **recorded against the instance** so later runs need no flags
+- `farcast ps` lists running applications, hiding the instance's own machinery without `--all`; 0 replicas is reported as stopped rather than broken, because that is what a protective shutdown leaves behind
+- `farcast logs <app>` streams application logs, finding the namespace by name across what the kernel meters
+- `farcast costs` shows current spending, per-app breakdown, and distance to limit — **read from the kernel's own checkpoint rather than modelled a second time**, so what is reported is what enforcement is acting on, and a missing billing feed is never shown as a confirmed zero
 
 ### 4.4 Shrike — manifest enforcement for running apps
 Extend Shrike to monitor per-application traffic.

@@ -14,7 +14,7 @@ See the root [README.md](../README.md#L169-L195) for the design intent and [AGEN
 
 ## File Location & Format
 
-- **Path**: repository root.
+- **Path**: repository root. `farcast run --manifest <path>` reads one from elsewhere in the repository, for a project that keeps deployment descriptors together in a directory. Everything *inside* the document stays **repository-relative** either way — a manifest describes the repository it belongs to, and moving the document must not move what it points at. See [`examples/manifest-elsewhere`](examples/manifest-elsewhere/farcast).
 - **Filename**: `farcast` (no extension). Referenced as `./farcast` in documentation.
 - **Format**: YAML 1.2, UTF-8 encoded, LF line endings.
 - **Companion files**: one or more `Containerfile`s, referenced by each app's `containerfile` field. The manifest parser does **not** read or validate Containerfiles — Planck does that at build time.

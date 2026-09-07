@@ -1,0 +1,19 @@
+# A manifest that does not sit at the repository root.
+#
+# Most repositories keep ./farcast at the top, and that is the default. Some
+# keep deployment descriptors together in a directory, and `farcast run
+# --manifest <path>` reads one from wherever it lives.
+#
+# The rule that matters is that every path inside stays REPOSITORY-relative,
+# not manifest-relative. A manifest describes the repository it belongs to, and
+# the build clones that repository — so moving the document must not move what
+# it points at.
+#
+# This example is also the fixture the Phase 4.3 runbook deploys, which is why
+# it points at a Containerfile that really exists in this repository and really
+# has a RUN step in it.
+name: manifest-elsewhere
+apps:
+  - name: prover
+    containerfile: manifest/examples/with-build/Containerfile
+    context: manifest/examples/with-build
