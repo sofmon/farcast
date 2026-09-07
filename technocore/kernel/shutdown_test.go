@@ -231,3 +231,34 @@ func TestEveryScaleFailingIsNotTheFloor(t *testing.T) {
 		t.Error("every scale call failing is a permissions problem, not the instance floor")
 	}
 }
+
+// The shutdown's OWN floor flag, not just the report's. A namespace the kernel
+// could not read may hold the very workloads it would be claiming to have run
+// out of ways to stop — and this is the field an operator-facing message is
+// built from, so it is the one that must not lie.
+func TestShutdownNeverClaimsTheFloorOnAPartialPicture(t *testing.T) {
+	f := &fakeCluster{
+		byNS: map[string][]kube.Pod{
+			"farcast-system": {pod("fatline-1", "farcast-system", "fatline", tier.System, kube.PodRunning, "100m", "128Mi")},
+		},
+		depsNS: map[string][]kube.Deployment{
+			"farcast-system": {deployment("fatline", "farcast-system", "fatline", tier.System, 2)},
+		},
+		nsErr: map[string]error{"farcast-apps": errors.New("pods is forbidden")},
+	}
+	r, rep := overLimit(t, f, "farcast-system", "farcast-apps")
+	if rep.Complete() {
+		t.Fatal("test setup: the report should be incomplete")
+	}
+	if len(rep.Stoppable()) != 0 {
+		t.Fatal("test setup: nothing visible should be stoppable")
+	}
+
+	res, err := r.Shutdown(context.Background(), rep, start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.AtFloor {
+		t.Error("the shutdown claimed the instance floor while a namespace was unreadable")
+	}
+}

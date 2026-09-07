@@ -23,6 +23,7 @@ type fakeCluster struct {
 	depsNS  map[string][]kube.Deployment
 	err     error
 	depErr  error
+	nsErr   map[string]error
 	scaleAt map[string]error
 	seen    []string
 	scaled  []string
@@ -33,12 +34,18 @@ func (f *fakeCluster) ListPods(_ context.Context, ns, selector string) ([]kube.P
 	if f.err != nil {
 		return nil, f.err
 	}
+	if err := f.nsErr[ns]; err != nil {
+		return nil, err
+	}
 	return f.byNS[ns], nil
 }
 
 func (f *fakeCluster) ListDeployments(_ context.Context, ns, _ string) ([]kube.Deployment, error) {
 	if f.depErr != nil {
 		return nil, f.depErr
+	}
+	if err := f.nsErr[ns]; err != nil {
+		return nil, err
 	}
 	return f.depsNS[ns], nil
 }
@@ -347,11 +354,63 @@ func TestAnUnparseableRequestFailsTheTick(t *testing.T) {
 	}
 }
 
-func TestAListFailureFailsTheTick(t *testing.T) {
+// Losing every namespace is a fault, not a finding: carrying on would report
+// $0 for an instance that is still spending.
+func TestLosingEveryNamespaceFailsTheTick(t *testing.T) {
 	f := &fakeCluster{err: errors.New("api server said no")}
 	r := reconciler(t, f, "farcast-apps")
 	if _, err := r.Reconcile(context.Background(), start); err == nil {
-		t.Fatal("expected the list failure to surface")
+		t.Fatal("expected a tick with no readable namespace to fail")
+	}
+}
+
+// One namespace refusing — almost always a missing RoleBinding after an app
+// deploy — must not disable cost enforcement for the whole instance. It is
+// recorded, and the report says it is incomplete.
+func TestOneUnreachableNamespaceIsRecordedNotFatal(t *testing.T) {
+	f := runningApp()
+	f.nsErr = map[string]error{"farcast-broken": errors.New("pods is forbidden")}
+	r := reconciler(t, f, "farcast-apps", "farcast-broken")
+
+	rep, err := r.Reconcile(context.Background(), start)
+	if err != nil {
+		t.Fatalf("one bad namespace must not fail the tick: %v", err)
+	}
+	if len(rep.Unreachable) == 0 {
+		t.Fatal("the unreachable namespace was not recorded")
+	}
+	if rep.Complete() {
+		t.Error("a tick that could not read a namespace is not complete")
+	}
+	// The rest of the instance is still metered.
+	if len(rep.Workloads) == 0 {
+		t.Error("the readable namespace was not metered")
+	}
+}
+
+// A kernel that cannot see a namespace cannot know what it would be leaving
+// running there, so it must never claim to have run out of things to stop.
+func TestTheFloorIsNeverClaimedOnAPartialPicture(t *testing.T) {
+	f := runningApp()
+	f.nsErr = map[string]error{"farcast-broken": errors.New("pods is forbidden")}
+	f.depsNS = map[string][]kube.Deployment{}
+	r := reconciler(t, f, "farcast-apps", "farcast-broken")
+	r.Limit = 0.0001
+	if _, err := r.Reconcile(context.Background(), start); err != nil {
+		t.Fatal(err)
+	}
+	rep, err := r.Reconcile(context.Background(), start.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.Assessment.Level.Acts() {
+		t.Fatal("test setup: the limit should be reached")
+	}
+	if len(rep.Stoppable()) != 0 {
+		t.Fatal("test setup: nothing should be stoppable")
+	}
+	if rep.AtFloor() {
+		t.Error("the floor was claimed while a namespace was unreadable")
 	}
 }
 

@@ -94,7 +94,11 @@ func (r *Reconciler) Shutdown(ctx context.Context, rep Report, now time.Time) (S
 	// The floor is reached when nothing was available to stop, not when
 	// nothing was stopped successfully: a failed scale call is a problem to
 	// report, not evidence that the instance has run out of options.
-	out.AtFloor = len(rep.Stoppable()) == 0
+	//
+	// And never on a partial picture. A namespace the kernel could not read
+	// may hold the very workloads it would be claiming to have run out of
+	// ways to stop.
+	out.AtFloor = rep.Complete() && len(rep.Stoppable()) == 0
 	return out, nil
 }
 
@@ -113,7 +117,7 @@ func (rep Report) Protected() []Target {
 // AtFloor reports that every stoppable workload is already stopped and
 // spending is still over the limit.
 func (rep Report) AtFloor() bool {
-	return rep.Assessment.Level.Acts() && len(rep.Stoppable()) == 0
+	return rep.Assessment.Level.Acts() && rep.Complete() && len(rep.Stoppable()) == 0
 }
 
 // SystemProtected is the reason the floor exists, stated as a number: what the

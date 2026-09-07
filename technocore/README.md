@@ -68,6 +68,24 @@ The operator's machine already holds the cloud credential, so it reads the bill 
 
 Confirmations are applied *before* anything is metered on each tick, so the assessment already reflects them. Re-reading the same document every tick is a no-op: a window already in the ledger comes back as an overlap and is skipped, and one belonging to a period that has rolled away is skipped too. Neither is a fault — both happen on every tick once the operator has pushed anything at all.
 
+### How a new application namespace becomes metered
+
+Two things have to happen when Planck creates an application namespace, and doing only one is worse than doing neither.
+
+**Permission.** [`deploy.RenderNamespaceBinding`](deploy/) emits a RoleBinding granting the kernel's ClusterRole inside that namespace. It lives in TechnoCore's package rather than the translator that creates the namespace: a translator writing its own version would be a second copy of the kernel's permission model, free to drift from the ClusterRole it references.
+
+**Configuration.** The kernel reads a `technocore-namespaces` ConfigMap on every tick and adds what it names to the configured set. This exists so that deploying an application does not restart the kernel — it is single-replica and `Recreate`, so re-rendering the workload with a longer `--namespaces` argument would tear down the meter at exactly the moment new spending starts. The kernel is granted `get` and never `update`: a kernel that could edit its own metering scope could narrow it, and a narrowed scope looks identical to an instance that is not spending anything.
+
+Discovery only ever **adds**. A document that omitted `farcast-system` would otherwise stop the instance's own components being metered, and under-reporting is the direction this package exists to avoid.
+
+### When the kernel cannot see a namespace
+
+A namespace the operator asked for but the kernel cannot list is almost always a missing RoleBinding — and it means the workloads there are running, billing, and counted nowhere. The response is graded:
+
+- **One namespace refusing is a finding.** It is recorded in `Report.Unreachable`, the tick continues, and the rest of the instance is still metered — a single misconfigured application must not disable cost enforcement everywhere.
+- **Every namespace refusing is a fault.** The tick fails. Carrying on would report `$0` for an instance that is still spending, which is the failure this component exists to prevent.
+- **An incomplete tick never claims the instance floor.** `Report.Complete()` gates it, in both `Report.AtFloor()` and the shutdown's own result: a namespace the kernel could not read may hold the very workloads it would be saying it has run out of ways to stop.
+
 ### One replica, replaced rather than overlapped
 
 The kernel is a meter with a single ledger, so its Deployment is `replicas: 1` with `strategy: Recreate`. A rolling update would run two kernels for a few seconds; both would meter the same instance into their own in-memory ledgers and race to write the same checkpoint, and the period's spending would become whichever wrote last.

@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/sofmon/farcast/technocore/cost"
@@ -60,6 +61,11 @@ type Reconciler struct {
 	Ledger     *cost.Ledger
 	Limit      float64
 	Interval   time.Duration
+
+	// Discover supplies namespaces to meter beyond the configured ones, so
+	// deploying an application does not require restarting the kernel. Nil
+	// means the configured list is the whole set.
+	Discover NamespaceSource
 
 	// Confirmations supplies the provider's own figures for closed windows.
 	// Nil means none are available, which is a state the reports name rather
@@ -124,6 +130,13 @@ type Report struct {
 	// Rolled is set when this tick opened a new accounting period.
 	Rolled bool
 
+	// Metered is the namespace set this tick actually read, and Unreachable
+	// is the subset that refused. A namespace the operator asked for but the
+	// kernel cannot list is almost always a missing RoleBinding — and it means
+	// the workloads there are running, billing, and counted nowhere.
+	Metered     []string
+	Unreachable []string
+
 	// ConfirmationsApplied counts the provider figures this tick took in;
 	// ConfirmationsRefused counts how many of those the clamp would not let
 	// calibrate the model. A refusal is the most interesting thing the cost
@@ -158,6 +171,14 @@ type Report struct {
 	// each one claims.
 	Targets []Target
 }
+
+// Complete reports whether this tick saw every namespace it was asked to.
+//
+// An incomplete tick still meters and still warns — under-reporting is better
+// than not reporting — but it must never claim the instance floor, because the
+// kernel cannot know what it is leaving running in a namespace it could not
+// read.
+func (rep Report) Complete() bool { return len(rep.Unreachable) == 0 }
 
 // Stoppable returns the deployments a cost shutdown may stop, most expensive
 // first, excluding any already scaled to zero.
@@ -211,10 +232,22 @@ func (r *Reconciler) Reconcile(ctx context.Context, now time.Time) (Report, erro
 		return Report{}, err
 	}
 
-	for _, ns := range r.Namespaces {
+	metered, err := r.meteredNamespaces(ctx)
+	if err != nil {
+		return Report{}, err
+	}
+	rep.Metered = metered
+
+	for _, ns := range metered {
 		pods, err := r.Cluster.ListPods(ctx, ns, r.Selector)
 		if err != nil {
-			return Report{}, fmt.Errorf("kernel: list pods in %s: %w", ns, err)
+			// One namespace refusing must not stop the meter reading the
+			// rest: a single missing RoleBinding would otherwise disable cost
+			// enforcement for the whole instance. It is recorded instead, and
+			// Report.Complete is what stops the kernel acting on a picture it
+			// knows is partial.
+			rep.Unreachable = append(rep.Unreachable, fmt.Sprintf("%s: %v", ns, safeNamespaceError(err)))
+			continue
 		}
 		for _, p := range pods {
 			if !p.Billable() {
@@ -247,6 +280,16 @@ func (r *Reconciler) Reconcile(ctx context.Context, now time.Time) (Report, erro
 		}
 	}
 
+	// Partial visibility is workable; none is not. If every namespace refused,
+	// the kernel has lost its permissions rather than met one misconfigured
+	// application — and carrying on would report $0 for an instance that is
+	// still spending, which is the exact failure this package is built to
+	// avoid. One namespace failing is a finding; all of them is a fault.
+	if len(rep.Unreachable) > 0 && len(rep.Unreachable) >= len(rep.Metered) {
+		return Report{}, fmt.Errorf("kernel: no metered namespace could be read (%s)",
+			strings.Join(rep.Unreachable, "; "))
+	}
+
 	if err := r.collectTargets(ctx, &rep); err != nil {
 		return Report{}, err
 	}
@@ -274,11 +317,25 @@ func (r *Reconciler) Reconcile(ctx context.Context, now time.Time) (Report, erro
 // A pod matching no deployment is simply not attributed: datasphered's pods
 // belong to a StatefulSet, and the system tier is never stopped anyway, so
 // there is nothing to gain from teaching this to walk owner references.
+// safeNamespaceError keeps a per-namespace failure short enough to log every
+// tick without drowning the reports that matter.
+func safeNamespaceError(err error) string {
+	s := err.Error()
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
+	}
+	if len(s) > 160 {
+		s = s[:160] + "…"
+	}
+	return s
+}
+
 func (r *Reconciler) collectTargets(ctx context.Context, rep *Report) error {
-	for _, ns := range r.Namespaces {
+	for _, ns := range rep.Metered {
 		deps, err := r.Cluster.ListDeployments(ctx, ns, r.Selector)
 		if err != nil {
-			return fmt.Errorf("kernel: list deployments in %s: %w", ns, err)
+			rep.Unreachable = append(rep.Unreachable, fmt.Sprintf("%s (deployments): %v", ns, safeNamespaceError(err)))
+			continue
 		}
 		for _, d := range deps {
 			t := Target{
