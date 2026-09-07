@@ -42,6 +42,17 @@ const (
 	secretName        = "fatline-mtls"
 	tlsMountPath      = "/etc/fatline/tls"
 
+	// EgressService is the in-cluster name applications send outbound traffic
+	// to. It is a SEPARATE ClusterIP Service from the tunnel's, and that
+	// separation is the point rather than tidiness: the tunnel's Service is a
+	// public load balancer (ADR 0005), so adding the proxy port to it would
+	// publish an open forward proxy on the internet.
+	//
+	// Added at 4.2, after the validation walk found applications pointed at a
+	// Service port that did not exist — FARCAST_FATLINE_PROXY resolved and
+	// connected to nothing.
+	EgressService = "fatline-egress"
+
 	// DefaultReplicas is two for the same reason datasphered runs two
 	// (ADR 0008 decision 6, ADR 0009 decision 11), and the reason is not
 	// throughput. Every unseal push — and every keeper reseed at 5.4 — rides
@@ -137,6 +148,7 @@ func Render(c Config) ([]byte, error) {
 		RequestCPUMilli: RequestCPUMilli,
 		RequestMemMiB:   RequestMemMiB,
 		SecretName:      secretName,
+		EgressService:   EgressService,
 		MountPath:       tlsMountPath,
 		CACert:          base64.StdEncoding.EncodeToString(c.CACertPEM),
 		ServerCert:      base64.StdEncoding.EncodeToString(c.ServerCertPEM),
@@ -170,20 +182,21 @@ func mtlsHash(parts ...[]byte) string {
 }
 
 type templateData struct {
-	StreamRoutes []string
-	Namespace    string
-	Name         string
-	Image        string
-	Carrier      string
-	TunnelPort   int
-	EgressPort   int
-	Replicas     int
-	SecretName   string
-	MountPath    string
-	MTLSHash     string
-	CACert       string
-	ServerCert   string
-	ServerKey    string
+	StreamRoutes  []string
+	Namespace     string
+	Name          string
+	Image         string
+	Carrier       string
+	TunnelPort    int
+	EgressPort    int
+	Replicas      int
+	SecretName    string
+	EgressService string
+	MountPath     string
+	MTLSHash      string
+	CACert        string
+	ServerCert    string
+	ServerKey     string
 
 	// Rendered from the exported constants rather than written into the
 	// template, so the cost estimate and the manifest quote one number.
@@ -342,6 +355,30 @@ spec:
   selector:
     matchLabels:
       app.kubernetes.io/name: fatline
+---
+# The egress proxy, in-cluster only.
+#
+# A SEPARATE Service from the tunnel's below, and separate on purpose: that one
+# is a public load balancer (ADR 0005), so putting the proxy port on it would
+# publish an open forward proxy to the internet — anyone could route traffic
+# through the instance. This one is ClusterIP and is what applications are
+# pointed at by FARCAST_FATLINE_PROXY.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{.EgressService}}
+  namespace: {{.Namespace}}
+  labels:
+    app.kubernetes.io/name: fatline
+    app.kubernetes.io/managed-by: farcast
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: fatline
+  ports:
+    - name: egress
+      port: {{.EgressPort}}
+      targetPort: egress
 ---
 apiVersion: v1
 kind: Service

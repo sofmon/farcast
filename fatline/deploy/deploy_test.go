@@ -320,3 +320,58 @@ func TestRenderedRequestsMatchTheExportedConstants(t *testing.T) {
 		}
 	}
 }
+
+// The egress proxy needs a Service of its own, and it must never be the
+// tunnel's.
+//
+// Found on the 4.2 walk: applications were pointed at
+// fatline.farcast-system:3128 and the tunnel's Service published only 8443, so
+// FARCAST_FATLINE_PROXY resolved and connected to nothing — an application's
+// only route out did not exist.
+//
+// The obvious fix is the dangerous one. The tunnel's Service is a public
+// LoadBalancer (ADR 0005); adding the proxy port to it would put an open
+// forward proxy on the internet, and anyone could route traffic through the
+// instance.
+func TestTheEgressProxyHasItsOwnClusterIPServiceAndIsNeverPublished(t *testing.T) {
+	out, err := Render(sampleConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var tunnel, egress map[string]any
+	for _, doc := range strings.Split(string(out), "\n---\n") {
+		var m map[string]any
+		if err := yaml.Unmarshal([]byte(doc), &m); err != nil {
+			t.Fatalf("invalid YAML: %v", err)
+		}
+		if k, _ := m["kind"].(string); k != "Service" {
+			continue
+		}
+		switch nested(t, m, "metadata", "name") {
+		case DefaultName:
+			tunnel = m
+		case EgressService:
+			egress = m
+		}
+	}
+
+	if egress == nil {
+		t.Fatal("no egress Service; applications have no route out at all")
+	}
+	if got := nested(t, egress, "spec", "type"); got != "ClusterIP" {
+		t.Errorf("egress Service type = %v, want ClusterIP — this port must never leave the cluster", got)
+	}
+	if got := fmt.Sprint(nested(t, egress, "spec", "ports")); !strings.Contains(got, fmt.Sprint(DefaultEgressPort)) {
+		t.Errorf("egress Service does not publish %d: %v", DefaultEgressPort, got)
+	}
+
+	if tunnel == nil {
+		t.Fatal("no tunnel Service")
+	}
+	// The one that must not happen.
+	if got := fmt.Sprint(nested(t, tunnel, "spec", "ports")); strings.Contains(got, fmt.Sprint(DefaultEgressPort)) {
+		t.Errorf("the PUBLIC Service publishes the egress proxy port (%v); that is an open forward proxy on the internet",
+			got)
+	}
+}
