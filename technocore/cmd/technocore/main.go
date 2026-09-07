@@ -100,6 +100,11 @@ func run(args []string) error {
 	}
 	store := kernel.NewConfigMapStore(client)
 	r.Confirmations = kernel.NewConfigMapConfirmations(client)
+	// Without this the kernel meters only the namespaces baked into its
+	// arguments, and every namespace added later is invisible: the
+	// applications there run, bill, and are counted nowhere. The 4.2 walk
+	// found exactly that — `kernel meter` wrote the list and nothing read it.
+	r.Discover = kernel.NewConfigMapNamespaces(client)
 
 	// A checkpoint that cannot be read is a failure, not a fresh start:
 	// carrying on from zero would silently reset the meter and the limit

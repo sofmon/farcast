@@ -3,6 +3,7 @@ package kernel
 import (
 	"context"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 
@@ -141,5 +142,33 @@ func TestTheNamespaceDocumentRoundTripsBetweenWriterAndReader(t *testing.T) {
 	}
 	if strings.Join(got, ",") != "demo,other" {
 		t.Errorf("read %v, wrote [demo other]", got)
+	}
+}
+
+// The kernel's entrypoint has to actually USE the discovery source, and no
+// unit test of this package can tell whether it does.
+//
+// Found on the 4.2 walk: `kernel meter` wrote a correct ConfigMap, the kernel
+// never read it, and the metered set silently stayed at whatever was baked
+// into the arguments. Every test here passed throughout — they exercise the
+// source and the reconciler, and the gap was between main.go and both.
+//
+// This is the third wiring gap of the same shape in this phase, which is why
+// it gets an assertion rather than a resolution to be careful.
+func TestTheEntrypointWiresTheDiscoverySource(t *testing.T) {
+	src, err := os.ReadFile("../cmd/technocore/main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(src)
+	if !strings.Contains(body, "NewConfigMapNamespaces(") {
+		t.Error("main.go never constructs a namespace source; namespaces added after deploy would be metered nowhere")
+	}
+	if !strings.Contains(body, ".Discover =") {
+		t.Error("main.go never assigns Reconciler.Discover; the source would be built and ignored")
+	}
+	// The confirmations source has the same shape and the same failure mode.
+	if !strings.Contains(body, ".Confirmations =") {
+		t.Error("main.go never assigns Reconciler.Confirmations")
 	}
 }
