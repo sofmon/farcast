@@ -18,14 +18,6 @@ const (
 	// buildTimeout bounds how long the CLI waits. The Job carries its own,
 	// shorter deadline; this is the operator's patience, not the build's.
 	buildTimeout = 35 * time.Minute
-
-	// kanikoRepo is where the maintained Kaniko lives. Google archived the
-	// original in June 2025 (ADR 0010 decision 10); this is the fork.
-	//
-	// It is a repository, deliberately not a pinned reference. Shipping a
-	// digest nobody in this project has verified would be worse than asking
-	// for one — see the refusal in resolveBuilder.
-	kanikoRepo = "cgr.dev/chainguard/kaniko"
 )
 
 // jobWaiter is the slice of the cluster client a build needs (injectable).
@@ -121,7 +113,7 @@ func (c *buildCommand) Run(ctx context.Context, env *Env, args []string) error {
 		return fmt.Errorf("instance %q has no image registry recorded; run 'farcast connect %s' first", name, name)
 	}
 
-	builder, err := c.resolveBuilder(ctx, env)
+	builder, err := c.resolveBuilder(ctx, env, meta)
 	if err != nil {
 		return err
 	}
@@ -206,56 +198,11 @@ func (c *buildCommand) Run(ctx context.Context, env *Env, args []string) error {
 	})
 }
 
-// resolveBuilder insists on a digest-pinned builder, and helps get one.
-//
-// The builder runs arbitrary build steps while holding a credential that can
-// write to the instance's registry, so a floating tag there is the single
-// worst place in FarCast to accept one. When a tag is given the CLI resolves
-// it and reports the digest — then refuses, because resolving at build time is
-// trust-on-first-use, not pinning: the next build would silently get whatever
-// the tag points at then. ADR 0010 decision 10 wants a reviewed constant, and
-// this is how the operator obtains one.
-func (c *buildCommand) resolveBuilder(ctx context.Context, env *Env) (string, error) {
-	ref := c.builderImage
-	if ref == "" {
-		return "", usagef("--builder-image is required and must be digest-pinned.\n"+
-			"Kaniko was archived by Google in June 2025 and continues as a fork at %s.\n"+
-			"Pass that repository with a tag once and this command will report the digest to pin.", kanikoRepo)
-	}
-	if isDigestPinned(ref) {
-		return ref, nil
-	}
-	b := c.newBuilder(func(msg string) { fprintf(env.Err, "  %s\n", msg) })
-	pinned, err := b.Resolve(ctx, ref, "", "")
-	if err != nil {
-		return "", fmt.Errorf("resolve the builder image %q: %w", ref, err)
-	}
-	return "", usagef("--builder-image %q is a tag, not a digest.\n"+
-		"It resolves today to:\n\n  %s\n\n"+
-		"Pass that, and record it: a builder image runs arbitrary build steps while holding a\n"+
-		"credential for your registry, so resolving a tag on every build would mean silently\n"+
-		"running whatever it points at next.", ref, pinned)
-}
-
-func isDigestPinned(ref string) bool {
-	_, digest, ok := strings.Cut(ref, "@")
-	return ok && isSHA256(digest)
-}
-
-// isSHA256 accepts only a complete, lowercase-hex sha256 digest.
-func isSHA256(s string) bool {
-	hex, ok := strings.CutPrefix(s, "sha256:")
-	if !ok || len(hex) != 64 {
-		return false
-	}
-	for i := range len(hex) {
-		switch ch := hex[i]; {
-		case ch >= '0' && ch <= '9', ch >= 'a' && ch <= 'f':
-		default:
-			return false
-		}
-	}
-	return true
+// resolveBuilder settles the Kaniko image, from the flag or from what this
+// instance already recorded. See resolveToolchainImage for why a tag is
+// reported and then refused.
+func (c *buildCommand) resolveBuilder(ctx context.Context, env *Env, meta *config.InstanceMetadata) (string, error) {
+	return resolveToolchainImage(ctx, env, meta, builderKind, c.builderImage, c.newBuilder)
 }
 
 // refTag turns a git ref into something usable as an image tag.

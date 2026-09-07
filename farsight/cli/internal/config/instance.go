@@ -231,6 +231,28 @@ type InstanceMetadata struct {
 
 	// Kernel records the in-cluster TechnoCore, if one has been deployed.
 	Kernel *Kernel `yaml:"kernel,omitempty"`
+
+	// Toolchain records the third-party images this instance runs to turn a
+	// repository into a deployable image, pointer-typed like the rest.
+	Toolchain *Toolchain `yaml:"toolchain,omitempty"`
+}
+
+// Toolchain is the pair of digest-pinned third-party images an instance uses
+// to read and build application source: Kaniko, and something with git in it
+// ([ADR 0010] decisions 10 and 11).
+//
+// It is recorded rather than defaulted. Neither image is FarCast's, both run
+// in the instance, and the builder holds a credential that can write to the
+// registry — so the digest is the operator's to review, once, and this is
+// where that review is written down so the next `farcast run` need not repeat
+// it. Shipping a default would be shipping a digest nobody had checked.
+//
+// [ADR 0010]: ../../../../docs/adr/0010-application-image-builds.md
+type Toolchain struct {
+	Builder string `yaml:"builder,omitempty"` // Kaniko, digest-pinned
+	Fetcher string `yaml:"fetcher,omitempty"` // git, digest-pinned
+
+	RecordedAt time.Time `yaml:"recorded_at,omitempty"`
 }
 
 // MTLSMaterial is a per-instance data-plane mTLS identity, PEM-encoded. It is a
