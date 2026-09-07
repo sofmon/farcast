@@ -1,0 +1,4 @@
+name: with-build
+apps:
+  - name: prover
+    containerfile: ./Containerfile

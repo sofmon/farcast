@@ -1,0 +1,12 @@
+# An example with a RUN step — the case that needs a builder.
+#
+# Every other example here assembles: a base image plus metadata, nothing
+# executed. That is not what most applications look like, and it is precisely
+# the shape ADR 0010 decided FarCast must support by building inside the
+# instance rather than on the operator's machine.
+#
+# The RUN below leaves a file the base image does not contain, so a container
+# started from the result proves the step actually ran.
+FROM alpine:3.19
+RUN mkdir -p /opt && echo "built by farcast, inside the instance" > /opt/built.txt
+CMD ["sh", "-c", "cat /opt/built.txt && sleep 3600"]
