@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"time"
 
@@ -110,7 +111,17 @@ func (c *kernelDeployCommand) Run(ctx context.Context, env *Env, args []string) 
 		return fmt.Errorf("instance %q has no cost limit recorded; the kernel would meter it and never act", name)
 	}
 
+	// The union of what was asked for and what is already metered.
+	//
+	// Seeding from --namespaces alone would silently drop every namespace
+	// `kernel meter` had added — so a routine redeploy (an image bump, a
+	// changed limit) would stop counting every application on the instance,
+	// and nothing would say so. Found on the 4.2 walk, immediately after
+	// fixing the gap that made the list matter at all.
 	namespaces := parseNamespaces(c.namespaces)
+	if meta.Kernel != nil {
+		namespaces = unionNamespaces(namespaces, meta.Kernel.Namespaces)
+	}
 	ok, err := c.confirmCost(env, meta, namespaces)
 	if err != nil {
 		return err
@@ -187,6 +198,24 @@ func (c *kernelDeployCommand) Run(ctx context.Context, env *Env, args []string) 
 		CostLimit:      costLimitResult(meta.CostLimit),
 		Floor:          floorFull(meta).Total,
 	})
+}
+
+// unionNamespaces merges two metered sets, sorted and deduplicated. Metering
+// only ever widens here: narrowing it is `kernel meter --remove`, which is an
+// explicit act rather than a side effect of redeploying.
+func unionNamespaces(a, b []string) []string {
+	set := map[string]bool{}
+	for _, ns := range append(append([]string{}, a...), b...) {
+		if ns = strings.TrimSpace(ns); ns != "" {
+			set[ns] = true
+		}
+	}
+	out := make([]string, 0, len(set))
+	for ns := range set {
+		out = append(out, ns)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // parseNamespaces splits the --namespaces flag, defaulting to FarCast's own.

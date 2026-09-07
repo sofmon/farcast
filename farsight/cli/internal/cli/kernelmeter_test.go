@@ -272,3 +272,36 @@ func writtenMeterList(t *testing.T, manifest string) []string {
 	t.Fatal("no metered-namespace document in the applied stream")
 	return nil
 }
+
+// A routine kernel redeploy must not stop metering the instance's
+// applications.
+//
+// Found on the 4.2 walk: `kernel deploy` seeded the metered list from
+// --namespaces alone, silently discarding everything `kernel meter` had added.
+// An image bump or a changed limit would have stopped counting every
+// application, and the only symptom would have been spending that quietly
+// went unattributed.
+func TestRedeployingTheKernelKeepsWhatIsAlreadyMetered(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	meteredInstance(t, dir, "p42", tcdeploy.DefaultNamespace, "with-build")
+	env, _ := testEnv(dir, output.ModeHuman)
+	fc := &fakeCluster{}
+
+	c := testKernelDeploy(fc, &fakeBuilder{})
+	c.namespaces = tcdeploy.DefaultNamespace // as a plain redeploy would pass
+	if err := c.Run(context.Background(), env, []string{"p42"}); err != nil {
+		t.Fatal(err)
+	}
+
+	got := writtenMeterList(t, string(fc.applied[0]))
+	if strings.Join(got, ",") != "farcast-system,with-build" {
+		t.Errorf("redeploy wrote %v; it dropped a metered namespace", got)
+	}
+	meta, err := dir.LoadInstanceMetadata("p42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(meta.Kernel.Namespaces, ",") != "farcast-system,with-build" {
+		t.Errorf("local record became %v after a redeploy", meta.Kernel.Namespaces)
+	}
+}
