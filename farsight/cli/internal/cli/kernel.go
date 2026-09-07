@@ -10,6 +10,7 @@ import (
 
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	tcdeploy "github.com/sofmon/farcast/technocore/deploy"
+	"github.com/sofmon/farcast/technocore/kernel"
 )
 
 const (
@@ -30,12 +31,13 @@ func newKernelCommand() Command {
 	subs := NewRegistry()
 	subs.Register(&kernelDeployCommand{})
 	subs.Register(&kernelConfirmCommand{})
+	subs.Register(&kernelMeterCommand{})
 	return &group{
 		name:     "kernel",
-		synopsis: "The in-cluster kernel that enforces the cost limit (deploy, confirm)",
+		synopsis: "The in-cluster kernel that enforces the cost limit (deploy, confirm, meter)",
 		subs:     subs,
 		usage: `
-Usage: farcast kernel <deploy|confirm> [flags] [arguments]
+Usage: farcast kernel <deploy|confirm|meter> [flags] [arguments]
 
 TechnoCore, the kernel: it watches what an instance runs, meters what that
 costs, and enforces the cost limit the instance was installed with.
@@ -138,6 +140,16 @@ func (c *kernelDeployCommand) Run(ctx context.Context, env *Env, args []string) 
 	if err != nil {
 		return err
 	}
+	// Seed the list the kernel re-reads with the same namespaces its own
+	// bindings cover. Without this the two views start disagreeing: the
+	// workload can list them and the kernel has not been told they exist, so
+	// nothing in them is counted until the first `kernel meter`.
+	seed, err := kernel.RenderNamespacesConfigMap(tcdeploy.DefaultNamespace, kernel.DefaultNamespacesName, namespaces)
+	if err != nil {
+		return err
+	}
+	manifests = append(manifests, []byte("---\n")...)
+	manifests = append(manifests, seed...)
 
 	// Recorded BEFORE the apply, like every other billable thing this CLI
 	// creates: a workload running in a cluster that local state does not know

@@ -75,7 +75,7 @@ farcast [global flags] <command> [command flags] [arguments]
 | `logs` | ⏳ stub | Stream an application's logs | 4.3 |
 | `costs` | ⏳ stub | Show spending and distance to the cost limit | 4.3 |
 | `storage` | ✅ works | The instance's encrypted disk: `ls`, `cp`, `rm`, `usage`, `key …` | 3.3 |
-| `kernel` | ✅ works | Deploy TechnoCore and push the provider's confirmed costs to it: `deploy`, `confirm` | 4.1 |
+| `kernel` | ✅ works | Deploy TechnoCore, meter namespaces, and push the provider's confirmed costs: `deploy`, `meter`, `confirm` | 4.1 |
 | `chat` | ⏳ stub | Terminal AI chat through AllThing | 6.2 |
 
 *Legend: ✅ works · 📋 specified, not yet implemented · ⏳ stub.* Stubbed commands route correctly and print a clear "not yet implemented (phase N)" message to stderr, exiting non-zero. This mirrors the SDK's `ErrNotImplemented` pattern: the whole surface is visible and navigable before the features land. `install` is the canonical verb for creating an instance — the CLI, the root README, and the [instance lifecycle](../../README.md#instance-lifecycle) (`install → bind → run → release`) all use it.
@@ -757,6 +757,16 @@ This is [ADR 0009](../../docs/adr/0009-technocore-kernel-and-cost-metering.md)'s
 An overlap is refused *here*, not left to the kernel: the kernel's only recourse would be to skip the window in silence, which looks identical to a confirmation that worked. Refusing at the point of entry means the operator finds out while they still have the invoice open. The push is recorded locally before it is applied, and rolled back if the apply fails — a confirmation the cluster never received would be skipped by the next push and the window would go unconfirmed forever.
 
 **Zero is a real answer.** An idle window genuinely cost nothing, so `--amount 0` is accepted and is distinct from omitting the flag — the same distinction the kernel keeps between "no confirmation yet" and "confirmed zero", carried through to the command line.
+
+### `farcast kernel meter` — making a namespace count
+
+Two things have to happen before an application's spending is counted, and doing only one is worse than doing neither: the kernel needs a **RoleBinding** to list pods in that namespace, and it needs to be **told the namespace exists**. A namespace with a binding and no listing is invisible to the meter; one listed without a binding makes every reconcile report an unreachable namespace.
+
+`farcast kernel meter <instance> <namespace>…` does both in a single apply, so a failure between them cannot leave exactly one. With no namespace it reports what is currently metered.
+
+**It never restarts the kernel.** The kernel is a single replica with a `Recreate` strategy, so re-rendering its workload with a longer `--namespaces` argument would stop the cost meter at precisely the moment new spending starts. Instead it re-reads a `technocore-namespaces` ConfigMap on every reconcile, and this command rewrites it. `kernel deploy` seeds the same list its own bindings cover, so the two views never begin out of step.
+
+`--remove` stops metering a namespace and says plainly that the RoleBinding stays: this command does not delete cluster objects, the grant reads nothing once the listing is gone, and deleting the namespace removes it. `farcast-system` cannot be un-metered — the instance's own components live there, and dropping them is the under-reporting the whole component exists to prevent.
 
 ### What the kernel may do once it is running
 
