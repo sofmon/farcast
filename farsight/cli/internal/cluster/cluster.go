@@ -12,8 +12,10 @@ package cluster
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os/exec"
 	"strings"
 	"time"
@@ -172,12 +174,185 @@ func (c *Client) jobMessage(ctx context.Context, namespace, job string) (string,
 	return strings.TrimSpace(string(out)), nil
 }
 
-// JobLogs returns the build's output, for a failure the operator has to read.
+// JobLogs returns a Job's output: a build failure the operator has to read, or
+// a manifest read whose whole point is what it printed.
+//
+// A non-positive lines asks for everything. That is not a convenience — a
+// fetch's stdout IS the manifest, and a tail of it is a manifest that parses
+// and is missing its first applications.
 func (c *Client) JobLogs(ctx context.Context, namespace, job string, lines int) (string, error) {
+	tail := "-1"
+	if lines > 0 {
+		tail = fmt.Sprintf("%d", lines)
+	}
 	out, err := c.runner.Run(ctx, nil, "logs", "-n", namespace,
-		"job/"+job, fmt.Sprintf("--tail=%d", lines))
+		"job/"+job, "--tail="+tail)
 	if err != nil {
 		return "", err
 	}
 	return string(out), nil
+}
+
+// Streamer is a Runner that can also write a command's output as it arrives.
+//
+// It is a second interface rather than a second method on Runner because
+// almost nothing needs it: following logs is the only place where waiting for
+// a subprocess to exit before showing anything would be wrong. A Runner that
+// does not implement it simply cannot follow.
+type Streamer interface {
+	Stream(ctx context.Context, out io.Writer, args ...string) error
+}
+
+func (r execRunner) Stream(ctx context.Context, out io.Writer, args ...string) error {
+	full := append([]string{"--kubeconfig", r.kubeconfig}, args...)
+	cmd := exec.CommandContext(ctx, "kubectl", full...)
+	var errb bytes.Buffer
+	cmd.Stdout, cmd.Stderr = out, &errb
+	if err := cmd.Run(); err != nil {
+		if errors.Is(err, exec.ErrNotFound) {
+			return errors.New("kubectl not found on PATH — reading an instance's logs needs kubectl and the gke-gcloud-auth-plugin")
+		}
+		// A follow the operator interrupted is not a failure, and reporting it
+		// as one would end every 'farcast logs --follow' with an error.
+		if ctx.Err() != nil {
+			return nil
+		}
+		if msg := strings.TrimSpace(errb.String()); msg != "" {
+			return fmt.Errorf("kubectl %s: %s", strings.Join(args, " "), msg)
+		}
+		return fmt.Errorf("kubectl %s: %w", strings.Join(args, " "), err)
+	}
+	return nil
+}
+
+// Workload is one Deployment, as much of it as a listing needs.
+type Workload struct {
+	Namespace string
+	Name      string
+	Desired   int
+	Ready     int
+	Images    []string
+	Labels    map[string]string
+	CreatedAt time.Time
+}
+
+// Deployments lists the Deployments in a namespace.
+//
+// It reads JSON rather than a jsonpath or custom columns. Both of those are
+// output formats meant for a human to eyeball, and both would parse a
+// cluster's answer by position — a column that moves becomes silently wrong
+// data rather than an error.
+func (c *Client) Deployments(ctx context.Context, namespace string) ([]Workload, error) {
+	out, err := c.runner.Run(ctx, nil, "get", "deployments", "-n", namespace, "-o", "json")
+	if err != nil {
+		return nil, err
+	}
+	if len(bytes.TrimSpace(out)) == 0 {
+		return nil, nil
+	}
+	var list struct {
+		Items []struct {
+			Metadata struct {
+				Name              string            `json:"name"`
+				Namespace         string            `json:"namespace"`
+				Labels            map[string]string `json:"labels"`
+				CreationTimestamp time.Time         `json:"creationTimestamp"`
+			} `json:"metadata"`
+			Spec struct {
+				Replicas *int `json:"replicas"`
+				Template struct {
+					Spec struct {
+						Containers []struct {
+							Image string `json:"image"`
+						} `json:"containers"`
+					} `json:"spec"`
+				} `json:"template"`
+			} `json:"spec"`
+			Status struct {
+				ReadyReplicas int `json:"readyReplicas"`
+			} `json:"status"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(out, &list); err != nil {
+		return nil, fmt.Errorf("cluster: read the deployments in %s: %w", namespace, err)
+	}
+	workloads := make([]Workload, 0, len(list.Items))
+	for _, it := range list.Items {
+		w := Workload{
+			Namespace: it.Metadata.Namespace,
+			Name:      it.Metadata.Name,
+			Ready:     it.Status.ReadyReplicas,
+			Labels:    it.Metadata.Labels,
+			CreatedAt: it.Metadata.CreationTimestamp,
+		}
+		if w.Namespace == "" {
+			w.Namespace = namespace
+		}
+		// A Deployment with no explicit replicas runs one. Reading that as
+		// zero would show every healthy application as stopped — and stopped
+		// is exactly what a protective cost shutdown leaves behind, so the two
+		// must never be confused.
+		w.Desired = 1
+		if it.Spec.Replicas != nil {
+			w.Desired = *it.Spec.Replicas
+		}
+		for _, ct := range it.Spec.Template.Spec.Containers {
+			w.Images = append(w.Images, ct.Image)
+		}
+		workloads = append(workloads, w)
+	}
+	return workloads, nil
+}
+
+// ConfigMapValue returns one key from a ConfigMap, and reports whether the
+// ConfigMap exists at all.
+//
+// JSON again, and for a sharper reason here: the keys FarCast stores contain
+// dots, and jsonpath reads a dot as a path separator. `{.data.checkpoint.json}`
+// asks for something that does not exist and returns empty rather than
+// failing, and empty reads as "the kernel has never checkpointed".
+func (c *Client) ConfigMapValue(ctx context.Context, namespace, name, key string) (string, bool, error) {
+	out, err := c.runner.Run(ctx, nil, "get", "configmap", name, "-n", namespace,
+		"--ignore-not-found", "-o", "json")
+	if err != nil {
+		return "", false, err
+	}
+	if len(bytes.TrimSpace(out)) == 0 {
+		return "", false, nil
+	}
+	var cm struct {
+		Data map[string]string `json:"data"`
+	}
+	if err := json.Unmarshal(out, &cm); err != nil {
+		return "", false, fmt.Errorf("cluster: read %s/%s: %w", namespace, name, err)
+	}
+	value, ok := cm.Data[key]
+	if !ok {
+		return "", true, fmt.Errorf("cluster: %s/%s has no %q", namespace, name, key)
+	}
+	return value, true, nil
+}
+
+// Logs writes a workload's logs to w, optionally following them.
+func (c *Client) Logs(ctx context.Context, out io.Writer, namespace, target string, lines int, follow, previous bool) error {
+	args := []string{"logs", "-n", namespace, target, fmt.Sprintf("--tail=%d", lines), "--all-containers=true"}
+	if follow {
+		args = append(args, "--follow")
+	}
+	if previous {
+		args = append(args, "--previous")
+	}
+	if follow {
+		s, ok := c.runner.(Streamer)
+		if !ok {
+			return errors.New("cluster: this client cannot follow logs")
+		}
+		return s.Stream(ctx, out, args...)
+	}
+	body, err := c.runner.Run(ctx, nil, args...)
+	if err != nil {
+		return err
+	}
+	_, err = out.Write(body)
+	return err
 }
