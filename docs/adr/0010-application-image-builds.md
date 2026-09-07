@@ -1,6 +1,6 @@
 # ADR 0010 — Application Images Are Built Inside the Instance
 
-**Status:** Proposed
+**Status:** Accepted
 
 **Date:** 2026-09-01
 
@@ -76,7 +76,13 @@ An earlier draft called this "weakening the approval gate". That was imprecise, 
 
 **9. This buys deployment portability, not administration portability, and the difference is not a gap to be closed later.** [ADR 0008](0008-in-cluster-key-delivery.md)'s impossibility theorem is untouched: the keyring and the CA private key can never rest in the cloud, so `storage unseal`, `key rotate` and the CA operations still require the operator's real machine or an exported keyring. What this decision makes machine-independent is *running and updating applications*. Claiming more than that would be the overstatement this project treats as worse than not promising at all.
 
-**10. Kaniko was archived by Google in June 2025 and continues as a Chainguard fork; the instance runs a digest-pinned reference to it.** A project that counts its 31 vendored modules as a security property does not get to adopt an unmaintained builder quietly. The image is pinned by digest like every other third-party base ([ADR 0007](0007-instance-owned-image-registry.md) decision 7), bumps are deliberate reviewed commits, and decision 11 records what replaces it.
+**10. Kaniko was archived by Google in June 2025 and continues as a Chainguard fork; the instance runs a digest-pinned reference to it.** A project that counts its 31 vendored modules as a security property does not get to adopt an unmaintained builder quietly. The image is pinned by digest like every other third-party base ([ADR 0007](0007-instance-owned-image-registry.md) decision 7), bumps are deliberate reviewed commits, and *Revisit triggers* 1 records what would replace it.
+
+**11. Reading the manifest is a second ephemeral Job, with its own image and strictly less reach than the build.** Decision 6 puts the manifest read inside the instance, and nothing already there can do it: Kaniko's executor image is built from `scratch` — no shell and no `git` — and it clones only as *part of* building, which is after the moment the operator has to approve. So `farcast run` fetches first, with a digest-pinned, git-capable image supplied and reviewed the same way decision 10's builder is. The fetch Job gets a ServiceAccount of its own with no Workload Identity grant, and a NetworkPolicy that excludes link-local **entirely**: the builder is allowed the metadata server because it must mint a push token, and a fetch pushes nothing, so the concession decision 1's builder needs is one this workload does not get.
+
+The alternative — a FarCast-built fetcher speaking Git itself — was rejected on the dependency count this project treats as a security property: `go-git` would roughly double the 31 vendored modules to read one text file.
+
+**The fetch reports the resolved commit SHA, and the build is given that SHA rather than the branch name.** Two clones of a moving branch would otherwise mean the operator approves one tree and the instance builds another — a gap decision 6 opens by splitting the read from the build, and this is what closes it.
 
 ---
 
@@ -93,7 +99,7 @@ An earlier draft called this "weakening the approval gate". That was imprecise, 
 ## Phasing
 
 - **4.2** — the build Job, the deploy-key Secret, the egress allowance, the Workload Identity push grant, and the manifest/commit reporting of decision 6.
-- **4.3** — `farcast run github.com/user/repo` drives it end to end; the approval gate displays the commit SHA and manifest digest alongside the external declarations.
+- **4.3** — `farcast run github.com/user/repo` drives it end to end: the fetch Job of decision 11, then the approval gate displaying the commit SHA and manifest digest alongside the external declarations, then a build pinned to that commit.
 - **4.4+** — Shrike may consume the fetched source; nothing before then depends on it.
 
 ## Revisit triggers
