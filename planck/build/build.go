@@ -50,6 +50,34 @@ const (
 	// it, with a window for the operator to see why a failure failed.
 	TTLSeconds = 3600
 
+	// MetadataServer is where a Workload Identity token comes from, on plain
+	// HTTP.
+	//
+	// Allowing it is a real concession and the reason is that there is no
+	// alternative: the builder pushes under its own cloud identity, and that
+	// identity is minted by asking this address. Denying it and granting the
+	// push are the same channel — the first live walk failed with
+	// "Unauthenticated request" after the clone and the build had both
+	// succeeded.
+	//
+	// What it grants is bounded by Workload Identity itself: with WI enabled
+	// the pod's metadata server returns the identity bound to THIS
+	// ServiceAccount and not the node's, so a hostile Containerfile can mint
+	// a token that pushes to one repository — which is the capability the
+	// build already has. Without WI it would expose the node's service
+	// account, and that would be a different and much worse trade.
+	MetadataServer = "169.254.169.254/32"
+	MetadataPort   = 80
+
+	// NodeLocalDNS is the address GKE's NodeLocal DNSCache listens on.
+	//
+	// It is link-local, and this package deliberately blocks link-local so a
+	// build cannot reach the cloud metadata server at 169.254.169.254. Those
+	// two facts collided on the first live walk: DNS resolution failed and the
+	// build died looking up its own Git host. So this one address is allowed
+	// back, on port 53 only, and the metadata server stays blocked.
+	NodeLocalDNS = "169.254.20.10/32"
+
 	// DigestFile is where Kaniko writes the digest it pushed.
 	//
 	// /dev/termination-log rather than a shared volume: Kubernetes surfaces
@@ -83,8 +111,12 @@ type Config struct {
 	// — inventing one here would be a digest nobody had checked.
 	Builder string
 
-	// Repo is the Git URL to clone, Ref the branch, tag or commit, and
-	// ContextSubPath the directory within the repository the build runs in.
+	// Repo is the Git URL to clone and Ref the branch, tag or commit.
+	//
+	// Containerfile and ContextSubPath are both REPOSITORY-relative, which is
+	// how a ./farcast manifest expresses them and how an operator thinks. The
+	// translation to what Kaniko wants happens in Render — see
+	// dockerfileArg.
 	Repo           string
 	Ref            string
 	Containerfile  string
@@ -169,14 +201,23 @@ func Render(c Config) ([]byte, error) {
 			"to be on the cluster, which is what building here avoids", c.Repo)
 	}
 
+	dockerfile, err := dockerfileArg(c.Containerfile, c.ContextSubPath)
+	if err != nil {
+		return nil, err
+	}
+
 	data := templateData{
 		Config:          c,
+		Dockerfile:      dockerfile,
 		ContextURL:      contextURL(c.Repo, c.Ref),
 		RequestCPUMilli: RequestCPUMilli,
 		RequestMemMiB:   RequestMemMiB,
 		DeadlineSeconds: DeadlineSeconds,
 		TTLSeconds:      TTLSeconds,
 		DigestFile:      DigestFile,
+		NodeLocalDNS:    NodeLocalDNS,
+		MetadataServer:  MetadataServer,
+		MetadataPort:    MetadataPort,
 		ServiceAccount:  ServiceAccount,
 		SecretGitUser:   SecretGitUser,
 		SecretGitToken:  SecretGitToken,
@@ -186,6 +227,32 @@ func Render(c Config) ([]byte, error) {
 		return nil, fmt.Errorf("build: render the build job: %w", err)
 	}
 	return buf.Bytes(), nil
+}
+
+// dockerfileArg converts a repository-relative Containerfile path into what
+// Kaniko's --dockerfile expects.
+//
+// Kaniko resolves --dockerfile relative to the build CONTEXT, and
+// --context-sub-path moves that context into a subdirectory. So a path that is
+// correct from the repository root is wrong the moment a sub-path is given —
+// and the failure is "please provide a valid path to a Dockerfile", which
+// points at the flag rather than at the sub-path that changed its meaning.
+//
+// Found on the first live walk, after the clone had already succeeded.
+func dockerfileArg(containerfile, subPath string) (string, error) {
+	if subPath == "" {
+		return containerfile, nil
+	}
+	sub := strings.Trim(subPath, "/") + "/"
+	rel := strings.TrimPrefix(strings.TrimPrefix(containerfile, "./"), sub)
+	if rel == containerfile && strings.Contains(containerfile, "/") {
+		// The Containerfile is not inside the context. Kaniko would refuse
+		// with a message about the flag; refusing here names the real
+		// mismatch instead.
+		return "", fmt.Errorf("build: containerfile %q is not inside the build context %q; "+
+			"a Containerfile must live within the context it is built from", containerfile, subPath)
+	}
+	return rel, nil
 }
 
 // contextURL is Kaniko's Git context form: the repository, then the ref after
@@ -213,9 +280,13 @@ func hasDigest(image string) bool {
 
 type templateData struct {
 	Config
+	Dockerfile      string
 	ContextURL      string
 	ServiceAccount  string
 	DigestFile      string
+	NodeLocalDNS    string
+	MetadataServer  string
+	MetadataPort    int
 	SecretGitUser   string
 	SecretGitToken  string
 	RequestCPUMilli int
@@ -264,15 +335,38 @@ spec:
   # Nothing may reach a build. It serves nothing and listens for nothing.
   ingress: []
   egress:
+    # DNS, by both of the paths a GKE cluster may use.
+    #
+    # The namespaceSelector covers a cluster whose pods talk to kube-dns
+    # directly. The ipBlock covers NodeLocal DNSCache, which listens on a
+    # LINK-LOCAL address on the node — and link-local is otherwise blocked
+    # below, to keep a build away from the cloud metadata server. Allowing
+    # exactly this one address on port 53 keeps both properties: DNS resolves,
+    # 169.254.169.254 does not.
+    #
+    # Found on the first live walk: without this the build failed with
+    # "lookup github.com: i/o timeout", which reads like a network outage and
+    # is a policy.
     - to:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: kube-system
+        - ipBlock:
+            cidr: {{.NodeLocalDNS}}
       ports:
         - protocol: UDP
           port: 53
         - protocol: TCP
           port: 53
+    # The Workload Identity token endpoint, on plain HTTP. This is how the
+    # builder authenticates its push, and it is the ONLY link-local address
+    # reachable — the rule below still excludes the range as a whole.
+    - to:
+        - ipBlock:
+            cidr: {{.MetadataServer}}
+      ports:
+        - protocol: TCP
+          port: {{.MetadataPort}}
     # The registry it pushes to and the Git host it clones from, over TLS.
     # Both are outside the cluster, and neither can be named more precisely
     # than this without a hostname-aware policy engine.
@@ -285,10 +379,10 @@ spec:
               - 10.0.0.0/8
               - 172.16.0.0/12
               - 192.168.0.0/16
-              # Link-local, which is where the cloud metadata server lives.
-              # The build's registry credential arrives through Workload
-              # Identity, and the metadata server is reached over a path the
-              # kubelet provides rather than this one.
+              # Link-local as a whole stays excluded here. The two
+              # addresses the build genuinely needs — DNS and the Workload
+              # Identity token endpoint — are allowed by their own rules
+              # above, each as a /32 on one port.
               - 169.254.0.0/16
       ports:
         - protocol: TCP
@@ -340,7 +434,7 @@ spec:
 {{- if .ContextSubPath}}
             - --context-sub-path={{.ContextSubPath}}
 {{- end}}
-            - --dockerfile={{.Containerfile}}
+            - --dockerfile={{.Dockerfile}}
             - --destination={{.Destination}}
             # Where the caller reads the digest back from, without parsing
             # logs: Kubernetes surfaces this file in the Pod's status.

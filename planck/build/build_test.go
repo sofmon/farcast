@@ -190,8 +190,8 @@ func TestABuildReachesTheInternetAndNothingInTheCluster(t *testing.T) {
 	}
 
 	rules := at(t, np, "spec", "egress").([]any)
-	if len(rules) != 2 {
-		t.Fatalf("egress has %d rules, want 2 (DNS and outbound TLS)", len(rules))
+	if len(rules) != 3 {
+		t.Fatalf("egress has %d rules, want 3 (DNS, the Workload Identity token endpoint, outbound TLS)", len(rules))
 	}
 
 	// The outbound rule must exclude the cluster's own ranges and link-local,
@@ -289,10 +289,59 @@ func TestTheContextIsTheRepositoryAtARef(t *testing.T) {
 		t.Errorf("context argument is wrong: %v", a)
 	}
 	if !hasArg(a, "--dockerfile=services/api/Containerfile") {
-		t.Errorf("dockerfile argument is wrong: %v", a)
+		t.Errorf("dockerfile argument is wrong with no sub-path: %v", a)
 	}
 	if !hasArg(a, "--destination=reg.example/farcast-p42/app/my-platform/api:abc123") {
 		t.Errorf("destination argument is wrong: %v", a)
+	}
+}
+
+// Found on the first live walk, after the clone had already succeeded.
+// Kaniko resolves --dockerfile relative to the build CONTEXT, and
+// --context-sub-path moves that context into a subdirectory — so a path that
+// is correct from the repository root becomes wrong the moment a sub-path is
+// given. The manifest expresses both repository-relative; the translation
+// belongs here, not in the operator's head.
+func TestTheContainerfilePathIsRelativeToTheContext(t *testing.T) {
+	c := sampleConfig()
+	c.ContextSubPath = "services/api"
+	c.Containerfile = "services/api/Containerfile"
+	_, docs := render(t, c)
+	a := args(t, docs)
+
+	if !hasArg(a, "--dockerfile=Containerfile") {
+		t.Errorf("dockerfile is not relative to the context sub-path: %v", a)
+	}
+	if hasArg(a, "--dockerfile=services/api/Containerfile") {
+		t.Error("a repository-relative dockerfile path was passed alongside a sub-path; Kaniko would not find it")
+	}
+	// Nested below the context still resolves.
+	c.Containerfile = "services/api/docker/Containerfile"
+	_, docs = render(t, c)
+	if !hasArg(args(t, docs), "--dockerfile=docker/Containerfile") {
+		t.Errorf("a nested containerfile did not resolve: %v", args(t, docs))
+	}
+	// A leading ./ is what a manifest actually writes.
+	c.ContextSubPath, c.Containerfile = "", "./Containerfile"
+	_, docs = render(t, c)
+	if !hasArg(args(t, docs), "--dockerfile=./Containerfile") {
+		t.Errorf("without a sub-path the path is passed through: %v", args(t, docs))
+	}
+}
+
+// A Containerfile outside its build context is a mismatch worth naming.
+// Kaniko's own message points at the flag rather than the sub-path that
+// changed its meaning.
+func TestAContainerfileOutsideTheContextIsRefused(t *testing.T) {
+	c := sampleConfig()
+	c.ContextSubPath = "services/api"
+	c.Containerfile = "services/worker/Containerfile"
+	_, err := Render(c)
+	if err == nil {
+		t.Fatal("a containerfile outside the build context was accepted")
+	}
+	if !strings.Contains(err.Error(), "not inside the build context") {
+		t.Errorf("err = %v, want it to name the real mismatch", err)
 	}
 }
 
@@ -368,4 +417,123 @@ func hasArg(args []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// Found on the first live walk, and invisible to every earlier test: the
+// egress policy blocked link-local to keep a build away from the cloud
+// metadata server, and GKE's NodeLocal DNSCache listens on a link-local
+// address. DNS failed, and the build died with "lookup github.com: i/o
+// timeout" — which reads like a network outage and is a policy.
+//
+// The two properties have to hold together: DNS resolves, 169.254.169.254
+// does not.
+func TestDNSResolvesWhileTheMetadataServerStaysBlocked(t *testing.T) {
+	_, docs := render(t, sampleConfig())
+	rules := at(t, docs["NetworkPolicy"], "spec", "egress").([]any)
+
+	var dns, outbound, metadata map[string]any
+	for _, r := range rules {
+		m := r.(map[string]any)
+		for _, p := range m["ports"].([]any) {
+			switch fmt.Sprint(p.(map[string]any)["port"]) {
+			case "53":
+				dns = m
+			case "443":
+				outbound = m
+			case "80":
+				metadata = m
+			}
+		}
+	}
+	_ = metadata
+	if dns == nil {
+		t.Fatal("no DNS rule; nothing the build needs would resolve")
+	}
+
+	// NodeLocal DNSCache is reachable...
+	var reachesNodeLocal bool
+	for _, d := range dns["to"].([]any) {
+		if b, ok := d.(map[string]any)["ipBlock"].(map[string]any); ok {
+			if fmt.Sprint(b["cidr"]) == NodeLocalDNS {
+				reachesNodeLocal = true
+			}
+		}
+	}
+	if !reachesNodeLocal {
+		t.Errorf("the DNS rule does not reach %s; on GKE that is where DNS lives and the build cannot resolve anything", NodeLocalDNS)
+	}
+	// ...and it is a /32, not the whole link-local range.
+	if !strings.HasSuffix(NodeLocalDNS, "/32") {
+		t.Errorf("NodeLocalDNS = %q; widening it past a single address would re-open the metadata server", NodeLocalDNS)
+	}
+
+	// The general outbound rule still excludes link-local entirely, so
+	// 169.254.169.254 is unreachable on 443.
+	if outbound == nil {
+		t.Fatal("no outbound rule")
+	}
+	var excluded string
+	for _, d := range outbound["to"].([]any) {
+		if b, ok := d.(map[string]any)["ipBlock"].(map[string]any); ok {
+			excluded = fmt.Sprint(b["except"])
+		}
+	}
+	if !strings.Contains(excluded, "169.254.0.0/16") {
+		t.Error("outbound traffic no longer excludes link-local; a build could reach the cloud metadata server")
+	}
+}
+
+// The contradiction the first live walk exposed: the builder pushes under its
+// own cloud identity, that identity is minted by asking the metadata server,
+// and this policy was blocking the metadata server to stop a hostile
+// Containerfile stealing credentials. Denying it and granting the push are
+// the same channel — the build failed with "Unauthenticated request" after
+// the clone and the build itself had both succeeded.
+//
+// The resolution is narrow rather than clever: exactly one link-local address
+// on exactly one port, with the range still excluded everywhere else.
+func TestTheWorkloadIdentityTokenEndpointIsReachableAndNothingElseLinkLocalIs(t *testing.T) {
+	_, docs := render(t, sampleConfig())
+	rules := at(t, docs["NetworkPolicy"], "spec", "egress").([]any)
+
+	var allowedLinkLocal []string
+	for _, r := range rules {
+		m := r.(map[string]any)
+		for _, d := range m["to"].([]any) {
+			b, ok := d.(map[string]any)["ipBlock"].(map[string]any)
+			if !ok {
+				continue
+			}
+			cidr := fmt.Sprint(b["cidr"])
+			if strings.HasPrefix(cidr, "169.254.") {
+				allowedLinkLocal = append(allowedLinkLocal, cidr)
+			}
+		}
+	}
+	// Only the two the build genuinely needs, and each a single address.
+	want := map[string]bool{NodeLocalDNS: true, MetadataServer: true}
+	if len(allowedLinkLocal) != 2 {
+		t.Fatalf("link-local addresses allowed: %v, want exactly %v", allowedLinkLocal, want)
+	}
+	for _, c := range allowedLinkLocal {
+		if !want[c] {
+			t.Errorf("link-local %s is reachable and should not be", c)
+		}
+		if !strings.HasSuffix(c, "/32") {
+			t.Errorf("%s is a range, not an address; link-local must be opened one address at a time", c)
+		}
+	}
+
+	// The metadata endpoint is HTTP, and only HTTP.
+	for _, r := range rules {
+		m := r.(map[string]any)
+		names := fmt.Sprint(m["to"])
+		if !strings.Contains(names, MetadataServer) {
+			continue
+		}
+		ports := m["ports"].([]any)
+		if len(ports) != 1 || fmt.Sprint(ports[0].(map[string]any)["port"]) != fmt.Sprint(MetadataPort) {
+			t.Errorf("the metadata rule opens %v, want only port %d", ports, MetadataPort)
+		}
+	}
 }
