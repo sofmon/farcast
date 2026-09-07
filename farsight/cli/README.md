@@ -75,6 +75,7 @@ farcast [global flags] <command> [command flags] [arguments]
 | `logs` | ⏳ stub | Stream an application's logs | 4.3 |
 | `costs` | ⏳ stub | Show spending and distance to the cost limit | 4.3 |
 | `storage` | ✅ works | The instance's encrypted disk: `ls`, `cp`, `rm`, `usage`, `key …` | 3.3 |
+| `build` | ✅ works | Build an application's image inside the instance | 4.2 |
 | `kernel` | ✅ works | Deploy TechnoCore, meter namespaces, and push the provider's confirmed costs: `deploy`, `meter`, `confirm` | 4.1 |
 | `chat` | ⏳ stub | Terminal AI chat through AllThing | 6.2 |
 
@@ -725,6 +726,32 @@ Cost is **surfaced, never gated**, per [ADR 0007](../../docs/adr/0007-instance-o
 The bucket is ensured **lazily, at first storage use**, never at `install`: an empty bucket costs $0.00 and serves nothing, and the registry's defensive-ensure precedent already proves lazy convergence. The record is written **before** the create call, because the name's 32 bits of entropy exist nowhere else and the name is deliberately not re-derivable from the instance (its instance segment may have been truncated to fit GCS's 63-character cap).
 
 The mint/record/retry loop belongs here, in the record-owning caller, never in the adapter — which mints nothing. On `ErrNotOwned` it mints a new suffix, updates the record and retries, bounded at 3 attempts. **With one hard exception:** if `created_at` is set, the bucket was ensured successfully before, and `ErrNotOwned` now means something changed rather than a name collision — auto-minting past it would abandon the operator's data under a name nothing points at any more. That case stops and asks the operator to look. Any other error keeps the record and fails, so a re-run converges.
+
+---
+
+## `farcast build` — build an image inside the instance (Phase 4.2)
+
+`farcast build <instance> --repo <url> --app <name>` runs the application's Containerfile as a one-shot Job **in the instance**, not on this machine. [ADR 0010](../../docs/adr/0010-application-image-builds.md) chose that so running and updating software is not tied to one prepared laptop: the instance clones the repository itself, and this machine never needs the source, a container engine, or the repository's credentials.
+
+### The builder image must be pinned, and the command helps you pin it
+
+A builder runs arbitrary build steps while holding a credential that can write to your registry — the single worst place in FarCast to accept a floating tag. So `--builder-image` must be digest-pinned.
+
+Pass a tag and the command **resolves it, reports the digest, and then refuses**. That is deliberate: resolving on every build would be trust-on-first-use rather than pinning, and the next build would silently run whatever the tag points at then. The refusal is how you obtain a value to record.
+
+There is no default. Kaniko was archived by Google in June 2025 and continues as a fork at `cgr.dev/chainguard/kaniko`; shipping a digest nobody in this project has verified would be worse than asking for one.
+
+### How the digest comes back
+
+Kaniko writes the digest it pushed to `/dev/termination-log`, which Kubernetes surfaces in the Pod's status — so the CLI reads it from the API server with no log parsing and no shared volume. It is validated as a *complete* sha256 digest before use: a truncated one would build a reference that looks pinned and names nothing, and the image may well have been pushed by then.
+
+### What it prints, and why it cannot do it for you
+
+The builder pushes under its own cloud identity, so the `farcast-builder` ServiceAccount needs `roles/artifactregistry.writer` on the instance's repository through Workload Identity. The command prints that grant rather than applying it — granting it needs permission to change a repository's IAM, which this CLI's credential is not required to carry. Same reasoning, and same shape, as the keyholder's bucket grant ([ADR 0008](../../docs/adr/0008-in-cluster-key-delivery.md) decision 8). Without it the build fails on a 403 at push.
+
+A failed build prints the build's **own** output before failing, and says how to read more — the Job survives an hour so `kubectl logs job/…` still works. Repeating "the build failed" would help nobody; the Containerfile already said why.
+
+At 4.3 `farcast run` reads the manifest and calls this for each app. Today the app and its Containerfile are given explicitly.
 
 ---
 

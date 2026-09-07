@@ -206,7 +206,7 @@ Translate a `./farcast` manifest into K8s resources.
 - Parse manifest → create a K8s namespace named after the top-level `name`, then generate Deployment, Service, and ConfigMap resources for each entry in `apps[]` within that namespace
 - Sensible defaults for resources (start conservative, TechnoCore will adapt later)
 - Each app's container image comes from its `containerfile` path, using the app's `context` directory (or the Containerfile's directory when `context` is omitted), and lands in the instance's own registry under `app/<deployment>/<app>`, deployed by digest — the same registry, path convention, and pull grant `connect` already uses ([ADR 0007](docs/adr/0007-instance-owned-image-registry.md)); report a clear error if a referenced Containerfile is missing
-- Unlike FarCast's own system images, app Containerfiles execute arbitrary build steps and so need a builder — which builder runs them is deferred to its own 4.2-era ADR
+- Unlike FarCast's own system images, app Containerfiles execute arbitrary build steps and so need a builder — settled by [ADR 0010](docs/adr/0010-application-image-builds.md): an ephemeral Kaniko Job **inside the instance**, so that running and updating software is not tied to one prepared machine. `farcast build` drives it; 4.3's `run` reads the manifest and calls the same path for each app
 - Inject SDK as sidecar or init container
 
 ### 4.3 FarSight CLI — `farcast run`
