@@ -165,7 +165,7 @@ func defaultRegistry() *Registry {
 	reg.Register(&releaseCommand{})
 	reg.Register(newConnectCommand())
 	reg.Register(newRedeployCommand())
-	reg.Register(newStub("run", "Deploy a Git repository to an instance", "4.3"))
+	reg.Register(&runCommand{})
 	reg.Register(newStub("ps", "List running applications", "4.3"))
 	reg.Register(newStub("logs", "Stream an application's logs", "4.3"))
 	reg.Register(newStub("costs", "Show spending and distance to the cost limit", "4.3"))
