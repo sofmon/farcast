@@ -300,6 +300,40 @@ The digest Kaniko pushed comes back through `--digest-file=/dev/termination-log`
 
 ---
 
+## The fetch Job — reading the manifest, inside the instance (Phase 4.3)
+
+[ADR 0010](../docs/adr/0010-application-image-builds.md) decision 6 puts the manifest read inside the instance too, and decision 11 explains why it needs a workload of its own: Kaniko's executor image is built from `scratch` — no shell, no `git` — and it clones only *as part of* building, which is after the moment the operator has to approve. [`fetch.Render`](fetch/) is that read: a ServiceAccount, a NetworkPolicy, and an ephemeral Job that clones at a ref, prints the manifest on stdout, and reports the resolved commit and a digest of the file it parsed through the Pod's termination message.
+
+### It is deliberately weaker than the build next door
+
+The two Jobs sit in the same namespace and differ in exactly the ways that matter:
+
+| | build | fetch |
+|---|---|---|
+| ServiceAccount | `farcast-builder`, with a Workload Identity grant that writes to the registry | `farcast-fetcher`, with no grant at all |
+| Metadata server (`169.254.169.254`) | allowed on port 80 — it must mint a push token | **blocked**; link-local is excluded with no carve-out |
+| Root filesystem | writable, because Kaniko unpacks layers into it | read-only; the clone lands on an `emptyDir` |
+| Capabilities | eight, added back one at a time | all dropped, none added |
+
+A fetch pushes nothing, so the one concession the builder needs is one this workload does not get.
+
+### Two channels, so truncation is detectable
+
+The manifest travels on the Job's stdout and its digest travels in the Pod's status. The caller hashes what arrived and compares. That catches a log that was truncated or rotated — bytes that parse perfectly and are not what the instance read. It is **not** a defence against a dishonest instance, and [ADR 0010](../docs/adr/0010-application-image-builds.md) decision 6 says plainly that the gate never was one.
+
+### The commit closes the gap the split opens
+
+Reading and building are two clones, so a branch that moves between them would mean the operator approving one tree and the instance building another. The fetch reports the **resolved commit SHA**, and `farcast run` passes that to the build instead of the branch name.
+
+### What the caller still has to supply
+
+- **A digest-pinned, git-capable image**, for the same reason the builder has no default. The fetcher decides which bytes the approval gate shows, so a tag resolved fresh on every run is a reviewer nobody reviewed.
+- **The same Git credential the build uses**, when the repository is private. One Secret, read through a `GIT_ASKPASS` helper rather than a URL — a token in the URL would need encoding to survive its own punctuation, would appear in git's error output, and would be visible in the process table.
+
+Nothing the operator typed is ever rendered *into* the read script: the repository, the ref and the manifest path reach the shell as environment variables, and `Render` refuses values carrying quotes, backslashes, `$`, backticks or control characters.
+
+---
+
 ## First adapter: GKE Autopilot
 
 The first cloud is **Google Kubernetes Engine in Autopilot mode** — decided in [ADR 0003](../docs/adr/0003-gke-autopilot.md) after a cost, egress-security, and in-cluster-control analysis. Google manages the nodes; FarCast pays per running Pod request; and the deny-by-default network boundary is enforced by always-on NetworkPolicy rather than privileged containers. Cluster creation is a single call against one mature first-party Go SDK, with no VPC/IAM/node-group scaffolding to stand up first.
@@ -374,6 +408,7 @@ Cluster creation costs real money and takes minutes, so the test pyramid is spli
 | 2.3 (ADR 0007) | optional `RegistryProvider` — the instance's own image registry (GKE: Artifact Registry), ensured at `install`, re-ensured at `connect`, deleted at `release` |
 | 4.2 | [`translate`](translate/) — `./farcast` manifest → K8s namespace + ConfigMap/Deployment/Service/NetworkPolicy per app. Exported, not `internal/translator` as this row first said: the operator CLI has to render these workloads and Go's internal rule would put them out of its reach. Every other module's deploy package settled on the same shape. |
 | 4.2 | [`build`](build/) — the ephemeral Kaniko Job that turns an application's Containerfile into an image in the instance's own registry ([ADR 0010](../docs/adr/0010-application-image-builds.md)) |
+| 4.3 | [`fetch`](fetch/) — the ephemeral Job that reads a repository's `./farcast` inside the instance and reports the commit and manifest digest the operator approves ([ADR 0010](../docs/adr/0010-application-image-builds.md) decision 11) |
 | 5+ | Optional Standard/Spot hybrid node pool as a TechnoCore cost optimization (ADR 0003) |
 | 8.1 | Second cloud provider adapter behind the same interface — including the image-registry contract on ECR |
 
