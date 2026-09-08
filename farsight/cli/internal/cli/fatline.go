@@ -62,6 +62,20 @@ type imageBuilder interface {
 	BuildAndPush(ctx context.Context, opts image.Options, user, pass string) (string, error)
 }
 
+// providerOpener opens the cloud provider for an instance. It is a named type
+// so the seam is the same one in every command that needs it.
+type providerOpener func(meta *config.InstanceMetadata, creds *config.InstanceCredentials) (planck.Provider, error)
+
+// defaultProviderOpener opens the real provider from the instance's recorded
+// project, region and service-account key.
+func defaultProviderOpener(meta *config.InstanceMetadata, creds *config.InstanceCredentials) (planck.Provider, error) {
+	return planck.Open(meta.Provider, planck.Config{
+		Project:     meta.Project,
+		Location:    meta.Region,
+		Credentials: []byte(creds.ServiceAccountKey),
+	})
+}
+
 // registryAccess is the instance's ensured registry plus the ability to mint a
 // credential for it.
 //
@@ -138,7 +152,7 @@ type fatlineDeployer struct {
 
 	// Seams, overridable in tests; defaulted by ensureDefaults.
 	newCluster   func(kubeconfigPath string) clusterApplier
-	openProvider func(meta *config.InstanceMetadata, creds *config.InstanceCredentials) (planck.Provider, error)
+	openProvider providerOpener
 	newBuilder   func(progress func(string)) imageBuilder
 	findSource   func(dir string) (string, error)
 }
@@ -151,13 +165,7 @@ func (d *fatlineDeployer) ensureDefaults() {
 		d.newCluster = func(kc string) clusterApplier { return cluster.New(kc) }
 	}
 	if d.openProvider == nil {
-		d.openProvider = func(meta *config.InstanceMetadata, creds *config.InstanceCredentials) (planck.Provider, error) {
-			return planck.Open(meta.Provider, planck.Config{
-				Project:     meta.Project,
-				Location:    meta.Region,
-				Credentials: []byte(creds.ServiceAccountKey),
-			})
-		}
+		d.openProvider = defaultProviderOpener
 	}
 	if d.newBuilder == nil {
 		d.newBuilder = func(progress func(string)) imageBuilder {
@@ -197,11 +205,18 @@ func (d *fatlineDeployer) setYesFlag(fs *flag.FlagSet, usage string) {
 // cost-gated — the registry is cents at most (decision 8), unlike connect's load
 // balancer.
 func (d *fatlineDeployer) ensureRegistry(ctx context.Context, env *Env, name string, meta *config.InstanceMetadata) (*registryAccess, error) {
+	return ensureRegistry(ctx, env, name, meta, d.openProvider)
+}
+
+// ensureRegistry is the deployer's body, lifted out so a command that only
+// needs to push into the instance's registry — mirroring a toolchain image,
+// say — does not have to construct a FatLine deployer to get at it.
+func ensureRegistry(ctx context.Context, env *Env, name string, meta *config.InstanceMetadata, open providerOpener) (*registryAccess, error) {
 	creds, err := env.ConfigDir.LoadInstanceCredentials(name)
 	if err != nil {
 		return nil, fmt.Errorf("load credentials for %q: %w", name, err)
 	}
-	p, err := d.openProvider(meta, creds)
+	p, err := open(meta, creds)
 	if err != nil {
 		return nil, err
 	}
