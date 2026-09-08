@@ -5,6 +5,12 @@
 # container with no way to try — so this one carries a wget and the CA bundle
 # it needs to complete a TLS handshake, then sleeps so a runbook can exec into
 # it and ask.
+#
+# curl, not busybox wget. The Phase 4.4 walk found busybox's wget cannot make
+# an HTTPS request through an HTTP CONNECT proxy at all: it ignores https_proxy
+# and HTTPS_PROXY outright, and when given http_proxy it issues a cleartext
+# proxied GET, which FatLine correctly refuses. An application that cannot
+# speak to the boundary cannot demonstrate anything about it.
 FROM alpine:3.19
-RUN apk add --no-cache ca-certificates
+RUN apk add --no-cache ca-certificates curl
 CMD ["sh", "-c", "echo egress-demo ready && sleep 86400"]
