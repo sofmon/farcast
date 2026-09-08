@@ -214,3 +214,39 @@ func (b *Builder) progress(format string, args ...any) {
 func mib(n int) string {
 	return fmt.Sprintf("%.1f MiB", float64(n)/(1<<20))
 }
+
+// Mirror copies a third-party image into the instance's own registry, keeping
+// the digest of the platform manifest it copied.
+//
+// The Phase 4.3 walk found the builder [ADR 0010] decision 10 names withdrawn
+// from its registry's free catalogue a week after it was reviewed, which left
+// an instance unable to build anything. A third-party registry's availability
+// is somebody else's policy decision, and an instance that cannot deploy
+// because of one is not sovereign in the sense this project means.
+//
+// Source access is anonymous. Every image FarCast mirrors is a public one, and
+// a credential offered to a registry that did not ask for it is a credential
+// that can be collected by a registry that lies about needing it.
+//
+// [ADR 0010]: ../../../../docs/adr/0010-application-image-builds.md
+func (b *Builder) Mirror(ctx context.Context, src, dst, dstUser, dstPass string) (string, error) {
+	from, err := oci.ParseReference(src)
+	if err != nil {
+		return "", err
+	}
+	to, err := oci.ParseReference(dst)
+	if err != nil {
+		return "", err
+	}
+	if from.Registry == to.Registry && from.Repository == to.Repository {
+		return "", fmt.Errorf("image: %s is already in the instance's registry", src)
+	}
+	b.progress("mirroring %s", src)
+	digest, err := b.client(to.Registry, dstUser, dstPass).Copy(ctx, from, to, targetPlatform)
+	if err != nil {
+		return "", fmt.Errorf("mirror %s into %s: %w", src, to.Repository, err)
+	}
+	pinned := to.WithDigest(digest).String()
+	b.progress("mirrored to %s", pinned)
+	return pinned, nil
+}

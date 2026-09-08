@@ -363,15 +363,22 @@ func seedIndexedImage(t *testing.T, r *fakeRegistry, repo, tag string) (indexDig
 		cfgDesc := r.addBlob(repo, cfg)
 		cfgDesc.MediaType = MediaTypeOCIConfig
 
-		manifest, err := json.Marshal(Manifest{
+		// Indented on purpose. A real registry serves the bytes it was given,
+		// and those are almost never what Go's json.Marshal would produce —
+		// different key order, different whitespace, a trailing newline. A
+		// fixture that round-trips byte-identically cannot tell a faithful
+		// copy from a re-encoded one, which is the single property Copy
+		// exists to provide.
+		manifest, err := json.MarshalIndent(Manifest{
 			SchemaVersion: 2,
 			MediaType:     MediaTypeOCIManifest,
 			Config:        cfgDesc,
 			Layers:        []Descriptor{layerDesc},
-		})
+		}, "", "  ")
 		if err != nil {
 			t.Fatalf("marshal base manifest: %v", err)
 		}
+		manifest = append(manifest, '\n')
 		digest := r.addManifest(repo, digestOf(manifest), manifest, MediaTypeOCIManifest)
 		if plat.Architecture == "amd64" {
 			amd64Digest = digest
