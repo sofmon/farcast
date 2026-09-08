@@ -1,16 +1,36 @@
 package config
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"time"
 
 	"github.com/goccy/go-yaml"
 )
+
+// ErrMetadataConflict is returned when metadata.yaml changed on disk between
+// the moment a command read it and the moment it tried to write it back.
+//
+// It exists because this file is an instance's only local record — the bucket
+// holding its data, the carrier's endpoint, the keyring generation, the image
+// registry. Every command used to read it whole, mutate a field and write the
+// whole thing back, so two commands overlapping meant the slower one silently
+// erased whatever the faster one had recorded. That was observed on the Phase
+// 4.4 walk: `farcast toolchain` recorded a mirrored builder and fetcher while
+// `farcast connect` was still finishing, and connect's write — from a copy
+// loaded before toolchain ran — dropped the record entirely. There is no
+// second copy of this file, and a dropped `storage.bucket` is the name of a
+// bucket that keeps billing after nothing remembers it.
+//
+// Refusing is the point. The command that would have overwritten stops and
+// says so, rather than reporting success over a loss nobody can see.
+var ErrMetadataConflict = errors.New("instance metadata changed on disk since it was read")
 
 const (
 	instancesSubdir = "instances"
@@ -235,6 +255,13 @@ type InstanceMetadata struct {
 	// Toolchain records the third-party images this instance runs to turn a
 	// repository into a deployable image, pointer-typed like the rest.
 	Toolchain *Toolchain `yaml:"toolchain,omitempty"`
+
+	// loaded and loadedSum are how a write knows it is replacing the record it
+	// read rather than one somebody else has since written. Unexported, so
+	// they never reach the file; see ErrMetadataConflict for what they are for.
+	loaded    bool
+	loadedSum [sha256.Size]byte
+	loadedRaw []byte
 }
 
 // Toolchain is the pair of digest-pinned third-party images an instance uses
@@ -334,12 +361,112 @@ func (d Dir) ListInstances() ([]string, error) {
 }
 
 // SaveInstanceMetadata writes metadata.yaml (0600) for an instance.
+//
+// It refuses with ErrMetadataConflict when the file on disk is not the one the
+// caller read, because writing would erase whatever changed it. A metadata
+// this process never read is refused too: overwriting a file nobody looked at
+// is the same loss with less evidence.
+//
+// The write itself goes through a temporary file and a rename, so a process
+// that dies mid-write leaves the previous record intact rather than a
+// truncated one.
 func (d Dir) SaveInstanceMetadata(name string, m *InstanceMetadata) error {
 	data, err := yaml.Marshal(m)
 	if err != nil {
 		return fmt.Errorf("encode instance metadata: %w", err)
 	}
-	return d.writeInstanceFile(name, metadataFile, data)
+	path := filepath.Join(d.instanceDir(name), metadataFile)
+
+	switch current, readErr := os.ReadFile(path); {
+	case readErr == nil:
+		if !m.loaded {
+			return fmt.Errorf("%w: %s already exists and this command never read it", ErrMetadataConflict, path)
+		}
+		if sha256.Sum256(current) != m.loadedSum {
+			// Something wrote between our read and now. Commands touch
+			// different parts of this record — connect the carrier, storage
+			// deploy the bucket, toolchain the mirrored images — so the two
+			// writes are usually not in conflict at all, and refusing would
+			// leave a resource that already exists unrecorded. Replay our own
+			// changes onto theirs instead, and refuse only if we both moved
+			// the same field somewhere different.
+			merged, err := mergeOntoNewer(m.loadedRaw, m, current)
+			if err != nil {
+				return fmt.Errorf("%s: %w", path, err)
+			}
+			data, err = yaml.Marshal(merged)
+			if err != nil {
+				return fmt.Errorf("encode instance metadata: %w", err)
+			}
+			*m = *merged
+		}
+	case errors.Is(readErr, fs.ErrNotExist):
+		// A first write, from install. Nothing to conflict with.
+	default:
+		return fmt.Errorf("read %s: %w", path, readErr)
+	}
+
+	if err := writeFileAtomic(path, data); err != nil {
+		return err
+	}
+	// The saved bytes are now what a later read returns, so a command that
+	// saves twice does not conflict with itself.
+	m.loaded = true
+	m.loadedSum = sha256.Sum256(data)
+	return nil
+}
+
+// mergeOntoNewer replays the caller's changes onto a record somebody else has
+// written since the caller read it.
+//
+// It is an ordinary three-way merge over the top-level fields: base is what
+// the caller read, mine is what it now wants, newer is what is on disk. A
+// field the caller did not touch keeps the newer value; a field only the
+// caller touched takes the caller's. Only a field both moved, and moved
+// somewhere different, is a real conflict — and that is refused rather than
+// guessed, because this record names cloud resources that cost money.
+//
+// Top-level granularity is the right grain here: each command owns a distinct
+// subtree of this struct, so two commands writing the same field at once means
+// two commands doing the same job.
+func mergeOntoNewer(baseRaw []byte, mine *InstanceMetadata, newerRaw []byte) (*InstanceMetadata, error) {
+	var base, newer InstanceMetadata
+	if err := yaml.Unmarshal(baseRaw, &base); err != nil {
+		return nil, fmt.Errorf("parse the record this command read: %w", err)
+	}
+	if err := yaml.Unmarshal(newerRaw, &newer); err != nil {
+		return nil, fmt.Errorf("parse the record on disk: %w", err)
+	}
+
+	out := newer
+	bv, mv, ov := reflect.ValueOf(base), reflect.ValueOf(*mine), reflect.ValueOf(&out).Elem()
+	t := ov.Type()
+	for i := range t.NumField() {
+		f := t.Field(i)
+		if !f.IsExported() {
+			continue
+		}
+		if f.Name == "UpdatedAt" {
+			// Every write moves this, so it differs on both sides of every
+			// real merge and would report a conflict on all of them. The
+			// later of the two stamps is the honest answer.
+			if mine.UpdatedAt.After(out.UpdatedAt) {
+				out.UpdatedAt = mine.UpdatedAt
+			}
+			continue
+		}
+		baseF, mineF, newerF := bv.Field(i).Interface(), mv.Field(i).Interface(), ov.Field(i).Interface()
+		switch {
+		case reflect.DeepEqual(mineF, baseF):
+			// Untouched here; whatever is on disk stands.
+		case reflect.DeepEqual(newerF, baseF), reflect.DeepEqual(newerF, mineF):
+			ov.Field(i).Set(mv.Field(i))
+		default:
+			return nil, fmt.Errorf("%w: field %s was changed by this command and by something else at the same time", ErrMetadataConflict, f.Name)
+		}
+	}
+
+	return &out, nil
 }
 
 // LoadInstanceMetadata reads metadata.yaml for an instance.
@@ -353,7 +480,39 @@ func (d Dir) LoadInstanceMetadata(name string) (*InstanceMetadata, error) {
 	if err := yaml.Unmarshal(data, &m); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
+	m.loaded = true
+	m.loadedSum = sha256.Sum256(data)
+	m.loadedRaw = data
 	return &m, nil
+}
+
+// UpdateInstanceMetadata reads the current metadata, applies mutate and writes
+// the result back, retrying once if something else wrote in between.
+//
+// Prefer it over Load/mutate/Save for a change that does not need the metadata
+// held across a long cloud operation: the read-modify-write is narrow, so the
+// window in which a conflict is even possible is a few syscalls wide rather
+// than the length of the command.
+func (d Dir) UpdateInstanceMetadata(name string, mutate func(*InstanceMetadata) error) (*InstanceMetadata, error) {
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		m, err := d.LoadInstanceMetadata(name)
+		if err != nil {
+			return nil, err
+		}
+		if err := mutate(m); err != nil {
+			return nil, err
+		}
+		if err := d.SaveInstanceMetadata(name, m); err != nil {
+			if errors.Is(err, ErrMetadataConflict) {
+				lastErr = err
+				continue
+			}
+			return nil, err
+		}
+		return m, nil
+	}
+	return nil, lastErr
 }
 
 // SaveInstanceCredentials writes credentials.yaml (0600) for an instance.
@@ -555,6 +714,45 @@ func (d Dir) LoadInstanceMTLS(name string) (MTLSMaterial, error) {
 func (d Dir) writeInstanceFile(name, file string, data []byte) error {
 	path := filepath.Join(d.instanceDir(name), file)
 	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	return nil
+}
+
+// writeFileAtomic writes data to path at 0600 by way of a temporary file in
+// the same directory and a rename, so a reader sees either the whole previous
+// file or the whole new one and never a half-written record.
+//
+// The temporary file is created at 0600 rather than created and chmod-ed,
+// because the gap between the two is a window in which the instance's record
+// is world-readable.
+func writeFileAtomic(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, ".tmp-"+filepath.Base(path)+"-")
+	if err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	tmp := f.Name()
+	defer func() { _ = os.Remove(tmp) }() // no-op once the rename succeeds
+
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	// Durability before visibility: a rename that beats its own contents to
+	// disk is how a crash produces an empty file with a valid name.
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
 		return fmt.Errorf("write %s: %w", path, err)
 	}
 	return nil

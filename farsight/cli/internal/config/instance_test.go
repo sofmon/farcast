@@ -1,8 +1,10 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -179,5 +181,200 @@ func TestRemoveInstance(t *testing.T) {
 	}
 	if exists, _ := d.InstanceExists("gone"); exists {
 		t.Error("instance should be gone after RemoveInstance")
+	}
+}
+
+// The Phase 4.4 walk lost a record exactly this way: one command read the
+// metadata, a second command wrote a field, and the first wrote its stale copy
+// back over it. The write must be refused and the second command's field must
+// survive.
+func TestSaveInstanceMetadataRefusesToEraseAConcurrentWrite(t *testing.T) {
+	d := testDir(t)
+	if err := d.Ensure(); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	if err := d.CreateInstance("prod"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := d.SaveInstanceMetadata("prod", &InstanceMetadata{Name: "prod", Provider: "gke"}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// "connect" reads the record.
+	connect, err := d.LoadInstanceMetadata("prod")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	// "toolchain" records the mirrored images while connect is still working.
+	if _, err := d.UpdateInstanceMetadata("prod", func(m *InstanceMetadata) error {
+		m.Toolchain = &Toolchain{Builder: "registry/kaniko@sha256:aa", Fetcher: "registry/git@sha256:bb"}
+		return nil
+	}); err != nil {
+		t.Fatalf("toolchain update: %v", err)
+	}
+
+	// connect finishes and writes back the copy it read before that. Both
+	// changes must survive: they are different fields, so there is nothing to
+	// choose between. Refusing here would leave a billable load balancer
+	// unrecorded, which is the same class of loss the merge exists to prevent.
+	connect.FatLineDeployed = true
+	connect.UpdatedAt = time.Now().UTC()
+	if err := d.SaveInstanceMetadata("prod", connect); err != nil {
+		t.Fatalf("save after a concurrent write: %v", err)
+	}
+
+	got, err := d.LoadInstanceMetadata("prod")
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if got.Toolchain == nil {
+		t.Fatal("the toolchain record was erased by a stale write — this is the defect")
+	}
+	if !got.FatLineDeployed {
+		t.Error("connect's own change was dropped by the merge")
+	}
+}
+
+// Two commands moving the SAME field to different values is the one case the
+// merge must not guess at.
+func TestSaveInstanceMetadataRefusesARealCollision(t *testing.T) {
+	d := testDir(t)
+	if err := d.Ensure(); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	if err := d.CreateInstance("prod"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := d.SaveInstanceMetadata("prod", &InstanceMetadata{Name: "prod", Status: "running"}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	mine, err := d.LoadInstanceMetadata("prod")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if _, err := d.UpdateInstanceMetadata("prod", func(m *InstanceMetadata) error {
+		m.Status = "removed"
+		return nil
+	}); err != nil {
+		t.Fatalf("other writer: %v", err)
+	}
+
+	mine.Status = "stopping"
+	err = d.SaveInstanceMetadata("prod", mine)
+	if !errors.Is(err, ErrMetadataConflict) {
+		t.Fatalf("colliding save error = %v, want ErrMetadataConflict", err)
+	}
+	got, err := d.LoadInstanceMetadata("prod")
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if got.Status != "removed" {
+		t.Errorf("status = %q, want the other writer's %q left intact", got.Status, "removed")
+	}
+}
+
+// The bucket is the case that matters most: losing its name loses the only
+// local pointer to an instance's data, and it keeps billing regardless.
+func TestSaveInstanceMetadataKeepsTheBucketThroughAConcurrentWrite(t *testing.T) {
+	d := testDir(t)
+	if err := d.Ensure(); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	if err := d.CreateInstance("prod"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := d.SaveInstanceMetadata("prod", &InstanceMetadata{Name: "prod"}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	stale, err := d.LoadInstanceMetadata("prod")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if _, err := d.UpdateInstanceMetadata("prod", func(m *InstanceMetadata) error {
+		m.Storage = &Storage{Bucket: "farcast-prod-abc123", Location: "us-central1", Provider: "gcs"}
+		return nil
+	}); err != nil {
+		t.Fatalf("storage deploy: %v", err)
+	}
+
+	stale.Status = "running"
+	if err := d.SaveInstanceMetadata("prod", stale); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	got, err := d.LoadInstanceMetadata("prod")
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if got.Storage == nil || got.Storage.Bucket != "farcast-prod-abc123" {
+		t.Fatalf("the bucket name was lost: %+v", got.Storage)
+	}
+}
+
+func TestSaveInstanceMetadataRefusesAnUnreadFile(t *testing.T) {
+	d := testDir(t)
+	if err := d.Ensure(); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	if err := d.CreateInstance("prod"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := d.SaveInstanceMetadata("prod", &InstanceMetadata{Name: "prod"}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	// A fresh struct that never read what is already there.
+	err := d.SaveInstanceMetadata("prod", &InstanceMetadata{Name: "prod", Provider: "gke"})
+	if !errors.Is(err, ErrMetadataConflict) {
+		t.Fatalf("blind overwrite error = %v, want ErrMetadataConflict", err)
+	}
+}
+
+// A command that saves more than once must not conflict with itself; several
+// do (run, kernel meter, kernel confirm all save twice on one path).
+func TestSaveInstanceMetadataTwiceInARow(t *testing.T) {
+	d := testDir(t)
+	if err := d.Ensure(); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	if err := d.CreateInstance("prod"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	m := &InstanceMetadata{Name: "prod"}
+	for i, status := range []string{"running", "stopping", "removed"} {
+		m.Status = status
+		if err := d.SaveInstanceMetadata("prod", m); err != nil {
+			t.Fatalf("save %d: %v", i, err)
+		}
+	}
+	got, err := d.LoadInstanceMetadata("prod")
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if got.Status != "removed" {
+		t.Errorf("status = %q, want %q", got.Status, "removed")
+	}
+}
+
+func TestSaveInstanceMetadataIsAtomicAndPrivate(t *testing.T) {
+	d := testDir(t)
+	if err := d.Ensure(); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	if err := d.CreateInstance("prod"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := d.SaveInstanceMetadata("prod", &InstanceMetadata{Name: "prod"}); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	assertPerm(t, filepath.Join(d.InstancePath("prod"), "metadata.yaml"), 0o600)
+
+	entries, err := os.ReadDir(d.InstancePath("prod"))
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".tmp-") {
+			t.Errorf("left a temporary file behind: %s", e.Name())
+		}
 	}
 }

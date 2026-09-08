@@ -278,14 +278,25 @@ through a CONNECT proxy at all. The walk fell back to a raw CONNECT over `nc`,
 which proves FatLine but **not** the "no application change" claim. The fixture
 now carries curl; that claim remains unproven until the next walk.
 
-**5. `metadata.yaml` loses concurrent writes, and is not fixed.** Running
-`farcast toolchain` while `farcast connect` was still finishing left no
-toolchain record: every command does an unguarded read-modify-write of the
-whole file, so `connect` wrote back a copy loaded before `toolchain` ran. It
-cost a re-run here. The same race can drop `storage.bucket`, which is the only
-local pointer to the bucket holding an instance's data — and that bucket keeps
-billing whether or not anything remembers its name. There is no second copy of
-this file.
+**5. `metadata.yaml` lost concurrent writes.** Running `farcast toolchain`
+while `farcast connect` was still finishing left no toolchain record: every
+command did an unguarded read-modify-write of the whole file, so `connect`
+wrote back a copy loaded before `toolchain` ran. It cost a re-run here. The
+same race could drop `storage.bucket`, the only local pointer to the bucket
+holding an instance's data — and that bucket keeps billing whether or not
+anything remembers its name. There is no second copy of this file.
+
+Fixed after the walk. A save now compares what is on disk against what the
+command read, and where they differ it replays the command's own changes onto
+the newer record rather than over it — an ordinary three-way merge, which is
+the right answer because each command owns a distinct part of this record
+(`connect` the carrier, `storage deploy` the bucket, `toolchain` the mirrored
+images). Refusing instead would have been the wrong fix: it would leave a load
+balancer that already exists unrecorded, which is the same loss wearing a
+different hat. Only two commands moving the *same* field somewhere different
+is a real conflict, and that is refused rather than guessed. Writes also go
+through a temporary file and a rename, so a process that dies mid-write leaves
+the previous record whole instead of a truncated one.
 
 **6. Smaller things.** `farcast toolchain` mirrors the builder *before*
 validating `--fetcher`, so a rejected command still has an effect;
