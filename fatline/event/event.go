@@ -90,6 +90,11 @@ func (s SlogSink) Emit(e Event) {
 	}
 	l.LogAttrs(context.Background(), lvl, "egress",
 		slog.String("kind", string(e.Kind)),
+		// Who, before what. A denial nobody can attribute is telemetry rather
+		// than enforcement (ADR 0013), and that is decided here: the proxy
+		// fills these in and this is the only place an operator reads them.
+		slog.String("tenant", e.Tenant),
+		slog.String("app", e.App),
 		slog.String("host", e.Host),
 		slog.String("port", e.Port),
 		slog.String("proto", e.Proto),

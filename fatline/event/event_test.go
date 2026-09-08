@@ -1,7 +1,10 @@
 package event
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -27,6 +30,29 @@ func (c *capture) len() int {
 func TestSlogSinkEmitDoesNotPanic(t *testing.T) {
 	SlogSink{}.Emit(Event{Kind: Deny, Host: "x", Reason: ReasonNotInAllowlist})
 	SlogSink{}.Emit(Event{Kind: Allow, Host: "y"})
+}
+
+// TestSlogSinkNamesTheApplication asserts on the RENDERED line rather than on
+// the Event, which is the layer where attribution was being lost: the proxy
+// filled Tenant and App correctly and this sink dropped them, so every denial
+// in a live instance read as anonymous. A test that inspects the Event cannot
+// see that; only the bytes an operator reads can.
+func TestSlogSinkNamesTheApplication(t *testing.T) {
+	for _, k := range []Kind{Deny, Allow, Close} {
+		var buf bytes.Buffer
+		s := SlogSink{Logger: slog.New(slog.NewTextHandler(&buf, nil))}
+		s.Emit(Event{
+			Kind: k, Tenant: "egress-demo", App: "reacher",
+			Host: "example.com", Port: "443", Proto: "connect",
+			Reason: ReasonNotInAllowlist,
+		})
+		line := buf.String()
+		for _, want := range []string{"tenant=egress-demo", "app=reacher"} {
+			if !strings.Contains(line, want) {
+				t.Errorf("%s event: log line lacks %q\n  got: %s", k, want, line)
+			}
+		}
+	}
 }
 
 func TestBufferedSinkDropsAndCounts(t *testing.T) {

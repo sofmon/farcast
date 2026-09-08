@@ -160,7 +160,10 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	// consumed bytes so they can be replayed unchanged into the upstream copy.
 	sni, buffered := peekSNI(clientConn)
 	if p.enforceSNI && sni != "" && !strings.EqualFold(sni, host) {
-		p.events.Emit(event.Event{Kind: event.Deny, Host: host, Port: port, Proto: "connect", SNI: sni, Reason: event.ReasonSNIMismatch})
+		p.events.Emit(event.Event{
+			Kind: event.Deny, Tenant: caller.Namespace, App: caller.App,
+			Host: host, Port: port, Proto: "connect", SNI: sni, Reason: event.ReasonSNIMismatch,
+		})
 		return
 	}
 
@@ -172,7 +175,10 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	clientSrc := io.MultiReader(bytes.NewReader(buffered), clientConn)
 	up, down := netcopy.Duplex(upstream, clientConn, clientSrc)
-	p.events.Emit(event.Event{Kind: event.Close, Host: host, Port: port, Proto: "connect", SNI: sni, BytesUp: up, BytesDown: down})
+	p.events.Emit(event.Event{
+		Kind: event.Close, Tenant: caller.Namespace, App: caller.App,
+		Host: host, Port: port, Proto: "connect", SNI: sni, BytesUp: up, BytesDown: down,
+	})
 }
 
 // splice copies bidirectionally between the client and the upstream, returning
