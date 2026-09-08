@@ -430,16 +430,25 @@ func (c *Client) fetchToken(ctx context.Context, registry string, ch challenge, 
 	if resp.StatusCode != http.StatusOK {
 		return "", newError("GET token", u.Redacted(), resp)
 	}
-	if ct := resp.Header.Get("Content-Type"); ct != "" && !strings.Contains(strings.ToLower(ct), "json") {
-		return "", fmt.Errorf("oci: token endpoint %s answered with %q, not JSON", u.Host, ct)
-	}
 	var tr tokenResponse
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxTokenSize))
 	if err != nil {
 		return "", fmt.Errorf("oci: read token response: %w", err)
 	}
+	// The body is the test, not the Content-Type header.
+	//
+	// This used to refuse any response not labelled JSON, which read as
+	// defensive and was not: json.Unmarshal already rejects an HTML error
+	// page, and a registry that serves correct JSON under a sloppy label was
+	// refused for no gain. Chainguard's cgr.dev — where the Kaniko fork and
+	// the git image both live — answers with "text/plain; charset=utf-8" and
+	// a perfectly good token, so the check rejected the whole toolchain.
+	//
+	// The label is still reported, but only once decoding has actually
+	// failed, where it is a clue rather than a verdict.
 	if err := json.Unmarshal(body, &tr); err != nil {
-		return "", fmt.Errorf("oci: decode token response: %w", err)
+		return "", fmt.Errorf("oci: token endpoint %s answered with %q that is not JSON: %w (%s)",
+			u.Host, resp.Header.Get("Content-Type"), err, excerpt(body))
 	}
 	if tr.Token != "" {
 		return tr.Token, nil
@@ -473,4 +482,17 @@ func drain(resp *http.Response) {
 	}
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, errorBodyLimit))
 	_ = resp.Body.Close()
+}
+
+// excerpt is a short, single-line view of a response body, for an error that
+// has to say what arrived without pasting a page into the terminal.
+func excerpt(body []byte) string {
+	s := strings.Join(strings.Fields(string(body)), " ")
+	if len(s) > 120 {
+		s = s[:120] + "…"
+	}
+	if s == "" {
+		return "empty body"
+	}
+	return "body: " + s
 }

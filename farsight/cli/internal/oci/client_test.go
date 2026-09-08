@@ -233,3 +233,62 @@ func TestRedirectDropsCredentialAcrossHosts(t *testing.T) {
 		t.Error("followed a redirect that downgraded to plaintext HTTP")
 	}
 }
+
+// A registry that serves a correct token under a sloppy Content-Type must
+// still work.
+//
+// Found on the Phase 4.3 walk. Chainguard's cgr.dev — which hosts both images
+// ADR 0010 puts inside an instance, the Kaniko fork and the git image —
+// answers its token endpoint with "text/plain; charset=utf-8" and a perfectly
+// good JSON body. Refusing on the label rejected the entire application build
+// toolchain, and the message blamed the registry for something that was not
+// wrong with it.
+func TestATokenIsJudgedByItsBodyNotItsLabel(t *testing.T) {
+	for _, ct := range []string{
+		"text/plain; charset=utf-8",
+		"application/octet-stream",
+		"",
+	} {
+		t.Run("Content-Type: "+ct, func(t *testing.T) {
+			reg := newFakeRegistry(t)
+			reg.mode = authBearer
+			reg.tokenContentType = ct
+			seedIndexedImage(t, reg, "chainguard/git", "latest-dev")
+
+			c := clientFor(reg, "", "")
+			ref, err := ParseReference(reg.host() + "/chainguard/git:latest-dev")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := c.Pull(t.Context(), ref, linuxAMD64); err != nil {
+				t.Fatalf("a valid token labelled %q was refused: %v", ct, err)
+			}
+		})
+	}
+}
+
+// The other half: a body that genuinely is not JSON still fails, and the error
+// carries both the label and what actually arrived — because "not JSON" on its
+// own tells an operator nothing they can act on.
+func TestANonJSONTokenBodyFailsAndSaysWhatArrived(t *testing.T) {
+	reg := newFakeRegistry(t)
+	reg.mode = authBearer
+	reg.tokenContentType = "text/html"
+	reg.tokenBody = "<html><body>Service Unavailable, try again later</body></html>"
+	seedIndexedImage(t, reg, "chainguard/git", "latest-dev")
+
+	c := clientFor(reg, "", "")
+	ref, err := ParseReference(reg.host() + "/chainguard/git:latest-dev")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.Pull(t.Context(), ref, linuxAMD64)
+	if err == nil {
+		t.Fatal("an HTML error page was accepted as a token")
+	}
+	for _, want := range []string{"text/html", "Service Unavailable"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the error does not mention %q: %v", want, err)
+		}
+	}
+}

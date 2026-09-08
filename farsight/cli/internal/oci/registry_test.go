@@ -40,6 +40,8 @@ type fakeRegistry struct {
 	user, pass       string
 	token            string
 	tokenRealm       string // overrides the realm advertised in a Bearer challenge
+	tokenContentType string // overrides the Content-Type on the token response
+	tokenBody        string // overrides the token response body entirely
 	omitDigestHeader bool
 	putDigestLie     string          // if set, the digest a manifest PUT claims to have stored
 	corrupt          map[string]bool // digests to serve with flipped bytes
@@ -137,7 +139,15 @@ func (r *fakeRegistry) serveToken(w http.ResponseWriter, req *http.Request) {
 	if req.URL.Query().Get("scope") == "" {
 		r.t.Errorf("token request carried no scope: %s", req.URL)
 	}
-	w.Header().Set("Content-Type", "application/json")
+	ct := r.tokenContentType
+	if ct == "" {
+		ct = "application/json"
+	}
+	w.Header().Set("Content-Type", ct)
+	if r.tokenBody != "" {
+		_, _ = io.WriteString(w, r.tokenBody)
+		return
+	}
 	_ = json.NewEncoder(w).Encode(map[string]string{"token": r.token})
 }
 
