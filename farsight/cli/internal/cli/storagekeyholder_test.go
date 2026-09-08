@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sofmon/farcast/datasphere"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
@@ -232,8 +233,20 @@ func TestDeployRefusesWithoutATunnel(t *testing.T) {
 }
 
 // A keyholder with no bucket would start, pass its probes and refuse every
-// write — a failure that reads as an application bug.
-func TestDeployRefusesWithoutABucket(t *testing.T) {
+// write — a failure that reads as an application bug. So deploy must not
+// proceed without one.
+//
+// It used to REFUSE, telling the operator to "run a 'farcast storage' command
+// first so the bucket is minted" — and the only such command that mints is one
+// that writes. The Phase 4.3 walk followed that literally, wrote to app/, and
+// so placed an object under the master key space in the one window before the
+// app scope exists; unseal then minted that scope over the prefix and the
+// object became unreachable by its own name.
+//
+// Deploy now mints the bucket itself, which removes the window rather than
+// documenting a way around it. This asserts it still does not proceed on a
+// bucketless instance — it just gets there by creating one.
+func TestDeployMintsTheBucketItNeeds(t *testing.T) {
 	dir := config.Dir(t.TempDir())
 	if err := os.Chmod(string(dir), 0o700); err != nil {
 		t.Fatal(err)
@@ -250,9 +263,57 @@ func TestDeployRefusesWithoutABucket(t *testing.T) {
 	}
 	env, _ := testEnv(dir, output.ModeHuman)
 
-	err := (&storageDeployCommand{}).Run(context.Background(), env, []string{"prod"})
-	if err == nil || !strings.Contains(err.Error(), "bucket") {
-		t.Fatalf("deploy should refuse without a bucket, got %v", err)
+	var minted []string
+	c := &storageDeployCommand{}
+	c.ensureStorage = func(_ context.Context, _ *Env, instance string) error {
+		minted = append(minted, instance)
+		return errors.New("stop here")
+	}
+
+	err := c.Run(context.Background(), env, []string{"prod"})
+	if err == nil {
+		t.Fatal("deploy proceeded with no bucket at all")
+	}
+	if len(minted) != 1 || minted[0] != "prod" {
+		t.Fatalf("deploy minted %v; it must create the bucket it needs rather than refuse", minted)
+	}
+	if !strings.Contains(err.Error(), "create storage") {
+		t.Errorf("the failure does not say it was creating storage: %v", err)
+	}
+	if strings.Contains(err.Error(), "run a 'farcast storage' command first") {
+		t.Error("deploy still tells the operator to mint a bucket by writing to it")
+	}
+}
+
+// And an instance that already has a bucket is left alone: minting again would
+// be a second bucket for an instance that has one.
+func TestDeployDoesNotMintOverAnExistingBucket(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	if err := os.Chmod(string(dir), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := dir.CreateInstance("prod"); err != nil {
+		t.Fatal(err)
+	}
+	meta := &config.InstanceMetadata{
+		Name: "prod", Provider: "gke", Region: "us-central1", Status: "running",
+		FatLineDeployed: true,
+		Storage:         &config.Storage{Bucket: "farcast-prod-abc", Location: "us-central1"},
+	}
+	if err := dir.SaveInstanceMetadata("prod", meta); err != nil {
+		t.Fatal(err)
+	}
+	env, _ := testEnv(dir, output.ModeHuman)
+
+	var minted []string
+	c := &storageDeployCommand{}
+	c.ensureStorage = func(_ context.Context, _ *Env, instance string) error {
+		minted = append(minted, instance)
+		return nil
+	}
+	_ = c.Run(context.Background(), env, []string{"prod"})
+	if len(minted) != 0 {
+		t.Fatalf("deploy minted storage for an instance that already has a bucket: %v", minted)
 	}
 }
 
@@ -393,5 +454,56 @@ func TestDeployDoesNotWaitForReadiness(t *testing.T) {
 	// The operator is told the next step, because nothing works until it runs.
 	if !strings.Contains(out.String(), "SEALED") || !strings.Contains(out.String(), "storage unseal "+name) {
 		t.Errorf("the operator was not told to unseal: %q", out.String())
+	}
+}
+
+// The default mint path, exercised rather than stubbed: deploy against an
+// instance whose storage record has no bucket must actually create one.
+//
+// The seam above proves deploy DECIDES to mint. This proves the thing it calls
+// mints — the join between them, which a seam test cannot see and which is
+// where this kind of fix usually rots.
+func TestDeployReallyMintsTheBucket(t *testing.T) {
+	env, _, _, dir, _ := newDataEnv(t, output.ModeHuman)
+
+	// Same instance, but with the bucket name cleared: a storage record that
+	// names a provider and nothing else is the state a half-finished mint
+	// leaves, and it must be treated as no storage at all.
+	meta, err := dir.LoadInstanceMetadata("prod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta.FatLineDeployed = true
+	meta.Storage.Bucket = ""
+	meta.Storage.CreatedAt = time.Time{}
+	if err := dir.SaveInstanceMetadata("prod", meta); err != nil {
+		t.Fatal(err)
+	}
+
+	c := &storageDeployCommand{}
+	c.deployer.assumeYes = true
+	// It will fail later, at the registry, with no cloud to reach. What
+	// matters is what exists by then.
+	_ = c.Run(context.Background(), env, []string{"prod"})
+
+	got, err := dir.LoadInstanceMetadata("prod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Storage == nil || got.Storage.Bucket == "" {
+		t.Fatal("deploy did not mint the bucket it needs")
+	}
+	// And the keyring came with it, application scope and all, so the first
+	// write to app/ cannot land in the master key space.
+	raw, err := dir.LoadInstanceKeyring("prod")
+	if err != nil {
+		t.Fatalf("deploy minted no keyring: %v", err)
+	}
+	keys, err := datasphere.ParseKeyring(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := keys.ScopeNamed(datasphere.DefaultScopeName); !ok {
+		t.Error("the keyring deploy minted has no application scope")
 	}
 }

@@ -40,6 +40,20 @@ const keyholderReplicas = 2
 type storageDeployCommand struct {
 	deployer fatlineDeployer
 	image    string
+
+	// ensureStorage mints the bucket and keyring when the instance has none.
+	// A seam, because whether this command mints at all is the fix for a real
+	// defect and deserves a test that does not need a cloud.
+	ensureStorage func(ctx context.Context, env *Env, instance string) error
+}
+
+func (c *storageDeployCommand) ensureDefaults() {
+	if c.ensureStorage == nil {
+		c.ensureStorage = func(ctx context.Context, env *Env, instance string) error {
+			_, err := openSession(ctx, env, instance, true)
+			return err
+		}
+	}
 }
 
 func (*storageDeployCommand) Name() string { return "deploy" }
@@ -78,6 +92,7 @@ func (c *storageDeployCommand) Run(ctx context.Context, env *Env, args []string)
 		return usagef("storage deploy takes one instance argument")
 	}
 	name := args[0]
+	c.ensureDefaults()
 	c.deployer.component = keyholderComponent
 	c.deployer.fatlineImage = c.image
 	c.deployer.ensureDefaults()
@@ -93,9 +108,29 @@ func (c *storageDeployCommand) Run(ctx context.Context, env *Env, args []string)
 		return fmt.Errorf("instance %q is not connected; run 'farcast connect %s' first — "+
 			"the keyholder is reachable only through the FatLine tunnel", name, name)
 	}
+	// Mint the bucket and the keyring here rather than sending the operator
+	// away to create them.
+	//
+	// This used to refuse, telling the operator to "run a 'farcast storage'
+	// command first so the bucket is minted" — and the only such command that
+	// mints is one that writes. The Phase 4.3 walk followed that instruction
+	// literally, wrote to app/, and so put an object under the MASTER key
+	// space at the one moment before the app scope exists. Unseal then minted
+	// that scope over the prefix, and the object became unreachable by its own
+	// name. A bring-up order whose documented happy path orphans data is a
+	// trap in the order, not a mistake by whoever walked it.
+	//
+	// Minting the keyring here is deliberate too: it is needed by the unseal
+	// that follows immediately, and the key-loss warning it prints belongs at
+	// the moment storage is brought up rather than buried in the output of a
+	// file copy.
 	if meta.Storage == nil || meta.Storage.Bucket == "" {
-		return fmt.Errorf("instance %q has no storage bucket recorded; run a 'farcast storage' command first "+
-			"so the bucket is minted and recorded", name)
+		if err := c.ensureStorage(ctx, env, name); err != nil {
+			return fmt.Errorf("create storage for %q: %w", name, err)
+		}
+		if meta, err = env.ConfigDir.LoadInstanceMetadata(name); err != nil {
+			return fmt.Errorf("re-read instance %q after creating its storage: %w", name, err)
+		}
 	}
 
 	ok, err := c.confirmCost(env, meta)
