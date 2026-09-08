@@ -77,3 +77,30 @@ func TestLogsPassesTailFollowAndPrevious(t *testing.T) {
 		}
 	}
 }
+
+// "deployment/datasphered" names nothing: the key holder is a StatefulSet, so
+// the log target has to be built from the kind that was actually found.
+func TestLogsTargetsTheKindItFound(t *testing.T) {
+	for kind, want := range map[string]string{
+		"Deployment":  "deployment/thing",
+		"StatefulSet": "statefulset/thing",
+	} {
+		t.Run(kind, func(t *testing.T) {
+			dir := config.Dir(t.TempDir())
+			meteringInstance(t, dir, "p43", "apps")
+			env, _ := testEnv(dir, output.ModeHuman)
+
+			f := &fakeReader{deployments: map[string][]cluster.Workload{
+				"apps": {workloadOf(kind, "apps", "thing", 1, 1, "app")},
+			}}
+			c := &logsCommand{lines: 10}
+			c.newCluster = func(string) logReader { return f }
+			if err := c.Run(context.Background(), env, []string{"p43", "thing"}); err != nil {
+				t.Fatal(err)
+			}
+			if f.logged != "apps "+want {
+				t.Errorf("read %q, want %q", f.logged, "apps "+want)
+			}
+		})
+	}
+}

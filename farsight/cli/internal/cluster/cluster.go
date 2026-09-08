@@ -225,8 +225,12 @@ func (r execRunner) Stream(ctx context.Context, out io.Writer, args ...string) e
 	return nil
 }
 
-// Workload is one Deployment, as much of it as a listing needs.
+// Workload is one Deployment or StatefulSet, as much of it as a listing needs.
 type Workload struct {
+	// Kind is "Deployment" or "StatefulSet". It is carried because reading a
+	// workload's logs needs the kind in the target, and guessing "deployment/"
+	// is how the Phase 4.3 walk found the key holder invisible to `farcast ps`.
+	Kind      string
 	Namespace string
 	Name      string
 	Desired   int
@@ -236,14 +240,19 @@ type Workload struct {
 	CreatedAt time.Time
 }
 
-// Deployments lists the Deployments in a namespace.
+// Workloads lists the Deployments and StatefulSets in a namespace.
+//
+// Both kinds, because FarCast runs both: the key holder is a StatefulSet, and
+// a listing that asked only for Deployments showed an instance with no storage
+// in it at all. The Phase 4.3 walk found that — `farcast ps --all` claimed to
+// show FarCast's own components and silently omitted one of them.
 //
 // It reads JSON rather than a jsonpath or custom columns. Both of those are
 // output formats meant for a human to eyeball, and both would parse a
 // cluster's answer by position — a column that moves becomes silently wrong
 // data rather than an error.
-func (c *Client) Deployments(ctx context.Context, namespace string) ([]Workload, error) {
-	out, err := c.runner.Run(ctx, nil, "get", "deployments", "-n", namespace, "-o", "json")
+func (c *Client) Workloads(ctx context.Context, namespace string) ([]Workload, error) {
+	out, err := c.runner.Run(ctx, nil, "get", "deployments,statefulsets", "-n", namespace, "-o", "json")
 	if err != nil {
 		return nil, err
 	}
@@ -252,6 +261,7 @@ func (c *Client) Deployments(ctx context.Context, namespace string) ([]Workload,
 	}
 	var list struct {
 		Items []struct {
+			Kind     string `json:"kind"`
 			Metadata struct {
 				Name              string            `json:"name"`
 				Namespace         string            `json:"namespace"`
@@ -279,6 +289,7 @@ func (c *Client) Deployments(ctx context.Context, namespace string) ([]Workload,
 	workloads := make([]Workload, 0, len(list.Items))
 	for _, it := range list.Items {
 		w := Workload{
+			Kind:      it.Kind,
 			Namespace: it.Metadata.Namespace,
 			Name:      it.Metadata.Name,
 			Ready:     it.Status.ReadyReplicas,
@@ -287,6 +298,9 @@ func (c *Client) Deployments(ctx context.Context, namespace string) ([]Workload,
 		}
 		if w.Namespace == "" {
 			w.Namespace = namespace
+		}
+		if w.Kind == "" {
+			w.Kind = "Deployment"
 		}
 		// A Deployment with no explicit replicas runs one. Reading that as
 		// zero would show every healthy application as stopped — and stopped

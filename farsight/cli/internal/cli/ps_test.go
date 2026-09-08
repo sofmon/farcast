@@ -26,7 +26,7 @@ type fakeReader struct {
 	logsBody string
 }
 
-func (f *fakeReader) Deployments(_ context.Context, ns string) ([]cluster.Workload, error) {
+func (f *fakeReader) Workloads(_ context.Context, ns string) ([]cluster.Workload, error) {
 	if err := f.errs[ns]; err != nil {
 		return nil, err
 	}
@@ -52,8 +52,12 @@ func (f *fakeReader) Logs(_ context.Context, out io.Writer, ns, target string, l
 }
 
 func appDeployment(ns, name string, desired, ready int, tier string) cluster.Workload {
+	return workloadOf("Deployment", ns, name, desired, ready, tier)
+}
+
+func workloadOf(kind, ns, name string, desired, ready int, tier string) cluster.Workload {
 	return cluster.Workload{
-		Namespace: ns, Name: name, Desired: desired, Ready: ready,
+		Kind: kind, Namespace: ns, Name: name, Desired: desired, Ready: ready,
 		Images:    []string{"reg.example/app/" + name + "@sha256:" + strings.Repeat("a", 64)},
 		Labels:    map[string]string{"farcast.sofmon.com/tier": tier},
 		CreatedAt: time.Now().Add(-3 * time.Hour),
@@ -159,5 +163,31 @@ func TestPsSaysWhenItCouldNotSeeEverything(t *testing.T) {
 		if !strings.Contains(shown, want) {
 			t.Errorf("the listing does not say %q could not be read:\n%s", want, shown)
 		}
+	}
+}
+
+// FarCast runs both kinds, and the key holder is a StatefulSet. A listing that
+// asked only for Deployments showed an instance with no storage in it at all.
+//
+// Found on the Phase 4.3 walk: `farcast ps --all` said it shows FarCast's own
+// components and silently omitted one of them.
+func TestPsShowsStatefulSetsAsWellAsDeployments(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	meteringInstance(t, dir, "p43")
+	env, out := testEnv(dir, output.ModeHuman)
+
+	f := &fakeReader{deployments: map[string][]cluster.Workload{
+		tcdeploy.DefaultNamespace: {
+			workloadOf("Deployment", tcdeploy.DefaultNamespace, "fatline", 2, 2, "system"),
+			workloadOf("StatefulSet", tcdeploy.DefaultNamespace, "datasphered", 2, 2, "system"),
+		},
+	}}
+	c := &psCommand{all: true}
+	c.newCluster = func(string) lister { return f }
+	if err := c.Run(context.Background(), env, []string{"p43"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "datasphered") {
+		t.Errorf("the key holder is a StatefulSet and does not appear:\n%s", out.String())
 	}
 }

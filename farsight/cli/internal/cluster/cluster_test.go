@@ -116,7 +116,7 @@ func TestJobLogsAsksForEverythingUnlessGivenALimit(t *testing.T) {
 // A Deployment with no explicit replicas runs one. Decoding that as zero would
 // show every healthy application as stopped — and stopped is exactly what a
 // protective cost shutdown leaves behind, so the two must not be confused.
-func TestDeploymentsWithoutExplicitReplicasRunOne(t *testing.T) {
+func TestWorkloadsWithoutExplicitReplicasRunOne(t *testing.T) {
 	const body = `{"items":[
 	  {"metadata":{"name":"api","namespace":"apps","creationTimestamp":"2026-09-01T10:00:00Z",
 	    "labels":{"farcast.sofmon.com/tier":"app"}},
@@ -127,7 +127,7 @@ func TestDeploymentsWithoutExplicitReplicasRunOne(t *testing.T) {
 	   "status":{}}
 	]}`
 	fr := &fakeRunner{out: map[string][]byte{"get": []byte(body)}}
-	got, err := NewWithRunner(fr).Deployments(context.Background(), "apps")
+	got, err := NewWithRunner(fr).Workloads(context.Background(), "apps")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,9 +152,9 @@ func TestDeploymentsWithoutExplicitReplicasRunOne(t *testing.T) {
 }
 
 // An empty answer is a namespace with no deployments, not a parse failure.
-func TestDeploymentsHandlesAnEmptyAnswer(t *testing.T) {
+func TestWorkloadsHandlesAnEmptyAnswer(t *testing.T) {
 	fr := &fakeRunner{}
-	got, err := NewWithRunner(fr).Deployments(context.Background(), "apps")
+	got, err := NewWithRunner(fr).Workloads(context.Background(), "apps")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -282,5 +282,43 @@ func TestFollowingNeedsAStreamer(t *testing.T) {
 	err := NewWithRunner(&fakeRunner{}).Logs(context.Background(), &buf, "apps", "deployment/api", 10, true, false)
 	if err == nil {
 		t.Fatal("following succeeded on a Runner that cannot stream")
+	}
+}
+
+// FarCast runs Deployments and StatefulSets — the key holder is the latter —
+// so a listing must ask for both, and must carry back which is which. The
+// Phase 4.3 walk found `farcast ps --all` silently omitting storage.
+func TestWorkloadsAsksForBothKindsAndKeepsThem(t *testing.T) {
+	const body = `{"items":[
+	  {"kind":"Deployment","metadata":{"name":"fatline","namespace":"farcast-system"},
+	   "spec":{"replicas":2,"template":{"spec":{"containers":[{"image":"reg/fatline@sha256:a"}]}}},
+	   "status":{"readyReplicas":2}},
+	  {"kind":"StatefulSet","metadata":{"name":"datasphered","namespace":"farcast-system"},
+	   "spec":{"replicas":2,"template":{"spec":{"containers":[{"image":"reg/ds@sha256:b"}]}}},
+	   "status":{"readyReplicas":2}}
+	]}`
+	fr := &fakeRunner{out: map[string][]byte{"get": []byte(body)}}
+	got, err := NewWithRunner(fr).Workloads(context.Background(), "farcast-system")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The request itself: asking only for deployments is how storage vanished.
+	if len(fr.calls) != 1 {
+		t.Fatalf("calls=%v, want one", fr.calls)
+	}
+	if !slices.Contains(fr.calls[0], "deployments,statefulsets") {
+		t.Errorf("args=%v, want them to ask for both kinds", fr.calls[0])
+	}
+
+	kinds := map[string]string{}
+	for _, w := range got {
+		kinds[w.Name] = w.Kind
+	}
+	if kinds["datasphered"] != "StatefulSet" {
+		t.Errorf("datasphered came back as %q; reading its logs would target the wrong kind", kinds["datasphered"])
+	}
+	if kinds["fatline"] != "Deployment" {
+		t.Errorf("fatline came back as %q", kinds["fatline"])
 	}
 }

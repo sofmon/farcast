@@ -19,7 +19,7 @@ import (
 
 // lister is the slice of the cluster client a listing needs.
 type lister interface {
-	Deployments(ctx context.Context, namespace string) ([]cluster.Workload, error)
+	Workloads(ctx context.Context, namespace string) ([]cluster.Workload, error)
 }
 
 type psCommand struct {
@@ -76,7 +76,7 @@ func (c *psCommand) Run(ctx context.Context, env *Env, args []string) error {
 	cl := c.newCluster(env.ConfigDir.InstanceKubeconfigPath(name))
 	res := psResult{Instance: name, Currency: currencyOf(meta)}
 	for _, ns := range namespaces {
-		workloads, err := cl.Deployments(ctx, ns)
+		workloads, err := cl.Workloads(ctx, ns)
 		if err != nil {
 			// One namespace refusing must not hide the rest, for the same
 			// reason the kernel's own meter tolerates it — but the report has

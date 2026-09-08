@@ -73,36 +73,42 @@ func (c *logsCommand) Run(ctx context.Context, env *Env, args []string) error {
 	}
 	cl := c.newCluster(env.ConfigDir.InstanceKubeconfigPath(name))
 
-	namespace := c.namespace
-	if namespace == "" {
-		ps := &psCommand{all: true}
-		found, err := findApp(ctx, cl, ps.namespacesOf(meta), app)
-		if err != nil {
-			return err
-		}
-		namespace = found
+	// The kind matters as much as the namespace: the key holder is a
+	// StatefulSet, and "deployment/datasphered" names nothing.
+	namespace, kind := c.namespace, "Deployment"
+	found, err := findApp(ctx, cl, (&psCommand{all: true}).namespacesOf(meta), app, c.namespace)
+	if err != nil {
+		return err
 	}
+	namespace, kind = found.Namespace, found.Kind
 
 	// Logs go to stdout unformatted, whatever --output says: they are the
 	// application's bytes, and wrapping them in this CLI's envelope would make
 	// them something else.
-	return cl.Logs(ctx, env.Out, namespace, "deployment/"+app, c.lines, c.follow, c.previous)
+	return cl.Logs(ctx, env.Out, namespace, strings.ToLower(kind)+"/"+app, c.lines, c.follow, c.previous)
 }
 
-// findApp locates a deployment by name across the namespaces an instance
-// meters, and refuses to guess when two of them match.
-func findApp(ctx context.Context, cl lister, namespaces []string, app string) (string, error) {
-	var found []string
+// findApp locates a workload by name across the namespaces an instance meters,
+// and refuses to guess when two of them match.
+//
+// It returns the workload rather than its namespace because the caller needs
+// the kind too: FarCast runs Deployments and StatefulSets, and a log target
+// built from the wrong one names nothing.
+func findApp(ctx context.Context, cl lister, namespaces []string, app, only string) (cluster.Workload, error) {
+	if only != "" {
+		namespaces = []string{only}
+	}
+	var found []cluster.Workload
 	var unreadable []string
 	for _, ns := range namespaces {
-		workloads, err := cl.Deployments(ctx, ns)
+		workloads, err := cl.Workloads(ctx, ns)
 		if err != nil {
 			unreadable = append(unreadable, fmt.Sprintf("%s: %v", ns, err))
 			continue
 		}
 		for _, w := range workloads {
 			if w.Name == app {
-				found = append(found, ns)
+				found = append(found, w)
 			}
 		}
 	}
@@ -111,12 +117,16 @@ func findApp(ctx context.Context, cl lister, namespaces []string, app string) (s
 		return found[0], nil
 	case 0:
 		if len(unreadable) > 0 {
-			return "", fmt.Errorf("no application %q in %s, and %s could not be read (%s)",
+			return cluster.Workload{}, fmt.Errorf("no application %q in %s, and %s could not be read (%s)",
 				app, strings.Join(namespaces, ", "),
 				plural(len(unreadable), "namespace", "namespaces"), strings.Join(unreadable, "; "))
 		}
-		return "", fmt.Errorf("no application %q in %s", app, strings.Join(namespaces, ", "))
+		return cluster.Workload{}, fmt.Errorf("no application %q in %s", app, strings.Join(namespaces, ", "))
 	default:
-		return "", fmt.Errorf("%q exists in %s; name one with --namespace", app, strings.Join(found, " and "))
+		var where []string
+		for _, w := range found {
+			where = append(where, w.Namespace)
+		}
+		return cluster.Workload{}, fmt.Errorf("%q exists in %s; name one with --namespace", app, strings.Join(where, " and "))
 	}
 }
