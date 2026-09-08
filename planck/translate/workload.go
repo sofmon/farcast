@@ -30,6 +30,27 @@ metadata:
 {{- range .Apps}}
 ---
 apiVersion: v1
+kind: Secret
+metadata:
+  name: {{.Name}}-egress
+  namespace: {{$.Namespace}}
+  labels:
+    app.kubernetes.io/name: {{.Name}}
+    app.kubernetes.io/managed-by: farcast
+    app.kubernetes.io/part-of: {{$.Deployment}}
+# This application's egress credential, inside the proxy address it is given.
+#
+# It rides as userinfo because that is the universal HTTP proxy convention —
+# every standard client turns it into Proxy-Authorization on its own — which is
+# what lets ADR 0013 change how an application is identified without changing
+# the application (decision 2).
+#
+# What it authorises is exactly this app's declared hosts, nothing wider, and it
+# is reminted on every deploy.
+stringData:
+  FARCAST_FATLINE_PROXY: {{.ProxyURL}}
+---
+apiVersion: v1
 kind: ConfigMap
 metadata:
   name: {{.Name}}
@@ -39,11 +60,10 @@ metadata:
     app.kubernetes.io/managed-by: farcast
     app.kubernetes.io/part-of: {{$.Deployment}}
 data:
-  # The proxy every outbound request must go through. There is no direct-dial
-  # fallback: the NetworkPolicy below denies everything else, so an app that
-  # ignores this variable fails closed rather than quietly bypassing the
-  # boundary (ADR 0005).
-  FARCAST_FATLINE_PROXY: http://{{$.FatLineService}}.{{$.SystemNamespace}}.svc.cluster.local:{{$.FatLineEgressPort}}
+  # FARCAST_FATLINE_PROXY is NOT here. It carries this application's egress
+  # credential (ADR 0013), so it lives in the Secret below — a ConfigMap is
+  # readable by anything that can read ConfigMaps, and this value is what tells
+  # FatLine which application is asking.
 {{- if $.HasStorage}}
   FARCAST_STORAGE_ENDPOINT: https://{{$.StorageService}}.{{$.SystemNamespace}}.svc.cluster.local:{{$.StoragePort}}
   FARCAST_STORAGE_STATUS_ENDPOINT: https://{{$.StorageStatusService}}.{{$.SystemNamespace}}.svc.cluster.local:{{$.StorageStatusPort}}
@@ -104,6 +124,14 @@ spec:
           envFrom:
             - configMapRef:
                 name: {{.Name}}
+            # The proxy address, with this application's egress credential in
+            # it. There is no direct-dial fallback: the NetworkPolicy below
+            # denies everything else, so an app that ignores the variable fails
+            # closed rather than quietly bypassing the boundary (ADR 0005), and
+            # one that reaches FatLine without the credential is refused
+            # because FatLine cannot tell whose declarations to enforce.
+            - secretRef:
+                name: {{.Name}}-egress
           ports:
             - name: http
               containerPort: {{$.Port}}

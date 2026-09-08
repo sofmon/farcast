@@ -145,8 +145,9 @@ func podTemplateLabels(t *testing.T, manifest []byte) map[string]string {
 func translatedAppLabels(t *testing.T) (ns, pod map[string]string) {
 	t.Helper()
 	out, err := translate.Render(translate.Config{
-		Manifest: parser.Manifest{Name: "demo", Apps: []parser.App{{Name: "server"}}},
-		Images:   map[string]string{"server": "reg/app/demo/server@sha256:" + strings.Repeat("a", 64)},
+		Manifest:    parser.Manifest{Name: "demo", Apps: []parser.App{{Name: "server"}}},
+		Images:      map[string]string{"server": "reg/app/demo/server@sha256:" + strings.Repeat("a", 64)},
+		Credentials: map[string]string{"server": "server-egress-credential"},
 	})
 	if err != nil {
 		t.Fatal(err)

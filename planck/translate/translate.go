@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/sofmon/farcast/fatline/policy"
 	"github.com/sofmon/farcast/manifest/parser"
 )
 
@@ -118,6 +119,15 @@ type Config struct {
 	// separately from the address used to reach it (see sdk/go's
 	// FARCAST_STORAGE_SERVER_NAME).
 	StorageServerName string
+
+	// Credentials maps each app's name to its egress credential (ADR 0013).
+	//
+	// Every app in the manifest must have one. A translation that left one out
+	// would deploy an application FatLine cannot identify, which reaches
+	// nothing and reports it as an unidentified caller rather than as a
+	// misconfiguration — so it is refused here, where the message can say what
+	// actually happened.
+	Credentials map[string]string
 }
 
 func (c *Config) withDefaults() {
@@ -187,7 +197,17 @@ func Render(c Config) ([]byte, error) {
 		if !hasDigest(image) {
 			return nil, fmt.Errorf("translate: image %q for app %q is not digest-pinned (want repo@sha256:<64 hex>)", image, app.Name)
 		}
-		data.Apps = append(data.Apps, appData{Name: app.Name, Image: image})
+		credential := c.Credentials[app.Name]
+		if credential == "" {
+			return nil, fmt.Errorf("translate: no egress credential for app %q; FatLine could not tell which "+
+				"application is calling, so it would reach nothing (ADR 0013)", app.Name)
+		}
+		data.Apps = append(data.Apps, appData{
+			Name: app.Name, Image: image,
+			ProxyURL: policy.ProxyURL("http",
+				FatLineService+"."+SystemNamespace+".svc.cluster.local",
+				FatLineEgressPort, app.Name, credential),
+		})
 	}
 
 	var buf bytes.Buffer
@@ -249,6 +269,9 @@ func indentPEM(pem []byte) string {
 type appData struct {
 	Name  string
 	Image string
+	// ProxyURL is the app's egress address with its own credential in it
+	// (ADR 0013 decision 2).
+	ProxyURL string
 }
 
 type templateData struct {

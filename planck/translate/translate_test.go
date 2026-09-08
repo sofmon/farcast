@@ -25,6 +25,10 @@ func sampleConfig() Config {
 			"api": "reg/app/my-platform/api" + digest,
 			"web": "reg/app/my-platform/web" + digest,
 		},
+		Credentials: map[string]string{
+			"api": "api-egress-credential",
+			"web": "web-egress-credential",
+		},
 		Instance:          "p42",
 		StorageScope:      "app",
 		StorageServerName: "p42.datasphered.farcast",
@@ -96,10 +100,10 @@ func labels(t *testing.T, v any) map[string]string {
 	return out
 }
 
-func TestRenderProducesOneNamespaceAndFourDocumentsPerApp(t *testing.T) {
+func TestRenderProducesOneNamespaceAndFiveDocumentsPerApp(t *testing.T) {
 	_, docs := render(t, sampleConfig())
-	if len(docs) != 1+2*4 {
-		t.Fatalf("rendered %d documents, want 9 (a namespace plus four per app)", len(docs))
+	if len(docs) != 1+2*5 {
+		t.Fatalf("rendered %d documents, want 11 (a namespace plus five per app)", len(docs))
 	}
 	pick(t, docs, "Namespace", "my-platform")
 	for _, app := range []string{"api", "web"} {
@@ -216,8 +220,13 @@ func TestWithoutStorageThereIsNoStorageEnvOrEgress(t *testing.T) {
 func TestTheSDKContractReachesTheContainer(t *testing.T) {
 	_, docs := render(t, sampleConfig())
 	cm := at(t, pick(t, docs, "ConfigMap", "api"), "data").(map[string]any)
+	// FARCAST_FATLINE_PROXY is deliberately NOT here: it carries the app's
+	// egress credential and lives in the Secret (ADR 0013).
+	if _, ok := cm["FARCAST_FATLINE_PROXY"]; ok {
+		t.Error("the proxy address is in the ConfigMap; it carries a credential and belongs in the Secret")
+	}
 	for _, key := range []string{
-		"FARCAST_FATLINE_PROXY", "FARCAST_STORAGE_ENDPOINT", "FARCAST_STORAGE_STATUS_ENDPOINT",
+		"FARCAST_STORAGE_ENDPOINT", "FARCAST_STORAGE_STATUS_ENDPOINT",
 		"FARCAST_STORAGE_SCOPE", "FARCAST_STORAGE_SERVER_NAME", "FARCAST_STORAGE_CA",
 	} {
 		if v, ok := cm[key]; !ok || v == "" {
@@ -425,7 +434,7 @@ func TestDNSReachesTheNodeLocalCacheAsWellAsKubeDNS(t *testing.T) {
 func TestTheProxyAddressIsTheEgressServiceAndThePolicySelectsThePods(t *testing.T) {
 	_, docs := render(t, sampleConfig())
 
-	proxy := at(t, pick(t, docs, "ConfigMap", "api"), "data").(map[string]any)["FARCAST_FATLINE_PROXY"].(string)
+	proxy := at(t, pick(t, docs, "Secret", "api-egress"), "stringData").(map[string]any)["FARCAST_FATLINE_PROXY"].(string)
 	if !strings.Contains(proxy, FatLineService) {
 		t.Errorf("proxy = %q, want the egress Service %q", proxy, FatLineService)
 	}
@@ -455,5 +464,63 @@ func TestTheProxyAddressIsTheEgressServiceAndThePolicySelectsThePods(t *testing.
 	}
 	if !found {
 		t.Errorf("no egress rule selects FatLine's pods (%q)", FatLineWorkload)
+	}
+}
+
+// The credential is what identifies an application to FatLine, so it must
+// reach the container — and must not be somewhere every reader of ConfigMaps
+// can see it (ADR 0013).
+func TestEachAppGetsItsOwnCredentialInItsOwnSecret(t *testing.T) {
+	out, docs := render(t, sampleConfig())
+
+	seen := map[string]string{}
+	for _, app := range []string{"api", "web"} {
+		sec := at(t, pick(t, docs, "Secret", app+"-egress"), "stringData").(map[string]any)
+		proxy, ok := sec["FARCAST_FATLINE_PROXY"].(string)
+		if !ok || proxy == "" {
+			t.Fatalf("%s has no proxy address", app)
+		}
+		if !strings.Contains(proxy, "-egress-credential@") {
+			t.Errorf("%s's proxy address carries no credential: %q", app, proxy)
+		}
+		seen[app] = proxy
+	}
+	if seen["api"] == seen["web"] {
+		t.Fatal("both applications were given the same egress address; they would be indistinguishable to FatLine")
+	}
+
+	// The Deployment must actually consume it, or the credential is written
+	// and never presented.
+	var sourced bool
+	for _, c := range at(t, pick(t, docs, "Deployment", "api"), "spec", "template", "spec", "containers").([]any) {
+		for _, e := range c.(map[string]any)["envFrom"].([]any) {
+			if ref, ok := e.(map[string]any)["secretRef"].(map[string]any); ok && ref["name"] == "api-egress" {
+				sourced = true
+			}
+		}
+	}
+	if !sourced {
+		t.Error("the app's Deployment does not read its egress Secret")
+	}
+
+	// And no credential leaked into a ConfigMap on the way.
+	for _, d := range docs {
+		if d["kind"] != "ConfigMap" {
+			continue
+		}
+		if strings.Contains(fmt.Sprint(d["data"]), "-egress-credential") {
+			t.Errorf("a credential reached a ConfigMap: %v", d["metadata"])
+		}
+	}
+	_ = out
+}
+
+// An app with no credential would deploy, reach nothing, and report it as an
+// unidentified caller rather than as the misconfiguration it is.
+func TestTranslateRefusesAnAppWithNoCredential(t *testing.T) {
+	c := sampleConfig()
+	delete(c.Credentials, "web")
+	if _, err := Render(c); err == nil {
+		t.Fatal("Render accepted an app with no egress credential")
 	}
 }

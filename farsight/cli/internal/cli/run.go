@@ -11,6 +11,7 @@ import (
 	"github.com/sofmon/farcast/farsight/cli/internal/cluster"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/image"
+	fldeploy "github.com/sofmon/farcast/fatline/deploy"
 	"github.com/sofmon/farcast/fatline/identity"
 	"github.com/sofmon/farcast/manifest/parser"
 	pbuild "github.com/sofmon/farcast/planck/build"
@@ -29,6 +30,7 @@ const rolloutTimeout = 5 * time.Minute
 // runCluster is the slice of the cluster client `run` needs.
 type runCluster interface {
 	jobWaiter
+	policyReader
 	RolloutStatus(ctx context.Context, namespace, name string, timeout time.Duration) error
 }
 
@@ -185,8 +187,26 @@ func (c *runCommand) Run(ctx context.Context, env *Env, args []string) error {
 		return err
 	}
 
-	// 4. Translate and apply.
-	workloads, err := c.translate(env, meta, namespace, *m, images)
+	// 4. Mint this deployment's egress credentials and write the instance's
+	//    policy, merged with every other deployment's (ADR 0013).
+	doc, credentials, err := egressPolicy(ctx, cl, namespace, *m)
+	if err != nil {
+		return err
+	}
+	policyManifest, err := fldeploy.RenderPolicyConfigMap(fldeploy.DefaultNamespace, doc)
+	if err != nil {
+		return err
+	}
+	// Before the workloads, so FatLine has the chance to learn an application
+	// before that application starts asking. It polls, so the window is not
+	// zero — but an application that starts first is denied for a few seconds,
+	// where one whose policy never arrives is denied forever.
+	if err := cl.Apply(ctx, policyManifest); err != nil {
+		return fmt.Errorf("write the egress policy: %w", err)
+	}
+
+	// 5. Translate and apply.
+	workloads, err := c.translate(env, meta, namespace, *m, images, credentials)
 	if err != nil {
 		return err
 	}
@@ -194,7 +214,7 @@ func (c *runCommand) Run(ctx context.Context, env *Env, args []string) error {
 		return fmt.Errorf("deploy %q: %w", namespace, err)
 	}
 
-	// 5. Meter it. An application the kernel does not count is an application
+	// 6. Meter it. An application the kernel does not count is an application
 	// the cost limit does not protect against — and the limit is the pillar,
 	// not the feature.
 	metered, meterErr := c.meter(ctx, env, cl, meta, name, namespace)
@@ -217,6 +237,7 @@ func (c *runCommand) Run(ctx context.Context, env *Env, args []string) error {
 		Deployment: m.Name, Commit: read.Report.Commit,
 		ManifestDigest: read.Report.ManifestDigest,
 		Apps:           appResults(*m, images),
+		Egress:         summarise(doc, namespace),
 		Metered:        metered, MeterError: errString(meterErr),
 		NotReady: slow,
 	})
@@ -281,12 +302,13 @@ func (c *runCommand) buildAll(ctx context.Context, env *Env, cl jobWaiter, meta 
 
 // translate renders the workloads, wiring storage when the instance has a key
 // holder to wire it to.
-func (c *runCommand) translate(env *Env, meta *config.InstanceMetadata, namespace string, m parser.Manifest, images map[string]string) ([]byte, error) {
+func (c *runCommand) translate(env *Env, meta *config.InstanceMetadata, namespace string, m parser.Manifest, images, credentials map[string]string) ([]byte, error) {
 	cfg := translate.Config{
-		Manifest:  m,
-		Namespace: namespace,
-		Images:    images,
-		Instance:  meta.Name,
+		Manifest:    m,
+		Namespace:   namespace,
+		Images:      images,
+		Instance:    meta.Name,
+		Credentials: credentials,
 	}
 	if meta.Keyholder != nil && meta.Keyholder.Deployed && meta.Keyholder.Scope != "" {
 		mtls, err := env.ConfigDir.LoadInstanceMTLS(meta.Name)
@@ -415,16 +437,17 @@ type runApp struct {
 }
 
 type runResult struct {
-	Instance       string   `json:"instance"`
-	Repo           string   `json:"repo"`
-	Deployment     string   `json:"deployment"`
-	Namespace      string   `json:"namespace"`
-	Commit         string   `json:"commit"`
-	ManifestDigest string   `json:"manifest_digest"`
-	Apps           []runApp `json:"apps"`
-	Metered        bool     `json:"metered"`
-	MeterError     string   `json:"meter_error,omitempty"`
-	NotReady       []string `json:"not_ready,omitempty"`
+	Instance       string        `json:"instance"`
+	Repo           string        `json:"repo"`
+	Deployment     string        `json:"deployment"`
+	Namespace      string        `json:"namespace"`
+	Commit         string        `json:"commit"`
+	ManifestDigest string        `json:"manifest_digest"`
+	Apps           []runApp      `json:"apps"`
+	Egress         egressSummary `json:"egress"`
+	Metered        bool          `json:"metered"`
+	MeterError     string        `json:"meter_error,omitempty"`
+	NotReady       []string      `json:"not_ready,omitempty"`
 }
 
 func (r runResult) Human(w io.Writer) error {
@@ -433,6 +456,17 @@ func (r runResult) Human(w io.Writer) error {
 	fmt.Fprintf(w, "  reading %s\n", r.ManifestDigest)
 	for _, a := range r.Apps {
 		fmt.Fprintf(w, "  %-16s %s\n", a.Name, a.Image)
+	}
+	// What each application may now reach, and the fact that it is per
+	// application rather than per instance — which is the promise the review
+	// gate makes and, until ADR 0013, the one the enforcement point could not
+	// keep.
+	fmt.Fprintf(w, "\nEgress: %s across %s, enforced per application.\n",
+		plural(r.Egress.Hosts, "declared host", "declared hosts"),
+		plural(r.Egress.Applications, "application", "applications"))
+	if r.Egress.Others > 0 {
+		fmt.Fprintf(w, "%s from other deployments on this instance kept their own.\n",
+			plural(r.Egress.Others, "application", "applications"))
 	}
 	if len(r.NotReady) > 0 {
 		fmt.Fprintf(w, "\nNot ready yet: %s\n", strings.Join(r.NotReady, ", "))

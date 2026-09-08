@@ -5,6 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	fldeploy "github.com/sofmon/farcast/fatline/deploy"
+	"github.com/sofmon/farcast/fatline/policy"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -47,11 +50,12 @@ type fakeRunCluster struct {
 	manifest string
 	report   string
 
-	applied  []string
-	waited   []string
-	rollouts []string
-	tails    []int
-	jobs     map[string]bool
+	applied    []string
+	waited     []string
+	rollouts   []string
+	tails      []int
+	jobs       map[string]bool
+	configMaps map[string]string
 
 	buildFails bool
 	fetchFails bool
@@ -116,6 +120,13 @@ func (f *fakeRunCluster) JobLogs(_ context.Context, _, job string, lines int) (s
 		split = split[len(split)-lines:]
 	}
 	return strings.Join(split, ""), nil
+}
+
+// ConfigMapValue answers the egress-policy read. An empty map is an instance
+// that has never deployed an application.
+func (f *fakeRunCluster) ConfigMapValue(_ context.Context, ns, name, key string) (string, bool, error) {
+	v, ok := f.configMaps[ns+"/"+name+"/"+key]
+	return v, ok, nil
 }
 
 func (f *fakeRunCluster) RolloutStatus(_ context.Context, ns, name string, _ time.Duration) error {
@@ -690,5 +701,198 @@ func TestAnUnusableNamespaceIsRefusedBeforeAnythingIsSpent(t *testing.T) {
 				t.Errorf("%q reached the cluster before being refused", ns)
 			}
 		})
+	}
+}
+
+// policyIn returns the egress policy a run applied.
+func policyIn(t *testing.T, f *fakeRunCluster) *policy.Document {
+	t.Helper()
+	stream := appliedWith(t, f, "ConfigMap\nmetadata:\n  name: "+fldeploy.PolicyConfigMap)
+	var doc struct {
+		Data map[string]string `yaml:"data"`
+	}
+	if err := yaml.Unmarshal([]byte(stream), &doc); err != nil {
+		t.Fatalf("the applied policy is not valid YAML: %v", err)
+	}
+	parsed, err := policy.Parse([]byte(doc.Data[fldeploy.PolicyKey]))
+	if err != nil {
+		t.Fatalf("the applied policy does not parse: %v", err)
+	}
+	return parsed
+}
+
+// One FatLine serves every application on an instance, so a run that wrote only
+// its own deployment would silently revoke every other one's egress. The same
+// shape as the metering a redeploy erased on the 4.2 walk, reached from a
+// different direction.
+func TestRunKeepsOtherDeploymentsEgressPolicy(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	runnableInstance(t, dir, "p44")
+	env, _ := testEnv(dir, output.ModeHuman)
+
+	// An instance that already runs somebody else's deployment.
+	existing := &policy.Document{Version: policy.Version, Apps: []policy.App{{
+		Name: "worker", Namespace: "other-deployment",
+		CredentialSHA256: policy.HashCredential("their-credential"),
+		External:         []parser.External{{Host: "queue.example", Reason: "jobs"}},
+	}}}
+	body, err := existing.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newFakeRun(twoAppManifest)
+	f.configMaps = map[string]string{
+		fldeploy.DefaultNamespace + "/" + fldeploy.PolicyConfigMap + "/" + fldeploy.PolicyKey: string(body),
+	}
+
+	if err := runCmd(f).Run(context.Background(), env, []string{"p44", "github.com/example/my-platform"}); err != nil {
+		t.Fatal(err)
+	}
+
+	doc := policyIn(t, f)
+	if _, ok := doc.Identify("their-credential"); !ok {
+		t.Fatal("the other deployment's application lost its egress policy")
+	}
+	var mine int
+	for _, app := range doc.Apps {
+		if app.Namespace == "manifest-elsewhere" || app.Namespace == "my-platform" {
+			mine++
+		}
+	}
+	if mine != 2 {
+		t.Errorf("this deployment contributed %d applications, want 2: %+v", mine, doc.Apps)
+	}
+}
+
+// Each application gets its own credential and its own declarations, and the
+// document carries neither in a form that reveals a credential.
+func TestRunWritesAPerApplicationPolicy(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	runnableInstance(t, dir, "p44")
+	env, _ := testEnv(dir, output.ModeHuman)
+
+	f := newFakeRun(twoAppManifest)
+	if err := runCmd(f).Run(context.Background(), env, []string{"p44", "github.com/example/my-platform"}); err != nil {
+		t.Fatal(err)
+	}
+	doc := policyIn(t, f)
+
+	byName := map[string]policy.App{}
+	for _, app := range doc.Apps {
+		byName[app.Name] = app
+	}
+	if len(byName["api"].External) != 2 {
+		t.Errorf("api declared %v, want its two hosts", byName["api"].External)
+	}
+	if len(byName["web"].External) != 0 {
+		t.Errorf("web inherited %v; it declares nothing", byName["web"].External)
+	}
+	if byName["api"].CredentialSHA256 == byName["web"].CredentialSHA256 {
+		t.Fatal("both applications share a credential; they would be indistinguishable")
+	}
+
+	// The credential each app actually received must be the one the policy
+	// recognises — the join between the Secret and the document.
+	workloads := appliedWith(t, f, "kind: Deployment")
+	for _, app := range []string{"api", "web"} {
+		credential := credentialFromSecret(t, f, app)
+		got, ok := doc.Identify(credential)
+		if !ok {
+			t.Fatalf("%s's credential is not in the policy FatLine will enforce", app)
+		}
+		if got.Name != app {
+			t.Errorf("%s's credential identifies %q", app, got.Name)
+		}
+	}
+	_ = workloads
+}
+
+// credentialFromSecret lifts an app's egress credential out of the Secret the
+// translator rendered, the way the container will receive it.
+func credentialFromSecret(t *testing.T, f *fakeRunCluster, app string) string {
+	t.Helper()
+	stream := appliedWith(t, f, "kind: Secret\nmetadata:\n  name: "+app+"-egress")
+	for _, d := range strings.Split(stream, "\n---\n") {
+		var m struct {
+			Kind     string `yaml:"kind"`
+			Metadata struct {
+				Name string `yaml:"name"`
+			} `yaml:"metadata"`
+			StringData map[string]string `yaml:"stringData"`
+		}
+		if yaml.Unmarshal([]byte(d), &m) != nil || m.Metadata.Name != app+"-egress" {
+			continue
+		}
+		raw := m.StringData["FARCAST_FATLINE_PROXY"]
+		u, err := url.Parse(raw)
+		if err != nil {
+			t.Fatalf("%s's proxy address does not parse: %q", app, raw)
+		}
+		credential, _ := u.User.Password()
+		if credential == "" {
+			t.Fatalf("%s's proxy address carries no credential: %q", app, raw)
+		}
+		return credential
+	}
+	t.Fatalf("no egress Secret for %s", app)
+	return ""
+}
+
+// An unreadable existing policy must stop the deploy, not be replaced: writing
+// a fresh document would revoke every application already running.
+func TestRunRefusesToReplaceAnUnreadablePolicy(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	runnableInstance(t, dir, "p44")
+	env, _ := testEnv(dir, output.ModeHuman)
+
+	f := newFakeRun(twoAppManifest)
+	f.configMaps = map[string]string{
+		fldeploy.DefaultNamespace + "/" + fldeploy.PolicyConfigMap + "/" + fldeploy.PolicyKey: "{ not json",
+	}
+	err := runCmd(f).Run(context.Background(), env, []string{"p44", "github.com/example/my-platform"})
+	if err == nil {
+		t.Fatal("run replaced a policy it could not read")
+	}
+	if !strings.Contains(err.Error(), "revoke every application") {
+		t.Errorf("the refusal does not say what was at stake: %v", err)
+	}
+}
+
+// An application removed from a manifest must stop being allowed anything.
+// Merging naively would leave its old entry in force forever — an application
+// nobody deploys any more, still permitted its old hosts, and still identified
+// by a credential nothing rotates.
+func TestRedeployingWithoutAnAppRevokesIt(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	runnableInstance(t, dir, "p44")
+	env, _ := testEnv(dir, output.ModeHuman)
+
+	// The instance already runs THIS deployment with a third app.
+	existing := &policy.Document{Version: policy.Version, Apps: []policy.App{{
+		Name: "retired", Namespace: "my-platform",
+		CredentialSHA256: policy.HashCredential("retired-credential"),
+		External:         []parser.External{{Host: "old.example", Reason: "gone"}},
+	}}}
+	body, err := existing.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newFakeRun(twoAppManifest) // declares api and web, not retired
+	f.configMaps = map[string]string{
+		fldeploy.DefaultNamespace + "/" + fldeploy.PolicyConfigMap + "/" + fldeploy.PolicyKey: string(body),
+	}
+
+	if err := runCmd(f).Run(context.Background(), env, []string{"p44", "github.com/example/my-platform"}); err != nil {
+		t.Fatal(err)
+	}
+
+	doc := policyIn(t, f)
+	if _, ok := doc.Identify("retired-credential"); ok {
+		t.Fatal("an application dropped from the manifest kept its egress credential")
+	}
+	for _, app := range doc.Apps {
+		if app.Name == "retired" {
+			t.Fatalf("the retired application is still in the policy: %+v", app)
+		}
 	}
 }
