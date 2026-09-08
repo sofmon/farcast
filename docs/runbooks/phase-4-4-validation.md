@@ -84,11 +84,23 @@ different fixes. Separate them before assuming a defect:
 
 1. **The policy has not reached FatLine yet** — read step 6.
 2. **FatLine refused** — step 7's log will say so, with a reason.
-3. **the client never asked** — no log line at all, because it either did not
+3. **The client never asked** — no log line at all, because it either did not
    open a CONNECT tunnel or did not send the credential.
 
-The third is not a FarCast defect, and this probe tells it apart from the other
-two by speaking to FatLine with no client in the way:
+**Read curl's own error first; it usually settles this.** A refusal at the
+boundary surfaces to the client as the proxy's status:
+
+- `curl: (56) CONNECT tunnel failed, response 403` — FatLine identified the
+  application and refused the host. Case 2, and step 7 will name it.
+- `curl: (56) CONNECT tunnel failed, response 407` — FatLine could not identify
+  the caller at all. The credential did not arrive; see step 8.
+- A timeout or a connection error with no status — case 3, or case 1.
+
+Drop `-o /dev/null` and keep `-sS` so those messages are visible; adding
+`-w 'http_code=%{http_code}\n'` prints the status of a request that succeeded.
+
+If that is not conclusive, this probe separates the remaining cases by speaking
+to FatLine with no client in the way:
 
 ```bash
 kubectl -n "$APPS" exec deploy/reacher -- sh -c '
@@ -161,6 +173,28 @@ kubectl -n "$NS" logs -l app.kubernetes.io/name=fatline --prefix --tail=5 | grep
 
 Expected: `REACHED`, **the same pod names**, and a log line reporting the reload. The network boundary did not restart.
 
+Measured on the 2026-09-08 `p44b` walk: **28s** from `kubectl apply` to the
+first `REACHED`. Poll rather than sleeping a fixed interval — the kubelet
+propagates a ConfigMap on its own schedule, and a single check timed too early
+reads as a failed reload.
+
+**Now revoke it, which is the direction that matters.** That adding a host
+starts working traffic says nothing about whether removing one stops it, and
+until 2026-09-08 nothing here had checked:
+
+```bash
+kubectl -n "$NS" get configmap fatline-egress-policy -o json \
+  | jq '.data["policy.json"] |= (fromjson | (.apps[] | select(.name=="hermit")) |= del(.external) | tojson)' \
+  | kubectl apply -f -
+```
+
+Poll the same `hermit` command until it reports `BLOCKED`, and check step 7
+shows `reason=not_in_allowlist` rather than the request simply failing.
+Measured: **41s**. That window — between an operator revoking egress and the
+boundary enforcing it — is inherent to distributing policy through a ConfigMap.
+It is not a defect, and an operator revoking access in an incident should know
+it exists.
+
 ## 7. Shrike names the application
 
 ```bash
@@ -211,22 +245,28 @@ farcast release "$INSTANCE" --delete-data
 
 ## Success criteria
 
-Walked 2026-09-08 against instance `p44` on GKE Autopilot, released the same day.
+Walked twice, both on 2026-09-08 against GKE Autopilot, each instance released
+the same day: first as `p44`, then as `p44b` after the two product defects the
+first walk found were fixed and the fixture was given a client that can speak
+to the boundary. **The table records the second walk**, which is the one where
+every criterion was met by the mechanism the phase actually ships; the first
+walk's results and what it cost are kept below, because what a walk fails is
+the part worth keeping.
 
 | # | Claim | Result |
 |---|-------|--------|
 | 1 | `run` reports per-application egress and writes the policy | ✅ `Egress: 1 declared host across 2 applications, enforced per application.` |
-| 2 | The policy carries hashes and no credential in the clear | ✅ zero occurrences of either credential; `sha256(credential)` recomputed on the operator's machine and matched |
-| 3 | An application reaches a host it declared | ✅ at the boundary — `HTTP/1.1 200 Connection Established`. See finding 4: not via the fixture's own client |
-| 4 | It cannot reach a host it did not declare | ✅ `403`, `reason=not_in_allowlist` |
-| 5 | Another application cannot reach it by its own identity | ✅ `hermit` with its **own** credential: `403 not_in_allowlist` |
-| 6 | A borrowed credential does work, as the ADR says it would | ✅ `hermit` with `reacher`'s credential: `200`, logged as `app=reacher` |
-| 7 | Policy reloads with no FatLine restart | ✅ two reloads per replica, pod names unchanged throughout |
-| 8 | Denials name the application | ❌ → fixed during the walk (finding 1), re-verified live |
+| 2 | The policy carries hashes and no credential in the clear | ✅ zero occurrences of either credential, against a control pattern that did match; **both** `sha256(credential)` recomputed on the operator's machine and matched |
+| 3 | An application reaches a host it declared | ✅ **by the fixture's own client** — `curl 8.14.1 (x86_64-alpine-linux-musl)`, given nothing but `FARCAST_FATLINE_PROXY`, returned `http_code=200`. The first walk could only reach the boundary by hand |
+| 4 | It cannot reach a host it did not declare | ✅ `403`, logged `app=reacher reason=not_in_allowlist` |
+| 5 | Another application cannot reach it by its own identity | ✅ `hermit` with its **own** credential: `403`, logged `app=hermit reason=not_in_allowlist` |
+| 6 | A borrowed credential does work, as the ADR says it would | ✅ `200` from `hermit`'s pod, logged `app=reacher` — the theft is visible as the wrong application acting |
+| 7 | Policy reloads with no FatLine restart | ✅ three reload cycles; both pods kept their names and `restartCount=0`. A grant took **28s** to bite, a revocation **41s** |
+| 8 | Denials name the application | ✅ from a **cold deploy** this time, not a mid-walk redeploy |
 | 9 | An unidentified caller is reported as `unknown_app` | ✅ `407`, `tenant="" app="" reason=unknown_app` |
-| 10 | A second deployment does not revoke the first's egress | ❌ blocked by finding 2 → fixed, then ✅ three applications in the document, `reacher` still reaching |
+| 10 | A second deployment does not revoke the first's egress | ✅ all three applications in the document, `reacher` still reaching, and **two distinct fetch Jobs** where the first walk collided |
 
-## What walking it found
+## What the first walk found
 
 Five of the ten criteria could not have been honestly ticked from this runbook
 as it was first written, and two product defects were invisible to a fully
@@ -276,7 +316,7 @@ issues a cleartext proxied GET which FatLine correctly refuses
 (`port=80 proto=http cleartext_not_allowed`). It cannot make an HTTPS request
 through a CONNECT proxy at all. The walk fell back to a raw CONNECT over `nc`,
 which proves FatLine but **not** the "no application change" claim. The fixture
-now carries curl; that claim remains unproven until the next walk.
+now carries curl, and **the second walk closed this** — see below.
 
 **5. `metadata.yaml` lost concurrent writes.** Running `farcast toolchain`
 while `farcast connect` was still finishing left no toolchain record: every
@@ -309,6 +349,81 @@ grant has made a healthy instance look broken.
 Confirmed in passing: [ADR 0008](../adr/0008-in-cluster-key-delivery.md) decision
 9's fix, live for the first time — the `app` scope was present in the keyring
 with `prefix: app/` before any unseal succeeded.
+
+## What the second walk found
+
+The second walk existed to settle one claim the first could not, and it did.
+It also ran the whole prerequisite chain from nothing, which is where the rest
+of what follows came from.
+
+**1. The "no application change" claim is now proven, and this is the finding.**
+`curl 8.14.1 (x86_64-alpine-linux-musl)`, running inside the built fixture and
+handed nothing but `FARCAST_FATLINE_PROXY`, opened a CONNECT tunnel to a
+cluster Service, turned the URL's userinfo into a `Proxy-Authorization` header
+on its own, and reached `example.com`. Nothing in the application knew about
+FatLine. The three refusals came back as distinguishable HTTP statuses through
+the same client — `403` for an identified application refused a host, `407` for
+one that could not be identified — which is a better first diagnostic than the
+`nc` probe step 3 still documents, and cost nothing to obtain.
+
+**2. Every event names the application, from a cold deploy.** The first walk
+verified finding 1's fix by redeploying FatLine mid-walk, which leaves open
+whether a fresh instance behaves the same. It does. The evidence also arrived
+split across both replicas — steps 3 and 8 landed on one pod, steps 4 and 5 on
+the other — so this runbook's insistence on reading every replica is not
+belt-and-braces, it is the difference between seeing half the record and all of
+it.
+
+**3. A refused `farcast toolchain` still mirrors the builder.** Known from the
+first walk as a smaller thing; this walk has the before-and-after. Passing a
+digest-pinned `--builder` with a tagged `--fetcher` exits **2** with a usage
+error, and `system/kaniko` is in the instance's registry afterwards — three
+images before the command, four after. The refusal is real and the side effect
+is real, on the one registry the instance runs code from.
+
+**4. `farcast storage deploy` creates the bucket and the keyring before it asks
+whether to spend anything.** Declining the cost prompt, or running without
+`--yes` where stdin cannot answer, exits non-zero having already created a real
+billable bucket. It is recorded in `metadata.yaml`, so `farcast release` still
+destroys it and nothing is stranded — but a command that reports failure while
+having had a lasting effect is the same shape as finding 3 above, and the
+ordering is worth changing in both.
+
+**5. Policy propagation is fast in both directions, and the revoking direction
+is the one to state.** A grant reached a running FatLine in **28s**, a
+revocation in **41s** — both inside the "about a minute" this runbook already
+promised. The revoking direction had never been walked: until now nothing here
+showed that *removing* a host from the policy stops working traffic, only that
+adding one starts it. It does, and the ~40s window between an operator revoking
+egress and it taking effect is a property of distributing policy through a
+ConfigMap rather than a defect. It should be stated rather than discovered.
+
+**6. FatLine starts closed when no policy has been mounted yet.** Both replicas
+logged `no egress policy at /etc/fatline/policy/policy.json yet; starting
+closed` and then `serving … 0 application(s) with policy` before the ConfigMap
+arrived. That is the correct direction to fail and had never been observed;
+[ADR 0013](../adr/0013-per-application-egress-identity.md) asserts it, and now
+something has watched it happen.
+
+**7. A second deployment preserves the policy document, not the manifests.**
+Deploying a second application left `hermit` holding the `example.com` this
+runbook had patched in by hand, rather than resetting it to what
+`manifest/examples/egress-demo/farcast` declares. That is right for criterion
+10 — a deployment owns its own namespace's entries and must not rewrite
+anybody else's — but it does mean the ConfigMap, not the manifest, is the
+authority for applications a given `run` is not deploying. `run` says as much
+in its output (*"2 applications from other deployments on this instance kept
+their own"*), which is the correct place to say it.
+
+**Confirmed in passing.** The `metadata.yaml` three-way merge (first walk's
+finding 5) held across five commands that each own a different part of the
+record: `connect` wrote the carrier and registry, `storage deploy` the bucket,
+`kernel deploy` the kernel block, and `toolchain` both images — all five
+present in one file at the end. The first walk lost the toolchain record to
+exactly this sequence. [ADR 0011](../adr/0011-build-toolchain-mirroring.md)
+decision 2's two-hop digest was also visible rather than asserted: the upstream
+builder `sha256:9e69fd…` became `sha256:8a4f9a…` in the instance, because an
+index is resolved to linux/amd64 before it is copied.
 
 ## Not covered by this run
 

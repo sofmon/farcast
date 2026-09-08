@@ -202,7 +202,7 @@ apps:
     containerfile: ./Containerfile
 ```
 
-If an application needs to connect to external services, it must declare them explicitly. All outbound connections are denied by default — only declared endpoints are allowed. Declarations are scoped per-application: each app sees only its own allowlist. This ensures the operator knows exactly what each application will access before running it, and gives Shrike a clear contract to enforce at runtime.
+If an application needs to connect to external services, it must declare them explicitly. All outbound connections are denied by default — only declared endpoints are allowed. Declarations are scoped per-application: each app sees only its own allowlist. This ensures the operator knows exactly what each application will access before running it, and gives FatLine a clear contract to enforce at runtime — and Shrike one to watch against.
 
 ```yaml
 # ./farcast — with external access
