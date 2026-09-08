@@ -1,4 +1,4 @@
-# ADR 0011 — AllThing: Private Inference First, External Providers by Declared Policy
+# ADR 0012 — AllThing: Private Inference First, External Providers by Declared Policy
 
 **Status:** Proposed (2026-09-04). Nothing below is implemented. Every cloud figure is a model of a published rate card, dated and sourced, and none has been reconciled against an invoice — the standing the existing rate card has ([ADR 0009](0009-technocore-kernel-and-cost-metering.md) decision 10). Items marked *[to confirm live]* carry the procedure that confirms them; the first runbook of Phase 6 walks them.
 
