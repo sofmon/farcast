@@ -11,6 +11,7 @@ package allowlist
 
 import (
 	"net"
+	"sort"
 	"strings"
 	"sync/atomic"
 
@@ -73,10 +74,52 @@ func build(byTenant map[string][]parser.External) *snapshot {
 }
 
 // Reload atomically replaces the default tenant's allowlist. Concurrent readers
-// see either the old or the new list, never a mix. (Per-tenant reloads for the
-// phase-4.4 multi-app model would extend this; 2.1 has only the default tenant.)
+// see either the old or the new list, never a mix.
 func (l *List) Reload(decls []parser.External) {
 	l.snap.Store(build(map[string][]parser.External{defaultTenant: decls}))
+}
+
+// NewPerApp builds an allowlist with one entry per tenant and NO default
+// tenant, which is what phase 4.4 runs.
+//
+// The absence of a default is the point. With per-application policy there is
+// no such thing as "the instance's allowlist" to fall back on, so a caller
+// FatLine could not identify has nothing to be checked against and is denied —
+// rather than quietly inheriting whatever the last shared list happened to
+// hold (ADR 0013 decision 6).
+func NewPerApp(byTenant map[string][]parser.External) *List {
+	l := &List{}
+	l.snap.Store(build(byTenant))
+	return l
+}
+
+// ReloadPerApp atomically replaces every tenant's allowlist. A tenant absent
+// from the new map stops being allowed anything the instant the swap happens,
+// which is what makes removing an application from the manifest take effect.
+func (l *List) ReloadPerApp(byTenant map[string][]parser.External) {
+	l.snap.Store(build(byTenant))
+}
+
+// Tenants lists the tenants this allowlist knows, sorted, for status reporting.
+func (l *List) Tenants() []string {
+	snap := l.snap.Load()
+	out := make([]string, 0, len(snap.tenants))
+	for tenant := range snap.tenants {
+		out = append(out, tenant)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// HostsFor returns one tenant's declared hosts, normalized and sorted.
+func (l *List) HostsFor(tenant string) []string {
+	hosts := l.snap.Load().tenants[tenant]
+	out := make([]string, 0, len(hosts))
+	for h := range hosts {
+		out = append(out, h)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Allowed checks a host against the default tenant's allowlist.

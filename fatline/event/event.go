@@ -38,6 +38,15 @@ const (
 	// ReasonSNIMismatch: the TLS ClientHello server_name did not match the
 	// allowlisted CONNECT authority.
 	ReasonSNIMismatch = "sni_mismatch"
+
+	// ReasonUnknownApp: the caller presented no usable credential, so FatLine
+	// cannot tell which application's declarations to enforce.
+	//
+	// It is deliberately distinct from ReasonNotInAllowlist. "This app may not
+	// reach that host" and "I do not know who is asking" have different causes
+	// and different fixes, and collapsing them would make a missing credential
+	// look like a manifest that forgot a host (ADR 0013 decision 6).
+	ReasonUnknownApp = "unknown_app"
 )
 
 // Event is one structured egress decision. FatLine emits exactly one decision

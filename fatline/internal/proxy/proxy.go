@@ -15,6 +15,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"io"
 	"net"
@@ -30,12 +31,34 @@ import (
 // DialFunc dials an upstream address. It is injectable for tests.
 type DialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
 
+// Caller is the application a request was identified as.
+type Caller struct {
+	// Tenant is the key its allowlist is held under.
+	Tenant string
+	// Namespace and App are for attribution: every decision names them, so an
+	// alert can say which application attempted what (ADR 0013 decision 7).
+	Namespace string
+	App       string
+}
+
+// IdentifyFunc resolves a presented credential to an application.
+//
+// A function rather than the policy type, so this package stays free of the
+// document format and a test can identify callers without building one.
+type IdentifyFunc func(credential string) (Caller, bool)
+
 // Options configures a Proxy.
 type Options struct {
 	Allowlist   *allowlist.List
 	Events      event.Sink
 	EnforceSNI  bool
 	DialContext DialFunc
+
+	// Identify resolves the caller. A nil Identify denies every request:
+	// per-application policy with no way to tell applications apart is not a
+	// weaker policy, it is no policy, and failing closed is the only safe
+	// reading of a misconfiguration here.
+	Identify IdentifyFunc
 }
 
 // Proxy is the egress forward proxy.
@@ -44,12 +67,16 @@ type Proxy struct {
 	events     event.Sink
 	enforceSNI bool
 	dial       DialFunc
+	identify   IdentifyFunc
 }
 
 // New builds a Proxy. A nil Events logs via slog; a nil DialContext uses a
 // default net.Dialer.
 func New(o Options) *Proxy {
-	p := &Proxy{allow: o.Allowlist, events: o.Events, enforceSNI: o.EnforceSNI, dial: o.DialContext}
+	p := &Proxy{allow: o.Allowlist, events: o.Events, enforceSNI: o.EnforceSNI, dial: o.DialContext, identify: o.Identify}
+	if p.identify == nil {
+		p.identify = func(string) (Caller, bool) { return Caller{}, false }
+	}
 	if p.events == nil {
 		p.events = event.SlogSink{}
 	}
@@ -74,7 +101,13 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // FatLine refuses to proxy traffic it (and the cloud) would see in the clear.
 func (p *Proxy) handlePlain(w http.ResponseWriter, r *http.Request) {
 	host, port := authority(plainHost(r), "80")
-	p.events.Emit(event.Event{Kind: event.Deny, Host: host, Port: port, Proto: "http", Reason: event.ReasonCleartext})
+	// Identified anyway, so the refusal names who tried. A denial nobody can
+	// attribute is telemetry rather than enforcement.
+	caller, _ := p.identify(credentialFrom(r))
+	p.events.Emit(event.Event{
+		Kind: event.Deny, Tenant: caller.Namespace, App: caller.App,
+		Host: host, Port: port, Proto: "http", Reason: event.ReasonCleartext,
+	})
 	http.Error(w, "fatline: cleartext http egress is denied by default", http.StatusForbidden)
 }
 
@@ -82,13 +115,31 @@ func (p *Proxy) handlePlain(w http.ResponseWriter, r *http.Request) {
 func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	host, port := authority(r.Host, "443")
 
-	d := p.allow.Allowed(host)
+	// Who is asking, before what they asked for. With per-application policy
+	// there is no instance-wide allowlist to check against, so a caller FatLine
+	// cannot identify has nothing to be checked against and is refused
+	// (ADR 0013 decision 6).
+	caller, known := p.identify(credentialFrom(r))
+	if !known {
+		p.events.Emit(event.Event{Kind: event.Deny, Host: host, Port: port, Proto: "connect", Reason: event.ReasonUnknownApp})
+		w.Header().Set("Proxy-Authenticate", `Basic realm="farcast"`)
+		http.Error(w, "fatline: unidentified application", http.StatusProxyAuthRequired)
+		return
+	}
+
+	d := p.allow.Allow(caller.Tenant, host)
 	if !d.Allowed {
-		p.events.Emit(event.Event{Kind: event.Deny, Host: host, Port: port, Proto: "connect", Reason: d.Reason})
+		p.events.Emit(event.Event{
+			Kind: event.Deny, Tenant: caller.Namespace, App: caller.App,
+			Host: host, Port: port, Proto: "connect", Reason: d.Reason,
+		})
 		http.Error(w, "fatline: host not in allowlist", http.StatusForbidden)
 		return
 	}
-	p.events.Emit(event.Event{Kind: event.Allow, Host: host, Port: port, Proto: "connect", Reason: d.Reason})
+	p.events.Emit(event.Event{
+		Kind: event.Allow, Tenant: caller.Namespace, App: caller.App,
+		Host: host, Port: port, Proto: "connect", Reason: d.Reason,
+	})
 
 	hj, ok := w.(http.Hijacker)
 	if !ok {
@@ -181,4 +232,32 @@ func plainHost(r *http.Request) string {
 		return r.URL.Host
 	}
 	return r.Host
+}
+
+// credentialFrom lifts an application's egress credential out of a request.
+//
+// It reads Proxy-Authorization, which is where every standard HTTP client puts
+// the userinfo from a proxy URL — that is what lets ADR 0013 decision 2 claim
+// an application needs no change. Only the password is returned: the username
+// is the caller's own claim about who they are, and trusting it would make the
+// credential decorative.
+//
+// The credential is never logged, never emitted on an event, and never reaches
+// the upstream — a CONNECT is hijacked rather than forwarded, so the header
+// dies with the request that carried it.
+func credentialFrom(r *http.Request) string {
+	header := r.Header.Get("Proxy-Authorization")
+	scheme, encoded, ok := strings.Cut(header, " ")
+	if !ok || !strings.EqualFold(scheme, "basic") {
+		return ""
+	}
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(encoded))
+	if err != nil {
+		return ""
+	}
+	_, credential, ok := strings.Cut(string(raw), ":")
+	if !ok {
+		return ""
+	}
+	return credential
 }

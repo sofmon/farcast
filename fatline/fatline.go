@@ -24,6 +24,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sofmon/farcast/fatline/event"
@@ -31,6 +32,7 @@ import (
 	fcrypto "github.com/sofmon/farcast/fatline/internal/crypto"
 	"github.com/sofmon/farcast/fatline/internal/proxy"
 	"github.com/sofmon/farcast/fatline/internal/router"
+	"github.com/sofmon/farcast/fatline/policy"
 	"github.com/sofmon/farcast/manifest/parser"
 )
 
@@ -53,8 +55,22 @@ type Config struct {
 	// accepts any client presenting a CA-signed certificate.
 	AllowClientIdentity func(uri string) bool
 
-	// Allowlist is the egress policy: declared external hosts, deny-by-default.
+	// Allowlist is the egress policy for an instance with no per-application
+	// policy: declared external hosts, deny-by-default, one shared list.
+	//
+	// Policy supersedes it. When Policy is set every application is enforced
+	// under its own declarations and there is no shared list at all — see
+	// ADR 0013. This field survives for the tunnel-only and test paths that
+	// have no applications to separate.
 	Allowlist []parser.External
+
+	// Policy is the per-application egress policy: who exists, what each may
+	// reach, and the credential that identifies each one.
+	//
+	// Nil means no application can be identified, and therefore none may reach
+	// anything — which is the correct reading of "policy was not delivered",
+	// and is what a FatLine deployed before its first `farcast run` enforces.
+	Policy *policy.Document
 	// StreamRoutes are the in-instance services the operator may reach
 	// through the tunnel, as a closed list fixed at deploy time. Empty means
 	// the relay refuses everything, which is the correct default: an
@@ -77,6 +93,7 @@ type Server struct {
 	egress   Egress
 	sessions *router.Table
 	events   *event.BufferedSink
+	policy   atomic.Pointer[policy.Document]
 
 	mu    sync.Mutex
 	since time.Time
@@ -93,6 +110,9 @@ func New(cfg Config) (*Server, error) {
 		return nil, err
 	}
 	al := allowlist.New(cfg.Allowlist)
+	if cfg.Policy != nil {
+		al = allowlist.NewPerApp(cfg.Policy.ByTenant())
+	}
 
 	sink := cfg.Events
 	if sink == nil {
@@ -106,10 +126,12 @@ func New(cfg Config) (*Server, error) {
 		sessions: router.NewTable(),
 		events:   buffered,
 	}
+	s.policy.Store(cfg.Policy)
 	s.egress = proxy.New(proxy.Options{
 		Allowlist:  al,
 		Events:     buffered,
 		EnforceSNI: true, // default-on; degrades only to authority-only, never off
+		Identify:   s.identify,
 	})
 	return s, nil
 }
@@ -204,6 +226,43 @@ func (s *Server) Status() ConnStatus {
 func (s *Server) ReloadAllowlist(decls []parser.External) {
 	s.allow.Reload(decls)
 }
+
+// ReloadPolicy atomically replaces the per-application egress policy.
+//
+// Both halves swap together — the credentials that identify applications and
+// the declarations enforced for them. Swapping them separately would leave a
+// window in which an application is identified and its policy is not yet
+// there, and the honest behaviour in that window is a denial the operator
+// never asked for.
+func (s *Server) ReloadPolicy(doc *policy.Document) {
+	s.policy.Store(doc)
+	if doc == nil {
+		s.allow.ReloadPerApp(nil)
+		return
+	}
+	s.allow.ReloadPerApp(doc.ByTenant())
+}
+
+// identify resolves a presented credential to the application it belongs to.
+//
+// A nil policy identifies nobody, so every request is denied. That is the state
+// of a FatLine deployed before its first `farcast run`, and denying is the only
+// safe reading of it: an instance whose policy has not arrived cannot know what
+// anyone is allowed to do.
+func (s *Server) identify(credential string) (proxy.Caller, bool) {
+	doc := s.policy.Load()
+	if doc == nil {
+		return proxy.Caller{}, false
+	}
+	app, ok := doc.Identify(credential)
+	if !ok {
+		return proxy.Caller{}, false
+	}
+	return proxy.Caller{Tenant: app.Tenant(), Namespace: app.Namespace, App: app.Name}, true
+}
+
+// Applications lists the tenants this FatLine holds policy for, for status.
+func (s *Server) Applications() []string { return s.allow.Tenants() }
 
 // DroppedEvents reports how many egress events were dropped because the event
 // sink could not keep up (the block/allow decision always happened regardless).

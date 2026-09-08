@@ -18,6 +18,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/sofmon/farcast/fatline/policy"
+	"strings"
 	"text/template"
 )
 
@@ -41,6 +43,14 @@ const (
 	DefaultEgressPort = 3128
 	secretName        = "fatline-mtls"
 	tlsMountPath      = "/etc/fatline/tls"
+
+	// PolicyConfigMap is where the per-application egress policy lives, and
+	// PolicyKey the entry inside it. Exported because `farcast run` writes the
+	// same ConfigMap this deployment mounts: two spellings of one name is the
+	// join that mounts an empty volume forever (ADR 0013 decision 5).
+	PolicyConfigMap = "fatline-egress-policy"
+	PolicyKey       = "policy.json"
+	policyMountPath = "/etc/fatline/policy"
 
 	// EgressService is the in-cluster name applications send outbound traffic
 	// to. It is a SEPARATE ClusterIP Service from the tunnel's, and that
@@ -150,6 +160,9 @@ func Render(c Config) ([]byte, error) {
 		SecretName:      secretName,
 		EgressService:   EgressService,
 		MountPath:       tlsMountPath,
+		PolicyMountPath: policyMountPath,
+		PolicyConfigMap: PolicyConfigMap,
+		PolicyKey:       PolicyKey,
 		CACert:          base64.StdEncoding.EncodeToString(c.CACertPEM),
 		ServerCert:      base64.StdEncoding.EncodeToString(c.ServerCertPEM),
 		ServerKey:       base64.StdEncoding.EncodeToString(c.ServerKeyPEM),
@@ -182,21 +195,24 @@ func mtlsHash(parts ...[]byte) string {
 }
 
 type templateData struct {
-	StreamRoutes  []string
-	Namespace     string
-	Name          string
-	Image         string
-	Carrier       string
-	TunnelPort    int
-	EgressPort    int
-	Replicas      int
-	SecretName    string
-	EgressService string
-	MountPath     string
-	MTLSHash      string
-	CACert        string
-	ServerCert    string
-	ServerKey     string
+	StreamRoutes    []string
+	Namespace       string
+	Name            string
+	Image           string
+	Carrier         string
+	TunnelPort      int
+	EgressPort      int
+	Replicas        int
+	SecretName      string
+	EgressService   string
+	MountPath       string
+	PolicyMountPath string
+	PolicyConfigMap string
+	PolicyKey       string
+	MTLSHash        string
+	CACert          string
+	ServerCert      string
+	ServerKey       string
 
 	// Rendered from the exported constants rather than written into the
 	// template, so the cost estimate and the manifest quote one number.
@@ -305,6 +321,11 @@ spec:
             - --cert={{.MountPath}}/server.crt
             - --key={{.MountPath}}/server.key
             - --ca={{.MountPath}}/ca.crt
+            # The per-application egress policy (ADR 0013). The file may not
+            # exist yet — a freshly connected instance has no applications —
+            # and until it does, no application can be identified and none may
+            # reach anything.
+            - --policy={{.PolicyMountPath}}/{{.PolicyKey}}
 {{- range .StreamRoutes}}
             - --stream-route={{.}}
 {{- end}}
@@ -326,8 +347,17 @@ spec:
           volumeMounts:
             - name: mtls
               mountPath: {{.MountPath}}
+            - name: policy
+              mountPath: {{.PolicyMountPath}}
               readOnly: true
       volumes:
+        # optional, because farcast connect deploys FatLine before any
+        # application exists to have a policy. A missing policy is a closed
+        # instance, not a broken one.
+        - name: policy
+          configMap:
+            name: {{.PolicyConfigMap}}
+            optional: true
         - name: mtls
           secret:
             secretName: {{.SecretName}}
@@ -396,4 +426,62 @@ spec:
     - name: tunnel
       port: {{.TunnelPort}}
       targetPort: tunnel
+`))
+
+// RenderPolicyConfigMap renders the ConfigMap FatLine mounts its
+// per-application egress policy from.
+//
+// It lives here, beside the Deployment that mounts it, so the name and the key
+// are written once. `farcast run` writes this ConfigMap and this package's
+// Deployment reads it: two spellings of one name would mount an empty volume
+// forever, and the mount is optional precisely so that failure would be silent.
+func RenderPolicyConfigMap(namespace string, doc *policy.Document) ([]byte, error) {
+	if namespace == "" {
+		namespace = DefaultNamespace
+	}
+	body, err := doc.Marshal()
+	if err != nil {
+		return nil, err
+	}
+	var buf bytes.Buffer
+	if err := policyTemplate.Execute(&buf, map[string]any{
+		"Namespace": namespace,
+		"Name":      PolicyConfigMap,
+		"Key":       PolicyKey,
+		"Policy":    indentBlock(string(body), 4),
+	}); err != nil {
+		return nil, fmt.Errorf("deploy: render the egress policy: %w", err)
+	}
+	return buf.Bytes(), nil
+}
+
+// indentBlock shifts a block scalar's body to its position in the document.
+func indentBlock(s string, n int) string {
+	pad := strings.Repeat(" ", n)
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	for i, l := range lines {
+		if l != "" {
+			lines[i] = pad + l
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+var policyTemplate = template.Must(template.New("policy").Parse(`apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{.Name}}
+  namespace: {{.Namespace}}
+  labels:
+    app.kubernetes.io/name: fatline
+    app.kubernetes.io/managed-by: farcast
+# The per-application egress policy (ADR 0013): which applications exist, what
+# each may reach, and a HASH of the credential that identifies each one.
+#
+# It is a ConfigMap and not a Secret because it holds no secret material. The
+# credentials themselves live only in each application's own Secret; this side
+# carries SHA-256 of them, which is all FatLine needs to recognise a caller.
+data:
+  {{.Key}}: |
+{{.Policy}}
 `))

@@ -375,3 +375,59 @@ func TestTheEgressProxyHasItsOwnClusterIPServiceAndIsNeverPublished(t *testing.T
 			got)
 	}
 }
+
+// FatLine mounts the per-application egress policy `farcast run` writes, and
+// the mount is optional because connect deploys FatLine before any application
+// exists to have one — a missing policy is a closed instance, not a broken one
+// (ADR 0013 decision 5).
+func TestTheEgressPolicyIsMountedAndOptional(t *testing.T) {
+	out, err := Render(sampleConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	docs := docsByKind(t, out)
+
+	if !strings.Contains(string(out), "--policy="+policyMountPath+"/"+PolicyKey) {
+		t.Error("FatLine is not told where its egress policy is")
+	}
+
+	spec := docs["Deployment"]["spec"].(map[string]any)["template"].(map[string]any)["spec"].(map[string]any)
+
+	var mounted bool
+	for _, c := range spec["containers"].([]any) {
+		for _, m := range c.(map[string]any)["volumeMounts"].([]any) {
+			mm := m.(map[string]any)
+			if mm["name"] == "policy" {
+				mounted = true
+				if mm["mountPath"] != policyMountPath {
+					t.Errorf("policy mounted at %v, want %v", mm["mountPath"], policyMountPath)
+				}
+				if mm["readOnly"] != true {
+					t.Error("FatLine can write to its own egress policy")
+				}
+			}
+		}
+	}
+	if !mounted {
+		t.Fatal("the policy volume is not mounted")
+	}
+
+	var found bool
+	for _, v := range spec["volumes"].([]any) {
+		vm := v.(map[string]any)
+		if vm["name"] != "policy" {
+			continue
+		}
+		found = true
+		cm := vm["configMap"].(map[string]any)
+		if cm["name"] != PolicyConfigMap {
+			t.Errorf("policy volume reads %v, want %v", cm["name"], PolicyConfigMap)
+		}
+		if cm["optional"] != true {
+			t.Error("the policy volume is not optional; FatLine would not start before the first farcast run")
+		}
+	}
+	if !found {
+		t.Fatal("no policy volume")
+	}
+}

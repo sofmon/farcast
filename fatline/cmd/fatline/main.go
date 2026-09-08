@@ -7,8 +7,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -16,10 +18,11 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/sofmon/farcast/fatline"
 	fcrypto "github.com/sofmon/farcast/fatline/internal/crypto"
-	"github.com/sofmon/farcast/manifest/parser"
+	"github.com/sofmon/farcast/fatline/policy"
 	"github.com/sofmon/farcast/shrike"
 )
 
@@ -30,6 +33,11 @@ func main() {
 	}
 }
 
+// policyPollInterval is how often the mounted policy file is re-read. A
+// ConfigMap update reaches a pod on the kubelet's own schedule of tens of
+// seconds, so polling faster would only spend wakeups.
+const policyPollInterval = 10 * time.Second
+
 func run(args []string) error {
 	fs := flag.NewFlagSet("fatline", flag.ContinueOnError)
 	var (
@@ -38,7 +46,7 @@ func run(args []string) error {
 		certPath     = fs.String("cert", "", "server certificate PEM (required for the tunnel)")
 		keyPath      = fs.String("key", "", "server private key PEM (required for the tunnel)")
 		caPath       = fs.String("ca", "", "client CA certificate PEM (required for the tunnel)")
-		manifestPath = fs.String("manifest", "", "path to a ./farcast manifest whose external hosts seed the egress allowlist")
+		policyPath   = fs.String("policy", "", "path to the per-application egress policy (ADR 0013); absent means no application can be identified, so none may reach anything")
 		endpoint     = fs.String("endpoint", "", "externally advertised endpoint, reported in status")
 		streamRoutes routeFlag
 		shrikeSocket = fs.String("shrike-socket", "", "if set, stream egress events to a Shrike sidecar at this Unix socket (else log via slog)")
@@ -84,12 +92,21 @@ func run(args []string) error {
 		cfg.ClientCA = pool
 	}
 
-	if *manifestPath != "" {
-		m, err := parser.ParseFile(*manifestPath)
-		if err != nil {
-			return fmt.Errorf("parse manifest: %w", err)
+	if *policyPath != "" {
+		doc, err := loadPolicy(*policyPath)
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			// Expected on a freshly connected instance: FatLine is deployed
+			// before any application exists to have a policy. Start closed and
+			// let the watcher pick the file up when `farcast run` writes it —
+			// refusing to start would make the network boundary depend on
+			// there being something to police.
+			fmt.Fprintf(os.Stderr, "fatline: no egress policy at %s yet; starting closed\n", *policyPath)
+		case err != nil:
+			return err
+		default:
+			cfg.Policy = doc
 		}
-		cfg.Allowlist = flattenExternal(m)
 	}
 
 	// Optionally ship egress decisions to a Shrike sidecar; otherwise FatLine's
@@ -109,8 +126,24 @@ func run(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	fmt.Fprintf(os.Stderr, "fatline: serving (tunnel=%q egress=%q, %d allowlisted hosts, shrike=%q)\n",
-		*tunnelListen, *egressListen, len(cfg.Allowlist), *shrikeSocket)
+	// The policy is a mounted ConfigMap: `farcast run` writes it and the
+	// kubelet propagates the change. Watching the file is what makes deploying
+	// an application not require restarting the instance's network boundary
+	// (ADR 0013 decision 5).
+	if *policyPath != "" {
+		go watchPolicy(ctx, *policyPath, policyPollInterval, srv,
+			func(format string, args ...any) { fmt.Fprintf(os.Stderr, format, args...) })
+	}
+
+	apps := 0
+	if cfg.Policy != nil {
+		apps = len(cfg.Policy.Apps)
+	}
+	fmt.Fprintf(os.Stderr, "fatline: serving (tunnel=%q egress=%q, %d application(s) with policy, shrike=%q)\n",
+		*tunnelListen, *egressListen, apps, *shrikeSocket)
+	if *policyPath == "" {
+		fmt.Fprintf(os.Stderr, "fatline: no egress policy: no application can be identified, so none may reach anything\n")
+	}
 	err = srv.Serve(ctx)
 	if ds != nil {
 		_ = ds.Close()
@@ -120,12 +153,57 @@ func run(args []string) error {
 
 // flattenExternal collects every app's declared external hosts into one
 // allowlist. Phase 2.1 is single-tenant; per-app scoping arrives in 4.4.
-func flattenExternal(m *parser.Manifest) []parser.External {
-	var out []parser.External
-	for _, app := range m.Apps {
-		out = append(out, app.External...)
+// loadPolicy reads and validates the per-application egress policy.
+func loadPolicy(path string) (*policy.Document, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read egress policy: %w", err)
 	}
-	return out
+	doc, err := policy.Parse(data)
+	if err != nil {
+		return nil, err
+	}
+	return doc, nil
+}
+
+// watchPolicy re-reads the policy file and reloads on change.
+//
+// Polling rather than an inotify library, for the reason this project gives
+// everywhere: a dependency is a security decision, and the thing being watched
+// is a mounted ConfigMap whose updates the kubelet already applies on its own
+// schedule of tens of seconds. A watch precise to the millisecond would be
+// precision about the wrong end of the pipe.
+//
+// A policy that fails to parse is REFUSED and the previous one stays in force.
+// The alternative — dropping to no policy — would turn a typo in a document
+// into an instance-wide egress outage, and the last known-good policy is the
+// operator's own most recent intent.
+func watchPolicy(ctx context.Context, path string, every time.Duration, srv *fatline.Server, log func(string, ...any)) {
+	last, _ := os.ReadFile(path)
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		data, err := os.ReadFile(path)
+		if err != nil || bytes.Equal(data, last) {
+			continue
+		}
+		doc, err := policy.Parse(data)
+		if err != nil {
+			log("fatline: refusing an unreadable egress policy, keeping the previous one: %v\n", err)
+			// last is deliberately NOT updated: a file that is still broken on
+			// the next tick must be complained about again, or an operator who
+			// looks a minute later sees silence and assumes it took.
+			continue
+		}
+		last = data
+		srv.ReloadPolicy(doc)
+		log("fatline: egress policy reloaded (%d applications)\n", len(doc.Apps))
+	}
 }
 
 // routeFlag collects repeatable --stream-route values.
