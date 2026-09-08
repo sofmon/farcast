@@ -1,0 +1,10 @@
+# An application that can actually attempt an outbound request.
+#
+# Every other example here either assembles or prints a file. Phase 4.4 is
+# about what an application may REACH, and that cannot be validated by a
+# container with no way to try — so this one carries a wget and the CA bundle
+# it needs to complete a TLS handshake, then sleeps so a runbook can exec into
+# it and ask.
+FROM alpine:3.19
+RUN apk add --no-cache ca-certificates
+CMD ["sh", "-c", "echo egress-demo ready && sleep 86400"]

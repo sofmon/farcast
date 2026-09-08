@@ -230,13 +230,15 @@ The core command that makes FarCast useful.
 ### 4.4 Shrike — manifest enforcement for running apps
 Extend Shrike to monitor per-application traffic.
 
-**Status: ⬜ Not started** — and the 4.3 walk made the case concrete rather than theoretical: `farcast run` now shows an operator *per-application* declarations, while FatLine still enforces a single allowlist per instance. The gate promises more than what currently backs it, and closing that gap is this section.
+**Status: ✅ Complete** — per-application egress in [`fatline/policy`](fatline/README.md), designed by [ADR 0013](docs/adr/0013-per-application-egress-identity.md): an application's identity is a **credential it holds**, not a position it occupies, so the separation is enforced by FarCast's own code on any Kubernetes rather than by a NetworkPolicy feature that EKS leaves off by default and AKS fixes at cluster creation. Zero new vendored modules. Live validation pending — see [the 4.4 runbook](docs/runbooks/phase-4-4-validation.md).
 
-- Each app's FatLine allowlist derived from its own entry in the manifest
-- App A cannot use App B's external declarations
-- Violation alerts tied to specific applications
+Building it found something bigger than the section described: **the declarations never reached the enforcement point at all.** `fatline/deploy` passed no manifest, so a deployed FatLine's allowlist was empty and applications could reach nothing outside the cluster — invisible through both earlier walks, because the example application declares no external hosts.
 
-**Phase 4 deliverable** 🟨 **three of four:** the full `install → connect → run → release` lifecycle works and is validated live — a Git repository the operator's machine never clones is read, reviewed, built and run inside the instance, with spending metered against the limit throughout. What remains is 4.4: declarations are reviewed per application and still enforced per instance.
+- Each app's FatLine allowlist derived from its own entry in the manifest — `farcast run` writes an instance-wide policy document, **merged** with every other deployment's, and FatLine reloads it from a mounted ConfigMap without restarting the network boundary
+- App A cannot use App B's external declarations — a caller FatLine cannot identify is refused as `unknown_app` rather than falling back to a shared list, because there is no longer a shared list to fall back to; `flattenExternal` is deleted
+- Violation alerts tied to specific applications — Shrike keys violations by application as well as by reason and host, since two apps denied the same host are two problems with two different remedies
+
+**Phase 4 deliverable** ✅ **achieved, pending its last live walk:** the full `install → connect → run → release` lifecycle works — a Git repository the operator's machine never clones is read, reviewed, built and run inside the instance, with spending metered against the limit and each application confined to the hosts it declared. 4.1 through 4.3 are validated live; 4.4 has [a runbook](docs/runbooks/phase-4-4-validation.md) and has not yet been walked.
 
 ---
 

@@ -1,0 +1,19 @@
+# Two applications with deliberately different declarations, for Phase 4.4.
+#
+# The whole point is the asymmetry: "reacher" may reach exactly one host and
+# "hermit" may reach none. If per-application enforcement were not real, hermit
+# would inherit reacher's declaration and the walk would show it immediately.
+#
+# Paths are repository-relative, as they are in every manifest — see
+# manifest/examples/manifest-elsewhere for why that rule exists.
+name: egress-demo
+apps:
+  - name: reacher
+    containerfile: manifest/examples/egress-demo/Containerfile
+    context: manifest/examples/egress-demo
+    external:
+      - host: example.com
+        reason: proving an application reaches what it declared
+  - name: hermit
+    containerfile: manifest/examples/egress-demo/Containerfile
+    context: manifest/examples/egress-demo

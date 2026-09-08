@@ -332,3 +332,15 @@ These are deliberately accepted-and-documented in 2.1, not oversights:
 - Private control plane (deferred egress/PoP) — [ADR 0004](../docs/adr/0004-private-control-plane.md)
 - FatLine data-plane ingress — [ADR 0005](../docs/adr/0005-fatline-data-plane-ingress.md)
 - Instance-owned image registry (where FatLine's image is built, pushed, and pulled from) — [ADR 0007](../docs/adr/0007-instance-owned-image-registry.md)
+
+## Per-application egress (Phase 4.4)
+
+An instance's egress policy is **one allowlist per application**, not one per instance. [ADR 0013](../docs/adr/0013-per-application-egress-identity.md) settles how FatLine tells applications apart: each holds a **credential**, delivered in its `FARCAST_FATLINE_PROXY` address as userinfo, which every standard HTTP client turns into `Proxy-Authorization` on its own — so an application does exactly what it did before, which is read one variable.
+
+Identity is something an application **holds**, not somewhere it **sits**. The alternative was a port per application with the NetworkPolicy enforcing it, and it was rejected on portability: NetworkPolicy is always on under GKE Autopilot, **off by default on EKS**, and fixed at cluster creation on AKS. Where it is not enforced, a position-based identity fails *silently* — the wrong application is named in every log and alert — while a credential fails closed.
+
+- **[`policy`](policy/)** is the document both sides share: `farcast run` writes it, FatLine reads it from a mounted ConfigMap and reloads on change, so deploying an application does not restart the network boundary. It carries **SHA-256 of each credential and never a credential**, which is what lets it be a ConfigMap.
+- **There is no shared allowlist to fall back on.** A caller FatLine cannot identify is refused as `unknown_app`, deliberately distinct from `not_in_allowlist`: "I do not know who is asking" and "you may not go there" have different fixes.
+- **A FatLine with no policy denies everything.** That is the state of a freshly connected instance, and it is the correct reading of "policy has not arrived".
+
+What the network still does is unchanged and still load-bearing: the per-app NetworkPolicy forces every outbound byte through FatLine. It just no longer *also* separates applications from each other.
