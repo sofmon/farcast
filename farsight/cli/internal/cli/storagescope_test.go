@@ -1,6 +1,12 @@
 package cli
 
-import "testing"
+import (
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/sofmon/farcast/datasphere"
+)
 
 // Which key spaces a listing consults. Getting any of these wrong loses objects
 // from a listing — objects that are still stored, still billed, and still
@@ -54,4 +60,58 @@ func TestSpaceCanHoldWithoutScopes(t *testing.T) {
 			t.Errorf("master skipped for %q on an instance with no scopes", requested)
 		}
 	}
+}
+
+// A listing spans every key space that could hold the prefix, and each is
+// expected to fail on the others' objects — that is what a scope IS. Only an
+// object NO key space could name is worth telling an operator about.
+//
+// The Phase 4.3 walk spent its time hunting corruption that did not exist
+// because this warned about the routine case.
+func TestOnlyObjectsNoKeySpaceCouldNameAreReported(t *testing.T) {
+	foreign := func(stored string) error {
+		return &datasphere.NameError{Stored: stored, Err: datasphere.ErrForeignObject}
+	}
+
+	t.Run("another key space named it", func(t *testing.T) {
+		errs := []error{errors.Join(foreign("aaa/bbb"), foreign("ccc/ddd"))}
+		named := map[string]bool{"aaa/bbb": true, "ccc/ddd": true}
+		if err := unnamedOnly(errs, named); err != nil {
+			t.Errorf("reported %v for objects another key space resolved", err)
+		}
+	})
+
+	t.Run("nobody named it", func(t *testing.T) {
+		errs := []error{foreign("aaa/bbb")}
+		err := unnamedOnly(errs, map[string]bool{"ccc/ddd": true})
+		if err == nil {
+			t.Fatal("an object no key space could name was suppressed")
+		}
+		if !strings.Contains(err.Error(), "aaa/bbb") {
+			t.Errorf("the error does not name the stored object: %v", err)
+		}
+	})
+
+	t.Run("a mixture", func(t *testing.T) {
+		errs := []error{errors.Join(foreign("aaa/bbb"), foreign("eee/fff"))}
+		err := unnamedOnly(errs, map[string]bool{"aaa/bbb": true})
+		if err == nil {
+			t.Fatal("the unnamed object was suppressed along with the named one")
+		}
+		if strings.Contains(err.Error(), "aaa/bbb") {
+			t.Errorf("a resolved object was still reported: %v", err)
+		}
+		if !strings.Contains(err.Error(), "eee/fff") {
+			t.Errorf("the unresolved object was not reported: %v", err)
+		}
+	})
+
+	t.Run("a failure that is not about a name survives", func(t *testing.T) {
+		// A provider error is not a key-space mismatch and must never be
+		// filtered away by one.
+		errs := []error{errors.New("list: the cloud said no")}
+		if err := unnamedOnly(errs, map[string]bool{}); err == nil {
+			t.Fatal("a provider failure was suppressed")
+		}
+	})
 }

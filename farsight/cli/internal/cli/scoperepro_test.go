@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -321,5 +322,61 @@ func TestExplainReportsWhatEachKeySpaceQueried(t *testing.T) {
 	}
 	if !seen["master"] || !seen["app"] {
 		t.Errorf("root listing did not name both key spaces: %v", seen)
+	}
+}
+
+// A healthy instance holding two key spaces must list without warning about
+// either of them.
+//
+// Each key space is asked for the whole bucket and each fails to name the
+// other's objects — by design, because that is what a scope IS. Reporting
+// those failures made `farcast storage ls` warn "stored data failed integrity
+// check" on an instance where nothing was wrong, in a system whose entire
+// premise is that the cloud cannot tamper with an operator's data. The Phase
+// 4.3 walk lost time to exactly that.
+func TestListingTwoKeySpacesWarnsAboutNeither(t *testing.T) {
+	session, _, _ := reproSession(t)
+
+	entries, reports, err := listAcrossScopes(context.Background(), session, "")
+	if err != nil {
+		t.Fatalf("a healthy two-key-space instance reported: %v", err)
+	}
+	if len(reports) < 2 {
+		t.Fatalf("only %d key space(s) were consulted; this fixture has a master and a scope", len(reports))
+	}
+
+	// Both objects are still listed — suppressing the noise must not suppress
+	// the data.
+	var keys []string
+	for _, e := range entries {
+		keys = append(keys, e.Key)
+	}
+	for _, want := range []string{"system/operator.txt", "app/sdk-written"} {
+		if !slices.Contains(keys, want) {
+			t.Errorf("listing lost %q; it has %q", want, keys)
+		}
+	}
+}
+
+// The other half: an object NO key space can name is still reported, because
+// that one really does deserve an operator's attention.
+func TestAnObjectNoKeySpaceCanNameIsStillReported(t *testing.T) {
+	session, provider, _ := reproSession(t)
+	ctx := context.Background()
+
+	// A stored object under a token neither keyring produced, with a header
+	// that is not a blob at all.
+	if err := provider.Put(ctx, session.Bucket, datasphere.Object{
+		Name: "deadbeef/cafebabe", Data: []byte("not a farcast blob"), Meta: map[string]string{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err := listAcrossScopes(ctx, session, "")
+	if err == nil {
+		t.Fatal("an object no key space could name was suppressed")
+	}
+	if !strings.Contains(err.Error(), "deadbeef/cafebabe") {
+		t.Errorf("the warning does not name the object: %v", err)
 	}
 }

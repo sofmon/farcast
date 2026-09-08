@@ -1024,6 +1024,7 @@ func listAcrossScopes(ctx context.Context, session *storage.Session, prefix stri
 	var reports []spaceReport
 	var entries []datasphere.Entry
 	var errs []error
+	named := map[string]bool{}
 	scoped := scopePrefixes(session)
 	for _, space := range spaces {
 		if !spaceCanHold(space.Prefix, prefix, scoped) {
@@ -1032,6 +1033,9 @@ func listAcrossScopes(ctx context.Context, session *storage.Session, prefix stri
 		found, err := space.Store.ListEntries(ctx, prefix)
 		if err != nil {
 			errs = append(errs, err)
+		}
+		for _, e := range found {
+			named[e.Stored] = true
 		}
 		entries = append(entries, found...)
 
@@ -1050,7 +1054,50 @@ func listAcrossScopes(ctx context.Context, session *storage.Session, prefix stri
 		reports = append(reports, report)
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Key < entries[j].Key })
-	return entries, reports, errors.Join(errs...)
+	return entries, reports, unnamedOnly(errs, named)
+}
+
+// unnamedOnly drops the failures that another key space went on to resolve.
+//
+// Every key space is asked for a prefix that spans them, and each is expected
+// to fail on the others' objects — that is what a scope IS. Reporting those
+// failures made a healthy instance warn about objects nothing was wrong with,
+// which is how the Phase 4.3 walk spent its time looking for corruption that
+// did not exist.
+//
+// What survives is the case that genuinely deserves attention: a stored object
+// that NO key space in this keyring could name. That is either a damaged
+// header or an object whose keys the operator does not hold, and both are
+// worth saying out loud.
+func unnamedOnly(errs []error, named map[string]bool) error {
+	var kept []error
+	for _, err := range errs {
+		for _, one := range flattenJoined(err) {
+			var ne *datasphere.NameError
+			if errors.As(one, &ne) && named[ne.Stored] {
+				continue
+			}
+			kept = append(kept, one)
+		}
+	}
+	return errors.Join(kept...)
+}
+
+// flattenJoined unwraps errors.Join's tree into its leaves, so a per-object
+// failure can be judged on its own rather than as part of a blob of text.
+func flattenJoined(err error) []error {
+	if err == nil {
+		return nil
+	}
+	joined, ok := err.(interface{ Unwrap() []error })
+	if !ok {
+		return []error{err}
+	}
+	var out []error
+	for _, e := range joined.Unwrap() {
+		out = append(out, flattenJoined(e)...)
+	}
+	return out
 }
 
 // spaceReport is what --explain shows for one key space.
