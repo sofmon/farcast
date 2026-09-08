@@ -113,6 +113,9 @@ EOF
 
 ./bin/shrike --socket "$SOCK" --manifest "$TMP/sample-manifest.yaml" --status-listen "127.0.0.1:$STATUS_PORT" >"$TMP/shrike.log" 2>&1 &
 SHRIKE_PID=$!
+# SUPERSEDED BY PHASE 4.4: fatline takes --policy (a per-application egress document,
+# ADR 0013), not --manifest, and refuses an unidentified caller with 407. This line does
+# not run as written. See docs/runbooks/phase-2-validation.md and phase-4-4-validation.md.
 ./bin/fatline --egress-listen "127.0.0.1:$EGRESS_PORT" --manifest "$TMP/sample-manifest.yaml" --shrike-socket "$SOCK" >"$TMP/fatline.log" 2>&1 &
 FATLINE_PID=$!
 wait_http "http://127.0.0.1:$STATUS_PORT/_shrike/status" 5 || die "Shrike status endpoint never came up — $TMP/shrike.log"

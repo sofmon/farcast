@@ -76,6 +76,15 @@ This is the visible proof of 2.1 (deny-by-default egress) + 2.2 (Shrike monitors
 and alerts) wired together — no cloud, no mTLS tunnel, just the egress plane and
 the sidecar event wire.
 
+> **⚠️ Part A's FatLine invocation is superseded by Phase 4.4 and does not run as written.**
+> FatLine no longer takes `--manifest`; it takes `--policy`, a per-application egress
+> document ([ADR 0013](../adr/0013-per-application-egress-identity.md)), and a caller it
+> cannot identify by credential is refused with `407` rather than checked against a shared
+> allowlist. Shrike's `--manifest` is unchanged. Rewriting Part A for per-application
+> identity is open work; until then the per-application boundary is covered by
+> [the 4.4 runbook](phase-4-4-validation.md), which walks it against a real instance.
+> Discovered by auditing PLAN.md after the 4.4 walk, on 2026-09-08.
+
 ```bash
 TMP=$(mktemp -d)
 SOCK="$TMP/shrike.sock"
