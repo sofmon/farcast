@@ -163,7 +163,7 @@ Wire the `farcast.Storage()` interface to DataSphere.
 - Applications can store/retrieve files without knowing the cloud provider
 - Encryption is transparent to the application
 
-**Status: ✅ Complete** — the in-cluster keyholder (`datasphere serve`, a mode of the existing binary), the operator's unseal push, the frozen SDK storage contract, and `farcast storage deploy`/`state`/`unseal`/`seal` in [`farsight/cli/`](farsight/cli/README.md). Key material reaches the cluster only as a *scoped* bundle pushed from the operator's machine over the FatLine tunnel, sealed to one specific replica process answering a single-use challenge; the master KEK and the unrotatable name key never enter the cluster at all. A restarted replica comes back sealed. `go test -race`, `go vet` and `gofmt` clean across both modules; zero new vendored modules (31 before, 31 after) and the SDK module still has none. Live validation pending — see [the 3.2 runbook](docs/runbooks/phase-3-2-validation.md).
+**Status: ✅ Complete** — the in-cluster keyholder (`datasphere serve`, a mode of the existing binary), the operator's unseal push, the frozen SDK storage contract, and `farcast storage deploy`/`state`/`unseal`/`seal` in [`farsight/cli/`](farsight/cli/README.md). Key material reaches the cluster only as a *scoped* bundle pushed from the operator's machine over the FatLine tunnel, sealed to one specific replica process answering a single-use challenge; the master KEK and the unrotatable name key never enter the cluster at all. A restarted replica comes back sealed. `go test -race`, `go vet` and `gofmt` clean across both modules; zero new vendored modules (31 before, 31 after) and the SDK module still has none. **Partially validated live:** `storage deploy` and `unseal` have been exercised against real GKE on every Phase 4 walk, since 4.1, 4.2 and 4.3 each require a working keyholder as a prerequisite — a sealed replica that never becomes ready, the challenge-response unseal, and a restart resealing itself have all been observed. What remains unwalked is the rest of [the 3.2 runbook](docs/runbooks/phase-3-2-validation.md): the deliberate seal, the `--hold` path, and the node-upgrade scenario. The 4.3 walk also surfaced a defect in the bring-up order it shares with 3.3 — an object written to `app/` before the `app` scope exists becomes unreachable by name once `unseal` mints that scope, and the error blames data integrity when the cause is key-space ownership ([the 4.3 runbook](docs/runbooks/phase-4-3-validation.md) records it in full).
 
 **Unblocked by [ADR 0008](docs/adr/0008-in-cluster-key-delivery.md) (accepted 2026-08-28):** an in-cluster keyholder that holds only *derived per-scope* material, in memory, pushed by the operator over the FatLine tunnel — sealed by default after any restart. The master KEK and the unrotatable name key never enter the cluster. The ADR proves that autonomous recovery is impossible under the invariant, states the availability cost plainly rather than engineering around it, and fixes the one irreversible piece now: the SDK's `ErrStorageSealed` contract, which every application ever written inherits. 3.2 ships the keyholder with two replicas and a PodDisruptionBudget, so the common restarts — a single OOM, one node's auto-repair, a rollout — do not seal storage at all.
 
@@ -187,6 +187,8 @@ Operator tools for managing storage.
 ### 4.1 TechnoCore — instance lifecycle & cost monitoring
 The kernel comes online. It manages what runs inside the instance and enforces cost limits from day one.
 
+**Status: ✅ Complete** — the in-cluster kernel in [`technocore/`](technocore/README.md) and `farcast kernel deploy`/`meter`/`confirm` in [`farsight/cli/`](farsight/cli/README.md), designed by [ADR 0009](docs/adr/0009-technocore-kernel-and-cost-metering.md): a stateless reconciler over a hand-rolled stdlib Kubernetes client, the two-signal ledger (`expected` enforces, `confirmed` corrects within a clamp), per-app attribution, threshold and projection warnings, the floor check at deploy time, and a protective shutdown that stops applications only and reports the instance floor rather than acting on it. Zero new vendored modules (31 before, 31 after). **Validated live against GKE on 2026-09-01:** all criteria in [the 4.1 runbook](docs/runbooks/phase-4-1-validation.md) passed after two defects were found and fixed. **Open:** criterion 12, reconciliation against a real invoice — every cost figure in FarCast remains modelled from a published rate card and unverified against a bill.
+
 - Application registry (what's running, what's declared)
 - Lifecycle management: deploy, start, stop, restart
 - Health checking
@@ -203,6 +205,8 @@ The kernel comes online. It manages what runs inside the instance and enforces c
 ### 4.2 Planck — manifest-to-workload translator
 Translate a `./farcast` manifest into K8s resources.
 
+**Status: ✅ Complete** — [`planck/translate`](planck/README.md) renders a namespace plus a ConfigMap, Deployment, Service and NetworkPolicy per app, and [`planck/build`](planck/README.md) is the ephemeral Kaniko Job that turns a Containerfile into an image *inside the instance* ([ADR 0010](docs/adr/0010-application-image-builds.md)), driven by `farcast build`. Zero new vendored modules. **Validated live against GKE on 2026-09-01:** all ten criteria in [the 4.2 runbook](docs/runbooks/phase-4-2-validation.md) passed after **seven** defects were found and fixed — including an application with no route out, and metering a routine redeploy silently erased. Three claims no unit test could make were settled there: Kaniko is admissible on Autopilot, the Workload Identity push grant works as printed, and the digest arrives through the Pod's termination message.
+
 - Parse manifest → create a K8s namespace named after the top-level `name`, then generate Deployment, Service, and ConfigMap resources for each entry in `apps[]` within that namespace
 - Sensible defaults for resources (start conservative, TechnoCore will adapt later)
 - Each app's container image comes from its `containerfile` path, using the app's `context` directory (or the Containerfile's directory when `context` is omitted), and lands in the instance's own registry under `app/<deployment>/<app>`, deployed by digest — the same registry, path convention, and pull grant `connect` already uses ([ADR 0007](docs/adr/0007-instance-owned-image-registry.md)); report a clear error if a referenced Containerfile is missing
@@ -211,6 +215,8 @@ Translate a `./farcast` manifest into K8s resources.
 
 ### 4.3 FarSight CLI — `farcast run`
 The core command that makes FarCast useful.
+
+**Status: ✅ Complete** — `farcast run`, `ps`, `logs` and `costs` in [`farsight/cli/`](farsight/cli/README.md), with [`planck/fetch`](planck/README.md) reading the manifest inside the instance ([ADR 0010](docs/adr/0010-application-image-builds.md) decision 11) and the kernel publishing its own observation so nothing models spending twice. Zero new vendored modules. **Validated live against GKE on 2026-09-08:** all thirteen criteria in [the 4.3 runbook](docs/runbooks/phase-4-3-validation.md) passed after three defects were found and fixed. The walk also broke a ratified decision: the maintained builder [ADR 0010](docs/adr/0010-application-image-builds.md) decision 10 chose was withdrawn from public access seven days after it was ratified, and [ADR 0011](docs/adr/0011-build-toolchain-mirroring.md) is the answer — reviewed third-party images are mirrored into the instance's own registry, and the builder is Google's archived Kaniko, pinned, **explicitly a stopgap with the exits named**.
 
 - `farcast run <instance> github.com/user/repo` — **the instance fetches the repo, not this machine** ([ADR 0010](docs/adr/0010-application-image-builds.md) decision 6). An ephemeral Job clones at the ref, prints `./farcast`, and reports the resolved commit and a digest of the manifest it parsed; decision 11 gives that read its own workload, with a ServiceAccount that has no registry grant and a policy that blocks the metadata server the builder is allowed
 - Reads `./farcast` manifest — `--manifest <path>` for a repository that keeps it elsewhere; paths inside stay repository-relative either way
@@ -224,11 +230,13 @@ The core command that makes FarCast useful.
 ### 4.4 Shrike — manifest enforcement for running apps
 Extend Shrike to monitor per-application traffic.
 
+**Status: ⬜ Not started** — and the 4.3 walk made the case concrete rather than theoretical: `farcast run` now shows an operator *per-application* declarations, while FatLine still enforces a single allowlist per instance. The gate promises more than what currently backs it, and closing that gap is this section.
+
 - Each app's FatLine allowlist derived from its own entry in the manifest
 - App A cannot use App B's external declarations
 - Violation alerts tied to specific applications
 
-**Phase 4 deliverable:** the full `install → bind → run → release` lifecycle works. Operators can deploy Git repositories, review their security declarations, and monitor running applications.
+**Phase 4 deliverable** 🟨 **three of four:** the full `install → connect → run → release` lifecycle works and is validated live — a Git repository the operator's machine never clones is read, reviewed, built and run inside the instance, with spending metered against the limit throughout. What remains is 4.4: declarations are reviewed per application and still enforced per instance.
 
 ---
 
