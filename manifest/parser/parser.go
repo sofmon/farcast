@@ -31,9 +31,14 @@ type App struct {
 }
 
 // External is one declared outbound endpoint for an app.
+//
+// The JSON tags are load-bearing: this type is serialised into the egress
+// policy an operator can read in a ConfigMap (ADR 0013), and Go's default
+// capitalised field names would make a document about their own manifest look
+// like somebody else's format.
 type External struct {
-	Host   string
-	Reason string
+	Host   string `json:"host"`
+	Reason string `json:"reason,omitempty"`
 }
 
 // ErrInvalidManifest is the sentinel wrapper for every validation failure.
