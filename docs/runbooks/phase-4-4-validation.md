@@ -381,13 +381,24 @@ error, and `system/kaniko` is in the instance's registry afterwards — three
 images before the command, four after. The refusal is real and the side effect
 is real, on the one registry the instance runs code from.
 
+Fixed after the walk. Checking and copying are now two passes: every requested
+image is settled before any of them is copied, so a refusal leaves the registry
+as it found it. A run that is given two tags now reports both, rather than
+refusing on the builder and waiting to be run again before mentioning the
+fetcher.
+
 **4. `farcast storage deploy` creates the bucket and the keyring before it asks
 whether to spend anything.** Declining the cost prompt, or running without
 `--yes` where stdin cannot answer, exits non-zero having already created a real
 billable bucket. It is recorded in `metadata.yaml`, so `farcast release` still
 destroys it and nothing is stranded — but a command that reports failure while
-having had a lasting effect is the same shape as finding 3 above, and the
-ordering is worth changing in both.
+having had a lasting effect is the same shape as finding 3 above.
+
+Fixed after the walk, in both. The cost gate now sits above the bucket: nothing
+is created until the operator has agreed to the standing charge. Minting the
+bucket and keyring *inside* this command stays as it was — that is the fix for
+a worse Phase 4.3 defect, where the documented way to mint a bucket stranded
+the object that minted it — and only the order relative to the gate changed.
 
 **5. Policy propagation is fast in both directions, and the revoking direction
 is the one to state.** A grant reached a running FatLine in **28s**, a

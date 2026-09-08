@@ -108,6 +108,27 @@ func (c *storageDeployCommand) Run(ctx context.Context, env *Env, args []string)
 		return fmt.Errorf("instance %q is not connected; run 'farcast connect %s' first — "+
 			"the keyholder is reachable only through the FatLine tunnel", name, name)
 	}
+	// Ask before creating anything, not after.
+	//
+	// The cost gate used to sit below the bucket, so declining it — or running
+	// non-interactively without --yes — exited non-zero having already created
+	// a real bucket and keyring. The Phase 4.4 walk hit exactly that. Nothing
+	// was stranded, because the bucket is recorded and 'farcast release'
+	// destroys it, but a command that reports failure after provisioning is
+	// one an operator cannot reason about, and this project's second pillar is
+	// that spending is never a side effect.
+	//
+	// Nothing below the gate is needed to describe the cost: the figure is the
+	// keyholder's standing compute, which does not depend on storage existing.
+	ok, err := c.confirmCost(env, meta)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		fprintln(env.Err, "Aborted.")
+		return nil
+	}
+
 	// Mint the bucket and the keyring here rather than sending the operator
 	// away to create them.
 	//
@@ -131,15 +152,6 @@ func (c *storageDeployCommand) Run(ctx context.Context, env *Env, args []string)
 		if meta, err = env.ConfigDir.LoadInstanceMetadata(name); err != nil {
 			return fmt.Errorf("re-read instance %q after creating its storage: %w", name, err)
 		}
-	}
-
-	ok, err := c.confirmCost(env, meta)
-	if err != nil {
-		return err
-	}
-	if !ok {
-		fprintln(env.Err, "Aborted.")
-		return nil
 	}
 
 	reg, err := c.deployer.ensureRegistry(ctx, env, name, meta)

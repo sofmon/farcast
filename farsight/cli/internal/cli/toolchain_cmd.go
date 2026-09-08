@@ -97,6 +97,19 @@ func (c *toolchainCommand) Run(ctx context.Context, env *Env, args []string) err
 
 	b := c.newBuilder(func(msg string) { fprintf(env.Err, "  %s\n", msg) })
 
+	// Settle every image before copying any of them.
+	//
+	// This used to check and mirror in one pass, so a digest-pinned builder
+	// beside a tagged fetcher mirrored the builder and *then* refused. The
+	// Phase 4.4 walk caught it: the command exited 2 and the instance's
+	// registry held one image more than before it ran. A refusal that leaves
+	// a third-party image in the one registry the instance runs code from is
+	// not a refusal.
+	plan, err := c.settle(ctx, b)
+	if err != nil {
+		return err
+	}
+
 	// The credential is minted once, held for these two pushes, and never
 	// written anywhere — a push credential for the instance's registry is a
 	// foothold on everything the cluster runs (ADR 0007 decision 5).
@@ -110,26 +123,7 @@ func (c *toolchainCommand) Run(ctx context.Context, env *Env, args []string) err
 	}
 
 	res := toolchainResult{Instance: name}
-	for _, m := range []struct {
-		kind toolchainKind
-		src  string
-		path string
-	}{
-		{builderKind, c.builder, "kaniko"},
-		{fetcherKind, c.fetcher, "git"},
-	} {
-		if m.src == "" {
-			continue
-		}
-		if !isDigestPinned(m.src) {
-			pinned, rerr := b.Resolve(ctx, m.src, "", "")
-			if rerr != nil {
-				return fmt.Errorf("resolve the %s image %q: %w", m.kind.what, m.src, rerr)
-			}
-			return usagef("--%s %q is a tag, not a digest.\nIt resolves today to:\n\n  %s\n\n"+
-				"Pass that. Mirroring an unreviewed tag would copy whatever it points at today "+
-				"into the one registry your instance runs code from.", m.kind.what, m.src, pinned)
-		}
+	for _, m := range plan {
 		dst := systemPathFor(meta.Registry.Prefix, m.path) + ":" + imageTag(digestTag(m.src))
 		mirrored, merr := b.Mirror(ctx, m.src, dst, user, pass)
 		if merr != nil {
@@ -145,6 +139,53 @@ func (c *toolchainCommand) Run(ctx context.Context, env *Env, args []string) err
 	}
 	res.Toolchain = meta.Toolchain
 	return env.Printer.Print(res)
+}
+
+// mirrorRequest is one image this invocation was asked to mirror, once it has
+// been checked and is safe to copy.
+type mirrorRequest struct {
+	kind toolchainKind
+	src  string
+	path string
+}
+
+// settle checks every requested image and copies none of them. It reports
+// everything wrong at once: an operator who passed two tags should learn that
+// from one run rather than fix the builder, run again, and be told about the
+// fetcher.
+func (c *toolchainCommand) settle(ctx context.Context, b mirroringBuilder) ([]mirrorRequest, error) {
+	var plan []mirrorRequest
+	var problems []string
+	for _, m := range []mirrorRequest{
+		{builderKind, c.builder, "kaniko"},
+		{fetcherKind, c.fetcher, "git"},
+	} {
+		if m.src == "" {
+			continue
+		}
+		if isDigestPinned(m.src) {
+			plan = append(plan, m)
+			continue
+		}
+		// Resolving is a read against the source registry: it tells the
+		// operator what the tag means today without copying anything.
+		pinned, err := b.Resolve(ctx, m.src, "", "")
+		if err != nil {
+			return nil, fmt.Errorf("resolve the %s image %q: %w", m.kind.what, m.src, err)
+		}
+		problems = append(problems, fmt.Sprintf(
+			"--%s %q is a tag, not a digest.\nIt resolves today to:\n\n  %s\n",
+			m.kind.what, m.src, pinned))
+	}
+	if len(problems) == 0 {
+		return plan, nil
+	}
+	pass := "Pass that."
+	if len(problems) > 1 {
+		pass = "Pass those."
+	}
+	return nil, usagef("%s\n%s Mirroring an unreviewed tag would copy whatever it points at today "+
+		"into the one registry your instance runs code from.", strings.Join(problems, "\n"), pass)
 }
 
 // digestTag turns a digest-pinned reference into a short, human-readable tag

@@ -265,6 +265,9 @@ func TestDeployMintsTheBucketItNeeds(t *testing.T) {
 
 	var minted []string
 	c := &storageDeployCommand{}
+	// Consent first: since the Phase 4.4 walk the cost gate sits above the
+	// bucket, so a deploy that never gets past it creates nothing at all.
+	c.deployer.assumeYes = true
 	c.ensureStorage = func(_ context.Context, _ *Env, instance string) error {
 		minted = append(minted, instance)
 		return errors.New("stop here")
@@ -314,6 +317,58 @@ func TestDeployDoesNotMintOverAnExistingBucket(t *testing.T) {
 	_ = c.Run(context.Background(), env, []string{"prod"})
 	if len(minted) != 0 {
 		t.Fatalf("deploy minted storage for an instance that already has a bucket: %v", minted)
+	}
+}
+
+// Nothing is created before the operator has agreed to the cost.
+//
+// The gate used to sit BELOW the bucket, so declining it — or running
+// non-interactively without --yes — returned an error having already created a
+// real, billable bucket and a keyring whose loss is unrecoverable. Found on the
+// Phase 4.4 walk. Cost is the project's second pillar: spending must never be
+// something a command does on the way to telling you it will not proceed.
+func TestDeployCreatesNothingWithoutConsent(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	if err := os.Chmod(string(dir), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := dir.CreateInstance("prod"); err != nil {
+		t.Fatal(err)
+	}
+	// No Storage recorded: this instance has no bucket, so a deploy that got
+	// as far as minting would create one.
+	meta := &config.InstanceMetadata{
+		Name: "prod", Provider: "gke", Region: "us-central1", Status: "running",
+		FatLineDeployed: true,
+	}
+	if err := dir.SaveInstanceMetadata("prod", meta); err != nil {
+		t.Fatal(err)
+	}
+	env, _ := testEnv(dir, output.ModeHuman)
+
+	var minted []string
+	c := &storageDeployCommand{} // assumeYes stays false; env is non-interactive
+	c.ensureStorage = func(_ context.Context, _ *Env, instance string) error {
+		minted = append(minted, instance)
+		return nil
+	}
+
+	err := c.Run(context.Background(), env, []string{"prod"})
+	if err == nil {
+		t.Fatal("deploy provisioned without confirmation")
+	}
+	if len(minted) != 0 {
+		t.Errorf("a refused deploy created storage anyway: %v", minted)
+	}
+	after, lerr := dir.LoadInstanceMetadata("prod")
+	if lerr != nil {
+		t.Fatal(lerr)
+	}
+	if after.Storage != nil && after.Storage.Bucket != "" {
+		t.Errorf("a refused deploy recorded a bucket: %s", after.Storage.Bucket)
+	}
+	if after.Keyholder != nil {
+		t.Error("a refused deploy recorded a keyholder")
 	}
 }
 

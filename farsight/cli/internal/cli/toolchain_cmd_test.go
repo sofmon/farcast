@@ -113,6 +113,65 @@ func TestMirroringRefusesATag(t *testing.T) {
 	}
 }
 
+// The defect the Phase 4.4 walk found: a valid builder beside a tagged fetcher
+// mirrored the builder and THEN refused, so a command that exited non-zero
+// left a third-party image in the instance's registry — three images before
+// it ran, four after. Checking and copying were one pass; they are now two.
+func TestRefusingOneImageMirrorsNeither(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	buildableInstance(t, dir, "p44")
+	env, _ := testEnv(dir, output.ModeHuman)
+
+	f := &fakeMirror{}
+	c := toolchainCmd(f)
+	c.builder = "gcr.io/kaniko-project/executor@sha256:" + strings.Repeat("a", 64) // fine
+	c.fetcher = "cgr.dev/chainguard/git:latest-dev"                                // a tag
+
+	err := c.Run(context.Background(), env, []string{"p44"})
+	if err == nil {
+		t.Fatal("a tagged fetcher was accepted")
+	}
+	if !strings.Contains(err.Error(), "is a tag, not a digest") {
+		t.Errorf("unhelpful refusal: %v", err)
+	}
+	if len(f.mirrored) != 0 {
+		t.Fatalf("a refused command still mirrored %v into the instance registry", f.mirrored)
+	}
+	meta, lerr := dir.LoadInstanceMetadata("p44")
+	if lerr != nil {
+		t.Fatal(lerr)
+	}
+	if meta.Toolchain != nil && (meta.Toolchain.Builder != "" || meta.Toolchain.Fetcher != "") {
+		t.Errorf("a refused command recorded a toolchain: %+v", meta.Toolchain)
+	}
+}
+
+// And an operator who passes two tags should learn about both from one run,
+// rather than fix the builder, run again, and be told about the fetcher.
+func TestRefusalNamesEveryUnpinnedImage(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	buildableInstance(t, dir, "p44")
+	env, _ := testEnv(dir, output.ModeHuman)
+
+	f := &fakeMirror{}
+	c := toolchainCmd(f)
+	c.builder = "gcr.io/kaniko-project/executor:v1.23.2"
+	c.fetcher = "cgr.dev/chainguard/git:latest-dev"
+
+	err := c.Run(context.Background(), env, []string{"p44"})
+	if err == nil {
+		t.Fatal("two tags were accepted")
+	}
+	for _, want := range []string{"--builder", "--fetcher"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not mention %s:\n%v", want, err)
+		}
+	}
+	if len(f.mirrored) != 0 {
+		t.Errorf("it mirrored %v anyway", f.mirrored)
+	}
+}
+
 func TestToolchainReportsWhatIsRecorded(t *testing.T) {
 	dir := config.Dir(t.TempDir())
 	meta := buildableInstance(t, dir, "p43")
