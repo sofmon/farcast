@@ -151,7 +151,7 @@ func (c *Config) withDefaults() {
 		c.FSGroup = FSGroup
 	}
 	if c.JobName == "" {
-		c.JobName = JobName(c.Repo, c.Ref)
+		c.JobName = JobName(c.Repo, c.Ref, c.Manifest)
 	}
 }
 
@@ -170,14 +170,21 @@ func (c Config) Job() string {
 //
 // It cannot be named after the deployment, because the deployment's name is
 // inside the manifest this Job exists to read. So it is named after what the
-// caller does know — the repository and the ref — with a hash to keep two
-// repositories whose last path segment is "api" apart.
+// caller does know — the repository, the ref and the manifest path — with a
+// hash to keep two repositories whose last path segment is "api" apart.
+//
+// The manifest path is in the hash because a Job's spec.template is immutable:
+// two deployments from one repository at one ref, differing only in which
+// manifest they read, would otherwise resolve to the same Job name and the
+// second would be refused by the API server. A repository holding several
+// manifests is an ordinary layout, and manifest/examples/manifest-elsewhere
+// exists to demonstrate exactly it.
 //
 // Exported because the caller waits on, and reads both the manifest and the
 // commit from, the same Job this package created. A second implementation of
 // the name is the join that silently watches the wrong object.
-func JobName(repo, ref string) string {
-	sum := sha256.Sum256([]byte(repo + "#" + ref))
+func JobName(repo, ref, manifest string) string {
+	sum := sha256.Sum256([]byte(repo + "#" + ref + "#" + manifest))
 	n := "fetch-" + label(basename(repo)) + "-" + hex.EncodeToString(sum[:])[:8]
 	if len(n) > 63 {
 		n = n[len(n)-63:]

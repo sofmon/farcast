@@ -325,21 +325,29 @@ func TestRefuses(t *testing.T) {
 }
 
 func TestJobNameIsStableDistinctAndALegalLabel(t *testing.T) {
-	a := JobName("https://github.com/one/api", "refs/heads/main")
-	if b := JobName("https://github.com/one/api", "refs/heads/main"); a != b {
+	a := JobName("https://github.com/one/api", "refs/heads/main", "farcast")
+	if b := JobName("https://github.com/one/api", "refs/heads/main", "farcast"); a != b {
 		t.Errorf("the same repository and ref produced %q then %q; a re-run must replace rather than accumulate", a, b)
 	}
-	if b := JobName("https://gitlab.test/two/api", "refs/heads/main"); a == b {
+	if b := JobName("https://gitlab.test/two/api", "refs/heads/main", "farcast"); a == b {
 		t.Errorf("two different repositories whose last segment is \"api\" both produced %q", a)
 	}
-	if b := JobName("https://github.com/one/api", "refs/heads/next"); a == b {
+	if b := JobName("https://github.com/one/api", "refs/heads/next", "farcast"); a == b {
 		t.Errorf("two refs of the same repository both produced %q", a)
+	}
+	// A repository holding several manifests is an ordinary layout. Two such
+	// deployments collided on this name in the Phase 4.4 walk, and because a
+	// Job's spec.template is immutable the second was refused outright by the
+	// API server — no build, no deployment, and an error naming neither the
+	// manifest nor the collision.
+	if b := JobName("https://github.com/one/api", "refs/heads/main", "services/web/farcast"); a == b {
+		t.Errorf("two manifests in one repository at one ref both produced %q", a)
 	}
 	for _, n := range []string{
 		a,
-		JobName("https://example.test/team/My_Repo.v2.git", "main"),
-		JobName("https://example.test/"+strings.Repeat("long", 40), "main"),
-		JobName("https://example.test/", "main"),
+		JobName("https://example.test/team/My_Repo.v2.git", "main", "farcast"),
+		JobName("https://example.test/"+strings.Repeat("long", 40), "main", "farcast"),
+		JobName("https://example.test/", "main", "farcast"),
 	} {
 		if len(n) == 0 || len(n) > 63 {
 			t.Errorf("%q is %d characters; a DNS label allows 1..63", n, len(n))
