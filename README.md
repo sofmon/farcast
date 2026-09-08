@@ -179,7 +179,7 @@ farcast/
 | **FatLine** | Go | Networking layer — routing, proxy, encryption, all traffic in/out |
 | **DataSphere** | Go | Storage abstraction layer — cloud-agnostic proxy with encryption-at-rest |
 | **AllThing** | Go | AI abstraction — cloud-agnostic layer over managed AI services (Gemini, Claude, OpenAI) |
-| **Shrike** | Go | Security monitor — validates traffic against manifest declarations, intervenes on violations |
+| **Shrike** | Go | Security monitor — validates traffic against manifest declarations and raises attributed alerts; blocking is FatLine's, inline and fail-closed |
 | **FarSight** | Go + Electron + TypeScript | The "farcast" app — GUI (tiling browser), CLI, and server-side composition |
 
 See each module's `README.md` for language specifics, architecture detail, and implementation notes.
@@ -250,7 +250,7 @@ Full manifest specification → [`manifest/README.md`](manifest/README.md)
 A FarCast instance is the fundamental unit — analogous to a running OS on a physical machine. Instances are installed from base images, live in cloud infrastructure, and are terminated when no longer needed.
 
 ### Sovereignty
-Every instance is private by default. All connections — inbound and outbound — are denied unless explicitly declared. Each application must list the external services it needs in its `./farcast` manifest, including a human-readable reason. The operator reviews these declarations before running the app. FatLine enforces the boundary, allowing only declared endpoints. Shrike monitors traffic at runtime and intervenes if an application attempts to reach an undeclared destination. The cloud provider cannot access the contents of an instance.
+Every instance is private by default. All connections — inbound and outbound — are denied unless explicitly declared. Each application must list the external services it needs in its `./farcast` manifest, including a human-readable reason. The operator reviews these declarations before running the app. FatLine enforces the boundary, allowing only declared endpoints — inline and fail-closed, so a refusal never depends on anything else being up. Shrike watches the decision stream and raises alerts naming the application that caused each violation; it never sits in the data path and fails open, so it can tell the operator what happened but cannot itself stop it. The cloud provider cannot access the contents of an instance.
 
 ### Cost Control
 Cloud costs are unpredictable by nature. FarCast treats cost control as a mandatory safeguard, not an optional dashboard. When installing an instance, the operator **must** set a cost limit — there is no default, no "unlimited", no way to skip it. TechnoCore continuously monitors cloud spending across compute (Planck), storage (DataSphere), networking (FatLine), and AI (AllThing). It breaks costs down per application, warns the operator as spending approaches the threshold, and takes protective action when the limit is reached — stopping the highest-cost applications first, and if necessary, shutting down the entire instance while keeping only TechnoCore alive to report status and allow the operator to respond.
