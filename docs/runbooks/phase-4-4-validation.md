@@ -346,6 +346,27 @@ keyholder crash-loops on a 403 until the operator applies the grant `storage
 deploy` prints *after* deploying it — the second time a printed-not-applied
 grant has made a healthy instance look broken.
 
+All four are now fixed, and each has a test that fails without the fix:
+
+- **toolchain** settles every image before copying any of them, and reports all
+  the unpinned ones at once instead of one per run.
+- **kernel deploy** checks the namespaces it would meter against the instance
+  before it builds. A namespace named on `--namespaces` that does not exist is
+  refused; one that is merely *carried forward* from an earlier `kernel meter`
+  and has since been deleted is dropped with a note, because refusing there
+  would leave an operator who removed an application namespace unable to deploy
+  the kernel at all — a worse failure than the one being fixed.
+- **unseal** records the generation only once a replica has taken it. The
+  counter can now lag the cluster but never lead it, which is the safe
+  direction: `storage state` reads each replica's own generation, so a lagging
+  record is visible rather than hiding material nobody wrote down.
+- **storage deploy** prints the bucket grant *before* applying the workload
+  that needs it, on stderr so `--output json` carries it too. FarCast still
+  does not apply the grant itself — that needs permission to change a bucket's
+  IAM, which this CLI deliberately never asks for ([ADR 0008](../adr/0008-in-cluster-key-delivery.md)
+  decision 8) — but the operator now reads it before the replicas start rather
+  than underneath a crash loop.
+
 Confirmed in passing: [ADR 0008](../adr/0008-in-cluster-key-delivery.md) decision
 9's fix, live for the first time — the `app` scope was present in the keyring
 with `prefix: app/` before any unseal succeeded.

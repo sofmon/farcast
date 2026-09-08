@@ -10,6 +10,7 @@ import (
 
 	"github.com/sofmon/farcast/datasphere"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
+	"github.com/sofmon/farcast/farsight/cli/internal/keyholder"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
 	"github.com/sofmon/farcast/planck"
 )
@@ -124,10 +125,12 @@ func TestEnsureScopeMintsAndRecordsBeforeAnyPush(t *testing.T) {
 		t.Error("the recorded scope is not the one that would have been pushed")
 	}
 
-	// And the metadata records where it went.
+	// But the GENERATION is not recorded yet, because nothing has been handed
+	// over. It used to be written here, so an unseal that failed on every
+	// replica still advanced the counter (Phase 4.4 walk).
 	meta2, _ := dir.LoadInstanceMetadata("prod")
-	if meta2.Keyholder.Scope != DefaultScopeName || meta2.Keyholder.Generation != 1 {
-		t.Errorf("metadata = %+v", meta2.Keyholder)
+	if meta2.Keyholder.Generation != 0 {
+		t.Errorf("generation %d recorded before any push", meta2.Keyholder.Generation)
 	}
 }
 
@@ -148,7 +151,7 @@ func TestEnsureScopeAdvancesTheGeneration(t *testing.T) {
 				reloadedKeys = k
 			}
 		}
-		_, generation, err := ensureScope(env, "prod", meta, reloadedKeys)
+		scope, generation, err := ensureScope(env, "prod", meta, reloadedKeys)
 		if err != nil {
 			t.Fatalf("round %d: %v", i, err)
 		}
@@ -156,6 +159,97 @@ func TestEnsureScopeAdvancesTheGeneration(t *testing.T) {
 			t.Fatalf("generation went backwards: %d after %d", generation, last)
 		}
 		last = generation
+		// Stand in for the push landing, which is what records it now.
+		meta.Keyholder.Scope = scope.Name
+		meta.Keyholder.Generation = generation
+		if err := dir.SaveInstanceMetadata("prod", meta); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// fakeKeyholder stands in for the replicas an unseal pushes to.
+type fakeKeyholder struct {
+	err   error
+	calls int
+}
+
+func (f *fakeKeyholder) Unseal(_ context.Context, _ int, _ []byte, _ string) (keyholder.State, error) {
+	f.calls++
+	if f.err != nil {
+		return keyholder.State{}, f.err
+	}
+	return keyholder.State{Phase: "unsealed", Scopes: []string{DefaultScopeName}}, nil
+}
+
+// unsealWith wires an unseal command to a fake keyholder and gives the
+// instance a keyring to push.
+func unsealWith(t *testing.T, dir config.Dir, f *fakeKeyholder) *storageUnsealCommand {
+	t.Helper()
+	keys, err := datasphere.NewKeyring()
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := keys.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dir.CreateInstanceKeyring("prod", encoded); err != nil {
+		t.Fatal(err)
+	}
+	return &storageUnsealCommand{
+		connect: func(context.Context, *Env, string) (keyholderPusher, func(), error) {
+			return f, func() {}, nil
+		},
+	}
+}
+
+// An unseal that reaches no replica must not advance the generation.
+//
+// It used to: the counter was written before the first push. The usual reason
+// every push fails is the keyholder crash-looping without its bucket grant —
+// which an operator retries — so each attempt burned a generation and left the
+// record describing a handover that never happened. Found on the Phase 4.4
+// walk, alongside the grant ordering that causes it.
+func TestAFailedUnsealDoesNotConsumeAGeneration(t *testing.T) {
+	dir, env := keyholderInstance(t, true)
+	f := &fakeKeyholder{err: errors.New("403 from the bucket")}
+	c := unsealWith(t, dir, f)
+
+	if err := c.Run(context.Background(), env, []string{"prod"}); err == nil {
+		t.Fatal("an unseal that reached no replica reported success")
+	}
+	if f.calls == 0 {
+		t.Fatal("it never tried to push")
+	}
+	meta, err := dir.LoadInstanceMetadata("prod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Keyholder.Generation != 0 {
+		t.Errorf("a failed unseal consumed generation %d", meta.Keyholder.Generation)
+	}
+}
+
+// And one that lands records it, so the next unseal moves forward. A keyholder
+// refuses anything older than what it holds, so a generation that never
+// advanced would make the next bundle unacceptable.
+func TestASuccessfulUnsealRecordsTheGeneration(t *testing.T) {
+	dir, env := keyholderInstance(t, true)
+	c := unsealWith(t, dir, &fakeKeyholder{})
+
+	if err := c.Run(context.Background(), env, []string{"prod"}); err != nil {
+		t.Fatalf("unseal: %v", err)
+	}
+	meta, err := dir.LoadInstanceMetadata("prod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Keyholder.Generation != 1 {
+		t.Errorf("generation = %d, want 1", meta.Keyholder.Generation)
+	}
+	if meta.Keyholder.Scope != DefaultScopeName {
+		t.Errorf("scope = %q, want %q", meta.Keyholder.Scope, DefaultScopeName)
 	}
 }
 
@@ -476,6 +570,79 @@ func TestDeployRecordsTheKeyholderBeforeApplying(t *testing.T) {
 	}
 	if after.Keyholder.Replicas != keyholderReplicas {
 		t.Errorf("recorded %d replicas, want %d", after.Keyholder.Replicas, keyholderReplicas)
+	}
+}
+
+// withProject gives an instance the cloud project a real GKE instance always
+// has. The shared fixture leaves it empty, and the grant is addressed to a
+// project.
+func withProject(t *testing.T, dir config.Dir, name string) {
+	t.Helper()
+	meta, err := dir.LoadInstanceMetadata(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta.Project = "farcast-proj"
+	if err := dir.SaveInstanceMetadata(name, meta); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The bucket grant reaches the operator even when the deploy fails, because it
+// is printed before the apply rather than as part of the success result.
+//
+// It used to live only in deployResult.Human, which never runs on a failure —
+// and on the happy path it printed underneath a workload that was already
+// crash-looping on the 403 it prevents. Two walks (3.2 and 4.4) lost time to a
+// healthy instance that looked broken for want of a grant the tool had not yet
+// mentioned.
+func TestTheBucketGrantIsPrintedBeforeTheDeployNeedsIt(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	const name = "prod"
+	deployableInstance(t, dir, name)
+
+	withProject(t, dir, name)
+
+	fc := &fakeCluster{applyErr: errors.New("the API server said no")}
+	c := testStorageDeploy(&fakeProvider{}, &fakeBuilder{})
+	c.deployer.assumeYes = true
+	c.deployer.newCluster = func(string) clusterApplier { return fc }
+
+	env, _, errOut := testEnvBoth(dir, output.ModeHuman)
+	if err := c.Run(context.Background(), env, []string{name}); err == nil {
+		t.Fatal("a failed apply reported success")
+	}
+	got := errOut.String()
+	for _, want := range []string{"add-iam-policy-binding", "roles/storage.objectAdmin", "roles/storage.legacyBucketReader"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the grant was not printed before the deploy that needs it; missing %q:\n%s", want, got)
+		}
+	}
+}
+
+// And it is on stderr, so --output json still carries it: a machine-readable
+// result that silently drops the one manual step would be worse than no
+// output at all.
+func TestTheBucketGrantSurvivesJSONOutput(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	const name = "prod"
+	deployableInstance(t, dir, name)
+
+	withProject(t, dir, name)
+
+	c := testStorageDeploy(&fakeProvider{}, &fakeBuilder{})
+	c.deployer.assumeYes = true
+	c.deployer.newCluster = func(string) clusterApplier { return &fakeCluster{} }
+
+	env, out, errOut := testEnvBoth(dir, output.ModeJSON)
+	if err := c.Run(context.Background(), env, []string{name}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(errOut.String(), "add-iam-policy-binding") {
+		t.Errorf("the grant is missing from stderr in json mode:\n%s", errOut.String())
+	}
+	if strings.Contains(out.String(), "add-iam-policy-binding") {
+		t.Error("the grant leaked into the json result on stdout")
 	}
 }
 

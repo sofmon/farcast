@@ -31,6 +31,12 @@ type fakeCluster struct {
 	ipErr      error
 	applyErr   error
 	rolloutErr error
+
+	// namespaces is what the cluster contains. Empty means an empty cluster,
+	// deliberately: a fake that answers "yes, it exists" to everything is what
+	// let kernel deploy build an image for a namespace that was not there.
+	namespaces    []string
+	namespacesErr error
 }
 
 func (f *fakeCluster) Apply(_ context.Context, m []byte) error {
@@ -41,6 +47,10 @@ func (f *fakeCluster) Apply(_ context.Context, m []byte) error {
 func (f *fakeCluster) RolloutStatus(_ context.Context, _, _ string, _ time.Duration) error {
 	f.rollouts++
 	return f.rolloutErr
+}
+
+func (f *fakeCluster) Namespaces(context.Context) ([]string, error) {
+	return f.namespaces, f.namespacesErr
 }
 
 func (f *fakeCluster) WaitExternalIP(_ context.Context, _, _ string, _ time.Duration) (string, error) {
@@ -135,6 +145,14 @@ func instanceImageRef(instance string) string {
 }
 
 func testEnv(dir config.Dir, mode output.Mode) (*Env, *bytes.Buffer) {
+	env, out, _ := testEnvBoth(dir, mode)
+	return env, out
+}
+
+// testEnvBoth is testEnv for a test that also has to read stderr: results go to
+// stdout, warnings and progress to stderr, and some behaviour is only visible
+// on the second one.
+func testEnvBoth(dir config.Dir, mode output.Mode) (*Env, *bytes.Buffer, *bytes.Buffer) {
 	var out, errb bytes.Buffer
 	env := &Env{
 		Out:       &out,
@@ -144,7 +162,7 @@ func testEnv(dir config.Dir, mode output.Mode) (*Env, *bytes.Buffer) {
 		ConfigDir: dir,
 		Log:       slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
-	return env, &out
+	return env, &out, &errb
 }
 
 func installedInstance(t *testing.T, dir config.Dir, name string) *config.InstanceMetadata {

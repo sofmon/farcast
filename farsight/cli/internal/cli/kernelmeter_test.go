@@ -285,7 +285,9 @@ func TestRedeployingTheKernelKeepsWhatIsAlreadyMetered(t *testing.T) {
 	dir := config.Dir(t.TempDir())
 	meteredInstance(t, dir, "p42", tcdeploy.DefaultNamespace, "with-build")
 	env, _ := testEnv(dir, output.ModeHuman)
-	fc := &fakeCluster{}
+	// Both namespaces are really there: with-build is a deployed application,
+	// which is why it is metered.
+	fc := &fakeCluster{namespaces: []string{tcdeploy.DefaultNamespace, "with-build"}}
 
 	c := testKernelDeploy(fc, &fakeBuilder{})
 	c.namespaces = tcdeploy.DefaultNamespace // as a plain redeploy would pass

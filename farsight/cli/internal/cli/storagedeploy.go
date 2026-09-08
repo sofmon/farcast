@@ -209,6 +209,12 @@ func (c *storageDeployCommand) Run(ctx context.Context, env *Env, args []string)
 		return fmt.Errorf("record the keyholder before deploying it: %w", err)
 	}
 
+	// Before the workload exists, not after: a replica that starts without
+	// this grant crash-loops, and an operator reading the fix underneath a
+	// deploy that has already failed is the wrong order. On stderr so it
+	// survives --output json, where the human result is never rendered.
+	writeBucketGrant(env.Err, meta.Project, meta.Storage.Bucket, dsdeploy.DefaultNamespace, dsdeploy.DefaultName)
+
 	cl := c.deployer.newCluster(env.ConfigDir.InstanceKubeconfigPath(name))
 	if isInteractive(env) || env.Verbose {
 		fprintf(env.Err, "Deploying the keyholder to %q…\n", name)
@@ -263,24 +269,42 @@ func (r deployResult) Human(w io.Writer) error {
 	fprintf(w, "\nEvery replica is SEALED and will not become ready until you unseal it.\n")
 	fprintf(w, "Run: farcast storage unseal %s\n", r.Instance)
 
-	// The keyholder reads and writes the bucket with a cloud-side identity
-	// (ADR 0008 decision 8). FarCast does not grant it: doing so needs
-	// permission to change a bucket's IAM, which the operator's credential is
-	// not required to carry and which this CLI deliberately never asks for.
-	// Without the binding the replicas crash-loop on a 403 at start-up, so the
-	// command that creates them is where the grant belongs.
+	// The grant itself was printed BEFORE the deploy — see writeBucketGrant.
+	// All that belongs here is the reminder that it has to be in place before
+	// the unseal above will work.
 	if r.Project != "" && r.Bucket != "" {
-		fprintf(w, "\nThe keyholder needs read/write access to the bucket under its own identity.\n")
-		fprintf(w, "If you have not granted it for this instance yet, run:\n\n")
-		fprintf(w, "  PROJNUM=$(gcloud projects describe %s --format='value(projectNumber)')\n", r.Project)
-		fprintf(w, "  PRINCIPAL=\"principal://iam.googleapis.com/projects/$PROJNUM/locations/global/workloadIdentityPools/%s.svc.id.goog/subject/ns/%s/sa/%s\"\n",
-			r.Project, r.Namespace, r.ServiceAccount)
-		fprintf(w, "  gcloud storage buckets add-iam-policy-binding gs://%s \\\n", r.Bucket)
-		fprintf(w, "    --member \"$PRINCIPAL\" --role roles/storage.objectAdmin\n")
-		fprintf(w, "  gcloud storage buckets add-iam-policy-binding gs://%s \\\n", r.Bucket)
-		fprintf(w, "    --member \"$PRINCIPAL\" --role roles/storage.legacyBucketReader\n")
-		fprintf(w, "\nThe grant is on the BUCKET, not the project, and object access is\n")
-		fprintf(w, "separated from bucket reads so the keyholder cannot delete its own bucket.\n")
+		fprintf(w, "\nThe bucket grant printed above has to be in place first. Without it the\n")
+		fprintf(w, "replicas crash-loop on a 403 at start-up and the unseal fails.\n")
 	}
 	return nil
+}
+
+// writeBucketGrant prints the IAM binding the keyholder needs before it runs.
+//
+// The keyholder reads and writes the bucket with a cloud-side identity (ADR
+// 0008 decision 8). FarCast does not apply it: that needs permission to change
+// a bucket's IAM, which the operator's credential is not required to carry and
+// which this CLI deliberately never asks for.
+//
+// It is printed BEFORE the workload is applied. It used to be printed after,
+// as part of the result — so the replicas were already crash-looping on a 403
+// by the time the operator read how to prevent it, and the instance looked
+// broken. That happened twice, on the Phase 3.2 and Phase 4.4 walks, and the
+// second time cost a failed unseal as well (which is why unseal no longer
+// consumes a generation when every push fails).
+func writeBucketGrant(w io.Writer, project, bucket, namespace, serviceAccount string) {
+	if project == "" || bucket == "" {
+		return
+	}
+	fprintf(w, "\nBefore this keyholder can start, it needs read/write access to the bucket\n")
+	fprintf(w, "under its own identity. If you have not granted it for this instance yet, run:\n\n")
+	fprintf(w, "  PROJNUM=$(gcloud projects describe %s --format='value(projectNumber)')\n", project)
+	fprintf(w, "  PRINCIPAL=\"principal://iam.googleapis.com/projects/$PROJNUM/locations/global/workloadIdentityPools/%s.svc.id.goog/subject/ns/%s/sa/%s\"\n",
+		project, namespace, serviceAccount)
+	fprintf(w, "  gcloud storage buckets add-iam-policy-binding gs://%s \\\n", bucket)
+	fprintf(w, "    --member \"$PRINCIPAL\" --role roles/storage.objectAdmin\n")
+	fprintf(w, "  gcloud storage buckets add-iam-policy-binding gs://%s \\\n", bucket)
+	fprintf(w, "    --member \"$PRINCIPAL\" --role roles/storage.legacyBucketReader\n")
+	fprintf(w, "\nThe grant is on the BUCKET, not the project, and object access is\n")
+	fprintf(w, "separated from bucket reads so the keyholder cannot delete its own bucket.\n\n")
 }

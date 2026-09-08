@@ -275,7 +275,29 @@ func (r sealResult) Human(w io.Writer) error {
 
 // ---------------------------------------------------------------- unseal
 
-type storageUnsealCommand struct{}
+// keyholderPusher is the slice of *keyholder.Client the unseal loop uses. A
+// seam, like every other cloud-touching dependency in this package: without it
+// nothing could test what unseal records when a push fails, which is the
+// behaviour a keyholder without its bucket grant produces.
+type keyholderPusher interface {
+	Unseal(ctx context.Context, ordinal int, bundle []byte, intent string) (keyholder.State, error)
+}
+
+type storageUnsealCommand struct {
+	connect func(ctx context.Context, env *Env, name string) (keyholderPusher, func(), error)
+}
+
+func (c *storageUnsealCommand) ensureDefaults() {
+	if c.connect == nil {
+		c.connect = func(ctx context.Context, env *Env, name string) (keyholderPusher, func(), error) {
+			cl, done, err := keyholderClient(ctx, env, name)
+			if err != nil {
+				return nil, nil, err
+			}
+			return cl, done, nil
+		}
+	}
+}
 
 func (*storageUnsealCommand) Name() string     { return "unseal" }
 func (*storageUnsealCommand) Synopsis() string { return "Hand the keyholder its key material" }
@@ -300,11 +322,12 @@ and no way to make things worse.`)
 
 func (*storageUnsealCommand) SetFlags(*flag.FlagSet) {}
 
-func (*storageUnsealCommand) Run(ctx context.Context, env *Env, args []string) error {
+func (c *storageUnsealCommand) Run(ctx context.Context, env *Env, args []string) error {
 	if len(args) != 1 {
 		return usagef("storage unseal takes one instance argument")
 	}
 	name := args[0]
+	c.ensureDefaults()
 	meta, err := env.ConfigDir.LoadInstanceMetadata(name)
 	if err != nil {
 		return fmt.Errorf("load instance %q: %w", name, err)
@@ -320,7 +343,7 @@ func (*storageUnsealCommand) Run(ctx context.Context, env *Env, args []string) e
 	// anything without it, and finding that out before touching keys.yaml
 	// means a failed recovery leaves the most dangerous file in the system
 	// exactly as it was.
-	client, done, err := keyholderClient(ctx, env, name)
+	client, done, err := c.connect(ctx, env, name)
 	if err != nil {
 		return err
 	}
@@ -379,23 +402,51 @@ func (*storageUnsealCommand) Run(ctx context.Context, env *Env, args []string) e
 		}
 	}
 
+	// Record the generation only when a replica actually took it.
+	//
+	// It used to be written before the first push, so an unseal that failed on
+	// every replica still advanced the counter. The usual cause of that
+	// failure is the keyholder crash-looping without its bucket grant, which
+	// an operator retries — burning a generation each time and leaving the
+	// record describing a handover that never happened. Found on the Phase 4.4
+	// walk.
+	//
+	// Recording after the push can only leave the record BEHIND the cluster,
+	// which is the safe direction: 'farcast storage state' reads each replica's
+	// own generation, so a lagging record shows up there rather than hiding a
+	// replica that holds material nobody recorded.
+	var recordErr error
+	if loaded > 0 {
+		meta.Keyholder.Scope = scope.Name
+		meta.Keyholder.ScopePrefix = scope.Prefix
+		meta.Keyholder.Generation = generation
+		meta.UpdatedAt = time.Now().UTC()
+		recordErr = env.ConfigDir.SaveInstanceMetadata(name, meta)
+	}
+
 	if err := env.Printer.Print(unsealResult{
 		Instance: name, Scope: scope.Name, Generation: generation,
 		Loaded: loaded, Total: total, Replicas: states,
 	}); err != nil {
 		return err
 	}
+	if recordErr != nil {
+		return fmt.Errorf("the keyholder was unsealed at generation %d but recording it failed: %w",
+			generation, recordErr)
+	}
 	// A partial unseal is a failure, and the loaded replicas are NOT rolled
 	// back: undoing them would turn a transient network error into an outage.
 	return partialFailure("unseal", loaded, total)
 }
 
-// ensureScope returns the scope to push, minting and RECORDING it first if the
-// instance has none.
+// ensureScope returns the scope to push and the generation this unseal would
+// be, minting and RECORDING the scope first if the instance has none.
 //
-// The recording happens before any push, and that ordering is the point: key
-// material handed to a cluster but not written into keys.yaml is material
-// whose data nobody can ever find again.
+// The scope's recording happens before any push, and that ordering is the
+// point: key material handed to a cluster but not written into keys.yaml is
+// material whose data nobody can ever find again. The generation is different
+// — it describes a handover rather than key material — and is recorded by the
+// caller, after one has actually happened.
 func ensureScope(env *Env, name string, meta *config.InstanceMetadata, keys datasphere.Keyring) (datasphere.Scope, uint64, error) {
 	scope, ok := keys.ScopeNamed(DefaultScopeName)
 	if !ok {
@@ -419,14 +470,9 @@ func ensureScope(env *Env, name string, meta *config.InstanceMetadata, keys data
 		scope = fresh
 	}
 
-	generation := meta.Keyholder.Generation + 1
-	meta.Keyholder.Scope = scope.Name
-	meta.Keyholder.ScopePrefix = scope.Prefix
-	meta.Keyholder.Generation = generation
-	if err := env.ConfigDir.SaveInstanceMetadata(name, meta); err != nil {
-		return datasphere.Scope{}, 0, fmt.Errorf("recording the unseal generation: %w", err)
-	}
-	return scope, generation, nil
+	// The generation this unseal WOULD be. It is not recorded here: see the
+	// push loop, which records it only if a replica actually takes it.
+	return scope, meta.Keyholder.Generation + 1, nil
 }
 
 type unsealResult struct {

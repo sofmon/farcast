@@ -86,6 +86,32 @@ func (c *kernelDeployCommand) SetFlags(fs *flag.FlagSet) {
 	c.deployer.setYesFlag(fs, "skip the cost confirmation")
 }
 
+// existingNamespaces is the set of namespaces the instance actually has.
+func existingNamespaces(ctx context.Context, cl clusterApplier) (map[string]bool, error) {
+	have, err := cl.Namespaces(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list the instance's namespaces: %w", err)
+	}
+	set := make(map[string]bool, len(have))
+	for _, n := range have {
+		set[n] = true
+	}
+	return set, nil
+}
+
+// partitionByExistence splits names into those the cluster has and those it
+// does not, preserving order.
+func partitionByExistence(present map[string]bool, names []string) (have, missing []string) {
+	for _, n := range names {
+		if present[n] {
+			have = append(have, n)
+			continue
+		}
+		missing = append(missing, n)
+	}
+	return have, missing
+}
+
 func (c *kernelDeployCommand) Run(ctx context.Context, env *Env, args []string) error {
 	if len(args) != 1 {
 		return usagef("kernel deploy takes one instance argument")
@@ -111,17 +137,53 @@ func (c *kernelDeployCommand) Run(ctx context.Context, env *Env, args []string) 
 		return fmt.Errorf("instance %q has no cost limit recorded; the kernel would meter it and never act", name)
 	}
 
-	// The union of what was asked for and what is already metered.
+	// Settle the metered list against what the instance actually has, before
+	// anything is built.
 	//
-	// Seeding from --namespaces alone would silently drop every namespace
-	// `kernel meter` had added — so a routine redeploy (an image bump, a
-	// changed limit) would stop counting every application on the instance,
-	// and nothing would say so. Found on the 4.2 walk, immediately after
-	// fixing the gap that made the list matter at all.
-	namespaces := parseNamespaces(c.namespaces)
-	if meta.Kernel != nil {
-		namespaces = unionNamespaces(namespaces, meta.Kernel.Namespaces)
+	// deploy renders a RoleBinding into every metered namespace and the API
+	// server rejects one for a namespace that is not there — but it rejected
+	// it at the apply, which is after the kernel's image has been compiled and
+	// pushed into the instance's registry. On the Phase 4.4 walk a namespace
+	// that did not exist yet cost a build and a registry write before anything
+	// said so. One API call settles it here instead.
+	cl := c.deployer.newCluster(env.ConfigDir.InstanceKubeconfigPath(name))
+	present, err := existingNamespaces(ctx, cl)
+	if err != nil {
+		return err
 	}
+
+	// What --namespaces names is this operator's input for this run, so a name
+	// that does not exist is a mistake worth stopping for.
+	requested := parseNamespaces(c.namespaces)
+	if _, missing := partitionByExistence(present, requested); len(missing) > 0 {
+		return fmt.Errorf("cannot meter %s: no such namespace in this instance.\n"+
+			"The kernel binds a role in every namespace it meters, so each one has to exist before it "+
+			"deploys.\nCreate it with 'kubectl create namespace <name>', or deploy into it with "+
+			"'farcast run', which creates the namespace it is given.", strings.Join(missing, ", "))
+	}
+
+	// What is ALREADY metered is carried forward, because seeding from
+	// --namespaces alone would silently drop every namespace `kernel meter`
+	// had added — so a routine redeploy (an image bump, a changed limit) would
+	// stop counting every application on the instance, and nothing would say
+	// so. Found on the 4.2 walk, immediately after fixing the gap that made
+	// the list matter at all.
+	//
+	// A carried namespace that has since been deleted is dropped rather than
+	// refused. Refusing would mean an operator who removed an application
+	// namespace without 'kernel meter --remove' could no longer deploy the
+	// kernel at all — trading a defect for a worse one. Nothing runs in a
+	// namespace that does not exist, so dropping it cannot under-meter
+	// anything; it is said out loud so the list does not shrink silently.
+	namespaces := requested
+	if meta.Kernel != nil {
+		kept, gone := partitionByExistence(present, meta.Kernel.Namespaces)
+		for _, n := range gone {
+			fprintf(env.Err, "no longer metering %q: the namespace does not exist in this instance any more.\n", n)
+		}
+		namespaces = unionNamespaces(namespaces, kept)
+	}
+
 	ok, err := c.confirmCost(env, meta, namespaces)
 	if err != nil {
 		return err
@@ -178,7 +240,6 @@ func (c *kernelDeployCommand) Run(ctx context.Context, env *Env, args []string) 
 		return fmt.Errorf("record the kernel before deploying it: %w", err)
 	}
 
-	cl := c.deployer.newCluster(env.ConfigDir.InstanceKubeconfigPath(name))
 	if isInteractive(env) || env.Verbose {
 		fprintf(env.Err, "Deploying the kernel to %q…\n", name)
 	}

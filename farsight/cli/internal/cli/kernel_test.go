@@ -22,7 +22,88 @@ func testKernelDeploy(fc *fakeCluster, b imageBuilder) *kernelDeployCommand {
 	c.deployer.newBuilder = func(func(string)) imageBuilder { return b }
 	c.deployer.newCluster = func(string) clusterApplier { return fc }
 	c.deployer.findSource = func(string) (string, error) { return "/checkouts/farcast", nil }
+	// deploy refuses to meter a namespace that does not exist, so the ones
+	// these tests meter have to be in the cluster. A test that wants the
+	// refusal sets this itself.
+	if fc.namespaces == nil {
+		fc.namespaces = []string{"farcast-system", "farcast-apps"}
+	}
 	return c
+}
+
+// A namespace that does not exist is caught before anything is built.
+//
+// deploy renders a RoleBinding into every metered namespace, and the API
+// server rejects one for a namespace that is not there. It used to reject it
+// at the apply — after the kernel's image had been compiled and pushed into
+// the instance's registry — so on the Phase 4.4 walk a mistyped namespace cost
+// a build and a registry write before anything said so.
+func TestKernelDeployRefusesAMissingNamespaceBeforeBuilding(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	connectedInstance(t, dir, "p44")
+	env, _ := testEnv(dir, output.ModeHuman)
+
+	fc := &fakeCluster{namespaces: []string{tcdeploy.DefaultNamespace}}
+	b := &fakeBuilder{}
+	c := testKernelDeploy(fc, b)
+	c.namespaces = tcdeploy.DefaultNamespace + ",not-there,also-missing"
+
+	err := c.Run(context.Background(), env, []string{"p44"})
+	if err == nil {
+		t.Fatal("deploy accepted a namespace the instance does not have")
+	}
+	// Both, not just the first: an operator who mistyped twice should not have
+	// to run again to learn about the second one.
+	for _, want := range []string{"not-there", "also-missing"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not name %q:\n%v", want, err)
+		}
+	}
+	if len(b.built) != 0 {
+		t.Errorf("a refused deploy built and pushed an image anyway: %v", b.built)
+	}
+	if len(fc.applied) != 0 {
+		t.Errorf("a refused deploy applied %d manifests", len(fc.applied))
+	}
+	meta, lerr := dir.LoadInstanceMetadata("p44")
+	if lerr != nil {
+		t.Fatal(lerr)
+	}
+	if meta.Kernel != nil {
+		t.Error("a refused deploy recorded a kernel")
+	}
+}
+
+// But an already-metered namespace that has since been deleted is dropped, not
+// refused. Refusing would mean an operator who removed an application
+// namespace without 'kernel meter --remove' could never deploy the kernel
+// again — a worse failure than the one being fixed.
+func TestKernelDeployDropsAMeteredNamespaceThatIsGone(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	meteredInstance(t, dir, "p44", tcdeploy.DefaultNamespace, "deleted-app")
+	env, _, errOut := testEnvBoth(dir, output.ModeHuman)
+
+	// The application namespace is gone from the cluster; the record still has it.
+	fc := &fakeCluster{namespaces: []string{tcdeploy.DefaultNamespace}}
+	c := testKernelDeploy(fc, &fakeBuilder{})
+	c.namespaces = tcdeploy.DefaultNamespace
+
+	if err := c.Run(context.Background(), env, []string{"p44"}); err != nil {
+		t.Fatalf("a deleted namespace blocked the redeploy: %v", err)
+	}
+	meta, lerr := dir.LoadInstanceMetadata("p44")
+	if lerr != nil {
+		t.Fatal(lerr)
+	}
+	for _, n := range meta.Kernel.Namespaces {
+		if n == "deleted-app" {
+			t.Error("kept metering a namespace that no longer exists")
+		}
+	}
+	// And it did not shrink the list silently.
+	if !strings.Contains(errOut.String(), "deleted-app") {
+		t.Errorf("dropping a metered namespace was not reported:\n%s", errOut.String())
+	}
 }
 
 func TestKernelDeployAppliesTheWorkloadAndRecordsIt(t *testing.T) {

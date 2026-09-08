@@ -347,6 +347,27 @@ func (c *Client) ConfigMapValue(ctx context.Context, namespace, name, key string
 	return value, true, nil
 }
 
+// Namespaces lists every namespace in the cluster.
+//
+// The whole list rather than a membership test per name: callers use it to
+// refuse before doing expensive work, and an operator who mistyped two names
+// should be told about both in one go.
+func (c *Client) Namespaces(ctx context.Context) ([]string, error) {
+	out, err := c.runner.Run(ctx, nil, "get", "namespace", "-o", "name")
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		names = append(names, strings.TrimPrefix(line, "namespace/"))
+	}
+	return names, nil
+}
+
 // Logs writes a workload's logs to w, optionally following them.
 func (c *Client) Logs(ctx context.Context, out io.Writer, namespace, target string, lines int, follow, previous bool) error {
 	args := []string{"logs", "-n", namespace, target, fmt.Sprintf("--tail=%d", lines), "--all-containers=true"}

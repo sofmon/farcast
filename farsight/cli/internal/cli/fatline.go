@@ -53,6 +53,9 @@ type clusterApplier interface {
 	Apply(ctx context.Context, manifests []byte) error
 	RolloutStatus(ctx context.Context, namespace, name string, timeout time.Duration) error
 	WaitExternalIP(ctx context.Context, namespace, name string, timeout time.Duration) (string, error)
+	// Namespaces is here so a command can check what it is about to render
+	// into before it builds anything (see kernel deploy).
+	Namespaces(ctx context.Context) ([]string, error)
 }
 
 // imageBuilder is the slice of *image.Builder these commands need (injectable):
