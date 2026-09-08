@@ -58,8 +58,8 @@ The two non-negotiable pillars of FarCast are: (1) security/privacy, (2) cost co
 **Sofmon FarCast** is the full product name, following the "Microsoft Windows" pattern. In casual use, people say "FarCast". In official/formal contexts, use "Sofmon FarCast".
 
 **Domain strategy:**
-- `sofmon.com` — the company hub. Developer docs, SDK references, marketplace, source code. FarCast lives at `sofmon.com/farcast`, not at the root. Leave room for other Sofmon projects.
-- `farcast.one` — the first living FarCast instance. Not a marketing page — it's an actual FarCast instance running on itself. Proof that the OS works.
+- `sofmon.com` — the company hub. Developer docs, SDK references, marketplace, source code. FarCast lives at `sofmon.com/farcast`, not at the root. Leave room for other Sofmon projects. **Not published yet:** the README links the company root, `www.sofmon.com`, because the `/farcast` subpath does not exist — that is a not-yet, not a change of strategy, and the link moves to the subpath when it is live.
+- `farcast.one` — the first living FarCast instance. Not a marketing page — it's an actual FarCast instance running on itself. Proof that the OS works. **Pending:** no instance is deployed there yet, and the README says so rather than linking a promise.
 
 **Go module paths** use `github.com/sofmon/farcast/...` to reflect the company ownership.
 

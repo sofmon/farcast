@@ -4,7 +4,25 @@
 
 FarCast is a cloud-native operating system by [Sofmon](https://sofmon.com). It treats cloud infrastructure as its hardware — no dedicated machines, no fixed location. A FarCast instance is a **private sovereign space** that lives within the public cloud universe, owned and controlled exclusively by its operator.
 
-**[sofmon.com/farcast](https://sofmon.com/farcast)** · **[farcast.one](https://farcast.one)** *(the first FarCast instance)*
+**[www.sofmon.com](https://www.sofmon.com)** · **[farcast.one](https://farcast.one)** *(the first FarCast instance — pending)*
+
+### Build progress
+
+Phase 4 of 8 · **16 of 35 sections complete**
+
+```
+Phase 0  Foundation                     ████████████████████  3/3 ✅
+Phase 1  Install                        ████████████████████  4/4 ✅
+Phase 2  Networking & security boundary ████████████████████  3/3 ✅
+Phase 3  Storage                        ████████████████████  3/3 ✅
+Phase 4  Run applications               ███████████████·····  3/4 🟨
+Phase 5  Intelligent resources          ····················  0/4
+Phase 6  AI layer                       ····················  0/4
+Phase 7  FarSight GUI                   ····················  0/5
+Phase 8  Multi-provider & hardening     ····················  0/5
+```
+
+Phases 1–4 are **validated live against real cloud infrastructure**, not only unit-tested — each against a [runbook](docs/runbooks/) walked end to end, with the defects it found recorded. See [PLAN.md](PLAN.md) for what each section contains and where it stands.
 
 ---
 
@@ -309,7 +327,7 @@ farcast redeploy my-instance
 farcast release my-instance
 ```
 
-*Implemented today: `install`, `connect`, `redeploy`, `release` (plus `version` and `help`). `run`, `ps`, and `costs` are registered but stubbed until Phase 4.*
+*Implemented today: `install`, `connect`, `redeploy`, `release`, `storage`, `kernel`, `toolchain`, `build`, `run`, `ps`, `logs` and `costs` (plus `version` and `help`). Only `chat` is still a stub, waiting on Phase 6.2.*
 
 Full CLI reference → [`farsight/cli/README.md`](farsight/cli/README.md)
 
@@ -341,18 +359,25 @@ Each module folder contains its own `README.md` with:
 
 ## Status
 
-> This project is in early development. Phases 0–2 are implemented, and Phase 3.1 with them. Phase 0 (foundation): the manifest parser and the Go SDK (core interfaces + logging). Phase 1 (provisioning): the FarSight CLI with `install`/`release`, driving Planck's GKE Autopilot provider with a private control plane — and giving every instance its own container image registry, created at install and deleted at release. Phase 2 (connection): FatLine's core proxy (mTLS tunnel, deny-by-default egress), Shrike's policy engine, and `farcast connect`, which builds FatLine's image from a local checkout with the Go toolchain, pushes it to that registry, and deploys it pinned by digest — no container engine anywhere. Phase 3 storage has landed apart from the SDK wiring: DataSphere's encrypting store, both blob formats (buffered and chunked-streaming), the operator-held keyring and the GCS adapter — 3.1 validated live against GCP, the provider holding only opaque name tokens and ciphertext — plus 3.3's `farcast storage` commands, keyring lifecycle and data-gated teardown, also validated live. The remaining modules are in specification.
+> Phases 0 through 3 are complete, and Phase 4 is three sections of four. The lifecycle works end to end and is **validated against real cloud infrastructure**, not only unit tests.
+>
+> **Phase 0–1 (foundation and provisioning):** the manifest parser, the Go SDK, and the FarSight CLI driving Planck's GKE Autopilot provider behind a private control plane, with a mandatory cost limit and an image registry of the instance's own.
+> **Phase 2 (the boundary):** FatLine's mTLS tunnel and deny-by-default egress, Shrike's policy engine, and `farcast connect`, which compiles FatLine's image locally with the Go toolchain and deploys it pinned by digest — no container engine anywhere.
+> **Phase 3 (storage):** DataSphere's encrypting store, both blob formats, the operator-held keyring, the GCS adapter, and the in-cluster keyholder that never receives the master key. The provider holds opaque name tokens and ciphertext, confirmed independently with `gcloud`.
+> **Phase 4 (running applications):** the kernel meters spending on two signals and enforces the limit; a `./farcast` manifest becomes workloads; and `farcast run` reads a repository **inside the instance**, shows the operator what it declares, builds it there and deploys it — so deploying does not depend on the machine you happen to be sitting at.
+>
+> What remains in Phase 4 is 4.4: external declarations are reviewed per application and still enforced per instance. Phases 5–8 are in specification.
 
 | Module | Spec | Implementation |
 |---|---|---|
-| TechnoCore | 🔲 Draft | 🔲 Not started |
-| Planck | 🟡 In progress | 🟡 GKE Autopilot provider (create/destroy), instance image registry |
-| FatLine | 🟡 In progress | 🟡 Core proxy: mTLS tunnel, deny-by-default egress |
-| DataSphere | 🟡 In progress | 🟡 Encrypting store, blob formats v1+v2, keyring, GCS adapter (3.1 validated live, 3.3 done) |
-| Shrike | 🟡 In progress | 🟡 Policy engine |
+| TechnoCore | 🟡 In progress | 🟡 Kernel, two-signal cost ledger, protective shutdown (adaptive scaling is Phase 5) |
+| Planck | 🟡 In progress | 🟡 GKE Autopilot provider, instance image registry, manifest→workload translator, in-instance build and manifest read |
+| FatLine | 🟡 In progress | 🟡 Core proxy: mTLS tunnel, deny-by-default egress (per-application allowlists are 4.4) |
+| DataSphere | 🟡 In progress | 🟡 Encrypting store, blob formats v1+v2, keyring, GCS adapter, in-cluster keyholder |
+| Shrike | 🟡 In progress | 🟡 Policy engine (per-application enforcement is 4.4) |
 | AllThing | 🔲 Draft | 🔲 Not started |
-| FarSight | 🟡 In progress | 🟡 CLI: `install`, `release`, `connect`, `redeploy`, `storage`; engine-less image build |
-| SDK | 🟡 In progress | 🟡 Go: logging live, interfaces stubbed |
+| FarSight | 🟡 In progress | 🟡 CLI: the full `install → connect → run → release` lifecycle, plus `storage`, `kernel`, `toolchain`, `ps`, `logs`, `costs`; engine-less image build (GUI is Phase 7) |
+| SDK | 🟡 In progress | 🟡 Go: logging and storage live; config, secrets and AI are Phases 5–6 |
 | Manifest Spec | ✅ Complete | ✅ Parser + tests |
 
 *Legend: ✅ complete · 🟡 in progress · 🔲 draft / not started.*
@@ -371,4 +396,4 @@ TimeTomb will provide point-in-time snapshots of an entire FarCast instance — 
 
 ---
 
-*Sofmon FarCast — [sofmon.com/farcast](https://sofmon.com/farcast)*
+*Sofmon FarCast — [www.sofmon.com](https://www.sofmon.com)*
