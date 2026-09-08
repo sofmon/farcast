@@ -76,14 +76,16 @@ This is the visible proof of 2.1 (deny-by-default egress) + 2.2 (Shrike monitors
 and alerts) wired together — no cloud, no mTLS tunnel, just the egress plane and
 the sidecar event wire.
 
-> **⚠️ Part A's FatLine invocation is superseded by Phase 4.4 and does not run as written.**
-> FatLine no longer takes `--manifest`; it takes `--policy`, a per-application egress
-> document ([ADR 0013](../adr/0013-per-application-egress-identity.md)), and a caller it
-> cannot identify by credential is refused with `407` rather than checked against a shared
-> allowlist. Shrike's `--manifest` is unchanged. Rewriting Part A for per-application
-> identity is open work; until then the per-application boundary is covered by
-> [the 4.4 runbook](phase-4-4-validation.md), which walks it against a real instance.
-> Discovered by auditing PLAN.md after the 4.4 walk, on 2026-09-08.
+Since [Phase 4.4](phase-4-4-validation.md), FatLine is identified **per
+application** ([ADR 0013](../adr/0013-per-application-egress-identity.md)): it
+reads a policy document rather than a manifest, and an application is whoever
+holds the credential whose SHA-256 that document names. So this section runs
+**two** applications — `web`, which declares a host, and `worker`, which
+declares none — because the property worth showing is that one cannot use the
+other's declaration.
+
+Shrike still takes the manifest. Its job is to know what was *declared*, which
+is a different question from who is *asking*.
 
 ```bash
 TMP=$(mktemp -d)
@@ -98,26 +100,56 @@ apps:
         reason: payments
 EOF
 
+# A credential per application, and the policy that names their hashes.
+sha256_hex() { if command -v shasum >/dev/null 2>&1; then shasum -a 256 | cut -d' ' -f1; else sha256sum | cut -d' ' -f1; fi; }
+WEB_CRED=$(openssl rand -hex 32)
+WORKER_CRED=$(openssl rand -hex 32)
+cat > "$TMP/policy.json" <<EOF
+{
+  "version": 1,
+  "apps": [
+    { "name": "web", "namespace": "validate",
+      "credential_sha256": "$(printf '%s' "$WEB_CRED" | sha256_hex)",
+      "external": [ { "host": "api.stripe.com", "reason": "payments" } ] },
+    { "name": "worker", "namespace": "validate",
+      "credential_sha256": "$(printf '%s' "$WORKER_CRED" | sha256_hex)" }
+  ]
+}
+EOF
+
 # Start Shrike (declared policy from the manifest; status on :18132):
 ./bin/shrike --socket "$SOCK" --manifest "$TMP/sample-manifest.yaml" --status-listen 127.0.0.1:18132 &
 SHRIKE_PID=$!
 
 # Start FatLine's egress proxy, shipping decisions to the Shrike socket:
-./bin/fatline --egress-listen 127.0.0.1:18131 --manifest "$TMP/sample-manifest.yaml" --shrike-socket "$SOCK" &
+./bin/fatline --egress-listen 127.0.0.1:18131 --policy "$TMP/policy.json" --shrike-socket "$SOCK" &
 FATLINE_PID=$!
 sleep 1
 ```
 
-Drive traffic through the proxy and watch the boundary act:
+Drive traffic through the proxy and watch the boundary act. The credential rides
+as proxy userinfo, which every standard client turns into a
+`Proxy-Authorization` header on its own — that is what lets identity change
+without the application changing:
 
 ```bash
+WEB="http://web:$WEB_CRED@127.0.0.1:18131"
+WORKER="http://worker:$WORKER_CRED@127.0.0.1:18131"
+ANON="http://127.0.0.1:18131"
+
 # DENIED — undeclared host (deny-by-default), repeated to exercise de-dup:
-for i in 1 2 3; do curl -s -o /dev/null -x http://127.0.0.1:18131 https://evil.example.com --max-time 3; done
+for i in 1 2 3; do curl -s -o /dev/null -x "$WEB" https://evil.example.com --max-time 3; done
 # DENIED — cleartext http to a declared host (confidentiality is part of deny-by-default):
-curl -s -o /dev/null -x http://127.0.0.1:18131 http://api.stripe.com --max-time 3
+curl -s -o /dev/null -x "$WEB" http://api.stripe.com --max-time 3
 # ALLOWED — a declared host (the CONNECT is permitted; the upstream dial may or may
 # not complete depending on your network, but FatLine emits the allow):
-curl -s -o /dev/null -x http://127.0.0.1:18131 https://api.stripe.com --max-time 5
+curl -s -o /dev/null -x "$WEB" https://api.stripe.com --max-time 5
+# DENIED — no credential at all: FatLine cannot say who is asking, so there is
+# nothing to check the request against. Distinct from "you may not go there".
+curl -s -o /dev/null -x "$ANON" https://api.stripe.com --max-time 3
+# DENIED — worker asking for the host WEB declared, under its own identity.
+# This is the property 4.4 exists for, and it is visible without a cluster.
+curl -s -o /dev/null -x "$WORKER" https://api.stripe.com --max-time 3
 sleep 1
 
 echo "=== Shrike security picture ==="
@@ -126,12 +158,22 @@ curl -s http://127.0.0.1:18132/_shrike/status   # | python3 -m json.tool
 
 ✅ Expect the Shrike status JSON to show:
 - `declared: ["api.stripe.com"]`,
-- a **`warning`** violation for `evil.example.com` with **`count: 3`** (the three
-  denials de-duplicated into one class),
+- a **`warning`** violation for `evil.example.com` with **`count: 3`** and
+  **`"app": "web"`** (the three denials de-duplicated into one class),
 - an **`info`** violation for the cleartext attempt (`cleartext_not_allowed`),
-- `api.stripe.com` under `allowed` (it was permitted).
+  also attributed to `web`,
+- `api.stripe.com` under `allowed` (it was permitted),
+- a **`warning`** violation with reason **`unknown_app`** and **no** `app` field
+  — an unidentified caller has no application to name,
+- a **`warning`** violation with reason `not_in_allowlist` and **`"app": "worker"`**
+  for `api.stripe.com` — the same host `web` is allowed to reach.
 
-Shrike's stderr should carry matching alert lines (`WARN … policy violation …`).
+The last two are what per-application enforcement looks like from the outside:
+two applications denied the same host are two entries, not one.
+
+Shrike's stderr should carry matching alert lines, each naming the application
+(`WARN … policy violation … app=web …`). Curl exits non-zero on the denied
+calls by design — the proof is the Shrike picture, not curl's exit code.
 
 Clean up:
 
