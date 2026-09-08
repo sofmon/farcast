@@ -201,7 +201,11 @@ func storageProviderFor(meta *config.InstanceMetadata) (string, error) {
 // conflict by minting another — but only while the record is still just an
 // intent.
 func ensureBucket(ctx context.Context, opt Options, meta *config.InstanceMetadata, provider datasphere.Provider, providerName string, session *Session) error {
-	if meta.Storage == nil {
+	// An empty bucket name counts as no storage. mintAndRecord always sets
+	// both, so a half-written record should not exist — but treating it as
+	// present would hand every Store an empty bucket name and push the failure
+	// out to the provider, where it reads as a cloud problem.
+	if meta.Storage == nil || meta.Storage.Bucket == "" {
 		if !opt.Mint {
 			return fmt.Errorf("instance %q has no storage yet; a command that writes will create it", opt.Instance)
 		}
@@ -311,6 +315,32 @@ func openKeyring(opt Options, session *Session) error {
 		keyring, err := datasphere.NewKeyring()
 		if err != nil {
 			return err
+		}
+		// The application scope is minted WITH the keyring, not later at the
+		// first unseal.
+		//
+		// It used to arrive at unseal, which left a window: until then nothing
+		// owned "app/", so anything written there landed in the master key
+		// space — and the scope, once minted, took ownership of the prefix and
+		// those objects stopped being reachable by their own names. The Phase
+		// 4.3 walk fell into exactly that, because the documented way to mint a
+		// bucket was to write an object and "app/" is the documented place to
+		// write one.
+		//
+		// Closing the window is better than detecting the collision. Unseal
+		// deliberately touches no cloud — recovery must not depend on the
+		// provider being reachable or on this machine holding credentials —
+		// so an unseal-time check would either break that property or be a
+		// check that silently skips itself. Minting here needs neither: the
+		// scope exists before any write can happen, so there is nothing to
+		// collide with.
+		scope, err := datasphere.NewScope(datasphere.DefaultScopeName, datasphere.DefaultScopePrefix)
+		if err != nil {
+			return err
+		}
+		keyring, err = keyring.AddScope(scope)
+		if err != nil {
+			return fmt.Errorf("mint the %q scope for %q: %w", datasphere.DefaultScopeName, opt.Instance, err)
 		}
 		data, err := keyring.Marshal()
 		if err != nil {

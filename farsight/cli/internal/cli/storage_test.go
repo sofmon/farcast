@@ -21,6 +21,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -247,6 +248,35 @@ func newDataEnv(t *testing.T, mode output.Mode) (*Env, *bytes.Buffer, *bytes.Buf
 
 // dataStore resolves the instance's Store through the CLI's own composition
 // root, minting the keyring on first use exactly as cp does.
+// dataSession opens the instance's storage the way a command does, so a
+// fixture routes each key to the key space that owns it.
+//
+// Reading an "app/" key through the MASTER store is what these helpers used to
+// do, and it was right only while nothing owned that prefix. The application
+// scope is now minted with the keyring, so "app/" belongs to it from the first
+// write — which is the whole point of the fix — and a fixture that bypasses
+// the routing tests something the CLI never does.
+func dataSession(t *testing.T, env *Env) *storage.Session {
+	t.Helper()
+	session, err := storage.Open(context.Background(), storage.Options{
+		Dir: env.ConfigDir, Instance: "prod", Mint: true,
+	})
+	if err != nil {
+		t.Fatalf("open storage: %v", err)
+	}
+	return session
+}
+
+// spaceFor is the fixture's routing: the key space that owns this key.
+func spaceFor(t *testing.T, session *storage.Session, key string) *datasphere.Store {
+	t.Helper()
+	store, err := session.StoreFor(key)
+	if err != nil {
+		t.Fatalf("StoreFor(%q): %v", key, err)
+	}
+	return store
+}
+
 func dataStore(t *testing.T, env *Env) *datasphere.Store {
 	t.Helper()
 	session, err := storage.Open(context.Background(), storage.Options{
@@ -261,41 +291,50 @@ func dataStore(t *testing.T, env *Env) *datasphere.Store {
 // seedData writes objects the way cp does — through the chunked streaming
 // path, not the buffered one — so what the tests list, read and delete is
 // shaped like what the CLI itself would have left behind.
-func seedData(t *testing.T, store *datasphere.Store, objects map[string][]byte) {
+func seedData(t *testing.T, session *storage.Session, objects map[string][]byte) {
 	t.Helper()
 	for key, data := range objects {
-		if err := store.WriteStream(context.Background(), key, bytes.NewReader(data)); err != nil {
+		if err := spaceFor(t, session, key).WriteStream(context.Background(), key, bytes.NewReader(data)); err != nil {
 			t.Fatalf("seed %q: %v", key, err)
 		}
 	}
 }
 
-func storedNameFor(t *testing.T, store *datasphere.Store, key string) string {
+func storedNameFor(t *testing.T, session *storage.Session, key string) string {
 	t.Helper()
-	stored, err := store.StoredName(key)
+	stored, err := spaceFor(t, session, key).StoredName(key)
 	if err != nil {
 		t.Fatalf("StoredName(%q): %v", key, err)
 	}
 	return stored
 }
 
-func readStored(t *testing.T, store *datasphere.Store, key string) string {
+func readStored(t *testing.T, session *storage.Session, key string) string {
 	t.Helper()
-	data, err := store.Read(context.Background(), key)
+	data, err := spaceFor(t, session, key).Read(context.Background(), key)
 	if err != nil {
 		t.Fatalf("read %q: %v", key, err)
 	}
 	return string(data)
 }
 
-// storedKeys is what the bucket holds, read through a Store rather than
+// storedKeys is what the bucket holds, read through the Stores rather than
 // through `ls`, so a test never checks a command against itself.
-func storedKeys(t *testing.T, store *datasphere.Store, prefix string) []string {
+//
+// It spans every key space, because an instance's storage is not one: a
+// fixture that consulted only the master keyring would report an application's
+// objects as absent, which is the same blind spot the CLI itself had to fix.
+func storedKeys(t *testing.T, session *storage.Session, prefix string) []string {
 	t.Helper()
-	keys, err := store.List(context.Background(), prefix)
+	entries, _, err := listAcrossScopes(context.Background(), session, prefix)
 	if err != nil {
 		t.Fatalf("list %q: %v", prefix, err)
 	}
+	keys := make([]string, 0, len(entries))
+	for _, e := range entries {
+		keys = append(keys, e.Key)
+	}
+	sort.Strings(keys)
 	return keys
 }
 
@@ -452,7 +491,7 @@ func TestStorageInstanceOperandAcceptsABareName(t *testing.T) {
 
 func TestStorageLsSortsAndSummarizes(t *testing.T) {
 	env, out, _, _, _ := newDataEnv(t, output.ModeHuman)
-	seedData(t, dataStore(t, env), map[string][]byte{
+	seedData(t, dataSession(t, env), map[string][]byte{
 		"zz.bin":             []byte("z"),
 		"app/reports/q3.csv": []byte("three"),
 		"app/reports/q1.csv": []byte("one"),
@@ -492,7 +531,7 @@ func TestStorageLsSortsAndSummarizes(t *testing.T) {
 
 func TestStorageLsLongShowsSizes(t *testing.T) {
 	env, out, _, _, _ := newDataEnv(t, output.ModeHuman)
-	seedData(t, dataStore(t, env), map[string][]byte{"app/notes.txt": []byte("notes")})
+	seedData(t, dataSession(t, env), map[string][]byte{"app/notes.txt": []byte("notes")})
 
 	cmd := &storageLsCommand{long: true}
 	if err := cmd.Run(context.Background(), env, []string{"prod:"}); err != nil {
@@ -515,8 +554,8 @@ func TestStorageLsLongShowsSizes(t *testing.T) {
 func TestStorageLsTokensRevealNothingOfTheKey(t *testing.T) {
 	env, out, _, _, f := newDataEnv(t, output.ModeHuman)
 	const key = "app/reports/q3.csv"
-	store := dataStore(t, env)
-	seedData(t, store, map[string][]byte{key: []byte("payload")})
+	session := dataSession(t, env)
+	seedData(t, session, map[string][]byte{key: []byte("payload")})
 
 	cmd := &storageLsCommand{tokens: true}
 	if err := cmd.Run(context.Background(), env, []string{"prod:"}); err != nil {
@@ -535,7 +574,7 @@ func TestStorageLsTokensRevealNothingOfTheKey(t *testing.T) {
 	}
 	assertNothingInCommon(t, key, stored)
 	// And it is genuinely the name the cloud holds, not a decoration.
-	if want := storedNameFor(t, store, key); stored != want {
+	if want := storedNameFor(t, session, key); stored != want {
 		t.Errorf("--tokens printed %q, but the object is stored at %q", stored, want)
 	}
 	if _, err := f.Get(context.Background(), dataBucket, stored); err != nil {
@@ -558,7 +597,7 @@ func assertNothingInCommon(t *testing.T, logical, stored string) {
 
 func TestStorageLsJSON(t *testing.T) {
 	env, out, _, _, _ := newDataEnv(t, output.ModeJSON)
-	seedData(t, dataStore(t, env), map[string][]byte{
+	seedData(t, dataSession(t, env), map[string][]byte{
 		"app/notes.txt": []byte("notes"),
 		"app/other.txt": []byte("other"),
 		"zz.bin":        []byte("z"),
@@ -664,7 +703,7 @@ func TestStorageCpRoundTrip(t *testing.T) {
 	if !strings.Contains(out.String(), "uploaded 1 object") {
 		t.Errorf("upload result = %q", out.String())
 	}
-	if got := readStored(t, dataStore(t, env), "app/reports/q3.csv"); got != string(payload) {
+	if got := readStored(t, dataSession(t, env), "app/reports/q3.csv"); got != string(payload) {
 		t.Fatalf("stored %q, want %q", got, payload)
 	}
 
@@ -712,7 +751,7 @@ func TestStorageCpStreamsLargePayloads(t *testing.T) {
 	if f.putStreams != 1 || f.puts != 0 {
 		t.Errorf("the cloud saw %d streamed and %d buffered writes, want 1 and 0", f.putStreams, f.puts)
 	}
-	stored, err := f.Get(context.Background(), dataBucket, storedNameFor(t, dataStore(t, env), "archive/big.bin"))
+	stored, err := f.Get(context.Background(), dataBucket, storedNameFor(t, dataSession(t, env), "archive/big.bin"))
 	if err != nil {
 		t.Fatalf("stored object: %v", err)
 	}
@@ -731,8 +770,8 @@ func TestStorageCpStreamsLargePayloads(t *testing.T) {
 
 func TestStorageCpRefusesToOverwriteRemote(t *testing.T) {
 	env, out, _, _, _ := newDataEnv(t, output.ModeHuman)
-	store := dataStore(t, env)
-	seedData(t, store, map[string][]byte{"app/q3.csv": []byte("first")})
+	session := dataSession(t, env)
+	seedData(t, session, map[string][]byte{"app/q3.csv": []byte("first")})
 	src := filepath.Join(t.TempDir(), "q3.csv")
 	writeLocalFile(t, src, []byte("second"))
 
@@ -743,7 +782,7 @@ func TestStorageCpRefusesToOverwriteRemote(t *testing.T) {
 	if !strings.Contains(err.Error(), "already exists") || !strings.Contains(err.Error(), "--force") {
 		t.Errorf("err = %v, want what is there and the way past it", err)
 	}
-	if got := readStored(t, store, "app/q3.csv"); got != "first" {
+	if got := readStored(t, session, "app/q3.csv"); got != "first" {
 		t.Fatalf("the object changed under a refusal: %q", got)
 	}
 
@@ -751,7 +790,7 @@ func TestStorageCpRefusesToOverwriteRemote(t *testing.T) {
 	if err := (&storageCpCommand{skipExisting: true}).Run(context.Background(), env, []string{src, "prod:app/q3.csv"}); err != nil {
 		t.Fatalf("--skip-existing: %v", err)
 	}
-	if got := readStored(t, store, "app/q3.csv"); got != "first" {
+	if got := readStored(t, session, "app/q3.csv"); got != "first" {
 		t.Errorf("--skip-existing overwrote the object: %q", got)
 	}
 	if !strings.Contains(out.String(), "uploaded 0 object") || !strings.Contains(out.String(), "skipped 1") {
@@ -762,14 +801,14 @@ func TestStorageCpRefusesToOverwriteRemote(t *testing.T) {
 	if err := (&storageCpCommand{force: true}).Run(context.Background(), env, []string{src, "prod:app/q3.csv"}); err != nil {
 		t.Fatalf("--force: %v", err)
 	}
-	if got := readStored(t, store, "app/q3.csv"); got != "second" {
+	if got := readStored(t, session, "app/q3.csv"); got != "second" {
 		t.Errorf("--force left %q, want the new bytes", got)
 	}
 }
 
 func TestStorageCpRefusesToOverwriteLocal(t *testing.T) {
 	env, out, _, _, _ := newDataEnv(t, output.ModeHuman)
-	seedData(t, dataStore(t, env), map[string][]byte{"app/q3.csv": []byte("remote")})
+	seedData(t, dataSession(t, env), map[string][]byte{"app/q3.csv": []byte("remote")})
 	dst := filepath.Join(t.TempDir(), "q3.csv")
 	writeLocalFile(t, dst, []byte("mine"))
 
@@ -862,16 +901,16 @@ func TestStorageCpOperandUsageErrors(t *testing.T) {
 // worse than no file at all.
 func TestStorageCpDownloadLeavesNoPartialFile(t *testing.T) {
 	env, _, _, _, f := newDataEnv(t, output.ModeHuman)
-	store := dataStore(t, env)
+	session := dataSession(t, env)
 	payload := framedPayload()
-	seedData(t, store, map[string][]byte{"archive/big.bin": payload})
-	f.corrupt(t, storedNameFor(t, store, "archive/big.bin"))
+	seedData(t, session, map[string][]byte{"archive/big.bin": payload})
+	f.corrupt(t, storedNameFor(t, session, "archive/big.bin"))
 
 	// The damage really is late: the reader emits most of the object before it
 	// reaches the frame that fails. That is what makes staging load-bearing
 	// rather than tidy, and without it this test would prove nothing.
 	var counted countingSink
-	if err := store.ReadStream(context.Background(), "archive/big.bin", &counted); err == nil {
+	if err := spaceFor(t, session, "archive/big.bin").ReadStream(context.Background(), "archive/big.bin", &counted); err == nil {
 		t.Fatal("a corrupt object read clean")
 	}
 	if counted.n == 0 {
@@ -921,7 +960,7 @@ func TestStorageCpRecursiveDownloadStaysInsideTheDestination(t *testing.T) {
 	for _, key := range escapes {
 		objects[key] = []byte("ESCAPED")
 	}
-	seedData(t, dataStore(t, env), objects)
+	seedData(t, dataSession(t, env), objects)
 
 	base := t.TempDir()
 	root := filepath.Join(base, "out")
@@ -1018,8 +1057,8 @@ func TestStorageStoreRefusesALeadingSlashKey(t *testing.T) {
 
 func TestStorageRmOneKey(t *testing.T) {
 	env, out, _, _, _ := newDataEnv(t, output.ModeHuman)
-	store := dataStore(t, env)
-	seedData(t, store, map[string][]byte{"a/1": []byte("1"), "a/2": []byte("2")})
+	session := dataSession(t, env)
+	seedData(t, session, map[string][]byte{"a/1": []byte("1"), "a/2": []byte("2")})
 
 	if err := (&storageRmCommand{}).Run(context.Background(), env, []string{"prod:a/1"}); err != nil {
 		t.Fatalf("Run: %v", err)
@@ -1027,7 +1066,7 @@ func TestStorageRmOneKey(t *testing.T) {
 	if !strings.Contains(out.String(), "deleted 1 object") || !strings.Contains(out.String(), "final") {
 		t.Errorf("result = %q, want the count and the finality", out.String())
 	}
-	if remaining := storedKeys(t, store, ""); len(remaining) != 1 || remaining[0] != "a/2" {
+	if remaining := storedKeys(t, session, ""); len(remaining) != 1 || remaining[0] != "a/2" {
 		t.Errorf("remaining = %v, want only a/2", remaining)
 	}
 }
@@ -1036,8 +1075,8 @@ func TestStorageRmOneKey(t *testing.T) {
 // not proceed on silence.
 func TestStorageRmRecursiveNeedsConfirmation(t *testing.T) {
 	env, _, _, _, _ := newDataEnv(t, output.ModeHuman)
-	store := dataStore(t, env)
-	seedData(t, store, map[string][]byte{"a/1": []byte("1"), "a/2": []byte("2"), "b/1": []byte("3")})
+	session := dataSession(t, env)
+	seedData(t, session, map[string][]byte{"a/1": []byte("1"), "a/2": []byte("2"), "b/1": []byte("3")})
 
 	err := (&storageRmCommand{recursive: true}).Run(context.Background(), env, []string{"prod:a/"})
 	if _, ok := errors.AsType[*usageError](err); !ok {
@@ -1046,15 +1085,15 @@ func TestStorageRmRecursiveNeedsConfirmation(t *testing.T) {
 	if !strings.Contains(err.Error(), "--yes") {
 		t.Errorf("err = %v, want it to name --yes", err)
 	}
-	if got := storedKeys(t, store, ""); len(got) != 3 {
+	if got := storedKeys(t, session, ""); len(got) != 3 {
 		t.Fatalf("%v remains; nothing may be deleted without confirmation", got)
 	}
 }
 
 func TestStorageRmRecursiveDeletesExactlyThePrefix(t *testing.T) {
 	env, out, _, _, _ := newDataEnv(t, output.ModeHuman)
-	store := dataStore(t, env)
-	seedData(t, store, map[string][]byte{
+	session := dataSession(t, env)
+	seedData(t, session, map[string][]byte{
 		"a/1": []byte("1"), "a/2": []byte("2"), "a/deep/3": []byte("3"),
 		"b/1": []byte("4"), "ab": []byte("5"),
 	})
@@ -1068,7 +1107,7 @@ func TestStorageRmRecursiveDeletesExactlyThePrefix(t *testing.T) {
 	}
 	// "ab" begins with "a" but is not under "a/": the prefix is honoured
 	// exactly rather than by blind string matching.
-	got, want := storedKeys(t, store, ""), []string{"ab", "b/1"}
+	got, want := storedKeys(t, session, ""), []string{"ab", "b/1"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Errorf("remaining = %v, want %v", got, want)
 	}
@@ -1134,7 +1173,7 @@ func TestStorageRmOperandUsageErrors(t *testing.T) {
 // they are paying for, and stop.
 func TestStorageUsageWorksWithoutAKeyring(t *testing.T) {
 	env, out, _, dir, _ := newDataEnv(t, output.ModeHuman)
-	seedData(t, dataStore(t, env), map[string][]byte{
+	seedData(t, dataSession(t, env), map[string][]byte{
 		"a/1": []byte("one"), "a/2": []byte("two"), "b/1": framedPayload(),
 	})
 	keyring := dir.InstanceKeyringPath("prod")
@@ -1168,7 +1207,7 @@ func TestStorageUsageWorksWithoutAKeyring(t *testing.T) {
 func TestStorageUsageJSON(t *testing.T) {
 	env, out, _, _, _ := newDataEnv(t, output.ModeJSON)
 	payload := framedPayload()
-	seedData(t, dataStore(t, env), map[string][]byte{"a/1": payload})
+	seedData(t, dataSession(t, env), map[string][]byte{"a/1": payload})
 
 	if err := (&storageUsageCommand{}).Run(context.Background(), env, []string{"prod:"}); err != nil {
 		t.Fatalf("Run: %v", err)
@@ -1200,7 +1239,7 @@ func TestStorageUsageJSON(t *testing.T) {
 // subcommand's flags before it can parse the line at all.
 func TestStorageRouterAcceptsSubcommandFlags(t *testing.T) {
 	env, _, _, dir, _ := newDataEnv(t, output.ModeHuman)
-	seedData(t, dataStore(t, env), map[string][]byte{"a/1": []byte("one"), "a/2": []byte("two")})
+	seedData(t, dataSession(t, env), map[string][]byte{"a/1": []byte("one"), "a/2": []byte("two")})
 	export := filepath.Join(t.TempDir(), "keys.export")
 	passphrase := filepath.Join(t.TempDir(), "passphrase")
 	writeLocalFile(t, passphrase, []byte("correct-horse-battery-staple\n"))

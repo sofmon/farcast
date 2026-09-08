@@ -614,3 +614,110 @@ func assertPerm(t *testing.T, path string, want os.FileMode) {
 		t.Errorf("%s perm = %#o, want %#o", path, got, want)
 	}
 }
+
+// A half-written record — storage recorded but with no bucket name — must be
+// treated as no storage at all. Reading it as present hands every Store an
+// empty bucket name and pushes the failure out to the provider, where it reads
+// as a cloud problem rather than as local state that never finished.
+func TestAnEmptyBucketNameCountsAsNoStorage(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	if err := os.Chmod(string(dir), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const name = "prod"
+	if err := dir.CreateInstance(name); err != nil {
+		t.Fatal(err)
+	}
+	provider := newFakeProvider(dir, name)
+	providerName := "ds-halfwritten-" + t.Name()
+	datasphere.Register(providerName, func(datasphere.Config) (datasphere.Provider, error) { return provider, nil })
+
+	meta := &config.InstanceMetadata{
+		Name: name, Provider: "gke", Region: "us-central1", Status: "running",
+		Storage: &config.Storage{Provider: providerName, Location: "us-central1"},
+	}
+	if err := dir.SaveInstanceMetadata(name, meta); err != nil {
+		t.Fatal(err)
+	}
+	if err := dir.SaveInstanceCredentials(name, &config.InstanceCredentials{Provider: "gke"}); err != nil {
+		t.Fatal(err)
+	}
+
+	session, err := Open(context.Background(), Options{Dir: dir, Instance: name, Mint: true})
+	if err != nil {
+		t.Fatalf("Open with Mint did not converge a half-written record: %v", err)
+	}
+	if session.Bucket == "" {
+		t.Fatal("the session carries an empty bucket name")
+	}
+	got, err := dir.LoadInstanceMetadata(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Storage.Bucket == "" {
+		t.Error("the minted bucket was not recorded")
+	}
+}
+
+// The application scope exists from the moment the keyring does.
+//
+// It used to be minted at the first unseal, which left a window in which
+// nothing owned "app/": anything written there landed in the MASTER key space,
+// and the scope then took ownership of the prefix and those objects stopped
+// being reachable by their own names. The Phase 4.3 walk fell into it, because
+// the documented way to mint a bucket was to write an object and "app/" is the
+// documented place to write one.
+//
+// Closing the window is the fix. An unseal-time check was the alternative and
+// was rejected: unseal deliberately touches no cloud, so a check that listed
+// the bucket would either break recovery or silently skip itself.
+func TestTheApplicationScopeIsMintedWithTheKeyring(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	if err := os.Chmod(string(dir), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const name = "prod"
+	if err := dir.CreateInstance(name); err != nil {
+		t.Fatal(err)
+	}
+	provider := newFakeProvider(dir, name)
+	providerName := "ds-scope-at-mint-" + t.Name()
+	datasphere.Register(providerName, func(datasphere.Config) (datasphere.Provider, error) { return provider, nil })
+
+	meta := &config.InstanceMetadata{
+		Name: name, Provider: "gke", Region: "us-central1", Status: "running",
+		Storage: &config.Storage{Provider: providerName, Location: "us-central1"},
+	}
+	if err := dir.SaveInstanceMetadata(name, meta); err != nil {
+		t.Fatal(err)
+	}
+	if err := dir.SaveInstanceCredentials(name, &config.InstanceCredentials{Provider: "gke"}); err != nil {
+		t.Fatal(err)
+	}
+
+	session, err := Open(context.Background(), Options{Dir: dir, Instance: name, Mint: true})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if !session.KeyringMinted {
+		t.Fatal("this test is meant to exercise a freshly minted keyring")
+	}
+
+	scope, ok := session.Keyring.ScopeNamed(datasphere.DefaultScopeName)
+	if !ok {
+		t.Fatal("a freshly minted keyring has no application scope; the window this fix closes is open again")
+	}
+	if scope.Prefix != datasphere.DefaultScopePrefix {
+		t.Errorf("the scope owns %q, want %q", scope.Prefix, datasphere.DefaultScopePrefix)
+	}
+
+	// And the very first write to that prefix goes to the SCOPE, not to
+	// master — so nothing can be stranded there later.
+	store, err := session.StoreFor(datasphere.DefaultScopePrefix + "hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store == session.Store {
+		t.Fatal("a write to the application prefix still routes to the master key space")
+	}
+}
