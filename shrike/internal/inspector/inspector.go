@@ -76,7 +76,12 @@ const burstThreshold = 20
 // Alert is a raised violation — more than a log line: severity-ranked,
 // de-duplicated by class (reason+host), counted, and time-bounded.
 type Alert struct {
-	Severity  Severity  `json:"severity"`
+	Severity Severity `json:"severity"`
+	// App and Namespace are which application did this. Empty only
+	// when FatLine could not identify the caller at all, which is its
+	// own reason (ADR 0013 decision 6).
+	App       string    `json:"app,omitempty"`
+	Namespace string    `json:"namespace,omitempty"`
 	Host      string    `json:"host"`
 	Port      string    `json:"port,omitempty"`
 	Proto     string    `json:"proto,omitempty"`
@@ -138,7 +143,12 @@ type HostStat struct {
 // Violation is a denied egress class (reason+host) with its running count,
 // effective severity, and timing.
 type Violation struct {
-	Severity  Severity  `json:"severity"`
+	Severity Severity `json:"severity"`
+	// App and Namespace are which application did this. Empty only
+	// when FatLine could not identify the caller at all, which is its
+	// own reason (ADR 0013 decision 6).
+	App       string    `json:"app,omitempty"`
+	Namespace string    `json:"namespace,omitempty"`
 	Host      string    `json:"host"`
 	Port      string    `json:"port,omitempty"`
 	Proto     string    `json:"proto,omitempty"`
@@ -233,10 +243,17 @@ func (i *Inspector) recordClose(e event.Event, now time.Time) {
 }
 
 func (i *Inspector) recordDeny(e event.Event, now time.Time) *Alert {
-	key := e.Reason + "\x00" + e.Host
+	// Keyed by application as well as by reason and host. Two applications
+	// denied the same host are two different violations with two different
+	// remedies — one is reaching somewhere it never declared, the other may
+	// simply need the host adding to its manifest — and merging them would
+	// report a count nobody can act on (ADR 0013 decision 7).
+	key := e.Tenant + "\x00" + e.App + "\x00" + e.Reason + "\x00" + e.Host
 	v := i.violations[key]
 	if v == nil {
 		v = &vrec{Violation: Violation{
+			App:       e.App,
+			Namespace: e.Tenant,
 			Host:      e.Host,
 			Port:      e.Port,
 			Proto:     e.Proto,
@@ -270,6 +287,8 @@ func (i *Inspector) recordDeny(e event.Event, now time.Time) *Alert {
 	v.lastAlertAt = now
 	a := Alert{
 		Severity:  v.Severity,
+		App:       v.App,
+		Namespace: v.Namespace,
 		Host:      v.Host,
 		Port:      v.Port,
 		Proto:     v.Proto,
@@ -278,20 +297,29 @@ func (i *Inspector) recordDeny(e event.Event, now time.Time) *Alert {
 		Count:     v.Count,
 		FirstSeen: v.FirstSeen,
 		LastSeen:  v.LastSeen,
-		Message:   message(v.Reason, v.Host, v.Count),
+		Message:   message(v.Reason, v.Host, v.App, v.Count),
 	}
 	return &a
 }
 
 // message renders the operator-facing alert text for a violation class.
-func message(reason, host string, count int64) string {
+func message(reason, host, app string, count int64) string {
+	// Named where it is known. An alert that says "application" when it could
+	// say which one leaves an operator to guess, and with per-application
+	// policy the guess is the whole question.
+	who := "application"
+	if app != "" {
+		who = fmt.Sprintf("application %q", app)
+	}
 	switch reason {
 	case event.ReasonSNIMismatch:
-		return fmt.Sprintf("TLS server_name did not match the allowed CONNECT authority %q (possible domain-fronting or MITM); %d attempt(s)", host, count)
+		return fmt.Sprintf("%s: TLS server_name did not match the allowed CONNECT authority %q (possible domain-fronting or MITM); %d attempt(s)", who, host, count)
 	case event.ReasonCleartext:
-		return fmt.Sprintf("application attempted cleartext http:// to %q, denied by default; %d attempt(s)", host, count)
+		return fmt.Sprintf("%s attempted cleartext http:// to %q, denied by default; %d attempt(s)", who, host, count)
+	case event.ReasonUnknownApp:
+		return fmt.Sprintf("an unidentified caller attempted %q; it presented no credential FatLine recognises, so no declarations could be enforced for it; %d attempt(s)", host, count)
 	default:
-		return fmt.Sprintf("application reached undeclared host %q, denied by default; %d attempt(s)", host, count)
+		return fmt.Sprintf("%s reached undeclared host %q, denied by default; %d attempt(s)", who, host, count)
 	}
 }
 

@@ -231,3 +231,11 @@ Accepted-and-documented for 2.2, not oversights:
 - Manifest spec (the `external` policy source) — [`../manifest/README.md`](../manifest/README.md)
 - GKE Autopilot (sidecar inspector, no privilege) — [ADR 0003](../docs/adr/0003-gke-autopilot.md)
 - Backend language strategy + guardrails — [ADR 0002](../docs/adr/0002-backend-language-strategy.md)
+
+## Per-application attribution (Phase 4.4)
+
+Every egress decision now names the application that made it, because [ADR 0013](../docs/adr/0013-per-application-egress-identity.md) gave FatLine a way to tell applications apart. Shrike keys violations by **application as well as by reason and host**.
+
+That grouping is the point rather than a detail. Two applications denied the same host are two violations with two different remedies — one is reaching somewhere it never declared, the other may simply need the host adding to its manifest — and a single merged count is a number nobody can act on.
+
+An alert that cannot name the application is telemetry, not enforcement. The one case where the name is legitimately absent is `unknown_app`, where FatLine could not identify the caller at all, and the message says so rather than blaming an application it cannot name.

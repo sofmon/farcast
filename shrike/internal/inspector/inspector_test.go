@@ -1,6 +1,7 @@
 package inspector
 
 import (
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -161,5 +162,80 @@ func TestConcurrentRecord(t *testing.T) {
 	wg.Wait()
 	if want := int64(goroutines * iters * 2); ins.Events() != want {
 		t.Fatalf("Events()=%d, want %d", ins.Events(), want)
+	}
+}
+
+// Two applications denied the same host are two violations, not one.
+//
+// They have different remedies — one is reaching somewhere it never declared,
+// the other may simply need the host adding to its manifest — so a single
+// merged count is a number nobody can act on (ADR 0013 decision 7).
+func TestTwoApplicationsDeniedTheSameHostAreTwoViolations(t *testing.T) {
+	cap := &capAlerter{}
+	i := New(cap, time.Minute)
+
+	for _, app := range []string{"alpha", "beta"} {
+		i.Record(event.Event{
+			Kind: event.Deny, Tenant: "my-platform", App: app,
+			Host: "shared.test", Port: "443", Proto: "connect",
+			Reason: event.ReasonNotInAllowlist,
+		})
+	}
+
+	raised := cap.alerts
+	if len(raised) != 2 {
+		t.Fatalf("raised %d alerts, want one per application: %+v", len(raised), raised)
+	}
+	seen := map[string]bool{}
+	for _, a := range raised {
+		seen[a.App] = true
+		if a.Namespace != "my-platform" {
+			t.Errorf("alert for %q has namespace %q", a.App, a.Namespace)
+		}
+		if a.Count != 1 {
+			t.Errorf("alert for %q counted %d attempts; the two applications were merged", a.App, a.Count)
+		}
+		if !strings.Contains(a.Message, a.App) {
+			t.Errorf("the message does not name the application: %q", a.Message)
+		}
+	}
+	if !seen["alpha"] || !seen["beta"] {
+		t.Errorf("alerts did not name both applications: %v", seen)
+	}
+}
+
+// The same application repeating itself is still one violation, counted.
+func TestOneApplicationRepeatingIsOneViolation(t *testing.T) {
+	cap := &capAlerter{}
+	i := New(cap, time.Minute)
+	for range 3 {
+		i.Record(event.Event{
+			Kind: event.Deny, Tenant: "my-platform", App: "alpha",
+			Host: "shared.test", Reason: event.ReasonNotInAllowlist,
+		})
+	}
+	raised := cap.alerts
+	if len(raised) != 1 {
+		t.Fatalf("raised %d alerts for one application repeating, want 1", len(raised))
+	}
+}
+
+// An unidentified caller is its own kind of problem and must not read as an
+// application that forgot to declare a host.
+func TestAnUnidentifiedCallerSaysSo(t *testing.T) {
+	cap := &capAlerter{}
+	i := New(cap, time.Minute)
+	i.Record(event.Event{
+		Kind: event.Deny, Host: "somewhere.test", Reason: event.ReasonUnknownApp,
+	})
+	raised := cap.alerts
+	if len(raised) != 1 {
+		t.Fatalf("raised %d alerts", len(raised))
+	}
+	if !strings.Contains(raised[0].Message, "unidentified caller") {
+		t.Errorf("message = %q, want it to say the caller could not be identified", raised[0].Message)
+	}
+	if raised[0].App != "" {
+		t.Errorf("an unidentified caller was attributed to %q", raised[0].App)
 	}
 }
