@@ -258,7 +258,7 @@ func (c *Client) do(ctx context.Context, method, path, selector, contentType str
 	if err != nil {
 		return fmt.Errorf("kube: %s %s: %w", method, path, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	payload, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 	if err != nil {

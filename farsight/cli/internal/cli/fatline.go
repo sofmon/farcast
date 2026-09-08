@@ -327,18 +327,6 @@ func (d *fatlineDeployer) progressTo(env *Env) func(string) {
 	return func(line string) { fprintf(env.Err, "  %s\n", line) }
 }
 
-// instanceFatlineImage is the default image reference: the instance's own
-// registry, at the fixed system path, tagged with this CLI's version.
-//
-// There is deliberately no central fallback. The ghcr.io default this replaces
-// made every instance's network boundary depend on an artifact feed Sofmon
-// controls — a standing central dependency and a supply-chain injection point
-// aimed at FatLine itself (ADR 0007 decision 4). The tag is what the operator
-// reads; the digest is what gets deployed.
-func instanceFatlineImage(prefix string) string {
-	return instanceSystemImage(prefix, fatlineComponent)
-}
-
 // imageTag renders a build version as a valid OCI tag.
 //
 // A tag is [A-Za-z0-9_][A-Za-z0-9._-]{0,127}, which a Go build version does not

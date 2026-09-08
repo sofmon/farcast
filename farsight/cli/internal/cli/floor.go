@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"fmt"
 	"io"
 	"sort"
 
@@ -51,9 +50,9 @@ func (f instanceFloor) print(w io.Writer, currency string) {
 	items := append([]floorItem(nil), f.Items...)
 	sort.SliceStable(items, func(i, j int) bool { return items[i].MonthlyUSD > items[j].MonthlyUSD })
 	for _, it := range items {
-		fmt.Fprintf(w, "  %-14s ~%s %6.2f/mo  %s\n", it.Name, currency, it.MonthlyUSD, it.Why)
+		fprintf(w, "  %-14s ~%s %6.2f/mo  %s\n", it.Name, currency, it.MonthlyUSD, it.Why)
 	}
-	fmt.Fprintf(w, "  %-14s ~%s %6.2f/mo\n", "total", currency, f.Total)
+	fprintf(w, "  %-14s ~%s %6.2f/mo\n", "total", currency, f.Total)
 }
 
 // floorNow is the standing cost of what this instance actually runs today.
@@ -120,14 +119,14 @@ func warnIfBelowFloor(w io.Writer, limit config.CostLimit, f instanceFloor, what
 	if limit.Amount <= 0 || limit.Amount >= f.Total {
 		return false
 	}
-	fmt.Fprintf(w, "\nThe cost limit is below what %s costs standing still.\n", what)
-	fmt.Fprintf(w, "  limit          %s %.2f/%s\n", limit.Currency, limit.Amount, limit.Period)
+	fprintf(w, "\nThe cost limit is below what %s costs standing still.\n", what)
+	fprintf(w, "  limit          %s %.2f/%s\n", limit.Currency, limit.Amount, limit.Period)
 	f.print(w, limit.Currency)
-	fmt.Fprintf(w, "\nTechnoCore would reach the limit before a single application ran, stop every\n"+
+	fprintf(w, "\nTechnoCore would reach the limit before a single application ran, stop every\n"+
 		"application it is allowed to stop, and still be over — it never stops the tunnel\n"+
 		"or the key holder, because that would make storage impossible to unseal while the\n"+
 		"instance kept billing.\n")
-	fmt.Fprintf(w, "These are estimates from published prices, not a bill; the cluster line dominates\n"+
+	fprintf(w, "These are estimates from published prices, not a bill; the cluster line dominates\n"+
 		"and is the least certain of them.\n")
 	return true
 }

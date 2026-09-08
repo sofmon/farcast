@@ -169,79 +169,79 @@ type costsResult struct {
 
 func (r costsResult) Human(w io.Writer) error {
 	cur := r.Currency
-	fmt.Fprintf(w, "Spending in %q", r.Instance)
+	fprintf(w, "Spending in %q", r.Instance)
 	if r.Period != "" {
-		fmt.Fprintf(w, " — %s period", r.Period)
+		fprintf(w, " — %s period", r.Period)
 	}
-	fmt.Fprintf(w, ", %s to %s\n\n", r.PeriodStart.Format("2006-01-02"), r.PeriodEnd.Format("2006-01-02"))
+	fprintf(w, ", %s to %s\n\n", r.PeriodStart.Format("2006-01-02"), r.PeriodEnd.Format("2006-01-02"))
 
-	fmt.Fprintf(w, "  expected   %s %8.2f  metered locally from Pod requests, in real time\n", cur, r.Expected)
+	fprintf(w, "  expected   %s %8.2f  metered locally from Pod requests, in real time\n", cur, r.Expected)
 	if r.HasConfirmation {
-		fmt.Fprintf(w, "  confirmed  %s %8.2f  the provider's own figure, through %s\n",
+		fprintf(w, "  confirmed  %s %8.2f  the provider's own figure, through %s\n",
 			cur, r.Confirmed, r.ConfirmedThrough.Format("2006-01-02 15:04"))
 	} else {
 		// Never printed as a confirmed zero. A missing feed and a period that
 		// genuinely cost nothing look identical in a number and are not the
 		// same thing (ADR 0009 decision 5).
-		fmt.Fprintf(w, "  confirmed  %8s      the provider has confirmed nothing yet\n", "—")
+		fprintf(w, "  confirmed  %8s      the provider has confirmed nothing yet\n", "—")
 	}
-	fmt.Fprintf(w, "  total      %s %8.2f  what enforcement compares against the limit\n", cur, r.Total)
+	fprintf(w, "  total      %s %8.2f  what enforcement compares against the limit\n", cur, r.Total)
 
 	a := r.Assessment
 	if a.Limit > 0 {
-		fmt.Fprintf(w, "  limit      %s %8.2f  %.0f%% of it, %s\n", cur, a.Limit, a.Fraction*100, a.Level.String())
-		fmt.Fprintf(w, "  remaining  %s %8.2f\n", cur, max(a.Limit-a.Total, 0))
+		fprintf(w, "  limit      %s %8.2f  %.0f%% of it, %s\n", cur, a.Limit, a.Fraction*100, a.Level.String())
+		fprintf(w, "  remaining  %s %8.2f\n", cur, max(a.Limit-a.Total, 0))
 	} else {
-		fmt.Fprintf(w, "  limit      none recorded — nothing will be stopped\n")
+		fprintf(w, "  limit      none recorded — nothing will be stopped\n")
 	}
 
 	if r.RecordedLimit > 0 && a.Limit > 0 && r.RecordedLimit != a.Limit {
-		fmt.Fprintf(w, "\nThe kernel is enforcing %s %.2f; this machine has %s %.2f recorded.\n",
+		fprintf(w, "\nThe kernel is enforcing %s %.2f; this machine has %s %.2f recorded.\n",
 			cur, a.Limit, cur, r.RecordedLimit)
-		fmt.Fprintf(w, "The cluster acts on its own until 'farcast kernel deploy %s' redeploys it.\n", r.Instance)
+		fprintf(w, "The cluster acts on its own until 'farcast kernel deploy %s' redeploys it.\n", r.Instance)
 	}
 
-	fmt.Fprintf(w, "\n  rate       %s %.4f/hour across %s",
+	fprintf(w, "\n  rate       %s %.4f/hour across %s",
 		cur, r.Observed.RateHourlyUSD, plural(r.Observed.Pods, "pod", "pods"))
 	if r.ObservedAgo != "" {
-		fmt.Fprintf(w, ", observed %s ago", r.ObservedAgo)
+		fprintf(w, ", observed %s ago", r.ObservedAgo)
 	}
-	fmt.Fprintln(w)
+	fprintln(w)
 
 	if a.ProjectedOver {
-		fmt.Fprintf(w, "\nOn course to reach the limit on %s, at %s %.2f for the period.\n",
+		fprintf(w, "\nOn course to reach the limit on %s, at %s %.2f for the period.\n",
 			a.ProjectedAt.Format("2006-01-02 15:04"), cur, a.Projected)
-		fmt.Fprintf(w, "That is a warning and nothing acts on it: a projection is not spending.\n")
+		fprintf(w, "That is a warning and nothing acts on it: a projection is not spending.\n")
 	}
 
 	if len(r.Apps) > 0 {
-		fmt.Fprintf(w, "\nBy application:\n")
+		fprintf(w, "\nBy application:\n")
 		for _, app := range r.Apps {
-			fmt.Fprintf(w, "  %-24s %s %8.2f\n", app.Name, cur, app.USD)
+			fprintf(w, "  %-24s %s %8.2f\n", app.Name, cur, app.USD)
 		}
 		// Attribution is always local. The provider bills an instance, not an
 		// application, so `confirmed` cannot be broken down and saying which
 		// figure this is matters.
-		fmt.Fprintf(w, "\nAttribution is from 'expected' only — the provider bills the instance, not\n")
-		fmt.Fprintf(w, "the applications in it, so a confirmed total can never be split this way.\n")
+		fprintf(w, "\nAttribution is from 'expected' only — the provider bills the instance, not\n")
+		fprintf(w, "the applications in it, so a confirmed total can never be split this way.\n")
 	}
 
 	if r.Observed.Unclassified > 0 {
-		fmt.Fprintf(w, "\n%s carry no tier label and are protected from a cost shutdown as a result.\n",
+		fprintf(w, "\n%s carry no tier label and are protected from a cost shutdown as a result.\n",
 			plural(r.Observed.Unclassified, "pod", "pods"))
 	}
 	if r.Observed.Incomplete {
-		fmt.Fprintf(w, "\nThe kernel could not read every namespace it meters:\n")
+		fprintf(w, "\nThe kernel could not read every namespace it meters:\n")
 		for _, u := range r.Observed.Unreachable {
-			fmt.Fprintf(w, "  %s\n", u)
+			fprintf(w, "  %s\n", u)
 		}
-		fmt.Fprintf(w, "These figures are a floor, not a total.\n")
+		fprintf(w, "These figures are a floor, not a total.\n")
 	}
 	for _, d := range r.Discrepancies {
-		fmt.Fprintf(w, "\nBilling disagrees with the model beyond the clamp; the estimate stands: %s\n", d)
+		fprintf(w, "\nBilling disagrees with the model beyond the clamp; the estimate stands: %s\n", d)
 	}
 	if r.Calibration != 0 && r.Calibration != 1 {
-		fmt.Fprintf(w, "\nThe local model is calibrated by %.3f against confirmed figures.\n", r.Calibration)
+		fprintf(w, "\nThe local model is calibrated by %.3f against confirmed figures.\n", r.Calibration)
 	}
 	return nil
 }

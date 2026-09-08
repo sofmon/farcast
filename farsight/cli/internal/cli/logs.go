@@ -75,12 +75,11 @@ func (c *logsCommand) Run(ctx context.Context, env *Env, args []string) error {
 
 	// The kind matters as much as the namespace: the key holder is a
 	// StatefulSet, and "deployment/datasphered" names nothing.
-	namespace, kind := c.namespace, "Deployment"
 	found, err := findApp(ctx, cl, (&psCommand{all: true}).namespacesOf(meta), app, c.namespace)
 	if err != nil {
 		return err
 	}
-	namespace, kind = found.Namespace, found.Kind
+	namespace, kind := found.Namespace, found.Kind
 
 	// Logs go to stdout unformatted, whatever --output says: they are the
 	// application's bytes, and wrapping them in this CLI's envelope would make

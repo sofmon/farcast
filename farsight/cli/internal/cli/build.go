@@ -256,26 +256,26 @@ type buildResult struct {
 }
 
 func (r buildResult) Human(w io.Writer) error {
-	fmt.Fprintf(w, "Built %s/%s in %q\n", r.Deployment, r.App, r.Instance)
-	fmt.Fprintf(w, "  from   %s", r.Repo)
+	fprintf(w, "Built %s/%s in %q\n", r.Deployment, r.App, r.Instance)
+	fprintf(w, "  from   %s", r.Repo)
 	if r.Ref != "" {
-		fmt.Fprintf(w, " at %s", r.Ref)
+		fprintf(w, " at %s", r.Ref)
 	}
-	fmt.Fprintln(w)
-	fmt.Fprintf(w, "  image  %s\n", r.Image)
+	fprintln(w)
+	fprintf(w, "  image  %s\n", r.Image)
 
 	// The push grant is not FarCast's to apply: granting it needs permission
 	// to change a repository's IAM, which this CLI's credential is not
 	// required to carry — the same reasoning as the keyholder's bucket grant
 	// (ADR 0008 decision 8). Without it the build fails on a 403 at push.
-	fmt.Fprintf(w, "\nThe builder pushes under its own cloud identity. If you have not granted it\n")
-	fmt.Fprintf(w, "for this instance yet, run:\n\n")
-	fmt.Fprintf(w, "  PROJNUM=$(gcloud projects describe %s --format='value(projectNumber)')\n", orPlaceholder(r.Project))
-	fmt.Fprintf(w, "  PRINCIPAL=\"principal://iam.googleapis.com/projects/$PROJNUM/locations/global/workloadIdentityPools/%s.svc.id.goog/subject/ns/%s/sa/%s\"\n",
+	fprintf(w, "\nThe builder pushes under its own cloud identity. If you have not granted it\n")
+	fprintf(w, "for this instance yet, run:\n\n")
+	fprintf(w, "  PROJNUM=$(gcloud projects describe %s --format='value(projectNumber)')\n", orPlaceholder(r.Project))
+	fprintf(w, "  PRINCIPAL=\"principal://iam.googleapis.com/projects/$PROJNUM/locations/global/workloadIdentityPools/%s.svc.id.goog/subject/ns/%s/sa/%s\"\n",
 		orPlaceholder(r.Project), r.Namespace, r.ServiceAccount)
-	fmt.Fprintf(w, "  gcloud artifacts repositories add-iam-policy-binding farcast-%s \\\n", r.Instance)
-	fmt.Fprintf(w, "    --location <region> --member \"$PRINCIPAL\" --role roles/artifactregistry.writer\n")
-	fmt.Fprintf(w, "\nThe grant is on the ONE repository, not the project.\n")
+	fprintf(w, "  gcloud artifacts repositories add-iam-policy-binding farcast-%s \\\n", r.Instance)
+	fprintf(w, "    --location <region> --member \"$PRINCIPAL\" --role roles/artifactregistry.writer\n")
+	fprintf(w, "\nThe grant is on the ONE repository, not the project.\n")
 	return nil
 }
 

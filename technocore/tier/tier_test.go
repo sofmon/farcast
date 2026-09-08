@@ -44,7 +44,7 @@ func TestAnUnrecognisedTierIsProtectedNotStopped(t *testing.T) {
 }
 
 func TestRankStopsApplicationsFirstAndTheKernelLast(t *testing.T) {
-	if !(App.Rank() < Unknown.Rank() && Unknown.Rank() < System.Rank() && System.Rank() < Kernel.Rank()) {
+	if App.Rank() >= Unknown.Rank() || Unknown.Rank() >= System.Rank() || System.Rank() >= Kernel.Rank() {
 		t.Errorf("ranks out of order: app=%d unknown=%d system=%d kernel=%d",
 			App.Rank(), Unknown.Rank(), System.Rank(), Kernel.Rank())
 	}

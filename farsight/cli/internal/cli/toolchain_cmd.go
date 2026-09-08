@@ -172,31 +172,31 @@ type toolchainResult struct {
 
 func (r toolchainResult) Human(w io.Writer) error {
 	for _, m := range r.Mirrored {
-		fmt.Fprintf(w, "Mirrored the %s into %q\n", m.Kind, r.Instance)
-		fmt.Fprintf(w, "  from  %s\n", m.From)
-		fmt.Fprintf(w, "  to    %s\n", m.To)
+		fprintf(w, "Mirrored the %s into %q\n", m.Kind, r.Instance)
+		fprintf(w, "  from  %s\n", m.From)
+		fprintf(w, "  to    %s\n", m.To)
 	}
 	if r.Toolchain == nil || (r.Toolchain.Builder == "" && r.Toolchain.Fetcher == "") {
-		fmt.Fprintf(w, "\nNothing recorded for %q yet. 'farcast run' will ask for both images.\n", r.Instance)
+		fprintf(w, "\nNothing recorded for %q yet. 'farcast run' will ask for both images.\n", r.Instance)
 		return nil
 	}
 	if len(r.Mirrored) > 0 {
-		fmt.Fprintln(w)
+		fprintln(w)
 	}
-	fmt.Fprintf(w, "Recorded for %q:\n", r.Instance)
+	fprintf(w, "Recorded for %q:\n", r.Instance)
 	if r.Toolchain.Builder != "" {
-		fmt.Fprintf(w, "  builder  %s\n", r.Toolchain.Builder)
+		fprintf(w, "  builder  %s\n", r.Toolchain.Builder)
 	}
 	if r.Toolchain.Fetcher != "" {
-		fmt.Fprintf(w, "  fetcher  %s\n", r.Toolchain.Fetcher)
+		fprintf(w, "  fetcher  %s\n", r.Toolchain.Fetcher)
 	}
 	if len(r.Mirrored) > 0 {
 		// The mirror keeps the digest of the platform manifest it copied, and
 		// saying how to check that is the difference between a verifiable
 		// claim and a request for trust.
-		fmt.Fprintf(w, "\nEach digest above is the upstream image's own, for linux/amd64. To check one\n")
-		fmt.Fprintf(w, "against where it came from, resolve the upstream reference for that platform\n")
-		fmt.Fprintf(w, "and compare — nothing here has to be believed.\n")
+		fprintf(w, "\nEach digest above is the upstream image's own, for linux/amd64. To check one\n")
+		fprintf(w, "against where it came from, resolve the upstream reference for that platform\n")
+		fprintf(w, "and compare — nothing here has to be believed.\n")
 	}
 	return nil
 }

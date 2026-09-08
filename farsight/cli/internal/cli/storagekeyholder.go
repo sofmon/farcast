@@ -165,25 +165,25 @@ func (r stateResult) Human(w io.Writer) error {
 	for _, s := range r.Replicas {
 		switch {
 		case s.Error != "":
-			fmt.Fprintf(w, "  replica %d  unreachable — %s\n", s.Ordinal, s.Error)
+			fprintf(w, "  replica %d  unreachable — %s\n", s.Ordinal, s.Error)
 			sealed++
 		case s.Phase == "unsealed":
-			fmt.Fprintf(w, "  replica %d  unsealed   generation %d, scopes %s\n",
+			fprintf(w, "  replica %d  unsealed   generation %d, scopes %s\n",
 				s.Ordinal, s.Generation, strings.Join(s.Scopes, ","))
 		default:
 			reason := s.Phase
 			if s.HoldReason != "" {
 				reason += " — " + s.HoldReason
 			}
-			fmt.Fprintf(w, "  replica %d  %s\n", s.Ordinal, reason)
+			fprintf(w, "  replica %d  %s\n", s.Ordinal, reason)
 			sealed++
 		}
 	}
 	if sealed == len(r.Replicas) {
-		fmt.Fprintf(w, "\nEvery replica is sealed: applications are receiving ErrStorageSealed.\n"+
+		fprintf(w, "\nEvery replica is sealed: applications are receiving ErrStorageSealed.\n"+
 			"Nothing is lost — run 'farcast storage unseal %s' to restore service.\n", r.Instance)
 	} else if sealed > 0 {
-		fmt.Fprintf(w, "\n%d of %d replicas are sealed. Storage is serving, with less headroom than it should have.\n",
+		fprintf(w, "\n%d of %d replicas are sealed. Storage is serving, with less headroom than it should have.\n",
 			sealed, len(r.Replicas))
 	}
 	return nil
@@ -261,13 +261,13 @@ type sealResult struct {
 func (r sealResult) Human(w io.Writer) error {
 	for _, s := range r.Replicas {
 		if s.Error != "" {
-			fmt.Fprintf(w, "  replica %d  NOT SEALED — %s\n", s.Ordinal, s.Error)
+			fprintf(w, "  replica %d  NOT SEALED — %s\n", s.Ordinal, s.Error)
 			continue
 		}
-		fmt.Fprintf(w, "  replica %d  %s\n", s.Ordinal, s.Phase)
+		fprintf(w, "  replica %d  %s\n", s.Ordinal, s.Phase)
 	}
 	if r.Hold {
-		fmt.Fprintf(w, "\nThis hold lives only until the pod restarts. A restarted replica comes back\n"+
+		fprintf(w, "\nThis hold lives only until the pod restarts. A restarted replica comes back\n"+
 			"restart-sealed, which a keeper device may clear unattended.\n")
 	}
 	return nil
@@ -375,7 +375,7 @@ func (*storageUnsealCommand) Run(ctx context.Context, env *Env, args []string) e
 			states = append(states, replicaState{Ordinal: i, Phase: st.Phase, Generation: st.Generation, Scopes: st.Scopes})
 		}
 		if lerr := keyholder.AppendLedger(ledgerPath, entry); lerr != nil {
-			fmt.Fprintf(env.Err, "warning: the unseal ledger could not be written: %v\n", lerr)
+			fprintf(env.Err, "warning: the unseal ledger could not be written: %v\n", lerr)
 		}
 	}
 
@@ -414,7 +414,7 @@ func ensureScope(env *Env, name string, meta *config.InstanceMetadata, keys data
 		if err := env.ConfigDir.SaveInstanceKeyring(name, encoded); err != nil {
 			return datasphere.Scope{}, 0, fmt.Errorf("recording the new scope: %w", err)
 		}
-		fmt.Fprintf(env.Err, "Minted the %q scope and recorded it in the keyring. %s\n",
+		fprintf(env.Err, "Minted the %q scope and recorded it in the keyring. %s\n",
 			DefaultScopeName, datasphere.KeyLossWarning)
 		scope = fresh
 	}
@@ -441,13 +441,13 @@ type unsealResult struct {
 func (r unsealResult) Human(w io.Writer) error {
 	for _, s := range r.Replicas {
 		if s.Error != "" {
-			fmt.Fprintf(w, "  replica %d  NOT UNSEALED — %s\n", s.Ordinal, s.Error)
+			fprintf(w, "  replica %d  NOT UNSEALED — %s\n", s.Ordinal, s.Error)
 			continue
 		}
-		fmt.Fprintf(w, "  replica %d  %s   generation %d\n", s.Ordinal, s.Phase, s.Generation)
+		fprintf(w, "  replica %d  %s   generation %d\n", s.Ordinal, s.Phase, s.Generation)
 	}
-	fmt.Fprintf(w, "\n%d of %d replicas hold the %q scope at generation %d.\n",
+	fprintf(w, "\n%d of %d replicas hold the %q scope at generation %d.\n",
 		r.Loaded, r.Total, r.Scope, r.Generation)
-	fmt.Fprintf(w, "Key material is held in RAM only: any restart seals that replica again.\n")
+	fprintf(w, "Key material is held in RAM only: any restart seals that replica again.\n")
 	return nil
 }

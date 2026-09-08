@@ -282,15 +282,6 @@ func TestConcurrentAccess(t *testing.T) {
 	wg.Wait()
 }
 
-func allZero(b []byte) bool {
-	for _, c := range b {
-		if c != 0 {
-			return false
-		}
-	}
-	return true
-}
-
 // A bundle's key material is shared, not copied, by Bundle.Scopes(). The vault
 // must therefore take OWNERSHIP of what it installs — otherwise the caller
 // wiping its bundle (which it should, and the HTTP handler does) zeroes the

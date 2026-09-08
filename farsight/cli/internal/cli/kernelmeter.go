@@ -242,28 +242,28 @@ type meterResult struct {
 
 func (r meterResult) Human(w io.Writer) error {
 	if len(r.Metered) == 0 {
-		fmt.Fprintf(w, "%q meters nothing, which means nothing is counted against its cost limit.\n", r.Instance)
+		fprintf(w, "%q meters nothing, which means nothing is counted against its cost limit.\n", r.Instance)
 		return nil
 	}
-	fmt.Fprintf(w, "%q meters:\n", r.Instance)
+	fprintf(w, "%q meters:\n", r.Instance)
 	for _, ns := range r.Metered {
 		switch {
 		case meteredContains(r.Added, ns):
-			fmt.Fprintf(w, "  %-24s (added)\n", ns)
+			fprintf(w, "  %-24s (added)\n", ns)
 		default:
-			fmt.Fprintf(w, "  %s\n", ns)
+			fprintf(w, "  %s\n", ns)
 		}
 	}
 	for _, ns := range r.Removed {
-		fmt.Fprintf(w, "  %-24s (no longer metered)\n", ns)
+		fprintf(w, "  %-24s (no longer metered)\n", ns)
 	}
 	if len(r.Removed) > 0 && r.BindingsLeft {
-		fmt.Fprintf(w, "\nThe kernel's RoleBinding is still present in %s. It grants nothing that is\n",
+		fprintf(w, "\nThe kernel's RoleBinding is still present in %s. It grants nothing that is\n",
 			strings.Join(r.Removed, ", "))
-		fmt.Fprintf(w, "read any more, and deleting the namespace removes it.\n")
+		fprintf(w, "read any more, and deleting the namespace removes it.\n")
 	}
 	if len(r.Added) > 0 {
-		fmt.Fprintf(w, "\nThe kernel picks these up on its next reconcile. It was not restarted.\n")
+		fprintf(w, "\nThe kernel picks these up on its next reconcile. It was not restarted.\n")
 	}
 	return nil
 }

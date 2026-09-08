@@ -608,7 +608,7 @@ func TestALongManifestIsReadWhole(t *testing.T) {
 	b.WriteString("name: big\napps:\n")
 	const apps = 20
 	for i := range apps {
-		fmt.Fprintf(&b, "  - name: app-%02d\n    containerfile: svc/%02d/Containerfile\n    context: svc/%02d\n", i, i, i)
+		fprintf(&b, "  - name: app-%02d\n    containerfile: svc/%02d/Containerfile\n    context: svc/%02d\n", i, i, i)
 	}
 	manifest := b.String()
 	if n := strings.Count(manifest, "\n"); n <= 40 {

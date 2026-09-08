@@ -1,0 +1,30 @@
+# Lint configuration for FarCast.
+#
+# It exists mostly so the bar is the same everywhere. docs/runbooks/phase-2-part-a.sh
+# gates on a clean run, and without a config that gate means whatever the
+# operator's installed golangci-lint happens to check this month.
+version: "2"
+
+linters:
+  settings:
+    staticcheck:
+      # golangci-lint's own default set, with one subtraction.
+      #
+      # ST1005 forbids error strings that end in punctuation or contain
+      # newlines. That is the right rule for a library, whose errors get
+      # wrapped into someone else's sentence. FarCast's CLI errors are not
+      # wrapped — they are printed to an operator verbatim, and several are
+      # deliberately several sentences: what broke, what it means for the
+      # applications, and the command to run next. Mangling them into
+      # lowercase fragments would make the tool worse to be on the other end
+      # of, which is the only thing these strings are for.
+      checks:
+        - all
+        - -ST1000
+        - -ST1003
+        - -ST1005
+        - -ST1016
+        - -ST1020
+        - -ST1021
+        - -ST1022
+        - -ST1023

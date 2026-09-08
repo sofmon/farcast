@@ -451,37 +451,37 @@ type runResult struct {
 }
 
 func (r runResult) Human(w io.Writer) error {
-	fmt.Fprintf(w, "Deployed %s into %q, namespace %q\n", r.Deployment, r.Instance, r.Namespace)
-	fmt.Fprintf(w, "  from    %s at %s\n", r.Repo, r.Commit)
-	fmt.Fprintf(w, "  reading %s\n", r.ManifestDigest)
+	fprintf(w, "Deployed %s into %q, namespace %q\n", r.Deployment, r.Instance, r.Namespace)
+	fprintf(w, "  from    %s at %s\n", r.Repo, r.Commit)
+	fprintf(w, "  reading %s\n", r.ManifestDigest)
 	for _, a := range r.Apps {
-		fmt.Fprintf(w, "  %-16s %s\n", a.Name, a.Image)
+		fprintf(w, "  %-16s %s\n", a.Name, a.Image)
 	}
 	// What each application may now reach, and the fact that it is per
 	// application rather than per instance — which is the promise the review
 	// gate makes and, until ADR 0013, the one the enforcement point could not
 	// keep.
-	fmt.Fprintf(w, "\nEgress: %s across %s, enforced per application.\n",
+	fprintf(w, "\nEgress: %s across %s, enforced per application.\n",
 		plural(r.Egress.Hosts, "declared host", "declared hosts"),
 		plural(r.Egress.Applications, "application", "applications"))
 	if r.Egress.Others > 0 {
-		fmt.Fprintf(w, "%s from other deployments on this instance kept their own.\n",
+		fprintf(w, "%s from other deployments on this instance kept their own.\n",
 			plural(r.Egress.Others, "application", "applications"))
 	}
 	if len(r.NotReady) > 0 {
-		fmt.Fprintf(w, "\nNot ready yet: %s\n", strings.Join(r.NotReady, ", "))
-		fmt.Fprintf(w, "They are deployed and billing. 'farcast logs %s <app>' says why.\n", r.Instance)
+		fprintf(w, "\nNot ready yet: %s\n", strings.Join(r.NotReady, ", "))
+		fprintf(w, "They are deployed and billing. 'farcast logs %s <app>' says why.\n", r.Instance)
 	}
 	if !r.Metered {
-		fmt.Fprintf(w, "\nNOT METERED: %s\n", r.MeterError)
-		fmt.Fprintf(w, "These applications are running and are not counted against the cost limit.\n")
+		fprintf(w, "\nNOT METERED: %s\n", r.MeterError)
+		fprintf(w, "These applications are running and are not counted against the cost limit.\n")
 	}
 
 	// The commit and the digest are the whole of what a device that cannot
 	// reach the repository can check later (ADR 0010 decision 6), so they are
 	// worth telling the operator how to use rather than only printing.
-	fmt.Fprintf(w, "\nTo verify out of band, from any machine that can reach the repository:\n")
-	fmt.Fprintf(w, "  git ls-remote %s | grep %s\n", r.Repo, shortCommit(r.Commit))
+	fprintf(w, "\nTo verify out of band, from any machine that can reach the repository:\n")
+	fprintf(w, "  git ls-remote %s | grep %s\n", r.Repo, shortCommit(r.Commit))
 	return nil
 }
 

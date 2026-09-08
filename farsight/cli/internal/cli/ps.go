@@ -187,12 +187,12 @@ func (r psResult) replicas() int {
 
 func (r psResult) Human(w io.Writer) error {
 	if len(r.Apps) == 0 {
-		fmt.Fprintf(w, "Nothing is running in %q.\n", r.Instance)
+		fprintf(w, "Nothing is running in %q.\n", r.Instance)
 	} else {
-		fmt.Fprintf(w, "%-22s %-18s %-7s %-8s %s\n", "NAMESPACE", "NAME", "READY", "TIER", "AGE")
+		fprintf(w, "%-22s %-18s %-7s %-8s %s\n", "NAMESPACE", "NAME", "READY", "TIER", "AGE")
 		for _, a := range r.Apps {
 			ready := fmt.Sprintf("%d/%d", a.Ready, a.Desired)
-			fmt.Fprintf(w, "%-22s %-18s %-7s %-8s %s\n", a.Namespace, a.Name, ready, a.Tier, a.Age)
+			fprintf(w, "%-22s %-18s %-7s %-8s %s\n", a.Namespace, a.Name, ready, a.Tier, a.Age)
 		}
 		var stopped int
 		for _, a := range r.Apps {
@@ -201,16 +201,16 @@ func (r psResult) Human(w io.Writer) error {
 			}
 		}
 		if stopped > 0 {
-			fmt.Fprintf(w, "\n%s at 0 replicas. A protective shutdown scales to zero and never back:\n",
+			fprintf(w, "\n%s at 0 replicas. A protective shutdown scales to zero and never back:\n",
 				plural(stopped, "application is", "applications are"))
-			fmt.Fprintf(w, "bringing an application back up is not the kernel's decision to make.\n")
+			fprintf(w, "bringing an application back up is not the kernel's decision to make.\n")
 		}
 	}
 	for _, u := range r.Unreadable {
-		fmt.Fprintf(w, "\nCould not read %s\n", u)
+		fprintf(w, "\nCould not read %s\n", u)
 	}
 	if len(r.Unreadable) > 0 {
-		fmt.Fprintf(w, "This listing is partial.\n")
+		fprintf(w, "This listing is partial.\n")
 	}
 	return nil
 }

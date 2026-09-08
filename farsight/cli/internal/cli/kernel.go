@@ -273,13 +273,13 @@ type kernelDeployResult struct {
 }
 
 func (r kernelDeployResult) Human(w io.Writer) error {
-	fmt.Fprintf(w, "Kernel deployed to %q (%d replica)\n", r.Instance, r.Replicas)
-	fmt.Fprintf(w, "  image      %s\n", r.Image)
-	fmt.Fprintf(w, "  meters     %s\n", strings.Join(r.Namespaces, ", "))
-	fmt.Fprintf(w, "  limit      %s %.2f/%s\n", r.CostLimit.Currency, r.CostLimit.Amount, r.CostLimit.Period)
-	fmt.Fprintf(w, "  floor      ~%s %.2f/mo fully provisioned (estimated)\n", r.CostLimit.Currency, r.Floor)
-	fmt.Fprintf(w, "\nIt stops applications only. The tunnel and the key holder are last-to-die:\n")
-	fmt.Fprintf(w, "stopping them would make storage impossible to unseal while the instance kept\n")
-	fmt.Fprintf(w, "billing.\n")
+	fprintf(w, "Kernel deployed to %q (%d replica)\n", r.Instance, r.Replicas)
+	fprintf(w, "  image      %s\n", r.Image)
+	fprintf(w, "  meters     %s\n", strings.Join(r.Namespaces, ", "))
+	fprintf(w, "  limit      %s %.2f/%s\n", r.CostLimit.Currency, r.CostLimit.Amount, r.CostLimit.Period)
+	fprintf(w, "  floor      ~%s %.2f/mo fully provisioned (estimated)\n", r.CostLimit.Currency, r.Floor)
+	fprintf(w, "\nIt stops applications only. The tunnel and the key holder are last-to-die:\n")
+	fprintf(w, "stopping them would make storage impossible to unseal while the instance kept\n")
+	fprintf(w, "billing.\n")
 	return nil
 }

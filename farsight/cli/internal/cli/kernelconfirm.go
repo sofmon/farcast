@@ -262,12 +262,12 @@ type confirmResult struct {
 
 func (r confirmResult) Human(w io.Writer) error {
 	if !r.Confirmed {
-		fmt.Fprintf(w, "Nothing new to confirm for %q.\n", r.Instance)
+		fprintf(w, "Nothing new to confirm for %q.\n", r.Instance)
 		return nil
 	}
-	fmt.Fprintf(w, "Confirmed %s %.2f for %s..%s on %q (%d window(s) pushed)\n",
+	fprintf(w, "Confirmed %s %.2f for %s..%s on %q (%d window(s) pushed)\n",
 		r.Currency, r.Amount, r.From.Format(time.DateOnly), r.To.Format(time.DateOnly), r.Instance, r.Windows)
-	fmt.Fprintf(w, "\nThe kernel will correct its estimate on its next reconcile. It never acts on\n")
-	fmt.Fprintf(w, "this figure — 'expected' enforces, 'confirmed' corrects.\n")
+	fprintf(w, "\nThe kernel will correct its estimate on its next reconcile. It never acts on\n")
+	fprintf(w, "this figure — 'expected' enforces, 'confirmed' corrects.\n")
 	return nil
 }

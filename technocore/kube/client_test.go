@@ -244,7 +244,7 @@ func TestTheTokenIsRereadOnEveryRequest(t *testing.T) {
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		count.Add(1)
 		seen.auth = r.Header.Get("Authorization")
-		w.Write([]byte(`{"items":[]}`))
+		_, _ = w.Write([]byte(`{"items":[]}`))
 	}))
 	t.Cleanup(s.Close)
 
