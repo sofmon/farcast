@@ -57,6 +57,23 @@ Autonomous recovery therefore requires either hardware that will refuse to run t
 
 **8. The bucket credential is not a keyring entry** and may be cloud-side. Workload Identity is the right shape — metadata-server tokens, no key at rest anywhere.
 
+**9. A scope is minted with the keyring, not at the first unseal.** *(Added 2026-09-08, after the Phase 4.3 walk.)*
+
+The `app` scope used to arrive when `farcast storage unseal` first ran. That left a window in which **nothing owned `app/`**: anything written there landed in the master key space, and the scope — once minted — took ownership of the prefix, after which those objects could no longer be reached by their own names. `ls` still showed them, because the master keyring recovered the name; a read routed to the scope and reported "object not found". Nothing was lost, and nothing could be fetched.
+
+The bring-up order walked an operator straight into it. `storage deploy` refused without a bucket, the only way to mint a bucket was to write an object, and `app/` is where the documentation says to write one. The walk followed its own runbook and stranded a file.
+
+Two halves, and the second is the decision:
+
+- **`storage deploy` mints the bucket and the keyring itself**, so nothing forces a write before storage exists.
+- **The scope is created with the keyring**, so `app/` has an owner before the first write can happen.
+
+**An unseal-time collision check was considered and rejected**, and the reason is decision 4's neighbour rather than a preference: *unseal deliberately touches no cloud*. It reads `keys.yaml` and nothing else, so that recovery never depends on the provider being reachable or on the machine holding cloud credentials at the moment an operator needs storage back. A check that listed the bucket would either break that property or silently skip itself whenever the cloud was unreachable — a guard that is absent exactly when things are going badly. Closing the window needs neither: with the scope minted up front there is nothing left to collide with.
+
+There is a residue, and it is recorded rather than papered over: a keyring created **before** this change still has no scope until its first unseal, and for those instances the window remains. It is no longer reachable through the documented path, and detecting it would require the cloud access this decision just declined to depend on.
+
+**10. "This keyring did not write that object" is not an integrity failure.** *(Added 2026-09-08.)* Opening a sealed name is an AEAD open, so a wrong key and a damaged header are cryptographically indistinguishable — but they are not equally likely and they have opposite remedies. An instance holds several key spaces, every listing that spans them asks each in turn, and each is *expected* to fail on the others' objects. Reporting that routine outcome as `stored data failed integrity check` sent an operator hunting for corruption in a system whose entire premise is that the cloud cannot tamper with their data. A header that does not **parse** is still ErrIntegrity — no key changes structure. A header that parses and whose name does not **open** now reports `ErrForeignObject`, and a listing spanning key spaces reports only objects that **no** key space could name.
+
 ---
 
 ## Consequences

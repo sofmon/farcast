@@ -36,6 +36,8 @@ Every `kubectl` below assumes `KUBECONFIG` points at the file `farcast connect` 
 farcast storage deploy "$INSTANCE"
 ```
 
+**This creates the bucket and the keyring if the instance has neither.** It used to refuse and tell you to "run a 'farcast storage' command first so the bucket is minted" — and the only such command that mints is one that *writes*. The Phase 4.3 walk followed that literally, wrote to `app/`, and stranded the object: nothing owned `app/` yet, so it landed in the master key space, and the first unseal minted the `app` scope over the prefix. See [ADR 0008](../adr/0008-in-cluster-key-delivery.md) decision 9.
+
 Expect a cost confirmation naming the standing compute, then a build-and-push of `system/datasphered` if the instance registry does not already have it (no container engine involved — the CLI compiles the Go binary and pushes an OCI image directly).
 
 **The command must NOT wait for the pods to become ready.** It should return promptly saying every replica is SEALED and telling you to run `unseal`. If it hangs waiting for a rollout, that is a bug: sealed replicas never become Ready, so the wait could only ever time out.

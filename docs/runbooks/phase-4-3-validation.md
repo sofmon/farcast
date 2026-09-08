@@ -293,7 +293,7 @@ The listing recovers the name through master; the read routes through `app` and 
 
 The message is the sharper half: `stored data failed integrity check`. Nothing is corrupt; the wrong key was tried. Telling an operator that encrypted storage failed an integrity check, in a system whose whole premise is that the cloud cannot tamper with their data, sends them hunting for corruption that does not exist. "Cannot decrypt because this is not my object" and "decrypted and the tag did not verify" must not share a message.
 
-Filed for a separate session; the smallest real fix may be letting `storage deploy` mint an empty bucket itself, which removes the trap rather than handling it.
+**Fixed on 2026-09-08**, and the smallest real fix was indeed to remove the trap rather than handle it: `storage deploy` now mints the bucket and the keyring itself, and the `app` scope is created *with* the keyring so the prefix has an owner before any write can happen. An unseal-time collision check was considered and rejected — unseal deliberately touches no cloud, so such a check would either break recovery or silently skip itself. The misleading message is fixed too: a header that does not parse is still an integrity failure, one that parses and whose name will not open reports `ErrForeignObject`, and a listing spanning key spaces now reports only objects **no** key space could name. Recorded as [ADR 0008](../adr/0008-in-cluster-key-delivery.md) decisions 9 and 10.
 
 ### Not a finding: the meter briefly reported five pods for six
 
