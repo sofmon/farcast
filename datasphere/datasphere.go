@@ -35,6 +35,24 @@ var (
 	// with it, ever.
 	ErrIntegrity = crypto.ErrIntegrity
 
+	// ErrForeignObject reports that an object's sealed name could not be
+	// opened with this keyring's name key.
+	//
+	// It is deliberately NOT ErrIntegrity, which is what this path used to
+	// return. Opening a sealed name is an AEAD open, so a wrong key and a
+	// damaged header are cryptographically indistinguishable — but they are
+	// not equally likely, and they have opposite remedies. An instance holds
+	// several key spaces (the master keyring and one per scope), every
+	// listing that spans them asks each in turn, and each is expected to fail
+	// on the others' objects. Reporting that routine, by-design outcome as
+	// "stored data failed integrity check" sends an operator hunting for
+	// corruption in a system whose entire premise is that the cloud cannot
+	// tamper with their data.
+	//
+	// Found on the Phase 4.3 walk, where exactly one object triggered it and
+	// nothing whatsoever was wrong.
+	ErrForeignObject = errors.New("datasphere: this keyring did not write that object")
+
 	// ErrUnknownKey reports that a blob names a key ID absent from the
 	// keyring. Two causes are indistinguishable from here: the header was
 	// tampered with (the key ID is cloud-writable bytes, read before any

@@ -952,3 +952,64 @@ func TestStoreRejectsOversizedPlaintext(t *testing.T) {
 		t.Errorf("provider saw %d Put calls for an oversized object, want 0", got)
 	}
 }
+
+// An object written under one keyring and listed through another is the
+// routine, by-design outcome in an instance that holds several key spaces —
+// the master keyring and one per scope. It must not be reported as corruption.
+//
+// Found on the Phase 4.3 walk: one object, nothing wrong with it, and a
+// warning that said "stored data failed integrity check" in a system whose
+// entire premise is that the cloud cannot tamper with an operator's data.
+func TestAnotherKeyringsObjectIsNotReportedAsCorruption(t *testing.T) {
+	ctx := context.Background()
+	mine, fake := newTestStore(t)
+
+	// A second key space over the same bucket, exactly as a scope is: its own
+	// name key and its own KEK, which is what makes a scope a scope.
+	other := Keyring{
+		nameKeys: []KeyEntry{testEntry(t, "0203040506070809", "OTHER-NAMEKEY-MATERIAL-32-BYTE!!")},
+		keys:     []KeyEntry{testEntry(t, "1213141516171819", "OTHER-KEYRING-MATERIAL-32-BYTE!!")},
+	}
+	if err := other.Valid(); err != nil {
+		t.Fatalf("the second keyring is not valid: %v", err)
+	}
+	theirs, err := NewStore(fake, "farcast-test-bucket", other)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	if err := theirs.Write(ctx, "app/hello", []byte("written by the other key space")); err != nil {
+		t.Fatalf("write through the other key space: %v", err)
+	}
+
+	// Listing the whole bucket through MY keyring finds their object's bytes
+	// and cannot name them. That is expected.
+	_, err = mine.ListEntries(ctx, "")
+	if err == nil {
+		t.Fatal("listing another key space's object reported no difficulty at all")
+	}
+	if !errors.Is(err, ErrForeignObject) {
+		t.Errorf("error = %v, want it to classify as ErrForeignObject", err)
+	}
+	if errors.Is(err, ErrIntegrity) {
+		t.Errorf("error = %v, must NOT classify as an integrity failure — nothing is corrupt", err)
+	}
+
+	// And the caller can tell WHICH stored object, so a listing spanning key
+	// spaces can check whether another one managed it.
+	var ne *NameError
+	if !errors.As(err, &ne) {
+		t.Fatalf("error = %v, want a *NameError carrying the stored name", err)
+	}
+	if ne.Stored == "" {
+		t.Error("the NameError carries no stored name")
+	}
+
+	// Their own keyring reads it back perfectly.
+	got, err := theirs.Read(ctx, "app/hello")
+	if err != nil {
+		t.Fatalf("the writing key space cannot read its own object: %v", err)
+	}
+	if string(got) != "written by the other key space" {
+		t.Errorf("read back %q", got)
+	}
+}

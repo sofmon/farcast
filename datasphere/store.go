@@ -315,14 +315,51 @@ func (s *Store) logicalName(ctx context.Context, info ObjectInfo) (string, error
 	// precisely when something is already wrong.
 	head, err := s.header(ctx, info.Name)
 	if err != nil {
-		return "", fmt.Errorf("datasphere: recover name of stored object %s: %w", info.Name, err)
+		// A fetch that failed is an I/O problem and says so. Only the open
+		// below can speak to whose object this is.
+		return "", &NameError{Stored: info.Name, Err: err}
 	}
-	name, err := crypto.HeaderName(s.nameKey, info.Name, head)
+	// Parsing and opening are separated deliberately, because the two failures
+	// mean opposite things and HeaderName folds them together.
+	//
+	// A header that does not PARSE is structurally not a blob this module
+	// wrote: wrong magic, wrong version, impossible lengths. No key can change
+	// that, so it is damage and ErrIntegrity is exactly right.
+	//
+	// A header that parses and whose sealed name does not OPEN is an AEAD
+	// failure, and in an instance holding several key spaces the overwhelmingly
+	// likely cause is that this keyring did not write the object. Reporting
+	// that as an integrity failure is what sent an operator hunting for
+	// corruption on the Phase 4.3 walk.
+	h, err := crypto.ParseHeader(head)
 	if err != nil {
-		return "", fmt.Errorf("datasphere: recover name of stored object %s: %w", info.Name, err)
+		return "", &NameError{Stored: info.Name, Err: err}
+	}
+	name, err := crypto.OpenName(s.nameKey, info.Name, h.SealedName)
+	if err != nil {
+		return "", &NameError{Stored: info.Name, Err: ErrForeignObject}
 	}
 	return name, nil
 }
+
+// NameError is a failure to recover one stored object's logical name, carrying
+// the stored name so a caller spanning several key spaces can tell whether any
+// OTHER key space managed it.
+//
+// That distinction is the whole point: an instance's listing asks every key
+// space that could hold a prefix, and each is expected to fail on the others'
+// objects. Only an object no key space can name is worth an operator's
+// attention.
+type NameError struct {
+	Stored string
+	Err    error
+}
+
+func (e *NameError) Error() string {
+	return fmt.Sprintf("datasphere: recover name of stored object %s: %v", e.Stored, e.Err)
+}
+
+func (e *NameError) Unwrap() error { return e.Err }
 
 // header fetches at most a blob's header. A short object simply yields fewer
 // bytes, which is not an error — the header parser is what judges it.
