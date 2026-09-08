@@ -8,6 +8,20 @@ import (
 	"github.com/sofmon/farcast/datasphere/internal/crypto"
 )
 
+// DefaultScope is the slice of storage an instance's applications share.
+// Per-application scopes arrive later; until then one scope keeps application
+// data cryptographically separate from the operator's own objects, which is
+// the property that matters first.
+//
+// These live here rather than in the CLI because two places now need to agree
+// on them: the keyholder that serves the scope, and the keyring minting that
+// creates it. A prefix the two disagreed about would be a scope that owns
+// nothing.
+const (
+	DefaultScopeName   = "app"
+	DefaultScopePrefix = "app/"
+)
+
 // ScopePrefixSuffix is the separator every scope prefix ends with. A scope
 // owns a whole subtree, never a partial segment: without the trailing
 // separator a scope named "app" would also claim "application/…".

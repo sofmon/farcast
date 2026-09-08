@@ -14,13 +14,12 @@ import (
 	"github.com/sofmon/farcast/fatline/tunnel"
 )
 
-// DefaultScope is the slice of storage an instance's applications share in
-// phase 3.2. Per-application scopes arrive at 4.x; until then one scope keeps
-// application data cryptographically separate from the operator's own objects,
-// which is the property that matters first.
+// The application scope's name and prefix now live in datasphere, so the
+// keyring minting that creates the scope and the keyholder that serves it
+// cannot disagree about which prefix it owns.
 const (
-	DefaultScopeName   = "app"
-	DefaultScopePrefix = "app/"
+	DefaultScopeName   = datasphere.DefaultScopeName
+	DefaultScopePrefix = datasphere.DefaultScopePrefix
 )
 
 // keyholderDialer opens the operator's tunnel and returns a client for the
