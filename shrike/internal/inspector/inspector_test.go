@@ -1,6 +1,8 @@
 package inspector
 
 import (
+	"bytes"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -237,5 +239,25 @@ func TestAnUnidentifiedCallerSaysSo(t *testing.T) {
 	}
 	if raised[0].App != "" {
 		t.Errorf("an unidentified caller was attributed to %q", raised[0].App)
+	}
+}
+
+// The status JSON has named the application since 4.4; the alert stream did
+// not, so two applications denied the same host read as one problem in the
+// logs an operator actually watches. Assert on the rendered line, because
+// asserting on the Alert is what let this through.
+func TestSlogAlerterNamesTheApplication(t *testing.T) {
+	var buf bytes.Buffer
+	a := SlogAlerter{Logger: slog.New(slog.NewTextHandler(&buf, nil))}
+	a.Alert(Alert{
+		Severity: Warning, App: "reacher", Namespace: "egress-demo",
+		Host: "evil.example.com", Port: "443", Proto: "connect",
+		Reason: event.ReasonNotInAllowlist, Count: 3,
+	})
+	line := buf.String()
+	for _, want := range []string{"app=reacher", "namespace=egress-demo"} {
+		if !strings.Contains(line, want) {
+			t.Errorf("alert line lacks %q\n  got: %s", want, line)
+		}
 	}
 }

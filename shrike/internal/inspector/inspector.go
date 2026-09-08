@@ -116,6 +116,11 @@ func (a SlogAlerter) Alert(al Alert) {
 	}
 	l.LogAttrs(context.Background(), lvl, "shrike: egress policy violation",
 		slog.String("severity", string(al.Severity)),
+		// Who, before what. The status JSON has carried these since 4.4 while
+		// this line did not, so an operator watching the alert stream saw two
+		// applications denied the same host as one indistinguishable problem.
+		slog.String("namespace", al.Namespace),
+		slog.String("app", al.App),
 		slog.String("host", al.Host),
 		slog.String("port", al.Port),
 		slog.String("proto", al.Proto),
