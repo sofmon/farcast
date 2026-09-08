@@ -226,27 +226,88 @@ farcast release "$INSTANCE"
 
 ## Success criteria
 
+Walked live against GKE on **2026-09-08**, instance `p43`, released the same day.
+
 | # | Claim | Result |
 |---|-------|--------|
-| 1 | An unpinned fetcher is resolved, reported and refused | |
-| 2 | The instance reads the manifest and reports a commit and a digest | |
-| 3 | The gate shows every external declaration before anything is built | |
-| 4 | Answering no builds nothing | |
-| 5 | The fetch reaches DNS and the Git host, and not the metadata server | |
-| 6 | The build is pinned to the commit that was read, not the branch | |
-| 7 | `farcast ps` shows the application, and hides the machinery without `--all` | |
-| 8 | `farcast logs` finds the app without a namespace and prints the `RUN` step's file | |
-| 9 | `farcast costs` reports both figures, and no confirmed zero | |
-| 10 | The reported rate matches the cluster's pod count exactly | |
-| 11 | The new namespace is metered, with its RoleBinding | |
-| 12 | A second run needs neither image flag | |
-| 13 | The commit and manifest digest check out against the remote | |
+| 1 | An unpinned fetcher is resolved, reported and refused | ✅ after finding 1 |
+| 2 | The instance reads the manifest and reports a commit and a digest | ✅ `37c2eb398a87…`, `sha256:02deddf8…` |
+| 3 | The gate shows every external declaration before anything is built | ✅ |
+| 4 | Answering no builds nothing | ✅ only the fetch Job existed |
+| 5 | The fetch reaches DNS and the Git host, and not the metadata server | ✅ `169.254.0.0/16` excluded whole |
+| 6 | The build is pinned to the commit that was read, not the branch | ✅ `--context=…#37c2eb39…` |
+| 7 | `farcast ps` shows the application, and hides the machinery without `--all` | ✅ after finding 3 |
+| 8 | `farcast logs` finds the app without a namespace and prints the `RUN` step's file | ✅ `built by farcast, inside the instance` |
+| 9 | `farcast costs` reports both figures, and no confirmed zero | ✅ |
+| 10 | The reported rate matches the cluster's pod count exactly | ✅ `0.0304/h` = 6 × $0.0050625 |
+| 11 | The new namespace is metered, with its RoleBinding | ✅ |
+| 12 | A second run needs neither image flag | ✅ |
+| 13 | The commit and manifest digest check out against the remote | ✅ byte-identical |
 
-## Not covered by this run
+**The four unknowns about the fetcher image all held.** `/bin/sh`, `git` and `sha256sum` are all present in `cgr.dev/chainguard/git:latest-dev`, and a read-only root filesystem over an `emptyDir` owned by `fsGroup: 65532` clones without complaint. The read took **9 seconds**.
 
-- **A repository whose manifest is at its root.** This walk uses `--manifest` because FarCast's own repository has no root `./farcast`. The default path is the same code with a different string, but it is untested here.
-- **A manifest with more than one application.** `run` builds them one at a time and that ordering is unit-tested, but a multi-app deployment has never been built in a cluster.
-- **`--namespace`.** Deploying a manifest under a name it does not declare.
-- **A build that fails.** The unit tests cover "nothing is deployed"; a real Containerfile error in a real cluster is not walked.
-- **Shrike.** Per-application enforcement of these declarations is 4.4. Today FatLine's allowlist is instance-wide: the manifest is *reviewed* per application and *enforced* per instance.
-- **Invoice reconciliation.** Still open from 4.1, and still the largest unverified claim in the project: every cost figure here is modelled from a published rate card and none has been checked against a bill.
+**Kaniko checks out a bare commit SHA.** Documented and never previously exercised here. It works, which is what makes the approval gate mean anything.
+
+---
+
+## Findings
+
+### 1. The OCI client judged a token by its label, not its content — and that blocked the entire toolchain
+
+`farcast run` could not resolve *either* image: `token endpoint cgr.dev answered with "text/plain; charset=utf-8", not JSON`. The body was valid JSON. Chainguard serves it under a sloppy `Content-Type`, and [`oci`](../../farsight/cli/internal/oci/) refused on the header before reading it.
+
+The check looked defensive and was not: `json.Unmarshal` already rejects an HTML error page, so the header gate bought nothing and cost every image on that registry. It now decodes the body and reports the label only when decoding actually fails, with an excerpt of what arrived — because "not JSON" alone tells an operator nothing they can act on.
+
+This would have blocked the 4.2 walk's builder identically. That walk resolved it, so **cgr.dev changed its response between 2026-09-01 and 2026-09-08** — the same week it changed the image's availability.
+
+### 2. The builder image was withdrawn seven days after it was reviewed — and the review had not been written down
+
+`cgr.dev/chainguard/kaniko` returns an empty tag list to an anonymous puller; Docker Hub returns 401; Chainguard's directory now shows the image as `cgr.dev/ORGANIZATION/kaniko`. The maintained fork [ADR 0010](../adr/0010-application-image-builds.md) decision 10 chose is no longer publicly pullable.
+
+Pulling **by digest** survives their tier changes, so the 4.2 walk's reviewed digest would still have worked — except that nothing recorded it. Both runbooks said *"record the digest it prints"* into a shell variable, and no commit, no metadata and no ADR carried it. **The review happened, was never written down, and died with the session.** That half was entirely within this project's control and is the more embarrassing of the two.
+
+[ADR 0011](../adr/0011-build-toolchain-mirroring.md) is the response: reviewed third-party images are **mirrored into the instance's own registry**, so no third party's catalogue policy can stop an instance deploying; the copy preserves the digest of the platform manifest, so a mirror is checkable in two hops without trusting FarCast's code; and the builder is Google's archived Kaniko, pinned — explicitly a stopgap, with the exits named.
+
+Both mirrors were verified against upstream during this walk, and both matched.
+
+### 3. `farcast ps --all` claimed to show FarCast's own components and omitted storage
+
+`ps` listed Deployments. The key holder is a **StatefulSet**, so `datasphered` did not appear at all — on a command whose `--all` flag exists precisely to show the instance's own machinery. `farcast logs` had the same gap from the other side: it built `deployment/<name>`, which names nothing for a StatefulSet.
+
+Both now ask for `deployments,statefulsets` and carry the kind through, and the log target is built from the kind that was found. The regression tests sit at the cluster layer, where the kubectl argument and the JSON decoding actually happen — a first attempt tested through a fake that returned pre-built workloads and caught neither mutation.
+
+### Incidental: an object written before its scope exists becomes unreachable by name
+
+Not a 4.3 defect, and found only because `farcast release` refused to destroy data without consent — a safety gate earning its keep.
+
+A fresh instance has no bucket, `farcast storage deploy` refuses without one, and the only way to mint a bucket is to write an object. The documented place to write is `app/`. But the `app` **scope** does not exist yet, so the object is encrypted under the **master** key space — and `farcast storage unseal` then mints `app`, which owns the `app/` prefix from that moment on.
+
+`ls --explain` names it exactly:
+
+```
+master   owns (everything outside every scope)   1 object(s) under it, 1 name(s) recovered
+app      owns app/                               1 object(s) under it, 0 name(s) recovered
+```
+
+The listing recovers the name through master; the read routes through `app` and reports `object not found`. Nothing is lost — master still holds the key — but the CLI will not reach the object by its own name, and **the documented bring-up order walks you into it.**
+
+The message is the sharper half: `stored data failed integrity check`. Nothing is corrupt; the wrong key was tried. Telling an operator that encrypted storage failed an integrity check, in a system whose whole premise is that the cloud cannot tamper with their data, sends them hunting for corruption that does not exist. "Cannot decrypt because this is not my object" and "decrypted and the tag did not verify" must not share a message.
+
+Filed for a separate session; the smallest real fix may be letting `storage deploy` mint an empty bucket itself, which removes the trap rather than handling it.
+
+### Not a finding: the meter briefly reported five pods for six
+
+`farcast costs` said `across 5 pods` while the cluster had six. The sixth was the application that had just started, and the checkpoint carrying the observation is written every five minutes. The next checkpoint reported six and the rate matched exactly.
+
+This is the documented staleness, and it was diagnosable in seconds **only because the observation carries its own age** — `observed 2m ago`. Without that field it would have looked like a metering bug, which is the most alarming thing this system can appear to have.
+
+---
+
+## What this walk did not cover
+
+- **A repository whose manifest is at its root.** This walk used `--manifest`, because FarCast's own repository has no root `./farcast`. The default path is the same code with a different string — and "the same code with a different string" is the shape of several findings here.
+- **A multi-application manifest.** One app was built. The one-at-a-time ordering is unit-tested and was not exercised against a cluster.
+- **`--namespace`,** and a build that fails in a real cluster.
+- **The private-repository path.** Step 10 was skipped by choice; it needs a read-only credential.
+- **Shrike.** Per-application enforcement is 4.4. The manifest is *reviewed* per application and *enforced* per instance, so the gate this walk validated is currently stronger than what backs it.
+- **Invoice reconciliation.** Still open from 4.1, and still the largest unverified claim in the project: every figure here is modelled from a published rate card, and `farcast costs` now puts those figures in front of an operator as the answer to "what am I spending".
