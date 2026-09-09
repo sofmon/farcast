@@ -489,7 +489,7 @@ func TestUsageSaysWhoseNetworkPictureItIs(t *testing.T) {
 	}{
 		{
 			name: "several replicas", desired: 2, seedPods: true,
-			want: []string{"of 2", "share of the instance's traffic, not the total"},
+			want: []string{"of 2", "that replica's share, not the total"},
 		},
 		{
 			name: "one replica", desired: 1, seedPods: true,
@@ -498,7 +498,7 @@ func TestUsageSaysWhoseNetworkPictureItIs(t *testing.T) {
 		},
 		{
 			name: "replica count unreadable", seedPods: false,
-			want: []string{"could not be read", "whether this is the whole picture"},
+			want: []string{"unknown number", "cannot be said"},
 		},
 	}
 	for _, tc := range cases {

@@ -292,3 +292,72 @@ func TestWithNoProfilesThereIsNoAdvice(t *testing.T) {
 		t.Errorf("advised %+v with collection off", got)
 	}
 }
+
+// A held advice must not describe a target it no longer carries. The 5.2
+// walk's published document showed a cooled-down workload still flagged as
+// "a bounded step", which reads as something about to happen.
+func TestAHeldAdviceCarriesNoTargetAndNoStep(t *testing.T) {
+	now := start.Add(48 * time.Hour)
+	d := deployment("web", "farcast-apps", "web", tier.App, 1)
+	d.Metadata.Annotations = map[string]string{AdaptedAtLabel: now.Add(-time.Minute).Format(time.RFC3339)}
+	f := &fakeCluster{
+		byNS:   map[string][]kube.Pod{"farcast-apps": {podFor("web-1", "farcast-apps", "web", tier.App, "4000m", "4096Mi")}},
+		depsNS: map[string][]kube.Deployment{"farcast-apps": {d}},
+	}
+	_, advice := adviseOnce(t, f, now, func(r *Reconciler) { profiled(t, r, now, "web", 10, 10, 4000, 4096) })
+	got := advice[0]
+	if got.Act {
+		t.Fatalf("the cooldown did not hold: %+v", got)
+	}
+	if got.Stepped {
+		t.Error("a held advice is flagged as a bounded step")
+	}
+	if got.CPUMilli != got.CurrentCPUMilli || got.MemMiB != got.CurrentMemMiB {
+		t.Errorf("a held advice carries a target: %+v", got)
+	}
+}
+
+// The 5.2 walk watched the kernel ask Autopilot for 25m, be answered 200, and
+// announce a resize to 25m — while the cluster had already replaced it with
+// its own 50m floor, in the pod template. It then read 50m back and asked
+// again on the next cooldown, forever. What is reported has to be what the
+// cluster KEPT.
+func TestAResizeReportsWhatTheClusterKept(t *testing.T) {
+	now := start.Add(time.Hour)
+	f := &fakeCluster{
+		byNS:   map[string][]kube.Pod{"farcast-apps": {podFor("web-1", "farcast-apps", "web", tier.App, "500m", "512Mi")}},
+		depsNS: map[string][]kube.Deployment{"farcast-apps": {deployment("web", "farcast-apps", "web", tier.App, 1)}},
+		// An admission controller with a floor of its own.
+		storeCPU: 250, storeMem: 512,
+	}
+	r, advice := adviseOnce(t, f, now, func(r *Reconciler) { profiled(t, r, now, "web", 40, 60, 500, 512) })
+	asked := advice[0].CPUMilli
+	res := r.Adapt(context.Background(), advice, now)
+	if len(res.Applied) != 1 {
+		t.Fatalf("applied %+v", res.Applied)
+	}
+	got := res.Applied[0]
+	if !got.Overridden {
+		t.Error("an override went unreported")
+	}
+	if got.CPUMilli != 250 || got.MemMiB != 512 {
+		t.Errorf("reported %dm/%dMi, want what the cluster kept (250m/512Mi)", got.CPUMilli, got.MemMiB)
+	}
+	if got.AskedCPUMilli != asked {
+		t.Errorf("the asked-for value was lost: %dm, want %dm", got.AskedCPUMilli, asked)
+	}
+}
+
+// The ordinary case must not be reported as an override.
+func TestAnAcceptedResizeIsNotAnOverride(t *testing.T) {
+	now := start.Add(time.Hour)
+	f := &fakeCluster{
+		byNS:   map[string][]kube.Pod{"farcast-apps": {podFor("web-1", "farcast-apps", "web", tier.App, "500m", "512Mi")}},
+		depsNS: map[string][]kube.Deployment{"farcast-apps": {deployment("web", "farcast-apps", "web", tier.App, 1)}},
+	}
+	r, advice := adviseOnce(t, f, now, func(r *Reconciler) { profiled(t, r, now, "web", 40, 60, 500, 512) })
+	res := r.Adapt(context.Background(), advice, now)
+	if res.Applied[0].Overridden {
+		t.Error("a resize the cluster accepted was reported as an override")
+	}
+}

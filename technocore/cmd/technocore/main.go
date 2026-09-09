@@ -273,6 +273,18 @@ func (s *supervisor) adapt(ctx context.Context, rep kernel.Report) {
 	}
 	res := s.reconciler.Adapt(ctx, advice, rep.At)
 	for _, a := range res.Applied {
+		if a.Overridden {
+			// The cluster kept something else. Said at WARN and named as an
+			// override, because the alternative is what the 5.2 walk saw: a
+			// kernel announcing a resize to a value an admission controller
+			// had already replaced, then reading the replacement back and
+			// asking again on the next cooldown.
+			s.log.Warn("the cluster stored a different reservation than the one asked for",
+				"app", a.App, "namespace", a.Namespace, "deployment", a.Deployment,
+				"asked", fmt.Sprintf("%dm/%dMi", a.AskedCPUMilli, a.AskedMemMiB),
+				"stored", fmt.Sprintf("%dm/%dMi", a.CPUMilli, a.MemMiB),
+				"likely", "an admission controller's own floor")
+		}
 		s.log.Warn("resized an application",
 			"app", a.App, "namespace", a.Namespace, "deployment", a.Deployment, "container", a.Container,
 			"from", fmt.Sprintf("%dm/%dMi", a.CurrentCPUMilli, a.CurrentMemMiB),

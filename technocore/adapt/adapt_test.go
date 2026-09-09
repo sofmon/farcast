@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/sofmon/farcast/technocore/pricing"
 	"github.com/sofmon/farcast/technocore/usage"
 )
 
@@ -176,5 +177,68 @@ func TestTheSavingIsReportedAsANegativeDelta(t *testing.T) {
 	grew := Recommend(summary("api", 100, 128, 500, 600, 500, 600), Config{})
 	if d := grew.MonthlyDeltaUSD(); d <= 0 {
 		t.Errorf("growing a reservation reported a delta of %v, want a cost", d)
+	}
+}
+
+// Found live on the 5.2 walk: the kernel took a workload from 50m to 25m,
+// restarted three healthy pods, and saved $0.0000 — because Autopilot bills a
+// Pod for at least its floor, so both reservations cost the same. Every other
+// bound in this package is about ratios, and a ratio can be large while the
+// money is nothing.
+func TestAResizeThatDoesNotChangeTheBillIsNotWorthARollout(t *testing.T) {
+	// Raising the floor to the billing floor stops the walk's exact case
+	// arising again, so the guard is exercised on what remains: a workload
+	// somebody set BELOW the floor by hand. Moving it to 50m is a 67% change
+	// — comfortably past the deadband — and costs the same either way.
+	if pricing.PodMonthlyUSD(30, 64) != pricing.PodMonthlyUSD(50, 64) {
+		t.Fatal("this test assumes 30m and 50m bill identically; the rate card has changed")
+	}
+	s := summary("idle", 30, 64, 0, 0, 0, 0)
+	got := Recommend(s, Config{})
+	if got.Act {
+		t.Fatalf("rolled a workload for no change in the bill: %+v", got)
+	}
+	if !strings.Contains(got.Hold, "would not change the bill") {
+		t.Errorf("hold is %q", got.Hold)
+	}
+	if got.CPUMilli != 30 || got.MemMiB != 64 {
+		t.Errorf("a held advice moved the reservation: %+v", got)
+	}
+	// The consequence, stated rather than hidden: such a workload keeps less
+	// headroom than it could have for the same money. One rollout would buy
+	// it, and the rule is that a rollout needs a reason the cost pillar
+	// recognises.
+}
+
+// Nothing is ever sized below the point where shrinking stops paying: such a
+// reservation costs what the floor costs and buys less headroom.
+func TestNothingIsSizedBelowTheBillingFloor(t *testing.T) {
+	if MinCPUMilli < pricing.BurstingMinCPUMilli {
+		t.Errorf("the CPU floor is %dm, below the billing floor of %dm — strictly worse than sizing to it",
+			MinCPUMilli, pricing.BurstingMinCPUMilli)
+	}
+	cur := summary("idle", 4000, 4096, 0, 0, 0, 0)
+	for i := 0; i < 20; i++ {
+		got := Recommend(cur, Config{})
+		if !got.Act {
+			break
+		}
+		cur.RequestCPUMilli, cur.RequestMemMiB = got.CPUMilli, got.MemMiB
+	}
+	t.Logf("settled at %dm/%dMi", cur.RequestCPUMilli, cur.RequestMemMiB)
+	if cur.RequestCPUMilli < pricing.BurstingMinCPUMilli {
+		t.Errorf("settled at %dm, below the billing floor", cur.RequestCPUMilli)
+	}
+}
+
+// A real saving is still acted on: the guard must not stop the thing this
+// phase exists to do.
+func TestARealSavingIsStillWorthIt(t *testing.T) {
+	got := Recommend(summary("api", 2000, 2048, 40, 60, 40, 60), Config{})
+	if !got.Act {
+		t.Fatalf("a genuinely over-provisioned workload was held: %+v", got)
+	}
+	if d := got.MonthlyDeltaUSD(); d > -1 {
+		t.Errorf("the saving is only %v/month", d)
 	}
 }

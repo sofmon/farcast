@@ -105,7 +105,7 @@ func (c *costsCommand) Run(ctx context.Context, env *Env, args []string) error {
 		limit = meta.CostLimit.Amount
 	}
 	res := costsResult{
-		Instance: name, Currency: currencyOf(meta),
+		Instance: name, Currency: currencyOf(meta), Region: meta.Region,
 		Period: meta.CostLimit.Period, PeriodStart: start, PeriodEnd: end,
 		Expected: accrual.Expected, Confirmed: accrual.Confirmed, Total: accrual.Total,
 		HasConfirmation: accrual.HasConfirmation, ConfirmedThrough: accrual.ConfirmedThrough,
@@ -145,8 +145,11 @@ type appCost struct {
 }
 
 type costsResult struct {
-	Instance    string    `json:"instance"`
-	Currency    string    `json:"currency"`
+	Instance string `json:"instance"`
+	Currency string `json:"currency"`
+	// Region is carried so the report can say when its prices are not this
+	// instance's prices.
+	Region      string    `json:"region,omitempty"`
 	Period      string    `json:"period,omitempty"`
 	PeriodStart time.Time `json:"period_start"`
 	PeriodEnd   time.Time `json:"period_end"`
@@ -203,6 +206,9 @@ func (r costsResult) Human(w io.Writer) error {
 
 	fprintf(w, "\n  rate       %s %.4f/hour across %s",
 		cur, r.Observed.RateHourlyUSD, plural(r.Observed.Pods, "pod", "pods"))
+	if c := regionCaveat(r.Region); c != "" {
+		fprintf(w, ", %s", c)
+	}
 	if r.ObservedAgo != "" {
 		fprintf(w, ", observed %s ago", r.ObservedAgo)
 	}

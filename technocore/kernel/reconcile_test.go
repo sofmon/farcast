@@ -39,19 +39,28 @@ type fakeCluster struct {
 	resized    []string
 	resizeErr  map[string]error
 	resizeAnns map[string]map[string]string
+	// storeCPU/storeMem model an admission controller that keeps something
+	// other than what was asked for.
+	storeCPU int
+	storeMem int
 }
 
-func (f *fakeCluster) SetRequests(_ context.Context, ns, name, container string, cpu, mem int, anns map[string]string) error {
+func (f *fakeCluster) SetRequests(_ context.Context, ns, name, container string, cpu, mem int, anns map[string]string) (int, int, error) {
 	key := ns + "/" + name
 	if err := f.resizeErr[key]; err != nil {
-		return err
+		return 0, 0, err
 	}
 	f.resized = append(f.resized, fmt.Sprintf("%s:%s=%dm/%dMi", key, container, cpu, mem))
 	if f.resizeAnns == nil {
 		f.resizeAnns = map[string]map[string]string{}
 	}
 	f.resizeAnns[key] = anns
-	return nil
+	// An admission controller may keep something else. Zero means "kept what
+	// it was given", so a test only says so when it cares.
+	if f.storeCPU > 0 || f.storeMem > 0 {
+		return f.storeCPU, f.storeMem, nil
+	}
+	return cpu, mem, nil
 }
 
 func (f *fakeCluster) ListPodMetrics(_ context.Context, ns, selector string) ([]kube.PodMetrics, error) {

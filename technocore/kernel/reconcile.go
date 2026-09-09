@@ -52,7 +52,11 @@ type Cluster interface {
 	// SetRequests is the only thing the kernel writes to a workload that is
 	// not a zero (ADR 0016). Everything dangerous about this phase is on the
 	// other side of this one call.
-	SetRequests(ctx context.Context, namespace, name, container string, cpuMilli, memMiB int, annotations map[string]string) error
+	// It returns what the cluster STORED, which is not always what was asked
+	// for: a mutating admission controller sits between the two, and the 5.2
+	// walk watched Autopilot raise a below-floor request in the pod template
+	// itself while answering 200.
+	SetRequests(ctx context.Context, namespace, name, container string, cpuMilli, memMiB int, annotations map[string]string) (int, int, error)
 }
 
 // ManagedBy selects the workloads FarCast created. A kernel that metered

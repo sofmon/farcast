@@ -50,8 +50,12 @@ type connectCommand struct {
 	// redeploy: the two must not drift on where FatLine's image comes from.
 	fatlineDeployer
 
-	carrier    string
-	statusOnly bool
+	carrier string
+	// warmupRetry and warmupWindow are seams: the walk that motivated the
+	// warm-up takes two minutes to reproduce, and a unit suite must not.
+	warmupRetry  time.Duration
+	warmupWindow time.Duration
+	statusOnly   bool
 
 	// Seams, overridable in tests; defaulted by newConnectCommand / ensureDefaults.
 	dial func(ctx context.Context, endpoint string, id tunnel.ClientIdentity) (tunnelConn, error)
@@ -77,6 +81,44 @@ func (c *connectCommand) ensureDefaults() {
 			return conn, nil
 		}
 	}
+}
+
+// carrierWarmup bounds how long a freshly bound load balancer is given to
+// start forwarding. GCP usually programs one within a minute of the address
+// appearing; two is slack, not an expectation.
+const carrierWarmup = 2 * time.Minute
+
+// carrierRetry is how long to wait between attempts while it warms up.
+const carrierRetry = 10 * time.Second
+
+// dialCarrier opens the tunnel, waiting for a just-bound carrier to start
+// forwarding if it has to.
+func (c *connectCommand) dialCarrier(ctx context.Context, env *Env, endpoint string, id tunnel.ClientIdentity, warmup bool) (tunnelConn, error) {
+	conn, err := c.dial(ctx, "https://"+endpoint, id)
+	if err == nil || !warmup {
+		return conn, err
+	}
+	fprintf(env.Err, "The load balancer has its address but is not forwarding yet; waiting up to %s.\n", carrierWarmup)
+
+	retry, window := c.warmupRetry, c.warmupWindow
+	if retry <= 0 {
+		retry = carrierRetry
+	}
+	if window <= 0 {
+		window = carrierWarmup
+	}
+	deadline := time.Now().Add(window)
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(retry):
+		}
+		if conn, err = c.dial(ctx, "https://"+endpoint, id); err == nil {
+			return conn, nil
+		}
+	}
+	return nil, err
 }
 
 func (*connectCommand) Name() string     { return "connect" }
@@ -209,7 +251,18 @@ func (c *connectCommand) Run(ctx context.Context, env *Env, args []string) error
 	if err != nil {
 		return err
 	}
-	conn, err := c.dial(ctx, "https://"+meta.Carrier.Endpoint, id)
+	// Retried, and only on a bootstrap. A public L4 load balancer has an IP
+	// some time before it forwards to anything: `bootstrap` waits for the
+	// address to be ASSIGNED, which is the only thing the cloud API will tell
+	// it, and the data path is programmed afterwards. Dialling immediately
+	// therefore fails on a perfectly healthy instance — the 5.2 walk hit it
+	// on a first connect, with both FatLine pods Running and the Service's
+	// endpoints already populated, and the error read as a network fault.
+	//
+	// `--status` and a re-connect do NOT retry: there the carrier has been up
+	// for a while, so a timeout is real news and waiting two minutes to
+	// report it would be the wrong answer.
+	conn, err := c.dialCarrier(ctx, env, meta.Carrier.Endpoint, id, !c.statusOnly && !connected)
 	if err != nil {
 		return fmt.Errorf("connect to %q: %w", name, err)
 	}

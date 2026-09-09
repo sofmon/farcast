@@ -57,7 +57,14 @@ const (
 	// them however little it appears to use — an idle process still has to
 	// start, and a request small enough to make start-up fail turns an
 	// over-provisioned application into a broken one.
-	MinCPUMilli = 25
+	//
+	// The CPU floor is the BILLING floor, not a guess. Autopilot charges a
+	// Pod for at least [pricing.BurstingMinCPUMilli], so a reservation below
+	// that costs exactly what the floor costs and buys less headroom: it is
+	// strictly worse than sizing to the floor. The 5.2 walk found this the
+	// expensive way — the kernel took a workload from 50m to 25m, rolled
+	// three live pods, and saved $0.0000.
+	MinCPUMilli = pricing.BurstingMinCPUMilli
 	MinMemMiB   = 64
 )
 
@@ -180,8 +187,27 @@ func Recommend(s usage.Summary, cfg Config) Advice {
 	a.CPUMilli, a.MemMiB = cpu, mem
 	a.Act = true
 	a.Stepped = cpuStepped || memStepped
+
+	// The last guard, and the one the 5.2 walk had to teach: a change that
+	// does not change the BILL is not worth a rollout.
+	//
+	// Every other bound here is about ratios, and a ratio can be large while
+	// the money is nothing — below Autopilot's per-Pod billing floor, halving
+	// a reservation costs the same as leaving it alone. The whole
+	// justification for resizing a running application is the cost pillar, so
+	// a resize that saves nothing has no justification at all, and the walk
+	// watched one restart three healthy pods to save $0.0000.
+	if math.Abs(a.MonthlyDeltaUSD()) < worthwhileUSD {
+		a.CPUMilli, a.MemMiB = s.RequestCPUMilli, s.RequestMemMiB
+		a.Act, a.Stepped = false, false
+		a.Hold = "changing this reservation would not change the bill; it is already at the billing floor"
+	}
 	return a
 }
+
+// worthwhileUSD is the smallest monthly change to one Pod that justifies
+// restarting it. A cent a month is not a saving; it is a rollout.
+const worthwhileUSD = 0.01
 
 // scale applies headroom to an observation and floors it.
 func scale(observed int, headroom float64, floor int) int {

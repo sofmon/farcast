@@ -917,3 +917,60 @@ func TestConnectRejectsBothImageFlags(t *testing.T) {
 		t.Error("applied a workload despite the usage error")
 	}
 }
+
+// A public L4 load balancer has an IP some time before it forwards. The 5.2
+// walk's first connect failed on a healthy instance — both FatLine pods
+// Running, endpoints populated — because the dial happened the moment the
+// address appeared.
+func TestABootstrapWaitsForTheCarrierToStartForwarding(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	installedInstance(t, dir, "warm")
+	env, _, errb := testEnvBoth(dir, output.ModeHuman)
+
+	c := testConnect(&fakeProvider{}, &fakeBuilder{})
+	c.assumeYes = true
+	c.fatlineImage = "img:test"
+	c.newCluster = func(string) clusterApplier { return &fakeCluster{ip: "34.0.0.9"} }
+	c.warmupRetry, c.warmupWindow = time.Millisecond, time.Second
+
+	var attempts int
+	c.dial = func(context.Context, string, tunnel.ClientIdentity) (tunnelConn, error) {
+		attempts++
+		if attempts < 3 {
+			return nil, errors.New("dial tcp: operation timed out")
+		}
+		return &fakeConn{st: fatline.ConnStatus{Connected: true}}, nil
+	}
+	if err := c.Run(context.Background(), env, []string{"warm"}); err != nil {
+		t.Fatalf("a carrier that came up on the third attempt failed the connect: %v", err)
+	}
+	if attempts < 3 {
+		t.Errorf("dialled %d times; the warm-up did not retry", attempts)
+	}
+	if !strings.Contains(errb.String(), "not forwarding yet") {
+		t.Errorf("the wait was silent:\n%s", errb.String())
+	}
+}
+
+// --status is not a bootstrap: the carrier has been up for a while, so a
+// timeout there is real news and two minutes of silence is the wrong answer.
+func TestStatusDoesNotWaitOutATimeout(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	connectedInstance(t, dir, "cold")
+	env, _, _ := testEnvBoth(dir, output.ModeHuman)
+
+	c := testConnect(&fakeProvider{}, &fakeBuilder{})
+	c.statusOnly = true
+	c.newCluster = func(string) clusterApplier { return &fakeCluster{ip: "34.0.0.9"} }
+	var attempts int
+	c.dial = func(context.Context, string, tunnel.ClientIdentity) (tunnelConn, error) {
+		attempts++
+		return nil, errors.New("dial tcp: operation timed out")
+	}
+	if err := c.Run(context.Background(), env, []string{"cold"}); err == nil {
+		t.Fatal("a dead carrier reported success")
+	}
+	if attempts != 1 {
+		t.Errorf("--status dialled %d times, want exactly one", attempts)
+	}
+}

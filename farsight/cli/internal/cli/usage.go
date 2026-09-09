@@ -395,17 +395,17 @@ func (r usageResult) writeReplicaCaveat(w io.Writer) {
 	// are a share — the count comes from the cluster and is enough on its own.
 	who := ""
 	if r.NetworkReplica != "" {
-		who = " " + r.NetworkReplica
+		who = ", " + r.NetworkReplica
 	}
 	switch {
 	case r.Replicas > 1:
-		fprintf(w, "  Seen by one FatLine replica%s, of %d. Each keeps its own picture, so these\n", who, r.Replicas)
-		fprintf(w, "  are that replica's share of the instance's traffic, not the total.\n")
+		fprintf(w, "  Seen by one FatLine replica of %d%s.\n", r.Replicas, who)
+		fprintf(w, "  Each keeps its own picture, so these are that replica's share, not the total.\n")
 	case r.Replicas == 1:
 		fprintf(w, "  Seen by the only FatLine replica%s — this is the whole picture.\n", who)
 	default:
-		fprintf(w, "  Seen by one FatLine replica%s. How many replicas there are could not be read,\n", who)
-		fprintf(w, "  so whether this is the whole picture or one replica's share is unknown.\n")
+		fprintf(w, "  Seen by one FatLine replica%s, of an unknown number.\n", who)
+		fprintf(w, "  Whether this is the whole picture or one replica's share cannot be said.\n")
 	}
 }
 

@@ -147,6 +147,17 @@ type PodList struct {
 type DeploymentSpec struct {
 	Replicas *int           `json:"replicas"`
 	Selector *LabelSelector `json:"selector"`
+	// Template is read only so a resize can see what the cluster STORED.
+	// GKE Autopilot rewrites a request below its floor in the pod template
+	// itself, so a patch can be accepted and the workload still not carry
+	// what was asked for.
+	Template PodTemplateSpec `json:"template"`
+}
+
+// PodTemplateSpec is the pod a workload creates.
+type PodTemplateSpec struct {
+	Metadata ObjectMeta `json:"metadata"`
+	Spec     PodSpec    `json:"spec"`
 }
 
 type DeploymentStatus struct {

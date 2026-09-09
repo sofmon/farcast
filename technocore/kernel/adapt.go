@@ -42,6 +42,17 @@ type Adaptation struct {
 	// happened to be first.
 	Container string `json:"container,omitempty"`
 	Replicas  int    `json:"replicas,omitempty"`
+
+	// Stored says the CPUMilli/MemMiB above are what the cluster kept rather
+	// than what was requested, and Overridden that the two differed — an
+	// admission controller changed the answer. Both are set by Adapt, never
+	// by Advise.
+	Stored     bool `json:"stored,omitempty"`
+	Overridden bool `json:"overridden,omitempty"`
+	// AskedCPUMilli and AskedMemMiB are what was requested, kept only when
+	// the cluster stored something else so the two can be shown together.
+	AskedCPUMilli int `json:"asked_cpu_milli,omitempty"`
+	AskedMemMiB   int `json:"asked_mem_mib,omitempty"`
 }
 
 // MonthlyDeltaUSD is what acting would do to the bill across every replica.
@@ -106,6 +117,11 @@ func (r *Reconciler) Advise(rep Report, now time.Time) []Adaptation {
 			if hold := r.holdReason(t, rep, a, now); hold != "" {
 				a.Act, a.Hold = false, hold
 				a.CPUMilli, a.MemMiB = a.CurrentCPUMilli, a.CurrentMemMiB
+				// Stepped describes a target, and a held advice no longer has
+				// one. Leaving it set published "a bounded step" beside a
+				// workload nothing was going to touch — seen in the 5.2 walk's
+				// own document, where a cooled-down reacher carried it.
+				a.Stepped = false
 			}
 		}
 		out = append(out, a)
@@ -192,11 +208,23 @@ func (r *Reconciler) Adapt(ctx context.Context, advice []Adaptation, now time.Ti
 			// object rather than by finding a log line.
 			AdaptedFromLabel: fmt.Sprintf("%dm/%dMi", a.CurrentCPUMilli, a.CurrentMemMiB),
 		}
-		err := r.Cluster.SetRequests(ctx, a.Namespace, a.Deployment, a.Container, a.CPUMilli, a.MemMiB, stamp)
+		// Captured before the write, because Adaptation embeds Advice: the
+		// asked-for value and the reported one are the same field, and
+		// comparing after the assignment compares a number with itself.
+		askedCPU, askedMem := a.CPUMilli, a.MemMiB
+		cpu, mem, err := r.Cluster.SetRequests(ctx, a.Namespace, a.Deployment, a.Container, askedCPU, askedMem, stamp)
 		if err != nil {
 			res.Failed = append(res.Failed, AdaptFailure{Adaptation: a, Err: err})
 			continue
 		}
+		// What the cluster kept, not what was asked for. Reporting the
+		// request would have the kernel announce a change that did not
+		// happen — which is exactly what the 5.2 walk watched it do, twice,
+		// while Autopilot quietly held the workload at its own floor.
+		a.Stored = true
+		a.AskedCPUMilli, a.AskedMemMiB = askedCPU, askedMem
+		a.CPUMilli, a.MemMiB = cpu, mem
+		a.Overridden = cpu != askedCPU || mem != askedMem
 		res.Applied = append(res.Applied, a)
 	}
 	return res

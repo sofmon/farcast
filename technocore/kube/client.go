@@ -320,12 +320,14 @@ func net(host, port string) string {
 // kernel changed this workload and when, and a stamp written separately could
 // be lost while the resize landed — leaving a workload that has been adapted
 // and does not say so, which the cooldown would then ignore.
-func (c *Client) SetRequests(ctx context.Context, namespace, name, container string, cpuMilli, memMiB int, annotations map[string]string) error {
+// It returns the requests the cluster actually STORED, which is not always
+// what was asked for.
+func (c *Client) SetRequests(ctx context.Context, namespace, name, container string, cpuMilli, memMiB int, annotations map[string]string) (storedCPUMilli, storedMemMiB int, err error) {
 	if container == "" {
-		return errors.New("kube: a resize must name the container it changes")
+		return 0, 0, errors.New("kube: a resize must name the container it changes")
 	}
 	if cpuMilli <= 0 || memMiB <= 0 {
-		return fmt.Errorf("kube: refusing a request of %dm/%dMi for %s/%s", cpuMilli, memMiB, namespace, name)
+		return 0, 0, fmt.Errorf("kube: refusing a request of %dm/%dMi for %s/%s", cpuMilli, memMiB, namespace, name)
 	}
 	patch := map[string]any{
 		"spec": map[string]any{
@@ -349,9 +351,35 @@ func (c *Client) SetRequests(ctx context.Context, namespace, name, container str
 	}
 	body, err := json.Marshal(patch)
 	if err != nil {
-		return fmt.Errorf("kube: encode the resize patch: %w", err)
+		return 0, 0, fmt.Errorf("kube: encode the resize patch: %w", err)
 	}
 	path := fmt.Sprintf("/apis/apps/v1/namespaces/%s/deployments/%s",
 		url.PathEscape(namespace), url.PathEscape(name))
-	return c.do(ctx, http.MethodPatch, path, "", "application/strategic-merge-patch+json", body, nil)
+
+	// The API server returns the object as STORED, after every mutating
+	// admission controller has had it. That is not a detail: GKE Autopilot
+	// rewrites a request below its own floor, in the Deployment's pod
+	// template, so a patch can be accepted and the workload still not carry
+	// what was asked for. The 5.2 walk watched the kernel ask for 25m, be
+	// answered 200, and log a resize to a value the cluster had already
+	// replaced with 50m — twice, two minutes apart, because it then read 50m
+	// back and asked again.
+	//
+	// Reading the answer is what turns that from a silent loop into a fact
+	// the caller can report.
+	var stored Deployment
+	if err := c.do(ctx, http.MethodPatch, path, "", "application/strategic-merge-patch+json", body, &stored); err != nil {
+		return 0, 0, err
+	}
+	for _, ct := range stored.Spec.Template.Spec.Containers {
+		if ct.Name != container {
+			continue
+		}
+		cpu, mem, err := containerRequests(ct)
+		if err != nil {
+			return 0, 0, fmt.Errorf("kube: %s/%s stored an unreadable request: %w", namespace, name, err)
+		}
+		return cpu, mem, nil
+	}
+	return 0, 0, fmt.Errorf("kube: %s/%s has no container %q after the patch", namespace, name, container)
 }

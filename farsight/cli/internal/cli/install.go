@@ -419,5 +419,8 @@ func (r installResult) Human(w io.Writer) error {
 	fprintf(w, "  cost limit:  %s %.2f / %s\n", r.CostLimit.Currency, r.CostLimit.Amount, r.CostLimit.Period)
 	fprintf(w, "  state:       %s\n", r.Status)
 	fprintf(w, "  config:      %s\n", r.ConfigPath)
+	// Said where the region is CHOSEN and the limit is set, which is the one
+	// moment an operator can still act on it.
+	writeRegionCaveat(w, r.Region)
 	return nil
 }
