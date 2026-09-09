@@ -134,6 +134,12 @@ Every workload on the instance reserves between roughly **4× and 75×** what it
 
 `farcast run` failed at Kaniko's push check with `DENIED: Permission 'artifactregistry.repositories.uploadArtifacts'`, despite the repository-level grant [the 4.2 runbook](phase-4-2-validation.md) prescribes being present and correct, the cluster's workload pool matching, and a pod running as `farcast-builder` **successfully reading** the same repository through the Artifact Registry API. Reads were honoured and writes were refused on the Docker token endpoint, across four attempts over twelve minutes.
 
+**Diagnosed afterwards, and it was mostly FarCast's fault after all.** The first push happened *before* any grant existed — correct behaviour from Artifact Registry, and the walk had no way to know: the instruction that fixes it was printed only on `build`'s success path, and `run` did not print it at all. Earlier walks applied the grant before their first build because [the 4.2 runbook](phase-4-2-validation.md) tells them to; this one reached `run` first and was handed a raw permission string. That is fixed — both commands now recognise a refused push and print the grant on the failure.
+
+What is **not** explained is the rest: after the grant was applied, the Artifact Registry API honoured it within about three minutes while the Docker registry endpoint kept refusing for at least nine, across four attempts. That is most likely the registry endpoint's own IAM cache, and it is recorded as an observation rather than a conclusion — it was not reproduced. The advice printed on failure now says a retry is worth repeating once for exactly this reason.
+
+Two things were checked and ruled out: the project carries **no IAM deny policy**, and the workload identity pool has **no project-level grant** that could have made earlier walks work by another route.
+
 This blocked `farcast run`, so **the walk did not exercise it**. The policy document `run` would have written was constructed by hand instead, through the product's own `fatline/policy` package so the format could not drift, and applied as the same ConfigMap FatLine watches. Everything in section 5 is therefore real traffic through a real boundary under a real per-application credential — but the path that *produces* that policy was not walked here. It was walked on 2026-09-08 for 4.4.
 
 ### 5. A false finding, caught before it was recorded

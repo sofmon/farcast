@@ -268,3 +268,27 @@ func TestTheDestinationFollowsTheRegistryPathConvention(t *testing.T) {
 		t.Errorf("destination does not follow the path convention; want %q", want)
 	}
 }
+
+// A refused push is not a Containerfile failure, and the raw output does not
+// say so. The 5.1b walk paid for a clone and a build four times over before
+// working out that the grant was missing — because the instruction that fixes
+// it was printed only on the SUCCESS path, where it cannot be needed.
+func TestAFailedBuildNamesTheGrantWhenThePushWasRefused(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	buildableInstance(t, dir, "p42")
+	env, _ := testEnv(dir, output.ModeHuman)
+
+	fj := &fakeJobs{result: cluster.JobResult{Succeeded: false}, logs: arDenial}
+	c := buildCmd(fj)
+	c.repo, c.app, c.builderImage = "https://github.com/example/repo.git", "api", builderDigest
+
+	if err := c.Run(context.Background(), env, []string{"p42"}); err == nil {
+		t.Fatal("a failed build reported success")
+	}
+	errOut := env.Err.(interface{ String() string }).String()
+	for _, want := range []string{"not a problem with the Containerfile", "add-iam-policy-binding farcast-p42", "roles/artifactregistry.writer"} {
+		if !strings.Contains(errOut, want) {
+			t.Errorf("the failure does not name the grant (%q missing):\n%s", want, errOut)
+		}
+	}
+}

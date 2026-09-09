@@ -58,6 +58,9 @@ type fakeRunCluster struct {
 	configMaps map[string]string
 
 	buildFails bool
+	// buildLogs is what a failing build printed. It defaults to something
+	// unremarkable so a test that cares about the OUTPUT has to say so.
+	buildLogs  string
 	fetchFails bool
 	applyErr   error
 	rolloutErr error
@@ -108,6 +111,9 @@ func (f *fakeRunCluster) WaitJob(_ context.Context, ns, name string, _ time.Dura
 // that parses and is missing its first applications.
 func (f *fakeRunCluster) JobLogs(_ context.Context, _, job string, lines int) (string, error) {
 	body := "build output\n"
+	if f.buildLogs != "" {
+		body = f.buildLogs
+	}
 	if strings.HasPrefix(job, "fetch-") {
 		body = f.manifest
 	}
@@ -893,6 +899,28 @@ func TestRedeployingWithoutAnAppRevokesIt(t *testing.T) {
 	for _, app := range doc.Apps {
 		if app.Name == "retired" {
 			t.Fatalf("the retired application is still in the policy: %+v", app)
+		}
+	}
+}
+
+// `run` printed the grant nowhere at all, though the 4.3 runbook recorded that
+// it "prints it, like build does". Both halves of that sentence were wrong.
+func TestRunNamesTheGrantWhenAPushIsRefused(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	runnableInstance(t, dir, "p42")
+	env, _ := testEnv(dir, output.ModeHuman)
+
+	f := newFakeRun(twoAppManifest)
+	f.buildFails = true
+	f.buildLogs = arDenial
+
+	if err := runCmd(f).Run(context.Background(), env, []string{"p42", "github.com/example/my-platform"}); err == nil {
+		t.Fatal("a failed build reported success")
+	}
+	errOut := env.Err.(interface{ String() string }).String()
+	for _, want := range []string{"not a problem with the Containerfile", "add-iam-policy-binding farcast-p42"} {
+		if !strings.Contains(errOut, want) {
+			t.Errorf("run does not name the grant (%q missing):\n%s", want, errOut)
 		}
 	}
 }

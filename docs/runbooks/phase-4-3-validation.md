@@ -17,7 +17,7 @@ Everything below was designed against fakes and rendered YAML. The claims that m
 
 ## Prerequisites
 
-- An instance that has completed [the Phase 4.2 runbook](phase-4-2-validation.md): installed, connected, storage deployed and unsealed, kernel deployed, and with the builder's Workload Identity push grant already applied. **`run` does not apply that grant** — it prints it, like `build` does, and a missing grant fails at push after the clone and the build have both succeeded.
+- An instance that has completed [the Phase 4.2 runbook](phase-4-2-validation.md): installed, connected, storage deployed and unsealed, kernel deployed, and with the builder's Workload Identity push grant already applied. **`run` does not apply that grant.** This runbook used to say it printed it "like `build` does"; both halves of that were wrong until 2026-09-09. `build` printed it only on the SUCCESS path — after a build that had already worked, where it cannot be needed — and `run` printed it nowhere at all. A missing grant therefore failed at push, after the clone and the build had both been paid for, with nothing but the registry's own permission string to go on. Both now recognise a refused push and print the grant on the failure, which is where it belongs.
 - **A valid gcloud user session** — `gcloud auth print-access-token >/dev/null` must succeed.
 - The repository is this one, `github.com/sofmon/farcast`, and it is public, so no Git credential is involved. Step 10 covers the private case and is optional.
 

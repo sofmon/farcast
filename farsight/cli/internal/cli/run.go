@@ -283,9 +283,19 @@ func (c *runCommand) buildAll(ctx context.Context, env *Env, cl jobWaiter, meta 
 			return nil, fmt.Errorf("wait for the build of %s: %w", app.Name, err)
 		}
 		if !res.Succeeded {
-			if logs, lerr := cl.JobLogs(ctx, pbuild.Namespace, job, 40); lerr == nil && strings.TrimSpace(logs) != "" {
-				fprintf(env.Err, "\n%s\n", strings.TrimRight(logs, "\n"))
+			var logs string
+			if l, lerr := cl.JobLogs(ctx, pbuild.Namespace, job, 40); lerr == nil && strings.TrimSpace(l) != "" {
+				logs = l
+				fprintf(env.Err, "\n%s\n", strings.TrimRight(l, "\n"))
 			}
+			// `run` never said this at all. The 4.3 runbook recorded that it
+			// "prints it, like build does" — build printed it only on SUCCESS,
+			// and run printed it nowhere. The 5.1b walk spent four attempts and
+			// a mirrored toolchain finding that out.
+			explainPushDenial(env.Err, logs, pushGrant{
+				Instance: meta.Name, Project: meta.Project, Region: meta.Region,
+				Namespace: pbuild.Namespace, ServiceAccount: pbuild.ServiceAccount,
+			})
 			return nil, fmt.Errorf("the build of %s failed; nothing was deployed. Its Job survives for an hour, "+
 				"so 'kubectl -n %s logs job/%s' still works", app.Name, pbuild.Namespace, job)
 		}

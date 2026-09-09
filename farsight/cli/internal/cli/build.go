@@ -167,9 +167,20 @@ func (c *buildCommand) Run(ctx context.Context, env *Env, args []string) error {
 	if !res.Succeeded {
 		// The operator needs the build's own output, not ours: a Containerfile
 		// that failed says why, and repeating "the build failed" helps nobody.
-		if logs, lerr := cl.JobLogs(ctx, pbuild.Namespace, job, 40); lerr == nil && strings.TrimSpace(logs) != "" {
-			fprintf(env.Err, "\n%s\n", strings.TrimRight(logs, "\n"))
+		var logs string
+		if l, lerr := cl.JobLogs(ctx, pbuild.Namespace, job, 40); lerr == nil && strings.TrimSpace(l) != "" {
+			logs = l
+			fprintf(env.Err, "\n%s\n", strings.TrimRight(l, "\n"))
 		}
+		// One failure is not a Containerfile problem, and the raw output does
+		// not say so: a refused push means the build worked and the grant is
+		// missing. Naming it here is the whole point — the alternative is what
+		// the 5.1b walk did, which was to pay for a clone and a build and be
+		// handed a permission string.
+		explainPushDenial(env.Err, logs, pushGrant{
+			Instance: name, Project: meta.Project, Region: meta.Region,
+			Namespace: pbuild.Namespace, ServiceAccount: pbuild.ServiceAccount,
+		})
 		return fmt.Errorf("the build of %s/%s failed; its Job survives for an hour so 'kubectl -n %s logs job/%s' still works",
 			deployment, c.app, pbuild.Namespace, job)
 	}
@@ -194,7 +205,7 @@ func (c *buildCommand) Run(ctx context.Context, env *Env, args []string) error {
 		Repo: c.repo, Ref: c.ref, Tag: tag,
 		Image: pinned, Builder: builder,
 		ServiceAccount: pbuild.ServiceAccount, Namespace: pbuild.Namespace,
-		Project: meta.Project,
+		Project: meta.Project, Region: meta.Region,
 	})
 }
 
@@ -253,6 +264,10 @@ type buildResult struct {
 	ServiceAccount string `json:"service_account"`
 	Namespace      string `json:"namespace"`
 	Project        string `json:"project,omitempty"`
+	// Region completes the grant command. Without it the printed instruction
+	// carried a <region> placeholder the operator had to fill in from memory,
+	// on a command whose whole purpose is to be copied.
+	Region string `json:"region,omitempty"`
 }
 
 func (r buildResult) Human(w io.Writer) error {
@@ -270,11 +285,10 @@ func (r buildResult) Human(w io.Writer) error {
 	// (ADR 0008 decision 8). Without it the build fails on a 403 at push.
 	fprintf(w, "\nThe builder pushes under its own cloud identity. If you have not granted it\n")
 	fprintf(w, "for this instance yet, run:\n\n")
-	fprintf(w, "  PROJNUM=$(gcloud projects describe %s --format='value(projectNumber)')\n", orPlaceholder(r.Project))
-	fprintf(w, "  PRINCIPAL=\"principal://iam.googleapis.com/projects/$PROJNUM/locations/global/workloadIdentityPools/%s.svc.id.goog/subject/ns/%s/sa/%s\"\n",
-		orPlaceholder(r.Project), r.Namespace, r.ServiceAccount)
-	fprintf(w, "  gcloud artifacts repositories add-iam-policy-binding farcast-%s \\\n", r.Instance)
-	fprintf(w, "    --location <region> --member \"$PRINCIPAL\" --role roles/artifactregistry.writer\n")
+	writePushGrant(w, pushGrant{
+		Instance: r.Instance, Project: r.Project, Region: r.Region,
+		Namespace: r.Namespace, ServiceAccount: r.ServiceAccount,
+	})
 	fprintf(w, "\nThe grant is on the ONE repository, not the project.\n")
 	return nil
 }
