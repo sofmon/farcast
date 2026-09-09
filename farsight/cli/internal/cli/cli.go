@@ -169,6 +169,7 @@ func defaultRegistry() *Registry {
 	reg.Register(&psCommand{})
 	reg.Register(&logsCommand{})
 	reg.Register(&costsCommand{})
+	reg.Register(&usageCommand{})
 	reg.Register(&buildCommand{})
 	reg.Register(&toolchainCommand{})
 	reg.Register(newStorageCommand())

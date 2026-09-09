@@ -199,6 +199,7 @@ metadata:
 #   pods              list    — the meter reads what Autopilot bills
 #   deployments       list    — the shutdown reads what can be stopped
 #   deployments/scale patch   — the only thing the kernel ever writes to a workload
+#   pods.metrics      list    — what a pod USES, which nothing here enforces on
 # There is deliberately no watch (the loop polls), no get, no delete, and no
 # create of anything at all.
 apiVersion: rbac.authorization.k8s.io/v1
@@ -218,6 +219,14 @@ rules:
   - apiGroups: ["apps"]
     resources: ["deployments/scale"]
     verbs: ["patch"]
+  # The aggregated metrics API — the same reading kubectl top shows. It is
+  # bound namespace-scoped like everything else here, so the kernel sees the
+  # consumption of the pods FarCast runs and nothing else in the cluster.
+  # ADR 0014 decision 2: nothing that enforces anything reads this, and a
+  # cluster that does not serve it is a state the report names.
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods"]
+    verbs: ["list"]
 {{- range .Meter}}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -277,6 +286,13 @@ rules:
     resources: ["configmaps"]
     resourceNames: ["{{.Name}}-namespaces"]
     verbs: ["get"]
+  # The usage profiles. A SEPARATE object from the ledger, not a section of
+  # it: the ledger must always be writable, and an advisory document must
+  # never be able to make the cost checkpoint fail.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["{{.Name}}-profiles"]
+    verbs: ["get", "update", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

@@ -24,6 +24,7 @@ import (
 	"github.com/sofmon/farcast/technocore/kernel"
 	"github.com/sofmon/farcast/technocore/kube"
 	"github.com/sofmon/farcast/technocore/pricing"
+	"github.com/sofmon/farcast/technocore/usage"
 )
 
 func main() {
@@ -47,6 +48,7 @@ func run(args []string) error {
 	interval := fs.Duration("interval", kernel.DefaultInterval, "how often to reconcile")
 	checkpointEvery := fs.Duration("checkpoint-interval", 5*time.Minute, "how often to write the ledger")
 	enforce := fs.Bool("enforce", true, "stop applications when the limit is reached")
+	usageHours := fs.Int("usage-hours", usage.DefaultHours, "how many hours of observed usage to profile; 0 turns collection off")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -100,6 +102,14 @@ func run(args []string) error {
 	}
 	store := kernel.NewConfigMapStore(client)
 	r.Confirmations = kernel.NewConfigMapConfirmations(client)
+	// Observed usage, per ADR 0014. Nothing in the cost path reads it: the
+	// meter reads requests, which is what Autopilot bills, and this exists so
+	// that a later resize has something better than a guess to act on.
+	var profiles kernel.ProfileStore
+	if *usageHours > 0 {
+		r.Usage = usage.New(*usageHours)
+		profiles = kernel.NewConfigMapProfiles(client)
+	}
 	// Without this the kernel meters only the namespaces baked into its
 	// arguments, and every namespace added later is invisible: the
 	// applications there run, bill, and are counted nowhere. The 4.2 walk
@@ -113,25 +123,37 @@ func run(args []string) error {
 	if err != nil {
 		return fmt.Errorf("restore the ledger: %w", err)
 	}
+	// The opposite policy to the ledger above, and deliberately: a usage
+	// document that cannot be read is discarded and said out loud. Carrying
+	// on from zero here costs a day of advisory history; doing the same with
+	// the ledger would silently reset the meter.
+	usageRestored, err := r.RestoreUsage(context.Background(), profiles)
+	if err != nil {
+		log.Warn("the stored usage profiles could not be read and were discarded; collection starts again from nothing", "err", err)
+	}
 
 	log.Info("technocore starting",
 		"instance", *instance, "namespaces", meter,
 		"limit", fmt.Sprintf("%s %.2f/%s", *currency, *limit, *period),
 		"period", fmt.Sprintf("%s..%s", start.Format(time.RFC3339), end.Format(time.RFC3339)),
-		"restored", restored, "enforce", *enforce,
+		"restored", restored, "usage_restored", usageRestored, "usage_hours", *usageHours,
+		"enforce", *enforce,
 		"prices", fmt.Sprintf("%s as of %s", pricing.Region, pricing.AsOf))
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
 	s := &supervisor{
-		log: log, reconciler: r, store: store,
+		log: log, reconciler: r, store: store, profiles: profiles,
 		currency: *currency, enforce: *enforce, checkpointEvery: *checkpointEvery,
 	}
 	err = r.Run(ctx, s.observe)
 	// A clean shutdown must not lose the period's accounting.
 	if saveErr := r.Save(context.Background(), store); saveErr != nil {
 		log.Error("final checkpoint failed", "err", saveErr)
+	}
+	if saveErr := r.SaveUsage(context.Background(), profiles, time.Now().UTC()); saveErr != nil {
+		log.Warn("final usage write failed", "err", saveErr)
 	}
 	if errors.Is(err, context.Canceled) {
 		log.Info("technocore stopped")
@@ -146,6 +168,7 @@ type supervisor struct {
 	log             *slog.Logger
 	reconciler      *kernel.Reconciler
 	store           kernel.CheckpointStore
+	profiles        kernel.ProfileStore
 	currency        string
 	enforce         bool
 	checkpointEvery time.Duration
@@ -185,6 +208,12 @@ func (s *supervisor) observe(rep kernel.Report, err error) {
 		"has_confirmation", rep.Accrual.HasConfirmation,
 		"total", round(a.Total), "limit", round(a.Limit), "level", a.Level.String(),
 		"billed", rep.Billed.String(), "reconstructed", rep.Reconstructed)
+
+	if rep.UsageSampled > 0 || len(rep.UsageUnavailable) > 0 {
+		s.log.Info("observed usage",
+			"sampled", rep.UsageSampled, "unrefreshed", rep.UsageRepeated,
+			"unavailable", rep.UsageUnavailable)
+	}
 
 	for _, d := range rep.Accrual.Discrepancies {
 		s.log.Warn("billing disagrees with the local model beyond the clamp; the estimate stands", "detail", d.String())
@@ -251,6 +280,13 @@ func (s *supervisor) checkpoint(ctx context.Context, now time.Time) {
 		return
 	}
 	s.lastCheckpoint = now
+	// Written after the ledger, never instead of it. A usage document that
+	// cannot be written is advisory history lost and nothing more, so it is a
+	// warning — and it comes second so that a failure here can never be the
+	// reason the ledger went unwritten.
+	if err := s.reconciler.SaveUsage(ctx, s.profiles, now); err != nil {
+		s.log.Warn("the usage profiles could not be written; metering is unaffected", "err", err)
+	}
 }
 
 func round(v float64) string { return fmt.Sprintf("%.4f", v) }

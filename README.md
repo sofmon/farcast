@@ -317,6 +317,9 @@ farcast ps
 # View cost breakdown
 farcast costs my-instance
 
+# View what applications actually use, against what they reserve
+farcast usage my-instance
+
 # Connect to a FarCast instance via FarSight
 farcast connect my-instance
 
@@ -327,7 +330,7 @@ farcast redeploy my-instance
 farcast release my-instance
 ```
 
-*Implemented today: `install`, `connect`, `redeploy`, `release`, `storage`, `kernel`, `toolchain`, `build`, `run`, `ps`, `logs` and `costs` (plus `version` and `help`). Only `chat` is still a stub, waiting on Phase 6.2.*
+*Implemented today: `install`, `connect`, `redeploy`, `release`, `storage`, `kernel`, `toolchain`, `build`, `run`, `ps`, `logs`, `costs` and `usage` (plus `version` and `help`). Only `chat` is still a stub, waiting on Phase 6.2.*
 
 Full CLI reference → [`farsight/cli/README.md`](farsight/cli/README.md)
 

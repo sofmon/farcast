@@ -70,10 +70,11 @@ farcast [global flags] <command> [command flags] [arguments]
 | `release` | ✅ works | Destroy an instance and clean up local state | 1.4 |
 | `connect` | ✅ works | Open a FatLine tunnel to an instance | 2.3 |
 | `redeploy` | ✅ works | Re-apply FatLine's workload to a connected instance | 2.3 |
-| `run` | ⏳ stub | Deploy a Git repository to an instance | 4.3 |
-| `ps` | ⏳ stub | List running applications | 4.3 |
-| `logs` | ⏳ stub | Stream an application's logs | 4.3 |
-| `costs` | ⏳ stub | Show spending and distance to the cost limit | 4.3 |
+| `run` | ✅ works | Deploy a Git repository to an instance | 4.3 |
+| `ps` | ✅ works | List running applications | 4.3 |
+| `logs` | ✅ works | Stream an application's logs | 4.3 |
+| `costs` | ✅ works | Show spending and distance to the cost limit | 4.3 |
+| `usage` | ✅ works | Show what applications use against what they reserve | 5.1 |
 | `storage` | ✅ works | The instance's encrypted disk: `ls`, `cp`, `rm`, `usage`, `key …` | 3.3 |
 | `build` | ✅ works | Build an application's image inside the instance | 4.2 |
 | `kernel` | ✅ works | Deploy TechnoCore, meter namespaces, and push the provider's confirmed costs: `deploy`, `meter`, `confirm` | 4.1 |

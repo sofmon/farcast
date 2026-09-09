@@ -130,19 +130,31 @@ func TestTheClusterRoleGrantsOnlyWhatTheClientCalls(t *testing.T) {
 		t.Fatal("ClusterRole has no rules")
 	}
 
+	// Keyed by API GROUP and resource, not resource alone: "pods" in the core
+	// group is what Autopilot bills, and "pods" in metrics.k8s.io is what one
+	// is using. Collapsing them would let a grant on either look like a grant
+	// on the other.
 	got := map[string][]string{}
 	for _, r := range rules {
 		m := r.(map[string]any)
-		for _, res := range m["resources"].([]any) {
-			for _, v := range m["verbs"].([]any) {
-				got[res.(string)] = append(got[res.(string)], v.(string))
+		for _, g := range m["apiGroups"].([]any) {
+			group := g.(string)
+			if group == "" {
+				group = "core"
+			}
+			for _, res := range m["resources"].([]any) {
+				for _, v := range m["verbs"].([]any) {
+					key := group + "/" + res.(string)
+					got[key] = append(got[key], v.(string))
+				}
 			}
 		}
 	}
 	want := map[string][]string{
-		"pods":              {"list"},
-		"deployments":       {"list"},
-		"deployments/scale": {"patch"},
+		"core/pods":              {"list"},
+		"apps/deployments":       {"list"},
+		"apps/deployments/scale": {"patch"},
+		"metrics.k8s.io/pods":    {"list"},
 	}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Errorf("cluster rules = %v, want exactly %v", got, want)
@@ -199,11 +211,11 @@ func TestTheLedgerRoleIsPinnedToItsOwnConfigMap(t *testing.T) {
 		t.Fatalf("ledger Role has %d unnamed rules, want exactly 1 (create, which cannot be name-restricted)", unnamedCount)
 	}
 
-	// Exactly one object may be written, and it is the kernel's own ledger.
-	// The confirmations and the metered-namespace list are the OPERATOR's
-	// inputs: a kernel that could edit either could correct its own estimate
-	// or narrow its own scope, and a narrowed scope looks identical to an
-	// instance that is not spending anything.
+	// The kernel may write its OWN state and nothing else. The confirmations
+	// and the metered-namespace list are the OPERATOR's inputs: a kernel that
+	// could edit either could correct its own estimate or narrow its own
+	// scope, and a narrowed scope looks identical to an instance that is not
+	// spending anything.
 	writable := map[string]bool{}
 	for _, r := range rules {
 		m := r.(map[string]any)
@@ -218,8 +230,23 @@ func TestTheLedgerRoleIsPinnedToItsOwnConfigMap(t *testing.T) {
 			}
 		}
 	}
-	if len(writable) != 1 || !writable["[technocore-ledger]"] {
-		t.Errorf("writable pinned objects = %v, want only [technocore-ledger]", writable)
+	own := map[string]bool{"[technocore-ledger]": true, "[technocore-profiles]": true}
+	for name := range writable {
+		if !own[name] {
+			t.Errorf("the kernel may write %v, which is not its own state", name)
+		}
+	}
+	for name := range own {
+		if !writable[name] {
+			t.Errorf("the kernel cannot write %v, which is its own state", name)
+		}
+	}
+	// Named for what they are, so this test fails if an operator input ever
+	// becomes writable rather than quietly widening with the set above.
+	for _, operatorInput := range []string{"[technocore-confirmed]", "[technocore-namespaces]"} {
+		if writable[operatorInput] {
+			t.Errorf("%s is an operator input and must be read-only to the kernel", operatorInput)
+		}
 	}
 	if named == nil || unnamed == nil {
 		t.Fatal("expected one named and one unnamed configmap rule")

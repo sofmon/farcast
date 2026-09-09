@@ -25,6 +25,7 @@ import (
 	"github.com/sofmon/farcast/technocore/kube"
 	"github.com/sofmon/farcast/technocore/pricing"
 	"github.com/sofmon/farcast/technocore/tier"
+	"github.com/sofmon/farcast/technocore/usage"
 )
 
 // DefaultInterval is how often the loop reconciles. Seconds would buy
@@ -38,10 +39,13 @@ const DefaultInterval = 30 * time.Second
 // Pods and Deployments are both listed, and for different jobs: pods are what
 // Autopilot bills, so they are what the meter reads; deployments are what can
 // actually be stopped, because deleting a pod only makes its controller
-// create another one.
+// create another one. Pod metrics are a third thing again — what a pod
+// USES rather than what it reserves — and nothing that enforces anything
+// reads them.
 type Cluster interface {
 	ListPods(ctx context.Context, namespace, selector string) ([]kube.Pod, error)
 	ListDeployments(ctx context.Context, namespace, selector string) ([]kube.Deployment, error)
+	ListPodMetrics(ctx context.Context, namespace, selector string) ([]kube.PodMetrics, error)
 	Scale(ctx context.Context, namespace, name string, replicas int) error
 }
 
@@ -92,6 +96,20 @@ type Reconciler struct {
 	// publish it. It is what `farcast costs` reads, and it is deliberately the
 	// kernel's own figures rather than a second model of them.
 	Observed Observation
+
+	// Usage accumulates what workloads actually consume, as opposed to what
+	// they reserve. Nil turns collection off entirely, and everything else
+	// here behaves identically — nothing in the cost path reads it.
+	Usage *usage.Store
+
+	// lastReading is the timestamp of the most recent metrics reading taken
+	// for each pod, so a server that has not refreshed is not counted twice.
+	lastReading map[string]time.Time
+
+	// usageUnavailable is the last tick's list of namespaces whose metrics
+	// could not be read, carried so the published document can say "not
+	// measured" rather than leave a reader to infer it from emptiness.
+	usageUnavailable []string
 }
 
 // Workload is one metered pod, as the kernel sees it.
@@ -175,6 +193,19 @@ type Report struct {
 	// Targets are the deployments this tick saw, with the cost of the pods
 	// each one claims.
 	Targets []Target
+
+	// UsageSampled counts pod readings folded into the profiles this tick.
+	// UsageRepeated counts readings the metrics server had not refreshed
+	// since the last tick, which are skipped rather than counted twice.
+	UsageSampled  int
+	UsageRepeated int
+	// UsageUnavailable names namespaces whose metrics could not be read. It
+	// is a finding and never a fault, even when it names every namespace:
+	// the meter reads requests, and a profile that cannot be built means a
+	// resize declines. Metering that read nothing would report $0 for an
+	// instance that is spending, which is why THAT one is fatal and this is
+	// not.
+	UsageUnavailable []string
 }
 
 // Complete reports whether this tick saw every namespace it was asked to.
@@ -243,6 +274,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, now time.Time) (Report, erro
 	}
 	rep.Metered = metered
 
+	var read []string
 	for _, ns := range metered {
 		pods, err := r.Cluster.ListPods(ctx, ns, r.Selector)
 		if err != nil {
@@ -254,6 +286,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, now time.Time) (Report, erro
 			rep.Unreachable = append(rep.Unreachable, fmt.Sprintf("%s: %v", ns, safeNamespaceError(err)))
 			continue
 		}
+		read = append(read, ns)
 		for _, p := range pods {
 			if !p.Billable() {
 				continue
@@ -298,6 +331,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, now time.Time) (Report, erro
 	if err := r.collectTargets(ctx, &rep); err != nil {
 		return Report{}, err
 	}
+
+	// After the workloads are known and before anything is accrued: a
+	// reading is only attributed to an application the meter has already
+	// seen, so the profile set can never name something the cost path does
+	// not.
+	r.sampleUsage(ctx, read, &rep)
 
 	billed := r.billableInterval(now)
 	rep.Billed = billed

@@ -27,6 +27,25 @@ type fakeCluster struct {
 	scaleAt map[string]error
 	seen    []string
 	scaled  []string
+
+	// metricsNS being nil models a cluster with NO metrics API — which is
+	// the default on purpose. A fake that always has one would let a test
+	// pass while the only clusters it describes are the ones that already
+	// work.
+	metricsNS  map[string][]kube.PodMetrics
+	metricsErr map[string]error
+	metricsHit []string
+}
+
+func (f *fakeCluster) ListPodMetrics(_ context.Context, ns, selector string) ([]kube.PodMetrics, error) {
+	f.metricsHit = append(f.metricsHit, ns+"|"+selector)
+	if err := f.metricsErr[ns]; err != nil {
+		return nil, err
+	}
+	if f.metricsNS == nil {
+		return nil, kube.ErrNotFound
+	}
+	return f.metricsNS[ns], nil
 }
 
 func (f *fakeCluster) ListPods(_ context.Context, ns, selector string) ([]kube.Pod, error) {

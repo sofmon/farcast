@@ -25,6 +25,7 @@ Workloads carry `farcast.sofmon.com/tier` — `kernel`, `system` or `app`. A cos
 | [`kube`](kube/) | A hand-rolled, standard-library Kubernetes client scoped to what a kernel needs: list pods and deployments, read requests and conditions, patch the scale subresource. Polls; does not watch. |
 | [`tier`](tier/) | The `farcast.sofmon.com/tier` classification and the rule that only applications are stoppable by a cost shutdown. |
 | [`cost`](cost/) | The `expected`/`confirmed` ledger, the calibration clamp, and threshold assessment against the limit. |
+| [`usage`](usage/) | What workloads actually consume, as a bounded rolling distribution per application. Advisory: nothing in the cost path reads it. |
 | [`kernel`](kernel/) | The reconcile loop that joins them: observe, meter, assess, act — plus the ConfigMap checkpoint that makes the accounting survive a restart. |
 | [`deploy`](deploy/) | The kernel's own Namespace, ServiceAccount, RBAC and Deployment, rendered as a YAML apply stream. |
 | [`cmd/technocore`](cmd/technocore/) | The in-cluster entrypoint: `technocore serve`. |
@@ -48,11 +49,14 @@ The grants are exactly the verbs [`kube`](kube/) calls, and the shape is as impo
 | Resource | Verbs | Why |
 |---|---|---|
 | `pods` | `list` | The meter reads what Autopilot bills. |
+| `pods.metrics.k8s.io` | `list` | The profile reads what a pod actually uses. |
 | `deployments` | `list` | The shutdown reads what can be stopped. |
 | `deployments/scale` | `patch` | The only thing the kernel ever writes to a workload. |
 | `configmaps` | `create` | To make its ledger the first time. |
 | `configmaps` (named `technocore-ledger`) | `get`, `update`, `patch` | To maintain it, and nothing else in the namespace. |
 | `configmaps` (named `technocore-confirmed`) | `get` | To read the provider figures the operator pushes — and never to write one. |
+| `configmaps` (named `technocore-namespaces`) | `get` | To read the namespaces the operator asked to meter — and never to widen or narrow its own scope. |
+| `configmaps` (named `technocore-profiles`) | `get`, `update`, `patch` | To maintain the usage profiles, in their own object so they can never make the ledger unwritable. |
 
 There is no `watch` (the loop polls), no `delete`, and no `get` on anything it does not own. Those absences are each a design decision rather than an oversight, and a test fails if any of them appears.
 
@@ -94,10 +98,26 @@ It would be easy for the CLI to list pods and price them itself. That is the mis
 
 The observation rides the checkpoint's schedule rather than adding a write per tick, so it is as stale as the last checkpoint and carries the timestamp that says so. It also carries `Incomplete` and the unreadable namespaces, because a figure built on a partial picture is a floor and not a total.
 
+### What a pod uses, as opposed to what it reserves
+
+Everything above is about **requests**, because requests are what Autopilot bills. [ADR 0014](../docs/adr/0014-observed-usage.md) adds the other half: what a pod actually consumes, read from the aggregated `metrics.k8s.io` API on the same tick, by the same client, and surfaced as `farcast usage`.
+
+Four things about it are decisions rather than details.
+
+**It never enforces.** The cost meter reads requests and only requests. A namespace whose metrics cannot be read is a named state on the report — and unlike metering, *every* namespace failing is still not a fault. The asymmetry is the point: metering that reads nothing would report `$0` for an instance that is spending, so it must fail loudly; a profile that reads nothing means a future resize declines, which is the safe direction.
+
+**A profile describes one pod, not one application.** Summing three replicas and recommending the total as a request would be wrong by the replica count. Each pod contributes its own sample, so the distribution is across pods and time together, and the replica count is recorded beside it as the separate question it is.
+
+**History is a bounded distribution, never a sample log.** Twenty-four hourly slots per application, each an exponential-bucket histogram with an exact count, sum and peak. The stored size is fixed by the window rather than by uptime, so an instance up for a year holds what one up for a day holds. Keeping samples instead would have grown until a 1 MiB ConfigMap started refusing writes — months after it worked in testing — and a thirty-second series of per-application CPU is a timeline of when the operator is awake. Trend is the last hour compared against the day, not a chart.
+
+**The profiles are their own ConfigMap.** Not a section of the ledger's: the ledger must always be writable, and an advisory document must never be able to make the cost checkpoint fail. It is trimmed to a byte budget by shortening the retained window for everybody first, and only then dropping the least recently seen — degrade uniformly before degrading anybody to nothing. Both are published, because a window that is short because the budget shortened it looks exactly like an instance that has only just started.
+
+Storing these numbers discloses nothing new, by [ADR 0009](../docs/adr/0009-technocore-kernel-and-cost-metering.md) decision 2's own test: they come from the provider's kubelet by way of the provider's metrics-server, so the cloud measured every one of them first.
+
 ### One replica, replaced rather than overlapped
 
 The kernel is a meter with a single ledger, so its Deployment is `replicas: 1` with `strategy: Recreate`. A rolling update would run two kernels for a few seconds; both would meter the same instance into their own in-memory ledgers and race to write the same checkpoint, and the period's spending would become whichever wrote last.
 
 It carries **no PodDisruptionBudget**, deliberately: a single-replica workload behind `minAvailable: 1` makes every node drain hang forever, which would block the auto-upgrades ADR 0003 accepts. The checkpoint is what makes the kernel's own reschedule survivable — the successor bills the gap it slept through — so it does not need one.
 
-*The operator-side commands are `farcast kernel deploy|meter|confirm` (4.1) and `farcast costs` (4.3).*
+*The operator-side commands are `farcast kernel deploy|meter|confirm` (4.1), `farcast costs` (4.3) and `farcast usage` (5.1).*

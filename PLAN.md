@@ -249,9 +249,13 @@ Building it found something bigger than the section described: **the declaration
 ### 5.1 TechnoCore — monitoring & metrics
 Deep observability into running applications.
 
-- CPU, memory, network I/O, request latency metrics collection
-- Historical data for trend analysis
-- Per-application resource profiles
+**Status: 🟨 Partial** — CPU and memory are collected, profiled and surfaced; network I/O and latency are not, and none of it has been validated against a live cluster. Designed by [ADR 0014](docs/adr/0014-observed-usage.md). The kernel reads the aggregated `metrics.k8s.io` API on its existing reconcile tick — the same reading `kubectl top` shows, one more RBAC rule, no new client, no new process — and keeps a per-application profile in [`technocore/usage`](technocore/README.md), published as `farcast usage <instance>`. Zero new vendored modules (31 before, 31 after). Three decisions carry the section: **usage never enforces** (the meter reads requests, and every namespace refusing metrics is a finding rather than a fault — the exact opposite of metering, where reading nothing would report `$0` for an instance that is spending); **a profile describes one pod, not one application**, because summing replicas and reserving the total would be wrong by the replica count; and **history is a bounded rolling distribution rather than a sample log**, so the stored size is fixed by the window instead of by uptime — a thirty-second series of per-application CPU would both outgrow a 1 MiB ConfigMap and be a timeline of when the operator is awake.
+
+- CPU and memory metrics collection — **done**, deduplicated by the reading's own timestamp so a metrics server that has not refreshed is not counted twice
+- Network I/O, request latency — **not started**, and deliberately not sourced here: `metrics.k8s.io` does not carry them, and they are already visible at the boundary that sees every byte. They are FatLine's measurements, read from FatLine ([ADR 0014](docs/adr/0014-observed-usage.md) phasing, 5.1b)
+- Historical data for trend analysis — **done** as twenty-four hourly bucketed distributions per application; trend is the last hour compared against the day rather than a stored series
+- Per-application resource profiles — **done**, with the observed p95 against the current reservation and an explicit *thin* state when there are too few readings to say anything
+- **Not yet walked live.** Whether GKE's managed metrics-server answers this client, and what a real application's profile looks like, are both unverified — the code treats a missing metrics API as a named state precisely because that is the assumption most likely to be wrong
 
 ### 5.2 TechnoCore — adaptive scaling
 The "intelligent" part of the OS.
