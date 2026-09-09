@@ -105,6 +105,29 @@ func (s SlogSink) Emit(e Event) {
 	)
 }
 
+// Tee fans one event out to several sinks, in order. A nil member is skipped.
+//
+// It exists so streaming decisions to a monitor never REPLACES logging them.
+// FatLine is the enforcement point and its own record of what it allowed and
+// refused must not depend on anything downstream: Shrike is fail-open by
+// design and its wire drops events when the sidecar is unreachable, so wiring
+// the sidecar as a substitute would mean a monitor being down quietly erased
+// the boundary's audit trail — the one thing that has to survive it.
+//
+// Each sink is expected to honour the Sink contract and not block; Tee adds no
+// buffering of its own, because the caller already wraps the result in a
+// BufferedSink.
+type Tee []Sink
+
+// Emit passes the event to every sink.
+func (t Tee) Emit(e Event) {
+	for _, s := range t {
+		if s != nil {
+			s.Emit(e)
+		}
+	}
+}
+
 // BufferedSink decouples the data-plane hot path from a slow consumer with a
 // non-blocking buffered channel. When the buffer is full it drops the event —
 // the block/allow decision has already been enforced upstream, so security is

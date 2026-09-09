@@ -2,7 +2,9 @@ package deploy
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"testing"
 
@@ -430,4 +432,170 @@ func TestTheEgressPolicyIsMountedAndOptional(t *testing.T) {
 	if !found {
 		t.Fatal("no policy volume")
 	}
+}
+
+// containersOf returns the pod's containers by name.
+func containersOf(t *testing.T, out []byte) map[string]map[string]any {
+	t.Helper()
+	docs := docsByKind(t, out)
+	raw := nested(t, docs["Deployment"], "spec", "template", "spec", "containers")
+	list, ok := raw.([]any)
+	if !ok {
+		t.Fatalf("containers is %T, not a list", raw)
+	}
+	res := map[string]map[string]any{}
+	for _, c := range list {
+		m, ok := c.(map[string]any)
+		if !ok {
+			t.Fatalf("container is %T, not a map", c)
+		}
+		name, _ := m["name"].(string)
+		res[name] = m
+	}
+	return res
+}
+
+func argsOf(t *testing.T, container map[string]any) []string {
+	t.Helper()
+	raw, ok := container["args"].([]any)
+	if !ok {
+		t.Fatalf("args is %T, not a list", container["args"])
+	}
+	var out []string
+	for _, a := range raw {
+		s, _ := a.(string)
+		out = append(out, s)
+	}
+	return out
+}
+
+// Shrike is co-scheduled with FatLine, not deployed as its own workload.
+//
+// It was built at 2.2 and the two-container Pod was scoped to Planck at 4.2,
+// where it did not ship — so for two phases nothing deployed the monitor at
+// all and a policy violation in a running instance reached nobody. This is the
+// join that closes it.
+func TestShrikeIsCoScheduledWithFatLine(t *testing.T) {
+	c := sampleConfig()
+	c.ShrikeImage = "example/shrike:test"
+	out, err := Render(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	containers := containersOf(t, out)
+	if len(containers) != 2 {
+		t.Fatalf("rendered %d containers, want fatline + shrike: %v", len(containers), keysOf(containers))
+	}
+	sh, ok := containers[ShrikeName]
+	if !ok {
+		t.Fatalf("no %q container: %v", ShrikeName, keysOf(containers))
+	}
+	if got := sh["image"]; got != "example/shrike:test" {
+		t.Errorf("shrike image = %v", got)
+	}
+
+	// Both ends of the wire agree on one path, and it is the socket Shrike
+	// listens on. Two spellings of it would be a sidecar that silently
+	// receives nothing.
+	var fatlineSocket, shrikeSocket string
+	for _, a := range argsOf(t, containers["fatline"]) {
+		if v, ok := strings.CutPrefix(a, "--shrike-socket="); ok {
+			fatlineSocket = v
+		}
+	}
+	for _, a := range argsOf(t, sh) {
+		if v, ok := strings.CutPrefix(a, "--socket="); ok {
+			shrikeSocket = v
+		}
+	}
+	if fatlineSocket == "" {
+		t.Error("fatline was not told where the sidecar listens")
+	}
+	if fatlineSocket != shrikeSocket {
+		t.Errorf("the two ends disagree: fatline dials %q, shrike listens on %q", fatlineSocket, shrikeSocket)
+	}
+
+	// Shrike reads the same policy document FatLine enforces from.
+	if !strings.Contains(strings.Join(argsOf(t, sh), " "), PolicyKey) {
+		t.Error("shrike was not given the egress policy")
+	}
+
+	// The socket lives on a volume both containers mount, and Shrike's mount
+	// is writable because it is the end that creates the socket.
+	vols := nested(t, docsByKind(t, out)["Deployment"], "spec", "template", "spec", "volumes")
+	if !strings.Contains(mustJSON(t, vols), "shrike-wire") {
+		t.Error("no shared volume for the socket")
+	}
+	for _, m := range []struct {
+		container map[string]any
+		name      string
+	}{{containers["fatline"], "fatline"}, {sh, ShrikeName}} {
+		mounts := mustJSON(t, m.container["volumeMounts"])
+		if !strings.Contains(mounts, "shrike-wire") {
+			t.Errorf("%s does not mount the socket volume", m.name)
+		}
+	}
+	if strings.Contains(mustJSON(t, sh["volumeMounts"]), `"shrike-wire","readOnly":true`) {
+		t.Error("shrike's socket mount is read-only; it is the end that creates the socket")
+	}
+}
+
+// And without an image, FatLine deploys alone — which is every instance
+// connected before the sidecar shipped. FatLine logs every decision itself
+// either way, so the monitor's absence costs alerting, never the record.
+func TestWithoutAShrikeImageFatLineDeploysAlone(t *testing.T) {
+	out, err := Render(sampleConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	containers := containersOf(t, out)
+	if len(containers) != 1 {
+		t.Fatalf("rendered %d containers, want fatline alone: %v", len(containers), keysOf(containers))
+	}
+	if strings.Contains(string(out), "--shrike-socket") {
+		t.Error("fatline was told to dial a sidecar that was not rendered")
+	}
+	if strings.Contains(string(out), "shrike-wire") {
+		t.Error("the socket volume was rendered with no sidecar to use it")
+	}
+}
+
+// The sidecar must be admissible on Autopilot on the same terms as every other
+// container this project runs (ADR 0003).
+func TestShrikeSidecarIsAutopilotCompliant(t *testing.T) {
+	c := sampleConfig()
+	c.ShrikeImage = "example/shrike:test"
+	out, err := Render(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sh := containersOf(t, out)[ShrikeName]
+	req := mustJSON(t, nested(t, sh, "resources", "requests"))
+	if !strings.Contains(req, "cpu") || !strings.Contains(req, "memory") {
+		t.Errorf("the sidecar declares no resource requests: %s", req)
+	}
+	sec := mustJSON(t, sh["securityContext"])
+	for _, want := range []string{`"allowPrivilegeEscalation":false`, `"readOnlyRootFilesystem":true`, "ALL"} {
+		if !strings.Contains(sec, want) {
+			t.Errorf("securityContext missing %s: %s", want, sec)
+		}
+	}
+}
+
+func keysOf(m map[string]map[string]any) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func mustJSON(t *testing.T, v any) string {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
 }

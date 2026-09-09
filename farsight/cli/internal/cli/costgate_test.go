@@ -140,7 +140,9 @@ func TestFatLineSecondReplicaCostsWhatTheADRClaims(t *testing.T) {
 // gate had — a true number that is not the whole number — and ADR 0009
 // decision 11 doubled the half that was missing.
 func TestConnectCostGateNamesFatLineAsWellAsTheCarrier(t *testing.T) {
-	want := pricing.WorkloadMonthlyUSD(fldeploy.DefaultReplicas, fldeploy.RequestCPUMilli, fldeploy.RequestMemMiB)
+	// The POD's requests: Autopilot bills the Pod, and since 2.2's sidecar the
+	// Pod is FatLine plus the Shrike monitor beside it.
+	want := pricing.WorkloadMonthlyUSD(fldeploy.DefaultReplicas, fldeploy.PodRequestCPUMilli, fldeploy.PodRequestMemMiB)
 	if math.Abs(fatlineMonthlyUSD-want) > 0.01 {
 		t.Fatalf("connect prices FatLine at $%.2f/month; its manifest costs $%.2f/month", fatlineMonthlyUSD, want)
 	}

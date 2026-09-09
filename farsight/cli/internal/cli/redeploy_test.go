@@ -124,8 +124,12 @@ func TestRedeployDeploysAnExplicitImageAsGiven(t *testing.T) {
 	if len(fc.applied) != 1 || !bytes.Contains(fc.applied[0], []byte(explicit)) {
 		t.Fatalf("the supplied image was not deployed:\n%s", fc.applied)
 	}
-	if len(fb.resolved) != 0 || len(fb.built) != 0 {
-		t.Fatalf("an explicit --fatline-image must not preflight or build: resolved=%v built=%v", fb.resolved, fb.built)
+	if got := onlyFatline(fb.resolved); len(got) != 0 || len(onlyFatline(refsOf(fb.built))) != 0 {
+		t.Fatalf("an explicit --fatline-image must not preflight or build it: resolved=%v built=%v", got, fb.built)
+	}
+	// The sidecar is a separate image that --fatline-image does not name.
+	if len(shrikeRefs(fb.resolved)) == 0 {
+		t.Errorf("the Shrike sidecar's image was never resolved: %v", fb.resolved)
 	}
 	meta, _ := dir.LoadInstanceMetadata(name)
 	if deployedImage(meta) != explicit {
@@ -158,8 +162,8 @@ func TestRedeployDeploysThePreflightedDigest(t *testing.T) {
 	}
 
 	want := instanceImageRef(name)
-	if len(fb.resolved) != 1 || fb.resolved[0] != want {
-		t.Fatalf("preflighted %v, want [%s] derived from the instance registry", fb.resolved, want)
+	if got := onlyFatline(fb.resolved); len(got) != 1 || got[0] != want {
+		t.Fatalf("preflighted %v, want [%s] derived from the instance registry", got, want)
 	}
 	if len(fb.built) != 0 {
 		t.Fatal("a preflight hit must not build anything")
@@ -220,8 +224,9 @@ func TestRedeployBuildsTheImageWhenTheRegistryHasNone(t *testing.T) {
 	if askedFor != "/checkouts/farcast" {
 		t.Errorf("--source was not passed to the checkout lookup: %q", askedFor)
 	}
-	if len(fb.built) != 1 {
-		t.Fatalf("BuildAndPush called %d times, want 1", len(fb.built))
+	// Two images: the boundary and its co-scheduled monitor.
+	if len(fb.built) != 2 {
+		t.Fatalf("BuildAndPush called %d times, want fatline + shrike", len(fb.built))
 	}
 	opts := fb.built[0]
 	if opts.SourceDir != "/checkouts/farcast" || opts.Package != "./fatline/cmd/fatline" ||
@@ -415,8 +420,10 @@ func TestRedeploySourceForcesARebuild(t *testing.T) {
 	if err := c.Run(context.Background(), env, []string{name}); err != nil {
 		t.Fatalf("redeploy --source: %v", err)
 	}
-	if len(fb.built) != 1 {
-		t.Fatalf("--source did not rebuild: BuildAndPush calls = %d, resolves = %v", len(fb.built), fb.resolved)
+	// Both images rebuild: --source is a request to build this checkout, and
+	// the sidecar is compiled from it too.
+	if len(fb.built) != 2 {
+		t.Fatalf("--source did not rebuild both: BuildAndPush calls = %d, resolves = %v", len(fb.built), fb.resolved)
 	}
 	if len(fb.resolved) != 0 {
 		t.Errorf("preflighted anyway (%v); a forced rebuild has nothing to look up", fb.resolved)

@@ -374,7 +374,7 @@ Each module folder contains its own `README.md` with:
 | Planck | 🟡 In progress | 🟡 GKE Autopilot provider, instance image registry, manifest→workload translator, in-instance build and manifest read |
 | FatLine | 🟡 In progress | 🟡 Core proxy: mTLS tunnel, deny-by-default egress, per-application egress policy |
 | DataSphere | 🟡 In progress | 🟡 Encrypting store, blob formats v1+v2, keyring, GCS adapter, in-cluster keyholder |
-| Shrike | 🟡 In progress | 🟡 Policy engine, with violations attributed to the application that caused them |
+| Shrike | 🟡 In progress | 🟡 Policy engine, with violations attributed to the application that caused them; deployed as a sidecar beside FatLine |
 | AllThing | 🔲 Draft | 🔲 Not started |
 | FarSight | 🟡 In progress | 🟡 CLI: the full `install → connect → run → release` lifecycle, plus `storage`, `kernel`, `toolchain`, `ps`, `logs`, `costs`; engine-less image build (GUI is Phase 7) |
 | SDK | 🟡 In progress | 🟡 Go: logging and storage live; config, secrets and AI are Phases 5–6 |

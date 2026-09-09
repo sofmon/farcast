@@ -144,6 +144,39 @@ func instanceImageRef(instance string) string {
 	return "us-central1-docker.pkg.dev/proj-1/farcast-" + instance + "/system/fatline:" + buildinfo.Get().Version
 }
 
+// onlyFatline filters image refs to FatLine's own, so a test about the
+// boundary's image is not perturbed by the Shrike sidecar's, which is resolved
+// through the same builder and pushed to the same registry.
+func onlyFatline(refs []string) []string {
+	var out []string
+	for _, r := range refs {
+		if !strings.Contains(r, "system/shrike") {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// refsOf pulls the image references out of recorded BuildAndPush calls.
+func refsOf(opts []image.Options) []string {
+	var out []string
+	for _, o := range opts {
+		out = append(out, o.Ref)
+	}
+	return out
+}
+
+// shrikeRefs is the complement: the sidecar's.
+func shrikeRefs(refs []string) []string {
+	var out []string
+	for _, r := range refs {
+		if strings.Contains(r, "system/shrike") {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
 func testEnv(dir config.Dir, mode output.Mode) (*Env, *bytes.Buffer) {
 	env, out, _ := testEnvBoth(dir, mode)
 	return env, out
@@ -251,8 +284,13 @@ func TestConnectBootstrapsAndReports(t *testing.T) {
 	if len(fc.applied) != 1 || len(fc.applied[0]) == 0 {
 		t.Fatalf("expected exactly one non-empty Apply; got %d", len(fc.applied))
 	}
-	if len(fb.resolved) != 0 || len(fb.built) != 0 {
-		t.Fatalf("an explicit --fatline-image must not preflight or build: resolved=%v built=%v", fb.resolved, fb.built)
+	if got := onlyFatline(fb.resolved); len(got) != 0 || len(onlyFatline(refsOf(fb.built))) != 0 {
+		t.Fatalf("an explicit --fatline-image must not preflight or build it: resolved=%v built=%v", got, fb.built)
+	}
+	// The sidecar is a separate image and --fatline-image does not name it, so
+	// it is still resolved from the instance registry.
+	if len(shrikeRefs(fb.resolved)) == 0 {
+		t.Errorf("the Shrike sidecar's image was never resolved: %v", fb.resolved)
 	}
 	if !bytes.Contains(fc.applied[0], []byte("img:test")) {
 		t.Fatalf("deploy did not use the overridden image:\n%s", fc.applied[0])
@@ -361,6 +399,44 @@ func TestConnectReconnectSkipsBootstrap(t *testing.T) {
 	}
 }
 
+// connect deploys the monitor with the boundary.
+//
+// Shrike was written at 2.2 and the two-container Pod was scoped to Planck at
+// 4.2, where it did not ship — so for two phases every connected instance
+// enforced egress correctly and told nobody when it refused something. This is
+// the join, asserted on what actually reaches the cluster.
+func TestConnectDeploysShrikeBesideFatLine(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	const name = "prod"
+	installedInstance(t, dir, name)
+	env, _ := testEnv(dir, output.ModeHuman)
+
+	fc := &fakeCluster{ip: "203.0.113.7"}
+	fb := &fakeBuilder{}
+	c := testConnect(&fakeProvider{token: planck.RegistryToken{Username: "oauth2accesstoken", Password: "tok"}}, fb)
+	c.assumeYes = true
+	c.newCluster = func(string) clusterApplier { return fc }
+	c.dial = connectedDial()
+
+	if err := c.Run(context.Background(), env, []string{name}); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	if len(fc.applied) != 1 {
+		t.Fatalf("applied %d manifests, want 1", len(fc.applied))
+	}
+	applied := string(fc.applied[0])
+	if !strings.Contains(applied, "system/shrike") {
+		t.Fatalf("the deployed workload carries no Shrike image:\n%s", applied)
+	}
+	// Both ends of the wire, in the manifest that actually lands.
+	if !strings.Contains(applied, "--shrike-socket=") {
+		t.Error("FatLine was not told where the sidecar listens")
+	}
+	if !strings.Contains(applied, "shrike-wire") {
+		t.Error("no shared volume for the sidecar socket")
+	}
+}
+
 func TestConnectDefaultsImageToTheInstanceRegistry(t *testing.T) {
 	dir := config.Dir(t.TempDir())
 	const name = "prod"
@@ -380,8 +456,8 @@ func TestConnectDefaultsImageToTheInstanceRegistry(t *testing.T) {
 	}
 
 	want := instanceImageRef(name)
-	if len(fb.resolved) != 1 || fb.resolved[0] != want {
-		t.Fatalf("preflighted %v, want [%s] derived from the instance registry", fb.resolved, want)
+	if got := onlyFatline(fb.resolved); len(got) != 1 || got[0] != want {
+		t.Fatalf("preflighted %v, want [%s] derived from the instance registry", got, want)
 	}
 	if len(fb.built) != 0 {
 		t.Fatal("a preflight hit must not build anything")
@@ -426,8 +502,9 @@ func TestConnectBuildsTheImageWhenTheRegistryHasNone(t *testing.T) {
 	if askedFor != "/checkouts/farcast" {
 		t.Errorf("--source was not passed to the checkout lookup: %q", askedFor)
 	}
-	if len(fb.built) != 1 {
-		t.Fatalf("BuildAndPush called %d times, want 1", len(fb.built))
+	// Two images now: the boundary and its co-scheduled monitor.
+	if len(fb.built) != 2 {
+		t.Fatalf("BuildAndPush called %d times, want fatline + shrike", len(fb.built))
 	}
 	opts := fb.built[0]
 	if opts.SourceDir != "/checkouts/farcast" || opts.Package != "./fatline/cmd/fatline" ||

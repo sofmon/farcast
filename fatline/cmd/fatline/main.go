@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/sofmon/farcast/fatline"
+	"github.com/sofmon/farcast/fatline/event"
 	fcrypto "github.com/sofmon/farcast/fatline/internal/crypto"
 	"github.com/sofmon/farcast/fatline/policy"
 	"github.com/sofmon/farcast/shrike"
@@ -109,13 +110,16 @@ func run(args []string) error {
 		}
 	}
 
-	// Optionally ship egress decisions to a Shrike sidecar; otherwise FatLine's
-	// default slog sink logs them. The data plane never depends on Shrike being
-	// up — DialSink drops-and-counts when the sidecar is absent (2.2).
+	// Optionally ship egress decisions to a Shrike sidecar, IN ADDITION to
+	// logging them. The data plane never depends on Shrike being up — DialSink
+	// drops-and-counts when the sidecar is absent (2.2) — and neither does the
+	// record: this used to replace the slog sink, so turning the sidecar on
+	// would have removed FatLine's own log of every decision and left a
+	// fail-open monitor as the only witness. See event.Tee.
 	var ds *shrike.DialSink
 	if *shrikeSocket != "" {
 		ds = shrike.NewDialSink(*shrikeSocket)
-		cfg.Events = ds
+		cfg.Events = event.Tee{event.SlogSink{}, ds}
 	}
 
 	srv, err := fatline.New(cfg)

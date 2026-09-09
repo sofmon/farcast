@@ -227,6 +227,22 @@ else
   die "expected Shrike alert lines in $TMP/shrike.log"
 fi
 
+# Attaching a monitor must not remove the boundary's own record.
+#
+# Wiring the Shrike sidecar used to REPLACE FatLine's slog sink, so turning the
+# monitor on silently deleted the log every 4.4 walk read to verify attribution
+# — and Shrike is fail-open, dropping events when the sidecar is unreachable,
+# so a monitor being down would have erased the record rather than just the
+# alerting. FatLine now tees to both. This runs with --shrike-socket set, which
+# is exactly the configuration that used to lose it.
+for kind in allow deny; do
+  grep -q "egress kind=$kind" "$TMP/fatline.log" ||
+    die "FatLine logged no '$kind' decision of its own while streaming to Shrike — see $TMP/fatline.log"
+done
+grep -q 'egress kind=deny.*app=web' "$TMP/fatline.log" ||
+  die "FatLine's own log does not name the application on a denial — see $TMP/fatline.log"
+ok "FatLine still logged every decision itself while streaming to the sidecar ($(grep -c 'egress kind=' "$TMP/fatline.log") events)"
+
 kill "$FATLINE_PID" "$SHRIKE_PID" 2>/dev/null || true
 wait 2>/dev/null || true
 FATLINE_PID=''; SHRIKE_PID=''

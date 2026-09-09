@@ -64,7 +64,8 @@ func floorNow(meta *config.InstanceMetadata) instanceFloor {
 	}
 	if meta.FatLineDeployed {
 		f.add("fatline", pricing.WorkloadMonthlyUSD(fldeploy.DefaultReplicas,
-			fldeploy.RequestCPUMilli, fldeploy.RequestMemMiB), "the tunnel, two replicas (ADR 0009 decision 11)")
+			fldeploy.PodRequestCPUMilli, fldeploy.PodRequestMemMiB),
+			"the tunnel and its Shrike monitor, two replicas (ADR 0009 decision 11)")
 	}
 	if meta.Keyholder != nil && meta.Keyholder.Deployed {
 		f.add("keyholder", pricing.WorkloadMonthlyUSD(keyholderReplicas,
@@ -89,7 +90,8 @@ func floorFull(meta *config.InstanceMetadata) instanceFloor {
 	f.add("cluster", emptyClusterMonthlyUSD, "Autopilot's own managed workloads (ADR 0003, modelled)")
 	f.add("carrier", nlbMonthlyUSD, "the public mTLS load balancer (ADR 0005)")
 	f.add("fatline", pricing.WorkloadMonthlyUSD(fldeploy.DefaultReplicas,
-		fldeploy.RequestCPUMilli, fldeploy.RequestMemMiB), "the tunnel, two replicas (ADR 0009 decision 11)")
+		fldeploy.PodRequestCPUMilli, fldeploy.PodRequestMemMiB),
+		"the tunnel and its Shrike monitor, two replicas (ADR 0009 decision 11)")
 	f.add("keyholder", pricing.WorkloadMonthlyUSD(keyholderReplicas,
 		dsdeploy.RequestCPUMilli, dsdeploy.RequestMemMiB), "storage's key holder, two replicas (ADR 0008 decision 6)")
 	f.add("technocore", pricing.WorkloadMonthlyUSD(tcdeploy.Replicas,

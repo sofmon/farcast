@@ -142,6 +142,13 @@ func (c *redeployCommand) Run(ctx context.Context, env *Env, args []string) erro
 	if err != nil {
 		return err
 	}
+	// A redeploy is how an instance connected before the monitor shipped gets
+	// one: the sidecar's image is resolved the same way FatLine's is, and
+	// built if the registry does not have it yet.
+	shrikeImg, err := c.resolveSidecarImage(ctx, env, reg)
+	if err != nil {
+		return err
+	}
 	previous := deployedImage(meta)
 
 	// The consent gate. Note it follows image resolution, which may itself have
@@ -157,7 +164,7 @@ func (c *redeployCommand) Run(ctx context.Context, env *Env, args []string) erro
 		return errors.New("redeploy not confirmed")
 	}
 
-	manifests, err := renderWorkload(img, carrier, mtls)
+	manifests, err := renderWorkload(img, shrikeImg, carrier, mtls)
 	if err != nil {
 		return err
 	}

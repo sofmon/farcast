@@ -83,6 +83,48 @@ const (
 	// cannot drift from the number the manifest actually asks for.
 	RequestCPUMilli = 100
 	RequestMemMiB   = 128
+
+	// ShrikeName is the monitoring sidecar's container name, and the socket
+	// constants are the wire between it and FatLine.
+	//
+	// Shrike is co-scheduled rather than run as its own workload because the
+	// wire is a Unix socket on a shared emptyDir: the decision stream never
+	// touches the network, so it cannot be observed, delayed or spoofed by
+	// anything else in the cluster, and there is no second Service to secure.
+	// Shrike LISTENS and FatLine dials, so the socket exists only while the
+	// monitor does — which is what makes FatLine's fail-open behaviour the
+	// normal case rather than an error path.
+	ShrikeName       = "shrike"
+	shrikeSocketDir  = "/run/fatline"
+	shrikeSocketPath = shrikeSocketDir + "/shrike.sock"
+
+	// ShrikeStatusPort serves the live security picture as JSON. It binds
+	// loopback INSIDE the Pod and is deliberately not a Service and not a
+	// tunnel route: the picture is for the operator (and the GUI at phase 7),
+	// and until something reaches for it, publishing it would be new attack
+	// surface for no reader. 'kubectl exec' can curl it in the meantime.
+	ShrikeStatusPort = 9090
+
+	// ShrikeRequestCPUMilli and ShrikeRequestMemMiB are the sidecar's declared
+	// requests, exported for the same reason FatLine's are: the cost estimate
+	// an operator confirms is computed from these constants.
+	//
+	// On paper they add to the Pod. Whether they add to the BILL depends on
+	// Autopilot's per-Pod minimum, which the fatline container alone already
+	// sits under — so this is stated as an addition rather than modelled as
+	// free, because a cost claim this project cannot verify is one it should
+	// not make.
+	ShrikeRequestCPUMilli = 50
+	ShrikeRequestMemMiB   = 64
+
+	// PodRequestCPUMilli and PodRequestMemMiB are what one FatLine Pod asks
+	// for in total. Autopilot bills the POD, and since the monitor is
+	// co-scheduled the Pod is two containers — so a cost model quoting only
+	// the fatline container would understate the standing charge an operator
+	// is being asked to approve. Every estimate reads these, not the
+	// per-container constants.
+	PodRequestCPUMilli = RequestCPUMilli + ShrikeRequestCPUMilli
+	PodRequestMemMiB   = RequestMemMiB + ShrikeRequestMemMiB
 )
 
 // Config parameterizes the rendered FatLine workload. The Secret carries the CA
@@ -103,6 +145,11 @@ type Config struct {
 	// address — that is what keeps an operator credential from becoming a
 	// general port-forward into the cluster.
 	StreamRoutes []string
+
+	// ShrikeImage co-schedules the Shrike monitor as a sidecar. Empty renders
+	// FatLine alone, which is what every deployment did before 2.2's sidecar
+	// shipped — FatLine still logs every decision itself either way.
+	ShrikeImage string
 
 	CACertPEM     []byte
 	ServerCertPEM []byte
@@ -168,6 +215,14 @@ func Render(c Config) ([]byte, error) {
 		ServerKey:       base64.StdEncoding.EncodeToString(c.ServerKeyPEM),
 		StreamRoutes:    c.StreamRoutes,
 		MTLSHash:        mtlsHash(c.CACertPEM, c.ServerCertPEM, c.ServerKeyPEM),
+
+		ShrikeImage:           c.ShrikeImage,
+		ShrikeName:            ShrikeName,
+		ShrikeSocketDir:       shrikeSocketDir,
+		ShrikeSocketPath:      shrikeSocketPath,
+		ShrikeStatusPort:      ShrikeStatusPort,
+		ShrikeRequestCPUMilli: ShrikeRequestCPUMilli,
+		ShrikeRequestMemMiB:   ShrikeRequestMemMiB,
 	}
 	var buf bytes.Buffer
 	if err := workloadTemplate.Execute(&buf, data); err != nil {
@@ -218,6 +273,14 @@ type templateData struct {
 	// template, so the cost estimate and the manifest quote one number.
 	RequestCPUMilli int
 	RequestMemMiB   int
+
+	ShrikeImage           string
+	ShrikeName            string
+	ShrikeSocketDir       string
+	ShrikeSocketPath      string
+	ShrikeStatusPort      int
+	ShrikeRequestCPUMilli int
+	ShrikeRequestMemMiB   int
 }
 
 // workloadTemplate renders an Autopilot-compliant FatLine workload: resource
@@ -326,6 +389,13 @@ spec:
             # and until it does, no application can be identified and none may
             # reach anything.
             - --policy={{.PolicyMountPath}}/{{.PolicyKey}}
+{{- if .ShrikeImage}}
+            # Streamed to the sidecar IN ADDITION to being logged here. The
+            # data plane never waits on Shrike and never depends on it: the
+            # wire drops-and-counts when the socket is not there, which is the
+            # normal case while the sidecar starts.
+            - --shrike-socket={{.ShrikeSocketPath}}
+{{- end}}
 {{- range .StreamRoutes}}
             - --stream-route={{.}}
 {{- end}}
@@ -350,7 +420,53 @@ spec:
             - name: policy
               mountPath: {{.PolicyMountPath}}
               readOnly: true
+{{- if .ShrikeImage}}
+            - name: shrike-wire
+              mountPath: {{.ShrikeSocketDir}}
+{{- end}}
+{{- if .ShrikeImage}}
+        # The security monitor, co-scheduled rather than a workload of its own
+        # so the decision stream is a Unix socket that never touches the
+        # network. It never blocks egress — FatLine enforces inline and
+        # fail-closed — and it is fail-open: if this container is down, the
+        # boundary is unaffected and FatLine's own log still records every
+        # decision.
+        - name: {{.ShrikeName}}
+          image: {{.ShrikeImage}}
+          args:
+            - --socket={{.ShrikeSocketPath}}
+            # The same mounted document FatLine enforces from. In a cluster
+            # there is no manifest to read: it was read inside the instance at
+            # 'farcast run', and the policy is what survives.
+            - --policy={{.PolicyMountPath}}/{{.PolicyKey}}
+            # Loopback only, and inside the Pod: no Service, no tunnel route.
+            - --status-listen=127.0.0.1:{{.ShrikeStatusPort}}
+          resources:
+            requests:
+              cpu: {{.ShrikeRequestCPUMilli}}m
+              memory: {{.ShrikeRequestMemMiB}}Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            # Writable: Shrike creates and owns the socket, FatLine dials it.
+            - name: shrike-wire
+              mountPath: {{.ShrikeSocketDir}}
+            - name: policy
+              mountPath: {{.PolicyMountPath}}
+              readOnly: true
+{{- end}}
       volumes:
+{{- if .ShrikeImage}}
+        # The socket lives here. emptyDir rather than a hostPath: it is
+        # created with the Pod, shared only by these two containers, and gone
+        # when they are.
+        - name: shrike-wire
+          emptyDir: {}
+{{- end}}
         # optional, because farcast connect deploys FatLine before any
         # application exists to have a policy. A missing policy is a closed
         # instance, not a broken one.

@@ -39,6 +39,13 @@ const (
 	dispheredPackage   = "./datasphere/cmd/datasphere"
 	dispheredBinary    = "/datasphere"
 
+	// shrike is the security monitor's component identity. It is deployed as a
+	// container inside FatLine's Pod rather than as a workload of its own, so
+	// it has no deployer of its own either — only an image to resolve.
+	shrikeImagePath = "system/shrike"
+	shrikePackage   = "./shrike/cmd/shrike"
+	shrikeBinary    = "/shrike"
+
 	// fatlineRolloutTimeout bounds the wait for FatLine's Pods to become ready.
 	// Both the first deploy and a redeploy use it, so an operator never has to
 	// learn two different patience budgets for the same workload.
@@ -135,6 +142,10 @@ var (
 	keyholderComponent = systemComponent{
 		Name: "datasphered", ImagePath: dispheredImagePath,
 		Package: dispheredPackage, BinaryPath: dispheredBinary,
+	}
+	shrikeComponent = systemComponent{
+		Name: "shrike", ImagePath: shrikeImagePath,
+		Package: shrikePackage, BinaryPath: shrikeBinary,
 	}
 )
 
@@ -304,6 +315,33 @@ func (d *fatlineDeployer) resolveImage(ctx context.Context, env *Env, reg *regis
 	}, user, pass)
 }
 
+// resolveSidecarImage settles Shrike's image in the same instance registry the
+// FatLine image came from.
+//
+// It is this deployer with the component swapped, deliberately: the build, the
+// consent gate, the tag derivation and the push must behave identically for
+// both images, and a second implementation of "compile a Go package onto a
+// pinned distroless base and push it" is exactly how the two would drift.
+// --fatline-image is cleared because it names FatLine's image and nothing
+// else — an operator pinning the boundary's image is not pinning the monitor's.
+func (d *fatlineDeployer) resolveSidecarImage(ctx context.Context, env *Env, reg *registryAccess) (string, error) {
+	// The break-glass path: --fatline-image names an image directly and needs
+	// no registry at all, which is what makes it usable when the registry is
+	// the thing that is broken. There is nowhere to get a monitor image from
+	// in that case, so FatLine deploys alone — said out loud, because a
+	// security component that quietly stops being deployed is worse than one
+	// that was never there.
+	if d.fatlineImage != "" && reg == nil {
+		fprintln(env.Err, "No image registry for this instance, so the Shrike monitor cannot be built: deploying FatLine alone.")
+		fprintln(env.Err, "Egress is still enforced and every decision is still logged by FatLine. What is missing is alerting.")
+		return "", nil
+	}
+	sidecar := *d
+	sidecar.component = shrikeComponent
+	sidecar.fatlineImage = ""
+	return sidecar.resolveImage(ctx, env, reg)
+}
+
 // confirmBuild gates building FatLine's image from source. It is not a cost
 // gate — registry storage is ~$0 (ADR 0007 decision 8) — it is a consent gate:
 // the build compiles *this* checkout and pushes the result into the one place
@@ -379,14 +417,15 @@ func deployCarrier(c *config.Carrier) (deploy.Carrier, error) {
 	}
 }
 
-// renderWorkload renders FatLine's Kubernetes workload for one image and
-// carrier. Both commands render through it, so a redeploy cannot produce a
+// renderWorkload renders FatLine's Kubernetes workload — the boundary and its
+// co-scheduled monitor — for a carrier. Both commands render through it, so a redeploy cannot produce a
 // workload shaped differently from the one connect bootstrapped — and the CA
 // *certificate* plus the server leaf go to the cluster while the CA key, which
 // is not part of Config at all, stays on this machine.
-func renderWorkload(img string, carrier deploy.Carrier, mtls config.MTLSMaterial) ([]byte, error) {
+func renderWorkload(img, shrikeImg string, carrier deploy.Carrier, mtls config.MTLSMaterial) ([]byte, error) {
 	return deploy.Render(deploy.Config{
 		Image:         img,
+		ShrikeImage:   shrikeImg,
 		Carrier:       carrier,
 		StreamRoutes:  systemStreamRoutes(),
 		CACertPEM:     mtls.CACertPEM,

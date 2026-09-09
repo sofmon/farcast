@@ -93,3 +93,31 @@ func TestBufferedSinkDrainsOnCancel(t *testing.T) {
 		t.Fatalf("after drain on cancel: got %d events, want 4", cp.len())
 	}
 }
+
+// A monitor must never become the only witness.
+//
+// Wiring a Shrike sidecar used to REPLACE the slog sink, so enabling it would
+// have removed FatLine's own log of every decision — and Shrike's wire is
+// fail-open and drops events when the sidecar is unreachable, so a monitor
+// being down would have erased the boundary's record rather than just its
+// alerting.
+func TestTeeReachesEverySink(t *testing.T) {
+	var a, b []Event
+	tee := Tee{
+		sinkFunc(func(e Event) { a = append(a, e) }),
+		nil, // a nil member must be skipped, not panic
+		sinkFunc(func(e Event) { b = append(b, e) }),
+	}
+	tee.Emit(Event{Kind: Deny, Tenant: "ns", App: "web", Host: "evil.example.com"})
+
+	if len(a) != 1 || len(b) != 1 {
+		t.Fatalf("sinks received %d and %d events, want 1 each", len(a), len(b))
+	}
+	if a[0].App != "web" || b[0].App != "web" {
+		t.Errorf("attribution did not reach both sinks: %+v / %+v", a[0], b[0])
+	}
+}
+
+type sinkFunc func(Event)
+
+func (f sinkFunc) Emit(e Event) { f(e) }

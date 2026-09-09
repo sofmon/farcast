@@ -34,7 +34,10 @@ const registryMonthlyCost = "~$0"
 // decision 11 doubled it: the tunnel now runs two replicas so that a node drain
 // cannot leave storage unsealable. An operator agreeing to a standing cost
 // should see the whole standing cost, not the largest line of it.
-var fatlineMonthlyUSD = pricing.WorkloadMonthlyUSD(deploy.DefaultReplicas, deploy.RequestCPUMilli, deploy.RequestMemMiB)
+//
+// It is the POD's requests, which since 2.2's sidecar means FatLine plus the
+// Shrike monitor beside it. Autopilot bills the Pod.
+var fatlineMonthlyUSD = pricing.WorkloadMonthlyUSD(deploy.DefaultReplicas, deploy.PodRequestCPUMilli, deploy.PodRequestMemMiB)
 
 // tunnelConn is the slice of *tunnel.Conn connect needs (injectable).
 type tunnelConn interface {
@@ -300,8 +303,15 @@ func (c *connectCommand) bootstrap(ctx context.Context, env *Env, name string, m
 	if err != nil {
 		return err
 	}
+	// Shrike ships with the boundary, not after it. It was built at 2.2 and
+	// deployed by nothing until now, so every connected instance enforced
+	// egress correctly and told no one when something was refused.
+	shrikeImg, err := c.resolveSidecarImage(ctx, env, reg)
+	if err != nil {
+		return err
+	}
 
-	manifests, err := renderWorkload(img, deploy.CarrierLoadBalancer, mtls)
+	manifests, err := renderWorkload(img, shrikeImg, deploy.CarrierLoadBalancer, mtls)
 	if err != nil {
 		return err
 	}
@@ -503,7 +513,7 @@ func (r connectResult) Human(w io.Writer) error {
 	if r.Image != "" {
 		fprintf(w, "  image:       %s\n", r.Image)
 	}
-	fprintf(w, "  cost:        load balancer ~$%d/mo + FatLine ~$%.0f/mo + registry %s/mo (limit: %s %.0f/%s)\n",
+	fprintf(w, "  cost:        load balancer ~$%d/mo + FatLine and Shrike ~$%.0f/mo + registry %s/mo (limit: %s %.0f/%s)\n",
 		nlbMonthlyUSD, fatlineMonthlyUSD, registryMonthlyCost, r.costLimit.Currency, r.costLimit.Amount, r.costLimit.Period)
 	return nil
 }
