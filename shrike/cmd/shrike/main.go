@@ -9,6 +9,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -94,6 +95,15 @@ func run(args []string) error {
 		}()
 	}
 
+	// The policy is a mounted ConfigMap that arrives after this process starts
+	// and changes while it runs — the sidecar is deployed by `farcast connect`,
+	// long before any application exists to declare anything. Watching it is
+	// what keeps the picture's contract true; FatLine has watched its copy of
+	// the same document since ADR 0013 decision 5.
+	if *policyPath != "" {
+		go watchPolicy(ctx, *policyPath, policyPollInterval, mon)
+	}
+
 	fmt.Fprintf(os.Stderr, "shrike: monitoring (socket=%q, %d declared host(s), status=%q)\n",
 		*socket, len(declared), *statusListen)
 
@@ -105,6 +115,47 @@ func run(args []string) error {
 		cancel()
 	}
 	return err
+}
+
+// policyPollInterval is how often the mounted policy is re-read. The kubelet
+// propagates a ConfigMap change on its own schedule (tens of seconds), so
+// polling faster buys nothing.
+const policyPollInterval = 10 * time.Second
+
+// watchPolicy re-reads the declared contract when the mounted document changes.
+//
+// It mirrors FatLine's watcher deliberately, including its failure behaviour:
+// an unreadable document is complained about and the previous contract kept,
+// and `last` is not updated so a file that is still broken on the next tick is
+// complained about again rather than falling silent.
+func watchPolicy(ctx context.Context, path string, every time.Duration, mon *shrike.Monitor) {
+	last, _ := os.ReadFile(path)
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		data, err := os.ReadFile(path)
+		if err != nil || bytes.Equal(data, last) {
+			continue
+		}
+		doc, perr := policy.Parse(data)
+		if perr != nil {
+			fmt.Fprintf(os.Stderr, "shrike: refusing an unreadable egress policy, keeping the previous one: %v\n", perr)
+			continue
+		}
+		last = data
+		var hosts []parser.External
+		for _, h := range doc.ByTenant() {
+			hosts = append(hosts, h...)
+		}
+		mon.ReloadDeclared(hosts)
+		fmt.Fprintf(os.Stderr, "shrike: declared contract reloaded (%d application(s), %d host(s))\n",
+			len(doc.Apps), len(hosts))
+	}
 }
 
 // declaredFromPolicy reads the egress policy document and flattens every

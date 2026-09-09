@@ -14,6 +14,7 @@
 package shrike
 
 import (
+	"sync"
 	"time"
 
 	"github.com/sofmon/farcast/fatline/event"
@@ -65,8 +66,12 @@ type Config struct {
 }
 
 // Monitor is Shrike's policy engine: an event.Sink that inspects FatLine's
-// egress decisions and alerts on violations. Safe for concurrent Emit.
+// egress decisions and alerts on violations. Safe for concurrent Emit,
+// Snapshot and ReloadDeclared.
 type Monitor struct {
+	// mu guards policy only. The inspector has its own lock, and since never
+	// changes after New.
+	mu        sync.RWMutex
 	policy    policy.Policy
 	inspector *inspector.Inspector
 	since     time.Time
@@ -85,6 +90,26 @@ func New(cfg Config) *Monitor {
 // security picture and raises an alert if it is a denial that warrants one.
 func (m *Monitor) Emit(e event.Event) { m.inspector.Record(e) }
 
+// ReloadDeclared replaces the declared contract.
+//
+// The contract arrives AFTER the monitor starts and changes while it runs:
+// `farcast connect` deploys the sidecar before any application exists, and
+// `farcast run` writes the policy afterwards. A Monitor that read its contract
+// once therefore reported an empty one for the life of the Pod — every allowed
+// host annotated "not declared", and the picture unable to say what the
+// instance had actually promised. Found on the sidecar's first live walk;
+// FatLine had watched its copy of the same document since ADR 0013 decision 5,
+// and only the monitor did not.
+//
+// Violation detection never depended on this — that comes from FatLine's own
+// deny reasons — so the alerting was correct throughout. What was wrong was
+// the contract half of the picture.
+func (m *Monitor) ReloadDeclared(declared []parser.External) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.policy = policy.New(declared)
+}
+
 var _ event.Sink = (*Monitor)(nil)
 
 // Snapshot is the live security picture, served as JSON at StatusPath.
@@ -100,14 +125,18 @@ type Snapshot struct {
 // with whether it is in the declared policy: a reached-but-undeclared host means
 // FatLine and Shrike disagree on policy — a drift worth surfacing.
 func (m *Monitor) Snapshot() Snapshot {
+	m.mu.RLock()
+	pol := m.policy
+	m.mu.RUnlock()
+
 	allowed := m.inspector.Allowed()
 	for i := range allowed {
-		_, allowed[i].Declared = m.policy.Declared(allowed[i].Host)
+		_, allowed[i].Declared = pol.Declared(allowed[i].Host)
 	}
 	return Snapshot{
 		Since:      m.since,
 		Events:     m.inspector.Events(),
-		Declared:   m.policy.Hosts(),
+		Declared:   pol.Hosts(),
 		Allowed:    allowed,
 		Violations: m.inspector.Violations(),
 	}

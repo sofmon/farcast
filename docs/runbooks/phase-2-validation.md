@@ -331,6 +331,73 @@ ls -la "$FARCAST_CONFIG_HOME/instances/$INSTANCE/fatline/"   # ca.key present he
 kubectl get secret fatline-mtls -n farcast-system -o jsonpath='{.data.ca\.key}'; echo "  ← must be EMPTY"
 ```
 
+## B3a. The Shrike sidecar — co-scheduled, alerting, and not the only witness
+
+Shrike is deployed as a second container in FatLine's Pod, wired by a Unix
+socket on a shared `emptyDir`. Walked live for the first time on 2026-09-09.
+
+```bash
+kubectl -n farcast-system get pods -l app.kubernetes.io/name=fatline \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"  "}{range .spec.containers[*]}{.name}{" "}{end}{"ready="}{.status.containerStatuses[*].ready}{"\n"}{end}'
+```
+
+✅ Expect **`2/2`** on every replica, containers `fatline` and `shrike`, zero
+restarts. This is the step that answers the only question a cluster can:
+whether Autopilot admits a two-container Pod with these requests.
+
+**Check what Autopilot actually charges**, because the cost estimate is derived
+from the manifest and Autopilot is free to disagree:
+
+```bash
+kubectl -n farcast-system get pods -l app.kubernetes.io/name=fatline \
+  -o jsonpath='{range .items[0].spec.containers[*]}{.name}{": "}{.resources.requests}{"\n"}{end}'
+```
+
+✅ Expect the requests as written — `fatline` 100m/128Mi, `shrike` 50m/64Mi. On
+the 2026-09-09 walk Autopilot took them unchanged, so the sidecar's marginal
+cost is real rather than absorbed by a per-Pod floor, and `connect`'s
+`FatLine and Shrike ~$11/mo` is the number that bills.
+
+Now deploy an application that declares a host (`farcast run`, phase 4.3) and
+drive a refusal through the proxy. Then read **both** containers:
+
+```bash
+kubectl -n farcast-system logs -l app.kubernetes.io/name=fatline -c shrike  --prefix --tail=50 | grep -i violation
+kubectl -n farcast-system logs -l app.kubernetes.io/name=fatline -c fatline --prefix --tail=50 | grep 'egress kind='
+```
+
+✅ Expect Shrike to raise a violation **naming the application**, and — this is
+the part worth checking rather than assuming — FatLine's own log to still hold
+**every** decision, including the `allow` and the `close` with its byte counts.
+Shrike only alerts on violations, so the two logs are not the same log: on the
+2026-09-09 walk Shrike raised 3 alerts while FatLine recorded 5 events.
+Attaching a monitor must never be what deletes the boundary's own record.
+
+The status picture is on loopback inside the Pod — no Service, no tunnel route
+— so reach it with a port-forward:
+
+```bash
+POD=$(kubectl -n farcast-system get pods -l app.kubernetes.io/name=fatline -o jsonpath='{.items[0].metadata.name}')
+kubectl -n farcast-system port-forward "$POD" 19090:9090 &
+curl -fsS http://127.0.0.1:19090/_shrike/status | jq '{declared, violations}'
+```
+
+✅ Expect `declared` to list the hosts the deployed applications declared. **Wait
+for the port-forward to be ready** before curling — a one-second sleep is not
+enough, and an empty answer reads exactly like a broken feature.
+
+Finally, change the policy while it runs and confirm the monitor follows it:
+
+```bash
+kubectl -n farcast-system get configmap fatline-egress-policy -o json \
+  | jq '.data["policy.json"] |= (fromjson | (.apps[] | select(.name=="hermit") | .external) |= [{"host":"api.stripe.com","reason":"reload check"}] | tojson)' \
+  | kubectl apply -f -
+kubectl -n farcast-system logs -l app.kubernetes.io/name=fatline -c shrike --tail=20 | grep -i reload
+```
+
+✅ Expect `shrike: declared contract reloaded (…)` on the **already-running**
+pod, with no restart, and the status endpoint serving the new host.
+
 ## B4. Verify the mTLS boundary — the "locked door"
 
 Read back the carrier endpoint and the pinned server name, then prove the tunnel
@@ -425,6 +492,9 @@ left billing.
 - [ ] kubectl shows the FatLine Deployment/Service/Secret; the Secret has **no `ca.key`**; `ca.key` exists only locally at `0600`.
 - [ ] mTLS boundary: the operator cert gets status JSON; no-cert is rejected at the handshake.
 - [ ] `connect --status` reconnects idempotently (no re-deploy, no cost prompt).
+- [ ] Every FatLine Pod is **2/2** — Autopilot admits the two-container Pod and takes the declared requests unchanged.
+- [ ] A refusal reaches Shrike's alert stream **naming the application**, and FatLine's own log still records every decision beside it.
+- [ ] Shrike's picture lists the declared hosts, and follows a policy change without a restart.
 - [ ] `release` removes the cluster and the registry, leaving **no forwarding rule** (no lingering LB charge).
 
 If Part A passes you've validated the security boundary itself; if Part B passes
