@@ -25,6 +25,14 @@ const (
 	Deny Kind = "deny"
 	// Close is emitted when a proxied connection finishes, carrying byte counts.
 	Close Kind = "close"
+	// Fail is emitted when an ALLOWED connection could not be established.
+	//
+	// It is not a policy event and it is not a denial: FatLine said yes and
+	// the upstream did not answer. Before it existed the dial failure was
+	// silent — an application whose declared host was down or unreachable
+	// produced an Allow and then nothing at all, so neither the operator's log
+	// nor the monitor could tell "reached it" from "never got there".
+	Fail Kind = "fail"
 )
 
 // Deny reasons. These are stable strings so a consumer (Shrike) can branch on
@@ -38,6 +46,12 @@ const (
 	// ReasonSNIMismatch: the TLS ClientHello server_name did not match the
 	// allowlisted CONNECT authority.
 	ReasonSNIMismatch = "sni_mismatch"
+
+	// ReasonDialFailed: the connection was allowed and the upstream could not
+	// be reached. It rides Fail, never Deny — collapsing the two would report
+	// a network outage as a policy violation and send an operator to edit a
+	// manifest that was already correct.
+	ReasonDialFailed = "dial_failed"
 
 	// ReasonUnknownApp: the caller presented no usable credential, so FatLine
 	// cannot tell which application's declarations to enforce.
@@ -67,6 +81,20 @@ type Event struct {
 	Reason    string
 	BytesUp   int64
 	BytesDown int64
+
+	// DialMillis is how long establishing the upstream connection took. It
+	// rides Close and Fail — on a failure it is how long FatLine waited before
+	// giving up, which is what separates a refused connection from a timeout.
+	//
+	// This is the only latency the boundary can honestly report. FatLine
+	// tunnels CONNECT opaquely and never terminates TLS to the upstream, so
+	// the requests inside are ciphertext by construction: measuring per-request
+	// latency would mean terminating the application's TLS at the proxy, which
+	// is the one thing this component exists not to do.
+	DialMillis int64
+	// DurationMillis is how long the established connection stayed open. It
+	// rides Close only.
+	DurationMillis int64
 }
 
 // Sink receives egress events. Implementations must not block the caller for
@@ -85,7 +113,9 @@ func (s SlogSink) Emit(e Event) {
 		l = slog.Default()
 	}
 	lvl := slog.LevelInfo
-	if e.Kind == Deny {
+	// A failed dial is a warning, not an error: the boundary behaved
+	// correctly and something beyond it did not.
+	if e.Kind == Deny || e.Kind == Fail {
 		lvl = slog.LevelWarn
 	}
 	l.LogAttrs(context.Background(), lvl, "egress",
@@ -102,6 +132,8 @@ func (s SlogSink) Emit(e Event) {
 		slog.String("reason", e.Reason),
 		slog.Int64("bytes_up", e.BytesUp),
 		slog.Int64("bytes_down", e.BytesDown),
+		slog.Int64("dial_ms", e.DialMillis),
+		slog.Int64("duration_ms", e.DurationMillis),
 	)
 }
 

@@ -451,5 +451,12 @@ func systemStreamRoutes() []string {
 			keyholder.StreamRoute,
 			dsdeploy.DefaultName, dsdeploy.DefaultName, dsdeploy.DefaultNamespace,
 			dsdeploy.DefaultUnsealPort, keyholderReplicas),
+		// Shrike's status, on the Pod's own loopback. FatLine's relay runs in
+		// that same Pod, so this reaches the monitor without the monitor ever
+		// listening anywhere the cluster can dial — and like the keyholder's,
+		// the route is configured whether or not a Shrike is deployed, so an
+		// instance running FatLine alone fails as an honest "cannot reach the
+		// service" rather than as an unknown route.
+		fmt.Sprintf("%s=127.0.0.1:%d", deploy.ShrikeStreamRoute, deploy.ShrikeStatusPort),
 	}
 }

@@ -167,18 +167,45 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Timed, because this is the only latency the boundary can honestly
+	// report: everything after the dial is ciphertext FatLine never opens.
+	dialStart := time.Now()
 	upstream, err := p.dial(context.Background(), "tcp", net.JoinHostPort(host, port))
+	dialMillis := millisSince(dialStart)
 	if err != nil {
+		// Previously a bare return, and the silence was the problem: FatLine
+		// had said yes and then produced nothing, so "reached its host" and
+		// "never got there" looked identical in the log and in the monitor.
+		// It is a Fail rather than a Deny — the policy was satisfied and the
+		// network was not, and reporting it as a violation would send an
+		// operator to edit a manifest that is already correct.
+		p.events.Emit(event.Event{
+			Kind: event.Fail, Tenant: caller.Namespace, App: caller.App,
+			Host: host, Port: port, Proto: "connect", SNI: sni,
+			Reason: event.ReasonDialFailed, DialMillis: dialMillis,
+		})
 		return
 	}
 	defer func() { _ = upstream.Close() }()
 
+	openedAt := time.Now()
 	clientSrc := io.MultiReader(bytes.NewReader(buffered), clientConn)
 	up, down := netcopy.Duplex(upstream, clientConn, clientSrc)
 	p.events.Emit(event.Event{
 		Kind: event.Close, Tenant: caller.Namespace, App: caller.App,
 		Host: host, Port: port, Proto: "connect", SNI: sni, BytesUp: up, BytesDown: down,
+		DialMillis: dialMillis, DurationMillis: millisSince(openedAt),
 	})
+}
+
+// millisSince rounds a duration up to whole milliseconds, so a connection that
+// took some measurable time never reports as having taken none.
+func millisSince(start time.Time) int64 {
+	d := time.Since(start)
+	if d <= 0 {
+		return 0
+	}
+	return int64((d + time.Millisecond - 1) / time.Millisecond)
 }
 
 // splice copies bidirectionally between the client and the upstream, returning

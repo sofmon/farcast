@@ -11,7 +11,6 @@ import (
 	"github.com/sofmon/farcast/datasphere"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/keyholder"
-	"github.com/sofmon/farcast/fatline/tunnel"
 )
 
 // The application scope's name and prefix now live in datasphere, so the
@@ -29,22 +28,7 @@ const (
 // dependency the ADR calls a recovery floor becomes visible: an unseal rides
 // FatLine, so an instance whose tunnel is down cannot be unsealed at all.
 func keyholderClient(ctx context.Context, env *Env, name string) (*keyholder.Client, func(), error) {
-	meta, err := env.ConfigDir.LoadInstanceMetadata(name)
-	if err != nil {
-		return nil, nil, fmt.Errorf("load instance %q: %w", name, err)
-	}
-	if meta.Carrier == nil || meta.Carrier.Endpoint == "" {
-		return nil, nil, fmt.Errorf("instance %q has no tunnel; run 'farcast connect %s' first", name, name)
-	}
-	mtls, err := env.ConfigDir.LoadInstanceMTLS(name)
-	if err != nil {
-		return nil, nil, fmt.Errorf("load the mTLS identity for %q: %w", name, err)
-	}
-	id, err := clientIdentity(mtls, name)
-	if err != nil {
-		return nil, nil, err
-	}
-	conn, err := tunnel.Connect(ctx, "https://"+meta.Carrier.Endpoint, id)
+	conn, mtls, err := instanceTunnel(ctx, env, name)
 	if err != nil {
 		return nil, nil, fmt.Errorf(
 			"cannot reach %q through FatLine: %w\n"+

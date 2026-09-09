@@ -344,3 +344,13 @@ Identity is something an application **holds**, not somewhere it **sits**. The a
 - **A FatLine with no policy denies everything.** That is the state of a freshly connected instance, and it is the correct reading of "policy has not arrived".
 
 What the network still does is unchanged and still load-bearing: the per-app NetworkPolicy forces every outbound byte through FatLine. It just no longer *also* separates applications from each other.
+
+## What the boundary can measure (Phase 5.1b)
+
+Every event now carries how long the upstream connection took to establish, and a closed one carries how long it stayed open ([ADR 0015](../docs/adr/0015-what-the-boundary-can-measure.md)).
+
+**Connection latency, not request latency, and that is a refusal rather than a gap.** FatLine tunnels CONNECT opaquely and never terminates TLS to the upstream — that is the property [ADR 0005](../docs/adr/0005-fatline-data-plane-ingress.md) exists to keep, and it means the requests inside a connection are bytes this process cannot read. Measuring per-request timing would mean terminating the application's TLS here: a man-in-the-middle on the operator's own traffic, run by the one component this project treats as living on attacker-controlled bytes. An application that needs per-request timing has to measure it where the plaintext already is.
+
+**A failed dial is now an event.** An allowed CONNECT whose upstream could not be reached used to emit an `Allow` and then nothing at all — a bare `return` — so "reached its declared host" and "never got there" were indistinguishable in the log and absent from the monitor. It is `Fail` with `dial_failed`, carrying how long FatLine waited before giving up, which is what separates a refused connection from a timeout.
+
+It is deliberately **not** a `Deny`. The policy was satisfied and the network was not, and reporting an outage as a policy violation would send an operator to edit a manifest that is already correct.

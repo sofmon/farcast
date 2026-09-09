@@ -317,7 +317,8 @@ farcast ps
 # View cost breakdown
 farcast costs my-instance
 
-# View what applications actually use, against what they reserve
+# View what applications actually use — compute against what they reserve,
+# network against what they declared
 farcast usage my-instance
 
 # Connect to a FarCast instance via FarSight

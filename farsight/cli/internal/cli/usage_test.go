@@ -1,14 +1,24 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/sofmon/farcast/farsight/cli/internal/cluster"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
+	fldeploy "github.com/sofmon/farcast/fatline/deploy"
+	"github.com/sofmon/farcast/fatline/event"
+	"github.com/sofmon/farcast/manifest/parser"
+	"github.com/sofmon/farcast/shrike"
 	tcdeploy "github.com/sofmon/farcast/technocore/deploy"
 	"github.com/sofmon/farcast/technocore/kernel"
 	"github.com/sofmon/farcast/technocore/usage"
@@ -37,12 +47,53 @@ func usageReader(t *testing.T, body string) *fakeReader {
 	}}
 }
 
+// fakeStreamDialer stands in for the FatLine tunnel: it dials a local server
+// instead of relaying into a cluster, so the report exercises the real HTTP
+// path over a fake transport rather than a faked response.
+type fakeStreamDialer struct {
+	addr  string
+	err   error
+	route string
+	dials int
+}
+
+func (f *fakeStreamDialer) DialStream(ctx context.Context, route string, _ int) (net.Conn, error) {
+	f.dials++
+	f.route = route
+	if f.err != nil {
+		return nil, f.err
+	}
+	return (&net.Dialer{}).DialContext(ctx, "tcp", f.addr)
+}
+
+// shrikeServing runs a real Monitor behind a real handler, fed real events, so
+// the report cannot drift from what Shrike actually serves.
+func shrikeServing(t *testing.T, feed func(*shrike.Monitor)) *fakeStreamDialer {
+	t.Helper()
+	m := shrike.New(shrike.Config{Declared: []parser.External{{Host: "api.example"}}})
+	feed(m)
+	srv := httptest.NewServer(m.Handler())
+	t.Cleanup(srv.Close)
+	return &fakeStreamDialer{addr: strings.TrimPrefix(srv.URL, "http://")}
+}
+
 func runUsage(t *testing.T, dir config.Dir, body string, mode output.Mode) string {
+	t.Helper()
+	return runUsageWith(t, dir, body, mode, &fakeStreamDialer{err: errors.New("no tunnel in this test")})
+}
+
+func runUsageWith(t *testing.T, dir config.Dir, body string, mode output.Mode, d streamDialer) string {
 	t.Helper()
 	env, out := testEnv(dir, mode)
 	c := &usageCommand{}
 	f := usageReader(t, body)
-	c.newCluster = func(string) configMapReader { return f }
+	c.newCluster = func(string) usageReaderIface { return f }
+	c.newDialer = func(context.Context, *Env, string) (streamDialer, func(), error) {
+		if d == nil {
+			return nil, nil, errors.New("no dialer")
+		}
+		return d, func() {}, nil
+	}
 	if err := c.Run(context.Background(), env, []string{"p51"}); err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +236,7 @@ func TestUsageRefusesAnInstanceWithNoKernel(t *testing.T) {
 	buildableInstance(t, dir, "bare")
 	env, _ := testEnv(dir, output.ModeHuman)
 	c := &usageCommand{}
-	c.newCluster = func(string) configMapReader { return &fakeReader{} }
+	c.newCluster = func(string) usageReaderIface { return &fakeReader{} }
 	err := c.Run(context.Background(), env, []string{"bare"})
 	if err == nil || !strings.Contains(err.Error(), "kernel deploy") {
 		t.Fatalf("error is %v, want one naming the command that fixes it", err)
@@ -197,7 +248,7 @@ func TestUsageSaysWhenNothingHasBeenWrittenYet(t *testing.T) {
 	meteringInstance(t, dir, "p51")
 	env, _ := testEnv(dir, output.ModeHuman)
 	c := &usageCommand{}
-	c.newCluster = func(string) configMapReader { return &fakeReader{cmMissing: true} }
+	c.newCluster = func(string) usageReaderIface { return &fakeReader{cmMissing: true} }
 	err := c.Run(context.Background(), env, []string{"p51"})
 	if err == nil || !strings.Contains(err.Error(), "has not written any usage profiles yet") {
 		t.Fatalf("error is %v", err)
@@ -212,9 +263,305 @@ func TestUsageRefusesAnUnknownDocumentVersion(t *testing.T) {
 	env, _ := testEnv(dir, output.ModeHuman)
 	c := &usageCommand{}
 	f := usageReader(t, `{"version":99,"at":"2026-09-09T12:00:00Z","store":{"version":1,"hours":24}}`)
-	c.newCluster = func(string) configMapReader { return f }
+	c.newCluster = func(string) usageReaderIface { return f }
 	err := c.Run(context.Background(), env, []string{"p51"})
 	if err == nil || !strings.Contains(err.Error(), "older than the other") {
 		t.Fatalf("error is %v", err)
+	}
+}
+
+// The network half comes from the boundary, because the boundary is the only
+// place an application's traffic is visible at all.
+func TestUsageReportsWhatCrossedTheBoundaryPerApplication(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	meteringInstance(t, dir, "p51")
+	at := time.Date(2026, 9, 9, 12, 30, 0, 0, time.UTC)
+	body := profilesFor(t, at, func(*usage.Store) {}, nil)
+
+	d := shrikeServing(t, func(m *shrike.Monitor) {
+		m.Emit(event.Event{Kind: event.Allow, Tenant: "apps", App: "api", Host: "api.example", Port: "443"})
+		m.Emit(event.Event{Kind: event.Close, Tenant: "apps", App: "api", Host: "api.example", Port: "443",
+			BytesUp: 4096, BytesDown: 1 << 20, DialMillis: 40, DurationMillis: 900})
+		m.Emit(event.Event{Kind: event.Fail, Tenant: "apps", App: "api", Host: "api.example", Port: "443",
+			Reason: event.ReasonDialFailed, DialMillis: 3000})
+		m.Emit(event.Event{Kind: event.Deny, Tenant: "apps", App: "web", Host: "nope.example",
+			Reason: event.ReasonNotInAllowlist})
+	})
+
+	shown := runUsageWith(t, dir, body, output.ModeHuman, d)
+	t.Log("\n" + shown)
+	if d.route != "shrike" {
+		t.Errorf("the monitor was reached by route %q, want the named %q route", d.route, "shrike")
+	}
+	for _, want := range []string{"Network", "api", "web", "4.0 KiB", "1.0 MiB", "never opens the tunnel it carries"} {
+		if !strings.Contains(shown, want) {
+			t.Errorf("output is missing %q", want)
+		}
+	}
+	// A failed connection and a denied one are different facts and get
+	// different columns: one is the network, the other is the policy.
+	if !strings.Contains(shown, ">2s") {
+		t.Errorf("the three-second wait before failing is not shown")
+	}
+}
+
+// An unidentified caller is the row an operator most needs to see, so it is
+// named as what it is rather than rendered blank.
+func TestUsageNamesAnUnidentifiedCaller(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	meteringInstance(t, dir, "p51")
+	at := time.Date(2026, 9, 9, 12, 30, 0, 0, time.UTC)
+	body := profilesFor(t, at, func(*usage.Store) {}, nil)
+
+	d := shrikeServing(t, func(m *shrike.Monitor) {
+		m.Emit(event.Event{Kind: event.Deny, Host: "x.example", Reason: event.ReasonUnknownApp})
+	})
+	shown := runUsageWith(t, dir, body, output.ModeHuman, d)
+	if !strings.Contains(shown, "(unidentified)") {
+		t.Errorf("output does not name the unidentified caller:\n%s", shown)
+	}
+}
+
+// The two halves come from two places and either can be missing on its own. A
+// tunnel that is down must not cost the operator the compute half as well.
+func TestUsageStillReportsComputeWhenTheMonitorCannotBeReached(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	meteringInstance(t, dir, "p51")
+	at := time.Date(2026, 9, 9, 12, 30, 0, 0, time.UTC)
+	body := profilesFor(t, at, func(s *usage.Store) {
+		for i := 0; i < usage.MinSamples; i++ {
+			s.Record(at, "api", []usage.PodUsage{{CPUMilli: 40, MemMiB: 100, RequestCPUMilli: 500, RequestMemMiB: 512}})
+		}
+	}, nil)
+
+	shown := runUsageWith(t, dir, body, output.ModeHuman, &fakeStreamDialer{err: errors.New("connection refused")})
+	t.Log("\n" + shown)
+	if !strings.Contains(shown, "api") || !strings.Contains(shown, "500m") {
+		t.Error("the compute half was lost with the tunnel")
+	}
+	for _, want := range []string{"Network not measured", "not the same as zero", "connection refused", "farcast connect"} {
+		if !strings.Contains(shown, want) {
+			t.Errorf("output is missing %q", want)
+		}
+	}
+}
+
+// An instance whose applications have made no outbound connection is a real
+// answer, and a different one from a monitor that could not be read.
+func TestUsageDistinguishesQuietFromUnreadable(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	meteringInstance(t, dir, "p51")
+	at := time.Date(2026, 9, 9, 12, 30, 0, 0, time.UTC)
+	body := profilesFor(t, at, func(*usage.Store) {}, nil)
+
+	d := shrikeServing(t, func(*shrike.Monitor) {})
+	shown := runUsageWith(t, dir, body, output.ModeHuman, d)
+	if !strings.Contains(shown, "No application has made an outbound connection") {
+		t.Errorf("a quiet instance did not read as quiet:\n%s", shown)
+	}
+	if strings.Contains(shown, "not measured") {
+		t.Error("a quiet instance was reported as unmeasured")
+	}
+}
+
+// The route has to be in what `connect` actually deploys, or the feature is
+// dead in a cluster while every unit test above still passes — the failure
+// mode this project has hit twice (Shrike deployed nowhere, `kernel meter`
+// writing a list nothing read).
+func TestTheDeployedRoutesReachTheMonitor(t *testing.T) {
+	var found string
+	for _, r := range systemStreamRoutes() {
+		if strings.HasPrefix(r, fldeploy.ShrikeStreamRoute+"=") {
+			found = r
+		}
+	}
+	if found == "" {
+		t.Fatalf("no %q route in what connect deploys: %v", fldeploy.ShrikeStreamRoute, systemStreamRoutes())
+	}
+	// Loopback, deliberately: the monitor listens where only its own Pod can
+	// reach it, and FatLine's relay is in that Pod.
+	want := fmt.Sprintf("%s=127.0.0.1:%d", fldeploy.ShrikeStreamRoute, fldeploy.ShrikeStatusPort)
+	if found != want {
+		t.Errorf("route is %q, want %q", found, want)
+	}
+	// And it must be the route the reader asks for.
+	d := &fakeStreamDialer{err: errors.New("stop here")}
+	_, _ = fetchNetwork(context.Background(), d)
+	if d.route != fldeploy.ShrikeStreamRoute {
+		t.Errorf("the reader asks for route %q, the deploy publishes %q", d.route, fldeploy.ShrikeStreamRoute)
+	}
+}
+
+// The rendered workload must actually start the status listener, or the route
+// reaches a port nothing is on.
+func TestTheRenderedSidecarServesTheStatusPort(t *testing.T) {
+	out, err := fldeploy.Render(fldeploy.Config{
+		Image: "reg/fatline@sha256:aa", ShrikeImage: "reg/shrike@sha256:bb",
+		CACertPEM: []byte("ca"), ServerCertPEM: []byte("crt"), ServerKeyPEM: []byte("key"),
+		StreamRoutes: systemStreamRoutes(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rendered := string(out)
+	if want := fmt.Sprintf("--status-listen=127.0.0.1:%d", fldeploy.ShrikeStatusPort); !strings.Contains(rendered, want) {
+		t.Errorf("the sidecar does not serve %q", want)
+	}
+	if want := fmt.Sprintf("--stream-route=%s=127.0.0.1:%d", fldeploy.ShrikeStreamRoute, fldeploy.ShrikeStatusPort); !strings.Contains(rendered, want) {
+		t.Errorf("the workload does not carry %q", want)
+	}
+}
+
+// The tunnel failing to OPEN is a different path from a dial failing inside
+// it, and the likelier of the two: an instance that has never been connected,
+// or whose carrier is gone. It must read the same way — the compute half
+// intact, the network half named as missing.
+func TestUsageStillReportsComputeWhenThereIsNoTunnelAtAll(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	meteringInstance(t, dir, "p51")
+	at := time.Date(2026, 9, 9, 12, 30, 0, 0, time.UTC)
+	body := profilesFor(t, at, func(s *usage.Store) {
+		for i := 0; i < usage.MinSamples; i++ {
+			s.Record(at, "api", []usage.PodUsage{{CPUMilli: 40, MemMiB: 100, RequestCPUMilli: 500, RequestMemMiB: 512}})
+		}
+	}, nil)
+
+	env, out := testEnv(dir, output.ModeHuman)
+	c := &usageCommand{}
+	c.newCluster = func(string) usageReaderIface { return usageReader(t, body) }
+	c.newDialer = func(context.Context, *Env, string) (streamDialer, func(), error) {
+		return nil, nil, errors.New("instance \"p51\" has no tunnel; run 'farcast connect p51' first")
+	}
+	if err := c.Run(context.Background(), env, []string{"p51"}); err != nil {
+		t.Fatal(err)
+	}
+	shown := out.String()
+	t.Log("\n" + shown)
+	if !strings.Contains(shown, "500m") {
+		t.Error("the compute half was lost with the tunnel")
+	}
+	if !strings.Contains(shown, "has no tunnel") {
+		t.Errorf("the reason the network half is missing was not reported")
+	}
+}
+
+// --no-network is a different empty from a monitor that could not be read.
+func TestUsageSkipsTheNetworkWhenAsked(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	meteringInstance(t, dir, "p51")
+	at := time.Date(2026, 9, 9, 12, 30, 0, 0, time.UTC)
+	body := profilesFor(t, at, func(*usage.Store) {}, nil)
+
+	env, out := testEnv(dir, output.ModeHuman)
+	c := &usageCommand{noNetwork: true}
+	c.newCluster = func(string) usageReaderIface { return usageReader(t, body) }
+	called := false
+	c.newDialer = func(context.Context, *Env, string) (streamDialer, func(), error) {
+		called = true
+		return nil, nil, errors.New("should not be reached")
+	}
+	if err := c.Run(context.Background(), env, []string{"p51"}); err != nil {
+		t.Fatal(err)
+	}
+	if called {
+		t.Error("--no-network opened the tunnel anyway")
+	}
+	if !strings.Contains(out.String(), "--no-network was given") {
+		t.Errorf("the skipped section does not say why it is empty:\n%s", out.String())
+	}
+}
+
+// Found live on the 5.1b walk: each FatLine replica keeps its own Shrike and
+// its own picture, and a read lands on whichever pod terminated the tunnel —
+// so two consecutive reports showed two different partial counts, each
+// presented as the instance's traffic. Saying whose picture it is, and
+// whether it is the whole one, is what makes the number usable.
+func TestUsageSaysWhoseNetworkPictureItIs(t *testing.T) {
+	at := time.Date(2026, 9, 9, 12, 30, 0, 0, time.UTC)
+
+	cases := []struct {
+		name     string
+		desired  int
+		seedPods bool
+		want     []string
+		absent   []string
+	}{
+		{
+			name: "several replicas", desired: 2, seedPods: true,
+			want: []string{"of 2", "share of the instance's traffic, not the total"},
+		},
+		{
+			name: "one replica", desired: 1, seedPods: true,
+			want:   []string{"the only FatLine replica", "this is the whole picture"},
+			absent: []string{"not the total"},
+		},
+		{
+			name: "replica count unreadable", seedPods: false,
+			want: []string{"could not be read", "whether this is the whole picture"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := config.Dir(t.TempDir())
+			meteringInstance(t, dir, "p51")
+			body := profilesFor(t, at, func(*usage.Store) {}, nil)
+
+			f := usageReader(t, body)
+			if tc.seedPods {
+				f.deployments = map[string][]cluster.Workload{
+					tcdeploy.DefaultNamespace: {{Kind: "Deployment", Name: "fatline", Desired: tc.desired}},
+				}
+			}
+			d := shrikeServing(t, func(m *shrike.Monitor) {
+				m.Emit(event.Event{Kind: event.Allow, Tenant: "apps", App: "api", Host: "api.example"})
+			})
+			env, out := testEnv(dir, output.ModeHuman)
+			c := &usageCommand{}
+			c.newCluster = func(string) usageReaderIface { return f }
+			c.newDialer = func(context.Context, *Env, string) (streamDialer, func(), error) {
+				return d, func() {}, nil
+			}
+			if err := c.Run(context.Background(), env, []string{"p51"}); err != nil {
+				t.Fatal(err)
+			}
+			shown := out.String()
+			t.Log("\n" + shown)
+			for _, w := range tc.want {
+				if !strings.Contains(shown, w) {
+					t.Errorf("output is missing %q", w)
+				}
+			}
+			for _, a := range tc.absent {
+				if strings.Contains(shown, a) {
+					t.Errorf("output wrongly contains %q", a)
+				}
+			}
+		})
+	}
+}
+
+// The monitor names its own pod, so a reader can tell two reads apart.
+func TestTheMonitorNamesItsReplica(t *testing.T) {
+	m := shrike.New(shrike.Config{})
+	if m.Snapshot().Replica == "" {
+		t.Error("the picture does not say which pod kept it")
+	}
+}
+
+// A sidecar older than this build sends no replica name. The warning must
+// still fire: the replica count comes from the cluster, and it is what decides
+// whether the counts are a share.
+func TestTheShareWarningDoesNotDependOnTheSidecarsVersion(t *testing.T) {
+	r := usageResult{
+		Network:  []shrike.AppStat{{App: "api", Allows: 1}},
+		Replicas: 2,
+		// NetworkReplica deliberately empty — an older monitor.
+	}
+	var buf bytes.Buffer
+	if err := r.Human(&buf); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buf.String(), "not the total") {
+		t.Errorf("no share warning without a replica name:\n%s", buf.String())
 	}
 }

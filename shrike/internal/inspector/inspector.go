@@ -132,16 +132,147 @@ func (a SlogAlerter) Alert(al Alert) {
 
 var _ Alerter = SlogAlerter{}
 
+// LatencyBounds are the upper edges, in milliseconds, of the bands connection
+// times are counted in. There is one more bucket than there are bounds: the
+// last holds everything above the last bound.
+//
+// A ladder rather than a quantile sketch. What an operator asks of a
+// connection time is "is this fast, slow, or hanging", and five fixed bands
+// answer it in six integers — where a sketch would answer it more precisely in
+// a structure nothing here has a reason to carry.
+var LatencyBounds = []int64{5, 25, 100, 500, 2000}
+
+// LatencyBands are the human labels for each bucket, including the overflow.
+var LatencyBands = []string{"≤5ms", "≤25ms", "≤100ms", "≤500ms", "≤2s", ">2s"}
+
+// Latency is the distribution of upstream connection-establishment times.
+//
+// Establishment, not request. FatLine tunnels CONNECT opaquely and never
+// terminates TLS to the upstream, so what happens inside a connection is
+// ciphertext by construction — per-request latency would require breaking the
+// one property the boundary exists to keep.
+type Latency struct {
+	Count       int64   `json:"count"`
+	TotalMillis int64   `json:"total_ms"`
+	MaxMillis   int64   `json:"max_ms"`
+	Buckets     []int64 `json:"buckets,omitempty"`
+}
+
+// Observe records one connection time in milliseconds.
+func (l *Latency) Observe(ms int64) {
+	if ms < 0 {
+		ms = 0
+	}
+	if l.Buckets == nil {
+		l.Buckets = make([]int64, len(LatencyBounds)+1)
+	}
+	l.Count++
+	l.TotalMillis += ms
+	if ms > l.MaxMillis {
+		l.MaxMillis = ms
+	}
+	for i, bound := range LatencyBounds {
+		if ms <= bound {
+			l.Buckets[i]++
+			return
+		}
+	}
+	l.Buckets[len(LatencyBounds)]++
+}
+
+// Add folds another distribution into this one.
+func (l *Latency) Add(o Latency) {
+	if o.Count == 0 {
+		return
+	}
+	if l.Buckets == nil {
+		l.Buckets = make([]int64, len(LatencyBounds)+1)
+	}
+	l.Count += o.Count
+	l.TotalMillis += o.TotalMillis
+	if o.MaxMillis > l.MaxMillis {
+		l.MaxMillis = o.MaxMillis
+	}
+	for i := range o.Buckets {
+		if i < len(l.Buckets) {
+			l.Buckets[i] += o.Buckets[i]
+		}
+	}
+}
+
+// MeanMillis is the arithmetic mean, or zero when nothing was observed.
+func (l Latency) MeanMillis() float64 {
+	if l.Count == 0 {
+		return 0
+	}
+	return float64(l.TotalMillis) / float64(l.Count)
+}
+
+// Band returns the label of the band the q-th connection falls in — the
+// bucketed answer to "how slow is the slow end". An empty distribution is "—".
+func (l Latency) Band(q float64) string {
+	if l.Count == 0 {
+		return "—"
+	}
+	rank := int64(float64(l.Count)*q + 0.5)
+	if rank < 1 {
+		rank = 1
+	}
+	var seen int64
+	for i, n := range l.Buckets {
+		seen += n
+		if seen >= rank {
+			return LatencyBands[i]
+		}
+	}
+	return LatencyBands[len(LatencyBands)-1]
+}
+
 // HostStat is the accumulated traffic to one host FatLine allowed. Declared is
 // filled in by the Monitor from the policy (the engine leaves it false): a
 // reached host that is not declared is a policy-drift red flag.
 type HostStat struct {
-	Host      string    `json:"host"`
-	Port      string    `json:"port,omitempty"`
-	Declared  bool      `json:"declared"`
-	Allows    int64     `json:"allows"`
+	// App and Namespace are which application reached it. Rows are keyed by
+	// them as well as by host, because two applications talking to the same
+	// host are two facts: merging them reports bytes nobody can attribute,
+	// which is the gap ADR 0013 decision 7 closed for denials and left open
+	// here.
+	//
+	// Declared stays trustworthy under that split: a row exists only because
+	// FatLine allowed the connection, and FatLine allows against the calling
+	// application's own declarations. A false here therefore means Shrike's
+	// copy of the policy has drifted from FatLine's, which is what the flag is
+	// for.
+	App       string `json:"app,omitempty"`
+	Namespace string `json:"namespace,omitempty"`
+	Host      string `json:"host"`
+	Port      string `json:"port,omitempty"`
+	Declared  bool   `json:"declared"`
+	Allows    int64  `json:"allows"`
+	// Fails counts allowed connections that could not be established. It is
+	// not a violation and never alerts: the policy was satisfied and the
+	// network was not.
+	Fails     int64     `json:"fails,omitempty"`
 	BytesUp   int64     `json:"bytes_up"`
 	BytesDown int64     `json:"bytes_down"`
+	Latency   Latency   `json:"latency,omitzero"`
+	LastSeen  time.Time `json:"last_seen,omitzero"`
+}
+
+// AppStat is one application's whole network picture, rolled up across every
+// host it reached. It is what a resource report reads: an operator asking
+// "what is this application doing on the network" wants one row per
+// application, not one per destination.
+type AppStat struct {
+	App       string    `json:"app,omitempty"`
+	Namespace string    `json:"namespace,omitempty"`
+	Hosts     int       `json:"hosts"`
+	Allows    int64     `json:"allows"`
+	Denies    int64     `json:"denies"`
+	Fails     int64     `json:"fails"`
+	BytesUp   int64     `json:"bytes_up"`
+	BytesDown int64     `json:"bytes_down"`
+	Latency   Latency   `json:"latency,omitzero"`
 	LastSeen  time.Time `json:"last_seen,omitzero"`
 }
 
@@ -211,6 +342,8 @@ func (i *Inspector) Record(e event.Event) {
 		i.recordAllow(e, now)
 	case event.Close:
 		i.recordClose(e, now)
+	case event.Fail:
+		i.recordFail(e, now)
 	case event.Deny:
 		alert = i.recordDeny(e, now)
 	}
@@ -222,29 +355,50 @@ func (i *Inspector) Record(e event.Event) {
 	}
 }
 
-// statFor returns the host's stat record, creating it on first sight. Caller
-// holds the lock.
-func (i *Inspector) statFor(host, port string, now time.Time) *HostStat {
-	s := i.allowed[host]
+// statFor returns the stat record for one application's traffic to one host,
+// creating it on first sight. Caller holds the lock.
+//
+// Keyed by application as well as host, for the reason the violation table is:
+// two applications reaching the same host are two facts, and a single merged
+// row reports bytes nobody can attribute to anyone.
+func (i *Inspector) statFor(e event.Event, now time.Time) *HostStat {
+	key := e.Tenant + "\x00" + e.App + "\x00" + e.Host + "\x00" + e.Port
+	s := i.allowed[key]
 	if s == nil {
-		s = &HostStat{Host: host}
-		i.allowed[host] = s
+		s = &HostStat{App: e.App, Namespace: e.Tenant, Host: e.Host}
+		i.allowed[key] = s
 	}
-	if port != "" {
-		s.Port = port
+	if e.Port != "" {
+		s.Port = e.Port
 	}
 	s.LastSeen = now
 	return s
 }
 
 func (i *Inspector) recordAllow(e event.Event, now time.Time) {
-	i.statFor(e.Host, e.Port, now).Allows++
+	i.statFor(e, now).Allows++
 }
 
 func (i *Inspector) recordClose(e event.Event, now time.Time) {
-	s := i.statFor(e.Host, e.Port, now)
+	s := i.statFor(e, now)
 	s.BytesUp += e.BytesUp
 	s.BytesDown += e.BytesDown
+	if e.DialMillis > 0 {
+		s.Latency.Observe(e.DialMillis)
+	}
+}
+
+// recordFail folds an allowed connection that could not be established.
+//
+// It raises no alert, deliberately. An unreachable host is not a policy
+// violation, and routing it through the violation table would put a network
+// outage in front of an operator as something to fix in a manifest.
+func (i *Inspector) recordFail(e event.Event, now time.Time) {
+	s := i.statFor(e, now)
+	s.Fails++
+	if e.DialMillis > 0 {
+		s.Latency.Observe(e.DialMillis)
+	}
 }
 
 func (i *Inspector) recordDeny(e event.Event, now time.Time) *Alert {
@@ -335,16 +489,75 @@ func (i *Inspector) Events() int64 {
 	return i.events
 }
 
-// Allowed returns the per-host traffic stats for hosts FatLine allowed, sorted
-// by host. The returned slice is a copy.
+// Allowed returns the traffic stats for what FatLine allowed, one row per
+// application and host, sorted by application then host. The returned slice is
+// a copy, and so is each row's latency buckets — a caller must not be handed a
+// slice the engine keeps writing to.
 func (i *Inspector) Allowed() []HostStat {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	out := make([]HostStat, 0, len(i.allowed))
 	for _, s := range i.allowed {
-		out = append(out, *s)
+		row := *s
+		row.Latency.Buckets = append([]int64(nil), s.Latency.Buckets...)
+		out = append(out, row)
 	}
-	slices.SortFunc(out, func(a, b HostStat) int { return strings.Compare(a.Host, b.Host) })
+	slices.SortFunc(out, func(a, b HostStat) int {
+		if c := strings.Compare(a.App, b.App); c != 0 {
+			return c
+		}
+		if c := strings.Compare(a.Host, b.Host); c != 0 {
+			return c
+		}
+		return strings.Compare(a.Port, b.Port)
+	})
+	return out
+}
+
+// Apps rolls the picture up to one row per application: what it reached, how
+// much it moved, how often it could not get there, and how long connecting
+// took. Denials are counted here too, from the violation table, so an
+// application's network row is complete without a reader joining two tables.
+func (i *Inspector) Apps() []AppStat {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	byApp := map[string]*AppStat{}
+	get := func(namespace, app string, now time.Time) *AppStat {
+		key := namespace + "\x00" + app
+		a := byApp[key]
+		if a == nil {
+			a = &AppStat{App: app, Namespace: namespace}
+			byApp[key] = a
+		}
+		if now.After(a.LastSeen) {
+			a.LastSeen = now
+		}
+		return a
+	}
+	for _, s := range i.allowed {
+		a := get(s.Namespace, s.App, s.LastSeen)
+		a.Hosts++
+		a.Allows += s.Allows
+		a.Fails += s.Fails
+		a.BytesUp += s.BytesUp
+		a.BytesDown += s.BytesDown
+		a.Latency.Add(s.Latency)
+	}
+	for _, v := range i.violations {
+		get(v.Namespace, v.App, v.LastSeen).Denies += v.Count
+	}
+
+	out := make([]AppStat, 0, len(byApp))
+	for _, a := range byApp {
+		out = append(out, *a)
+	}
+	slices.SortFunc(out, func(a, b AppStat) int {
+		if c := strings.Compare(a.App, b.App); c != 0 {
+			return c
+		}
+		return strings.Compare(a.Namespace, b.Namespace)
+	})
 	return out
 }
 

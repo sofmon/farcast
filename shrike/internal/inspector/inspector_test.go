@@ -261,3 +261,135 @@ func TestSlogAlerterNamesTheApplication(t *testing.T) {
 		}
 	}
 }
+
+// The mirror of TestTwoApplicationsDeniedTheSameHostAreTwoViolations, for the
+// half that was still merged: allowed traffic was keyed by host alone, so two
+// applications talking to the same host reported one row of bytes nobody could
+// attribute to either of them.
+func TestTwoApplicationsReachingTheSameHostAreTwoRows(t *testing.T) {
+	i := New(nopAlerter{}, time.Minute)
+	i.Record(event.Event{Kind: event.Allow, Tenant: "apps", App: "api", Host: "example.test", Port: "443"})
+	i.Record(event.Event{Kind: event.Close, Tenant: "apps", App: "api", Host: "example.test", Port: "443", BytesUp: 100, BytesDown: 200})
+	i.Record(event.Event{Kind: event.Allow, Tenant: "apps", App: "web", Host: "example.test", Port: "443"})
+	i.Record(event.Event{Kind: event.Close, Tenant: "apps", App: "web", Host: "example.test", Port: "443", BytesUp: 7, BytesDown: 9})
+
+	rows := i.Allowed()
+	if len(rows) != 2 {
+		t.Fatalf("got %d rows, want one per application: %+v", len(rows), rows)
+	}
+	if rows[0].App != "api" || rows[0].BytesUp != 100 {
+		t.Errorf("first row is %+v, want api's own 100 bytes up", rows[0])
+	}
+	if rows[1].App != "web" || rows[1].BytesUp != 7 {
+		t.Errorf("second row is %+v, want web's own 7 bytes up", rows[1])
+	}
+}
+
+// An unreachable host is not a policy violation. Routing it through the
+// violation table would put a network outage in front of an operator as
+// something to fix in a manifest.
+func TestAFailedDialIsCountedAndNeverAlerts(t *testing.T) {
+	c := &capAlerter{}
+	i := New(c, time.Minute)
+	i.Record(event.Event{Kind: event.Allow, Tenant: "apps", App: "api", Host: "down.test", Port: "443"})
+	i.Record(event.Event{
+		Kind: event.Fail, Tenant: "apps", App: "api", Host: "down.test", Port: "443",
+		Reason: event.ReasonDialFailed, DialMillis: 30000,
+	})
+
+	if c.count() != 0 {
+		t.Errorf("an unreachable host raised %d alerts", c.count())
+	}
+	if len(i.Violations()) != 0 {
+		t.Errorf("an unreachable host became a violation: %+v", i.Violations())
+	}
+	rows := i.Allowed()
+	if len(rows) != 1 || rows[0].Fails != 1 {
+		t.Fatalf("rows are %+v, want one with a single failure", rows)
+	}
+	// The time spent waiting is recorded too: it is what separates a refused
+	// connection from one that hung until the dialer gave up.
+	if got := rows[0].Latency.MaxMillis; got != 30000 {
+		t.Errorf("the wait before failing was recorded as %dms, want 30000", got)
+	}
+}
+
+func TestLatencyLadder(t *testing.T) {
+	var l Latency
+	for _, ms := range []int64{1, 3, 20, 20, 90, 400, 1500, 9000} {
+		l.Observe(ms)
+	}
+	if l.Count != 8 || l.MaxMillis != 9000 {
+		t.Fatalf("count %d, max %d", l.Count, l.MaxMillis)
+	}
+	if got := l.MeanMillis(); got != 11034.0/8 {
+		t.Errorf("mean is %v, want %v", got, 11034.0/8)
+	}
+	// Half the connections are at or under 25ms.
+	if got := l.Band(0.5); got != "≤25ms" {
+		t.Errorf("median band is %q, want ≤25ms", got)
+	}
+	if got := l.Band(1); got != ">2s" {
+		t.Errorf("top band is %q, want >2s", got)
+	}
+	var empty Latency
+	if got := empty.Band(0.9); got != "—" {
+		t.Errorf("an empty distribution reported the band %q", got)
+	}
+}
+
+// A reader gets a copy. Handing out the engine's own bucket slice would let a
+// snapshot change under a caller while it was being encoded.
+func TestAllowedCopiesTheLatencyBuckets(t *testing.T) {
+	i := New(nopAlerter{}, time.Minute)
+	i.Record(event.Event{Kind: event.Close, Tenant: "apps", App: "api", Host: "a.test", DialMillis: 7})
+	rows := i.Allowed()
+	rows[0].Latency.Buckets[0] = 9999
+	if again := i.Allowed(); again[0].Latency.Buckets[0] == 9999 {
+		t.Error("a caller writing to its copy changed the engine's own counters")
+	}
+}
+
+// An application's network row must be complete on its own: an operator
+// reading it should not have to join it against the violation table to learn
+// that half its connections were refused.
+func TestAppsRollUpTrafficAndDenialsTogether(t *testing.T) {
+	i := New(nopAlerter{}, time.Minute)
+	i.Record(event.Event{Kind: event.Allow, Tenant: "apps", App: "api", Host: "a.test"})
+	i.Record(event.Event{Kind: event.Close, Tenant: "apps", App: "api", Host: "a.test", BytesUp: 10, BytesDown: 20, DialMillis: 15})
+	i.Record(event.Event{Kind: event.Allow, Tenant: "apps", App: "api", Host: "b.test"})
+	i.Record(event.Event{Kind: event.Close, Tenant: "apps", App: "api", Host: "b.test", BytesUp: 5, BytesDown: 5, DialMillis: 300})
+	i.Record(event.Event{Kind: event.Fail, Tenant: "apps", App: "api", Host: "b.test", Reason: event.ReasonDialFailed, DialMillis: 50})
+	i.Record(event.Event{Kind: event.Deny, Tenant: "apps", App: "api", Host: "nope.test", Reason: event.ReasonNotInAllowlist})
+	i.Record(event.Event{Kind: event.Deny, Tenant: "apps", App: "api", Host: "nope.test", Reason: event.ReasonNotInAllowlist})
+	i.Record(event.Event{Kind: event.Allow, Tenant: "apps", App: "web", Host: "a.test"})
+
+	apps := i.Apps()
+	if len(apps) != 2 {
+		t.Fatalf("got %d applications: %+v", len(apps), apps)
+	}
+	api := apps[0]
+	if api.App != "api" {
+		t.Fatalf("first row is %q", api.App)
+	}
+	if api.Hosts != 2 || api.Allows != 2 || api.Fails != 1 || api.Denies != 2 {
+		t.Errorf("api rolled up as %+v, want 2 hosts / 2 allows / 1 fail / 2 denies", api)
+	}
+	if api.BytesUp != 15 || api.BytesDown != 25 {
+		t.Errorf("api moved %d up / %d down, want 15 / 25", api.BytesUp, api.BytesDown)
+	}
+	if api.Latency.Count != 3 || api.Latency.MaxMillis != 300 {
+		t.Errorf("api latency is %+v, want 3 observations peaking at 300ms", api.Latency)
+	}
+}
+
+// An unidentified caller has no application to roll up to, and must still
+// appear: it is the row an operator most needs to see.
+func TestAnUnidentifiedCallerStillGetsARow(t *testing.T) {
+	i := New(nopAlerter{}, time.Minute)
+	i.Record(event.Event{Kind: event.Deny, Host: "x.test", Reason: event.ReasonUnknownApp})
+	apps := i.Apps()
+	if len(apps) != 1 || apps[0].Denies != 1 || apps[0].App != "" {
+		t.Fatalf("apps are %+v, want one unnamed row with a denial", apps)
+	}
+}

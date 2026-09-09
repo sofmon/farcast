@@ -114,6 +114,8 @@ Four things about it are decisions rather than details.
 
 Storing these numbers discloses nothing new, by [ADR 0009](../docs/adr/0009-technocore-kernel-and-cost-metering.md) decision 2's own test: they come from the provider's kubelet by way of the provider's metrics-server, so the cloud measured every one of them first.
 
+**Network I/O is not here, and that is a decision.** It is measured at the boundary, by [FatLine and Shrike](../shrike/README.md), and `farcast usage` joins the two halves in its report rather than routing one through the kernel ([ADR 0015](../docs/adr/0015-what-the-boundary-can-measure.md) decision 5). Autopilot bills CPU and memory, so network counters are not an input to the resize these profiles exist to feed — and carrying them here would mean either giving FatLine a cluster credential or giving the kernel a scrape path to a pod, both bought for a number nothing enforces on.
+
 ### One replica, replaced rather than overlapped
 
 The kernel is a meter with a single ledger, so its Deployment is `replicas: 1` with `strategy: Recreate`. A rolling update would run two kernels for a few seconds; both would meter the same instance into their own in-memory ledgers and race to write the same checkpoint, and the period's spending would become whichever wrote last.

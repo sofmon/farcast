@@ -14,6 +14,7 @@
 package shrike
 
 import (
+	"os"
 	"sync"
 	"time"
 
@@ -32,8 +33,12 @@ type (
 	Alert = inspector.Alert
 	// Alerter receives raised alerts. Nil defaults to slog.
 	Alerter = inspector.Alerter
-	// HostStat is accumulated traffic to one allowed host.
+	// HostStat is accumulated traffic from one application to one allowed host.
 	HostStat = inspector.HostStat
+	// AppStat is one application's whole network picture, rolled up.
+	AppStat = inspector.AppStat
+	// Latency is the distribution of upstream connection-establishment times.
+	Latency = inspector.Latency
 	// Violation is a denied egress class with its running count and severity.
 	Violation = inspector.Violation
 	// SlogAlerter is the default Alerter: it logs alerts via slog.
@@ -75,14 +80,23 @@ type Monitor struct {
 	policy    policy.Policy
 	inspector *inspector.Inspector
 	since     time.Time
+	replica   string
 }
 
 // New constructs a Monitor from the declared policy.
 func New(cfg Config) *Monitor {
+	// The pod this monitor is in. Each FatLine replica carries its own Shrike
+	// and its own picture, so a reader handed one without knowing WHICH has
+	// no way to tell a complete instance-wide picture from one replica's
+	// share of it — and no way to tell that two reads landed on two pods.
+	// Found live on the 5.1b walk, where consecutive reports alternated
+	// between two replicas' counts.
+	host, _ := os.Hostname()
 	return &Monitor{
 		policy:    policy.New(cfg.Declared),
 		inspector: inspector.New(cfg.Alerter, cfg.AlertWindow),
 		since:     time.Now(),
+		replica:   host,
 	}
 }
 
@@ -114,11 +128,22 @@ var _ event.Sink = (*Monitor)(nil)
 
 // Snapshot is the live security picture, served as JSON at StatusPath.
 type Snapshot struct {
+	// Replica is the pod this picture was kept in. It is not decoration: the
+	// counts below are THIS replica's, and an instance running more than one
+	// FatLine splits its traffic across them.
+	Replica    string      `json:"replica,omitempty"`
 	Since      time.Time   `json:"since"`
 	Events     int64       `json:"events"`
 	Declared   []string    `json:"declared"`   // the contract: declared hosts
-	Allowed    []HostStat  `json:"allowed"`    // hosts FatLine actually allowed
+	Allowed    []HostStat  `json:"allowed"`    // per app and host, what FatLine allowed
 	Violations []Violation `json:"violations"` // denied classes, most severe first
+
+	// Apps is the same traffic rolled up to one row per application: what it
+	// moved, how often it could not get where it was going, and how long
+	// connecting took. It is the network half of `farcast usage` (5.1b), and
+	// it is computed here rather than by the reader so that the picture and
+	// the report can never disagree about what an application did.
+	Apps []AppStat `json:"apps,omitempty"`
 }
 
 // Snapshot returns the current security picture. Each allowed host is annotated
@@ -134,10 +159,12 @@ func (m *Monitor) Snapshot() Snapshot {
 		_, allowed[i].Declared = pol.Declared(allowed[i].Host)
 	}
 	return Snapshot{
+		Replica:    m.replica,
 		Since:      m.since,
 		Events:     m.inspector.Events(),
 		Declared:   pol.Hosts(),
 		Allowed:    allowed,
 		Violations: m.inspector.Violations(),
+		Apps:       m.inspector.Apps(),
 	}
 }

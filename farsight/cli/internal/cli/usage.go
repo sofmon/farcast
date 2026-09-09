@@ -10,13 +10,30 @@ import (
 	"time"
 
 	"github.com/sofmon/farcast/farsight/cli/internal/cluster"
+	fldeploy "github.com/sofmon/farcast/fatline/deploy"
+	"github.com/sofmon/farcast/shrike"
 	"github.com/sofmon/farcast/technocore/deploy"
 	"github.com/sofmon/farcast/technocore/kernel"
 	"github.com/sofmon/farcast/technocore/usage"
 )
 
+// usageReader is what the compute half needs from the cluster, plus the one
+// thing the network half needs: how many FatLine replicas there are. A
+// picture read from one of several is a share, not a total, and the report
+// cannot say so without knowing the count.
+type usageReaderIface interface {
+	configMapReader
+	Workloads(ctx context.Context, namespace string) ([]cluster.Workload, error)
+}
+
 type usageCommand struct {
-	newCluster func(kubeconfigPath string) configMapReader
+	newCluster func(kubeconfigPath string) usageReaderIface
+	// newDialer opens the tunnel the network half is read through. It is a
+	// seam so the report can be tested without a cluster, and it is separate
+	// from newCluster because the two halves come from two places and either
+	// can be unavailable on its own.
+	newDialer func(ctx context.Context, env *Env, instance string) (streamDialer, func(), error)
+	noNetwork bool
 }
 
 func (*usageCommand) Name() string { return "usage" }
@@ -32,10 +49,16 @@ What one POD of each application actually consumed, against what it reserves.
 Per pod, not per application: summing replicas and reserving the total would
 be wrong by the replica count.
 
-The numbers come from the kernel's own profiles (ADR 0014), collected on its
-reconcile tick from the same reading 'kubectl top' shows. They are advisory —
-nothing in the cost path reads them, and a cluster that serves no metrics is
-reported as unmeasured rather than as zero.
+Compute comes from the kernel's own profiles (ADR 0014), collected on its
+reconcile tick from the same reading 'kubectl top' shows. Network comes from
+Shrike, through the FatLine tunnel, because the boundary is the only place
+that sees an application's traffic at all. Both are advisory — nothing in the
+cost path reads them, and what could not be measured is reported as unmeasured
+rather than as zero.
+
+The network latency is CONNECTION latency, not request latency: FatLine
+tunnels CONNECT opaquely and never terminates TLS, so what happens inside a
+connection is ciphertext by construction.
 
 Quantiles are bucketed and rounded UP, so a figure here is at or above what
 was observed, never below it. Nothing adjusts anything yet; that is 5.2.
@@ -43,11 +66,22 @@ was observed, never below it. Nothing adjusts anything yet; that is 5.2.
 For storage consumption, see 'farcast storage usage'.`)
 }
 
-func (c *usageCommand) SetFlags(*flag.FlagSet) {}
+func (c *usageCommand) SetFlags(fs *flag.FlagSet) {
+	fs.BoolVar(&c.noNetwork, "no-network", false, "skip the network half; do not open the tunnel")
+}
 
 func (c *usageCommand) ensureDefaults() {
 	if c.newCluster == nil {
-		c.newCluster = func(kc string) configMapReader { return cluster.New(kc) }
+		c.newCluster = func(kc string) usageReaderIface { return cluster.New(kc) }
+	}
+	if c.newDialer == nil {
+		c.newDialer = func(ctx context.Context, env *Env, instance string) (streamDialer, func(), error) {
+			conn, _, err := instanceTunnel(ctx, env, instance)
+			if err != nil {
+				return nil, nil, err
+			}
+			return conn, func() { _ = conn.Close() }, nil
+		}
 	}
 }
 
@@ -101,7 +135,56 @@ func (c *usageCommand) Run(ctx context.Context, env *Env, args []string) error {
 		Dropped:     doc.Dropped,
 		Apps:        store.Summarize(doc.At),
 	}
+	c.addNetwork(ctx, env, name, &res)
+	res.Replicas = fatlineReplicas(ctx, cl)
 	return env.Printer.Print(res)
+}
+
+// addNetwork fills in the network half, or records why it could not.
+//
+// It never fails the command. The two halves are read from two places — the
+// kernel's ConfigMap through the API server, and Shrike's picture through the
+// tunnel — and an operator whose tunnel is down should still be told what
+// their applications are using, with the missing half named rather than shown
+// as zeros.
+func (c *usageCommand) addNetwork(ctx context.Context, env *Env, name string, res *usageResult) {
+	if c.noNetwork {
+		res.NetworkSkipped = true
+		return
+	}
+	dialer, done, err := c.newDialer(ctx, env, name)
+	if err != nil {
+		res.NetworkError = err.Error()
+		return
+	}
+	defer done()
+	snap, err := fetchNetwork(ctx, dialer)
+	if err != nil {
+		res.NetworkError = err.Error()
+		return
+	}
+	res.Network = snap.Apps
+	res.NetworkSince = snap.Since
+	res.NetworkEvents = snap.Events
+	res.NetworkReplica = snap.Replica
+}
+
+// fatlineReplicas is how many FatLine pods are keeping their own picture.
+//
+// Zero means it could not be determined, which the report says rather than
+// guessing one — claiming a single replica when there are two would turn a
+// partial count into an apparent total.
+func fatlineReplicas(ctx context.Context, cl usageReaderIface) int {
+	loads, err := cl.Workloads(ctx, deploy.DefaultNamespace)
+	if err != nil {
+		return 0
+	}
+	for _, w := range loads {
+		if w.Name == fldeploy.DefaultName {
+			return w.Desired
+		}
+	}
+	return 0
 }
 
 type usageResult struct {
@@ -118,6 +201,25 @@ type usageResult struct {
 	Dropped     []string `json:"dropped,omitempty"`
 
 	Apps []usage.Summary `json:"apps,omitempty"`
+
+	// Network is the per-application traffic picture from Shrike, and
+	// NetworkError is why there is none. A report with neither is an instance
+	// whose applications have made no outbound connection at all — which is a
+	// real answer, and a different one from "the monitor could not be read".
+	Network       []shrike.AppStat `json:"network,omitempty"`
+	NetworkSince  time.Time        `json:"network_since,omitzero"`
+	NetworkEvents int64            `json:"network_events,omitempty"`
+	NetworkError  string           `json:"network_error,omitempty"`
+	// NetworkReplica is the FatLine pod the picture came from, and Replicas
+	// how many there are. Each replica keeps its own picture, so with more
+	// than one these counts are that replica's share of the instance's
+	// traffic — reporting them as a total would be wrong, and would change
+	// between two consecutive reads.
+	NetworkReplica string `json:"network_replica,omitempty"`
+	Replicas       int    `json:"fatline_replicas,omitempty"`
+	// NetworkSkipped records that --no-network was given, so an empty section
+	// is never mistaken for an instance that is not talking to anything.
+	NetworkSkipped bool `json:"network_skipped,omitempty"`
 }
 
 func (r usageResult) Human(w io.Writer) error {
@@ -156,6 +258,8 @@ func (r usageResult) Human(w io.Writer) error {
 		fprintln(w, "metrics.k8s.io, reports exactly this. Redeploying the kernel grants it.")
 	}
 
+	r.writeNetwork(w)
+
 	if r.TrimmedTo > 0 || len(r.Dropped) > 0 {
 		fprintln(w)
 		if r.TrimmedTo > 0 {
@@ -170,6 +274,94 @@ func (r usageResult) Human(w io.Writer) error {
 	fprintln(w, "Nothing adjusts anything on the strength of this yet — TechnoCore reports it")
 	fprintln(w, "and the reservations stay as declared. Acting on it is Phase 5.2.")
 	return nil
+}
+
+// writeNetwork renders the traffic half, or says why there is none.
+func (r usageResult) writeNetwork(w io.Writer) {
+	fprintln(w)
+	switch {
+	case r.NetworkSkipped:
+		fprintln(w, "Network not read — --no-network was given.")
+		return
+	case r.NetworkError != "":
+		fprintln(w, "Network not measured — this was not read, which is not the same as zero:")
+		fprintf(w, "  %s\n", r.NetworkError)
+		fprintln(w, "The monitor is read through the FatLine tunnel; 'farcast connect <instance> --status'")
+		fprintln(w, "says whether that is up. An instance running FatLine alone has no monitor to read.")
+		return
+	}
+
+	fprintf(w, "Network — what crossed the boundary, per application")
+	if !r.NetworkSince.IsZero() {
+		fprintf(w, ", since %s", r.NetworkSince.Format("2006-01-02 15:04"))
+	}
+	fprintln(w)
+	r.writeReplicaCaveat(w)
+	if len(r.Network) == 0 {
+		fprintln(w, "  No application has made an outbound connection.")
+		return
+	}
+	fprintf(w, "  %-20s %5s %6s %6s %6s %10s %10s  %s\n",
+		"application", "hosts", "conns", "failed", "denied", "out", "in", "connect")
+	for _, a := range r.Network {
+		name := a.App
+		if name == "" {
+			// FatLine could not identify the caller. It is the row an
+			// operator most needs to see, so it is named as what it is
+			// rather than left blank.
+			name = "(unidentified)"
+		}
+		fprintf(w, "  %-20s %5d %6d %6d %6d %10s %10s  %s\n",
+			name, a.Hosts, a.Allows, a.Fails, a.Denies,
+			humanBytes(a.BytesUp), humanBytes(a.BytesDown), connectTime(a.Latency))
+	}
+	fprintln(w)
+	fprintln(w, "  'connect' is how long establishing the connection took, at the 90th")
+	fprintln(w, "  percentile. Not request latency: FatLine never opens the tunnel it carries.")
+}
+
+// writeReplicaCaveat says whose picture this is.
+//
+// A FatLine with two replicas keeps two pictures, and a read lands on
+// whichever pod terminated the tunnel — so consecutive reports alternate
+// between two different partial counts. Saying so is the difference between a
+// number an operator can use and one that quietly contradicts itself.
+func (r usageResult) writeReplicaCaveat(w io.Writer) {
+	// The warning turns on the REPLICA COUNT, not on the monitor naming
+	// itself. A sidecar older than this build sends no name, and that must
+	// not be the thing that decides whether an operator is told their counts
+	// are a share — the count comes from the cluster and is enough on its own.
+	who := ""
+	if r.NetworkReplica != "" {
+		who = " " + r.NetworkReplica
+	}
+	switch {
+	case r.Replicas > 1:
+		fprintf(w, "  Seen by one FatLine replica%s, of %d. Each keeps its own picture, so these\n", who, r.Replicas)
+		fprintf(w, "  are that replica's share of the instance's traffic, not the total.\n")
+	case r.Replicas == 1:
+		fprintf(w, "  Seen by the only FatLine replica%s — this is the whole picture.\n", who)
+	default:
+		fprintf(w, "  Seen by one FatLine replica%s. How many replicas there are could not be read,\n", who)
+		fprintf(w, "  so whether this is the whole picture or one replica's share is unknown.\n")
+	}
+}
+
+// connectTime renders the connection-time band and peak.
+func connectTime(l shrike.Latency) string {
+	if l.Count == 0 {
+		return "—"
+	}
+	return fmt.Sprintf("%s (max %s)", l.Band(0.90), humanMillis(l.MaxMillis))
+}
+
+// humanMillis renders a duration the way an operator reads one: milliseconds
+// until they stop being legible as milliseconds.
+func humanMillis(ms int64) string {
+	if ms < 1000 {
+		return fmt.Sprintf("%dms", ms)
+	}
+	return fmt.Sprintf("%.1fs", float64(ms)/1000)
 }
 
 // spare renders a headroom ratio, or says why there is not one.

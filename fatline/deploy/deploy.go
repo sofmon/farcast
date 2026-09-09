@@ -99,11 +99,22 @@ const (
 	shrikeSocketPath = shrikeSocketDir + "/shrike.sock"
 
 	// ShrikeStatusPort serves the live security picture as JSON. It binds
-	// loopback INSIDE the Pod and is deliberately not a Service and not a
-	// tunnel route: the picture is for the operator (and the GUI at phase 7),
-	// and until something reaches for it, publishing it would be new attack
-	// surface for no reader. 'kubectl exec' can curl it in the meantime.
+	// LOOPBACK, inside the Pod, and it still does: there is no Service and no
+	// listener the cluster can reach. What changed at 5.1b is that something
+	// reaches for it — `farcast usage` reads the per-application network
+	// picture — and the reader is the operator, over the mTLS tunnel.
+	//
+	// That needed no new exposure at all, because FatLine's stream relay runs
+	// in this same Pod and therefore shares its loopback: the route below
+	// dials 127.0.0.1 from inside. An operator leaf reaches the picture; the
+	// cluster still cannot.
 	ShrikeStatusPort = 9090
+
+	// ShrikeStreamRoute is the name an operator asks for to reach the status
+	// endpoint through the tunnel. Routes are a closed list fixed at deploy
+	// time and a caller names a route rather than an address, so this adds one
+	// named destination and not a port-forward.
+	ShrikeStreamRoute = "shrike"
 
 	// ShrikeRequestCPUMilli and ShrikeRequestMemMiB are the sidecar's declared
 	// requests, exported for the same reason FatLine's are: the cost estimate
@@ -439,7 +450,9 @@ spec:
             # there is no manifest to read: it was read inside the instance at
             # 'farcast run', and the policy is what survives.
             - --policy={{.PolicyMountPath}}/{{.PolicyKey}}
-            # Loopback only, and inside the Pod: no Service, no tunnel route.
+            # Loopback only, and inside the Pod: no Service, and nothing the
+            # cluster can dial. The operator reaches it through the tunnel,
+            # because FatLine's relay shares this Pod's loopback.
             - --status-listen=127.0.0.1:{{.ShrikeStatusPort}}
           resources:
             requests:

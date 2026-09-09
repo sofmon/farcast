@@ -74,7 +74,7 @@ farcast [global flags] <command> [command flags] [arguments]
 | `ps` | ✅ works | List running applications | 4.3 |
 | `logs` | ✅ works | Stream an application's logs | 4.3 |
 | `costs` | ✅ works | Show spending and distance to the cost limit | 4.3 |
-| `usage` | ✅ works | Show what applications use against what they reserve | 5.1 |
+| `usage` | ✅ works | Compute and network use against what is reserved and declared | 5.1 |
 | `storage` | ✅ works | The instance's encrypted disk: `ls`, `cp`, `rm`, `usage`, `key …` | 3.3 |
 | `build` | ✅ works | Build an application's image inside the instance | 4.2 |
 | `kernel` | ✅ works | Deploy TechnoCore, meter namespaces, and push the provider's confirmed costs: `deploy`, `meter`, `confirm` | 4.1 |

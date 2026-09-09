@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/sofmon/farcast/fatline/event"
 	"github.com/sofmon/farcast/fatline/internal/allowlist"
@@ -396,5 +397,95 @@ func TestCredentialFrom(t *testing.T) {
 	r.Header.Set("Proxy-Authorization", "basic "+base64.StdEncoding.EncodeToString([]byte("u:p")))
 	if got := credentialFrom(r); got != "p" {
 		t.Errorf("a lower-case scheme was rejected: %q", got)
+	}
+}
+
+// FatLine said yes and the upstream did not answer. Before this event the
+// dial failure was a bare return: an Allow with nothing after it, so
+// "reached its declared host" and "never got there" were indistinguishable
+// in the log and in the monitor.
+func TestAnAllowedConnectionThatCannotBeReachedIsReported(t *testing.T) {
+	cp := &capture{}
+	p := New(Options{
+		Identify:   anyCaller,
+		Allowlist:  allowlist.New([]parser.External{{Host: "upstream.test"}}),
+		Events:     cp,
+		EnforceSNI: false,
+		DialContext: func(context.Context, string, string) (net.Conn, error) {
+			return nil, fmt.Errorf("connection refused")
+		},
+	})
+	client := proxyClient(t, p, &tls.Config{InsecureSkipVerify: true}) //nolint:gosec // the upstream is never reached
+	_, _ = client.Get("https://upstream.test:443/")
+
+	if cp.kinds(event.Fail) != 1 {
+		t.Fatalf("expected one fail event, got %+v", cp.all())
+	}
+	// Never a denial. The policy was satisfied; the network was not, and
+	// reporting it as a violation would send an operator to edit a manifest
+	// that is already correct.
+	if n := cp.kinds(event.Deny); n != 0 {
+		t.Errorf("an unreachable host produced %d deny events", n)
+	}
+	var fail event.Event
+	for _, e := range cp.all() {
+		if e.Kind == event.Fail {
+			fail = e
+		}
+	}
+	if fail.Reason != event.ReasonDialFailed {
+		t.Errorf("reason is %q, want %q", fail.Reason, event.ReasonDialFailed)
+	}
+	if fail.Host != "upstream.test" || fail.App == "" {
+		t.Errorf("the failure names host %q and app %q; both are how an operator finds it", fail.Host, fail.App)
+	}
+}
+
+// The only latency the boundary can honestly report: how long it took to
+// establish the connection, and how long it stayed open. Everything inside is
+// ciphertext FatLine never opens.
+func TestACloseCarriesTheConnectionTimings(t *testing.T) {
+	upAddr, clientTLS := tlsUpstream(t, "upstream.test")
+	cp := &capture{}
+	p := New(Options{
+		Identify:   anyCaller,
+		Allowlist:  allowlist.New([]parser.External{{Host: "upstream.test"}}),
+		Events:     cp,
+		EnforceSNI: true,
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			time.Sleep(2 * time.Millisecond)
+			return (&net.Dialer{}).DialContext(ctx, "tcp", upAddr)
+		},
+	})
+	client := proxyClient(t, p, clientTLS)
+	resp, err := client.Get("https://upstream.test:443/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	client.CloseIdleConnections()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && cp.kinds(event.Close) == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	var closed event.Event
+	for _, e := range cp.all() {
+		if e.Kind == event.Close {
+			closed = e
+		}
+	}
+	if closed.Kind != event.Close {
+		t.Fatalf("no close event: %+v", cp.all())
+	}
+	if closed.DialMillis < 2 {
+		t.Errorf("dial took %dms, want at least the 2ms the dialer slept", closed.DialMillis)
+	}
+	if closed.DurationMillis < 0 {
+		t.Errorf("duration is %dms", closed.DurationMillis)
+	}
+	if closed.BytesUp == 0 || closed.BytesDown == 0 {
+		t.Errorf("byte counts are %d up / %d down", closed.BytesUp, closed.BytesDown)
 	}
 }
