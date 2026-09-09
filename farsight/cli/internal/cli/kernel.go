@@ -54,6 +54,11 @@ type kernelDeployCommand struct {
 	deployer   fatlineDeployer
 	image      string
 	namespaces string
+	// adapt lets the kernel change what applications reserve. Off by
+	// default, and rendered as an argument on the workload, so the answer to
+	// "is this kernel allowed to resize my applications" is visible in the
+	// cluster rather than only in whoever ran this command.
+	adapt bool
 }
 
 func (*kernelDeployCommand) Name() string { return "deploy" }
@@ -83,6 +88,7 @@ func (c *kernelDeployCommand) SetFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.image, "technocore-image", "", "kernel container image (default: the instance registry's system/technocore)")
 	fs.StringVar(&c.namespaces, "namespaces", "", "comma-separated namespaces to meter (default: farcast-system)")
 	fs.StringVar(&c.deployer.sourceDir, "source", "", "farcast checkout to build the image from (default: auto-detected)")
+	fs.BoolVar(&c.adapt, "adapt", false, "let the kernel resize applications to what they actually use (off by default)")
 	c.deployer.setYesFlag(fs, "skip the cost confirmation")
 }
 
@@ -209,6 +215,7 @@ func (c *kernelDeployCommand) Run(ctx context.Context, env *Env, args []string) 
 		CostLimit:    meta.CostLimit.Amount,
 		CostCurrency: meta.CostLimit.Currency,
 		CostPeriod:   meta.CostLimit.Period,
+		Adapt:        c.adapt,
 	})
 	if err != nil {
 		return err

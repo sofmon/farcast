@@ -74,10 +74,10 @@ farcast [global flags] <command> [command flags] [arguments]
 | `ps` | ✅ works | List running applications | 4.3 |
 | `logs` | ✅ works | Stream an application's logs | 4.3 |
 | `costs` | ✅ works | Show spending and distance to the cost limit | 4.3 |
-| `usage` | ✅ works | Compute and network use against what is reserved and declared | 5.1 |
+| `usage` | ✅ works | Compute and network use, against what is reserved and declared, with the kernel's right-sizing advice | 5.1 |
 | `storage` | ✅ works | The instance's encrypted disk: `ls`, `cp`, `rm`, `usage`, `key …` | 3.3 |
 | `build` | ✅ works | Build an application's image inside the instance | 4.2 |
-| `kernel` | ✅ works | Deploy TechnoCore, meter namespaces, and push the provider's confirmed costs: `deploy`, `meter`, `confirm` | 4.1 |
+| `kernel` | ✅ works | Deploy TechnoCore, meter namespaces, and push the provider's confirmed costs: `deploy`, `meter`, `confirm`. `deploy --adapt` lets it right-size applications | 4.1 |
 | `chat` | ⏳ stub | Terminal AI chat through AllThing | 6.2 |
 
 *Legend: ✅ works · 📋 specified, not yet implemented · ⏳ stub.* Stubbed commands route correctly and print a clear "not yet implemented (phase N)" message to stderr, exiting non-zero. This mirrors the SDK's `ErrNotImplemented` pattern: the whole surface is visible and navigable before the features land. `install` is the canonical verb for creating an instance — the CLI, the root README, and the [instance lifecycle](../../README.md#instance-lifecycle) (`install → bind → run → release`) all use it.

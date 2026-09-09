@@ -67,6 +67,12 @@ type Config struct {
 	CostLimit    float64 // required, must be positive
 	CostCurrency string  // default "USD"
 	CostPeriod   string  // default "monthly"
+
+	// Adapt lets the kernel act on its resize advice rather than only
+	// publishing it. Off by default and rendered as an argument, so
+	// `kubectl describe pod` says plainly whether the kernel in this cluster
+	// is allowed to change an application's reservation.
+	Adapt bool
 }
 
 func (c *Config) withDefaults() {
@@ -125,6 +131,7 @@ func Render(c Config) ([]byte, error) {
 		CostLimit:       c.CostLimit,
 		CostCurrency:    c.CostCurrency,
 		CostPeriod:      c.CostPeriod,
+		Adapt:           c.Adapt,
 		Replicas:        Replicas,
 		RequestCPUMilli: RequestCPUMilli,
 		RequestMemMiB:   RequestMemMiB,
@@ -164,6 +171,7 @@ type templateData struct {
 	Replicas        int
 	RequestCPUMilli int
 	RequestMemMiB   int
+	Adapt           bool
 }
 
 // workloadTemplate renders the kernel.
@@ -198,7 +206,9 @@ metadata:
 # The verbs are exactly what technocore/kube calls, and no more:
 #   pods              list    — the meter reads what Autopilot bills
 #   deployments       list    — the shutdown reads what can be stopped
-#   deployments/scale patch   — the only thing the kernel ever writes to a workload
+#   deployments/scale patch   — the only thing the kernel writes that is a zero
+#   deployments       patch   — the resize (ADR 0016), and the only write here
+#                               that can make an instance cost MORE
 #   pods.metrics      list    — what a pod USES, which nothing here enforces on
 # There is deliberately no watch (the loop polls), no get, no delete, and no
 # create of anything at all.
@@ -215,7 +225,7 @@ rules:
     verbs: ["list"]
   - apiGroups: ["apps"]
     resources: ["deployments"]
-    verbs: ["list"]
+    verbs: ["list", "patch"]
   - apiGroups: ["apps"]
     resources: ["deployments/scale"]
     verbs: ["patch"]
@@ -369,6 +379,11 @@ spec:
             - --cost-limit={{.CostLimit}}
             - --cost-currency={{.CostCurrency}}
             - --cost-period={{.CostPeriod}}
+{{- if .Adapt}}
+            # The kernel may change an application's reservation. Everything
+            # else it writes removes capacity; this one can add it.
+            - --adapt
+{{- end}}
           resources:
             requests:
               cpu: {{.RequestCPUMilli}}m

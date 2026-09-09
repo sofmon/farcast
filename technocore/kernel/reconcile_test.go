@@ -35,6 +35,23 @@ type fakeCluster struct {
 	metricsNS  map[string][]kube.PodMetrics
 	metricsErr map[string]error
 	metricsHit []string
+
+	resized    []string
+	resizeErr  map[string]error
+	resizeAnns map[string]map[string]string
+}
+
+func (f *fakeCluster) SetRequests(_ context.Context, ns, name, container string, cpu, mem int, anns map[string]string) error {
+	key := ns + "/" + name
+	if err := f.resizeErr[key]; err != nil {
+		return err
+	}
+	f.resized = append(f.resized, fmt.Sprintf("%s:%s=%dm/%dMi", key, container, cpu, mem))
+	if f.resizeAnns == nil {
+		f.resizeAnns = map[string]map[string]string{}
+	}
+	f.resizeAnns[key] = anns
+	return nil
 }
 
 func (f *fakeCluster) ListPodMetrics(_ context.Context, ns, selector string) ([]kube.PodMetrics, error) {

@@ -269,10 +269,16 @@ Two things are **not** proven by this walk and are recorded as such: the reading
 ### 5.2 TechnoCore — adaptive scaling
 The "intelligent" part of the OS.
 
-- Detect under/over-provisioned applications
-- Auto-adjust CPU and memory limits based on observed behaviour
-- Horizontal scaling (replica count) based on load patterns
-- Graceful scaling (no disruption to running requests)
+**Status: 🟨 Two of four delivered, two refused with reasoning; unwalked.** Designed by [ADR 0016](docs/adr/0016-adaptive-resources.md), on the profiles 5.1 built and the 4–75× over-reservation its walk measured. This is the first thing TechnoCore writes to a workload that is not a zero, and the section is shaped by that: [`technocore/adapt`](technocore/README.md) is pure arithmetic that can be argued about without a cluster, and every dangerous thing lives behind one `SetRequests` call. Zero new vendored modules (31 before, 31 after).
+
+The load-bearing insight is an asymmetry: **CPU is a rate and memory is a level.** A process at the 95th percentile of its CPU is briefly throttled and recovers; a process at the 95th percentile of its memory is killed one time in twenty. So CPU is sized from the p95 and memory from the observed peak, and no amount of tidiness justifies using one statistic for both.
+
+- Detect under/over-provisioned applications — **done**, published as `farcast usage`'s right-sizing table whether or not the kernel is allowed to act, because an operator deciding whether to switch it on needs to see what it would have done to *their* instance
+- Auto-adjust CPU and memory requests — **done, off by default.** Applications only (the tunnel and key holder are what an operator recovers an instance *through*), bounded four ways — coverage, a deadband, a factor-of-two step, and absolute floors — with a cooldown stamped on the workload itself so a restarted kernel still honours it, and an increase that would put the instance on course to reach its cost limit refused. A decrease is never gated on cost: on an instance already over, it is the only thing that helps
+- Horizontal scaling (replica count) — **refused, and it is a manifest gap.** The manifest declares nothing about whether an application may correctly run twice. Scaling on a CPU measurement means inferring a *correctness* property from a *resource* one, and being wrong corrupts data rather than costing money. It becomes possible when the manifest can declare it
+- Graceful scaling (no disruption) — **not achievable at one replica**, and saying so is better than a `maxSurge` that implies otherwise. Every resize is a rollout, and every rollout of a single-replica Deployment is a gap. It depends on the bullet above
+- **A pod with more than one container is not resized at all** — [ADR 0014](docs/adr/0014-observed-usage.md)'s per-container revisit trigger firing, answered with a refusal: the profile is per pod, so nothing in it says which container's reservation the measurement justifies
+- **Not yet walked live.** Nothing here has resized a real workload. The unit suite proves the arithmetic converges in two to three adjustments and every gate bites under mutation, but a rollout driven by a kernel's own inference is exactly the kind of thing this project only believes after watching it
 
 ### 5.3 SDK — Config & Secrets
 Complete the SDK's environment capabilities.

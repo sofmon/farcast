@@ -116,6 +116,17 @@ type Profiles struct {
 	// the whole reason it is recorded rather than inferred from emptiness.
 	Unavailable []string `json:"unavailable,omitempty"`
 
+	// Advice is what the kernel would do to each application's reservation,
+	// and why it is holding where it is. It is published whether or not
+	// adapting is switched on: an operator deciding whether to switch it on
+	// needs to see what it would have done.
+	Advice []Adaptation `json:"advice,omitempty"`
+
+	// Adapting records whether the kernel is acting on that advice. Without
+	// it a report cannot tell a kernel that is holding back from one that is
+	// merely thinking out loud.
+	Adapting bool `json:"adapting,omitempty"`
+
 	// TrimmedTo is the window actually retained when the byte budget
 	// shortened it, and Dropped names applications the budget cost. Both are
 	// published because a reader would otherwise see a short window and
@@ -288,6 +299,8 @@ func (r *Reconciler) SaveUsage(ctx context.Context, store ProfileStore, now time
 		Store:       r.Usage.Snapshot(),
 		Unavailable: r.usageUnavailable,
 		Dropped:     trimmed.Dropped,
+		Advice:      r.lastAdvice,
+		Adapting:    r.Adapting,
 	}
 	if trimmed.Shortened(configured) {
 		doc.TrimmedTo = trimmed.Hours

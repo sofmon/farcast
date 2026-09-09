@@ -49,6 +49,8 @@ func run(args []string) error {
 	checkpointEvery := fs.Duration("checkpoint-interval", 5*time.Minute, "how often to write the ledger")
 	enforce := fs.Bool("enforce", true, "stop applications when the limit is reached")
 	usageHours := fs.Int("usage-hours", usage.DefaultHours, "how many hours of observed usage to profile; 0 turns collection off")
+	adaptResources := fs.Bool("adapt", false, "act on resize advice rather than only publishing it")
+	cooldown := fs.Duration("adapt-cooldown", kernel.DefaultCooldown, "how long a workload is left alone after being resized")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -110,6 +112,14 @@ func run(args []string) error {
 		r.Usage = usage.New(*usageHours)
 		profiles = kernel.NewConfigMapProfiles(client)
 	}
+	// The one switch that lets the kernel write something to a workload that
+	// is not a zero (ADR 0016). Off by default: everything TechnoCore has
+	// written until now removes capacity, and the failure mode of this one is
+	// an application that stops working rather than a bill that stops
+	// growing. The advice is published either way, so an operator decides
+	// with the instance's own numbers in front of them.
+	r.Adapting = *adaptResources && *usageHours > 0
+	r.Cooldown = *cooldown
 	// Without this the kernel meters only the namespaces baked into its
 	// arguments, and every namespace added later is invisible: the
 	// applications there run, bill, and are counted nowhere. The 4.2 walk
@@ -137,7 +147,7 @@ func run(args []string) error {
 		"limit", fmt.Sprintf("%s %.2f/%s", *currency, *limit, *period),
 		"period", fmt.Sprintf("%s..%s", start.Format(time.RFC3339), end.Format(time.RFC3339)),
 		"restored", restored, "usage_restored", usageRestored, "usage_hours", *usageHours,
-		"enforce", *enforce,
+		"enforce", *enforce, "adapt", r.Adapting, "adapt_cooldown", cooldown.String(),
 		"prices", fmt.Sprintf("%s as of %s", pricing.Region, pricing.AsOf))
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -234,7 +244,45 @@ func (s *supervisor) observe(rep kernel.Report, err error) {
 	if a.Level.Acts() {
 		s.act(ctx, rep)
 	}
+	s.adapt(ctx, rep)
 	s.checkpoint(ctx, rep.At)
+}
+
+// adapt works out what every application should reserve, and — only when the
+// operator has switched it on — changes it.
+//
+// The advice is computed on every tick regardless, because it is published
+// with the profiles and an operator deciding whether to switch this on needs
+// to see what it would have done to their instance.
+func (s *supervisor) adapt(ctx context.Context, rep kernel.Report) {
+	advice := s.reconciler.Advise(rep, rep.At)
+	if len(advice) == 0 {
+		return
+	}
+	if !s.reconciler.Adapting {
+		for _, a := range advice {
+			if a.Act {
+				s.log.Info("would resize, but adapting is off",
+					"app", a.App, "namespace", a.Namespace,
+					"from", fmt.Sprintf("%dm/%dMi", a.CurrentCPUMilli, a.CurrentMemMiB),
+					"to", fmt.Sprintf("%dm/%dMi", a.CPUMilli, a.MemMiB),
+					"monthly_delta", round(a.MonthlyDeltaUSD()))
+			}
+		}
+		return
+	}
+	res := s.reconciler.Adapt(ctx, advice, rep.At)
+	for _, a := range res.Applied {
+		s.log.Warn("resized an application",
+			"app", a.App, "namespace", a.Namespace, "deployment", a.Deployment, "container", a.Container,
+			"from", fmt.Sprintf("%dm/%dMi", a.CurrentCPUMilli, a.CurrentMemMiB),
+			"to", fmt.Sprintf("%dm/%dMi", a.CPUMilli, a.MemMiB),
+			"monthly_delta", round(a.MonthlyDeltaUSD()), "stepped", a.Stepped)
+	}
+	for _, f := range res.Failed {
+		s.log.Error("could not resize an application",
+			"app", f.Adaptation.App, "namespace", f.Adaptation.Namespace, "err", f.Err)
+	}
 }
 
 func (s *supervisor) act(ctx context.Context, rep kernel.Report) {

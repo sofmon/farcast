@@ -19,6 +19,7 @@ import (
 	"github.com/sofmon/farcast/fatline/event"
 	"github.com/sofmon/farcast/manifest/parser"
 	"github.com/sofmon/farcast/shrike"
+	"github.com/sofmon/farcast/technocore/adapt"
 	tcdeploy "github.com/sofmon/farcast/technocore/deploy"
 	"github.com/sofmon/farcast/technocore/kernel"
 	"github.com/sofmon/farcast/technocore/usage"
@@ -119,7 +120,7 @@ func TestUsageReportsWhatOnePodUsedAgainstWhatItReserves(t *testing.T) {
 
 	shown := runUsage(t, dir, body, output.ModeHuman)
 	t.Log("\n" + shown)
-	for _, want := range []string{"Observed usage", "24h window", "api", "500m", "512Mi", "ONE POD", "Phase 5.2"} {
+	for _, want := range []string{"Observed usage", "24h window", "api", "500m", "512Mi", "ONE POD", "never sizes itself"} {
 		if !strings.Contains(shown, want) {
 			t.Errorf("output is missing %q", want)
 		}
@@ -563,5 +564,105 @@ func TestTheShareWarningDoesNotDependOnTheSidecarsVersion(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "not the total") {
 		t.Errorf("no share warning without a replica name:\n%s", buf.String())
+	}
+}
+
+// adviceFor builds a profile document carrying real kernel advice, so the
+// report cannot drift from what the kernel actually publishes.
+func adviceFor(t *testing.T, at time.Time, adapting bool, advice ...kernel.Adaptation) string {
+	t.Helper()
+	store := usage.New(24)
+	doc := kernel.Profiles{
+		Version: kernel.ProfilesVersion, At: at, Store: store.Snapshot(),
+		Advice: advice, Adapting: adapting,
+	}
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw)
+}
+
+func TestUsageShowsWhatWouldBeResizedAndWhatItIsWaitingFor(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	meteringInstance(t, dir, "p51")
+	at := time.Date(2026, 9, 9, 12, 30, 0, 0, time.UTC)
+
+	body := adviceFor(t, at, false,
+		kernel.Adaptation{
+			Namespace: "apps", Deployment: "api", Container: "api", Replicas: 1,
+			Advice: adapt.Advice{App: "api", CurrentCPUMilli: 500, CurrentMemMiB: 512,
+				CPUMilli: 130, MemMiB: 128, Act: true},
+		},
+		kernel.Adaptation{
+			Namespace: "apps", Deployment: "batch", Replicas: 1,
+			Advice: adapt.Advice{App: "batch", CurrentCPUMilli: 100, CurrentMemMiB: 128,
+				CPUMilli: 100, MemMiB: 128, Hold: "only 14 readings so far"},
+		},
+	)
+	shown := runUsage(t, dir, body, output.ModeHuman)
+	t.Log("\n" + shown)
+	for _, want := range []string{
+		"Right-sizing", "api", "500m/512Mi", "130m/128Mi",
+		"batch", "holding: only 14 readings so far",
+		"Adapting is OFF", "--adapt",
+	} {
+		if !strings.Contains(shown, want) {
+			t.Errorf("output is missing %q", want)
+		}
+	}
+	// A saving must read as a saving.
+	if !strings.Contains(shown, "-") {
+		t.Error("no signed monthly delta")
+	}
+}
+
+// A report that cannot tell a kernel holding back from one merely thinking
+// out loud leaves an operator unable to know whether their instance is being
+// changed underneath them.
+func TestUsageSaysWhetherTheKernelIsActingOnItsAdvice(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	meteringInstance(t, dir, "p51")
+	at := time.Date(2026, 9, 9, 12, 30, 0, 0, time.UTC)
+	a := kernel.Adaptation{
+		Namespace: "apps", Deployment: "api", Container: "api", Replicas: 1,
+		Advice: adapt.Advice{App: "api", CurrentCPUMilli: 500, CurrentMemMiB: 512, CPUMilli: 130, MemMiB: 128, Act: true},
+	}
+	on := runUsage(t, dir, adviceFor(t, at, true, a), output.ModeHuman)
+	if !strings.Contains(on, "Adapting is ON") || !strings.Contains(on, "every resize is a rollout") &&
+		!strings.Contains(on, "Every resize is a rollout") {
+		t.Errorf("an adapting kernel does not say so:\n%s", on)
+	}
+	off := runUsage(t, dir, adviceFor(t, at, false, a), output.ModeHuman)
+	if !strings.Contains(off, "Adapting is OFF") {
+		t.Errorf("a non-adapting kernel does not say so:\n%s", off)
+	}
+}
+
+// A clamped step read as the system's final opinion would look like a wrong
+// answer rather than a first move.
+func TestUsageSaysWhenAStepWasBounded(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	meteringInstance(t, dir, "p51")
+	at := time.Date(2026, 9, 9, 12, 30, 0, 0, time.UTC)
+	body := adviceFor(t, at, false, kernel.Adaptation{
+		Namespace: "apps", Deployment: "api", Container: "api", Replicas: 1,
+		Advice: adapt.Advice{App: "api", CurrentCPUMilli: 4000, CurrentMemMiB: 4096,
+			CPUMilli: 2000, MemMiB: 2048, Act: true, Stepped: true},
+	})
+	shown := runUsage(t, dir, body, output.ModeHuman)
+	if !strings.Contains(shown, "move further next time") {
+		t.Errorf("a bounded step is presented as final:\n%s", shown)
+	}
+}
+
+// Nothing to advise means no section at all, rather than an empty heading.
+func TestUsageOmitsRightSizingWhenThereIsNone(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	meteringInstance(t, dir, "p51")
+	at := time.Date(2026, 9, 9, 12, 30, 0, 0, time.UTC)
+	shown := runUsage(t, dir, profilesFor(t, at, func(*usage.Store) {}, nil), output.ModeHuman)
+	if strings.Contains(shown, "Right-sizing") {
+		t.Errorf("an empty right-sizing section was printed:\n%s", shown)
 	}
 }

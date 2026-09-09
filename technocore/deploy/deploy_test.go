@@ -151,8 +151,16 @@ func TestTheClusterRoleGrantsOnlyWhatTheClientCalls(t *testing.T) {
 		}
 	}
 	want := map[string][]string{
-		"core/pods":              {"list"},
-		"apps/deployments":       {"list"},
+		"core/pods": {"list"},
+		// patch on deployments is the resize (ADR 0016) and it is the widest
+		// grant the kernel holds: Kubernetes cannot restrict a patch to
+		// particular FIELDS, so a grant that lets the kernel change a
+		// container's requests also lets it change that container's image.
+		// The narrowing that is available is applied elsewhere — the binding
+		// is namespaced, and the kernel refuses anything that is not
+		// application-tier — and this test exists so the grant cannot widen
+		// further without somebody deciding to.
+		"apps/deployments":       {"list", "patch"},
 		"apps/deployments/scale": {"patch"},
 		"metrics.k8s.io/pods":    {"list"},
 	}

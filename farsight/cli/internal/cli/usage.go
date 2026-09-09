@@ -134,6 +134,8 @@ func (c *usageCommand) Run(ctx context.Context, env *Env, args []string) error {
 		TrimmedTo:   doc.TrimmedTo,
 		Dropped:     doc.Dropped,
 		Apps:        store.Summarize(doc.At),
+		Advice:      doc.Advice,
+		Adapting:    doc.Adapting,
 	}
 	c.addNetwork(ctx, env, name, &res)
 	res.Replicas = fatlineReplicas(ctx, cl)
@@ -202,6 +204,13 @@ type usageResult struct {
 
 	Apps []usage.Summary `json:"apps,omitempty"`
 
+	// Advice is what the kernel would set each application's reservation to,
+	// and what it is waiting for where it holds. Adapting says whether it is
+	// acting on it — without that, a report cannot tell a kernel holding back
+	// from one merely thinking out loud.
+	Advice   []kernel.Adaptation `json:"advice,omitempty"`
+	Adapting bool                `json:"adapting,omitempty"`
+
 	// Network is the per-application traffic picture from Shrike, and
 	// NetworkError is why there is none. A report with neither is an instance
 	// whose applications have made no outbound connection at all — which is a
@@ -258,6 +267,7 @@ func (r usageResult) Human(w io.Writer) error {
 		fprintln(w, "metrics.k8s.io, reports exactly this. Redeploying the kernel grants it.")
 	}
 
+	r.writeAdvice(w)
 	r.writeNetwork(w)
 
 	if r.TrimmedTo > 0 || len(r.Dropped) > 0 {
@@ -270,10 +280,62 @@ func (r usageResult) Human(w io.Writer) error {
 		}
 	}
 
-	fprintln(w)
-	fprintln(w, "Nothing adjusts anything on the strength of this yet — TechnoCore reports it")
-	fprintln(w, "and the reservations stay as declared. Acting on it is Phase 5.2.")
+	// No closing note when there is advice: the right-sizing section above
+	// already says what will and will not happen, and repeating it in weaker
+	// words is how a report starts contradicting itself.
+	if len(r.Advice) == 0 && len(r.Apps) > 0 {
+		fprintln(w)
+		fprintln(w, "The kernel has not published any sizing advice yet. It does so once a")
+		fprintln(w, "workload has enough readings to size from — and it never sizes itself,")
+		fprintln(w, "FatLine or the key holder, only applications.")
+	}
 	return nil
+}
+
+// writeAdvice renders what the kernel would do to each reservation.
+//
+// It is printed whether or not the kernel is acting on it, because an
+// operator deciding whether to switch adapting on needs to see what it would
+// have done to their own instance rather than to an example.
+func (r usageResult) writeAdvice(w io.Writer) {
+	if len(r.Advice) == 0 {
+		return
+	}
+	fprintln(w)
+	fprintln(w, "Right-sizing — what TechnoCore makes of that, per pod")
+	fprintf(w, "  %-20s %14s %14s %10s  %s\n", "application", "reserved now", "would be", "per month", "")
+	for _, a := range r.Advice {
+		now := fmt.Sprintf("%dm/%dMi", a.CurrentCPUMilli, a.CurrentMemMiB)
+		if !a.Act {
+			fprintf(w, "  %-20s %14s %14s %10s  holding: %s\n", a.App, now, "—", "—", a.Hold)
+			continue
+		}
+		note := ""
+		if a.Stepped {
+			// Said out loud, or an operator reads a clamped step as the
+			// system's final opinion and concludes it got the answer wrong.
+			note = "a bounded step; it will move further next time"
+		}
+		fprintf(w, "  %-20s %14s %14s %10s  %s\n",
+			a.App, now, fmt.Sprintf("%dm/%dMi", a.CPUMilli, a.MemMiB),
+			signedUSD(a.MonthlyDeltaUSD()), note)
+	}
+	fprintln(w)
+	if r.Adapting {
+		fprintln(w, "  Adapting is ON: the kernel applies this itself, one workload at a time,")
+		fprintln(w, "  and leaves each alone for a cooldown afterwards. Every resize is a rollout.")
+	} else {
+		fprintln(w, "  Adapting is OFF: the kernel publishes this and changes nothing. Turn it on")
+		fprintf(w, "  with 'farcast kernel deploy %s --adapt'.\n", r.Instance)
+	}
+}
+
+// signedUSD renders a monthly delta so a saving reads as one.
+func signedUSD(v float64) string {
+	if v > -0.005 && v < 0.005 {
+		return "—"
+	}
+	return fmt.Sprintf("%+.2f", v)
 }
 
 // writeNetwork renders the traffic half, or says why there is none.

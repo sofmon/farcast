@@ -305,3 +305,53 @@ func net(host, port string) string {
 	}
 	return host + ":" + port
 }
+
+// SetRequests changes one container's resource requests on a Deployment, and
+// stamps the object with the caller's annotations in the same patch.
+//
+// A STRATEGIC merge patch, not a plain one: containers are a list, and a plain
+// merge patch on a list replaces the whole list — which would delete every
+// container the patch did not name. Kubernetes merges this one by the
+// container's `name`, so a patch that names one container leaves the others
+// exactly as they were. That distinction is the difference between resizing a
+// sidecar's neighbour and deleting it.
+//
+// The annotations ride the same patch deliberately. They record that the
+// kernel changed this workload and when, and a stamp written separately could
+// be lost while the resize landed — leaving a workload that has been adapted
+// and does not say so, which the cooldown would then ignore.
+func (c *Client) SetRequests(ctx context.Context, namespace, name, container string, cpuMilli, memMiB int, annotations map[string]string) error {
+	if container == "" {
+		return errors.New("kube: a resize must name the container it changes")
+	}
+	if cpuMilli <= 0 || memMiB <= 0 {
+		return fmt.Errorf("kube: refusing a request of %dm/%dMi for %s/%s", cpuMilli, memMiB, namespace, name)
+	}
+	patch := map[string]any{
+		"spec": map[string]any{
+			"template": map[string]any{
+				"spec": map[string]any{
+					"containers": []any{map[string]any{
+						"name": container,
+						"resources": map[string]any{
+							"requests": map[string]string{
+								"cpu":    fmt.Sprintf("%dm", cpuMilli),
+								"memory": fmt.Sprintf("%dMi", memMiB),
+							},
+						},
+					}},
+				},
+			},
+		},
+	}
+	if len(annotations) > 0 {
+		patch["metadata"] = map[string]any{"annotations": annotations}
+	}
+	body, err := json.Marshal(patch)
+	if err != nil {
+		return fmt.Errorf("kube: encode the resize patch: %w", err)
+	}
+	path := fmt.Sprintf("/apis/apps/v1/namespaces/%s/deployments/%s",
+		url.PathEscape(namespace), url.PathEscape(name))
+	return c.do(ctx, http.MethodPatch, path, "", "application/strategic-merge-patch+json", body, nil)
+}

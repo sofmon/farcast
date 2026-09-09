@@ -17,10 +17,12 @@ package kernel
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/sofmon/farcast/technocore/adapt"
 	"github.com/sofmon/farcast/technocore/cost"
 	"github.com/sofmon/farcast/technocore/kube"
 	"github.com/sofmon/farcast/technocore/pricing"
@@ -47,6 +49,10 @@ type Cluster interface {
 	ListDeployments(ctx context.Context, namespace, selector string) ([]kube.Deployment, error)
 	ListPodMetrics(ctx context.Context, namespace, selector string) ([]kube.PodMetrics, error)
 	Scale(ctx context.Context, namespace, name string, replicas int) error
+	// SetRequests is the only thing the kernel writes to a workload that is
+	// not a zero (ADR 0016). Everything dangerous about this phase is on the
+	// other side of this one call.
+	SetRequests(ctx context.Context, namespace, name, container string, cpuMilli, memMiB int, annotations map[string]string) error
 }
 
 // ManagedBy selects the workloads FarCast created. A kernel that metered
@@ -106,6 +112,25 @@ type Reconciler struct {
 	// for each pod, so a server that has not refreshed is not counted twice.
 	lastReading map[string]time.Time
 
+	// Advice bounds what a resize recommendation may say. The zero value uses
+	// the adapt package's own defaults.
+	Advice adapt.Config
+
+	// Cooldown is how long a workload is left alone after being resized.
+	// Zero means DefaultCooldown.
+	Cooldown time.Duration
+
+	// Adapting says the kernel acts on its own advice rather than only
+	// publishing it. It is off by default and it is the only switch in
+	// TechnoCore that lets the kernel write something to a workload that is
+	// not a zero.
+	Adapting bool
+
+	// lastAdvice is the most recent pass, kept so the published document can
+	// carry it. In-memory bookkeeping only — Advise writes nothing to the
+	// cluster, and a test asserts it.
+	lastAdvice []Adaptation
+
 	// usageUnavailable is the last tick's list of namespaces whose metrics
 	// could not be read, carried so the published document can say "not
 	// measured" rather than leave a reader to infer it from emptiness.
@@ -120,10 +145,24 @@ type Workload struct {
 	Tier      tier.Tier
 	// Labels are kept so a deployment's selector can claim this pod without
 	// a second API call.
-	Labels    map[string]string
-	CPUMilli  int
-	MemMiB    int
-	HourlyUSD float64
+	Labels map[string]string
+	// Containers names the pod's containers. A resize has to name the one it
+	// changes, and a pod with more than one cannot be sized from a per-pod
+	// profile at all.
+	Containers []string
+	CPUMilli   int
+	MemMiB     int
+	HourlyUSD  float64
+}
+
+// mergeNames appends names not already present, preserving order.
+func mergeNames(into []string, add []string) []string {
+	for _, n := range add {
+		if !slices.Contains(into, n) {
+			into = append(into, n)
+		}
+	}
+	return into
 }
 
 // Target is a workload a cost shutdown could act on: a Deployment, with the
@@ -140,6 +179,35 @@ type Target struct {
 	Replicas  int
 	Pods      int
 	HourlyUSD float64
+
+	// App and Containers come from the pods this deployment claims, and
+	// exist so an adaptation can find the workload a usage profile belongs
+	// to without a second API call. Containers is every container name in
+	// the claimed pods: a resize needs to name one, and a pod with more than
+	// one is a shape the per-pod profile cannot attribute (ADR 0014's stated
+	// limitation, and ADR 0016 decision 5's refusal).
+	App        string
+	Containers []string
+	// CPUMilli and MemMiB are what ONE of its pods reserves.
+	CPUMilli int
+	MemMiB   int
+	// Annotations are the deployment's own, read so a resize can see when it
+	// last changed this workload without a second call.
+	Annotations map[string]string
+}
+
+// AdaptedAt is when the kernel last resized this workload, from the stamp it
+// left on the object itself.
+func (t Target) AdaptedAt() (time.Time, bool) {
+	v := t.Annotations[AdaptedAtLabel]
+	if v == "" {
+		return time.Time{}, false
+	}
+	at, err := time.Parse(time.RFC3339, v)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return at, true
 }
 
 // Report is one tick's observation. It is a value, not a log line: the caller
@@ -296,14 +364,15 @@ func (r *Reconciler) Reconcile(ctx context.Context, now time.Time) (Report, erro
 				return Report{}, fmt.Errorf("kernel: pod %s/%s: %w", ns, p.Metadata.Name, err)
 			}
 			w := Workload{
-				Namespace: p.Metadata.Namespace,
-				Name:      p.Metadata.Name,
-				App:       appOf(p),
-				Tier:      tier.Of(p.Metadata.Labels),
-				Labels:    p.Metadata.Labels,
-				CPUMilli:  cpu,
-				MemMiB:    mem,
-				HourlyUSD: pricing.PodHourlyUSD(cpu, mem),
+				Namespace:  p.Metadata.Namespace,
+				Name:       p.Metadata.Name,
+				App:        appOf(p),
+				Tier:       tier.Of(p.Metadata.Labels),
+				Labels:     p.Metadata.Labels,
+				Containers: containerNames(p),
+				CPUMilli:   cpu,
+				MemMiB:     mem,
+				HourlyUSD:  pricing.PodHourlyUSD(cpu, mem),
 			}
 			if w.Namespace == "" {
 				w.Namespace = ns
@@ -393,10 +462,11 @@ func (r *Reconciler) collectTargets(ctx context.Context, rep *Report) error {
 		}
 		for _, d := range deps {
 			t := Target{
-				Namespace: ns,
-				Name:      d.Metadata.Name,
-				Tier:      tier.Of(d.Metadata.Labels),
-				Replicas:  d.Status.Replicas,
+				Namespace:   ns,
+				Name:        d.Metadata.Name,
+				Tier:        tier.Of(d.Metadata.Labels),
+				Replicas:    d.Status.Replicas,
+				Annotations: d.Metadata.Annotations,
 			}
 			if d.Spec.Replicas != nil {
 				t.Replicas = *d.Spec.Replicas
@@ -405,6 +475,9 @@ func (r *Reconciler) collectTargets(ctx context.Context, rep *Report) error {
 				if w.Namespace == ns && d.Spec.Selector.Matches(w.Labels) {
 					t.Pods++
 					t.HourlyUSD += w.HourlyUSD
+					t.App = w.App
+					t.CPUMilli, t.MemMiB = w.CPUMilli, w.MemMiB
+					t.Containers = mergeNames(t.Containers, w.Containers)
 				}
 			}
 			rep.Targets = append(rep.Targets, t)
@@ -472,6 +545,17 @@ func appOf(p kube.Pod) string {
 		}
 	}
 	return p.Metadata.Name
+}
+
+// containerNames lists a pod's main containers. Init containers are excluded:
+// they have finished by the time anything is measured, so a resize could not
+// be justified from a profile that never saw them run.
+func containerNames(p kube.Pod) []string {
+	out := make([]string, 0, len(p.Spec.Containers))
+	for _, c := range p.Spec.Containers {
+		out = append(out, c.Name)
+	}
+	return out
 }
 
 // Roll opens a new ledger when now has passed the end of the current period,

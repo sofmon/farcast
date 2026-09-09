@@ -26,6 +26,7 @@ Workloads carry `farcast.sofmon.com/tier` — `kernel`, `system` or `app`. A cos
 | [`tier`](tier/) | The `farcast.sofmon.com/tier` classification and the rule that only applications are stoppable by a cost shutdown. |
 | [`cost`](cost/) | The `expected`/`confirmed` ledger, the calibration clamp, and threshold assessment against the limit. |
 | [`usage`](usage/) | What workloads actually consume, as a bounded rolling distribution per application. Advisory: nothing in the cost path reads it. |
+| [`adapt`](adapt/) | What an application's reservation *should* be, given what it used. Pure arithmetic — no cluster, no clock, no side effects. |
 | [`kernel`](kernel/) | The reconcile loop that joins them: observe, meter, assess, act — plus the ConfigMap checkpoint that makes the accounting survive a restart. |
 | [`deploy`](deploy/) | The kernel's own Namespace, ServiceAccount, RBAC and Deployment, rendered as a YAML apply stream. |
 | [`cmd/technocore`](cmd/technocore/) | The in-cluster entrypoint: `technocore serve`. |
@@ -38,7 +39,9 @@ Workloads carry `farcast.sofmon.com/tier` — `kernel`, `system` or `app`. A cos
 
 **A cost shutdown stops Deployments, not Pods.** Deleting a pod only makes its controller create another one, so the meter reads pods — which is what Autopilot bills — and the shutdown scales deployments, which is what can actually be stopped. The two are attributed to each other through the deployment's own selector.
 
-**Everything the kernel writes is a zero.** There is no code path that scales anything up. Bringing an application back after a shutdown is an operator decision, and a `confirmed` correction that dropped accrued spend below the limit leaves the applications stopped and the operator informed — which is the right way round.
+**Everything the kernel writes to STOP something is a zero.** There is no code path that scales replicas up. Bringing an application back after a cost shutdown is an operator decision, and a `confirmed` correction that dropped accrued spend below the limit leaves the applications stopped and the operator informed — which is the right way round.
+
+Since [ADR 0016](../docs/adr/0016-adaptive-resources.md) that is no longer the *whole* story: the kernel can also change an application's resource **requests**, which is the one write it makes that can add capacity and cost money. It is off by default, it touches applications only, and every bound on it is in [What the kernel may resize](#what-the-kernel-may-resize) below.
 
 **The floor means "nothing left to stop", not "nothing was stopped".** An instance whose every scale call was refused has a permissions problem and plenty left to stop; reporting that as the floor would tell the operator the kernel had done all it could when it had done nothing.
 
@@ -50,7 +53,7 @@ The grants are exactly the verbs [`kube`](kube/) calls, and the shape is as impo
 |---|---|---|
 | `pods` | `list` | The meter reads what Autopilot bills. |
 | `pods.metrics.k8s.io` | `list` | The profile reads what a pod actually uses. |
-| `deployments` | `list` | The shutdown reads what can be stopped. |
+| `deployments` | `list`, `patch` | The shutdown reads what can be stopped; the resize changes what one reserves. |
 | `deployments/scale` | `patch` | The only thing the kernel ever writes to a workload. |
 | `configmaps` | `create` | To make its ledger the first time. |
 | `configmaps` (named `technocore-ledger`) | `get`, `update`, `patch` | To maintain it, and nothing else in the namespace. |
@@ -116,10 +119,28 @@ Storing these numbers discloses nothing new, by [ADR 0009](../docs/adr/0009-tech
 
 **Network I/O is not here, and that is a decision.** It is measured at the boundary, by [FatLine and Shrike](../shrike/README.md), and `farcast usage` joins the two halves in its report rather than routing one through the kernel ([ADR 0015](../docs/adr/0015-what-the-boundary-can-measure.md) decision 5). Autopilot bills CPU and memory, so network counters are not an input to the resize these profiles exist to feed — and carrying them here would mean either giving FatLine a cluster credential or giving the kernel a scrape path to a pod, both bought for a number nothing enforces on.
 
+### What the kernel may resize
+
+[ADR 0016](../docs/adr/0016-adaptive-resources.md). The 5.1 walk measured every workload on a live instance reserving **four to seventy-five times** what it used; this is what corrects that, and it is the first thing TechnoCore writes to a workload that is not a zero.
+
+**CPU is a rate; memory is a level.** A process at the 95th percentile of its CPU is briefly throttled — a delay, and it recovers. A process at the 95th percentile of its memory is killed one time in twenty. So CPU is sized from the observed **p95** and memory from the observed **peak**, with more headroom on memory because a day's peak is a lower bound on a week's. Using one statistic for both would be tidier and wrong in the direction that kills things.
+
+**Applications only, and off by default.** The tunnel and the key holder are what an operator recovers an instance *through*, and a kernel that could resize them could take away the means of fixing its own mistake; resizing itself is the same hazard with a shorter loop. And because every other guard here is a judgement about numbers, the operator gets to see what the kernel would have done to *their* instance before it may do it — `farcast usage` prints the advice whether acting is on or off, and `--adapt` is rendered as a visible argument on the workload.
+
+**Four bounds, each a refusal rather than an approximation.** Nothing is sized from too few readings; a target within a quarter of the current reservation is not worth a rollout; one adjustment moves by at most a factor of two, so neither a quiet hour nor a spike can be acted on in one leap; and nothing goes below a floor, because a reservation too small to start with turns an over-provisioned application into a broken one.
+
+**The cooldown lives on the workload.** A resized Deployment carries `farcast.sofmon.com/adapted-at` and `adapted-from`, in the same patch as the resize — a stamp written separately could be lost while the change landed. A restarted kernel reads its own last change off the object, because the cluster is the registry. A stamp nobody can parse counts as never resized: a typo must not freeze a reservation forever.
+
+**An increase may spend up to the limit and not past it.** The operator approved a limit, not an open budget. A decrease is never gated on cost — on an instance already over its limit it is the only thing that helps.
+
+**Two of the phase's bullets are refused.** A pod with more than one container is not resized at all: the profile is per pod, so nothing in it says which container's reservation the measurement justifies. And replica count is not adjusted, because the manifest says nothing about whether an application may correctly run twice — inferring that from a CPU measurement is inferring a correctness property from a resource one, and being wrong corrupts data rather than costing money.
+
+**`patch` on deployments cannot be narrowed to fields.** Kubernetes has no way to say "may change requests but not the image". The narrowing that is available is applied — the binding is namespaced, and the code refuses anything that is not application-tier — and a test asserts the grant so it cannot widen without somebody deciding to.
+
 ### One replica, replaced rather than overlapped
 
 The kernel is a meter with a single ledger, so its Deployment is `replicas: 1` with `strategy: Recreate`. A rolling update would run two kernels for a few seconds; both would meter the same instance into their own in-memory ledgers and race to write the same checkpoint, and the period's spending would become whichever wrote last.
 
 It carries **no PodDisruptionBudget**, deliberately: a single-replica workload behind `minAvailable: 1` makes every node drain hang forever, which would block the auto-upgrades ADR 0003 accepts. The checkpoint is what makes the kernel's own reschedule survivable — the successor bills the gap it slept through — so it does not need one.
 
-*The operator-side commands are `farcast kernel deploy|meter|confirm` (4.1), `farcast costs` (4.3) and `farcast usage` (5.1).*
+*The operator-side commands are `farcast kernel deploy|meter|confirm` (4.1), `farcast costs` (4.3) and `farcast usage` (5.1). `farcast kernel deploy --adapt` is what lets the kernel act on what `farcast usage` shows.*
