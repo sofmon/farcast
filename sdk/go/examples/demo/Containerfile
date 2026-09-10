@@ -1,0 +1,37 @@
+# The Phase 5.3 fixture: a Go application that actually calls the SDK.
+#
+# It is built from the SDK module's own directory (context: sdk/go in the
+# manifest), which is what lets the build need NO network beyond the two base
+# images. The SDK has zero dependencies, so with the example living inside that
+# module there is nothing to download: GOPROXY=off and GOTOOLCHAIN=local turn a
+# surprise fetch into a loud failure instead of a slow one.
+#
+# Two stages, and the runtime one carries curl on purpose. The walk execs into
+# this pod to ask the keyholder directly whether it refuses an application's
+# write under secrets/ — a claim about the server, which the SDK's own client
+# would never make because it never attempts the write.
+FROM golang:1.27-alpine AS build
+WORKDIR /src
+COPY . .
+ENV CGO_ENABLED=0 GOPROXY=off GOTOOLCHAIN=local
+RUN go build -trimpath -o /demo ./examples/demo
+
+FROM alpine:3.19
+RUN apk add --no-cache ca-certificates curl
+COPY --from=build /demo /usr/local/bin/demo
+
+# The fixture's own configuration, so Config() has something to read. There is
+# no manifest field for application configuration today, and this is one of the
+# two paths an operator actually has — the other being to patch the rendered
+# ConfigMap, which the walk also exercises.
+#
+# DEMO_TIMEOUT is deliberately unparseable: the SDK must warn once, name the
+# key, never print the value, and fall back to the caller's default.
+ENV DEMO_GREETING=hello \
+    DEMO_WORKERS=4 \
+    DEMO_DEBUG=true \
+    DEMO_TIMEOUT=soon \
+    DEMO_SECRET_NAME=DB_PASSWORD
+
+EXPOSE 8080
+CMD ["demo"]

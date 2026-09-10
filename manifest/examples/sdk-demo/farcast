@@ -1,0 +1,23 @@
+# Two applications that call the SDK, for Phase 5.3.
+#
+# Two, not one, and that is the point. Each gets its own secrets subtree from
+# Planck, so the walk can give them different secrets and then have one read
+# the other's — which ADR 0017 decision 2 says succeeds, because applications
+# in an instance share a storage scope and the keyholder cannot tell them
+# apart. A fixture with a single application could only ever show the happy
+# path.
+#
+# Neither declares an external host: the only thing this fixture talks to is
+# the in-cluster keyholder, which the translated NetworkPolicy already allows.
+#
+# The code lives in the SDK module (sdk/go/examples/demo) so the build context
+# is that module and nothing has to be downloaded to compile it. Paths are
+# repository-relative, as they are in every manifest.
+name: sdk-demo
+apps:
+  - name: alpha
+    containerfile: sdk/go/examples/demo/Containerfile
+    context: sdk/go
+  - name: beta
+    containerfile: sdk/go/examples/demo/Containerfile
+    context: sdk/go
