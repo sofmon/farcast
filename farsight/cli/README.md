@@ -76,6 +76,7 @@ farcast [global flags] <command> [command flags] [arguments]
 | `costs` | ✅ works | Show spending and distance to the cost limit | 4.3 |
 | `usage` | ✅ works | Compute and network use, against what is reserved and declared, with the kernel's right-sizing advice | 5.1 |
 | `storage` | ✅ works | The instance's encrypted disk: `ls`, `cp`, `rm`, `usage`, `key …` | 3.3 |
+| `secret` | ✅ works | Application secrets, encrypted at rest in the instance's storage: `set`, `ls`, `rm` | 5.3 |
 | `build` | ✅ works | Build an application's image inside the instance | 4.2 |
 | `kernel` | ✅ works | Deploy TechnoCore, meter namespaces, and push the provider's confirmed costs: `deploy`, `meter`, `confirm`. `deploy --adapt` lets it right-size applications | 4.1 |
 | `chat` | ⏳ stub | Terminal AI chat through AllThing | 6.2 |
@@ -727,6 +728,49 @@ Cost is **surfaced, never gated**, per [ADR 0007](../../docs/adr/0007-instance-o
 The bucket is ensured **lazily, at first storage use**, never at `install`: an empty bucket costs $0.00 and serves nothing, and the registry's defensive-ensure precedent already proves lazy convergence. The record is written **before** the create call, because the name's 32 bits of entropy exist nowhere else and the name is deliberately not re-derivable from the instance (its instance segment may have been truncated to fit GCS's 63-character cap).
 
 The mint/record/retry loop belongs here, in the record-owning caller, never in the adapter — which mints nothing. On `ErrNotOwned` it mints a new suffix, updates the record and retries, bounded at 3 attempts. **With one hard exception:** if `created_at` is set, the bucket was ensured successfully before, and `ErrNotOwned` now means something changed rather than a name collision — auto-minting past it would abandon the operator's data under a name nothing points at any more. That case stops and asks the operator to look. Any other error keeps the record and fails, so a re-run converges.
+
+---
+
+## `farcast secret` — the values an application must not carry in its image (Phase 5.3)
+
+`farcast secret` provisions database passwords, API tokens and signing keys for the applications an instance runs. An application reads them through the SDK with [`farcast.Secrets()`](../../sdk/go/README.md#secrets--farcastsecrets); it cannot write or delete one.
+
+Like `farcast storage`, it runs **entirely on the operator's machine** — the recorded bucket, the stored cloud credentials, the local keyring — so it needs no tunnel and no running cluster.
+
+```
+farcast secret set <instance> <app> <NAME> [--from-file PATH] [--raw] [--force]
+farcast secret ls  <instance> [<app>]
+farcast secret rm  <instance> <app> <NAME> [-y]
+```
+
+### Where a secret goes, and what that protects
+
+Each secret is an ordinary object in the instance's encrypted storage under `<scope>/secrets/<app>/<name>`, written with this instance's own keys. The cloud provider holds ciphertext under a tokenized name, and **nothing is ever placed in a Kubernetes Secret** — which is base64 in etcd, encrypted at rest under a key the cloud provider holds.
+
+**The boundary is the instance, not the application.** A secret is confidential from the cloud and from anything outside the instance; it is *not* confidential from another application inside the same instance. Every application shares one storage scope and the keyholder's data path cannot tell them apart. This is stated here, in the command's own help, in the SDK, and in full — with the alternatives that were rejected and what would close it — in [ADR 0017](../../docs/adr/0017-application-secrets.md).
+
+What *is* enforced: the keyholder refuses application writes and deletes under the subtree, so a secret is created and removed here and nowhere else. A compromised application can read the instance's secrets and cannot plant a credential for a neighbour to pick up, or delete one to force a fallback.
+
+### There is no `--value`, and there is no `get`
+
+The value is read from stdin, or from a file with `--from-file`:
+
+```bash
+printf '%s' "$PASSWORD" | farcast secret set prod api DB_PASSWORD
+farcast secret set prod api TLS_KEY --from-file ./key.pem
+```
+
+A value on the command line is visible to every process on the machine while the command runs, and it lands in shell history — so there is no flag that takes one. And there is no read-back verb: a secret printed to a terminal is in scrollback, in a screen share, and in whatever recorded the session. That is a guard rail rather than a lock — the keyring is the operator's, so `farcast storage cp` can always recover the bytes deliberately, with the key in hand.
+
+**A trailing newline is removed, and the removal is reported.** `echo x |` appends a byte that is the shell's and not the operator's, and a credential one byte longer than the one in the provider's console is a long afternoon. `--raw` keeps it. Acting and saying so beats both silent choices.
+
+`set` refuses an empty value (use `rm`), refuses to replace an existing secret without `--force`, and caps a secret at 64 KiB — something larger is a file, and files belong in `storage cp` where they stream.
+
+### The one thing that would fail silently
+
+The operator writes a key that an application reads, and the two are computed in different packages: the CLI from the keyring, the application from the `FARCAST_SECRETS_PREFIX` Planck rendered from the recorded scope prefix. A divergence would not fail loudly — it would store a secret nothing ever fetches.
+
+So `secret` resolves the prefix from the **keyring** (the material that actually encrypts the object), cross-checks it against what the deploy recorded, and refuses when the two disagree rather than picking one. A test asserts the CLI's key and Planck's rendered prefix agree.
 
 ---
 

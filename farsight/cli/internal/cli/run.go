@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sofmon/farcast/datasphere"
 	"github.com/sofmon/farcast/farsight/cli/internal/cluster"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/image"
@@ -328,6 +329,14 @@ func (c *runCommand) translate(env *Env, meta *config.InstanceMetadata, namespac
 		cfg.StorageScope = meta.Keyholder.Scope
 		cfg.StorageCAPEM = mtls.CACertPEM
 		cfg.StorageServerName = identity.KeyholderServerName(meta.Name)
+		if prefix := meta.Keyholder.ScopePrefix; prefix != "" {
+			// The secrets root is built here because this is the one place
+			// that holds both halves: the recorded scope prefix, and (through
+			// DataSphere) the reserved segment the keyholder enforces. An
+			// instance recorded before the prefix was written down gets no
+			// secrets wiring rather than a guessed one.
+			cfg.SecretsPrefix = prefix + datasphere.SecretsSegment + "/"
+		}
 	}
 	return translate.Render(cfg)
 }

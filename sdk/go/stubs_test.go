@@ -54,21 +54,11 @@ func TestAIStubNotImplemented(t *testing.T) {
 	}
 }
 
-func TestConfigStub(t *testing.T) {
-	c := Config()
-	if v, ok := c.Get("x"); ok || v != "" {
-		t.Errorf("Get = (%q, %v), want empty/false", v, ok)
-	}
-	if v := c.GetString("x", "def"); v != "def" {
-		t.Errorf("GetString = %q, want def", v)
-	}
-	if v := c.GetInt("x", 7); v != 7 {
-		t.Errorf("GetInt = %d, want 7", v)
-	}
-	if !c.GetBool("x", true) {
-		t.Error("GetBool = false, want true")
-	}
-	if _, err := c.Require("x"); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("Require err = %v, want ErrNotImplemented", err)
+func TestSecretsStubNotImplemented(t *testing.T) {
+	// Secrets() memoizes, and the environment is unset here, so this is the
+	// one place the package-level accessor is exercised; the wiring tests
+	// build the capability directly.
+	if _, err := Secrets().Get(context.Background(), "TOKEN"); !errors.Is(err, ErrNotImplemented) {
+		t.Errorf("Get err = %v, want ErrNotImplemented", err)
 	}
 }

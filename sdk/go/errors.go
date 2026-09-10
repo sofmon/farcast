@@ -74,3 +74,31 @@ var (
 	// both wrong in ways that cost data.
 	ErrStorageUnavailable = errors.New("farcast: storage is unavailable")
 )
+
+// Configuration error sentinels.
+var (
+	// ErrConfigMissing reports that a required configuration key was not
+	// set, or was set to the empty string — which Config reads as absent,
+	// because an empty value is what a mis-rendered template produces and
+	// never what somebody meant to configure.
+	ErrConfigMissing = errors.New("farcast: configuration key is not set")
+
+	// ErrConfigReserved reports a read of the platform's own namespace
+	// (FARCAST_*) through Config, which is refused.
+	//
+	// It is deliberately distinct from ErrConfigMissing: the variable is
+	// very likely set, and an operator told "not set" would go and set it
+	// again. Identity is farcast.AppName and farcast.InstanceID; the rest of
+	// the namespace is wiring the capability accessors already expose, and
+	// one entry of it is this application's egress credential.
+	ErrConfigReserved = errors.New("farcast: configuration key belongs to the platform")
+)
+
+// ErrSecretNotFound reports that no secret exists under that name.
+//
+// It means absence, and only absence. A malformed name is not absence and
+// does not report it, and neither does a sealed instance: secrets are served
+// by the same keyholder as storage, so while it is sealed every read reports
+// ErrStorageSealed and the correct response is to wait, not to proceed
+// without the secret.
+var ErrSecretNotFound = errors.New("farcast: no such secret")

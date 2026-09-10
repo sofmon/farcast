@@ -478,3 +478,59 @@ func TestSafeMessageReducesToTheSentinel(t *testing.T) {
 		t.Errorf("safeMessage leaked an unclassified error: %q", got)
 	}
 }
+
+// The application data path may read a secret and may not create or destroy
+// one.
+//
+// This is not isolation and must not be read as isolation: the path
+// authenticates the server only, and every application in the instance
+// declares the same scope, so the keyholder cannot tell whose secret this is.
+// What it can enforce is that no application plants a credential for a
+// neighbour to pick up, or deletes one to force a fallback.
+func TestSecretsAreReadOnlyOnTheDataPath(t *testing.T) {
+	h := newHarness(t)
+	h.unseal(t, 1)
+
+	const key = "app/secrets/api/DB_PASSWORD"
+
+	for _, tc := range []struct {
+		method string
+		body   []byte
+	}{
+		{"PUT", []byte("planted")},
+		{"DELETE", nil},
+	} {
+		w := do(h.data, tc.method, "/v1/object", objHeaders(key, "app"), tc.body)
+		if w.Code != http.StatusForbidden {
+			t.Errorf("%s = %d, want 403", tc.method, w.Code)
+		}
+		if got := w.Header().Get(HeaderCode); got != CodePermission {
+			t.Errorf("%s code = %q, want %q", tc.method, got, CodePermission)
+		}
+	}
+
+	// Ordinary application storage is untouched by the rule.
+	if w := do(h.data, "PUT", "/v1/object", objHeaders("app/reports/q3.csv", "app"), []byte("data")); w.Code != http.StatusNoContent {
+		t.Errorf("writing ordinary storage = %d, want 204", w.Code)
+	}
+	if w := do(h.data, "DELETE", "/v1/object", objHeaders("app/reports/q3.csv", "app"), nil); w.Code != http.StatusNoContent {
+		t.Errorf("deleting ordinary storage = %d, want 204", w.Code)
+	}
+}
+
+// Listing is deliberately not refused: the parent prefix is listable, so a
+// refusal would prevent nothing and would imply an enumeration boundary that
+// does not exist. Asserted so that "hardening" it later is a deliberate act
+// with ADR 0017 reopened, not a quiet one.
+func TestSecretListingIsNotRefused(t *testing.T) {
+	h := newHarness(t)
+	h.unseal(t, 1)
+
+	headers := map[string]string{
+		HeaderPrefix: base64.StdEncoding.EncodeToString([]byte("app/secrets/")),
+		HeaderScope:  "app",
+	}
+	if w := do(h.data, "GET", "/v1/list", headers, nil); w.Code != http.StatusOK {
+		t.Errorf("listing the secrets subtree = %d, want 200", w.Code)
+	}
+}

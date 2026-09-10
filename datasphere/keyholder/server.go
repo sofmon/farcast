@@ -257,7 +257,7 @@ func (s *Server) DataHandler() http.Handler {
 }
 
 func (s *Server) read(w http.ResponseWriter, r *http.Request) {
-	key, store, err := s.resolve(r, HeaderKey)
+	key, _, store, err := s.resolve(r, HeaderKey)
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -273,8 +273,14 @@ func (s *Server) read(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) write(w http.ResponseWriter, r *http.Request) {
-	key, store, err := s.resolve(r, HeaderKey)
+	key, scope, store, err := s.resolve(r, HeaderKey)
 	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	if err := refuseSecretMutation(scope, key); err != nil {
+		// Refused before the body is read, so an application cannot spend the
+		// instance's bandwidth on a write that was never going to happen.
 		s.fail(w, r, err)
 		return
 	}
@@ -291,8 +297,12 @@ func (s *Server) write(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) delete(w http.ResponseWriter, r *http.Request) {
-	key, store, err := s.resolve(r, HeaderKey)
+	key, scope, store, err := s.resolve(r, HeaderKey)
 	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	if err := refuseSecretMutation(scope, key); err != nil {
 		s.fail(w, r, err)
 		return
 	}
@@ -304,7 +314,7 @@ func (s *Server) delete(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) list(w http.ResponseWriter, r *http.Request) {
-	prefix, store, err := s.resolve(r, HeaderPrefix)
+	prefix, _, store, err := s.resolve(r, HeaderPrefix)
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -322,14 +332,14 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request) {
 
 // resolve decodes the requested logical key and returns a Store over the scope
 // that owns it.
-func (s *Server) resolve(r *http.Request, header string) (string, *datasphere.Store, error) {
+func (s *Server) resolve(r *http.Request, header string) (string, datasphere.Scope, *datasphere.Store, error) {
 	raw := r.Header.Get(header)
 	if raw == "" && header == HeaderKey {
-		return "", nil, fmt.Errorf("%w: missing %s header", datasphere.ErrInvalidKey, header)
+		return "", datasphere.Scope{}, nil, fmt.Errorf("%w: missing %s header", datasphere.ErrInvalidKey, header)
 	}
 	decoded, err := base64.StdEncoding.DecodeString(raw)
 	if err != nil {
-		return "", nil, fmt.Errorf("%w: %s is not base64", datasphere.ErrInvalidKey, header)
+		return "", datasphere.Scope{}, nil, fmt.Errorf("%w: %s is not base64", datasphere.ErrInvalidKey, header)
 	}
 	key := string(decoded)
 
@@ -338,22 +348,53 @@ func (s *Server) resolve(r *http.Request, header string) (string, *datasphere.St
 	// a refusal — otherwise that change would be a fail-open one.
 	declared := r.Header.Get(HeaderScope)
 	if declared == "" {
-		return "", nil, fmt.Errorf("%w: missing %s header", ErrOutOfScope, HeaderScope)
+		return "", datasphere.Scope{}, nil, fmt.Errorf("%w: missing %s header", ErrOutOfScope, HeaderScope)
 	}
 
 	scope, err := s.cfg.Vault.Scope(key)
 	if err != nil {
-		return "", nil, err
+		return "", datasphere.Scope{}, nil, err
 	}
 	if scope.Name != declared {
-		return "", nil, fmt.Errorf("%w: key belongs to scope %q, request declared %q", ErrOutOfScope, scope.Name, declared)
+		return "", datasphere.Scope{}, nil, fmt.Errorf("%w: key belongs to scope %q, request declared %q", ErrOutOfScope, scope.Name, declared)
 	}
 	store, err := s.cfg.Stores(scope)
 	if err != nil {
-		return "", nil, err
+		return "", datasphere.Scope{}, nil, err
 	}
-	return key, store, nil
+	return key, scope, store, nil
 }
+
+// refuseSecretMutation is the one rule the application data path enforces
+// about WHAT a key is, rather than about who may reach it.
+//
+// The data path cannot tell one application from another — it authenticates
+// the server only, and the scope a request declares is the same string every
+// application in the instance is given (see DataTLS). So it cannot enforce
+// whose secret this is, and pretending otherwise would be theatre.
+//
+// What it CAN enforce is that no application creates or destroys one. Secrets
+// are provisioned by the operator from their own machine, client-side
+// encrypted, and never through this path; refusing the mutation here means a
+// compromised application can read the secrets of the instance it is in, and
+// cannot plant a credential for a neighbour to pick up or delete one to force
+// a fallback. That is a smaller property than isolation and it is a real one.
+//
+// Listing is deliberately NOT refused. The parent prefix is listable, so a
+// refusal here would prevent nothing and would imply an enumeration boundary
+// that does not exist (ADR 0017).
+func refuseSecretMutation(scope datasphere.Scope, key string) error {
+	if !datasphere.IsSecretsKey(scope.Prefix, key) {
+		return nil
+	}
+	return fmt.Errorf("%w: %s/ is provisioned by the operator; applications may read a secret and may not write or delete one",
+		ErrSecretsReadOnly, datasphere.SecretsSegment)
+}
+
+// ErrSecretsReadOnly reports a write or delete under a scope's secrets
+// subtree. It reaches an application as the frozen "permission" code, which is
+// what it is: this caller may not touch that key.
+var ErrSecretsReadOnly = errors.New("keyholder: the secrets subtree is read-only on the application data path")
 
 // fail writes the wire error. The message never quotes the logical key: it is
 // a name the cloud must not learn, and an error body is the easiest place for

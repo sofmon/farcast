@@ -22,6 +22,77 @@ const (
 	DefaultScopePrefix = "app/"
 )
 
+// SecretsSegment is the reserved first segment of a scope's secrets subtree:
+// <scope prefix>secrets/<app>/<name>.
+//
+// It is the one piece of key-space layout DataSphere knows about, and it earns
+// that by carrying a rule: the keyholder refuses application WRITES and
+// DELETES under it (see keyholder.Server), so a secret is created and removed
+// by the operator from their own machine and by nobody else.
+//
+// The same constant is mirrored, deliberately and frozen, in the Go SDK
+// (farcast.SecretsSegment) — that module has no dependencies and cannot
+// import this one — and `farcast secret` writes under it and nowhere else.
+const SecretsSegment = "secrets"
+
+// MaxSecretNameLen bounds a secret's name, mirroring the SDK's constant of the
+// same name.
+const MaxSecretNameLen = 128
+
+// ValidateSecretName is the writer's rule for a secret name.
+//
+// It mirrors the reader's rule in the Go SDK (farcast.validSecretName), and
+// the mirroring has a direction that matters: this rule must never be MORE
+// permissive than the SDK's. A writer that accepts a name the reader refuses
+// stores a secret no application can fetch — visible only when something in
+// production asks for it — while a writer that is stricter than the reader
+// merely refuses a name somebody could have used. When the two drift, drift
+// this way.
+//
+// The rules themselves: non-empty, at most MaxSecretNameLen bytes, ASCII
+// letters, digits, '_', '-' and '.', with the punctuation never at either
+// edge and never doubled as "..". No separators — a name is appended to the
+// application's own prefix, and a name containing "/" would address a
+// different subtree.
+func ValidateSecretName(name string) error {
+	if name == "" {
+		return fmt.Errorf("%w: a secret name must not be empty", ErrInvalidKey)
+	}
+	if len(name) > MaxSecretNameLen {
+		return fmt.Errorf("%w: a secret name must be at most %d bytes, got %d", ErrInvalidKey, MaxSecretNameLen, len(name))
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case c == '_' || c == '-' || c == '.':
+			if i == 0 || i == len(name)-1 {
+				return fmt.Errorf("%w: a secret name must not begin or end with %q", ErrInvalidKey, string(c))
+			}
+		default:
+			return fmt.Errorf("%w: a secret name may use only letters, digits, '_', '-' and '.'", ErrInvalidKey)
+		}
+	}
+	if strings.Contains(name, "..") {
+		return fmt.Errorf("%w: a secret name must not contain %q", ErrInvalidKey, "..")
+	}
+	return nil
+}
+
+// IsSecretsKey reports whether key addresses the secrets subtree of the scope
+// whose prefix owns it.
+//
+// A key exactly equal to the subtree's own prefix is not a secret: it is the
+// prefix, and it addresses no object.
+func IsSecretsKey(scopePrefix, key string) bool {
+	rest, ok := strings.CutPrefix(key, scopePrefix)
+	if !ok {
+		return false
+	}
+	after, ok := strings.CutPrefix(rest, SecretsSegment+ScopePrefixSuffix)
+	return ok && after != ""
+}
+
 // ScopePrefixSuffix is the separator every scope prefix ends with. A scope
 // owns a whole subtree, never a partial segment: without the trailing
 // separator a scope named "app" would also claim "application/…".

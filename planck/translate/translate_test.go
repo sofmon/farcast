@@ -33,6 +33,7 @@ func sampleConfig() Config {
 		StorageScope:      "app",
 		StorageServerName: "p42.datasphered.farcast",
 		StorageCAPEM:      []byte("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----"),
+		SecretsPrefix:     "app/secrets/",
 	}
 }
 
@@ -522,5 +523,42 @@ func TestTranslateRefusesAnAppWithNoCredential(t *testing.T) {
 	delete(c.Credentials, "web")
 	if _, err := Render(c); err == nil {
 		t.Fatal("Render accepted an app with no egress credential")
+	}
+}
+
+// Each application is pointed at its own secrets subtree, fully qualified.
+//
+// The SDK never derives this: a prefix guessed one segment away addresses
+// somebody else's subtree, or one the keyholder does not protect.
+func TestEachAppGetsItsOwnSecretsPrefix(t *testing.T) {
+	_, docs := render(t, sampleConfig())
+	for app, want := range map[string]string{
+		"api": "app/secrets/api/",
+		"web": "app/secrets/web/",
+	} {
+		cm := at(t, pick(t, docs, "ConfigMap", app), "data").(map[string]any)
+		if got := cm["FARCAST_SECRETS_PREFIX"]; got != want {
+			t.Errorf("%s: FARCAST_SECRETS_PREFIX = %v, want %q", app, got, want)
+		}
+	}
+}
+
+// An instance recorded before the scope prefix was written down gets no
+// secrets wiring rather than a guessed one. The SDK then reports the
+// capability as absent, which is true.
+func TestWithoutASecretsPrefixNoSecretsAreWired(t *testing.T) {
+	c := sampleConfig()
+	c.SecretsPrefix = ""
+	out, _ := render(t, c)
+	if strings.Contains(out, "FARCAST_SECRETS_PREFIX") {
+		t.Error("a secrets prefix was rendered for an instance that has none recorded")
+	}
+}
+
+func TestASecretsPrefixMustEndAtASegmentBoundary(t *testing.T) {
+	c := sampleConfig()
+	c.SecretsPrefix = "app/secrets"
+	if _, err := Render(c); err == nil {
+		t.Error("Render accepted a prefix that claims a partial name")
 	}
 }

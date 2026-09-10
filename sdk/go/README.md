@@ -6,7 +6,7 @@ The Go SDK is the library an application imports to talk to the FarCast environm
 
 This document is the specification for the Go SDK. It describes the full capability surface, the way each capability reaches its backing module, and — in detail — the logging capability that is implemented first.
 
-> **Status.** [`PLAN.md`](../../PLAN.md) phases **0.2** (core interfaces) and **0.3** (logging implementation) are done: the package, interface types, capability accessors, context helpers, and error sentinels are in place, and logging is a working structured logger (`go test -race`, `go vet`, and `golangci-lint` all clean). **Storage is wired** as of phase 3.2: `farcast.Storage()` talks to the instance's DataSphere keyholder, with `ErrStorageSealed` as a first-class application state. The remaining capabilities (Config, Net, AI, Secrets) return stubs until they are wired to their modules in later phases; see the [roadmap](#roadmap).
+> **Status.** [`PLAN.md`](../../PLAN.md) phases **0.2** (core interfaces) and **0.3** (logging implementation) are done: the package, interface types, capability accessors, context helpers, and error sentinels are in place, and logging is a working structured logger (`go test -race`, `go vet`, and `golangci-lint` all clean). **Storage is wired** as of phase 3.2: `farcast.Storage()` talks to the instance's DataSphere keyholder, with `ErrStorageSealed` as a first-class application state. **Config and Secrets are wired** as of phase 5.3: `farcast.Config()` reads the process environment (refusing the platform's own namespace), and `farcast.Secrets()` reads operator-provisioned secrets that are encrypted at rest in DataSphere and never placed in a Kubernetes Secret — read [ADR 0017](../../docs/adr/0017-application-secrets.md) for what that boundary is, because it is the **instance**, not the application. `Net()` and `AI()` return stubs until they are wired to their modules; see the [roadmap](#roadmap).
 
 ---
 
@@ -84,6 +84,7 @@ Five accessors form the syscall surface. Each returns an interface backed by a F
 |---|---|---|---|
 | **Logging** | `farcast.Log()` | the platform (TechnoCore/Planck) | **stdout** — no network call |
 | **Config** | `farcast.Config()` | environment + app configuration | process environment |
+| **Secrets** | `farcast.Secrets()` | [DataSphere](../../datasphere/README.md) | in-instance module endpoint |
 | **Storage** | `farcast.Storage()` | [DataSphere](../../datasphere/README.md) | in-instance module endpoint |
 | **Net** | `farcast.Net()` | [FatLine](../../fatline/README.md) | in-instance proxy |
 | **AI** | `farcast.AI()` | [AllThing](../../allthing/README.md) | in-instance module endpoint |
@@ -107,7 +108,17 @@ The SDK reads ambient identity and behaviour from environment variables on first
 | `FARCAST_LOG_LEVEL` | Minimum level to emit: `debug`, `info`, `warn`, `error`. | `info` |
 | `FARCAST_LOG_SOURCE` | When `true`, add caller `source` (file:line) to each record. Has a cost; off by default. | `false` |
 
-Later phases introduce endpoint variables for the remaining capabilities (for example a storage endpoint and the FatLine proxy address). They are documented in those phases, not here, so this table stays accurate to what exists.
+Every variable in the `FARCAST_` namespace belongs to the platform, and **`farcast.Config()` refuses to return any of them** — one of them (`FARCAST_FATLINE_PROXY`) is this application's egress credential, and a capability documented as *non-secret configuration* that hands it back is one that will eventually log it. Identity is reached through accessors instead:
+
+```go
+farcast.AppName()    // FARCAST_APP_NAME, else the executable's base name
+farcast.InstanceID() // FARCAST_INSTANCE_ID, else "local"
+farcast.Reserved(k)  // true if k belongs to the platform's namespace
+```
+
+`Reserved` is exported so an application that builds its own configuration layer over `os.Environ` can exclude the same set — a "dump my configuration" endpoint is the classic way an injected credential reaches a log. It is a guard rail on this SDK's surface, not a sandbox: `os.Getenv` still works, and pretending otherwise would make a reader trust the wrong thing.
+
+The remaining capabilities' endpoint variables are documented in their own sections below.
 
 `instance` and `app` are **ambient**: read once, attached to every record automatically. The per-request identity — the request ID — is not ambient; it travels on the `context.Context` (see [Context propagation](#context-propagation)).
 
@@ -248,7 +259,7 @@ Each interface takes an `API` suffix — `Storage()` returns `StorageAPI`, `Conf
 
 ### Config — `farcast.Config()`
 
-Non-secret configuration: environment defaults and per-app values. Secrets are a separate capability (`farcast.Secrets()`, phase 5.3) and never flow through `Config`.
+Non-secret configuration: the process environment, which is where the platform puts an application's configuration (Planck renders a ConfigMap per application and hands it to the container wholesale). Secrets are a separate capability ([`farcast.Secrets()`](#secrets--farcastsecrets)) and never flow through `Config`.
 
 ```go
 func Config() ConfigAPI
@@ -258,11 +269,19 @@ type ConfigAPI interface {
 	GetString(key, def string) string
 	GetInt(key string, def int) int
 	GetBool(key string, def bool) bool
-	Require(key string) (string, error) // error if key is absent
+	Require(key string) (string, error) // ErrConfigMissing if key is absent
 }
 ```
 
-Implementation: phase 5.3.
+Three behaviours are worth knowing, because each is a decision rather than an accident:
+
+- **An empty value counts as absent.** `PORT=` is what a mis-rendered template, an unset shell variable, or a ConfigMap key with nothing after the colon produces — essentially never what someone meant to configure. Reading it as present would make `Require`, whose entire job is to catch configuration that did not arrive, hand back `""` and let the application start on an empty database URL.
+- **The platform's namespace is refused.** `FARCAST_*` reads return the default; `Require` reports `ErrConfigReserved`, which is deliberately *not* `ErrConfigMissing` — the variable is very likely set, and an operator told "not set" would go and set it again.
+- **A present-but-unparseable value warns once.** `GetInt`/`GetBool` fall back to their defaults, as the interface requires, and log one warning naming the **key**. The value is never logged: an application's own configuration is its own business, and a warning is not the place to decide that somebody's connection string is safe to print. One warning per key, not one per call — a bad value is a fact about the deployment.
+
+The environment is read live on every call rather than snapshotted, which is what lets an application's own tests set a variable and see it.
+
+Implementation: ✅ phase 5.3.
 
 ### Storage — `farcast.Storage()`
 
@@ -355,6 +374,66 @@ Without a usable CA the SDK refuses to talk to the keyholder at all rather than 
 
 Implementation: phase 3.2.
 
+### Secrets — `farcast.Secrets()`
+
+The values an application must not carry in its image: database passwords, API tokens, signing keys. An operator provisions them with `farcast secret set`; the application reads them.
+
+```go
+func Secrets() SecretsAPI
+
+type SecretsAPI interface {
+	Get(ctx context.Context, name string) (Secret, error)
+}
+```
+
+```go
+token, err := farcast.Secrets().Get(ctx, "API_TOKEN")
+switch {
+case errors.Is(err, farcast.ErrSecretNotFound):
+	// nobody has set it
+case errors.Is(err, farcast.ErrStorageSealed):
+	// the instance is sealed — wait, do not proceed without it
+case err != nil:
+	return err
+}
+req.Header.Set("Authorization", "Bearer "+token.Reveal())
+```
+
+**Where they live.** Each secret is an object in the instance's encrypted storage under `<scope>/secrets/<app>/<name>`, served by the same keyholder as `Storage()`. It is encrypted before the cloud sees it, stored under an opaque name, and it is **never** a Kubernetes Secret — which is base64 in etcd, encrypted at rest under a key the cloud provider holds.
+
+**What the boundary is — read this before you put a payment credential behind it.** The boundary is the **instance**, not the application. A secret is confidential from the cloud provider and from anything outside the instance; it is *not* confidential from another application inside the same instance. Every application in an instance shares one storage scope, and the keyholder's data path authenticates the server only, so it cannot tell which application is asking. The full statement, the alternatives that were rejected, and what would close it is [ADR 0017](../../docs/adr/0017-application-secrets.md).
+
+**What is enforced:** an application may read a secret and may **not** create or delete one. The keyholder refuses `PUT` and `DELETE` under the subtree with `ErrPermission`. So a compromised application can read the instance's secrets, and cannot plant a credential for a neighbour to pick up or delete one to force a fallback.
+
+**`Secret` refuses to print itself.** The common way a secret escapes is not an attacker — it is a log line, an error message, or a struct that got marshalled into a response.
+
+```go
+type Secret struct{ /* … */ }
+
+func NewSecret(value string) Secret       // for fakes in your own tests
+func (s Secret) Reveal() string           // the one way out
+func (s Secret) Equal(want string) bool   // constant-time
+func (s Secret) Empty() bool
+```
+
+`fmt` (every verb, `%#v` included), `slog`, and `String()` all yield `[redacted]`. `MarshalJSON` and `MarshalText` **fail** with `ErrSecretSerialization` rather than emitting a placeholder: a well-formed document containing `[redacted]` where a working value was meant is discovered at the far end of whatever consumed it.
+
+**Reading is a round trip; there is no cache.** Read a secret at start-up and hold it. The SDK does not cache, because a cache's TTL is a security policy — how long a revoked secret keeps working — and the SDK is not the place to pick one on your behalf.
+
+**A sealed instance has no secrets.** `Get` reports `ErrStorageSealed` until an operator (or, from 5.4, a keeper device) unseals. An application that needs a secret at start-up will not start until then. That is the correct behaviour and the same contract [`Storage()`](#storage--farcaststorage) has.
+
+**What the cloud still sees.** The same list as storage, and one entry matters more here: a stored object's **size** is visible to within a constant, so a secret drawn from a small set of differing lengths is identified by its size alone. Pad to a fixed slot deterministically if that matters for yours.
+
+#### Configuration
+
+| Variable | Meaning |
+|---|---|
+| `FARCAST_SECRETS_PREFIX` | this application's secrets subtree, fully qualified, ending in `/` |
+
+The platform sets it; the SDK never derives it. A prefix guessed from the scope name and the application name would land one segment away from the subtree the keyholder protects, and the capability would still call itself Secrets while reading ordinary storage. The SDK refuses any prefix that does not name the reserved `secrets/` segment, and reports `ErrStorageUnavailable` — not `ErrNotImplemented` — when a prefix is set but no keyholder is configured, so an operator is sent to the missing variable rather than to this roadmap.
+
+Implementation: ✅ phase 5.3.
+
 ### Net — `farcast.Net()`
 
 Outbound networking through [FatLine](../../fatline/README.md). The returned HTTP client routes every request through FatLine, which permits only the `external` hosts the application declared in its manifest; everything else is denied by default and flagged by Shrike. The application makes ordinary HTTP calls and the boundary is enforced underneath.
@@ -399,6 +478,8 @@ Implementation: phase 6.3.
   var ErrNotImplemented = errors.New("farcast: capability not implemented")
   ```
 
+- **Configuration sentinels.** `ErrConfigMissing` (not set, or set to the empty string) and `ErrConfigReserved` (the platform's namespace, which `Config` refuses). They are distinct because "not set" and "set, and not yours to read" send an operator to different places.
+- **Secrets sentinels.** `ErrSecretNotFound` means absence and only absence — not a malformed name, and not a seal. A sealed instance reports `ErrStorageSealed` through `Secrets()` as well, because it is the same keyholder and the same condition, and the correct response is to wait rather than to proceed without the secret. `ErrSecretSerialization` is what a `Secret` returns instead of marshalling itself.
 - **Storage sentinels.** `ErrStorageSealed`, `ErrObjectNotFound`, `ErrIntegrity`, `ErrInvalidKey`, `ErrTooLarge`, `ErrPermission`, and `ErrStorageUnavailable`. The set is deliberately small: each is inherited by every application ever written against this SDK, so one added carelessly can never be withdrawn. DataSphere's own vocabulary is wider — sentinels describing an *operator's* problem (a bucket proved to belong to another instance, a retention policy still billing for deleted objects) do not cross into this module, because an application cannot act on them and an error it cannot act on is one it may branch on wrongly. `ErrStorageUnavailable` is the total-mapping catch-all: an answer this build does not understand must never collapse into "no such object" or "never will work", since both are wrong in ways that cost data.
 - **Sentinel errors with `errors.Is`.** Following the same pattern as the manifest parser (see [`manifest/parser/parser.go`](../../manifest/parser/parser.go)), the SDK exposes sentinel errors and supports `errors.Is` for classification rather than string matching.
 - **`context.Context` is the first argument** of every I/O method. Cancellation and deadlines are honoured; the request ID propagates. `farcast.Log()` and `farcast.Config()` accessors themselves never fail — only their I/O-performing methods (and only Config's `Require`) return errors.
@@ -428,11 +509,11 @@ Per [`../../AGENTS.md`](../../AGENTS.md) ("Language guardrails") and [ADR 0002](
 | Capability | Interface defined | Implementation |
 |---|---|---|
 | Logging — `Log()` | phase 0.2 | **phase 0.3** |
-| Config — `Config()` | phase 0.2 | phase 5.3 |
+| Config — `Config()` | phase 0.2 | ✅ phase 5.3 |
 | Storage — `Storage()` | phase 0.2 | ✅ phase 3.2 |
 | Net — `Net()` | phase 0.2 | with the app data path (phase 4.2/4.4; FatLine core shipped in phase 2) |
 | AI — `AI()` | phase 0.2 | phase 6.3 |
-| Secrets — `Secrets()` | phase 5.3 | phase 5.3 |
+| Secrets — `Secrets()` | phase 5.3 | ✅ phase 5.3 |
 
 Node.js and Python SDKs mirror this contract in phase 8.4.
 

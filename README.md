@@ -8,7 +8,7 @@ FarCast is a cloud-native operating system by [Sofmon](https://sofmon.com). It t
 
 ### Build progress
 
-Phases 0–4 of 8 complete, Phase 5 under way · **18 of 35 sections**
+Phases 0–4 of 8 complete, Phase 5 under way · **19 of 35 sections**
 
 ```
 Phase 0  Foundation                     ████████████████████  3/3 ✅
@@ -16,13 +16,13 @@ Phase 1  Install                        █████████████�
 Phase 2  Networking & security boundary ████████████████████  3/3 ✅
 Phase 3  Storage                        ████████████████████  3/3 ✅
 Phase 4  Run applications               ████████████████████  4/4 ✅
-Phase 5  Intelligent resources          ███████▓············  1½/4
+Phase 5  Intelligent resources          ████████████▓·······  2½/4
 Phase 6  AI layer                       ····················  0/4
 Phase 7  FarSight GUI                   ····················  0/5
 Phase 8  Multi-provider & hardening     ····················  0/5
 ```
 
-Phases 1–4 and Phase 5's first two sections are **validated live against real cloud infrastructure**, not only unit-tested — walked against a [runbook](docs/runbooks/), with every defect each walk found recorded in it. Three things are deliberately not claimed: section 3.2's own runbook is only partly walked (its keyholder is exercised by every Phase 4 walk, but the deliberate-seal and node-upgrade paths are not); the two defects [the 5.2 walk](docs/runbooks/phase-5-2-validation.md) found are fixed but their fixes are not themselves walked; and no cost figure has yet been reconciled against a real invoice. See [PLAN.md](PLAN.md) for what each section contains and where it stands.
+Phases 1–4 and Phase 5's first two sections are **validated live against real cloud infrastructure**, not only unit-tested — walked against a [runbook](docs/runbooks/), with every defect each walk found recorded in it. Four things are deliberately not claimed: section 3.2's own runbook is only partly walked (its keyholder is exercised by every Phase 4 walk, but the deliberate-seal and node-upgrade paths are not); the two defects [the 5.2 walk](docs/runbooks/phase-5-2-validation.md) found are fixed but their fixes are not themselves walked; **section 5.3 is complete and unwalked**, its [runbook](docs/runbooks/phase-5-3-validation.md) written and unrun; and no cost figure has yet been reconciled against a real invoice. See [PLAN.md](PLAN.md) for what each section contains and where it stands.
 
 ---
 
@@ -372,18 +372,20 @@ Each module folder contains its own `README.md` with:
 >
 > **Phase 5 (intelligent resources), in progress:** TechnoCore now sees what applications actually *use*, not only what they reserve — CPU and memory from the cluster's own metrics, network traffic from the boundary that carries it — and right-sizes application reservations against it. Two of 5.2's four bullets are answered by a **refusal** rather than an implementation, with the reasoning recorded: request latency cannot be measured without breaking the confidentiality FatLine exists to provide, and replica count cannot be inferred from a resource measurement when the manifest never said whether an application may correctly run twice. Adapting is off by default; the advice is published either way.
 >
-> Sections 5.3 (SDK config and secrets) and 5.4 (`farcast keeper`) are next. Phases 6–8 are in specification.
+> Section 5.3 completes the SDK's environment: `farcast.Config()` reads an application's configuration and **refuses the platform's own namespace** — one entry of which is the application's egress credential — and `farcast.Secrets()` reads secrets that live as encrypted objects in the instance's storage, never as a Kubernetes Secret. The boundary that buys is stated plainly rather than implied: a secret is confidential from the cloud and from anything outside the instance, and **not** from another application inside it, because every application shares one storage scope and the keyholder cannot tell which one is asking. What the keyholder *can* enforce, it does — no application creates or destroys a secret.
+>
+> Section 5.4 (`farcast keeper`) is next. Phases 6–8 are in specification.
 
 | Module | Spec | Implementation |
 |---|---|---|
 | TechnoCore | 🟡 In progress | 🟡 Kernel, two-signal cost ledger, protective shutdown, per-application usage profiles, and right-sizing of application reservations (off by default) |
 | Planck | 🟡 In progress | 🟡 GKE Autopilot provider, instance image registry, manifest→workload translator, in-instance build and manifest read |
 | FatLine | 🟡 In progress | 🟡 Core proxy: mTLS tunnel, deny-by-default egress, per-application egress policy |
-| DataSphere | 🟡 In progress | 🟡 Encrypting store, blob formats v1+v2, keyring, GCS adapter, in-cluster keyholder |
+| DataSphere | 🟡 In progress | 🟡 Encrypting store, blob formats v1+v2, keyring, GCS adapter, in-cluster keyholder, operator-only secrets subtree |
 | Shrike | 🟡 In progress | 🟡 Policy engine, with violations *and* allowed traffic attributed to the application that caused them; deployed as a sidecar beside FatLine |
 | AllThing | 🔲 Draft | 🔲 Not started |
-| FarSight | 🟡 In progress | 🟡 CLI: the full `install → connect → run → release` lifecycle, plus `storage`, `kernel`, `toolchain`, `ps`, `logs`, `costs`, `usage`; engine-less image build (GUI is Phase 7) |
-| SDK | 🟡 In progress | 🟡 Go: logging and storage live; config and secrets are Phase 5.3, AI is Phase 6 |
+| FarSight | 🟡 In progress | 🟡 CLI: the full `install → connect → run → release` lifecycle, plus `storage`, `secret`, `kernel`, `toolchain`, `ps`, `logs`, `costs`, `usage`; engine-less image build (GUI is Phase 7) |
+| SDK | 🟡 In progress | 🟡 Go: logging, storage, config and secrets live — a `Secret` that refuses to print or marshal itself; AI is Phase 6 |
 | Manifest Spec | ✅ Complete | ✅ Parser + tests |
 
 *Legend: ✅ complete · 🟡 in progress · 🔲 draft / not started.*

@@ -393,3 +393,47 @@ func TestStoredPrefixReportsWhatListingQueries(t *testing.T) {
 		t.Errorf("StoredPrefix(%q) = %q, want empty", "app", got)
 	}
 }
+
+// IsSecretsKey decides what the keyholder refuses to let an application write,
+// so its edges are the rule's edges.
+func TestIsSecretsKey(t *testing.T) {
+	for _, tc := range []struct {
+		key  string
+		want bool
+	}{
+		{"app/secrets/api/DB_PASSWORD", true},
+		{"app/secrets/x", true},
+		// The subtree's own prefix addresses no object.
+		{"app/secrets/", false},
+		{"app/secrets", false},
+		// A neighbouring name that merely starts with the segment.
+		{"app/secretsauce/x", false},
+		{"app/reports/q3.csv", false},
+		// Outside the scope entirely: not this scope's secrets.
+		{"other/secrets/api/x", false},
+		{"", false},
+	} {
+		if got := IsSecretsKey("app/", tc.key); got != tc.want {
+			t.Errorf("IsSecretsKey(app/, %q) = %v, want %v", tc.key, got, tc.want)
+		}
+	}
+}
+
+// The writer's rule for a secret name. The same table appears in the SDK's
+// own tests, because the two implementations live in modules that cannot
+// import each other; when they drift, the writer must be the stricter one.
+func TestValidateSecretName(t *testing.T) {
+	for _, name := range []string{"A", "DB_PASSWORD", "api.key", "token-2", "x"} {
+		if err := ValidateSecretName(name); err != nil {
+			t.Errorf("ValidateSecretName(%q) = %v, want nil", name, err)
+		}
+	}
+	for _, name := range []string{
+		"", "../../master/key", "a/b", "DB PASSWORD", "sh|ell",
+		".hidden", "trailing.", "a..b", strings.Repeat("x", MaxSecretNameLen+1),
+	} {
+		if err := ValidateSecretName(name); err == nil {
+			t.Errorf("ValidateSecretName(%q) = nil, want a refusal", name)
+		}
+	}
+}

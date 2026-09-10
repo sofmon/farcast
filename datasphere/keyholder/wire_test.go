@@ -119,3 +119,40 @@ func TestUnknownErrorsGetNoCode(t *testing.T) {
 		t.Errorf("status = %d, want 500", status)
 	}
 }
+
+// The secrets subtree's reserved segment is the third string the two modules
+// must agree on, alongside the wire codes.
+//
+// A disagreement would not fail loudly: the SDK would read secrets from a
+// prefix the keyholder does not protect, so applications could write and
+// delete each other's secrets while both sides believed the rule was in force.
+func TestSecretsSegmentMatchesTheSDK(t *testing.T) {
+	src, err := os.ReadFile("../../sdk/go/secretsclient.go")
+	if err != nil {
+		t.Fatalf("read the SDK's secrets client: %v", err)
+	}
+	m := regexp.MustCompile(`(?m)^\s*(?:const\s+)?SecretsSegment\s*=\s*"([^"]*)"`).FindSubmatch(src)
+	if m == nil {
+		t.Fatal("the SDK does not declare SecretsSegment")
+	}
+	if got := string(m[1]); got != datasphere.SecretsSegment {
+		t.Errorf("SecretsSegment = %q here and %q in the SDK", datasphere.SecretsSegment, got)
+	}
+
+	// The name bound is the other half of the same agreement. The writer's
+	// rule (datasphere.ValidateSecretName) must never be more permissive than
+	// the reader's, and the length cap is the part of it that can be compared
+	// across a module boundary without re-implementing the rule.
+	secrets, err := os.ReadFile("../../sdk/go/secrets.go")
+	if err != nil {
+		t.Fatalf("read the SDK's secrets surface: %v", err)
+	}
+	m = regexp.MustCompile(`(?m)^\s*(?:const\s+)?MaxSecretNameLen\s*=\s*(\d+)`).FindSubmatch(secrets)
+	if m == nil {
+		t.Fatal("the SDK does not declare MaxSecretNameLen")
+	}
+	if got := string(m[1]); got != fmt.Sprint(datasphere.MaxSecretNameLen) {
+		t.Errorf("MaxSecretNameLen = %d here and %s in the SDK; the writer must never accept a name the reader refuses",
+			datasphere.MaxSecretNameLen, got)
+	}
+}

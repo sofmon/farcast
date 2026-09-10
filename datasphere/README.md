@@ -415,6 +415,16 @@ Three details are easy to get wrong and each is pinned by a test:
 
 And the selectors name labels that *other modules* render: FatLine's pod label, and the namespace and pod labels [Planck's translator](../planck/README.md) stamps on an application. A selector that does not match what those packages emit is a policy that silently admits nobody — storage timing out for every application while the keyholder looks healthy. `TestThePolicyAdmitsWhatTheOtherModulesActuallyRender` renders all three and compares them, because the 4.1 validation walk found this exact shape once already: a selector and a label that were each correct and never met.
 
+### The secrets subtree is read-only to applications (Phase 5.3)
+
+One key-space rule reaches into DataSphere itself: a key under `<scope>/secrets/` may be **read** on the application data path and may not be written or deleted. `PUT` and `DELETE` are refused with `keyholder.ErrSecretsReadOnly`, reported as the frozen `permission` code, before the request body is read.
+
+The rule is narrow on purpose, and what it is *not* is as important as what it is. The data path authenticates the server only, and every application in an instance declares the same scope, so the keyholder **cannot tell whose secret this is** — a per-application boundary here would be a claim it has no way to hold. What it can tell is that a write is happening, and secrets are written from the operator's machine, client-side, never through this path. So a compromised application can read the instance's secrets, and cannot plant a credential for a neighbour to pick up, or delete one to force a fallback to something weaker.
+
+Listing is deliberately **not** refused: the parent prefix is listable by the same caller, so a refusal would prevent nothing while implying an enumeration boundary that does not exist. A test asserts the listing succeeds, so hardening it later is a deliberate act rather than a quiet one.
+
+`datasphere.SecretsSegment` is the reserved segment, mirrored — frozen, and cross-checked by a test — in the Go SDK, which cannot import this module. The whole stance, including what would close the isolation gap, is [ADR 0017](../docs/adr/0017-application-secrets.md).
+
 ---
 
 ## The instance bucket

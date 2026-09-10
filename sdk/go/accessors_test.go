@@ -9,6 +9,7 @@ func TestAccessorsReturnUsableValues(t *testing.T) {
 	_ = Log()
 	_ = Config()
 	_ = Storage()
+	_ = Secrets()
 	_ = AI()
 
 	if Net().HTTPClient() == nil {

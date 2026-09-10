@@ -109,6 +109,20 @@ type Config struct {
 	// rather than reaching a keyholder it was not told about.
 	StorageScope string
 
+	// SecretsPrefix is the instance's secrets root, ending in "/"; each
+	// application's own subtree is that root plus its name.
+	//
+	// The caller supplies it whole rather than letting this package build it
+	// from the scope name, for two reasons. A scope may own any prefix, so
+	// the two are not derivable from each other. And the reserved segment
+	// inside it is a contract between DataSphere and the SDK — the two that
+	// enforce and consume it — so a third copy here would be a third place
+	// for it to drift.
+	//
+	// Empty means secrets are not wired, and the SDK reports the capability
+	// as absent rather than reading from a prefix somebody guessed.
+	SecretsPrefix string
+
 	// StorageCAPEM is the instance CA certificate an application uses to
 	// verify the keyholder. It is a certificate, not a key: it goes in a
 	// ConfigMap, and putting it anywhere more guarded would imply it is
@@ -154,6 +168,12 @@ func Render(c Config) ([]byte, error) {
 		// is deleted wholesale when its deployment is removed.
 		return nil, fmt.Errorf("translate: refusing to deploy applications into %q, which belongs to FarCast itself", SystemNamespace)
 	}
+	if c.SecretsPrefix != "" && !strings.HasSuffix(c.SecretsPrefix, "/") {
+		// A prefix that does not end at a segment boundary claims a partial
+		// name: "app" would also own "application/…". Refusing here beats
+		// rendering a ConfigMap that points applications at the wrong subtree.
+		return nil, fmt.Errorf("translate: secrets prefix %q must end in %q", c.SecretsPrefix, "/")
+	}
 	if strings.HasPrefix(c.Namespace, "kube-") {
 		return nil, fmt.Errorf("translate: refusing to deploy into the managed namespace %q (ADR 0003)", c.Namespace)
 	}
@@ -171,10 +191,12 @@ func Render(c Config) ([]byte, error) {
 		StorageStatusService: StorageStatusService,
 		StorageStatusPort:    StorageStatusPort,
 		StorageScope:         c.StorageScope,
+		SecretsPrefix:        c.SecretsPrefix,
 		StorageServerName:    c.StorageServerName,
 		StorageCA:            indentPEM(c.StorageCAPEM),
 		NodeLocalDNS:         NodeLocalDNS,
 		HasStorage:           c.StorageScope != "" && len(c.StorageCAPEM) > 0,
+		HasSecrets:           c.StorageScope != "" && len(c.StorageCAPEM) > 0 && c.SecretsPrefix != "",
 		RequestCPUMilli:      RequestCPUMilli,
 		RequestMemMiB:        RequestMemMiB,
 		Port:                 DefaultPort,
@@ -285,6 +307,8 @@ type templateData struct {
 	StorageService       string
 	StorageStatusService string
 	StorageScope         string
+	SecretsPrefix        string
+	HasSecrets           bool
 	StorageServerName    string
 	StorageCA            string
 	NodeLocalDNS         string
