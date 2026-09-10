@@ -292,7 +292,12 @@ func (r secretSetResult) Human(w io.Writer) error {
 	if r.TrimmedNewline {
 		fprintln(w, "  A trailing newline was removed; pass --raw to keep one.")
 	}
-	fprintf(w, "  %s reads it with farcast.Secrets().Get(ctx, %q) on its next start.\n", r.App, r.Name)
+	// Not "on its next start": the SDK holds no cache, so a running
+	// application picks this up on its next read. Saying otherwise sent an
+	// operator to restart a workload that did not need restarting — and, worse,
+	// implied a rotation would NOT take effect until one, which is the sort of
+	// thing somebody relies on while revoking a credential.
+	fprintf(w, "  %s picks it up on its next read of farcast.Secrets().Get(ctx, %q) — no restart needed.\n", r.App, r.Name)
 	return nil
 }
 

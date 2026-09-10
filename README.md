@@ -22,7 +22,7 @@ Phase 7  FarSight GUI                   ····················
 Phase 8  Multi-provider & hardening     ····················  0/5
 ```
 
-Phases 1–4 and Phase 5's first two sections are **validated live against real cloud infrastructure**, not only unit-tested — walked against a [runbook](docs/runbooks/), with every defect each walk found recorded in it. Four things are deliberately not claimed: section 3.2's own runbook is only partly walked (its keyholder is exercised by every Phase 4 walk, but the deliberate-seal and node-upgrade paths are not); the two defects [the 5.2 walk](docs/runbooks/phase-5-2-validation.md) found are fixed but their fixes are not themselves walked; **section 5.3 is complete and unwalked**, its [runbook](docs/runbooks/phase-5-3-validation.md) written and unrun; and no cost figure has yet been reconciled against a real invoice. See [PLAN.md](PLAN.md) for what each section contains and where it stands.
+Phases 1–4 and Phase 5's first three sections are **validated live against real cloud infrastructure**, not only unit-tested — walked against a [runbook](docs/runbooks/), with every defect each walk found recorded in it. Three things are deliberately not claimed: section 3.2's own runbook is only partly walked (its keyholder is exercised by every Phase 4 walk, but the deliberate-seal and node-upgrade paths are not); the two defects [the 5.2 walk](docs/runbooks/phase-5-2-validation.md) found are fixed but their fixes are not themselves walked; and no cost figure has yet been reconciled against a real invoice. See [PLAN.md](PLAN.md) for what each section contains and where it stands.
 
 ---
 

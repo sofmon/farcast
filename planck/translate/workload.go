@@ -60,6 +60,19 @@ metadata:
     app.kubernetes.io/managed-by: farcast
     app.kubernetes.io/part-of: {{$.Deployment}}
 data:
+  # Ambient identity. The SDK stamps these on every log record it emits, and
+  # without them an application reports the executable's base name and the
+  # string "local" — on a real instance, in the operator's own log stream.
+  #
+  # Worse than cosmetic: two applications built from one image are then
+  # INDISTINGUISHABLE in the operator log stream, and farcast.AppName() — the accessor
+  # ADR 0017 points applications at, because Config refuses this namespace —
+  # answers with something the manifest never said. Found on the 5.3 walk,
+  # where alpha and beta both logged themselves as "demo".
+  FARCAST_APP_NAME: {{.Name}}
+{{- if $.Instance}}
+  FARCAST_INSTANCE_ID: {{$.Instance}}
+{{- end}}
   # FARCAST_FATLINE_PROXY is NOT here. It carries this application's egress
   # credential (ADR 0013), so it lives in the Secret below — a ConfigMap is
   # readable by anything that can read ConfigMaps, and this value is what tells

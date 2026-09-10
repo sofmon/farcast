@@ -562,3 +562,39 @@ func TestASecretsPrefixMustEndAtASegmentBoundary(t *testing.T) {
 		t.Error("Render accepted a prefix that claims a partial name")
 	}
 }
+
+// Ambient identity reaches the container.
+//
+// Without it the SDK stamps every log record with the executable's base name
+// and the string "local", so two applications built from one image are
+// indistinguishable in the operator's log stream — and farcast.AppName(), the
+// accessor ADR 0017 points applications at because Config refuses this
+// namespace, answers with something the manifest never said. Found live on the
+// 5.3 walk, where both applications logged themselves as "demo".
+func TestAmbientIdentityReachesEachApp(t *testing.T) {
+	_, docs := render(t, sampleConfig())
+	for _, app := range []string{"api", "web"} {
+		cm := at(t, pick(t, docs, "ConfigMap", app), "data").(map[string]any)
+		if got := cm["FARCAST_APP_NAME"]; got != app {
+			t.Errorf("%s: FARCAST_APP_NAME = %v, want %q", app, got, app)
+		}
+		if got := cm["FARCAST_INSTANCE_ID"]; got != "p42" {
+			t.Errorf("%s: FARCAST_INSTANCE_ID = %v, want the instance", app, got)
+		}
+	}
+}
+
+// A deployment rendered without an instance name carries no instance variable
+// rather than an empty one: the SDK's own "local" fallback is a truer answer
+// than a blank string that looks like an identity.
+func TestWithoutAnInstanceNoInstanceIDIsRendered(t *testing.T) {
+	c := sampleConfig()
+	c.Instance = ""
+	out, _ := render(t, c)
+	if strings.Contains(out, "FARCAST_INSTANCE_ID") {
+		t.Error("an empty instance id was rendered")
+	}
+	if !strings.Contains(out, "FARCAST_APP_NAME") {
+		t.Error("the app name is not optional")
+	}
+}
