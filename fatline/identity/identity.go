@@ -72,6 +72,41 @@ func IssueKeyholderServer(caCertPEM, caKeyPEM []byte, instance string) (certPEM,
 	return leaf.CertPEM, leaf.KeyPEM, nil
 }
 
+// IssueKeeperClient issues one keeper device's client leaf from an
+// already-minted CA (phase 5.4).
+//
+// It is a separate issuance from Mint's operator leaf for the reason the
+// keeper design turns on: each device is named, so one can be revoked without
+// revoking the fleet, and a device holds a credential that authorizes the seal
+// control surface and nothing else.
+//
+// The CA private key is an argument and is never retained. That is what keeps
+// a keeper unable to enrol another keeper: minting happens on the operator's
+// machine, and the device receives a leaf rather than the authority to make
+// one.
+//
+// The leaf carries the CA's ordinary 90-day validity, which is the fleet's
+// only automatic revocation: a device that is never re-enrolled stops being
+// able to re-seed. `keeper revoke` is immediate for the operator's own records
+// and bounded by this date in the cluster.
+func IssueKeeperClient(caCertPEM, caKeyPEM []byte, instance, device string) (certPEM, keyPEM []byte, err error) {
+	if instance == "" {
+		return nil, nil, errors.New("identity: empty instance name")
+	}
+	if device == "" {
+		return nil, nil, errors.New("identity: empty device name")
+	}
+	ca, err := fcrypto.LoadCA(caCertPEM, caKeyPEM)
+	if err != nil {
+		return nil, nil, err
+	}
+	leaf, err := ca.IssueClient(KeeperURI(instance, device))
+	if err != nil {
+		return nil, nil, fmt.Errorf("identity: issue keeper client cert: %w", err)
+	}
+	return leaf.CertPEM, leaf.KeyPEM, nil
+}
+
 // Material is a per-instance mTLS identity, PEM-encoded for storage. CAKeyPEM is
 // the crown jewel — it stays on the operator's machine; ClusterSecret carries
 // only what FatLine needs in-cluster.

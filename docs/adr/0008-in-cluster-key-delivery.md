@@ -104,6 +104,22 @@ The theorem in *Context* leaves exactly one lawful automation: an external party
 
 None of this reopens decision 5. A peer is an in-cluster principal whose credentials the cloud mints; a keeper is the theorem's external party. The line holds.
 
+### What 5.4 actually shipped, and where it fell short of this record
+
+*(Added 2026-09-10, when the desktop keeper landed.)* The constraints above were written before anything implemented them. Six of the seven survived contact; the parts that did not are here rather than quietly absent.
+
+**Held as written.** A keeper holds a derived bundle and its own leaf and never the keyring or the CA key, so a stolen device can re-seed and cannot enrol another. It is outbound-only. It refuses to act on an operator hold — locally, before dialling, with the in-cluster refusal as the backstop rather than the only check. It refuses beyond its budget instead of re-seeding, and the refusal is the alarm. Every push lands in an append-only local ledger, and a device that is un-enrolled keeps the ledger, because erasing it would remove exactly the evidence an audit reads.
+
+**Finding 1 needed a primitive that did not exist.** "Reconciles the fleet's reseed counts against `datasphered`'s witnessed restarts" assumes the cluster can say how many times it restarted, and nothing in the seal state said so: a restarted process reports `restart-sealed` and a generation, both of which a solicited push also produces. So `datasphered` now mints a random **boot label** per process and serves it on the mutually-authenticated control surface only — never on the status endpoint, which is unauthenticated so a kubelet can probe a sealed replica. A keeper records which process it seeded, and the audit compares reseeds against **distinct** boots. One per boot is a cluster restarting; two into the same boot is a live process being handed material it already held. The label is random, derived from nothing, and says only that a restart happened.
+
+**Finding 2's "device-bound" is not delivered on the desktop, and saying otherwise would be the overpromise this project keeps refusing.** The bundle, the leaf key and the ledger rest at 0600 inside a 0700 directory, marked excluded from the platform's backup pipeline with the exclusion **read back** — a setter nobody checked is an intention, not a guarantee — and installing into a synced folder is refused outright and cannot be overridden, because a synced directory is a continuous upload rather than a periodic copy. What is missing is hardware binding: on a desktop, without a hardware keystore, the material is a file that anything running as the operator can read. Binding it to machine identifiers was considered and rejected as obfuscation — those identifiers are readable by whatever can read the file. Hardware binding waits for 7.5, where the platform APIs exist. A platform that cannot verify the backup exclusion refuses to install without an explicit override, and the override is written into the device's own record.
+
+**Finding 3's revocation is narrower than the word suggests, and the command says so.** `keeper revoke` marks a device withdrawn in the operator's records; it does not reach the cluster, and the device's certificate stays valid. What retires a lost device's bundle is `storage rekey`, and the command prints that rather than implying it happened. There is one automatic bound that was already there and had not been noticed: leaves carry the CA's 90-day validity, so an un-renewed keeper stops keeping on its own. That is the fleet's only automatic revocation, and it is now surfaced at enrolment and in `keeper status` before it arrives rather than after a device has silently stopped.
+
+**Finding 7's staleness check runs on the device.** A keeper whose bundle is older than the generation the cluster has held refuses and says to re-enrol, rather than pushing retired keys at a replica that would serve them.
+
+**What is still owed.** The in-cluster key-id pin of finding 4 is specified and not implemented: `datasphered` accepts any bundle at a generation no older than the one it holds, and after a restart it holds none, so a stale bundle is refused by the keeper's own check and by nothing in the cluster. That makes revocation-plus-rekey bind an honest keeper and not a modified one. It is recorded here rather than in a runbook because it is the difference between decision 3's backstop being real and being a plan.
+
 ### Phasing
 
 - **3.2** — `datasphered`, the unseal push, `ErrStorageSealed` + `Status()` + readiness gating, two replicas + PDB, one scope (the instance's own). Per-scope derivation is *specified*, not frozen. The unseal message is shaped as the keeper protocol from day one — bundle, key IDs, generation, restart-seal distinguished from operator hold — so 5.4 adds a driver, not a protocol.
@@ -144,4 +160,4 @@ External, for the claims this ADR rejects vendors on:
 
 ---
 
-*This ADR is a living record. Revisit it when a managed Kubernetes offers workload attestation rooted outside the node operator (reopening K3 and with it autonomy), when the first application proves it cannot tolerate a sealed window, when the keeper fleet lands (5.4/7.5) and its reseed budget meets real restart cadences, and when the write-only successor ADR is written.*
+*This ADR is a living record. Revisit it when a managed Kubernetes offers workload attestation rooted outside the node operator (reopening K3 and with it autonomy), when the first application proves it cannot tolerate a sealed window, when the desktop keeper's budget meets a real month of Autopilot restarts, when the mobile keeper lands (7.5) and brings the hardware binding the desktop cannot offer, and when the write-only successor ADR is written.*

@@ -34,6 +34,11 @@ var ErrMetadataConflict = errors.New("instance metadata changed on disk since it
 
 const (
 	instancesSubdir = "instances"
+	// keepersSubdir holds what this device needs to act as a keeper. It sits
+	// beside instances rather than inside one: keeping an instance is a role a
+	// device plays, and a keeper device is usually not the machine that holds
+	// that instance's keyring.
+	keepersSubdir   = "keepers"
 	metadataFile    = "metadata.yaml"
 	credentialsFile = "credentials.yaml"
 	kubeconfigFile  = "kubeconfig.yaml"
@@ -171,6 +176,27 @@ type Keyholder struct {
 	RecordedAt time.Time `yaml:"recorded_at,omitempty"`
 }
 
+// Keeper records one enrolled keeper device, from the operator's side.
+//
+// Nothing secret is here: the device's leaf went to the device, and its private
+// key was never on this machine after issuance. What this records is the fleet
+// — who is enrolled, since when, and until when their credential is valid —
+// because a fleet nobody wrote down cannot be audited or revoked.
+type Keeper struct {
+	Device     string    `yaml:"device"`
+	EnrolledAt time.Time `yaml:"enrolled_at"`
+	// Expires is the leaf's own NotAfter. It is the fleet's only automatic
+	// revocation, so it is recorded where an operator will see it before it
+	// arrives rather than after a keeper has silently stopped keeping.
+	Expires    time.Time `yaml:"expires,omitzero"`
+	Generation uint64    `yaml:"generation,omitempty"`
+	Budget     int       `yaml:"budget,omitempty"`
+	// Revoked marks a device the operator has withdrawn. The row stays, so an
+	// audit of old ledger entries can still attribute them.
+	Revoked   bool      `yaml:"revoked,omitempty"`
+	RevokedAt time.Time `yaml:"revoked_at,omitzero"`
+}
+
 // Kernel records the in-cluster TechnoCore.
 //
 // Nothing secret lives here. It exists for the same reason the Keyholder block
@@ -244,6 +270,9 @@ type InstanceMetadata struct {
 	// Storage is the instance's DataSphere bucket (3.3), pointer-typed for the
 	// same reason Registry is.
 	Storage *Storage `yaml:"storage,omitempty"`
+
+	// Keepers is the enrolled keeper fleet (phase 5.4).
+	Keepers []Keeper `yaml:"keepers,omitempty"`
 
 	// Keyholder is the in-cluster process that serves storage to
 	// applications; nil until `farcast storage deploy` has run.
@@ -565,6 +594,38 @@ func (d Dir) datasphereDir(name string) string {
 // erase, so a fleet's ledgers can be reconciled against what the cluster says
 // it restarted. Phase 5.4 reads it; 3.2 only writes it, so that when a keeper
 // arrives the history is already there.
+// KeeperDir is where THIS device keeps what it needs to act as a keeper for an
+// instance: its own leaf, the scope bundle it re-seeds with, and its ledger.
+//
+// It is deliberately outside the instance directory. An instance directory is
+// the operator's crown-jewel store — the CA key and the keyring — and a keeper
+// is a different role that a different machine plays; keeping them apart is
+// what lets a device be a keeper for an instance it does not otherwise hold.
+func (d Dir) KeeperDir(instance string) string {
+	return filepath.Join(string(d), keepersSubdir, instance)
+}
+
+// KeepersPath is the root of every keeper this device is enrolled as.
+func (d Dir) KeepersPath() string { return filepath.Join(string(d), keepersSubdir) }
+
+// ListKeepers returns the instances this device is enrolled to keep.
+func (d Dir) ListKeepers() ([]string, error) {
+	entries, err := os.ReadDir(d.KeepersPath())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var out []string
+	for _, e := range entries {
+		if e.IsDir() {
+			out = append(out, e.Name())
+		}
+	}
+	return out, nil
+}
+
 func (d Dir) InstanceUnsealLedgerPath(name string) string {
 	return filepath.Join(d.datasphereDir(name), "unseal-ledger.jsonl")
 }

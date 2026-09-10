@@ -415,6 +415,14 @@ Three details are easy to get wrong and each is pinned by a test:
 
 And the selectors name labels that *other modules* render: FatLine's pod label, and the namespace and pod labels [Planck's translator](../planck/README.md) stamps on an application. A selector that does not match what those packages emit is a policy that silently admits nobody — storage timing out for every application while the keyholder looks healthy. `TestThePolicyAdmitsWhatTheOtherModulesActuallyRender` renders all three and compares them, because the 4.1 validation walk found this exact shape once already: a selector and a label that were each correct and never met.
 
+### The boot label, and what a keeper counts (Phase 5.4)
+
+`datasphered` mints a random 8-byte **boot label** at process start and serves it on the **mutually-authenticated control surface only**. The status endpoint never carries it: that endpoint has to answer while sealed so a kubelet can probe a replica, which makes it readable by whatever can route to the port, and how many times an instance has restarted is not something to publish there.
+
+It exists because [ADR 0008](../docs/adr/0008-in-cluster-key-delivery.md)'s keeper audit asks a question the seal state could not answer. "Reconcile reseeds against witnessed restarts" needs the cluster to say how many times it restarted — and a restarted process reports `restart-sealed` and a generation, both of which a *solicited* push also produces. With a label per process, a keeper records which process it seeded and the audit compares reseeds against **distinct** boots: one per boot is a cluster restarting, and two into the same boot is a live process being handed material it already held.
+
+The label is random, derived from nothing, and changes on every restart by construction — a restart is exactly what it exists to distinguish. It discloses no key, no scope and nothing about what the process holds. A CSPRNG failure yields an empty label rather than a dead keyholder: reconciliation degrades to "cannot tell", which an auditor sees, and refusing to start would turn a missing audit label into an outage.
+
 ### The secrets subtree is read-only to applications (Phase 5.3)
 
 One key-space rule reaches into DataSphere itself: a key under `<scope>/secrets/` may be **read** on the application data path and may not be written or deleted. `PUT` and `DELETE` are refused with `keyholder.ErrSecretsReadOnly`, reported as the frozen `permission` code, before the request body is read.

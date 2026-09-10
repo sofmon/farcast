@@ -161,7 +161,7 @@ func (s *Server) ControlHandler() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /v1/state", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, stateBody(s.cfg.Instance, s.cfg.Vault.State()))
+		writeJSON(w, http.StatusOK, controlStateBody(s.cfg.Instance, s.cfg.Vault.State()))
 	})
 
 	mux.HandleFunc("GET "+SealChallengePath, func(w http.ResponseWriter, _ *http.Request) {
@@ -226,7 +226,7 @@ func (s *Server) ControlHandler() http.Handler {
 		}
 		st := s.cfg.Vault.State()
 		s.log.Info("unsealed", "intent", intent, "generation", st.Generation, "scopes", len(st.Scopes))
-		writeJSON(w, http.StatusOK, stateBody(s.cfg.Instance, st))
+		writeJSON(w, http.StatusOK, controlStateBody(s.cfg.Instance, st))
 	})
 
 	mux.HandleFunc("POST /v1/seal", func(w http.ResponseWriter, r *http.Request) {
@@ -234,13 +234,13 @@ func (s *Server) ControlHandler() http.Handler {
 		reason := r.URL.Query().Get("reason")
 		st := s.cfg.Vault.Seal(hold, reason)
 		s.log.Info("sealed", "hold", hold, "phase", st.Phase)
-		writeJSON(w, http.StatusOK, stateBody(s.cfg.Instance, st))
+		writeJSON(w, http.StatusOK, controlStateBody(s.cfg.Instance, st))
 	})
 
 	mux.HandleFunc("POST /v1/release-hold", func(w http.ResponseWriter, r *http.Request) {
 		st := s.cfg.Vault.ReleaseHold()
 		s.log.Info("hold released", "phase", st.Phase)
-		writeJSON(w, http.StatusOK, stateBody(s.cfg.Instance, st))
+		writeJSON(w, http.StatusOK, controlStateBody(s.cfg.Instance, st))
 	})
 
 	return mux
@@ -435,8 +435,18 @@ type stateResponse struct {
 	Generation uint64    `json:"generation"`
 	HoldReason string    `json:"hold_reason,omitempty"`
 	Scopes     []string  `json:"scopes,omitempty"`
+
+	// Boot is set on the control surface only. See controlStateBody.
+	Boot string `json:"boot,omitempty"`
 }
 
+// stateBody is what the UNAUTHENTICATED status endpoint answers.
+//
+// It deliberately omits the process's boot label. That endpoint has to be
+// reachable while sealed — the kubelet probes it, and the SDK asks it to tell a
+// seal from an outage — so anything on it is readable by whatever can route to
+// the port, and how many times this instance has restarted is not something to
+// publish there.
 func stateBody(instance string, st State) stateResponse {
 	return stateResponse{
 		Instance:   instance,
@@ -446,6 +456,15 @@ func stateBody(instance string, st State) stateResponse {
 		HoldReason: st.HoldReason,
 		Scopes:     st.Scopes,
 	}
+}
+
+// controlStateBody is what the mutually-authenticated control surface answers:
+// the same state, plus the boot label a keeper needs in order to record WHICH
+// process it seeded (ADR 0008 finding 1).
+func controlStateBody(instance string, st State) stateResponse {
+	body := stateBody(instance, st)
+	body.Boot = st.Boot
+	return body
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

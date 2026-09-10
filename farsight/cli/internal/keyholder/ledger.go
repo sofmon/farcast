@@ -26,6 +26,18 @@ type LedgerEntry struct {
 	Generation uint64    `json:"generation"`
 	Phase      string    `json:"phase,omitempty"`
 	Result     string    `json:"result"`
+
+	// Device names the keeper that wrote this entry; empty means the operator
+	// did, by hand. A fleet's ledgers are reconciled together, so an entry that
+	// could not say which device produced it would be unattributable in exactly
+	// the audit it exists for.
+	Device string `json:"device,omitempty"`
+
+	// Boot is the keyholder process this push landed in. Counting DISTINCT
+	// boots against the number of reseeds is the whole of the audit: more
+	// reseeds than boots means a process that had not restarted was asked for
+	// key material (ADR 0008 finding 1).
+	Boot string `json:"boot,omitempty"`
 }
 
 // AppendLedger adds one entry.

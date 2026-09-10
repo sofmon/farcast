@@ -16,6 +16,8 @@
 package keyholder
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"sync"
@@ -80,6 +82,11 @@ type State struct {
 	Generation uint64
 	HoldReason string
 	Scopes     []string
+
+	// Boot identifies this keyholder PROCESS. See newBootID: it is what lets a
+	// keeper fleet's ledgers be reconciled against how many times the cluster
+	// actually restarted, and it is disclosed only on the control surface.
+	Boot string
 }
 
 // Sealed reports whether storage is unavailable in this state.
@@ -94,6 +101,9 @@ func (s State) Sealed() bool { return s.Phase != PhaseUnsealed }
 type Vault struct {
 	mu       sync.RWMutex
 	instance string
+	// boot is fixed for the life of the process and needs no lock; it is
+	// stored here because this is what owns the process's seal identity.
+	boot string
 
 	phase      Phase
 	since      time.Time
@@ -118,7 +128,39 @@ func New(instance string) *Vault {
 		phase:    PhaseRestartSealed,
 		since:    now(),
 		now:      now,
+		boot:     newBootID(),
 	}
+}
+
+// bootIDLen is the length of a process's boot label, in bytes.
+const bootIDLen = 8
+
+// newBootID mints the label that identifies THIS keyholder process.
+//
+// It is what makes a keeper's ledger reconcilable ([ADR 0008]'s finding 1,
+// "detection by audit"). A keeper records the boot it seeded, so an auditor can
+// compare reseeds against DISTINCT processes: one reseed per boot is a cluster
+// restarting and a keeper doing its job, while two reseeds into the same boot
+// means something asked for key material that a live process already held —
+// which is what a solicited push looks like from the outside.
+//
+// It is a random label and nothing more. It is not derived from any key, it
+// says nothing about what the process holds, and it changes on every restart
+// by construction, because a restarted process is exactly what it exists to
+// distinguish. It is served only on the mutually-authenticated control
+// surface: the status endpoint is unauthenticated so that a kubelet can probe
+// a sealed replica, and a restart counter is not something to hand out there.
+//
+// A failure to read the system CSPRNG yields an empty label rather than a dead
+// keyholder. Reconciliation degrades to "cannot tell", which an auditor sees;
+// refusing to start would turn a missing audit label into an outage, and this
+// process's job is to hold keys.
+func newBootID() string {
+	b := make([]byte, bootIDLen)
+	if _, err := rand.Read(b); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(b)
 }
 
 // State reports the current phase.
@@ -135,6 +177,7 @@ func (v *Vault) State() State {
 		Generation: v.generation,
 		HoldReason: v.holdReason,
 		Scopes:     names,
+		Boot:       v.boot,
 	}
 }
 

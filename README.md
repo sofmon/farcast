@@ -8,7 +8,7 @@ FarCast is a cloud-native operating system by [Sofmon](https://sofmon.com). It t
 
 ### Build progress
 
-Phases 0–4 of 8 complete, Phase 5 under way · **19 of 35 sections**
+Phases 0–4 of 8 complete, Phase 5 under way · **20 of 35 sections**
 
 ```
 Phase 0  Foundation                     ████████████████████  3/3 ✅
@@ -16,13 +16,13 @@ Phase 1  Install                        █████████████�
 Phase 2  Networking & security boundary ████████████████████  3/3 ✅
 Phase 3  Storage                        ████████████████████  3/3 ✅
 Phase 4  Run applications               ████████████████████  4/4 ✅
-Phase 5  Intelligent resources          ████████████▓·······  2½/4
+Phase 5  Intelligent resources          █████████████████▓··  3½/4
 Phase 6  AI layer                       ····················  0/4
 Phase 7  FarSight GUI                   ····················  0/5
 Phase 8  Multi-provider & hardening     ····················  0/5
 ```
 
-Phases 1–4 and Phase 5's first three sections are **validated live against real cloud infrastructure**, not only unit-tested — walked against a [runbook](docs/runbooks/), with every defect each walk found recorded in it. Three things are deliberately not claimed: section 3.2's own runbook is only partly walked (its keyholder is exercised by every Phase 4 walk, but the deliberate-seal and node-upgrade paths are not); the two defects [the 5.2 walk](docs/runbooks/phase-5-2-validation.md) found are fixed but their fixes are not themselves walked; and no cost figure has yet been reconciled against a real invoice. See [PLAN.md](PLAN.md) for what each section contains and where it stands.
+Phases 1–4 and Phase 5's first three sections are **validated live against real cloud infrastructure**, not only unit-tested — walked against a [runbook](docs/runbooks/), with every defect each walk found recorded in it. Four things are deliberately not claimed: section 3.2's own runbook is only partly walked (its keyholder is exercised by every Phase 4 walk, but the deliberate-seal and node-upgrade paths are not); the two defects [the 5.2 walk](docs/runbooks/phase-5-2-validation.md) found are fixed but their fixes are not themselves walked; **section 5.4 is unwalked**, and its [runbook](docs/runbooks/phase-5-4-validation.md) needs a second machine to mean anything; and no cost figure has yet been reconciled against a real invoice. See [PLAN.md](PLAN.md) for what each section contains and where it stands.
 
 ---
 
@@ -374,7 +374,9 @@ Each module folder contains its own `README.md` with:
 >
 > Section 5.3 completes the SDK's environment: `farcast.Config()` reads an application's configuration and **refuses the platform's own namespace** — one entry of which is the application's egress credential — and `farcast.Secrets()` reads secrets that live as encrypted objects in the instance's storage, never as a Kubernetes Secret. The boundary that buys is stated plainly rather than implied: a secret is confidential from the cloud and from anything outside the instance, and **not** from another application inside it, because every application shares one storage scope and the keyholder cannot tell which one is asking. What the keyholder *can* enforce, it does — no application creates or destroys a secret.
 >
-> Section 5.4 (`farcast keeper`) is next. Phases 6–8 are in specification.
+> Section 5.4 puts the first keeper on the operator's own hardware: a device holding a derived bundle and its own leaf — never the keyring, never the CA key — that hands a restarted keyholder its material back without waking anyone. It refuses a deliberate seal, refuses beyond a budget, and writes every push to a local ledger the cloud can neither reach nor erase. Because that budget is a tripwire a patient adversary stays under, the keyholder now labels each of its processes so `keeper status` can ask the sharper question: not how often we re-seeded, but **how many distinct processes** we re-seeded. Two pushes into one live process is what a solicited handover looks like from outside. It is delivered for the desktop and **unwalked**, and two things it does not do are stated rather than implied — a desktop cannot bind the material to hardware, and the in-cluster key-id pin that would make revocation bind a modified device is specified and unbuilt.
+>
+> Phases 6–8 are in specification.
 
 | Module | Spec | Implementation |
 |---|---|---|
@@ -384,7 +386,7 @@ Each module folder contains its own `README.md` with:
 | DataSphere | 🟡 In progress | 🟡 Encrypting store, blob formats v1+v2, keyring, GCS adapter, in-cluster keyholder, operator-only secrets subtree |
 | Shrike | 🟡 In progress | 🟡 Policy engine, with violations *and* allowed traffic attributed to the application that caused them; deployed as a sidecar beside FatLine |
 | AllThing | 🔲 Draft | 🔲 Not started |
-| FarSight | 🟡 In progress | 🟡 CLI: the full `install → connect → run → release` lifecycle, plus `storage`, `secret`, `kernel`, `toolchain`, `ps`, `logs`, `costs`, `usage`; engine-less image build (GUI is Phase 7) |
+| FarSight | 🟡 In progress | 🟡 CLI: the full `install → connect → run → release` lifecycle, plus `storage`, `secret`, `keeper`, `kernel`, `toolchain`, `ps`, `logs`, `costs`, `usage`; engine-less image build (GUI is Phase 7) |
 | SDK | 🟡 In progress | 🟡 Go: logging, storage, config and secrets live — a `Secret` that refuses to print or marshal itself; AI is Phase 6 |
 | Manifest Spec | ✅ Complete | ✅ Parser + tests |
 

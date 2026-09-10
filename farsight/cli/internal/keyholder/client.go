@@ -41,6 +41,13 @@ type State struct {
 	Generation uint64    `json:"generation"`
 	HoldReason string    `json:"hold_reason,omitempty"`
 	Scopes     []string  `json:"scopes,omitempty"`
+
+	// Boot identifies the keyholder PROCESS that answered, and is served only
+	// on the mutually-authenticated control surface. It is what makes a
+	// keeper's ledger reconcilable: one reseed per distinct boot is a cluster
+	// restarting, and two into the same boot is a live process being asked for
+	// key material it already held.
+	Boot string `json:"boot,omitempty"`
 }
 
 // Sealed reports whether this replica is holding no key material.

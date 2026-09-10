@@ -534,3 +534,68 @@ func TestSecretListingIsNotRefused(t *testing.T) {
 		t.Errorf("listing the secrets subtree = %d, want 200", w.Code)
 	}
 }
+
+// The boot label is the keeper fleet's reconciliation primitive, and it is
+// disclosed only where the peer is authenticated.
+//
+// The status endpoint has to answer while sealed and is reachable by whatever
+// can route to the port — the kubelet probes it — so how many times this
+// instance has restarted does not belong there.
+func TestBootLabelIsControlSurfaceOnly(t *testing.T) {
+	h := newHarness(t)
+
+	var public struct {
+		Boot string `json:"boot"`
+	}
+	mustJSON(t, do(h.status, "GET", "/v1/state", nil, nil), &public)
+	if public.Boot != "" {
+		t.Errorf("the unauthenticated status endpoint disclosed a boot label: %q", public.Boot)
+	}
+
+	var control struct {
+		Boot string `json:"boot"`
+	}
+	mustJSON(t, do(h.control, "GET", "/v1/state", nil, nil), &control)
+	if control.Boot == "" {
+		t.Fatal("the control surface reported no boot label; a keeper cannot record which process it seeded")
+	}
+	if len(control.Boot) != bootIDLen*2 {
+		t.Errorf("boot = %q, want %d hex characters", control.Boot, bootIDLen*2)
+	}
+
+	// It rides every control response, because the push response is what a
+	// keeper has in hand when it writes its ledger entry.
+	h.unseal(t, 1)
+	var afterUnseal struct {
+		Boot string `json:"boot"`
+	}
+	mustJSON(t, do(h.control, "GET", "/v1/state", nil, nil), &afterUnseal)
+	if afterUnseal.Boot != control.Boot {
+		t.Errorf("the boot label changed within one process: %q then %q", control.Boot, afterUnseal.Boot)
+	}
+}
+
+// Two processes are two labels. Without that, "reseeded twice" and "restarted
+// twice" are indistinguishable in a ledger, and the audit ADR 0008 relies on
+// cannot be performed.
+func TestEachProcessGetsItsOwnBootLabel(t *testing.T) {
+	seen := map[string]bool{}
+	for range 8 {
+		b := New("prod").State().Boot
+		if b == "" {
+			t.Fatal("a vault minted an empty boot label")
+		}
+		if seen[b] {
+			t.Fatalf("two vaults share the boot label %q", b)
+		}
+		seen[b] = true
+	}
+}
+
+// mustJSON decodes a recorded response body or fails the test.
+func mustJSON(t *testing.T, w *httptest.ResponseRecorder, out any) {
+	t.Helper()
+	if err := json.Unmarshal(w.Body.Bytes(), out); err != nil {
+		t.Fatalf("decode %q: %v", w.Body.String(), err)
+	}
+}

@@ -174,6 +174,7 @@ func defaultRegistry() *Registry {
 	reg.Register(&toolchainCommand{})
 	reg.Register(newStorageCommand())
 	reg.Register(newSecretCommand())
+	reg.Register(newKeeperCommand())
 	reg.Register(newKernelCommand())
 	reg.Register(newStub("chat", "Terminal AI chat through AllThing", "6.2"))
 

@@ -77,6 +77,7 @@ farcast [global flags] <command> [command flags] [arguments]
 | `usage` | ✅ works | Compute and network use, against what is reserved and declared, with the kernel's right-sizing advice | 5.1 |
 | `storage` | ✅ works | The instance's encrypted disk: `ls`, `cp`, `rm`, `usage`, `key …` | 3.3 |
 | `secret` | ✅ works | Application secrets, encrypted at rest in the instance's storage: `set`, `ls`, `rm` | 5.3 |
+| `keeper` | ✅ works | Devices that re-seed a restart-sealed instance unattended: `enroll`, `install`, `run`, `status`, `revoke` | 5.4 |
 | `build` | ✅ works | Build an application's image inside the instance | 4.2 |
 | `kernel` | ✅ works | Deploy TechnoCore, meter namespaces, and push the provider's confirmed costs: `deploy`, `meter`, `confirm`. `deploy --adapt` lets it right-size applications | 4.1 |
 | `chat` | ⏳ stub | Terminal AI chat through AllThing | 6.2 |
@@ -771,6 +772,66 @@ A value on the command line is visible to every process on the machine while the
 The operator writes a key that an application reads, and the two are computed in different packages: the CLI from the keyring, the application from the `FARCAST_SECRETS_PREFIX` Planck rendered from the recorded scope prefix. A divergence would not fail loudly — it would store a secret nothing ever fetches.
 
 So `secret` resolves the prefix from the **keyring** (the material that actually encrypts the object), cross-checks it against what the deploy recorded, and refuses when the two disagree rather than picking one. A test asserts the CLI's key and Planck's rendered prefix agree.
+
+---
+
+## `farcast keeper` — unattended recovery on your own hardware (Phase 5.4)
+
+[ADR 0008](../../docs/adr/0008-in-cluster-key-delivery.md) concedes something plainly: key material lives only in the keyholder's memory, so after a 03:00 node upgrade applications get `ErrStorageSealed` until a human runs `storage unseal`. Nothing is lost and nothing is corrupted — and storage is down for hours.
+
+A **keeper** is the lawful automation of that human. The theorem in that ADR leaves exactly one option: an external party supplying an input the cloud does not hold. A keeper is an operator-owned device doing precisely that, and **running FarCast as a server wants at least two of them** — one device is one power cut away from the window this exists to close.
+
+```
+farcast keeper enroll  <instance> <device> --out <path> --passphrase-file <path>
+farcast keeper install <packet> --passphrase-file <path> [--accept-backup-risk]
+farcast keeper run     <instance> [--interval <duration>] [--once]
+farcast keeper status  [instance]
+farcast keeper revoke  <instance> <device> [-y]
+```
+
+`enroll` and `revoke` run on the machine holding the CA key. `install` and `run` run on the device. `status` runs on either and reads whatever ledgers that machine has.
+
+### What a keeper holds, and what it therefore cannot do
+
+A derived **scope bundle** and its **own device leaf** — nothing else. That bundle is exactly what an unsealed keyholder already holds in RAM, which is the property that lets a device push one without widening what a compromised cluster can yield.
+
+It does **not** hold the master keyring, so it cannot read names outside its scopes. It does **not** hold the instance CA key, so a stolen keeper can re-seed and **cannot enrol another keeper**. Losing a keeper is losing a device; losing the operator's machine is still losing the instance.
+
+Each device gets `farcast://<instance>/keeper/<device>` as its identity, so one can be revoked without revoking the fleet, and a ledger entry can say which device produced it.
+
+### The four refusals
+
+A keeper is an automaton holding key material, so the question it answers each cycle is *"is there any reason not to"* — and re-seeding is what is left when there is not.
+
+1. **An operator hold is never a keeper's to clear.** "Sealed because it restarted" and "sealed because you said so" are different states. The keeper refuses locally, before dialling; the keyholder refuses again if it is asked. Two checks, because the local one can be modified and the in-cluster one cannot.
+2. **Beyond its budget it refuses** — 8 reseeds per 30 days by default, which is well above what Autopilot actually does to two replicas. The refusal *is* the alarm. Widening the budget is not the fix for it.
+3. **A bundle older than the cluster's generation is stale**, and it says to re-enrol rather than pushing retired keys.
+4. **A synced folder is refused outright**, and that one cannot be overridden. A backup is a periodic copy; a synced directory is a continuous upload, and installing a bundle into one puts it in somebody's cloud before anyone looks.
+
+### The ledger, and why the budget is not the control
+
+The budget is a **tripwire, not a barrier** — a patient adversary simply stays under it. What actually catches a solicited push is reading the ledger, and `keeper status` is what reads it.
+
+The question it asks is not *"how often did we re-seed"* but **"how many distinct keyholder processes did we re-seed"**. `datasphered` mints a random boot label per process and serves it only on the mutually-authenticated control surface; a keeper records which process it seeded. A process is sealed once per restart, so:
+
+- one reseed per process is a cluster restarting and a keeper doing its job;
+- **two pushes into the same process** means something asked for key material a live process already held.
+
+That is detection by audit, and it is named as such: it runs when you run it, it is not a live alert, and against a cloud that reads the keyholder's memory directly it says nothing at all. Read it anyway — it is what is left after the tripwire.
+
+### What `revoke` does not do
+
+It marks the device withdrawn in your records. It does **not** reach the cluster, and the device's certificate stays cryptographically valid. What retires a lost device's *bundle* is `farcast storage rekey`, and the command prints that rather than implying it happened. Rekey bounds the damage forward, not backward: anything that device already read, it already read.
+
+There is one automatic bound, which was already there: keeper leaves carry the CA's ordinary **90-day validity**, so an un-renewed device stops keeping on its own. `keeper status` warns before that arrives rather than after a keeper has silently stopped.
+
+### At rest on the device, stated without softening
+
+The material comes to rest **unarmored**, and that is what a keeper is: a device that re-seeds at 03:00 cannot hold a passphrase behind a human. What protects it is mode 0600 inside a 0700 directory, marked excluded from the platform's backup pipeline with the exclusion **read back** — a setter nobody checked is an intention, not a guarantee.
+
+On macOS that check is real. On other platforms there is no single pipeline to exclude from, so `install` **refuses** unless you pass `--accept-backup-risk`, and the device's own record then says you did.
+
+What is **not** delivered is hardware binding. On a desktop the bundle is a file that anything running as you can read. Binding it to machine identifiers was considered and rejected as obfuscation — those identifiers are readable by whatever can read the file. The hardware-backed class waits for the mobile keeper in 7.5.
 
 ---
 
