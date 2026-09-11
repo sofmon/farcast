@@ -8,22 +8,91 @@ import (
 	"github.com/sofmon/farcast/datasphere/internal/crypto"
 )
 
-// DefaultScope is the slice of storage an instance's applications share.
-// Per-application scopes arrive later; until then one scope keeps application
-// data cryptographically separate from the operator's own objects, which is
-// the property that matters first.
+// AppScopeRoot is the segment every application's scope hangs under.
 //
-// These live here rather than in the CLI because two places now need to agree
-// on them: the keyholder that serves the scope, and the keyring minting that
-// creates it. A prefix the two disagreed about would be a scope that owns
-// nothing.
-const (
-	DefaultScopeName   = "app"
-	DefaultScopePrefix = "app/"
-)
+// There is deliberately no scope owning the root itself. An instance used to
+// have exactly one application scope — "app", owning "app/" — which every
+// application shared, so separation between them was a rule the keyholder
+// enforced rather than a property of the keys. ADR 0018 decision 5 replaces it
+// with one scope per application, and a scope owning "app/" could not coexist
+// with them: a scope owns a whole subtree, so "app/" and "app/<ns>/<name>/"
+// would both claim the same keys under two different name keys, and the object
+// would exist twice with neither copy visible from the other. AddScope refuses
+// exactly that.
+//
+// These live here rather than in the CLI because three places must agree: the
+// keyring that mints a scope, the keyholder that decides which caller may
+// reach it, and Planck, which tells an application where its own storage is.
+const AppScopeRoot = "app"
+
+// MaxAppScopeName bounds a scope's name, and therefore the namespace and
+// application names that can be composed into one.
+const MaxAppScopeName = 63
+
+// AppScopePrefix is the subtree one application owns:
+// app/<namespace>/<name>/. Everything that application stores — its objects
+// and its secrets — is inside it, and its keys open nothing outside it.
+func AppScopePrefix(namespace, app string) string {
+	return AppScopeRoot + ScopePrefixSuffix + namespace + ScopePrefixSuffix + app + ScopePrefixSuffix
+}
+
+// AppSecretsPrefix is where one application's secrets live.
+//
+// The application is named by the scope it is already inside, so the subtree
+// carries no second copy of the name: <scope prefix>secrets/<secret>. When
+// every application shared one scope the name had to be in the path, because
+// the path was the only thing distinguishing one application's secrets from
+// another's. The scope does that now.
+func AppSecretsPrefix(namespace, app string) string {
+	return AppScopePrefix(namespace, app) + SecretsSegment + ScopePrefixSuffix
+}
+
+// AppScopeName is the keyring's label for that scope.
+//
+// It is a label and not an address — the prefix above is what owns keys — but
+// it is what an operator sees in a listing and what an application declares as
+// a cross-check, so it names both halves rather than being opaque.
+func AppScopeName(namespace, app string) (string, error) {
+	name := AppScopeRoot + "-" + namespace + "-" + app
+	if len(name) > MaxAppScopeName {
+		return "", fmt.Errorf("%w: namespace %q and application %q compose a scope name of %d bytes, over the %d-byte limit",
+			ErrKeyringInvalid, namespace, app, len(name), MaxAppScopeName)
+	}
+	if err := ValidateScopeName(name); err != nil {
+		return "", err
+	}
+	return name, nil
+}
+
+// ParseAppScopePrefix reads an application scope's prefix back into the
+// namespace and application it belongs to.
+//
+// It exists so a listing can say WHOSE a scope is without the operator having
+// to decode a prefix by eye, and so nothing has to keep a parallel record of
+// what the prefix already states.
+func ParseAppScopePrefix(prefix string) (namespace, app string, ok bool) {
+	rest, ok := strings.CutPrefix(prefix, AppScopeRoot+ScopePrefixSuffix)
+	if !ok {
+		return "", "", false
+	}
+	parts := strings.Split(strings.TrimSuffix(rest, ScopePrefixSuffix), ScopePrefixSuffix)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", false
+	}
+	return parts[0], parts[1], true
+}
+
+// NewAppScope mints one application's scope.
+func NewAppScope(namespace, app string) (Scope, error) {
+	name, err := AppScopeName(namespace, app)
+	if err != nil {
+		return Scope{}, err
+	}
+	return NewScope(name, AppScopePrefix(namespace, app))
+}
 
 // SecretsSegment is the reserved first segment of a scope's secrets subtree:
-// <scope prefix>secrets/<app>/<name>.
+// <scope prefix>secrets/<secret>.
 //
 // It is the one piece of key-space layout DataSphere knows about, and it earns
 // that by carrying a rule: the keyholder refuses application WRITES and

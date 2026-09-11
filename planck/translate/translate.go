@@ -104,24 +104,17 @@ type Config struct {
 	// so a console or a bill reads as one recognisable set of resources.
 	Instance string
 
-	// StorageScope is the DataSphere scope applications are given. Empty
-	// means storage is not wired up, and the SDK will report ErrStorageSealed
-	// rather than reaching a keyholder it was not told about.
-	StorageScope string
-
-	// SecretsPrefix is the instance's secrets root, ending in "/"; each
-	// application's own subtree is that root plus its name.
+	// Storage maps each app's name to everything that is ITS OWN about
+	// storage: the leaf it presents, and the scope and secrets subtree that
+	// leaf entitles it to (ADR 0018 decisions 1 and 5).
 	//
-	// The caller supplies it whole rather than letting this package build it
-	// from the scope name, for two reasons. A scope may own any prefix, so
-	// the two are not derivable from each other. And the reserved segment
-	// inside it is a contract between DataSphere and the SDK — the two that
-	// enforce and consume it — so a third copy here would be a third place
-	// for it to drift.
-	//
-	// Empty means secrets are not wired, and the SDK reports the capability
-	// as absent rather than reading from a prefix somebody guessed.
-	SecretsPrefix string
+	// An empty map means storage is not wired up, and the SDK reports the
+	// capability as absent rather than reaching a keyholder it was not told
+	// about. A map missing one app while others have entries is refused:
+	// the keyholder admits only callers it can identify, so that application
+	// would reach nothing and report a transport failure rather than a
+	// misconfiguration.
+	Storage map[string]AppStorage
 
 	// StorageCAPEM is the instance CA certificate an application uses to
 	// verify the keyholder. It is a certificate, not a key: it goes in a
@@ -134,13 +127,6 @@ type Config struct {
 	// FARCAST_STORAGE_SERVER_NAME).
 	StorageServerName string
 
-	// Identities maps each app's name to the client leaf it presents to the
-	// keyholder's data path (ADR 0018 decisions 1 and 6). Required for every
-	// app whenever storage is wired: the keyholder admits only callers it can
-	// identify, so an application deployed without one would reach nothing
-	// and report it as a transport failure rather than as a misconfiguration.
-	Identities map[string]AppIdentity
-
 	// Credentials maps each app's name to its egress credential (ADR 0013).
 	//
 	// Every app in the manifest must have one. A translation that left one out
@@ -151,13 +137,28 @@ type Config struct {
 	Credentials map[string]string
 }
 
-// AppIdentity is one application's client leaf: the certificate that names it
-// farcast://<instance>/app/<namespace>/<name>, and the private key that proves
-// it. It travels in the same Kubernetes Secret as the egress credential and is
-// the same class of thing — a scoped, rotatable transport credential.
-type AppIdentity struct {
+// AppStorage is one application's whole storage identity.
+//
+// CertPEM and KeyPEM are the client leaf that names it
+// farcast://<instance>/app/<namespace>/<name>; they travel in the same
+// Kubernetes Secret as the egress credential and are the same class of thing —
+// a scoped, rotatable transport credential.
+//
+// Scope and SecretsPrefix are what that leaf entitles it to. The caller
+// supplies them rather than letting this package compose them, because the
+// keyring is what actually owns a prefix and a name composed here could differ
+// from the one minted there — a scope that owns nothing, discovered by an
+// application failing to read its own data.
+type AppStorage struct {
 	CertPEM []byte
 	KeyPEM  []byte
+	// Scope is the keyring's name for this application's scope. The SDK sends
+	// it as a cross-check the keyholder refuses on mismatch; it authorizes
+	// nothing (ADR 0018 decision 1).
+	Scope string
+	// SecretsPrefix is this application's secrets subtree, fully qualified
+	// and ending in "/".
+	SecretsPrefix string
 }
 
 func (c *Config) withDefaults() {
@@ -184,11 +185,14 @@ func Render(c Config) ([]byte, error) {
 		// is deleted wholesale when its deployment is removed.
 		return nil, fmt.Errorf("translate: refusing to deploy applications into %q, which belongs to FarCast itself", SystemNamespace)
 	}
-	if c.SecretsPrefix != "" && !strings.HasSuffix(c.SecretsPrefix, "/") {
-		// A prefix that does not end at a segment boundary claims a partial
-		// name: "app" would also own "application/…". Refusing here beats
-		// rendering a ConfigMap that points applications at the wrong subtree.
-		return nil, fmt.Errorf("translate: secrets prefix %q must end in %q", c.SecretsPrefix, "/")
+	for app, st := range c.Storage {
+		if st.SecretsPrefix != "" && !strings.HasSuffix(st.SecretsPrefix, "/") {
+			// A prefix that does not end at a segment boundary claims a
+			// partial name: "app" would also own "application/…". Refusing
+			// here beats rendering a ConfigMap that points an application at
+			// the wrong subtree.
+			return nil, fmt.Errorf("translate: secrets prefix %q for app %q must end in %q", st.SecretsPrefix, app, "/")
+		}
 	}
 	if strings.HasPrefix(c.Namespace, "kube-") {
 		return nil, fmt.Errorf("translate: refusing to deploy into the managed namespace %q (ADR 0003)", c.Namespace)
@@ -206,16 +210,14 @@ func Render(c Config) ([]byte, error) {
 		StoragePort:          StoragePort,
 		StorageStatusService: StorageStatusService,
 		StorageStatusPort:    StorageStatusPort,
-		StorageScope:         c.StorageScope,
-		SecretsPrefix:        c.SecretsPrefix,
-		StorageServerName:    c.StorageServerName,
-		StorageCA:            indentPEM(c.StorageCAPEM),
-		NodeLocalDNS:         NodeLocalDNS,
-		HasStorage:           c.StorageScope != "" && len(c.StorageCAPEM) > 0,
-		HasSecrets:           c.StorageScope != "" && len(c.StorageCAPEM) > 0 && c.SecretsPrefix != "",
-		RequestCPUMilli:      RequestCPUMilli,
-		RequestMemMiB:        RequestMemMiB,
-		Port:                 DefaultPort,
+
+		StorageServerName: c.StorageServerName,
+		StorageCA:         indentPEM(c.StorageCAPEM),
+		NodeLocalDNS:      NodeLocalDNS,
+		HasStorage:        len(c.Storage) > 0 && len(c.StorageCAPEM) > 0,
+		RequestCPUMilli:   RequestCPUMilli,
+		RequestMemMiB:     RequestMemMiB,
+		Port:              DefaultPort,
 	}
 
 	seen := map[string]bool{}
@@ -247,13 +249,19 @@ func Render(c Config) ([]byte, error) {
 				FatLineEgressPort, app.Name, credential),
 		}
 		if data.HasStorage {
-			id := c.Identities[app.Name]
-			if len(id.CertPEM) == 0 || len(id.KeyPEM) == 0 {
+			st := c.Storage[app.Name]
+			if len(st.CertPEM) == 0 || len(st.KeyPEM) == 0 {
 				return nil, fmt.Errorf("translate: no storage identity for app %q; the keyholder admits only "+
 					"callers it can identify, so it would reach no storage at all (ADR 0018)", app.Name)
 			}
-			entry.ClientCert = indentPEM(id.CertPEM)
-			entry.ClientKey = indentPEM(id.KeyPEM)
+			if st.Scope == "" || st.SecretsPrefix == "" {
+				return nil, fmt.Errorf("translate: no storage scope for app %q; its leaf would name a scope "+
+					"the keyring never minted (ADR 0018 decision 5)", app.Name)
+			}
+			entry.ClientCert = indentPEM(st.CertPEM)
+			entry.ClientKey = indentPEM(st.KeyPEM)
+			entry.Scope = st.Scope
+			entry.SecretsPrefix = st.SecretsPrefix
 		}
 		data.Apps = append(data.Apps, entry)
 	}
@@ -324,6 +332,9 @@ type appData struct {
 	// for a YAML block scalar; empty when storage is not wired.
 	ClientCert string
 	ClientKey  string
+	// Scope and SecretsPrefix are this application's own key space.
+	Scope         string
+	SecretsPrefix string
 }
 
 type templateData struct {
@@ -336,9 +347,6 @@ type templateData struct {
 	FatLineWorkload      string
 	StorageService       string
 	StorageStatusService string
-	StorageScope         string
-	SecretsPrefix        string
-	HasSecrets           bool
 	StorageServerName    string
 	StorageCA            string
 	NodeLocalDNS         string

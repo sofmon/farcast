@@ -30,13 +30,19 @@ func sampleConfig() Config {
 			"web": "web-egress-credential",
 		},
 		Instance:          "p42",
-		StorageScope:      "app",
 		StorageServerName: "p42.datasphered.farcast",
 		StorageCAPEM:      []byte("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----"),
-		SecretsPrefix:     "app/secrets/",
-		Identities: map[string]AppIdentity{
-			"api": {CertPEM: []byte("-----BEGIN CERTIFICATE-----\nAPILEAF\n-----END CERTIFICATE-----"), KeyPEM: []byte("-----BEGIN PRIVATE KEY-----\nAPIKEY\n-----END PRIVATE KEY-----")},
-			"web": {CertPEM: []byte("-----BEGIN CERTIFICATE-----\nWEBLEAF\n-----END CERTIFICATE-----"), KeyPEM: []byte("-----BEGIN PRIVATE KEY-----\nWEBKEY\n-----END PRIVATE KEY-----")},
+		Storage: map[string]AppStorage{
+			"api": {
+				CertPEM: []byte("-----BEGIN CERTIFICATE-----\nAPILEAF\n-----END CERTIFICATE-----"),
+				KeyPEM:  []byte("-----BEGIN PRIVATE KEY-----\nAPIKEY\n-----END PRIVATE KEY-----"),
+				Scope:   "app-my-platform-api", SecretsPrefix: "app/my-platform/api/secrets/",
+			},
+			"web": {
+				CertPEM: []byte("-----BEGIN CERTIFICATE-----\nWEBLEAF\n-----END CERTIFICATE-----"),
+				KeyPEM:  []byte("-----BEGIN PRIVATE KEY-----\nWEBKEY\n-----END PRIVATE KEY-----"),
+				Scope:   "app-my-platform-web", SecretsPrefix: "app/my-platform/web/secrets/",
+			},
 		},
 	}
 }
@@ -205,7 +211,7 @@ func TestEgressIsDeniedExceptDNSFatLineAndStorage(t *testing.T) {
 // credentials for.
 func TestWithoutStorageThereIsNoStorageEnvOrEgress(t *testing.T) {
 	c := sampleConfig()
-	c.StorageScope, c.StorageCAPEM = "", nil
+	c.Storage, c.StorageCAPEM = nil, nil
 	out, docs := render(t, c)
 
 	if strings.Contains(out, "FARCAST_STORAGE_") {
@@ -537,8 +543,8 @@ func TestTranslateRefusesAnAppWithNoCredential(t *testing.T) {
 func TestEachAppGetsItsOwnSecretsPrefix(t *testing.T) {
 	_, docs := render(t, sampleConfig())
 	for app, want := range map[string]string{
-		"api": "app/secrets/api/",
-		"web": "app/secrets/web/",
+		"api": "app/my-platform/api/secrets/",
+		"web": "app/my-platform/web/secrets/",
 	} {
 		cm := at(t, pick(t, docs, "ConfigMap", app), "data").(map[string]any)
 		if got := cm["FARCAST_SECRETS_PREFIX"]; got != want {
@@ -547,21 +553,28 @@ func TestEachAppGetsItsOwnSecretsPrefix(t *testing.T) {
 	}
 }
 
-// An instance recorded before the scope prefix was written down gets no
-// secrets wiring rather than a guessed one. The SDK then reports the
-// capability as absent, which is true.
-func TestWithoutASecretsPrefixNoSecretsAreWired(t *testing.T) {
+// An application whose scope was never minted is refused rather than deployed
+// against a prefix somebody guessed: its leaf would name a scope the keyring
+// does not hold, so it would reach nothing and report a transport failure.
+func TestAnAppWithoutAScopeIsRefused(t *testing.T) {
 	c := sampleConfig()
-	c.SecretsPrefix = ""
-	out, _ := render(t, c)
-	if strings.Contains(out, "FARCAST_SECRETS_PREFIX") {
-		t.Error("a secrets prefix was rendered for an instance that has none recorded")
+	st := c.Storage["web"]
+	st.Scope, st.SecretsPrefix = "", ""
+	c.Storage["web"] = st
+	_, err := Render(c)
+	if err == nil {
+		t.Fatal("Render deployed an application whose scope was never minted")
+	}
+	if !strings.Contains(err.Error(), "web") || !strings.Contains(err.Error(), "scope") {
+		t.Errorf("err = %v, want it to name the app and the missing scope", err)
 	}
 }
 
 func TestASecretsPrefixMustEndAtASegmentBoundary(t *testing.T) {
 	c := sampleConfig()
-	c.SecretsPrefix = "app/secrets"
+	st := c.Storage["api"]
+	st.SecretsPrefix = "app/my-platform/api/secrets"
+	c.Storage["api"] = st
 	if _, err := Render(c); err == nil {
 		t.Error("Render accepted a prefix that claims a partial name")
 	}
@@ -630,7 +643,7 @@ func TestEachAppGetsItsOwnStorageIdentityInTheSecret(t *testing.T) {
 // transport failure. Refused here, where the message can say what is missing.
 func TestStorageWiredWithoutAnIdentityIsRefused(t *testing.T) {
 	c := sampleConfig()
-	delete(c.Identities, "web")
+	delete(c.Storage, "web")
 	_, err := Render(c)
 	if err == nil {
 		t.Fatal("Render deployed an application with storage and no identity")
@@ -644,7 +657,7 @@ func TestStorageWiredWithoutAnIdentityIsRefused(t *testing.T) {
 // minted or rendered for it.
 func TestWithoutStorageNoIdentityIsRenderedOrRequired(t *testing.T) {
 	c := sampleConfig()
-	c.StorageScope, c.StorageCAPEM, c.SecretsPrefix, c.Identities = "", nil, "", nil
+	c.Storage, c.StorageCAPEM = nil, nil
 	out, _ := render(t, c)
 	if strings.Contains(out, "FARCAST_STORAGE_CLIENT") {
 		t.Error("a storage identity was rendered for a deployment with no storage")

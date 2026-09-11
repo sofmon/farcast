@@ -10,7 +10,6 @@ import (
 	"strings"
 
 	"github.com/sofmon/farcast/datasphere"
-	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
 	"github.com/sofmon/farcast/farsight/cli/internal/storage"
 )
@@ -23,12 +22,13 @@ import (
 // under an opaque name, and it never exists as a Kubernetes Secret — which is
 // base64 in etcd, encrypted at rest under a key the cloud provider holds.
 //
-// What that buys and what it does not is set out in ADR 0017. The short
-// version: the boundary is the INSTANCE. Every application in an instance
-// shares one storage scope and the keyholder's data path cannot tell them
-// apart, so an application can read its neighbours' secrets. The keyholder
-// does refuse application writes and deletes under the subtree, so a secret is
-// created and removed here and nowhere else.
+// What that buys is set out in ADR 0018, which moved the boundary from the
+// instance to the APPLICATION: each one has its own scope under
+// app/<namespace>/<app>/, so a neighbour's keys cannot compute the stored name
+// of this secret and its leaf does not reach the scope to ask. The keyholder
+// also refuses application writes and deletes under the subtree, so a secret
+// is created and removed here and nowhere else — including by the application
+// it belongs to.
 //
 // Like `farcast storage`, this runs entirely on the operator's machine and
 // needs no tunnel and no running cluster.
@@ -72,51 +72,78 @@ what reads secrets. This is a guard rail rather than a lock — the keyring is
 yours, so 'farcast storage cp' can always recover the bytes if you truly need
 them, deliberately and with the key in hand.
 
-What this protects against, and what it does not, is ADR 0017. Applications in
-one instance share a storage scope, so a secret is confidential from the cloud
-and from outside the instance — not from another application inside it.`,
+Each application has its own scope — its own keys, under app/<namespace>/<app>/
+— so a neighbour cannot compute the stored name of this secret, let alone open
+it. Name an application as <namespace>/<application>: the same manifest
+deployed twice is two applications with two sets of keys.`,
 	}
 }
 
-// secretsRoot resolves where an instance's secrets live.
+// appRef is an application named the way a secret's key already names it:
+// the deployment namespace it was deployed into, and its own name.
 //
-// It reads the prefix from the KEYRING, because that is the material that
-// actually encrypts the object, and cross-checks it against what the deploy
-// recorded. A divergence is refused rather than reconciled: applications are
-// handed the recorded prefix (Planck renders it into their ConfigMap), so
-// writing under the other one would store secrets nothing can read, and there
-// is no way to tell from here which of the two is the mistake.
-func secretsRoot(session *storage.Session, meta *config.InstanceMetadata) (string, error) {
-	scope, ok := session.Keyring.ScopeNamed(datasphere.DefaultScopeName)
+// Both halves are required because both are real. The same manifest deployed
+// into two namespaces is two sets of applications with two sets of scopes, and
+// a secret set for one is not a secret for the other — so a command that took
+// only the application name would be guessing which one an operator meant.
+type appRef struct{ Namespace, App string }
+
+func (a appRef) String() string { return a.Namespace + "/" + a.App }
+
+// parseAppRef reads a <namespace>/<application> operand.
+func parseAppRef(operand string) (appRef, error) {
+	ns, app, ok := strings.Cut(operand, "/")
 	if !ok {
-		return "", fmt.Errorf("instance %q has no %q scope in its keyring, so there is nowhere for an application to read a secret from; "+
-			"run 'farcast storage deploy %s' to create the keyholder and its scope",
-			session.Instance, datasphere.DefaultScopeName, session.Instance)
+		return appRef{}, usagef("name the application as <namespace>/<application> (for example %q), not %q",
+			"my-platform/api", operand)
 	}
-	root := scope.Prefix + datasphere.SecretsSegment + datasphere.ScopePrefixSuffix
-	if meta.Keyholder != nil && meta.Keyholder.ScopePrefix != "" && meta.Keyholder.ScopePrefix != scope.Prefix {
-		return "", fmt.Errorf("instance %q records the keyholder serving %q while the keyring's %q scope owns %q; "+
-			"applications are given the recorded prefix, so a secret written here would be one nothing can read",
-			session.Instance, meta.Keyholder.ScopePrefix, scope.Name, scope.Prefix)
+	if err := validateAppName(ns); err != nil {
+		return appRef{}, err
 	}
-	return root, nil
+	if err := validateAppName(app); err != nil {
+		return appRef{}, err
+	}
+	return appRef{Namespace: ns, App: app}, nil
+}
+
+// appScope resolves one application's slice of the instance's storage.
+//
+// The scope is the boundary, so this is also the check that the application
+// exists: a scope is minted when `farcast run` deploys it, and a secret set
+// for an application that was never deployed would sit under keys nothing
+// holds — readable by the operator, invisible to everyone else, and silently
+// wrong at exactly the moment somebody relied on it.
+func appScope(session *storage.Session, ref appRef) (datasphere.Scope, error) {
+	name, err := datasphere.AppScopeName(ref.Namespace, ref.App)
+	if err != nil {
+		return datasphere.Scope{}, err
+	}
+	scope, ok := session.Keyring.ScopeNamed(name)
+	if !ok {
+		return datasphere.Scope{}, fmt.Errorf(
+			"instance %q has no storage scope for %s, so it has nowhere to keep a secret.\n"+
+				"A scope is minted when the application is deployed: run 'farcast run %s <repository>' first.",
+			session.Instance, ref, session.Instance)
+	}
+	return scope, nil
 }
 
 // secretKey builds the object key for one application's named secret.
-func secretKey(root, app, name string) (string, error) {
-	if err := validateAppName(app); err != nil {
-		return "", err
-	}
+//
+// The application is named by the scope the key is already inside, so the path
+// carries no second copy of it. When every application shared one scope the
+// name had to be in the path, because the path was the only thing telling one
+// application's secrets from another's.
+func secretKey(scope datasphere.Scope, name string) (string, error) {
 	if err := datasphere.ValidateSecretName(name); err != nil {
 		return "", err
 	}
-	return root + app + datasphere.ScopePrefixSuffix + name, nil
+	return scope.Prefix + datasphere.SecretsSegment + datasphere.ScopePrefixSuffix + name, nil
 }
 
-// validateAppName holds the app operand to the manifest's own rule for an
-// application name, since that is what the deployed ConfigMap will carry. A
-// secret filed under a name no application can have is one nothing will ever
-// read.
+// validateAppName holds a namespace or application operand to the manifest's
+// own rule, since that is what was deployed. A secret filed under a name no
+// application can have is one nothing will ever read.
 func validateAppName(app string) error {
 	if app == "" {
 		return usagef("an application name is required")
@@ -131,6 +158,9 @@ func validateAppName(app string) error {
 			return usagef("%q is not an application name (lowercase letters, digits and dashes, starting with a letter)", app)
 		}
 	}
+	if app[len(app)-1] == '-' {
+		return usagef("%q is not an application name (it must not end with a dash)", app)
+	}
 	return nil
 }
 
@@ -138,20 +168,11 @@ func validateAppName(app string) error {
 // mints the keyring if there is not one yet, exactly as `storage cp` does; a
 // verb that only reads never brings key material into existence as a side
 // effect of listing.
-func openSecrets(ctx context.Context, env *Env, instance string, mint bool) (*storage.Session, string, error) {
-	meta, err := env.ConfigDir.LoadInstanceMetadata(instance)
-	if err != nil {
-		return nil, "", fmt.Errorf("load instance %q: %w", instance, err)
+func openSecrets(ctx context.Context, env *Env, instance string, mint bool) (*storage.Session, error) {
+	if _, err := env.ConfigDir.LoadInstanceMetadata(instance); err != nil {
+		return nil, fmt.Errorf("load instance %q: %w", instance, err)
 	}
-	session, err := openSession(ctx, env, instance, mint)
-	if err != nil {
-		return nil, "", err
-	}
-	root, err := secretsRoot(session, meta)
-	if err != nil {
-		return nil, "", err
-	}
-	return session, root, nil
+	return openSession(ctx, env, instance, mint)
 }
 
 // ------------------------------------------------------------------ set
@@ -167,13 +188,13 @@ func (*secretSetCommand) Synopsis() string { return "Store a secret, reading the
 
 func (*secretSetCommand) Usage() string {
 	return strings.TrimSpace(`
-Usage: farcast secret set <instance> <app> <NAME> [flags]
+Usage: farcast secret set <instance> <namespace>/<app> <NAME> [flags]
 
 Store a secret for one application. The value is read from stdin, or from a
 file with --from-file:
 
-  printf '%s' "$PASSWORD" | farcast secret set prod api DB_PASSWORD
-  farcast secret set prod api TLS_KEY --from-file ./key.pem
+  printf '%s' "$PASSWORD" | farcast secret set prod my-platform/api DB_PASSWORD
+  farcast secret set prod my-platform/api TLS_KEY --from-file ./key.pem
 
 There is no --value flag on purpose. A value on the command line is visible to
 every process on the machine while the command runs, and it lands in shell
@@ -189,7 +210,11 @@ would become part of the credential. One is removed and the removal is
 reported; --raw keeps it.
 
 The name may use letters, digits, '_', '-' and '.', up to 128 bytes. It is
-appended to the application's own prefix, so it carries no path separators.`)
+appended to the application's own prefix, so it carries no path separators.
+
+The application's scope is minted when 'farcast run' deploys it, so a secret
+for an application that was never deployed is refused rather than stored
+somewhere nothing will look.`)
 }
 
 func (c *secretSetCommand) SetFlags(fs *flag.FlagSet) {
@@ -200,9 +225,13 @@ func (c *secretSetCommand) SetFlags(fs *flag.FlagSet) {
 
 func (c *secretSetCommand) Run(ctx context.Context, env *Env, args []string) error {
 	if len(args) != 3 {
-		return usagef("secret set takes an instance, an application and a name")
+		return usagef("secret set takes an instance, a <namespace>/<application> and a name")
 	}
-	instance, app, name := args[0], args[1], args[2]
+	instance, name := args[0], args[2]
+	ref, err := parseAppRef(args[1])
+	if err != nil {
+		return err
+	}
 
 	value, trimmed, err := c.read(env)
 	if err != nil {
@@ -215,11 +244,15 @@ func (c *secretSetCommand) Run(ctx context.Context, env *Env, args []string) err
 		return fmt.Errorf("refusing to store an empty value for %q; to remove a secret use 'farcast secret rm'", name)
 	}
 
-	session, root, err := openSecrets(ctx, env, instance, true)
+	session, err := openSecrets(ctx, env, instance, true)
 	if err != nil {
 		return err
 	}
-	key, err := secretKey(root, app, name)
+	scope, err := appScope(session, ref)
+	if err != nil {
+		return err
+	}
+	key, err := secretKey(scope, name)
 	if err != nil {
 		return err
 	}
@@ -228,7 +261,7 @@ func (c *secretSetCommand) Run(ctx context.Context, env *Env, args []string) err
 		return err
 	}
 	if exists && !c.force {
-		return usagef("%s already has a secret named %q; pass --force to replace it", app, name)
+		return usagef("%s already has a secret named %q; pass --force to replace it", ref, name)
 	}
 	store, err := session.StoreFor(key)
 	if err != nil {
@@ -238,7 +271,7 @@ func (c *secretSetCommand) Run(ctx context.Context, env *Env, args []string) err
 		return fmt.Errorf("store the secret: %w", err)
 	}
 	return env.Printer.Print(secretSetResult{
-		Instance: instance, App: app, Name: name, Bytes: len(value),
+		Instance: instance, App: ref.String(), Name: name, Bytes: len(value),
 		Replaced: exists, TrimmedNewline: trimmed,
 	})
 }
@@ -310,7 +343,7 @@ func (*secretLsCommand) Synopsis() string { return "List secret names (never val
 
 func (*secretLsCommand) Usage() string {
 	return strings.TrimSpace(`
-Usage: farcast secret ls <instance> [<app>]
+Usage: farcast secret ls <instance> [<namespace>/<app>]
 
 List which secrets exist, for one application or for all of them. Names only:
 this command never reads a value, and never decrypts one.`)
@@ -320,39 +353,51 @@ func (*secretLsCommand) SetFlags(*flag.FlagSet) {}
 
 func (*secretLsCommand) Run(ctx context.Context, env *Env, args []string) error {
 	if len(args) == 0 || len(args) > 2 {
-		return usagef("secret ls takes an instance and an optional application")
+		return usagef("secret ls takes an instance and an optional <namespace>/<application>")
 	}
 	instance := args[0]
-	session, root, err := openSecrets(ctx, env, instance, false)
+	session, err := openSecrets(ctx, env, instance, false)
 	if err != nil {
 		return err
 	}
-	prefix := root
+
+	// Every application scope, or the one named. There is no longer a single
+	// subtree holding every application's secrets — each one's are inside its
+	// own scope, under its own keys — so a listing asks each scope in turn.
+	scopes := session.Keyring.Scopes()
 	if len(args) == 2 {
-		if err := validateAppName(args[1]); err != nil {
+		ref, err := parseAppRef(args[1])
+		if err != nil {
 			return err
 		}
-		prefix = root + args[1] + datasphere.ScopePrefixSuffix
+		scope, err := appScope(session, ref)
+		if err != nil {
+			return err
+		}
+		scopes = []datasphere.Scope{scope}
 	}
-	store, err := session.StoreFor(prefix)
-	if err != nil {
-		return err
-	}
-	keys, err := store.List(ctx, prefix)
-	if err != nil {
-		return fmt.Errorf("list secrets: %w", err)
-	}
-	entries := make([]secretEntry, 0, len(keys))
-	for _, key := range keys {
-		app, name, ok := strings.Cut(strings.TrimPrefix(key, root), datasphere.ScopePrefixSuffix)
+
+	entries := make([]secretEntry, 0)
+	for _, scope := range scopes {
+		ns, app, ok := datasphere.ParseAppScopePrefix(scope.Prefix)
 		if !ok {
-			// A key under the subtree that is not <app>/<name>. It is
-			// reported rather than hidden: something wrote it, and an
-			// operator who cannot see it cannot remove it.
-			entries = append(entries, secretEntry{Name: strings.TrimPrefix(key, root), Unattributed: true})
+			// Not an application scope. Skipped rather than reported: it is
+			// somebody else's key space, and this command speaks about
+			// applications.
 			continue
 		}
-		entries = append(entries, secretEntry{App: app, Name: name})
+		prefix := scope.Prefix + datasphere.SecretsSegment + datasphere.ScopePrefixSuffix
+		store, serr := session.StoreFor(prefix)
+		if serr != nil {
+			return serr
+		}
+		keys, lerr := store.List(ctx, prefix)
+		if lerr != nil {
+			return fmt.Errorf("list %s's secrets: %w", appRef{ns, app}, lerr)
+		}
+		for _, key := range keys {
+			entries = append(entries, secretEntry{App: appRef{ns, app}.String(), Name: strings.TrimPrefix(key, prefix)})
+		}
 	}
 	sort.Slice(entries, func(i, j int) bool {
 		if entries[i].App != entries[j].App {
@@ -364,9 +409,8 @@ func (*secretLsCommand) Run(ctx context.Context, env *Env, args []string) error 
 }
 
 type secretEntry struct {
-	App          string `json:"app,omitempty"`
-	Name         string `json:"name"`
-	Unattributed bool   `json:"unattributed,omitempty"`
+	App  string `json:"app"`
+	Name string `json:"name"`
 }
 
 type secretLsResult struct {
@@ -380,12 +424,7 @@ func (r secretLsResult) Human(w io.Writer) error {
 		return nil
 	}
 	for _, s := range r.Secrets {
-		switch {
-		case s.Unattributed:
-			fprintf(w, "  %-20s %s (not under an application prefix)\n", "?", s.Name)
-		default:
-			fprintf(w, "  %-20s %s\n", s.App, s.Name)
-		}
+		fprintf(w, "  %-28s %s\n", s.App, s.Name)
 	}
 	fprintf(w, "\n%d secret(s). Values are never printed by this command.\n", len(r.Secrets))
 	return nil
@@ -400,7 +439,7 @@ func (*secretRmCommand) Synopsis() string { return "Delete a secret" }
 
 func (*secretRmCommand) Usage() string {
 	return strings.TrimSpace(`
-Usage: farcast secret rm <instance> <app> <NAME> [-y]
+Usage: farcast secret rm <instance> <namespace>/<app> <NAME> [-y]
 
 Delete a secret. The delete is immediate and final — soft delete is disabled
 on the bucket by design — and an application that requires this secret will
@@ -417,14 +456,22 @@ func (c *secretRmCommand) SetFlags(fs *flag.FlagSet) {
 
 func (c *secretRmCommand) Run(ctx context.Context, env *Env, args []string) error {
 	if len(args) != 3 {
-		return usagef("secret rm takes an instance, an application and a name")
+		return usagef("secret rm takes an instance, a <namespace>/<application> and a name")
 	}
-	instance, app, name := args[0], args[1], args[2]
-	session, root, err := openSecrets(ctx, env, instance, false)
+	instance, name := args[0], args[2]
+	ref, err := parseAppRef(args[1])
 	if err != nil {
 		return err
 	}
-	key, err := secretKey(root, app, name)
+	session, err := openSecrets(ctx, env, instance, false)
+	if err != nil {
+		return err
+	}
+	scope, err := appScope(session, ref)
+	if err != nil {
+		return err
+	}
+	key, err := secretKey(scope, name)
 	if err != nil {
 		return err
 	}
@@ -436,14 +483,14 @@ func (c *secretRmCommand) Run(ctx context.Context, env *Env, args []string) erro
 		// Reported, not silently successful: an operator who mistyped the
 		// name would otherwise believe they had revoked a credential that is
 		// still live.
-		return fmt.Errorf("%s has no secret named %q", app, name)
+		return fmt.Errorf("%s has no secret named %q", ref, name)
 	}
 	if !c.assumeYes {
 		interactive := env.Printer.Mode == output.ModeHuman && isTerminal(env.In)
 		if !interactive {
-			return usagef("refusing to delete %s's %q without confirmation; pass --yes", app, name)
+			return usagef("refusing to delete %s's %q without confirmation; pass --yes", ref, name)
 		}
-		fprintf(env.Err, "Deleting %s's %q is immediate and final, and %s will fail to start without it.\n", app, name, app)
+		fprintf(env.Err, "Deleting %s's %q is immediate and final, and it will fail to start without it.\n", ref, name)
 		answer, perr := newPrompter(env.In, env.Err).line(fmt.Sprintf("Type the secret's name to confirm (%s)", name))
 		if perr != nil {
 			return perr
@@ -460,7 +507,7 @@ func (c *secretRmCommand) Run(ctx context.Context, env *Env, args []string) erro
 	if err := store.Delete(ctx, key); err != nil {
 		return fmt.Errorf("delete the secret: %w", err)
 	}
-	return env.Printer.Print(secretRmResult{Instance: instance, App: app, Name: name, Status: "deleted"})
+	return env.Printer.Print(secretRmResult{Instance: instance, App: ref.String(), Name: name, Status: "deleted"})
 }
 
 type secretRmResult struct {

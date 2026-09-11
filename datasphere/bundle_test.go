@@ -43,7 +43,6 @@ func TestNewBundleRefuses(t *testing.T) {
 	}{
 		{"empty instance", "", []Scope{app}},
 		{"blank instance", "   ", []Scope{app}},
-		{"no scopes", "prod", nil},
 		{"duplicate scope name", "prod", []Scope{app, mustScope(t, "app", "elsewhere/")}},
 		{"overlapping scopes", "prod", []Scope{app, mustScope(t, "other", "app/inner/")}},
 		{"invalid scope", "prod", []Scope{{Name: "app", Prefix: "app/"}}},
@@ -54,6 +53,27 @@ func TestNewBundleRefuses(t *testing.T) {
 				t.Fatal("NewBundle accepted an unusable bundle")
 			}
 		})
+	}
+}
+
+// An instance with no applications has no application keys, and its keyholder
+// must still be able to unseal — otherwise it is permanently sealed until the
+// first application happens to be deployed.
+func TestABundleMayCarryNoScopes(t *testing.T) {
+	b, err := NewBundle("prod", 1, nil)
+	if err != nil {
+		t.Fatalf("NewBundle with no scopes: %v", err)
+	}
+	out, err := b.Marshal()
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	back, err := ParseBundle(out)
+	if err != nil {
+		t.Fatalf("ParseBundle: %v", err)
+	}
+	if len(back.Scopes()) != 0 || back.Instance() != "prod" {
+		t.Errorf("round trip = %v", back)
 	}
 }
 

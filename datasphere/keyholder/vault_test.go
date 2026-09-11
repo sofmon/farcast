@@ -11,11 +11,18 @@ import (
 
 func mustBundle(t *testing.T, instance string, generation uint64) *datasphere.Bundle {
 	t.Helper()
-	scope, err := datasphere.NewScope("app", "app/")
+	// Two applications, each with its own scope — the shape ADR 0018 decision
+	// 5 deploys. A fixture with one scope could not tell "reached its own" from
+	// "reached the only one there is".
+	web, err := datasphere.NewAppScope("apps", "web")
 	if err != nil {
-		t.Fatalf("NewScope: %v", err)
+		t.Fatalf("NewAppScope: %v", err)
 	}
-	b, err := datasphere.NewBundle(instance, generation, []datasphere.Scope{scope})
+	api, err := datasphere.NewAppScope("apps", "api")
+	if err != nil {
+		t.Fatalf("NewAppScope: %v", err)
+	}
+	b, err := datasphere.NewBundle(instance, generation, []datasphere.Scope{web, api})
 	if err != nil {
 		t.Fatalf("NewBundle: %v", err)
 	}
@@ -47,7 +54,7 @@ func TestUnsealFromRestartSealed(t *testing.T) {
 	if st.Phase != PhaseUnsealed || !v.Ready() {
 		t.Fatalf("phase = %q, ready = %v", st.Phase, v.Ready())
 	}
-	if st.Generation != 1 || len(st.Scopes) != 1 || st.Scopes[0] != "app" {
+	if st.Generation != 1 || len(st.Scopes) != 2 || st.Scopes[0] != "app-apps-web" {
 		t.Errorf("state after unseal = %+v", st)
 	}
 }
@@ -179,20 +186,20 @@ func TestReleaseHoldLandsSealedNotUnsealed(t *testing.T) {
 	if v.Ready() {
 		t.Error("released hold must not be ready")
 	}
-	if _, err := v.Scope("app/x"); !errors.Is(err, ErrSealed) {
+	if _, err := v.Scope("app/apps/web/x"); !errors.Is(err, ErrSealed) {
 		t.Errorf("released hold still served a scope: %v", err)
 	}
 }
 
 func TestScopeResolution(t *testing.T) {
 	v := New("prod")
-	if _, err := v.Scope("app/x"); !errors.Is(err, ErrSealed) {
+	if _, err := v.Scope("app/apps/web/x"); !errors.Is(err, ErrSealed) {
 		t.Fatalf("sealed Scope = %v, want ErrSealed", err)
 	}
 	if err := v.Unseal(mustBundle(t, "prod", 1), IntentOperator); err != nil {
 		t.Fatalf("Unseal: %v", err)
 	}
-	if _, err := v.Scope("app/x"); err != nil {
+	if _, err := v.Scope("app/apps/web/x"); err != nil {
 		t.Errorf("in-scope key refused: %v", err)
 	}
 	// Out-of-scope is permanent; sealed is temporary. An application must be
@@ -214,12 +221,12 @@ func TestSealDropsScopes(t *testing.T) {
 	if err := v.Unseal(mustBundle(t, "prod", 1), IntentOperator); err != nil {
 		t.Fatalf("Unseal: %v", err)
 	}
-	if len(v.State().Scopes) != 1 {
-		t.Fatal("guard: scope did not load")
+	if len(v.State().Scopes) != 2 {
+		t.Fatal("guard: the fixture's two scopes did not load")
 	}
 	// Hold the scope the VAULT took — not the caller's bundle, which the vault
 	// no longer shares material with — so the wipe is observable after the seal.
-	held, err := v.Scope("app/x")
+	held, err := v.Scope("app/apps/web/x")
 	if err != nil {
 		t.Fatalf("Scope: %v", err)
 	}
@@ -234,7 +241,7 @@ func TestSealDropsScopes(t *testing.T) {
 	if !held.Zeroed() {
 		t.Error("Seal dropped the scopes without wiping their material")
 	}
-	if _, err := v.Scope("app/x"); !errors.Is(err, ErrSealed) {
+	if _, err := v.Scope("app/apps/web/x"); !errors.Is(err, ErrSealed) {
 		t.Errorf("a sealed vault still resolved a scope: %v", err)
 	}
 }
@@ -271,7 +278,7 @@ func TestConcurrentAccess(t *testing.T) {
 				case 1:
 					v.Seal(j%10 == 0, "churn")
 				case 2:
-					_, _ = v.Scope("app/x")
+					_, _ = v.Scope("app/apps/web/x")
 				default:
 					_ = v.State()
 					_ = v.Ready()
@@ -298,7 +305,7 @@ func TestUnsealTakesOwnershipOfKeyMaterial(t *testing.T) {
 		t.Fatalf("Unseal: %v", err)
 	}
 
-	before, err := v.Scope("app/x")
+	before, err := v.Scope("app/apps/web/x")
 	if err != nil {
 		t.Fatalf("Scope: %v", err)
 	}
@@ -309,7 +316,7 @@ func TestUnsealTakesOwnershipOfKeyMaterial(t *testing.T) {
 	// The caller wipes its copy, exactly as the unseal handler does on return.
 	b.Zero()
 
-	after, err := v.Scope("app/x")
+	after, err := v.Scope("app/apps/web/x")
 	if err != nil {
 		t.Fatalf("Scope after the caller wiped its bundle: %v", err)
 	}

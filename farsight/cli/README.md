@@ -739,18 +739,24 @@ The mint/record/retry loop belongs here, in the record-owning caller, never in t
 Like `farcast storage`, it runs **entirely on the operator's machine** — the recorded bucket, the stored cloud credentials, the local keyring — so it needs no tunnel and no running cluster.
 
 ```
-farcast secret set <instance> <app> <NAME> [--from-file PATH] [--raw] [--force]
-farcast secret ls  <instance> [<app>]
-farcast secret rm  <instance> <app> <NAME> [-y]
+farcast secret set <instance> <namespace>/<app> <NAME> [--from-file PATH] [--raw] [--force]
+farcast secret ls  <instance> [<namespace>/<app>]
+farcast secret rm  <instance> <namespace>/<app> <NAME> [-y]
 ```
+
+### Why an application is named `<namespace>/<app>`
+
+Because both halves are real. An application is one entry in a manifest's `apps:` list; the namespace is the manifest's top-level `name`, overridable with `--namespace` and not derived from the repository. The same manifest deployed under two namespaces is two sets of applications with **two sets of keys**, and a secret set for one is not a secret for the other — so a bare application name would be a guess about which one you meant.
 
 ### Where a secret goes, and what that protects
 
-Each secret is an ordinary object in the instance's encrypted storage under `<scope>/secrets/<app>/<name>`, written with this instance's own keys. The cloud provider holds ciphertext under a tokenized name, and **nothing is ever placed in a Kubernetes Secret** — which is base64 in etcd, encrypted at rest under a key the cloud provider holds.
+Each secret is an ordinary object under `app/<namespace>/<app>/secrets/<name>` — inside that application's **own scope**, with its own name key and KEK — written with this instance's keys. The cloud provider holds ciphertext under a tokenized name, and **nothing is ever placed in a Kubernetes Secret**, which is base64 in etcd encrypted under a key the provider holds.
 
-**The boundary is the instance, not the application.** A secret is confidential from the cloud and from anything outside the instance; it is *not* confidential from another application inside the same instance. Every application shares one storage scope and the keyholder's data path cannot tell them apart. This is stated here, in the command's own help, in the SDK, and in full — with the alternatives that were rejected and what would close it — in [ADR 0017](../../docs/adr/0017-application-secrets.md).
+**The boundary is the application.** A neighbour's keys cannot compute the stored name of this secret, let alone open it, and its leaf does not reach this scope to ask ([ADR 0018](../../docs/adr/0018-thin-device-storage.md) decisions 1 and 5). That was not true before: [ADR 0017](../../docs/adr/0017-application-secrets.md) records the boundary as the *instance*, which is what it was when every application shared one scope.
 
-What *is* enforced: the keyholder refuses application writes and deletes under the subtree, so a secret is created and removed here and nowhere else. A compromised application can read the instance's secrets and cannot plant a credential for a neighbour to pick up, or delete one to force a fallback.
+What is enforced on top: the keyholder refuses application writes and deletes under the subtree, so a secret is created and removed by you and by nobody else — including by the application it belongs to.
+
+An application's scope is minted when `farcast run` deploys it, so `secret set` for an application that was never deployed is refused rather than stored somewhere nothing will look.
 
 ### There is no `--value`, and there is no `get`
 
@@ -775,7 +781,7 @@ Since [ADR 0018](../../docs/adr/0018-thin-device-storage.md) decision 1 the keyh
 
 The operator writes a key that an application reads, and the two are computed in different packages: the CLI from the keyring, the application from the `FARCAST_SECRETS_PREFIX` Planck rendered from the recorded scope prefix. A divergence would not fail loudly — it would store a secret nothing ever fetches.
 
-So `secret` resolves the prefix from the **keyring** (the material that actually encrypts the object), cross-checks it against what the deploy recorded, and refuses when the two disagree rather than picking one. A test asserts the CLI's key and Planck's rendered prefix agree.
+So `secret` resolves the prefix from the **keyring**, which is the material that actually encrypts the object, and a test renders Planck's ConfigMap and asserts the two agree character for character.
 
 ---
 

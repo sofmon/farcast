@@ -437,3 +437,82 @@ func TestValidateSecretName(t *testing.T) {
 		}
 	}
 }
+
+// The layout ADR 0018 decision 5 fixes: one scope per application, under a
+// root that nothing owns.
+func TestAppScopeLayout(t *testing.T) {
+	if got := AppScopePrefix("shop", "api"); got != "app/shop/api/" {
+		t.Errorf("AppScopePrefix = %q", got)
+	}
+	if got := AppSecretsPrefix("shop", "api"); got != "app/shop/api/secrets/" {
+		t.Errorf("AppSecretsPrefix = %q", got)
+	}
+	name, err := AppScopeName("shop", "api")
+	if err != nil || name != "app-shop-api" {
+		t.Errorf("AppScopeName = %q, %v", name, err)
+	}
+
+	ns, app, ok := ParseAppScopePrefix("app/shop/api/")
+	if !ok || ns != "shop" || app != "api" {
+		t.Errorf("ParseAppScopePrefix = %q, %q, %v", ns, app, ok)
+	}
+	for _, bad := range []string{"app/", "app/shop/", "app/shop/api/extra/", "ops/shop/api/", "", "app/shop//"} {
+		if _, _, ok := ParseAppScopePrefix(bad); ok {
+			t.Errorf("ParseAppScopePrefix(%q) accepted", bad)
+		}
+	}
+
+	// A pair too long to name is refused at the mint rather than truncated
+	// into a collision with somebody else's scope — and the refusal names
+	// both halves and the limit, because the operator's next move is to
+	// shorten one of them and the generic rule does not say which.
+	_, err = AppScopeName(strings.Repeat("n", 40), strings.Repeat("a", 40))
+	if err == nil {
+		t.Fatal("AppScopeName composed a name over the limit")
+	}
+	for _, want := range []string{strings.Repeat("n", 40), strings.Repeat("a", 40), "63"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not name %q: %v", want, err)
+		}
+	}
+	if _, err := NewAppScope("Shop", "api"); err == nil {
+		t.Error("NewAppScope accepted a namespace no manifest could carry")
+	}
+}
+
+// Two applications' scopes coexist; a scope owning the root would not, which
+// is why there is no longer one.
+func TestAppScopesCoexistButNotWithARootScope(t *testing.T) {
+	keys, err := NewKeyring()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, app := range []string{"api", "web"} {
+		scope, serr := NewAppScope("shop", app)
+		if serr != nil {
+			t.Fatal(serr)
+		}
+		if keys, err = keys.AddScope(scope); err != nil {
+			t.Fatalf("AddScope(%s): %v", app, err)
+		}
+	}
+	// The same application in another namespace is another scope: the same
+	// manifest deployed twice is two key spaces, not one shared one.
+	other, err := NewAppScope("staging", "api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := keys.AddScope(other); err != nil {
+		t.Errorf("a second namespace's scope was refused: %v", err)
+	}
+
+	// And a scope owning "app/" is refused against them, which is the
+	// constraint that removed the shared scope rather than nesting inside it.
+	root, err := NewScope("app", "app/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := keys.AddScope(root); err == nil {
+		t.Error("a scope owning the application root was accepted alongside per-application scopes")
+	}
+}

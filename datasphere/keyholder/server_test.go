@@ -223,10 +223,10 @@ func TestDataRoundTrip(t *testing.T) {
 	h.unseal(t, 1)
 	payload := []byte("application data")
 
-	if w := doAs(h.data, asWeb, "PUT", "/v1/object", objHeaders("app/doc", "app"), payload); w.Code != http.StatusNoContent {
+	if w := doAs(h.data, asWeb, "PUT", "/v1/object", objHeaders("app/apps/web/doc", appScopeName), payload); w.Code != http.StatusNoContent {
 		t.Fatalf("PUT = %d: %s", w.Code, w.Body)
 	}
-	w := doAs(h.data, asWeb, "GET", "/v1/object", objHeaders("app/doc", "app"), nil)
+	w := doAs(h.data, asWeb, "GET", "/v1/object", objHeaders("app/apps/web/doc", appScopeName), nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("GET = %d: %s", w.Code, w.Body)
 	}
@@ -235,8 +235,8 @@ func TestDataRoundTrip(t *testing.T) {
 	}
 
 	lw := doAs(h.data, asWeb, "GET", "/v1/list", map[string]string{
-		HeaderPrefix: base64.StdEncoding.EncodeToString([]byte("app/")),
-		HeaderScope:  "app",
+		HeaderPrefix: base64.StdEncoding.EncodeToString([]byte("app/apps/web/")),
+		HeaderScope:  appScopeName,
 	}, nil)
 	if lw.Code != http.StatusOK {
 		t.Fatalf("LIST = %d: %s", lw.Code, lw.Body)
@@ -247,20 +247,20 @@ func TestDataRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(lw.Body.Bytes(), &listed); err != nil {
 		t.Fatalf("decode list: %v", err)
 	}
-	if len(listed.Keys) != 1 || listed.Keys[0] != "app/doc" {
+	if len(listed.Keys) != 1 || listed.Keys[0] != "app/apps/web/doc" {
 		t.Errorf("list = %v, want [app/doc]", listed.Keys)
 	}
 
-	if w := doAs(h.data, asWeb, "DELETE", "/v1/object", objHeaders("app/doc", "app"), nil); w.Code != http.StatusNoContent {
+	if w := doAs(h.data, asWeb, "DELETE", "/v1/object", objHeaders("app/apps/web/doc", appScopeName), nil); w.Code != http.StatusNoContent {
 		t.Fatalf("DELETE = %d", w.Code)
 	}
-	if w := doAs(h.data, asWeb, "GET", "/v1/object", objHeaders("app/doc", "app"), nil); w.Code != http.StatusNotFound {
+	if w := doAs(h.data, asWeb, "GET", "/v1/object", objHeaders("app/apps/web/doc", appScopeName), nil); w.Code != http.StatusNotFound {
 		t.Errorf("GET after delete = %d, want 404", w.Code)
 	}
 
 	// The cloud saw only tokenized names.
 	for name := range h.provider.objects {
-		if strings.Contains(name, "app/doc") || strings.Contains(name, "doc") {
+		if strings.Contains(name, "app/apps/web/doc") || strings.Contains(name, "doc") {
 			t.Errorf("the provider holds a recognizable logical name: %q", name)
 		}
 	}
@@ -271,7 +271,7 @@ func TestDataRoundTrip(t *testing.T) {
 func TestSealedDataPathReportsSealed(t *testing.T) {
 	h := newHarness(t)
 	h.unseal(t, 1)
-	if w := doAs(h.data, asWeb, "PUT", "/v1/object", objHeaders("app/doc", "app"), []byte("x")); w.Code != http.StatusNoContent {
+	if w := doAs(h.data, asWeb, "PUT", "/v1/object", objHeaders("app/apps/web/doc", appScopeName), []byte("x")); w.Code != http.StatusNoContent {
 		t.Fatalf("setup PUT = %d", w.Code)
 	}
 	h.vault.Seal(false, "")
@@ -281,11 +281,11 @@ func TestSealedDataPathReportsSealed(t *testing.T) {
 		headers        map[string]string
 		body           []byte
 	}{
-		{"GET", "/v1/object", objHeaders("app/doc", "app"), nil},
-		{"PUT", "/v1/object", objHeaders("app/doc", "app"), []byte("x")},
-		{"DELETE", "/v1/object", objHeaders("app/doc", "app"), nil},
+		{"GET", "/v1/object", objHeaders("app/apps/web/doc", appScopeName), nil},
+		{"PUT", "/v1/object", objHeaders("app/apps/web/doc", appScopeName), []byte("x")},
+		{"DELETE", "/v1/object", objHeaders("app/apps/web/doc", appScopeName), nil},
 		{"GET", "/v1/list", map[string]string{
-			HeaderPrefix: base64.StdEncoding.EncodeToString([]byte("app/")), HeaderScope: "app"}, nil},
+			HeaderPrefix: base64.StdEncoding.EncodeToString([]byte("app/apps/web/")), HeaderScope: appScopeName}, nil},
 	}
 	for _, tc := range cases {
 		w := doAs(h.data, asWeb, tc.method, tc.target, tc.headers, tc.body)
@@ -303,7 +303,7 @@ func TestSealedDataPathReportsSealed(t *testing.T) {
 func TestSealedListIsNotAnEmptySuccess(t *testing.T) {
 	h := newHarness(t)
 	w := doAs(h.data, asWeb, "GET", "/v1/list", map[string]string{
-		HeaderPrefix: base64.StdEncoding.EncodeToString([]byte("app/")), HeaderScope: "app"}, nil)
+		HeaderPrefix: base64.StdEncoding.EncodeToString([]byte("app/apps/web/")), HeaderScope: appScopeName}, nil)
 	if w.Code == http.StatusOK {
 		t.Fatalf("sealed LIST returned 200: %s", w.Body)
 	}
@@ -323,7 +323,7 @@ func TestOutOfScopeRefusedBeforeTouchingTheCloud(t *testing.T) {
 	h.unseal(t, 1)
 	h.provider.reset()
 
-	w := doAs(h.data, asWeb, "GET", "/v1/object", objHeaders("system/secret", "app"), nil)
+	w := doAs(h.data, asWeb, "GET", "/v1/object", objHeaders("system/secret", appScopeName), nil)
 	if w.Code != http.StatusForbidden || w.Header().Get(HeaderCode) != CodePermission {
 		t.Fatalf("= %d/%q, want 403/%s", w.Code, w.Header().Get(HeaderCode), CodePermission)
 	}
@@ -338,7 +338,7 @@ func TestMissingScopeHeaderIsRefused(t *testing.T) {
 	h := newHarness(t)
 	h.unseal(t, 1)
 	w := doAs(h.data, asWeb, "GET", "/v1/object", map[string]string{
-		HeaderKey: base64.StdEncoding.EncodeToString([]byte("app/doc"))}, nil)
+		HeaderKey: base64.StdEncoding.EncodeToString([]byte("app/apps/web/doc"))}, nil)
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("= %d, want 403 when the scope is not declared", w.Code)
 	}
@@ -364,24 +364,24 @@ func TestExoticKeysRoundTripByteExactly(t *testing.T) {
 		// NFC and NFD of the same word, written as escapes: literal bytes
 		// can be normalized by an editor or a tool, which would collapse
 		// them into one key and make this test prove nothing.
-		"app/caf\u00e9",
-		"app/cafe\u0301",
-		"app/a b/c+d&e=f?g#h",   // characters a URL would mangle
-		"app/../literal",        // ".." is a literal segment here, not traversal
-		"app/tab\tand\nnewline", // bytes a header could not carry unencoded
-		"app/\U0001F511",        // outside the BMP
+		"app/apps/web/caf\u00e9",
+		"app/apps/web/cafe\u0301",
+		"app/apps/web/a b/c+d&e=f?g#h",   // characters a URL would mangle
+		"app/apps/web/../literal",        // ".." is a literal segment here, not traversal
+		"app/apps/web/tab\tand\nnewline", // bytes a header could not carry unencoded
+		"app/apps/web/\U0001F511",        // outside the BMP
 	}
 	if keys[0] == keys[1] {
 		t.Fatal("guard: the NFC and NFD forms collapsed; this test would prove nothing")
 	}
 	for _, k := range keys {
 		body := []byte("value for " + k)
-		if w := doAs(h.data, asWeb, "PUT", "/v1/object", objHeaders(k, "app"), body); w.Code != http.StatusNoContent {
+		if w := doAs(h.data, asWeb, "PUT", "/v1/object", objHeaders(k, appScopeName), body); w.Code != http.StatusNoContent {
 			t.Fatalf("PUT %q = %d: %s", k, w.Code, w.Body)
 		}
 	}
 	for _, k := range keys {
-		w := doAs(h.data, asWeb, "GET", "/v1/object", objHeaders(k, "app"), nil)
+		w := doAs(h.data, asWeb, "GET", "/v1/object", objHeaders(k, appScopeName), nil)
 		if w.Code != http.StatusOK {
 			t.Fatalf("GET %q = %d: %s", k, w.Code, w.Body)
 		}
@@ -399,9 +399,9 @@ func TestExoticKeysRoundTripByteExactly(t *testing.T) {
 func TestErrorsNeverQuoteTheLogicalKey(t *testing.T) {
 	h := newHarness(t)
 	h.unseal(t, 1)
-	secret := "app/very-distinctive-object-name"
+	secret := "app/apps/web/very-distinctive-object-name"
 
-	w := doAs(h.data, asWeb, "GET", "/v1/object", objHeaders(secret, "app"), nil)
+	w := doAs(h.data, asWeb, "GET", "/v1/object", objHeaders(secret, appScopeName), nil)
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("= %d, want 404", w.Code)
 	}
@@ -409,7 +409,7 @@ func TestErrorsNeverQuoteTheLogicalKey(t *testing.T) {
 		t.Errorf("the error body quoted the logical key: %s", w.Body)
 	}
 
-	sealedResp := doAs(h.data, asWeb, "GET", "/v1/object", objHeaders("system/"+secret, "app"), nil)
+	sealedResp := doAs(h.data, asWeb, "GET", "/v1/object", objHeaders("system/"+secret, appScopeName), nil)
 	if strings.Contains(sealedResp.Body.String(), "very-distinctive") {
 		t.Errorf("the refusal quoted the logical key: %s", sealedResp.Body)
 	}
@@ -419,7 +419,7 @@ func TestOversizeObjectIsRefused(t *testing.T) {
 	h := newHarness(t)
 	h.srv.max = 32
 	h.unseal(t, 1)
-	w := doAs(h.data, asWeb, "PUT", "/v1/object", objHeaders("app/big", "app"), bytes.Repeat([]byte("x"), 64))
+	w := doAs(h.data, asWeb, "PUT", "/v1/object", objHeaders("app/apps/web/big", appScopeName), bytes.Repeat([]byte("x"), 64))
 	if w.Code != http.StatusRequestEntityTooLarge || w.Header().Get(HeaderCode) != CodeTooLarge {
 		t.Fatalf("= %d/%q, want 413/%s", w.Code, w.Header().Get(HeaderCode), CodeTooLarge)
 	}
@@ -505,7 +505,7 @@ func TestSecretsAreReadOnlyOnTheDataPath(t *testing.T) {
 		{"PUT", []byte("planted")},
 		{"DELETE", nil},
 	} {
-		w := doAs(h.data, asWeb, tc.method, "/v1/object", objHeaders(key, "app"), tc.body)
+		w := doAs(h.data, asWeb, tc.method, "/v1/object", objHeaders(key, appScopeName), tc.body)
 		if w.Code != http.StatusForbidden {
 			t.Errorf("%s = %d, want 403", tc.method, w.Code)
 		}
@@ -515,10 +515,10 @@ func TestSecretsAreReadOnlyOnTheDataPath(t *testing.T) {
 	}
 
 	// Ordinary application storage is untouched by the rule.
-	if w := doAs(h.data, asWeb, "PUT", "/v1/object", objHeaders("app/reports/q3.csv", "app"), []byte("data")); w.Code != http.StatusNoContent {
+	if w := doAs(h.data, asWeb, "PUT", "/v1/object", objHeaders("app/apps/web/reports/q3.csv", appScopeName), []byte("data")); w.Code != http.StatusNoContent {
 		t.Errorf("writing ordinary storage = %d, want 204", w.Code)
 	}
-	if w := doAs(h.data, asWeb, "DELETE", "/v1/object", objHeaders("app/reports/q3.csv", "app"), nil); w.Code != http.StatusNoContent {
+	if w := doAs(h.data, asWeb, "DELETE", "/v1/object", objHeaders("app/apps/web/reports/q3.csv", appScopeName), nil); w.Code != http.StatusNoContent {
 		t.Errorf("deleting ordinary storage = %d, want 204", w.Code)
 	}
 }
@@ -532,11 +532,11 @@ func TestSecretListingIsNotRefused(t *testing.T) {
 	h.unseal(t, 1)
 
 	headers := map[string]string{
-		HeaderPrefix: base64.StdEncoding.EncodeToString([]byte("app/secrets/")),
-		HeaderScope:  "app",
+		HeaderPrefix: base64.StdEncoding.EncodeToString([]byte("app/apps/web/secrets/")),
+		HeaderScope:  appScopeName,
 	}
 	if w := doAs(h.data, asWeb, "GET", "/v1/list", headers, nil); w.Code != http.StatusOK {
-		t.Errorf("listing the secrets subtree = %d, want 200", w.Code)
+		t.Errorf("listing its own secrets subtree = %d, want 200", w.Code)
 	}
 }
 
@@ -608,6 +608,23 @@ func mustJSON(t *testing.T, w *httptest.ResponseRecorder, out any) {
 // Identities the data-path tests act as. Every leaf has already been verified
 // by the listener by the time a handler runs, so a test supplies only what the
 // handler reads: the URI on the peer certificate.
+// The two applications the fixture bundle carries, and what their keys and
+// scope names look like.
+const (
+	appScopeName = "app-apps-web"
+	apiScopeName = "app-apps-api"
+	webSecret    = "app/apps/web/secrets/DB"
+	apiSecret    = "app/apps/api/secrets/DB"
+)
+
+// scopeOf names the scope a fixture key belongs to.
+func scopeOf(key string) string {
+	if strings.HasPrefix(key, "app/apps/api/") {
+		return apiScopeName
+	}
+	return appScopeName
+}
+
 const (
 	asWeb      = "farcast://prod/app/apps/web"
 	asAPI      = "farcast://prod/app/apps/api"
@@ -687,73 +704,86 @@ func TestAllowDataAdmitsEveryoneButKeepers(t *testing.T) {
 	}
 }
 
-func TestMayReachAndMayTouchSecret(t *testing.T) {
+// An application reaches its OWN scope. This is where the separation stops
+// being a rule the keyholder enforces and starts being the keys themselves
+// (ADR 0018 decision 5).
+func TestMayReach(t *testing.T) {
 	web, _ := ParseIdentity(asWeb, "prod")
+	api, _ := ParseIdentity(asAPI, "prod")
 	op, _ := ParseIdentity(asOperator, "prod")
 	dev, _ := ParseIdentity(asDevice, "prod")
 	keeper, _ := ParseIdentity(asKeeper, "prod")
 
-	if !web.MayReach("app") || web.MayReach("ops") {
-		t.Error("an application reaches the application scope and nothing else")
+	if !web.MayReach(appScopeName) {
+		t.Errorf("web cannot reach its own scope %q", appScopeName)
 	}
-	if !op.MayReach("ops") || !dev.MayReach("ops") {
+	for _, other := range []string{"app-apps-api", "app-other-web", "ops", "app"} {
+		if web.MayReach(other) {
+			t.Errorf("web reached %q, which is not its own", other)
+		}
+	}
+	if api.MayReach(appScopeName) {
+		t.Error("api reached web's scope")
+	}
+	if !op.MayReach("ops") || !dev.MayReach("ops") || !op.MayReach(appScopeName) {
 		t.Error("the operator and a device reach every scope")
 	}
-	if keeper.MayReach("app") {
+	if keeper.MayReach(appScopeName) {
 		t.Error("a keeper reaches storage")
 	}
-	for key, want := range map[string]bool{
-		"app/secrets/web/DB": true,  // its own
-		"app/secrets/api/DB": false, // a neighbour's
-		"app/secrets/":       true,  // the root addresses no object
-		"app/reports/q3.csv": true,  // not a secret at all
-		"app/secretsauce/x":  true,  // a neighbouring name
-	} {
-		if got := web.MayTouchSecret("app/", key); got != want {
-			t.Errorf("web.MayTouchSecret(%q) = %v, want %v", key, got, want)
-		}
-		if !op.MayTouchSecret("app/", key) || !dev.MayTouchSecret("app/", key) {
-			t.Errorf("operator or device refused %q", key)
-		}
+	// A namespace and name too long to compose a scope name reach nothing —
+	// the mint would have failed too, so there is nothing there to reach.
+	long, _ := ParseIdentity("farcast://prod/app/"+strings.Repeat("n", 40)+"/"+strings.Repeat("a", 40), "prod")
+	if long.MayReach("anything") {
+		t.Error("an uncomposable identity reached a scope")
 	}
 }
 
-// The boundary ADR 0017 said the path could not hold, held: an application
-// reads its own secrets and nobody else's.
-func TestAnApplicationReadsItsOwnSecretsAndNobodyElses(t *testing.T) {
+// The boundary ADR 0017 said the path could not hold, held — and now it is the
+// keys rather than a rule: web's scope is not api's, so nothing web presents
+// reaches anything of api's, secret or not.
+func TestAnApplicationReachesItsOwnScopeAndNobodyElses(t *testing.T) {
 	h := newHarness(t)
 	h.unseal(t, 1)
 
-	// The operator provisions both, through the data path, which it may now
-	// do because the path can tell it is the operator.
-	for _, k := range []string{"app/secrets/web/DB", "app/secrets/api/DB"} {
-		if w := doAs(h.data, asOperator, "PUT", "/v1/object", objHeaders(k, "app"), []byte("s3cret")); w.Code != http.StatusNoContent {
+	// The operator provisions both, through the data path, which it may do
+	// because the path can tell it is the operator.
+	for _, k := range []string{webSecret, apiSecret} {
+		scope := scopeOf(k)
+		if w := doAs(h.data, asOperator, "PUT", "/v1/object", objHeaders(k, scope), []byte("s3cret")); w.Code != http.StatusNoContent {
 			t.Fatalf("operator PUT %s = %d, want 204", k, w.Code)
 		}
 	}
 
-	if w := doAs(h.data, asWeb, "GET", "/v1/object", objHeaders("app/secrets/web/DB", "app"), nil); w.Code != http.StatusOK {
+	if w := doAs(h.data, asWeb, "GET", "/v1/object", objHeaders(webSecret, appScopeName), nil); w.Code != http.StatusOK {
 		t.Errorf("web reading its own secret = %d, want 200", w.Code)
 	}
-	w := doAs(h.data, asWeb, "GET", "/v1/object", objHeaders("app/secrets/api/DB", "app"), nil)
+	w := doAs(h.data, asWeb, "GET", "/v1/object", objHeaders(apiSecret, apiScopeName), nil)
 	if w.Code != http.StatusForbidden || w.Header().Get(HeaderCode) != CodePermission {
 		t.Errorf("web reading api's secret = %d %q, want 403 permission", w.Code, w.Header().Get(HeaderCode))
 	}
 	if strings.Contains(w.Body.String(), "s3cret") {
 		t.Error("a refused read carried the value")
 	}
-	// Listing INSIDE a neighbour's subtree is refused too; the secrets root
-	// stays listable, as ADR 0017 decision 4 says and ADR 0018 does not undo.
-	inside := map[string]string{HeaderPrefix: base64.StdEncoding.EncodeToString([]byte("app/secrets/api/")), HeaderScope: "app"}
-	if w := doAs(h.data, asWeb, "GET", "/v1/list", inside, nil); w.Code != http.StatusForbidden {
-		t.Errorf("web listing inside api's secrets = %d, want 403", w.Code)
+	// Ordinary objects too, which is what decision 5 adds over decision 1:
+	// the neighbour boundary is no longer only about secrets.
+	if w := doAs(h.data, asOperator, "PUT", "/v1/object", objHeaders("app/apps/api/report", apiScopeName), []byte("data")); w.Code != http.StatusNoContent {
+		t.Fatalf("operator PUT api's object = %d", w.Code)
 	}
-	root := map[string]string{HeaderPrefix: base64.StdEncoding.EncodeToString([]byte("app/secrets/")), HeaderScope: "app"}
-	if w := doAs(h.data, asWeb, "GET", "/v1/list", root, nil); w.Code != http.StatusOK {
-		t.Errorf("web listing the secrets root = %d, want 200", w.Code)
+	if w := doAs(h.data, asWeb, "GET", "/v1/object", objHeaders("app/apps/api/report", apiScopeName), nil); w.Code != http.StatusForbidden {
+		t.Errorf("web reading api's ordinary object = %d, want 403", w.Code)
+	}
+	// Its own secrets subtree lists; a neighbour's scope does not.
+	own := map[string]string{HeaderPrefix: base64.StdEncoding.EncodeToString([]byte("app/apps/web/secrets/")), HeaderScope: appScopeName}
+	if w := doAs(h.data, asWeb, "GET", "/v1/list", own, nil); w.Code != http.StatusOK {
+		t.Errorf("web listing its own secrets = %d, want 200", w.Code)
+	}
+	theirs := map[string]string{HeaderPrefix: base64.StdEncoding.EncodeToString([]byte("app/apps/api/secrets/")), HeaderScope: apiScopeName}
+	if w := doAs(h.data, asWeb, "GET", "/v1/list", theirs, nil); w.Code != http.StatusForbidden {
+		t.Errorf("web listing api's secrets = %d, want 403", w.Code)
 	}
 	// A device is the operator's hand and reaches all of them.
-	if w := doAs(h.data, asDevice, "GET", "/v1/object", objHeaders("app/secrets/api/DB", "app"), nil); w.Code != http.StatusOK {
+	if w := doAs(h.data, asDevice, "GET", "/v1/object", objHeaders(apiSecret, apiScopeName), nil); w.Code != http.StatusOK {
 		t.Errorf("a device reading api's secret = %d, want 200", w.Code)
 	}
 }
@@ -763,17 +793,17 @@ func TestAnApplicationReadsItsOwnSecretsAndNobodyElses(t *testing.T) {
 func TestOnlyApplicationsAreRefusedSecretMutation(t *testing.T) {
 	h := newHarness(t)
 	h.unseal(t, 1)
-	const key = "app/secrets/web/TOKEN"
-	if w := doAs(h.data, asWeb, "PUT", "/v1/object", objHeaders(key, "app"), []byte("x")); w.Code != http.StatusForbidden {
+	const key = "app/apps/web/secrets/TOKEN"
+	if w := doAs(h.data, asWeb, "PUT", "/v1/object", objHeaders(key, appScopeName), []byte("x")); w.Code != http.StatusForbidden {
 		t.Errorf("app PUT its own secret = %d, want 403", w.Code)
 	}
-	if w := doAs(h.data, asDevice, "PUT", "/v1/object", objHeaders(key, "app"), []byte("x")); w.Code != http.StatusNoContent {
+	if w := doAs(h.data, asDevice, "PUT", "/v1/object", objHeaders(key, appScopeName), []byte("x")); w.Code != http.StatusNoContent {
 		t.Errorf("device PUT = %d, want 204", w.Code)
 	}
-	if w := doAs(h.data, asWeb, "DELETE", "/v1/object", objHeaders(key, "app"), nil); w.Code != http.StatusForbidden {
+	if w := doAs(h.data, asWeb, "DELETE", "/v1/object", objHeaders(key, appScopeName), nil); w.Code != http.StatusForbidden {
 		t.Errorf("app DELETE its own secret = %d, want 403", w.Code)
 	}
-	if w := doAs(h.data, asOperator, "DELETE", "/v1/object", objHeaders(key, "app"), nil); w.Code != http.StatusNoContent {
+	if w := doAs(h.data, asOperator, "DELETE", "/v1/object", objHeaders(key, appScopeName), nil); w.Code != http.StatusNoContent {
 		t.Errorf("operator DELETE = %d, want 204", w.Code)
 	}
 }
@@ -784,7 +814,7 @@ func TestDataPathRefusesKeepersAndTheUnidentified(t *testing.T) {
 	h := newHarness(t)
 	h.unseal(t, 1)
 	for name, uri := range map[string]string{"a keeper": asKeeper, "no identity": ""} {
-		w := doAs(h.data, uri, "GET", "/v1/object", objHeaders("app/doc", "app"), nil)
+		w := doAs(h.data, uri, "GET", "/v1/object", objHeaders("app/apps/web/doc", appScopeName), nil)
 		if w.Code != http.StatusForbidden || w.Header().Get(HeaderCode) != CodePermission {
 			t.Errorf("%s = %d %q, want 403 permission", name, w.Code, w.Header().Get(HeaderCode))
 		}
@@ -792,7 +822,7 @@ func TestDataPathRefusesKeepersAndTheUnidentified(t *testing.T) {
 	// Identity is checked before anything else: an unidentified caller does
 	// not learn that the keyholder is sealed.
 	sealed := newHarness(t)
-	if w := doAs(sealed.data, "", "GET", "/v1/object", objHeaders("app/doc", "app"), nil); w.Header().Get(HeaderCode) == CodeSealed {
+	if w := doAs(sealed.data, "", "GET", "/v1/object", objHeaders("app/apps/web/doc", appScopeName), nil); w.Header().Get(HeaderCode) == CodeSealed {
 		t.Error("an unidentified caller was told the keyholder is sealed")
 	}
 }
@@ -802,12 +832,12 @@ func TestScopeHeaderIsACrossCheckNotAnAuthorization(t *testing.T) {
 	h := newHarness(t)
 	h.unseal(t, 1)
 	// Right identity, wrong declared scope: refused, as before.
-	if w := doAs(h.data, asWeb, "GET", "/v1/object", objHeaders("app/doc", "ops"), nil); w.Code != http.StatusForbidden {
+	if w := doAs(h.data, asWeb, "GET", "/v1/object", objHeaders("app/apps/web/doc", "ops"), nil); w.Code != http.StatusForbidden {
 		t.Errorf("mismatched scope header = %d, want 403", w.Code)
 	}
 	// The declared scope cannot widen what the identity may reach: a keeper
 	// naming the right scope is still a keeper.
-	if w := doAs(h.data, asKeeper, "GET", "/v1/object", objHeaders("app/doc", "app"), nil); w.Code != http.StatusForbidden {
+	if w := doAs(h.data, asKeeper, "GET", "/v1/object", objHeaders("app/apps/web/doc", appScopeName), nil); w.Code != http.StatusForbidden {
 		t.Errorf("a keeper declaring the scope = %d, want 403", w.Code)
 	}
 }

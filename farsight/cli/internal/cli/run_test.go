@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"github.com/sofmon/farcast/datasphere"
 	fldeploy "github.com/sofmon/farcast/fatline/deploy"
 	"github.com/sofmon/farcast/fatline/policy"
 	"net/url"
@@ -572,10 +573,11 @@ func TestAFailedBuildDeploysNothing(t *testing.T) {
 func TestStorageIsWiredWhenTheInstanceHasAKeyholder(t *testing.T) {
 	dir := config.Dir(t.TempDir())
 	meta := runnableInstance(t, dir, "p43")
-	meta.Keyholder = &config.Keyholder{Deployed: true, Scope: "apps", ScopePrefix: "app/"}
+	meta.Keyholder = &config.Keyholder{Deployed: true}
 	if err := dir.SaveInstanceMetadata("p43", meta); err != nil {
 		t.Fatal(err)
 	}
+	mintKeyring(t, dir, "p43")
 	env, _ := testEnv(dir, output.ModeHuman)
 
 	f := newFakeRun(twoAppManifest)
@@ -602,10 +604,11 @@ func TestStorageIsWiredWhenTheInstanceHasAKeyholder(t *testing.T) {
 func TestRunRefusesStorageWithoutTheCAKey(t *testing.T) {
 	dir := config.Dir(t.TempDir())
 	meta := runnableInstance(t, dir, "p43")
-	meta.Keyholder = &config.Keyholder{Deployed: true, Scope: "apps", ScopePrefix: "app/"}
+	meta.Keyholder = &config.Keyholder{Deployed: true}
 	if err := dir.SaveInstanceMetadata("p43", meta); err != nil {
 		t.Fatal(err)
 	}
+	mintKeyring(t, dir, "p43")
 	mtls, err := dir.LoadInstanceMTLS("p43")
 	if err != nil {
 		t.Fatal(err)
@@ -959,5 +962,124 @@ func TestRunNamesTheGrantWhenAPushIsRefused(t *testing.T) {
 		if !strings.Contains(errOut, want) {
 			t.Errorf("run does not name the grant (%q missing):\n%s", want, errOut)
 		}
+	}
+}
+
+// Every application gets its own scope, minted when it is deployed and
+// recorded before anything is (ADR 0018 decision 5).
+func TestRunMintsAScopePerApplication(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	meta := runnableInstance(t, dir, "p43")
+	meta.Keyholder = &config.Keyholder{Deployed: true}
+	if err := dir.SaveInstanceMetadata("p43", meta); err != nil {
+		t.Fatal(err)
+	}
+	mintKeyring(t, dir, "p43")
+	env, _ := testEnv(dir, output.ModeHuman)
+
+	f := newFakeRun(twoAppManifest)
+	if err := runCmd(f).Run(context.Background(), env, []string{"p43", "github.com/example/my-platform"}); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := dir.LoadInstanceKeyring("p43")
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys, err := datasphere.ParseKeyring(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scopes := keys.Scopes()
+	if len(scopes) != 2 {
+		t.Fatalf("keyring holds %d scope(s), want one per application", len(scopes))
+	}
+	// Each owns its own subtree, and no two overlap — which is what makes the
+	// separation cryptographic rather than a rule somebody enforces.
+	seen := map[string]bool{}
+	for _, s := range scopes {
+		ns, app, ok := datasphere.ParseAppScopePrefix(s.Prefix)
+		if !ok {
+			t.Errorf("scope %q owns %q, which is not an application subtree", s.Name, s.Prefix)
+			continue
+		}
+		seen[ns+"/"+app] = true
+	}
+	if !seen["my-platform/api"] || !seen["my-platform/web"] {
+		t.Errorf("scopes = %v, want one for each application in the manifest", seen)
+	}
+
+	// The workloads carry each application's own scope and secrets subtree.
+	workloads := appliedWith(t, f, "kind: Deployment")
+	for _, want := range []string{"app-my-platform-api", "app/my-platform/api/secrets/", "app-my-platform-web"} {
+		if !strings.Contains(workloads, want) {
+			t.Errorf("the workloads do not carry %q", want)
+		}
+	}
+}
+
+// Redeploying reuses the scope already minted. A second scope for the same
+// application would be a second key space, and the data written under the
+// first would become unreachable by name.
+func TestRunReusesAnApplicationsExistingScope(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	meta := runnableInstance(t, dir, "p43")
+	meta.Keyholder = &config.Keyholder{Deployed: true}
+	if err := dir.SaveInstanceMetadata("p43", meta); err != nil {
+		t.Fatal(err)
+	}
+	mintKeyring(t, dir, "p43")
+	env, _ := testEnv(dir, output.ModeHuman)
+
+	first := func() []datasphere.Scope {
+		f := newFakeRun(twoAppManifest)
+		if err := runCmd(f).Run(context.Background(), env, []string{"p43", "github.com/example/my-platform"}); err != nil {
+			t.Fatal(err)
+		}
+		raw, err := dir.LoadInstanceKeyring("p43")
+		if err != nil {
+			t.Fatal(err)
+		}
+		keys, err := datasphere.ParseKeyring(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return keys.Scopes()
+	}
+	before := first()
+	after := first()
+	if len(after) != len(before) {
+		t.Fatalf("a redeploy minted more scopes: %d then %d", len(before), len(after))
+	}
+	for i := range before {
+		if before[i].Name != after[i].Name || before[i].Prefix != after[i].Prefix {
+			t.Errorf("scope %d changed across a redeploy: %+v then %+v", i, before[i], after[i])
+		}
+	}
+}
+
+// Minting key material is the moment an operator will act on the warning, so
+// it is carried there — and the operator is told the keyholder does not have
+// the new scope until it is unsealed.
+func TestRunSaysWhatMintingAScopeMeans(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	meta := runnableInstance(t, dir, "p43")
+	meta.Keyholder = &config.Keyholder{Deployed: true}
+	if err := dir.SaveInstanceMetadata("p43", meta); err != nil {
+		t.Fatal(err)
+	}
+	mintKeyring(t, dir, "p43")
+	env, _, errBuf := testEnvBoth(dir, output.ModeHuman)
+
+	f := newFakeRun(twoAppManifest)
+	if err := runCmd(f).Run(context.Background(), env, []string{"p43", "github.com/example/my-platform"}); err != nil {
+		t.Fatal(err)
+	}
+	out := errBuf.String()
+	if !strings.Contains(out, datasphere.KeyLossWarning) {
+		t.Errorf("minting a scope did not carry the mandated key-loss warning:\n%s", out)
+	}
+	if !strings.Contains(out, "storage unseal") {
+		t.Errorf("nothing said the keyholder must be unsealed to receive the new scopes:\n%s", out)
 	}
 }

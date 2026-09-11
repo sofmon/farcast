@@ -43,7 +43,6 @@ func keeperEnv(t *testing.T, mode output.Mode) (*Env, *bytes.Buffer, *bytes.Buff
 	meta := connectedInstance(t, dir, "prod")
 	meta.Keyholder = &config.Keyholder{
 		Deployed: true, Replicas: 2, Generation: 3,
-		Scope: datasphere.DefaultScopeName, ScopePrefix: datasphere.DefaultScopePrefix,
 	}
 	if err := dir.SaveInstanceMetadata("prod", meta); err != nil {
 		t.Fatal(err)
@@ -52,7 +51,7 @@ func keeperEnv(t *testing.T, mode output.Mode) (*Env, *bytes.Buffer, *bytes.Buff
 	if err != nil {
 		t.Fatal(err)
 	}
-	scope, err := datasphere.NewScope(datasphere.DefaultScopeName, datasphere.DefaultScopePrefix)
+	scope, err := datasphere.NewAppScope("apps", "web")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,8 +164,8 @@ func TestKeeperPacketCarriesABundleAndNoKeyring(t *testing.T) {
 	if err := yaml.Unmarshal(p.Bundle, &bundleDoc); err != nil {
 		t.Fatalf("the packet's bundle did not decode: %v", err)
 	}
-	if len(bundleDoc.Scopes) != 1 || bundleDoc.Scopes[0].Name != datasphere.DefaultScopeName {
-		t.Errorf("bundle scopes = %+v, want just the app scope", bundleDoc.Scopes)
+	if len(bundleDoc.Scopes) != 1 || bundleDoc.Scopes[0].Name != "app-apps-web" {
+		t.Errorf("bundle scopes = %+v, want the one application scope the keyring holds", bundleDoc.Scopes)
 	}
 
 	// The device's own leaf, named so one device can be revoked alone.

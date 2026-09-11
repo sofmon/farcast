@@ -16,10 +16,7 @@ import (
 // The application scope's name and prefix now live in datasphere, so the
 // keyring minting that creates the scope and the keyholder that serves it
 // cannot disagree about which prefix it owns.
-const (
-	DefaultScopeName   = datasphere.DefaultScopeName
-	DefaultScopePrefix = datasphere.DefaultScopePrefix
-)
+const ()
 
 // keyholderDialer opens the operator's tunnel and returns a client for the
 // instance's keyholder replicas.
@@ -348,11 +345,8 @@ func (c *storageUnsealCommand) Run(ctx context.Context, env *Env, args []string)
 	if err != nil {
 		return err
 	}
-	scope, generation, err := ensureScope(env, name, meta, keys)
-	if err != nil {
-		return err
-	}
-	bundle, err := datasphere.NewBundle(name, generation, []datasphere.Scope{scope})
+	scopes, generation := bundleScopes(meta, keys)
+	bundle, err := datasphere.NewBundle(name, generation, scopes)
 	if err != nil {
 		return err
 	}
@@ -401,15 +395,13 @@ func (c *storageUnsealCommand) Run(ctx context.Context, env *Env, args []string)
 	// replica that holds material nobody recorded.
 	var recordErr error
 	if loaded > 0 {
-		meta.Keyholder.Scope = scope.Name
-		meta.Keyholder.ScopePrefix = scope.Prefix
 		meta.Keyholder.Generation = generation
 		meta.UpdatedAt = time.Now().UTC()
 		recordErr = env.ConfigDir.SaveInstanceMetadata(name, meta)
 	}
 
 	if err := env.Printer.Print(unsealResult{
-		Instance: name, Scope: scope.Name, Generation: generation,
+		Instance: name, Scopes: len(scopes), Generation: generation,
 		Loaded: loaded, Total: total, Replicas: states,
 	}); err != nil {
 		return err
@@ -423,45 +415,24 @@ func (c *storageUnsealCommand) Run(ctx context.Context, env *Env, args []string)
 	return partialFailure("unseal", loaded, total)
 }
 
-// ensureScope returns the scope to push and the generation this unseal would
-// be, minting and RECORDING the scope first if the instance has none.
+// bundleScopes is everything this instance's keyring holds for its
+// applications.
 //
-// The scope's recording happens before any push, and that ordering is the
-// point: key material handed to a cluster but not written into keys.yaml is
-// material whose data nobody can ever find again. The generation is different
-// — it describes a handover rather than key material — and is recorded by the
-// caller, after one has actually happened.
-func ensureScope(env *Env, name string, meta *config.InstanceMetadata, keys datasphere.Keyring) (datasphere.Scope, uint64, error) {
-	scope, ok := keys.ScopeNamed(DefaultScopeName)
-	if !ok {
-		fresh, err := datasphere.NewScope(DefaultScopeName, DefaultScopePrefix)
-		if err != nil {
-			return datasphere.Scope{}, 0, err
-		}
-		grown, err := keys.AddScope(fresh)
-		if err != nil {
-			return datasphere.Scope{}, 0, err
-		}
-		encoded, err := grown.Marshal()
-		if err != nil {
-			return datasphere.Scope{}, 0, err
-		}
-		if err := env.ConfigDir.SaveInstanceKeyring(name, encoded); err != nil {
-			return datasphere.Scope{}, 0, fmt.Errorf("recording the new scope: %w", err)
-		}
-		fprintf(env.Err, "Minted the %q scope and recorded it in the keyring. %s\n",
-			DefaultScopeName, datasphere.KeyLossWarning)
-		scope = fresh
-	}
-
+// It mints nothing. Scopes are minted per application by `farcast run`, when
+// the application that owns one is deployed; an unseal hands over what exists
+// and never brings a key space into being as a side effect of recovery. A
+// keyring with no scopes is an instance with no applications, and its bundle
+// is empty rather than refused — that keyholder still unseals, and is ready
+// for the first application that arrives.
+func bundleScopes(meta *config.InstanceMetadata, keys datasphere.Keyring) ([]datasphere.Scope, uint64) {
 	// The generation this unseal WOULD be. It is not recorded here: see the
 	// push loop, which records it only if a replica actually takes it.
-	return scope, meta.Keyholder.Generation + 1, nil
+	return keys.Scopes(), meta.Keyholder.Generation + 1
 }
 
 type unsealResult struct {
 	Instance   string         `json:"instance"`
-	Scope      string         `json:"scope"`
+	Scopes     int            `json:"scopes"`
 	Generation uint64         `json:"generation"`
 	Loaded     int            `json:"loaded"`
 	Total      int            `json:"total"`
@@ -476,8 +447,18 @@ func (r unsealResult) Human(w io.Writer) error {
 		}
 		fprintf(w, "  replica %d  %s   generation %d\n", s.Ordinal, s.Phase, s.Generation)
 	}
-	fprintf(w, "\n%d of %d replicas hold the %q scope at generation %d.\n",
-		r.Loaded, r.Total, r.Scope, r.Generation)
+	switch r.Scopes {
+	case 0:
+		// Not a failure. A keyholder with no application scopes is an
+		// instance with no applications: it unseals, becomes ready, and holds
+		// the first scope the moment `farcast run` mints one.
+		fprintf(w, "\n%d of %d replicas are unsealed at generation %d, holding no application scopes:\n",
+			r.Loaded, r.Total, r.Generation)
+		fprintf(w, "this instance has no applications yet. 'farcast run' mints a scope for each one.\n")
+	default:
+		fprintf(w, "\n%d of %d replicas hold %d application scope(s) at generation %d.\n",
+			r.Loaded, r.Total, r.Scopes, r.Generation)
+	}
 	fprintf(w, "Key material is held in RAM only: any restart seals that replica again.\n")
 	return nil
 }

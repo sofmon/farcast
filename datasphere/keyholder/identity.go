@@ -118,49 +118,42 @@ func AllowData(instance string) func(uri string) bool {
 // MayReach reports whether this identity may touch keys in the named scope.
 //
 // The operator and a device reach every scope the keyholder holds. An
-// application reaches the scope it is entitled to — today the shared
-// application scope, because that is the only one there is. ADR 0018 decision
-// 5 replaces that entitlement with a scope per application; this is the one
-// line it changes.
+// application reaches exactly one: its own, named for the namespace and
+// application its leaf names (ADR 0018 decision 5). Before per-application
+// scopes this compared against the single shared scope every application was
+// given, which is why authorization was the only thing separating neighbours;
+// now the scope is the boundary and this check is what binds a leaf to it.
+//
+// A scope name that cannot be composed — the namespace and application are too
+// long together — is not reachable by anyone, which is the safe direction: the
+// mint would have failed too, so there is nothing there to reach.
 func (id Identity) MayReach(scopeName string) bool {
 	switch id.Role {
 	case RoleOperator, RoleDevice:
 		return true
 	case RoleApp:
-		return scopeName == datasphere.DefaultScopeName
+		own, err := datasphere.AppScopeName(id.Namespace, id.Name)
+		return err == nil && scopeName == own
 	default:
 		return false
 	}
 }
 
-// MayTouchSecret reports whether this identity may reach a key under a scope's
-// secrets subtree.
+// A note on secrets, and why there is no separate check for them.
 //
-// The secrets layout is the one subtree whose second segment already names an
-// application — <scope>/secrets/<app>/<name> — so it is the one place the data
-// path can enforce a per-application boundary before decision 5 gives every
-// application its own scope. An application reaches its own secrets and
-// nobody else's; the operator and a device reach all of them.
+// There used to be one. When every application shared a scope, the secrets
+// subtree was the only layout that named its owner — <scope>/secrets/<app>/…
+// — so it was the only place a per-application boundary could be enforced at
+// all, and MayTouchSecret enforced it by comparing that segment against the
+// caller's name.
 //
-// The match is on the application's NAME rather than on namespace and name,
-// because that is how `farcast secret set` files them: secrets are per
-// instance and application, not per deployment. Two deployments of one
-// application share a subtree, and this check does not pretend otherwise.
-func (id Identity) MayTouchSecret(scopePrefix, key string) bool {
-	if !datasphere.IsSecretsKey(scopePrefix, key) {
-		return true
-	}
-	switch id.Role {
-	case RoleOperator, RoleDevice:
-		return true
-	case RoleApp:
-		rest := strings.TrimPrefix(key, scopePrefix+datasphere.SecretsSegment+datasphere.ScopePrefixSuffix)
-		owner, _, _ := strings.Cut(rest, datasphere.ScopePrefixSuffix)
-		return owner == id.Name
-	default:
-		return false
-	}
-}
+// With a scope per application the subtree is inside the scope, so MayReach
+// has already answered: an application that reaches the scope reaches its own
+// secrets, and one that does not reaches nothing in it. A second check keyed
+// on the path would be a second place for the rule to live and drift. What
+// remains is refuseSecretMutation — an application still never creates or
+// destroys a secret — which is about the OPERATION and not about whose key it
+// is.
 
 // identityFrom reads the caller's identity from the TLS connection.
 //

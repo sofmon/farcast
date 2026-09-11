@@ -703,21 +703,34 @@ func TestTheApplicationScopeIsMintedWithTheKeyring(t *testing.T) {
 		t.Fatal("this test is meant to exercise a freshly minted keyring")
 	}
 
-	scope, ok := session.Keyring.ScopeNamed(datasphere.DefaultScopeName)
-	if !ok {
-		t.Fatal("a freshly minted keyring has no application scope; the window this fix closes is open again")
-	}
-	if scope.Prefix != datasphere.DefaultScopePrefix {
-		t.Errorf("the scope owns %q, want %q", scope.Prefix, datasphere.DefaultScopePrefix)
+	// A freshly minted keyring carries NO scopes, and that is the point.
+	//
+	// It used to carry one shared "app" scope so that "app/" had an owner
+	// before anything could be written there (ADR 0008 decision 9). ADR 0018
+	// decision 5 mints one scope per application instead, at the moment the
+	// application is deployed — which closes the same window per application,
+	// and closes it better: there is no shared application prefix for an
+	// object to be stranded under in the first place.
+	if got := len(session.Keyring.Scopes()); got != 0 {
+		t.Errorf("a freshly minted keyring carries %d scope(s), want none", got)
 	}
 
-	// And the very first write to that prefix goes to the SCOPE, not to
-	// master — so nothing can be stranded there later.
-	store, err := session.StoreFor(datasphere.DefaultScopePrefix + "hello")
+	// An application's scope is minted with the application, and the first
+	// write into its subtree goes to that scope rather than to master.
+	scope, err := datasphere.NewAppScope("apps", "web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	grown, err := session.Keyring.AddScope(scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.Keyring = grown
+	store, err := session.StoreFor(scope.Prefix + "hello")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if store == session.Store {
-		t.Fatal("a write to the application prefix still routes to the master key space")
+		t.Error("a write into an application's own subtree routed to the master key space")
 	}
 }

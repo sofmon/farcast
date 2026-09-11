@@ -189,17 +189,19 @@ func (c *keeperEnrollCommand) Run(_ context.Context, env *Env, args []string) er
 	if err != nil {
 		return err
 	}
-	scope, ok := keys.ScopeNamed(DefaultScopeName)
-	if !ok {
-		return fmt.Errorf("instance %q has no %q scope yet; run 'farcast storage unseal %s' once first", name, DefaultScopeName, name)
-	}
+	// Every scope the keyring holds, because a keeper re-seeds an instance
+	// rather than an application: one that carried a subset would restore
+	// storage for some applications and leave others sealed, which is a
+	// half-recovery nobody asked for. A keyring with no scopes yields an
+	// empty bundle, which is what an instance with no applications has.
+	scopes := keys.Scopes()
 
 	// The keeper's bundle carries the generation the instance is ALREADY at,
 	// not the next one. A keeper restores what was there; advancing a
 	// generation is an operator's act, and a device that did it on its own
 	// would rewrite the counter the operator reconciles against.
 	generation := meta.Keyholder.Generation
-	bundle, err := datasphere.NewBundle(name, generation, []datasphere.Scope{scope})
+	bundle, err := datasphere.NewBundle(name, generation, scopes)
 	if err != nil {
 		return err
 	}

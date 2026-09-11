@@ -96,7 +96,10 @@ data:
 {{- if $.HasStorage}}
   FARCAST_STORAGE_ENDPOINT: https://{{$.StorageService}}.{{$.SystemNamespace}}.svc.cluster.local:{{$.StoragePort}}
   FARCAST_STORAGE_STATUS_ENDPOINT: https://{{$.StorageStatusService}}.{{$.SystemNamespace}}.svc.cluster.local:{{$.StorageStatusPort}}
-  FARCAST_STORAGE_SCOPE: {{$.StorageScope}}
+  # The scope this application owns, and nobody else does. It is a
+  # cross-check the keyholder refuses on mismatch rather than a claim: what
+  # this application may reach follows from the leaf below (ADR 0018).
+  FARCAST_STORAGE_SCOPE: {{.Scope}}
   # The address an app dials and the identity the keyholder must present are
   # different things and are carried separately, on purpose — the certificate
   # names an instance-scoped identity that never appears in public DNS.
@@ -106,19 +109,16 @@ data:
   FARCAST_STORAGE_CA: |
 {{$.StorageCA}}
 {{- end}}
-{{- if $.HasSecrets}}
   # Where this application's secrets live, fully qualified. The SDK never
   # derives it: a prefix guessed one segment away addresses somebody else's
   # subtree, or one the keyholder does not protect.
   #
-  # The path organises; it does not isolate. The keyholder's data path
-  # authenticates the server only and every application declares the same
-  # scope, so it cannot tell which application is asking and this prefix is
-  # not a boundary between them (ADR 0017). What it does buy is that the
-  # keyholder refuses application writes and deletes under secrets/, so a
-  # secret is created and removed by the operator and by nobody else.
-  FARCAST_SECRETS_PREFIX: {{$.SecretsPrefix}}{{.Name}}/
-{{- end}}
+  # It is inside this application's own scope, so it IS a boundary: another
+  # application's leaf does not reach this scope at all, and the keyholder
+  # refuses it before the key is decoded (ADR 0018 decisions 1 and 5). What
+  # the reserved segment still buys on top of that is the rule about the
+  # OPERATION — no application creates or destroys a secret, whoever it is.
+  FARCAST_SECRETS_PREFIX: {{.SecretsPrefix}}
 ---
 apiVersion: apps/v1
 kind: Deployment

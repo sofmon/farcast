@@ -316,32 +316,19 @@ func openKeyring(opt Options, session *Session) error {
 		if err != nil {
 			return err
 		}
-		// The application scope is minted WITH the keyring, not later at the
-		// first unseal.
+		// No application scope is minted here.
 		//
-		// It used to arrive at unseal, which left a window: until then nothing
-		// owned "app/", so anything written there landed in the master key
-		// space — and the scope, once minted, took ownership of the prefix and
-		// those objects stopped being reachable by their own names. The Phase
-		// 4.3 walk fell into exactly that, because the documented way to mint a
-		// bucket was to write an object and "app/" is the documented place to
-		// write one.
+		// An instance used to get one shared "app" scope with its keyring, so
+		// that "app/" had an owner before anything could be written to it
+		// (ADR 0008 decision 9). ADR 0018 decision 5 replaced that with one
+		// scope per application, minted by `farcast run` when the application
+		// is deployed — which closes the same window for the same reason, and
+		// closes it per application: nothing can write into an application's
+		// subtree before that application exists.
 		//
-		// Closing the window is better than detecting the collision. Unseal
-		// deliberately touches no cloud — recovery must not depend on the
-		// provider being reachable or on this machine holding credentials —
-		// so an unseal-time check would either break that property or be a
-		// check that silently skips itself. Minting here needs neither: the
-		// scope exists before any write can happen, so there is nothing to
-		// collide with.
-		scope, err := datasphere.NewScope(datasphere.DefaultScopeName, datasphere.DefaultScopePrefix)
-		if err != nil {
-			return err
-		}
-		keyring, err = keyring.AddScope(scope)
-		if err != nil {
-			return fmt.Errorf("mint the %q scope for %q: %w", datasphere.DefaultScopeName, opt.Instance, err)
-		}
+		// A fresh keyring therefore carries no scopes, and that is a real
+		// state rather than an incomplete one: an instance with no
+		// applications has no application keys.
 		data, err := keyring.Marshal()
 		if err != nil {
 			return err

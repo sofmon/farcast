@@ -78,67 +78,55 @@ func TestUnsealNamesFatLineWhenTheTunnelIsAbsent(t *testing.T) {
 	}
 }
 
-// The scope must be recorded in the keyring BEFORE any push. Key material
-// handed to a cluster but never written down is material whose data nobody can
-// find again.
-func TestEnsureScopeMintsAndRecordsBeforeAnyPush(t *testing.T) {
-	dir, env := keyholderInstance(t, true)
+// An unseal hands over what the keyring HOLDS and mints nothing.
+//
+// It used to mint the one shared application scope on the way past, which made
+// recovery a moment that could bring key material into existence. Scopes are
+// per application now and minted by `farcast run`, so unseal reads and pushes
+// — and an instance with no applications yields an empty bundle rather than a
+// refusal, because a keyholder that cannot unseal is one that never becomes
+// ready.
+func TestBundleScopesReadsTheKeyringAndMintsNothing(t *testing.T) {
+	dir, _ := keyholderInstance(t, true)
 	keys, err := datasphere.NewKeyring()
 	if err != nil {
 		t.Fatalf("NewKeyring: %v", err)
 	}
-	encoded, err := keys.Marshal()
-	if err != nil {
-		t.Fatalf("Marshal: %v", err)
-	}
-	if err := dir.CreateInstanceKeyring("prod", encoded); err != nil {
-		t.Fatalf("CreateInstanceKeyring: %v", err)
-	}
 	meta, _ := dir.LoadInstanceMetadata("prod")
 
-	scope, generation, err := ensureScope(env, "prod", meta, keys)
-	if err != nil {
-		t.Fatalf("ensureScope: %v", err)
-	}
-	if scope.Name != DefaultScopeName || scope.Prefix != DefaultScopePrefix {
-		t.Errorf("scope = %+v", scope)
+	scopes, generation := bundleScopes(meta, keys)
+	if len(scopes) != 0 {
+		t.Errorf("an instance with no applications yielded %d scope(s)", len(scopes))
 	}
 	if generation != 1 {
 		t.Errorf("generation = %d, want 1", generation)
 	}
-
-	// It is on disk, in the keyring, before anything was pushed anywhere.
-	saved, err := dir.LoadInstanceKeyring("prod")
-	if err != nil {
-		t.Fatalf("LoadInstanceKeyring: %v", err)
-	}
-	reloaded, err := datasphere.ParseKeyring(saved)
-	if err != nil {
-		t.Fatalf("ParseKeyring: %v", err)
-	}
-	got, ok := reloaded.ScopeNamed(DefaultScopeName)
-	if !ok {
-		t.Fatal("the scope was not recorded in the keyring")
-	}
-	a, _ := got.Keyring().ActiveKEK()
-	b, _ := scope.Keyring().ActiveKEK()
-	if a.ID != b.ID {
-		t.Error("the recorded scope is not the one that would have been pushed")
+	if _, err := datasphere.NewBundle("prod", generation, scopes); err != nil {
+		t.Errorf("an empty bundle was refused, so this keyholder could never unseal: %v", err)
 	}
 
-	// But the GENERATION is not recorded yet, because nothing has been handed
-	// over. It used to be written here, so an unseal that failed on every
-	// replica still advanced the counter (Phase 4.4 walk).
-	meta2, _ := dir.LoadInstanceMetadata("prod")
-	if meta2.Keyholder.Generation != 0 {
-		t.Errorf("generation %d recorded before any push", meta2.Keyholder.Generation)
+	// With applications deployed, every one of their scopes travels: a bundle
+	// carrying a subset would restore storage for some and leave others
+	// sealed.
+	for _, app := range []string{"api", "web"} {
+		scope, serr := datasphere.NewAppScope("apps", app)
+		if serr != nil {
+			t.Fatal(serr)
+		}
+		if keys, err = keys.AddScope(scope); err != nil {
+			t.Fatal(err)
+		}
+	}
+	scopes, _ = bundleScopes(meta, keys)
+	if len(scopes) != 2 {
+		t.Errorf("bundle carries %d scope(s), want both applications'", len(scopes))
 	}
 }
 
 // Generations only ever move forward: a keyholder refuses anything older, so a
 // captured bundle cannot be replayed to reinstate retired keys.
-func TestEnsureScopeAdvancesTheGeneration(t *testing.T) {
-	dir, env := keyholderInstance(t, true)
+func TestUnsealAdvancesTheGeneration(t *testing.T) {
+	dir, _ := keyholderInstance(t, true)
 	keys, _ := datasphere.NewKeyring()
 	encoded, _ := keys.Marshal()
 	_ = dir.CreateInstanceKeyring("prod", encoded)
@@ -152,16 +140,12 @@ func TestEnsureScopeAdvancesTheGeneration(t *testing.T) {
 				reloadedKeys = k
 			}
 		}
-		scope, generation, err := ensureScope(env, "prod", meta, reloadedKeys)
-		if err != nil {
-			t.Fatalf("round %d: %v", i, err)
-		}
+		_, generation := bundleScopes(meta, reloadedKeys)
 		if generation <= last {
-			t.Fatalf("generation went backwards: %d after %d", generation, last)
+			t.Fatalf("round %d: generation went backwards: %d after %d", i, generation, last)
 		}
 		last = generation
 		// Stand in for the push landing, which is what records it now.
-		meta.Keyholder.Scope = scope.Name
 		meta.Keyholder.Generation = generation
 		if err := dir.SaveInstanceMetadata("prod", meta); err != nil {
 			t.Fatal(err)
@@ -180,7 +164,7 @@ func (f *fakeKeyholder) Unseal(_ context.Context, _ int, _ []byte, _ string) (ke
 	if f.err != nil {
 		return keyholder.State{}, f.err
 	}
-	return keyholder.State{Phase: "unsealed", Scopes: []string{DefaultScopeName}}, nil
+	return keyholder.State{Phase: "unsealed", Scopes: []string{"app-apps-web"}}, nil
 }
 
 // unsealWith wires an unseal command to a fake keyholder and gives the
@@ -248,28 +232,6 @@ func TestASuccessfulUnsealRecordsTheGeneration(t *testing.T) {
 	}
 	if meta.Keyholder.Generation != 1 {
 		t.Errorf("generation = %d, want 1", meta.Keyholder.Generation)
-	}
-	if meta.Keyholder.Scope != DefaultScopeName {
-		t.Errorf("scope = %q, want %q", meta.Keyholder.Scope, DefaultScopeName)
-	}
-}
-
-// The key-loss warning is mandated wording, not prose: an operator who has not
-// internalised it will treat the keyring like a config file.
-func TestMintingAScopeCarriesTheKeyLossWarning(t *testing.T) {
-	dir, env := keyholderInstance(t, true)
-	keys, _ := datasphere.NewKeyring()
-	encoded, _ := keys.Marshal()
-	_ = dir.CreateInstanceKeyring("prod", encoded)
-	meta, _ := dir.LoadInstanceMetadata("prod")
-
-	var errBuf strings.Builder
-	env.Err = &errBuf
-	if _, _, err := ensureScope(env, "prod", meta, keys); err != nil {
-		t.Fatalf("ensureScope: %v", err)
-	}
-	if !strings.Contains(errBuf.String(), datasphere.KeyLossWarning) {
-		t.Errorf("minting a scope did not carry the mandated warning: %q", errBuf.String())
 	}
 }
 
@@ -726,8 +688,11 @@ func TestDeployReallyMintsTheBucket(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := keys.ScopeNamed(datasphere.DefaultScopeName); !ok {
-		t.Error("the keyring deploy minted has no application scope")
+	// Deploy mints the keyring and no scopes: an application's scope arrives
+	// with the application (ADR 0018 decision 5), so a fresh instance has a
+	// keyring that can receive them and nothing standing in their way.
+	if got := len(keys.Scopes()); got != 0 {
+		t.Errorf("the keyring deploy minted carries %d scope(s), want none", got)
 	}
 }
 

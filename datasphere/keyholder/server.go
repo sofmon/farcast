@@ -372,13 +372,6 @@ func (s *Server) resolve(r *http.Request, header string) (string, Identity, data
 	if scope.Name != declared {
 		return "", id, none, nil, fmt.Errorf("%w: key belongs to scope %q, request declared %q", ErrOutOfScope, scope.Name, declared)
 	}
-	// The secrets subtree already names its owner, so it is the one place a
-	// per-application boundary is enforceable before every application has
-	// its own scope. An application reaches its own secrets and nobody
-	// else's; the operator and a device reach all of them.
-	if !id.MayTouchSecret(scope.Prefix, key) {
-		return "", id, none, nil, fmt.Errorf("%w: %s %q may not reach another application's secrets", ErrNotAuthorized, id.Role, id.Name)
-	}
 	store, err := s.cfg.Stores(scope)
 	if err != nil {
 		return "", id, none, nil, err

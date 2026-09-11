@@ -34,6 +34,11 @@ type Bundle struct {
 	instance   string
 	generation uint64
 	scopes     []Scope
+	// zeroed records that Zero has run. An empty bundle and a wiped one are
+	// both scopeless and must not be treated alike: the first is an instance
+	// with no applications and marshals fine, the second is material that was
+	// deliberately destroyed and must never be sent anywhere.
+	zeroed bool
 }
 
 // NewBundle assembles the scopes an instance's keyholder should hold.
@@ -45,9 +50,11 @@ func NewBundle(instance string, generation uint64, scopes []Scope) (*Bundle, err
 	if strings.TrimSpace(instance) == "" {
 		return nil, fmt.Errorf("%w: bundle must name its instance", ErrBundleInvalid)
 	}
-	if len(scopes) == 0 {
-		return nil, fmt.Errorf("%w: bundle carries no scopes", ErrBundleInvalid)
-	}
+	// A bundle with no scopes is allowed, and it is a real state rather than
+	// a degenerate one: an instance whose keyholder is deployed and which has
+	// no applications yet has no application keys to hand over. Refusing it
+	// would leave that keyholder permanently sealed — never ready, and unable
+	// to become ready — until the first application happened to be deployed.
 	out := make([]Scope, 0, len(scopes))
 	for _, s := range scopes {
 		if err := s.Valid(); err != nil {
@@ -100,6 +107,7 @@ func (b *Bundle) Zero() {
 		s.Zero()
 	}
 	b.scopes = nil
+	b.zeroed = true
 }
 
 // bundleFile is the bundle's wire shape. It reuses the keyring's scope
@@ -115,8 +123,8 @@ type bundleFile struct {
 // Marshal renders the bundle for the wire. The result is key material in the
 // clear: every caller seals it before it leaves the process.
 func (b *Bundle) Marshal() ([]byte, error) {
-	if len(b.scopes) == 0 {
-		return nil, fmt.Errorf("%w: bundle carries no scopes", ErrBundleInvalid)
+	if b.zeroed {
+		return nil, fmt.Errorf("%w: this bundle's material has been wiped", ErrBundleInvalid)
 	}
 	out, err := yaml.Marshal(bundleFile{
 		Version:    bundleVersion,

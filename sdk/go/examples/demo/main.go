@@ -3,9 +3,11 @@
 // It exists because the claims 5.3 makes cannot be checked from outside a
 // running application: that Config refuses the platform's namespace while that
 // namespace is genuinely populated, that a Secret reaches no log in the clear,
-// that a seal reports as a seal rather than as absence — and that a
-// neighbouring application's secret is readable, which is the uncomfortable
-// half of ADR 0017 and the half a walk should demonstrate rather than assume.
+// that a seal reports as a seal rather than as absence — and what a
+// neighbouring application's secret does when reached for. That last one used
+// to succeed, which was the uncomfortable half of ADR 0017; since ADR 0018
+// gave every application its own scope it is refused, and the fixture reaches
+// for it either way so a walk sees which.
 //
 // It reports STATE, never values: whether a secret is present and how long it
 // is, never what it says. The one exception proves the rule — it deliberately
@@ -168,19 +170,24 @@ func readSecret(ctx context.Context, name string) state {
 // readPeerSecret derives a NEIGHBOUR's subtree from this application's own and
 // reads from it through plain storage.
 //
-// This is not a mistake and it is not a back door: it is the demonstration
-// ADR 0017 decision 2 asks for. Applications in one instance share a storage
-// scope, the keyholder's data path cannot tell them apart, and a walk that
-// only asserted the happy path would let a reader believe otherwise.
+// It is not a back door: it is a probe, and what it demonstrates changed. Under
+// ADR 0017 it succeeded, because every application shared one scope and the
+// keyholder could not tell them apart. Under ADR 0018 each application has its
+// own scope and its own leaf, so this is refused — and a walk that never
+// reached for it could not tell the two worlds apart.
 func readPeerSecret(ctx context.Context, peer, name string) state {
+	// This application's own secrets prefix is app/<namespace>/<app>/secrets/.
+	// A neighbour's is the same with the application segment replaced, which
+	// is exactly the guess a compromised application would make.
 	mine := os.Getenv("FARCAST_SECRETS_PREFIX")
-	root, _, found := cutLast(strings.TrimSuffix(mine, "/"))
 	st := state{Name: peer + "/" + name}
-	if mine == "" || !found {
+	parts := strings.Split(strings.TrimSuffix(mine, "/"), "/")
+	if mine == "" || len(parts) != 4 {
 		st.State = "unconfigured"
 		return st
 	}
-	data, err := farcast.Storage().Read(ctx, root+"/"+peer+"/"+name)
+	parts[2] = peer
+	data, err := farcast.Storage().Read(ctx, strings.Join(parts, "/")+"/"+name)
 	st.State = classify(err)
 	if err != nil {
 		st.Err = err.Error()
@@ -188,14 +195,6 @@ func readPeerSecret(ctx context.Context, peer, name string) state {
 	}
 	st.Bytes = len(data)
 	return st
-}
-
-func cutLast(path string) (before, after string, found bool) {
-	i := strings.LastIndex(path, "/")
-	if i < 0 {
-		return path, "", false
-	}
-	return path[:i], path[i+1:], true
 }
 
 // classify names the condition rather than the message, because the whole

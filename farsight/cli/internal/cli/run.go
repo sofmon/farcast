@@ -321,12 +321,11 @@ func (c *runCommand) translate(env *Env, meta *config.InstanceMetadata, namespac
 		Instance:    meta.Name,
 		Credentials: credentials,
 	}
-	if meta.Keyholder != nil && meta.Keyholder.Deployed && meta.Keyholder.Scope != "" {
+	if meta.Keyholder != nil && meta.Keyholder.Deployed {
 		mtls, err := env.ConfigDir.LoadInstanceMTLS(meta.Name)
 		if err != nil {
 			return nil, fmt.Errorf("read the instance CA so applications can verify the key holder: %w", err)
 		}
-		cfg.StorageScope = meta.Keyholder.Scope
 		cfg.StorageCAPEM = mtls.CACertPEM
 		cfg.StorageServerName = identity.KeyholderServerName(meta.Name)
 		// Every application gets its own leaf for the keyholder's data path
@@ -338,24 +337,93 @@ func (c *runCommand) translate(env *Env, meta *config.InstanceMetadata, namespac
 			return nil, fmt.Errorf("this machine holds no CA key for %q, so it cannot give applications a storage identity; "+
 				"deploy from the machine that installed the instance", meta.Name)
 		}
-		cfg.Identities = make(map[string]translate.AppIdentity, len(m.Apps))
+		scopes, err := c.ensureAppScopes(env, meta.Name, namespace, m)
+		if err != nil {
+			return nil, err
+		}
+		cfg.Storage = make(map[string]translate.AppStorage, len(m.Apps))
 		for _, app := range m.Apps {
 			certPEM, keyPEM, err := identity.IssueAppClient(mtls.CACertPEM, mtls.CAKeyPEM, meta.Name, namespace, app.Name)
 			if err != nil {
 				return nil, fmt.Errorf("issue a storage identity for %s: %w", app.Name, err)
 			}
-			cfg.Identities[app.Name] = translate.AppIdentity{CertPEM: certPEM, KeyPEM: keyPEM}
-		}
-		if prefix := meta.Keyholder.ScopePrefix; prefix != "" {
-			// The secrets root is built here because this is the one place
-			// that holds both halves: the recorded scope prefix, and (through
-			// DataSphere) the reserved segment the keyholder enforces. An
-			// instance recorded before the prefix was written down gets no
-			// secrets wiring rather than a guessed one.
-			cfg.SecretsPrefix = prefix + datasphere.SecretsSegment + "/"
+			cfg.Storage[app.Name] = translate.AppStorage{
+				CertPEM: certPEM, KeyPEM: keyPEM,
+				Scope:         scopes[app.Name].Name,
+				SecretsPrefix: datasphere.AppSecretsPrefix(namespace, app.Name),
+			}
 		}
 	}
 	return translate.Render(cfg)
+}
+
+// ensureAppScopes gives every application in this deployment its own slice of
+// the instance's storage, minting what is not there yet.
+//
+// One scope per application is what makes the separation between them
+// cryptographic rather than a rule the keyholder enforces: an application's
+// keys cannot compute the stored name of a neighbour's object, let alone open
+// it (ADR 0018 decision 5).
+//
+// The scope is keyed on NAMESPACE and application, which is what the
+// application's own leaf names, so the two agree by construction. That has a
+// consequence worth knowing before it is discovered: the same manifest
+// deployed under a second namespace is a second set of applications with a
+// second set of scopes, and it does not see the first's data. Redeploying the
+// same manifest to the same namespace reuses the scope already minted.
+//
+// Minting is idempotent and additive. The keyring is written before anything
+// is deployed, because a scope recorded nowhere is key material whose data
+// nobody can find again.
+func (c *runCommand) ensureAppScopes(env *Env, instance, namespace string, m parser.Manifest) (map[string]datasphere.Scope, error) {
+	raw, err := env.ConfigDir.LoadInstanceKeyring(instance)
+	if err != nil {
+		return nil, fmt.Errorf("read the storage keyring for %q, which is where an application's scope is minted: %w", instance, err)
+	}
+	keys, err := datasphere.ParseKeyring(raw)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make(map[string]datasphere.Scope, len(m.Apps))
+	minted := make([]string, 0, len(m.Apps))
+	for _, app := range m.Apps {
+		name, err := datasphere.AppScopeName(namespace, app.Name)
+		if err != nil {
+			return nil, err
+		}
+		if existing, ok := keys.ScopeNamed(name); ok {
+			out[app.Name] = existing
+			continue
+		}
+		fresh, err := datasphere.NewAppScope(namespace, app.Name)
+		if err != nil {
+			return nil, err
+		}
+		grown, err := keys.AddScope(fresh)
+		if err != nil {
+			return nil, fmt.Errorf("mint a storage scope for %s: %w", app.Name, err)
+		}
+		keys = grown
+		out[app.Name] = fresh
+		minted = append(minted, app.Name)
+	}
+	if len(minted) == 0 {
+		return out, nil
+	}
+
+	encoded, err := keys.Marshal()
+	if err != nil {
+		return nil, err
+	}
+	if err := env.ConfigDir.SaveInstanceKeyring(instance, encoded); err != nil {
+		return nil, fmt.Errorf("record the new storage scopes: %w", err)
+	}
+	fprintf(env.Err, "Minted a storage scope for %s in %q. %s\n",
+		strings.Join(minted, ", "), namespace, datasphere.KeyLossWarning)
+	fprintf(env.Err, "Run 'farcast storage unseal %s' so the keyholder receives them; until it does,\n", instance)
+	fprintf(env.Err, "these applications get ErrStorageSealed rather than their own storage.\n")
+	return out, nil
 }
 
 // meter adds the new namespace to what the kernel counts, reusing the same

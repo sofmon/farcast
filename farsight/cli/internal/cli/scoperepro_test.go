@@ -173,10 +173,22 @@ func reproSession(t *testing.T) (*storage.Session, *reproProvider, config.Dir) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	scope, generation, err := ensureScope(env, name, meta, keys)
+	scope, err := datasphere.NewAppScope("apps", "web")
 	if err != nil {
-		t.Fatalf("ensureScope: %v", err)
+		t.Fatalf("NewAppScope: %v", err)
 	}
+	grown, err := keys.AddScope(scope)
+	if err != nil {
+		t.Fatalf("AddScope: %v", err)
+	}
+	encoded, merr := grown.Marshal()
+	if merr != nil {
+		t.Fatal(merr)
+	}
+	if err := dir.SaveInstanceKeyring(name, encoded); err != nil {
+		t.Fatal(err)
+	}
+	generation := meta.Keyholder.Generation + 1
 
 	// 3. The bundle crosses the wire and is installed in a real vault.
 	bundle, err := datasphere.NewBundle(name, generation, []datasphere.Scope{scope})
@@ -197,7 +209,7 @@ func reproSession(t *testing.T) (*storage.Session, *reproProvider, config.Dir) {
 	}
 
 	// 4. An application writes through the keyholder's scoped Store.
-	held, err := vault.Scope("app/sdk-written")
+	held, err := vault.Scope("app/apps/web/sdk-written")
 	if err != nil {
 		t.Fatalf("vault.Scope: %v", err)
 	}
@@ -205,7 +217,7 @@ func reproSession(t *testing.T) (*storage.Session, *reproProvider, config.Dir) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := keyholderStore.Write(ctx, "app/sdk-written", []byte("written by the application")); err != nil {
+	if err := keyholderStore.Write(ctx, "app/apps/web/sdk-written", []byte("written by the application")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -223,11 +235,11 @@ func TestScopedObjectIsVisibleToTheOperatorCLI(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("ls of the scope prefix finds it", func(t *testing.T) {
-		entries, _, err := listAcrossScopes(ctx, session, "app/")
+		entries, _, err := listAcrossScopes(ctx, session, "app/apps/web/")
 		if err != nil {
 			t.Errorf("listing reported: %v", err)
 		}
-		if len(entries) != 1 || entries[0].Key != "app/sdk-written" {
+		if len(entries) != 1 || entries[0].Key != "app/apps/web/sdk-written" {
 			t.Fatalf("ls app/ = %v, want [app/sdk-written]", keysOf(entries))
 		}
 	})
@@ -235,7 +247,7 @@ func TestScopedObjectIsVisibleToTheOperatorCLI(t *testing.T) {
 	t.Run("ls of the root spans both key spaces", func(t *testing.T) {
 		entries, _, _ := listAcrossScopes(ctx, session, "")
 		got := keysOf(entries)
-		for _, want := range []string{"app/sdk-written", "system/operator.txt"} {
+		for _, want := range []string{"app/apps/web/sdk-written", "system/operator.txt"} {
 			if !contains(got, want) {
 				t.Errorf("root listing is missing %q: %v", want, got)
 			}
@@ -243,11 +255,11 @@ func TestScopedObjectIsVisibleToTheOperatorCLI(t *testing.T) {
 	})
 
 	t.Run("the object reads back byte-exact", func(t *testing.T) {
-		store, err := session.StoreFor("app/sdk-written")
+		store, err := session.StoreFor("app/apps/web/sdk-written")
 		if err != nil {
 			t.Fatal(err)
 		}
-		got, err := store.Read(ctx, "app/sdk-written")
+		got, err := store.Read(ctx, "app/apps/web/sdk-written")
 		if err != nil {
 			t.Fatalf("read: %v", err)
 		}
@@ -292,15 +304,15 @@ func TestExplainReportsWhatEachKeySpaceQueried(t *testing.T) {
 	ctx := context.Background()
 	session, _, _ := reproSession(t)
 
-	_, reports, err := listAcrossScopes(ctx, session, "app/")
+	_, reports, err := listAcrossScopes(ctx, session, "app/apps/web/")
 	if err != nil {
 		t.Fatalf("listing: %v", err)
 	}
 	if len(reports) != 1 {
-		t.Fatalf("listing %q consulted %d key spaces, want only the scope's", "app/", len(reports))
+		t.Fatalf("listing %q consulted %d key spaces, want only the scope's", "app/apps/web/", len(reports))
 	}
 	r := reports[0]
-	if r.Space != "app" {
+	if r.Space != "app-apps-web" {
 		t.Errorf("space = %q, want the scope", r.Space)
 	}
 	if r.Queried == "" {
@@ -320,7 +332,7 @@ func TestExplainReportsWhatEachKeySpaceQueried(t *testing.T) {
 	for _, rr := range rootReports {
 		seen[rr.Space] = true
 	}
-	if !seen["master"] || !seen["app"] {
+	if !seen["master"] || !seen["app-apps-web"] {
 		t.Errorf("root listing did not name both key spaces: %v", seen)
 	}
 }
@@ -351,7 +363,7 @@ func TestListingTwoKeySpacesWarnsAboutNeither(t *testing.T) {
 	for _, e := range entries {
 		keys = append(keys, e.Key)
 	}
-	for _, want := range []string{"system/operator.txt", "app/sdk-written"} {
+	for _, want := range []string{"system/operator.txt", "app/apps/web/sdk-written"} {
 		if !slices.Contains(keys, want) {
 			t.Errorf("listing lost %q; it has %q", want, keys)
 		}
