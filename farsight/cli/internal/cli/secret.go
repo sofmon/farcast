@@ -212,9 +212,9 @@ reported; --raw keeps it.
 The name may use letters, digits, '_', '-' and '.', up to 128 bytes. It is
 appended to the application's own prefix, so it carries no path separators.
 
-The application's scope is minted when 'farcast run' deploys it, so a secret
-for an application that was never deployed is refused rather than stored
-somewhere nothing will look.`)
+The application's scope is minted when 'farcast run' deploys it, and handed to
+the keyholder there, so a secret for an application that was never deployed is
+refused rather than stored somewhere nothing will look.`)
 }
 
 func (c *secretSetCommand) SetFlags(fs *flag.FlagSet) {

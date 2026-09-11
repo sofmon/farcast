@@ -12,6 +12,7 @@ import (
 	"github.com/sofmon/farcast/farsight/cli/internal/cluster"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/image"
+	"github.com/sofmon/farcast/farsight/cli/internal/keyholder"
 	fldeploy "github.com/sofmon/farcast/fatline/deploy"
 	"github.com/sofmon/farcast/fatline/identity"
 	"github.com/sofmon/farcast/manifest/parser"
@@ -47,6 +48,18 @@ type runCommand struct {
 	// Seams, overridable in tests.
 	newCluster func(kubeconfigPath string) runCluster
 	newBuilder func(progress func(string)) imageBuilder
+	// newKeyholder opens the session that hands new scopes to a running
+	// keyholder. It is a seam because the decision it guards — never unseal a
+	// sealed replica — is one no unit test could otherwise reach: the real
+	// path needs a tunnel and a cluster.
+	newKeyholder func(ctx context.Context, env *Env, instance string) (sealStateClient, func(), error)
+}
+
+// sealStateClient is the part of the keyholder client a deploy uses: ask what
+// a replica is, and hand it key material if it is already serving.
+type sealStateClient interface {
+	State(ctx context.Context, ordinal int) (keyholder.State, error)
+	Unseal(ctx context.Context, ordinal int, bundle []byte, intent string) (keyholder.State, error)
 }
 
 func (*runCommand) Name() string { return "run" }
@@ -206,10 +219,27 @@ func (c *runCommand) Run(ctx context.Context, env *Env, args []string) error {
 		return fmt.Errorf("write the egress policy: %w", err)
 	}
 
-	// 5. Translate and apply.
-	workloads, err := c.translate(env, meta, namespace, *m, images, credentials)
+	// 5. Give every application its own slice of storage, translate, and
+	//    apply.
+	//
+	// The scopes are minted and handed to the keyholder BEFORE the workloads
+	// exist, so an application does not start into a keyholder that has never
+	// heard of it. The reverse order would work eventually — the keyholder
+	// would learn the scope at the next unseal — and "eventually" is an
+	// outage an operator has to notice first.
+	var scopes map[string]datasphere.Scope
+	var minted []string
+	if meta.Keyholder != nil && meta.Keyholder.Deployed {
+		if scopes, minted, err = c.ensureAppScopes(env, meta.Name, namespace, *m); err != nil {
+			return err
+		}
+	}
+	workloads, err := c.translate(env, meta, namespace, *m, images, credentials, scopes)
 	if err != nil {
 		return err
+	}
+	if len(minted) > 0 {
+		c.handScopesToTheKeyholder(ctx, env, meta, minted)
 	}
 	if err := cl.Apply(ctx, workloads); err != nil {
 		return fmt.Errorf("deploy %q: %w", namespace, err)
@@ -313,7 +343,7 @@ func (c *runCommand) buildAll(ctx context.Context, env *Env, cl jobWaiter, meta 
 
 // translate renders the workloads, wiring storage when the instance has a key
 // holder to wire it to.
-func (c *runCommand) translate(env *Env, meta *config.InstanceMetadata, namespace string, m parser.Manifest, images, credentials map[string]string) ([]byte, error) {
+func (c *runCommand) translate(env *Env, meta *config.InstanceMetadata, namespace string, m parser.Manifest, images, credentials map[string]string, scopes map[string]datasphere.Scope) ([]byte, error) {
 	cfg := translate.Config{
 		Manifest:    m,
 		Namespace:   namespace,
@@ -337,9 +367,8 @@ func (c *runCommand) translate(env *Env, meta *config.InstanceMetadata, namespac
 			return nil, fmt.Errorf("this machine holds no CA key for %q, so it cannot give applications a storage identity; "+
 				"deploy from the machine that installed the instance", meta.Name)
 		}
-		scopes, err := c.ensureAppScopes(env, meta.Name, namespace, m)
-		if err != nil {
-			return nil, err
+		if len(scopes) == 0 {
+			return nil, fmt.Errorf("no storage scopes were resolved for %q; this is a bug in the deploy order", namespace)
 		}
 		cfg.Storage = make(map[string]translate.AppStorage, len(m.Apps))
 		for _, app := range m.Apps {
@@ -375,14 +404,14 @@ func (c *runCommand) translate(env *Env, meta *config.InstanceMetadata, namespac
 // Minting is idempotent and additive. The keyring is written before anything
 // is deployed, because a scope recorded nowhere is key material whose data
 // nobody can find again.
-func (c *runCommand) ensureAppScopes(env *Env, instance, namespace string, m parser.Manifest) (map[string]datasphere.Scope, error) {
+func (c *runCommand) ensureAppScopes(env *Env, instance, namespace string, m parser.Manifest) (map[string]datasphere.Scope, []string, error) {
 	raw, err := env.ConfigDir.LoadInstanceKeyring(instance)
 	if err != nil {
-		return nil, fmt.Errorf("read the storage keyring for %q, which is where an application's scope is minted: %w", instance, err)
+		return nil, nil, fmt.Errorf("read the storage keyring for %q, which is where an application's scope is minted: %w", instance, err)
 	}
 	keys, err := datasphere.ParseKeyring(raw)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	out := make(map[string]datasphere.Scope, len(m.Apps))
@@ -390,7 +419,7 @@ func (c *runCommand) ensureAppScopes(env *Env, instance, namespace string, m par
 	for _, app := range m.Apps {
 		name, err := datasphere.AppScopeName(namespace, app.Name)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if existing, ok := keys.ScopeNamed(name); ok {
 			out[app.Name] = existing
@@ -398,32 +427,153 @@ func (c *runCommand) ensureAppScopes(env *Env, instance, namespace string, m par
 		}
 		fresh, err := datasphere.NewAppScope(namespace, app.Name)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		grown, err := keys.AddScope(fresh)
 		if err != nil {
-			return nil, fmt.Errorf("mint a storage scope for %s: %w", app.Name, err)
+			return nil, nil, fmt.Errorf("mint a storage scope for %s: %w", app.Name, err)
 		}
 		keys = grown
 		out[app.Name] = fresh
 		minted = append(minted, app.Name)
 	}
 	if len(minted) == 0 {
-		return out, nil
+		return out, nil, nil
 	}
 
 	encoded, err := keys.Marshal()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := env.ConfigDir.SaveInstanceKeyring(instance, encoded); err != nil {
-		return nil, fmt.Errorf("record the new storage scopes: %w", err)
+		return nil, nil, fmt.Errorf("record the new storage scopes: %w", err)
 	}
 	fprintf(env.Err, "Minted a storage scope for %s in %q. %s\n",
 		strings.Join(minted, ", "), namespace, datasphere.KeyLossWarning)
-	fprintf(env.Err, "Run 'farcast storage unseal %s' so the keyholder receives them; until it does,\n", instance)
-	fprintf(env.Err, "these applications get ErrStorageSealed rather than their own storage.\n")
-	return out, nil
+	return out, minted, nil
+}
+
+// handScopesToTheKeyholder gives a running keyholder the scopes just minted.
+//
+// A new application's keys exist on this machine the moment they are minted
+// and nowhere else, so without this the application deploys, starts, and gets
+// ErrStorageSealed until somebody notices and unseals. Doing it here closes
+// that window on the ordinary path.
+//
+// It will NOT unseal a sealed keyholder, and that restraint is the whole
+// design of this function. Pushing a bundle to a sealed keyholder IS an
+// unseal: the same call, the same material. Unsealing is a deliberate act an
+// operator takes knowing the instance was sealed — after a restart, or after
+// they sealed it themselves — and a deploy performing it as a side effect
+// would hide a seal the operator has not seen, and would clear an operator
+// hold with a command whose subject is an application. So every replica is
+// asked what it is first, and only the ones already serving are handed
+// anything.
+//
+// Nothing here fails the deploy. The workloads are what the operator asked
+// for, and an application that starts into ErrStorageSealed is in a
+// documented, recoverable state that one command fixes — where a deploy
+// abandoned halfway is not.
+func (c *runCommand) handScopesToTheKeyholder(ctx context.Context, env *Env, meta *config.InstanceMetadata, minted []string) {
+	open := c.newKeyholder
+	if open == nil {
+		open = func(ctx context.Context, env *Env, instance string) (sealStateClient, func(), error) {
+			return keyholderClient(ctx, env, instance)
+		}
+	}
+	client, done, err := open(ctx, env, meta.Name)
+	if err != nil {
+		c.sealedNotice(env, meta.Name, minted, fmt.Sprintf("the keyholder could not be reached: %v", err))
+		return
+	}
+	defer done()
+
+	raw, err := env.ConfigDir.LoadInstanceKeyring(meta.Name)
+	if err != nil {
+		c.sealedNotice(env, meta.Name, minted, err.Error())
+		return
+	}
+	keys, err := datasphere.ParseKeyring(raw)
+	if err != nil {
+		c.sealedNotice(env, meta.Name, minted, err.Error())
+		return
+	}
+	scopes, generation := bundleScopes(meta, keys)
+	bundle, err := datasphere.NewBundle(meta.Name, generation, scopes)
+	if err != nil {
+		c.sealedNotice(env, meta.Name, minted, err.Error())
+		return
+	}
+	defer bundle.Zero()
+	payload, err := bundle.Marshal()
+	if err != nil {
+		c.sealedNotice(env, meta.Name, minted, err.Error())
+		return
+	}
+	defer clear(payload)
+
+	total := replicaCount(meta)
+	ledgerPath := env.ConfigDir.InstanceUnsealLedgerPath(meta.Name)
+	loaded, sealed := 0, 0
+	for i := range total {
+		st, err := client.State(ctx, i)
+		switch {
+		case err != nil:
+			fprintf(env.Err, "warning: keyholder replica %d did not answer, so it does not hold the new scopes: %v\n", i, err)
+			continue
+		case st.Sealed():
+			// Left alone on purpose. See the doc comment.
+			sealed++
+			continue
+		}
+		pushed, perr := client.Unseal(ctx, i, payload, "operator-unseal")
+		entry := keyholder.LedgerEntry{
+			Time: time.Now().UTC(), Instance: meta.Name, Ordinal: i,
+			Intent: "operator-unseal", Generation: generation, Boot: st.Boot, Result: "ok",
+		}
+		if perr != nil {
+			entry.Result = "refused"
+			fprintf(env.Err, "warning: keyholder replica %d refused the new scopes: %v\n", i, perr)
+		} else {
+			entry.Phase = pushed.Phase
+			if pushed.Boot != "" {
+				entry.Boot = pushed.Boot
+			}
+			loaded++
+		}
+		// The ledger records where key material went, and this is a place it
+		// goes. A push nobody wrote down is the one an audit cannot account
+		// for later.
+		if lerr := keyholder.AppendLedger(ledgerPath, entry); lerr != nil {
+			fprintf(env.Err, "warning: the unseal ledger could not be written: %v\n", lerr)
+		}
+	}
+
+	switch {
+	case sealed > 0:
+		c.sealedNotice(env, meta.Name, minted,
+			fmt.Sprintf("%d of %d keyholder replicas are sealed", sealed, total))
+	case loaded == 0:
+		c.sealedNotice(env, meta.Name, minted, "no replica took them")
+	default:
+		fprintf(env.Err, "The keyholder now holds %s's scope (generation %d).\n",
+			strings.Join(minted, ", "), generation)
+		meta.Keyholder.Generation = generation
+		meta.UpdatedAt = time.Now().UTC()
+		if err := env.ConfigDir.SaveInstanceMetadata(meta.Name, meta); err != nil {
+			// Recording behind the cluster is the safe direction: 'storage
+			// state' reads each replica's own generation, so a lagging record
+			// shows up there rather than hiding a replica holding material
+			// nobody wrote down.
+			fprintf(env.Err, "warning: the keyholder took generation %d but recording it failed: %v\n", generation, err)
+		}
+	}
+}
+
+// sealedNotice says the new scopes did not reach the keyholder, and what to do.
+func (c *runCommand) sealedNotice(env *Env, instance string, minted []string, why string) {
+	fprintf(env.Err, "The keyholder does not hold %s's scope yet — %s.\n", strings.Join(minted, ", "), why)
+	fprintf(env.Err, "Until it does, those applications receive ErrStorageSealed. Run:\n\n  farcast storage unseal %s\n\n", instance)
 }
 
 // meter adds the new namespace to what the kernel counts, reusing the same

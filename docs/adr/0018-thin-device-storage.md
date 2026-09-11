@@ -87,6 +87,8 @@ Decision 5 followed immediately, and it makes the rest of that boundary the keys
 
 The path-keyed secrets check that decision 1 added is gone with it: the scope is the boundary, and a second check keyed on the path would be a second place for the rule to live and drift. What remains is the rule about the *operation* — no application creates or destroys a secret, whoever it is.
 
+`farcast run` also hands the scopes it mints to a keyholder that is **already serving**, before the workloads exist — otherwise a new application starts, asks for storage, and gets `ErrStorageSealed` until somebody notices. It will not unseal a **sealed** one: pushing a bundle to a sealed keyholder is an unseal, the same call with the same material, and a deploy performing one as a side effect would hide a seal the operator has not seen and would clear an operator hold with a command whose subject is an application. A keyholder that cannot be reached, or that is sealed, leaves the deploy untouched and prints what to run.
+
 Two consequences worth stating. A bundle may now carry **no** scopes, and that is a real state rather than a degenerate one: an instance with no applications has no application keys, and refusing to build that bundle would leave its keyholder permanently sealed and never ready. And a **wiped** bundle is still refused, which is a different thing from an empty one — the distinction is explicit in the type rather than inferred from a length.
 
 ADR 0017 decisions 2, 3 and 4 are now fully superseded.

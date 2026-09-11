@@ -756,7 +756,9 @@ Each secret is an ordinary object under `app/<namespace>/<app>/secrets/<name>` �
 
 What is enforced on top: the keyholder refuses application writes and deletes under the subtree, so a secret is created and removed by you and by nobody else — including by the application it belongs to.
 
-An application's scope is minted when `farcast run` deploys it, so `secret set` for an application that was never deployed is refused rather than stored somewhere nothing will look.
+An application's scope is minted when `farcast run` deploys it — and handed to the keyholder there, so the application does not start into one that has never heard of it. A `secret set` for an application that was never deployed is refused rather than stored somewhere nothing will look.
+
+`run` will not unseal a **sealed** keyholder to do it. Pushing a bundle to a sealed keyholder is an unseal, and a deploy performing one would hide a seal you have not seen — or clear a hold you placed. It deploys anyway, says the scopes are waiting, and names `farcast storage unseal`.
 
 ### There is no `--value`, and there is no `get`
 

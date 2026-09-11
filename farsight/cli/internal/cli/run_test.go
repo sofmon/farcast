@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"github.com/sofmon/farcast/datasphere"
+	"github.com/sofmon/farcast/farsight/cli/internal/keyholder"
 	fldeploy "github.com/sofmon/farcast/fatline/deploy"
 	"github.com/sofmon/farcast/fatline/policy"
 	"net/url"
@@ -166,6 +168,13 @@ func runCmd(f *fakeRunCluster) *runCommand {
 	c.newCluster = func(string) runCluster { return f }
 	c.newBuilder = func(func(string)) imageBuilder { return &fakeBuilder{} }
 	c.fetcherImage, c.builderImage = fetcherDigest, builderDigest
+	// No test dials a real tunnel. Without this the default seam reaches for
+	// the network and waits out a connect timeout — which is slow, is flaky
+	// when something IS listening, and makes a unit suite depend on the
+	// machine it runs on. A test that wants a keyholder injects one.
+	c.newKeyholder = func(context.Context, *Env, string) (sealStateClient, func(), error) {
+		return nil, nil, errors.New("no tunnel in this test")
+	}
 	return c
 }
 
@@ -1081,5 +1090,186 @@ func TestRunSaysWhatMintingAScopeMeans(t *testing.T) {
 	}
 	if !strings.Contains(out, "storage unseal") {
 		t.Errorf("nothing said the keyholder must be unsealed to receive the new scopes:\n%s", out)
+	}
+}
+
+// fakeStateKeyholder answers State and records what was pushed, so a test can
+// tell "handed the scopes over" from "left it alone".
+type fakeStateKeyholder struct {
+	phase  string
+	pushes int
+	boots  []string
+}
+
+func (f *fakeStateKeyholder) State(_ context.Context, _ int) (keyholder.State, error) {
+	return keyholder.State{Phase: f.phase, Boot: "b0"}, nil
+}
+
+func (f *fakeStateKeyholder) Unseal(_ context.Context, _ int, _ []byte, _ string) (keyholder.State, error) {
+	f.pushes++
+	f.boots = append(f.boots, "b0")
+	return keyholder.State{Phase: "unsealed", Boot: "b0"}, nil
+}
+
+// Pushing a bundle to a SEALED keyholder is an unseal: the same call, the same
+// material. A deploy must not perform one as a side effect — it would hide a
+// seal the operator has not seen, and clear an operator hold with a command
+// whose subject is an application.
+func TestRunNeverUnsealsASealedKeyholder(t *testing.T) {
+	for _, phase := range []string{"restart-sealed", "operator-hold"} {
+		t.Run(phase, func(t *testing.T) {
+			dir := config.Dir(t.TempDir())
+			meta := runnableInstance(t, dir, "p43")
+			meta.Keyholder = &config.Keyholder{Deployed: true, Replicas: 2}
+			if err := dir.SaveInstanceMetadata("p43", meta); err != nil {
+				t.Fatal(err)
+			}
+			mintKeyring(t, dir, "p43")
+			env, _, errBuf := testEnvBoth(dir, output.ModeHuman)
+
+			kh := &fakeStateKeyholder{phase: phase}
+			c := runCmd(newFakeRun(twoAppManifest))
+			c.newKeyholder = func(context.Context, *Env, string) (sealStateClient, func(), error) {
+				return kh, func() {}, nil
+			}
+			if err := c.Run(context.Background(), env, []string{"p43", "github.com/example/my-platform"}); err != nil {
+				t.Fatal(err)
+			}
+
+			if kh.pushes != 0 {
+				t.Errorf("a %s keyholder was pushed to %d time(s); a deploy unsealed it", phase, kh.pushes)
+			}
+			out := errBuf.String()
+			if !strings.Contains(out, "sealed") || !strings.Contains(out, "farcast storage unseal p43") {
+				t.Errorf("the deploy did not say the scopes are waiting on an unseal:\n%s", out)
+			}
+			// And the ledger records no handover, because none happened.
+			entries, err := keyholder.ReadLedger(dir.InstanceUnsealLedgerPath("p43"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 0 {
+				t.Errorf("the ledger recorded %d push(es) that never happened", len(entries))
+			}
+		})
+	}
+}
+
+// The other half: a keyholder already serving takes them, and the handover is
+// written to the ledger like every other movement of key material.
+func TestRunPushesToAServingKeyholderAndRecordsIt(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	meta := runnableInstance(t, dir, "p43")
+	meta.Keyholder = &config.Keyholder{Deployed: true, Replicas: 2}
+	if err := dir.SaveInstanceMetadata("p43", meta); err != nil {
+		t.Fatal(err)
+	}
+	mintKeyring(t, dir, "p43")
+	env, _, errBuf := testEnvBoth(dir, output.ModeHuman)
+
+	kh := &fakeStateKeyholder{phase: "unsealed"}
+	c := runCmd(newFakeRun(twoAppManifest))
+	c.newKeyholder = func(context.Context, *Env, string) (sealStateClient, func(), error) {
+		return kh, func() {}, nil
+	}
+	if err := c.Run(context.Background(), env, []string{"p43", "github.com/example/my-platform"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if kh.pushes != 2 {
+		t.Errorf("pushes = %d, want one per replica", kh.pushes)
+	}
+	if out := errBuf.String(); !strings.Contains(out, "keyholder now holds") {
+		t.Errorf("the handover was not reported:\n%s", out)
+	}
+	entries, err := keyholder.ReadLedger(dir.InstanceUnsealLedgerPath("p43"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("the ledger recorded %d handover(s), want 2", len(entries))
+	}
+	for _, e := range entries {
+		if e.Result != "ok" || e.Boot == "" {
+			t.Errorf("ledger entry is not a usable record: %+v", e)
+		}
+	}
+	// The generation the keyholder took is recorded, so the next unseal does
+	// not replay an older one.
+	after, err := dir.LoadInstanceMetadata("p43")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Keyholder.Generation != 1 {
+		t.Errorf("recorded generation = %d, want 1", after.Keyholder.Generation)
+	}
+}
+
+// The ordinary path: a new application's scope reaches a serving keyholder
+// before the workloads exist, so the application does not start into a
+// keyholder that has never heard of it.
+func TestRunHandsNewScopesToAServingKeyholder(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	meta := runnableInstance(t, dir, "p43")
+	meta.Keyholder = &config.Keyholder{Deployed: true, Replicas: 1}
+	if err := dir.SaveInstanceMetadata("p43", meta); err != nil {
+		t.Fatal(err)
+	}
+	mintKeyring(t, dir, "p43")
+	env, _, errBuf := testEnvBoth(dir, output.ModeHuman)
+
+	// The keyholder cannot be reached — the case that must not fail the
+	// deploy, and must say what to do instead.
+	f := newFakeRun(twoAppManifest)
+	if err := runCmd(f).Run(context.Background(), env, []string{"p43", "github.com/example/my-platform"}); err != nil {
+		t.Fatal(err)
+	}
+
+	out := errBuf.String()
+	if !strings.Contains(out, "ErrStorageSealed") || !strings.Contains(out, "farcast storage unseal p43") {
+		t.Errorf("a keyholder that could not be reached was not reported actionably:\n%s", out)
+	}
+	// The deploy still happened: the workloads are what the operator asked
+	// for, and an application in ErrStorageSealed is recoverable by one
+	// command where an abandoned deploy is not.
+	deployed := false
+	for name := range appliedKinds(t, f) {
+		if strings.HasPrefix(name, "Deployment/") {
+			deployed = true
+		}
+	}
+	if !deployed {
+		t.Error("a keyholder that could not be reached aborted the deploy")
+	}
+}
+
+// A redeploy mints nothing, so it has no reason to touch the keyholder at all.
+func TestRunLeavesTheKeyholderAloneWhenNothingIsMinted(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	meta := runnableInstance(t, dir, "p43")
+	meta.Keyholder = &config.Keyholder{Deployed: true, Replicas: 1}
+	if err := dir.SaveInstanceMetadata("p43", meta); err != nil {
+		t.Fatal(err)
+	}
+	mintKeyring(t, dir, "p43")
+
+	env, _, errBuf := testEnvBoth(dir, output.ModeHuman)
+	if err := runCmd(newFakeRun(twoAppManifest)).Run(context.Background(), env, []string{"p43", "github.com/example/my-platform"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(errBuf.String(), "Minted a storage scope") {
+		t.Fatal("guard: the first deploy minted nothing")
+	}
+
+	env2, _, errBuf2 := testEnvBoth(dir, output.ModeHuman)
+	if err := runCmd(newFakeRun(twoAppManifest)).Run(context.Background(), env2, []string{"p43", "github.com/example/my-platform"}); err != nil {
+		t.Fatal(err)
+	}
+	second := errBuf2.String()
+	if strings.Contains(second, "Minted a storage scope") {
+		t.Errorf("a redeploy minted a second scope:\n%s", second)
+	}
+	if strings.Contains(second, "farcast storage unseal") {
+		t.Errorf("a redeploy that minted nothing still went to the keyholder:\n%s", second)
 	}
 }
