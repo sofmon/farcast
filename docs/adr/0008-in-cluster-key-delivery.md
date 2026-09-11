@@ -118,6 +118,8 @@ None of this reopens decision 5. A peer is an in-cluster principal whose credent
 
 **Finding 7's staleness check runs on the device.** A keeper whose bundle is older than the generation the cluster has held refuses and says to re-enrol, rather than pushing retired keys at a replica that would serve them.
 
+**Finding 4's least privilege now has a data-path half.** [ADR 0018](0018-thin-device-storage.md) decision 2 admits `device` leaves to storage and refuses them the control surface, and refuses `keeper` leaves the data path — which they were never admitted to only because nothing was. A data leaf never pushes; a keeper leaf never reads.
+
 **What is still owed.** The in-cluster key-id pin of finding 4 is specified and not implemented: `datasphered` accepts any bundle at a generation no older than the one it holds, and after a restart it holds none, so a stale bundle is refused by the keeper's own check and by nothing in the cluster. That makes revocation-plus-rekey bind an honest keeper and not a modified one. It is recorded here rather than in a runbook because it is the difference between decision 3's backstop being real and being a plan.
 
 ### Phasing
