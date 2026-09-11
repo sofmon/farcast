@@ -71,6 +71,16 @@ The shared `app` scope remains, holding what is already there. **Migration is a 
 
 ---
 
+### Decision 1, as built (2026-09-11)
+
+The data listener is mutual TLS against the instance CA, with no mode that requests a certificate and proceeds without one — a real handshake test refuses an unidentified peer, a keeper leaf and a leaf from a stranger CA *at the listener*, distinguishing that from a handler that merely says no. `farcast run` mints one leaf per application from the CA key and Planck renders it beside the egress credential; the SDK presents it and refuses to build a client without one, naming the missing variables rather than becoming a handshake failure that looks like an outage. The keyholder derives the caller's role from the leaf's URI, checks identity **before** decoding the key or consulting the seal state — an unidentified caller learns nothing, not even that the keyholder is sealed — and keeps the scope header as a cross-check refused on mismatch.
+
+What decision 1 closes on its own: a caller admitted by network position alone, and a keeper leaf on the data path. What it closes on the **secrets subtree** specifically, because that layout already names its owner: an application reads its own secrets and nobody else's, and listing inside a neighbour's subtree is refused. What it does **not** close: the shared `app` scope. Every application is still entitled to the one scope there is, so ordinary objects remain readable across neighbours until decision 5 gives each application its own. ADR 0017 decisions 2 and 4 therefore reopen only for secrets today, and for everything else when decision 5 lands.
+
+The `device` role is honoured on the listener and in authorization, so a thin device is a driver away rather than a protocol away; nothing yet issues a device leaf.
+
+**Operational consequence.** An application deployed before its instance's keyholder was upgraded holds no leaf and is refused the moment the new keyholder starts. `farcast storage deploy` says so, and `farcast run` again is what issues the leaf.
+
 ## What this does to the solicitation-oracle analysis
 
 [ADR 0008](0008-in-cluster-key-delivery.md) priced the concession exactly: FatLine's and the keyholder's TLS leaves rest in Secrets, so a cloud can impersonate the keyholder to whoever talks to it. It then asked, for every new flow, whether the impersonation yields a *class* of material the memory dump did not already yield. The same question, per tier and per role:
@@ -103,7 +113,7 @@ The controls against the provider are what they were — the ledger, the budget,
 
 ## Consequences
 
-**[ADR 0017](0017-application-secrets.md) decisions 2 and 4 reopen when decision 1 lands.** With identity on the data path and a scope per application, a secret is confidential from a neighbouring application as well as from the cloud, and the listing refusal that was theatre without identity becomes enforceable with it. That ADR's revisit trigger names this one.
+**[ADR 0017](0017-application-secrets.md) decisions 2 and 4 reopen when decision 1 lands** — for the secrets subtree immediately, and for the rest of the scope with decision 5. With identity on the data path and a scope per application, a secret is confidential from a neighbouring application as well as from the cloud, and the listing refusal that was theatre without identity becomes enforceable with it. That ADR's revisit trigger names this one.
 
 **[ADR 0008](0008-in-cluster-key-delivery.md) finding 4's least privilege now has a data-path half**, and its "what 5.4 shipped" note gains the observation that the keeper leaf was never admitted to the data path only because nothing was — decision 2 makes the refusal deliberate.
 

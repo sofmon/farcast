@@ -134,6 +134,13 @@ type Config struct {
 	// FARCAST_STORAGE_SERVER_NAME).
 	StorageServerName string
 
+	// Identities maps each app's name to the client leaf it presents to the
+	// keyholder's data path (ADR 0018 decisions 1 and 6). Required for every
+	// app whenever storage is wired: the keyholder admits only callers it can
+	// identify, so an application deployed without one would reach nothing
+	// and report it as a transport failure rather than as a misconfiguration.
+	Identities map[string]AppIdentity
+
 	// Credentials maps each app's name to its egress credential (ADR 0013).
 	//
 	// Every app in the manifest must have one. A translation that left one out
@@ -142,6 +149,15 @@ type Config struct {
 	// misconfiguration — so it is refused here, where the message can say what
 	// actually happened.
 	Credentials map[string]string
+}
+
+// AppIdentity is one application's client leaf: the certificate that names it
+// farcast://<instance>/app/<namespace>/<name>, and the private key that proves
+// it. It travels in the same Kubernetes Secret as the egress credential and is
+// the same class of thing — a scoped, rotatable transport credential.
+type AppIdentity struct {
+	CertPEM []byte
+	KeyPEM  []byte
 }
 
 func (c *Config) withDefaults() {
@@ -224,12 +240,22 @@ func Render(c Config) ([]byte, error) {
 			return nil, fmt.Errorf("translate: no egress credential for app %q; FatLine could not tell which "+
 				"application is calling, so it would reach nothing (ADR 0013)", app.Name)
 		}
-		data.Apps = append(data.Apps, appData{
+		entry := appData{
 			Name: app.Name, Image: image,
 			ProxyURL: policy.ProxyURL("http",
 				FatLineService+"."+SystemNamespace+".svc.cluster.local",
 				FatLineEgressPort, app.Name, credential),
-		})
+		}
+		if data.HasStorage {
+			id := c.Identities[app.Name]
+			if len(id.CertPEM) == 0 || len(id.KeyPEM) == 0 {
+				return nil, fmt.Errorf("translate: no storage identity for app %q; the keyholder admits only "+
+					"callers it can identify, so it would reach no storage at all (ADR 0018)", app.Name)
+			}
+			entry.ClientCert = indentPEM(id.CertPEM)
+			entry.ClientKey = indentPEM(id.KeyPEM)
+		}
+		data.Apps = append(data.Apps, entry)
 	}
 
 	var buf bytes.Buffer
@@ -294,6 +320,10 @@ type appData struct {
 	// ProxyURL is the app's egress address with its own credential in it
 	// (ADR 0013 decision 2).
 	ProxyURL string
+	// ClientCert and ClientKey are the app's storage identity, PEM indented
+	// for a YAML block scalar; empty when storage is not wired.
+	ClientCert string
+	ClientKey  string
 }
 
 type templateData struct {

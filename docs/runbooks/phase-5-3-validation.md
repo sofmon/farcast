@@ -142,6 +142,16 @@ The message is wrong in the direction that costs something. It sends an operator
 
 ---
 
+## Re-walk after ADR 0018 decision 1 — not yet walked
+
+Identity on the keyholder's data path changes three of the answers above, and each is a claim about a live cluster rather than a unit test.
+
+- **#4 changes shape.** From inside `alpha`'s pod, a `GET` of `alpha`'s own secret succeeds with the leaf the platform mounted; the same `GET` of `beta`'s secret returns `403 permission`; and a `curl` with `--cacert` but **no client certificate** fails the TLS handshake outright — no HTTP status at all. That last one is the listener refusing, and it is the property the whole decision rests on.
+- **#5 inverts for secrets.** `alpha` reading `beta`'s secret — the demonstration ADR 0017 asked for — now **fails**, and the fixture's `neighbour's secret` line reports `refused`. `alpha` reading `beta`'s ordinary objects still succeeds, because the shared scope is decision 5's to close, and the walk should show both so nobody reads the first as the second.
+- **Deploy order.** Upgrade the keyholder with `storage deploy` while an application from *before* the upgrade is running: it must report `ErrStorageUnavailable` naming the missing leaf, and `farcast run` again must restore it without any change to the application.
+
+Criteria 11–13: an unidentified client is refused at the handshake; an application's own secret is served and a neighbour's is refused with `permission`; a pre-upgrade application is refused with a message that names the leaf and recovers on redeploy.
+
 ## Criteria
 
 | # | Criterion | Result |

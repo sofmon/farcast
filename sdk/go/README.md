@@ -367,6 +367,10 @@ The platform injects these when it runs an application; absent them the capabili
 | `FARCAST_STORAGE_SCOPE` | the scope this application may address |
 | `FARCAST_STORAGE_CA` | the instance CA, in PEM, used to verify the keyholder |
 | `FARCAST_STORAGE_SERVER_NAME` | the identity the keyholder must present, when it differs from the endpoint host |
+| `FARCAST_STORAGE_CLIENT_CERT` | this application's leaf, naming it `farcast://<instance>/app/<namespace>/<name>` |
+| `FARCAST_STORAGE_CLIENT_KEY` | the key that proves it |
+
+**The keyholder admits only callers it can identify** ([ADR 0018](../../docs/adr/0018-thin-device-storage.md) decision 1). The leaf is issued by the instance CA at `farcast run` and delivered beside the egress credential; the keyholder derives what this application may reach from the name on it — the application scope, and its own secrets and nobody else's. `FARCAST_STORAGE_SCOPE` is still sent, as a cross-check the keyholder refuses on mismatch; it no longer decides anything. A configuration with the endpoint set and no leaf is reported as `ErrStorageUnavailable` naming both variables, rather than as the handshake failure it would otherwise become — an operator told "do not form a valid pair" would go looking for a corrupt file rather than a missing variable.
 
 A configuration that is *present but unusable* — an unreadable CA, a plain-`http` endpoint — is neither the stub nor a seal. It reports `ErrStorageUnavailable`, because telling an application "this build never supports storage" would make it stop trying, and telling it "sealed" would make it wait for an operator who has nothing to unseal.
 

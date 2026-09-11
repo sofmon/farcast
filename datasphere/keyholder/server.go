@@ -257,7 +257,7 @@ func (s *Server) DataHandler() http.Handler {
 }
 
 func (s *Server) read(w http.ResponseWriter, r *http.Request) {
-	key, _, store, err := s.resolve(r, HeaderKey)
+	key, _, _, store, err := s.resolve(r, HeaderKey)
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -273,12 +273,12 @@ func (s *Server) read(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) write(w http.ResponseWriter, r *http.Request) {
-	key, scope, store, err := s.resolve(r, HeaderKey)
+	key, id, scope, store, err := s.resolve(r, HeaderKey)
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
-	if err := refuseSecretMutation(scope, key); err != nil {
+	if err := refuseSecretMutation(id, scope, key); err != nil {
 		// Refused before the body is read, so an application cannot spend the
 		// instance's bandwidth on a write that was never going to happen.
 		s.fail(w, r, err)
@@ -297,12 +297,12 @@ func (s *Server) write(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) delete(w http.ResponseWriter, r *http.Request) {
-	key, scope, store, err := s.resolve(r, HeaderKey)
+	key, id, scope, store, err := s.resolve(r, HeaderKey)
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
-	if err := refuseSecretMutation(scope, key); err != nil {
+	if err := refuseSecretMutation(id, scope, key); err != nil {
 		s.fail(w, r, err)
 		return
 	}
@@ -314,7 +314,7 @@ func (s *Server) delete(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) list(w http.ResponseWriter, r *http.Request) {
-	prefix, _, store, err := s.resolve(r, HeaderPrefix)
+	prefix, _, _, store, err := s.resolve(r, HeaderPrefix)
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -332,59 +332,83 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request) {
 
 // resolve decodes the requested logical key and returns a Store over the scope
 // that owns it.
-func (s *Server) resolve(r *http.Request, header string) (string, datasphere.Scope, *datasphere.Store, error) {
+func (s *Server) resolve(r *http.Request, header string) (string, Identity, datasphere.Scope, *datasphere.Store, error) {
+	none := datasphere.Scope{}
+	// Identity first, before the key is even decoded. A caller the listener
+	// could not identify learns nothing — not whether the key parsed, not
+	// whether the keyholder is sealed.
+	id, err := identityFrom(r, s.cfg.Instance)
+	if err != nil {
+		return "", Identity{}, none, nil, err
+	}
+
 	raw := r.Header.Get(header)
 	if raw == "" && header == HeaderKey {
-		return "", datasphere.Scope{}, nil, fmt.Errorf("%w: missing %s header", datasphere.ErrInvalidKey, header)
+		return "", id, none, nil, fmt.Errorf("%w: missing %s header", datasphere.ErrInvalidKey, header)
 	}
 	decoded, err := base64.StdEncoding.DecodeString(raw)
 	if err != nil {
-		return "", datasphere.Scope{}, nil, fmt.Errorf("%w: %s is not base64", datasphere.ErrInvalidKey, header)
+		return "", id, none, nil, fmt.Errorf("%w: %s is not base64", datasphere.ErrInvalidKey, header)
 	}
 	key := string(decoded)
 
-	// The scope is required rather than inferred. When 4.x derives it from
-	// the caller's own certificate, a request that omits it must already be
-	// a refusal — otherwise that change would be a fail-open one.
+	// The scope header is a cross-check, not an authorization input (ADR
+	// 0018 decision 1). It is still required: the SDK has always sent it, and
+	// a caller whose idea of the scope disagrees with the keyholder's is
+	// addressing something other than what it thinks.
 	declared := r.Header.Get(HeaderScope)
 	if declared == "" {
-		return "", datasphere.Scope{}, nil, fmt.Errorf("%w: missing %s header", ErrOutOfScope, HeaderScope)
+		return "", id, none, nil, fmt.Errorf("%w: missing %s header", ErrOutOfScope, HeaderScope)
 	}
 
 	scope, err := s.cfg.Vault.Scope(key)
 	if err != nil {
-		return "", datasphere.Scope{}, nil, err
+		return "", id, none, nil, err
+	}
+	// What the caller may reach follows from the role its leaf names.
+	if !id.MayReach(scope.Name) {
+		return "", id, none, nil, fmt.Errorf("%w: %s %q may not reach scope %q", ErrNotAuthorized, id.Role, id.Name, scope.Name)
 	}
 	if scope.Name != declared {
-		return "", datasphere.Scope{}, nil, fmt.Errorf("%w: key belongs to scope %q, request declared %q", ErrOutOfScope, scope.Name, declared)
+		return "", id, none, nil, fmt.Errorf("%w: key belongs to scope %q, request declared %q", ErrOutOfScope, scope.Name, declared)
+	}
+	// The secrets subtree already names its owner, so it is the one place a
+	// per-application boundary is enforceable before every application has
+	// its own scope. An application reaches its own secrets and nobody
+	// else's; the operator and a device reach all of them.
+	if !id.MayTouchSecret(scope.Prefix, key) {
+		return "", id, none, nil, fmt.Errorf("%w: %s %q may not reach another application's secrets", ErrNotAuthorized, id.Role, id.Name)
 	}
 	store, err := s.cfg.Stores(scope)
 	if err != nil {
-		return "", datasphere.Scope{}, nil, err
+		return "", id, none, nil, err
 	}
-	return key, scope, store, nil
+	return key, id, scope, store, nil
 }
 
-// refuseSecretMutation is the one rule the application data path enforces
-// about WHAT a key is, rather than about who may reach it.
+// refuseSecretMutation keeps applications from creating or destroying secrets.
 //
-// The data path cannot tell one application from another — it authenticates
-// the server only, and the scope a request declares is the same string every
-// application in the instance is given (see DataTLS). So it cannot enforce
-// whose secret this is, and pretending otherwise would be theatre.
+// It was written when the data path could not tell one application from
+// another (ADR 0017 decision 3), and it was the one rule that path could
+// enforce honestly: not WHOSE secret, but that no application writes one.
+// Identity on the path (ADR 0018 decision 1) adds the whose — see
+// Identity.MayTouchSecret, applied in resolve — and this rule stays, narrowed
+// to the role it was always about.
 //
-// What it CAN enforce is that no application creates or destroys one. Secrets
-// are provisioned by the operator from their own machine, client-side
-// encrypted, and never through this path; refusing the mutation here means a
-// compromised application can read the secrets of the instance it is in, and
-// cannot plant a credential for a neighbour to pick up or delete one to force
-// a fallback. That is a smaller property than isolation and it is a real one.
-//
-// Listing is deliberately NOT refused. The parent prefix is listable, so a
-// refusal here would prevent nothing and would imply an enumeration boundary
-// that does not exist (ADR 0017).
-func refuseSecretMutation(scope datasphere.Scope, key string) error {
+// Listing the secrets ROOT is still not refused: the parent prefix is
+// listable, so refusing it would imply an enumeration boundary that does not
+// exist. Listing INSIDE another application's subtree is refused by resolve,
+// because that boundary now does.
+func refuseSecretMutation(id Identity, scope datasphere.Scope, key string) error {
 	if !datasphere.IsSecretsKey(scope.Prefix, key) {
+		return nil
+	}
+	// Since ADR 0018 decision 1 the path CAN tell who is asking, so the
+	// refusal narrows to exactly the callers it was aimed at: an application
+	// still never creates or destroys a secret, while the operator and a thin
+	// device provision them through the keyholder as they would from the
+	// laptop.
+	if id.Role != RoleApp {
 		return nil
 	}
 	return fmt.Errorf("%w: %s/ is provisioned by the operator; applications may read a secret and may not write or delete one",
@@ -417,6 +441,7 @@ func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 func safeMessage(err error) string {
 	for _, known := range []error{
 		ErrSealed, ErrOperatorHold, ErrGenerationTooOld, ErrInstanceMismatch, ErrOutOfScope,
+		ErrSecretsReadOnly, ErrNotAuthorized, ErrNoIdentity,
 		datasphere.ErrObjectNotFound, datasphere.ErrIntegrity, datasphere.ErrUnknownKey,
 		datasphere.ErrInvalidKey, datasphere.ErrTooLarge, datasphere.ErrBundleInvalid,
 		datasphere.ErrKeyringInvalid,

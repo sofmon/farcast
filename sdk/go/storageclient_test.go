@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
@@ -24,6 +25,16 @@ type fakeKeyholder struct {
 	data   *httptest.Server
 	status *httptest.Server
 
+	// The instance CA the SDK verifies the data path against, and the
+	// application leaf it presents. The data server DEMANDS that leaf: a
+	// client without one fails the handshake, so a test cannot pass by
+	// accident against a fixture that forgot to ask.
+	caPEM      []byte
+	clientCert []byte
+	clientKey  []byte
+	// sawIdentity is the URI on the leaf the last data request presented.
+	sawIdentity string
+
 	objects map[string][]byte
 	// sawBody records whether any request arrived carrying a payload, so a
 	// test can assert that a refusal happened before anything was sent.
@@ -37,9 +48,15 @@ type fakeKeyholder struct {
 func newFakeKeyholder(t *testing.T) *fakeKeyholder {
 	t.Helper()
 	f := &fakeKeyholder{objects: map[string][]byte{}, phase: "unsealed"}
+	ca := newTestCA(t)
+	f.caPEM = ca.pem
+	f.clientCert, f.clientKey = ca.client(t, "farcast://p32/app/apps/web")
 
-	f.data = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	f.data = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.sawScope = r.Header.Get(headerScope)
+		if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 && len(r.TLS.PeerCertificates[0].URIs) > 0 {
+			f.sawIdentity = r.TLS.PeerCertificates[0].URIs[0].String()
+		}
 		if r.ContentLength > 0 {
 			f.sawBody = true
 		}
@@ -82,6 +99,16 @@ func newFakeKeyholder(t *testing.T) *fakeKeyholder {
 	}))
 	t.Cleanup(f.data.Close)
 
+	pool := x509.NewCertPool()
+	pool.AddCert(ca.cert)
+	f.data.TLS = &tls.Config{
+		Certificates: []tls.Certificate{ca.server(t)},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    pool,
+		MinVersion:   tls.VersionTLS13,
+	}
+	f.data.StartTLS()
+
 	f.status = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.ContentLength > 0 {
 			f.sawBody = true
@@ -101,16 +128,11 @@ func decodeHeader(v string) string {
 
 func (f *fakeKeyholder) client(t *testing.T) *storageClient {
 	t.Helper()
-	c, err := newStorageClient(f.data.URL, f.status.URL, "app", certPEM(t, f.data.Certificate()), "")
+	c, err := newStorageClient(f.data.URL, f.status.URL, "app", f.caPEM, "", f.clientCert, f.clientKey)
 	if err != nil {
 		t.Fatalf("newStorageClient: %v", err)
 	}
 	return c
-}
-
-func certPEM(t *testing.T, cert *x509.Certificate) []byte {
-	t.Helper()
-	return pemEncode(cert.Raw)
 }
 
 func pemEncode(der []byte) []byte {
@@ -286,7 +308,7 @@ func TestBrokenConfigurationIsNeitherStubNorSeal(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := newStorageClient(tc.endpoint, tc.status, tc.scope, []byte(tc.ca), "")
+			_, err := newStorageClient(tc.endpoint, tc.status, tc.scope, []byte(tc.ca), "", nil, nil)
 			if err == nil {
 				t.Fatal("an unusable configuration was accepted")
 			}
@@ -335,7 +357,7 @@ func TestUntrustedPeerIsRefusedBeforeAnyPayloadIsSent(t *testing.T) {
 	// trusting one would trust the impostor too and this test would pass
 	// without verifying anything.
 	_ = real
-	c, err := newStorageClient(impostor.data.URL, impostor.status.URL, "app", freshCAPEM(t), "")
+	c, err := newStorageClient(impostor.data.URL, impostor.status.URL, "app", freshCAPEM(t), "", real.clientCert, real.clientKey)
 	if err != nil {
 		t.Fatalf("newStorageClient: %v", err)
 	}
@@ -453,7 +475,9 @@ func TestStorageFromEnvHasThreeDistinctOutcomes(t *testing.T) {
 		t.Setenv(envStorageEndpoint, f.data.URL)
 		t.Setenv(envStorageStatus, f.status.URL)
 		t.Setenv(envStorageScope, "app")
-		t.Setenv(envStorageCA, string(certPEM(t, f.data.Certificate())))
+		t.Setenv(envStorageCA, string(f.caPEM))
+		t.Setenv(envStorageClientCert, string(f.clientCert))
+		t.Setenv(envStorageClientKey, string(f.clientKey))
 
 		s := newStorageFromEnv()
 		if _, ok := s.(*storageClient); !ok {
@@ -477,7 +501,7 @@ func TestServerNameIsSeparableFromTheAddress(t *testing.T) {
 	// The fake's certificate is issued for "example.com"/127.0.0.1, never for
 	// this name, so a client that verifies against it must fail.
 	c, err := newStorageClient(f.data.URL, f.status.URL, "app",
-		certPEM(t, f.data.Certificate()), "p32.datasphered.farcast")
+		f.caPEM, "p32.datasphered.farcast", f.clientCert, f.clientKey)
 	if err != nil {
 		t.Fatalf("newStorageClient: %v", err)
 	}
@@ -494,5 +518,58 @@ func TestServerNameIsSeparableFromTheAddress(t *testing.T) {
 	plain := f.client(t)
 	if err := plain.Write(context.Background(), "app/doc", []byte("v")); err != nil {
 		t.Errorf("an un-overridden client failed: %v", err)
+	}
+}
+
+// The keyholder admits only callers it can identify (ADR 0018 decision 1).
+func TestTheClientPresentsItsApplicationLeaf(t *testing.T) {
+	f := newFakeKeyholder(t)
+	c := f.client(t)
+	if err := c.Write(context.Background(), "app/doc", []byte("v")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if f.sawIdentity != "farcast://p32/app/apps/web" {
+		t.Errorf("the keyholder saw identity %q, want the application's leaf", f.sawIdentity)
+	}
+
+	// The fixture is honest: a client with no leaf does not get in, so the
+	// assertion above cannot be passing against a server that never asked.
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(f.caPEM)
+	bare := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS13}}}
+	if _, err := bare.Get(f.data.URL + "/v1/object"); err == nil {
+		t.Fatal("the fake keyholder admitted a client with no leaf; the presented-leaf test proves nothing")
+	}
+}
+
+// Without a leaf the client would fail every handshake and report what looks
+// like an outage. Refused at construction instead, naming what is missing.
+func TestWithoutALeafTheClientIsBrokenNotUnreachable(t *testing.T) {
+	f := newFakeKeyholder(t)
+	_, err := newStorageClient(f.data.URL, f.status.URL, "app", f.caPEM, "", nil, nil)
+	if err == nil {
+		t.Fatal("a client with no identity was built")
+	}
+	if !errors.Is(err, ErrStorageUnavailable) {
+		t.Errorf("err = %v, want ErrStorageUnavailable", err)
+	}
+	for _, want := range []string{envStorageClientCert, envStorageClientKey, "required"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not say %q: %v", want, err)
+		}
+	}
+	// And it is the ABSENCE that was reported, not a failed parse of nothing:
+	// an operator told "do not form a valid pair" would go looking for a
+	// corrupt file rather than a missing variable.
+	if strings.Contains(err.Error(), "valid certificate") {
+		t.Errorf("a missing leaf was reported as a malformed one: %v", err)
+	}
+	// A leaf that does not pair with its key is refused without echoing it.
+	_, err = newStorageClient(f.data.URL, f.status.URL, "app", f.caPEM, "", f.clientCert, []byte("-----BEGIN PRIVATE KEY-----\nNOTAKEY\n-----END PRIVATE KEY-----"))
+	if err == nil {
+		t.Fatal("a mismatched leaf and key were accepted")
+	}
+	if strings.Contains(err.Error(), "NOTAKEY") {
+		t.Errorf("the error echoed key material: %v", err)
 	}
 }

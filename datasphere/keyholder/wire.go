@@ -58,7 +58,8 @@ func classify(err error) (status int, code string) {
 	case errors.Is(err, ErrSealed):
 		return http.StatusServiceUnavailable, CodeSealed
 
-	case errors.Is(err, ErrOutOfScope), errors.Is(err, ErrSecretsReadOnly):
+	case errors.Is(err, ErrOutOfScope), errors.Is(err, ErrSecretsReadOnly),
+		errors.Is(err, ErrNotAuthorized), errors.Is(err, ErrNoIdentity):
 		return http.StatusForbidden, CodePermission
 	case errors.Is(err, datasphere.ErrObjectNotFound):
 		return http.StatusNotFound, CodeNotFound

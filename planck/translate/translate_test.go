@@ -34,6 +34,10 @@ func sampleConfig() Config {
 		StorageServerName: "p42.datasphered.farcast",
 		StorageCAPEM:      []byte("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----"),
 		SecretsPrefix:     "app/secrets/",
+		Identities: map[string]AppIdentity{
+			"api": {CertPEM: []byte("-----BEGIN CERTIFICATE-----\nAPILEAF\n-----END CERTIFICATE-----"), KeyPEM: []byte("-----BEGIN PRIVATE KEY-----\nAPIKEY\n-----END PRIVATE KEY-----")},
+			"web": {CertPEM: []byte("-----BEGIN CERTIFICATE-----\nWEBLEAF\n-----END CERTIFICATE-----"), KeyPEM: []byte("-----BEGIN PRIVATE KEY-----\nWEBKEY\n-----END PRIVATE KEY-----")},
+		},
 	}
 }
 
@@ -596,5 +600,53 @@ func TestWithoutAnInstanceNoInstanceIDIsRendered(t *testing.T) {
 	}
 	if !strings.Contains(out, "FARCAST_APP_NAME") {
 		t.Error("the app name is not optional")
+	}
+}
+
+// Each application's storage identity reaches the container beside its egress
+// credential, in the Secret and never in the ConfigMap (ADR 0018 decision 6).
+func TestEachAppGetsItsOwnStorageIdentityInTheSecret(t *testing.T) {
+	_, docs := render(t, sampleConfig())
+	for app, marker := range map[string]string{"api": "APILEAF", "web": "WEBLEAF"} {
+		sec := at(t, pick(t, docs, "Secret", app+"-egress"), "stringData").(map[string]any)
+		cert, _ := sec["FARCAST_STORAGE_CLIENT_CERT"].(string)
+		key, _ := sec["FARCAST_STORAGE_CLIENT_KEY"].(string)
+		if !strings.Contains(cert, marker) {
+			t.Errorf("%s: FARCAST_STORAGE_CLIENT_CERT does not carry %s's own leaf", app, app)
+		}
+		if !strings.Contains(key, strings.ToUpper(app)+"KEY") {
+			t.Errorf("%s: FARCAST_STORAGE_CLIENT_KEY does not carry %s's own key", app, app)
+		}
+		// A ConfigMap is readable by anything that can read ConfigMaps.
+		cm := at(t, pick(t, docs, "ConfigMap", app), "data").(map[string]any)
+		if _, leaked := cm["FARCAST_STORAGE_CLIENT_KEY"]; leaked {
+			t.Errorf("%s: the private key is in the ConfigMap", app)
+		}
+	}
+}
+
+// The keyholder admits only callers it can identify, so an application
+// deployed with storage and no identity would reach nothing and report a
+// transport failure. Refused here, where the message can say what is missing.
+func TestStorageWiredWithoutAnIdentityIsRefused(t *testing.T) {
+	c := sampleConfig()
+	delete(c.Identities, "web")
+	_, err := Render(c)
+	if err == nil {
+		t.Fatal("Render deployed an application with storage and no identity")
+	}
+	if !strings.Contains(err.Error(), "web") || !strings.Contains(err.Error(), "identity") {
+		t.Errorf("err = %v, want it to name the app and the missing identity", err)
+	}
+}
+
+// Without storage there is nothing to identify to, and no key should be
+// minted or rendered for it.
+func TestWithoutStorageNoIdentityIsRenderedOrRequired(t *testing.T) {
+	c := sampleConfig()
+	c.StorageScope, c.StorageCAPEM, c.SecretsPrefix, c.Identities = "", nil, "", nil
+	out, _ := render(t, c)
+	if strings.Contains(out, "FARCAST_STORAGE_CLIENT") {
+		t.Error("a storage identity was rendered for a deployment with no storage")
 	}
 }

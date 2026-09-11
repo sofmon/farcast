@@ -68,19 +68,42 @@ func ControlTLS(cert tls.Certificate, clientCA *x509.CertPool, allow func(uri st
 
 // DataTLS is the application-facing listener.
 //
-// It authenticates the SERVER only. In phase 3.2 there are no application
-// identities to verify — Planck does not deploy applications until 4.2 — and
-// minting a client leaf per application now would put one more plaintext-
-// yielding credential in a Kubernetes Secret, which is cloud-resident storage.
-// Access control in 3.2 is therefore network reachability plus the scope a
-// request declares, and that is stated plainly rather than implied. The
-// NetworkPolicy that contains it is 4.2's, and per-app identity is 4.x's.
-func DataTLS(cert tls.Certificate) *tls.Config {
-	return &tls.Config{
+// It is mutually authenticated, as the control listener has been since 3.2.
+// Until ADR 0018 it authenticated the server only: 3.2 shipped before any
+// application had an identity, and access control was network reachability
+// plus the scope a request declared — stated plainly at the time rather than
+// implied, and drawn to its consequence by ADR 0017. Decision 1 of ADR 0018
+// closes it: a caller presents a leaf from the instance CA, the leaf's URI
+// names a role, and what it may reach follows from the role.
+//
+// There is no mode that requests a certificate and proceeds without one. A
+// listener that admitted an unidentified caller would be exactly the fail-open
+// the decision forbids, so the handshake refuses and the handler never sees
+// the request.
+func DataTLS(cert tls.Certificate, clientCA *x509.CertPool, allow func(uri string) bool) *tls.Config {
+	cfg := &tls.Config{
 		MinVersion:   tls.VersionTLS13,
 		MaxVersion:   tls.VersionTLS13,
 		Certificates: []tls.Certificate{cert},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    clientCA,
 	}
+	if allow != nil {
+		cfg.VerifyConnection = func(cs tls.ConnectionState) error {
+			if len(cs.PeerCertificates) == 0 {
+				return errors.New("keyholder: no client certificate")
+			}
+			for _, uri := range cs.PeerCertificates[0].URIs {
+				if allow(uri.String()) {
+					return nil
+				}
+			}
+			// As on the control surface: the peer knows what it sent, and an
+			// error is a poor place to echo identities.
+			return errors.New("keyholder: client identity is not authorized to use storage")
+		}
+	}
+	return cfg
 }
 
 // LoadTLS builds a certificate from PEM material.

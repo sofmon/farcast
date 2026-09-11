@@ -111,13 +111,14 @@ func serve(ctx context.Context, opt options, sopt serveOptions, out, errw io.Wri
 			TLSConfig: keyholder.ControlTLS(cert, clientCA, keyholder.AllowPusher(opt.instance)),
 		},
 
-		// Data: server-authenticated only. See keyholder.DataTLS for why
-		// there is no client certificate here in 3.2, stated rather than
-		// implied.
+		// Data: mutually authenticated since ADR 0018 decision 1. The same
+		// CA that admits the operator and keepers to the control surface
+		// admits applications and devices here; what each may reach is
+		// decided per request from the leaf's role.
 		{
 			Addr:      sopt.listen,
 			Handler:   srv.DataHandler(),
-			TLSConfig: keyholder.DataTLS(cert),
+			TLSConfig: keyholder.DataTLS(cert, clientCA, keyholder.AllowData(opt.instance)),
 		},
 	}
 

@@ -92,6 +92,9 @@ func TestSecretKeyMatchesWhatPlanckHandsTheApplication(t *testing.T) {
 		StorageServerName: "p.datasphered.farcast",
 		StorageCAPEM:      []byte("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----"),
 		SecretsPrefix:     root,
+		// Storage is wired, so the translator requires an identity per app
+		// (ADR 0018 decision 1); this test is about the key layout, not the leaf.
+		Identities: map[string]translate.AppIdentity{"api": {CertPEM: []byte("c"), KeyPEM: []byte("k")}},
 	})
 	if err != nil {
 		t.Fatalf("Render: %v", err)

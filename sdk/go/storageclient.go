@@ -34,6 +34,15 @@ const (
 	// already separates them for exactly this reason (ADR 0005's
 	// carrier-independent server identity); this is the same split.
 	envStorageServerName = "FARCAST_STORAGE_SERVER_NAME"
+
+	// envStorageClientCert and envStorageClientKey are this application's
+	// identity on the keyholder's data path: a leaf naming it
+	// farcast://<instance>/app/<namespace>/<name>, issued by the instance CA
+	// at deploy (ADR 0018 decision 1). The keyholder admits only callers it
+	// can identify and derives what they may reach from the name, so the
+	// scope this SDK also sends is a cross-check rather than a claim.
+	envStorageClientCert = "FARCAST_STORAGE_CLIENT_CERT"
+	envStorageClientKey  = "FARCAST_STORAGE_CLIENT_KEY"
 )
 
 // Header names on the keyholder's data path. The logical key travels
@@ -95,6 +104,8 @@ func newStorageFromEnv() StorageAPI {
 		strings.TrimSpace(os.Getenv(envStorageScope)),
 		[]byte(os.Getenv(envStorageCA)),
 		strings.TrimSpace(os.Getenv(envStorageServerName)),
+		[]byte(os.Getenv(envStorageClientCert)),
+		[]byte(os.Getenv(envStorageClientKey)),
 	)
 	if err != nil {
 		return storageBroken{err: err}
@@ -102,7 +113,7 @@ func newStorageFromEnv() StorageAPI {
 	return client
 }
 
-func newStorageClient(endpoint, status, scope string, caPEM []byte, serverName string) (*storageClient, error) {
+func newStorageClient(endpoint, status, scope string, caPEM []byte, serverName string, clientCertPEM, clientKeyPEM []byte) (*storageClient, error) {
 	if _, err := url.Parse(endpoint); err != nil || !strings.HasPrefix(endpoint, "https://") {
 		return nil, fmt.Errorf("%w: %s must be an https URL", ErrStorageUnavailable, envStorageEndpoint)
 	}
@@ -116,9 +127,24 @@ func newStorageClient(endpoint, status, scope string, caPEM []byte, serverName s
 		// system roots would accept exactly that. Refuse instead.
 		return nil, fmt.Errorf("%w: %s holds no certificate, so the keyholder cannot be verified", ErrStorageUnavailable, envStorageCA)
 	}
+	// The keyholder admits only callers it can identify. Without a leaf this
+	// client would fail the handshake and report a transport error that
+	// looks like an outage; naming the missing variable here sends an
+	// operator to the workload rather than to the network.
+	if len(clientCertPEM) == 0 || len(clientKeyPEM) == 0 {
+		return nil, fmt.Errorf("%w: %s and %s are required; the keyholder admits only callers it can identify",
+			ErrStorageUnavailable, envStorageClientCert, envStorageClientKey)
+	}
+	leaf, err := tls.X509KeyPair(clientCertPEM, clientKeyPEM)
+	if err != nil {
+		// The message never includes the material: this function is handed
+		// a private key, and a malformed one must not reach a log.
+		return nil, fmt.Errorf("%w: %s and %s do not form a valid certificate and key",
+			ErrStorageUnavailable, envStorageClientCert, envStorageClientKey)
+	}
 	// An empty override means the endpoint's own host is the identity, which
 	// is right when the two coincide and wrong the moment they do not.
-	tlsCfg := &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS13}
+	tlsCfg := &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{leaf}}
 	if serverName != "" {
 		tlsCfg.ServerName = serverName
 	}

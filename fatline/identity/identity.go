@@ -47,6 +47,42 @@ func KeeperURI(instance, device string) string {
 	return "farcast://" + instance + "/keeper/" + device
 }
 
+// AppURI is the identity a deployed application presents to the keyholder's
+// data path (ADR 0018 decisions 1 and 6). Namespace and name together, so two
+// deployments of one manifest are two principals.
+func AppURI(instance, namespace, app string) string {
+	return "farcast://" + instance + "/app/" + namespace + "/" + app
+}
+
+// DeviceURI is the identity a thin device presents to the data path (ADR 0018
+// decision 2): a leaf and no keyring, served storage and never the control
+// surface.
+func DeviceURI(instance, device string) string {
+	return "farcast://" + instance + "/device/" + device
+}
+
+// IssueAppClient issues one application's client leaf from an already-minted
+// CA.
+//
+// It is minted at `farcast run`, delivered beside the application's egress
+// credential, and rotates by redeploying — the transport-credential class of
+// ADR 0010 decision 4 and ADR 0013 decision 8, not the keyring's. The CA key
+// is an argument and is never retained.
+func IssueAppClient(caCertPEM, caKeyPEM []byte, instance, namespace, app string) (certPEM, keyPEM []byte, err error) {
+	if instance == "" || namespace == "" || app == "" {
+		return nil, nil, errors.New("identity: an application identity needs an instance, a namespace and a name")
+	}
+	ca, err := fcrypto.LoadCA(caCertPEM, caKeyPEM)
+	if err != nil {
+		return nil, nil, err
+	}
+	leaf, err := ca.IssueClient(AppURI(instance, namespace, app))
+	if err != nil {
+		return nil, nil, fmt.Errorf("identity: issue application client cert: %w", err)
+	}
+	return leaf.CertPEM, leaf.KeyPEM, nil
+}
+
 // IssueKeyholderServer issues a server leaf for the in-cluster keyholder from
 // an already-minted CA.
 //

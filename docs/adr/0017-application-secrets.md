@@ -80,6 +80,8 @@ The same list as ordinary storage ([`datasphere/README.md`](../../datasphere/REA
 
 That is a phase of work, not a section, and most of it is machinery Phase 5.4's planned ADR on thin-device storage through the keyholder needs anyway — that ADR has to settle what the keyholder serves an **operator** leaf versus an **application** one, which is the same question asked from the other side. When it lands, decisions 2 and 4 change and this ADR is reopened.
 
-*Settled 2026-09-10 by [ADR 0018](0018-thin-device-storage.md).* Identity on the data path is its decision 1, per-application scopes its decision 5, and the application leaf's credential class its decision 6. Decisions 2 and 4 here reopen when that decision 1 is implemented; until then this ADR's boundary stands as written.
+*Settled 2026-09-10 by [ADR 0018](0018-thin-device-storage.md).* Identity on the data path is its decision 1, per-application scopes its decision 5, and the application leaf's credential class its decision 6.
+
+*Decision 1 implemented 2026-09-11.* The data path now authenticates every caller, and for the **secrets subtree** — the one layout that already names its owner — decisions 2, 3 and 4 above are superseded: an application reads its own secrets and nobody else's, listing inside a neighbour's subtree is refused, and the operator and a thin device may provision secrets through the keyholder. For ordinary objects the boundary remains the instance, because every application is still entitled to the one shared scope; that changes with ADR 0018 decision 5, not before.
 
 Until then the honest statement is the one in decision 2, and it is the reason `farcast secret` talks about applications sharing an instance rather than about applications being isolated from each other.

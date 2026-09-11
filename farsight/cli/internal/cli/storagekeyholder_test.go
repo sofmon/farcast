@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -727,5 +728,20 @@ func TestDeployReallyMintsTheBucket(t *testing.T) {
 	}
 	if _, ok := keys.ScopeNamed(datasphere.DefaultScopeName); !ok {
 		t.Error("the keyring deploy minted has no application scope")
+	}
+}
+
+// Upgrading the keyholder strands every application deployed before it: they
+// hold no leaf and the new keyholder admits nothing without one. The failure
+// the SDK reports looks like an outage, so the deploy has to say what it is.
+func TestStorageDeploySaysToRedeployApplications(t *testing.T) {
+	var buf bytes.Buffer
+	if err := (deployResult{Instance: "prod", Replicas: 2, Image: "img"}).Human(&buf); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"storage identity", "farcast run"} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("deploy output does not mention %q:\n%s", want, buf.String())
+		}
 	}
 }

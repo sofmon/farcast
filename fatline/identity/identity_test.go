@@ -156,3 +156,53 @@ func TestIssueKeyholderServerRefusesBadInput(t *testing.T) {
 		t.Error("accepted a malformed CA certificate")
 	}
 }
+
+// Application and device identities (ADR 0018). The keyholder parses these by
+// shape — it cannot import this package — so the shapes are pinned here and
+// mirrored in datasphere/keyholder's own table.
+func TestDataPathURIs(t *testing.T) {
+	if got := AppURI("prod", "shop", "api"); got != "farcast://prod/app/shop/api" {
+		t.Errorf("AppURI = %q", got)
+	}
+	if got := DeviceURI("prod", "tablet"); got != "farcast://prod/device/tablet" {
+		t.Errorf("DeviceURI = %q", got)
+	}
+}
+
+func TestIssueAppClientChainsToCAWithItsOwnURI(t *testing.T) {
+	m, err := Mint("prod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM, keyPEM, err := IssueAppClient(m.CACertPEM, m.CAKeyPEM, "prod", "shop", "api")
+	if err != nil {
+		t.Fatalf("IssueAppClient: %v", err)
+	}
+	if _, err := tls.X509KeyPair(certPEM, keyPEM); err != nil {
+		t.Fatalf("the issued leaf and key do not pair: %v", err)
+	}
+	block, _ := pem.Decode(certPEM)
+	leaf, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := x509.NewCertPool()
+	roots.AppendCertsFromPEM(m.CACertPEM)
+	if _, err := leaf.Verify(x509.VerifyOptions{Roots: roots, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}); err != nil {
+		t.Errorf("the application leaf does not chain to the instance CA as a client: %v", err)
+	}
+	found := false
+	for _, u := range leaf.URIs {
+		if u.String() == "farcast://prod/app/shop/api" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("leaf URIs = %v, want the application's own", leaf.URIs)
+	}
+	for _, bad := range [][3]string{{"", "shop", "api"}, {"prod", "", "api"}, {"prod", "shop", ""}} {
+		if _, _, err := IssueAppClient(m.CACertPEM, m.CAKeyPEM, bad[0], bad[1], bad[2]); err == nil {
+			t.Errorf("IssueAppClient(%q, %q, %q) succeeded with a blank", bad[0], bad[1], bad[2])
+		}
+	}
+}

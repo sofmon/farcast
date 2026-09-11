@@ -767,6 +767,10 @@ A value on the command line is visible to every process on the machine while the
 
 `set` refuses an empty value (use `rm`), refuses to replace an existing secret without `--force`, and caps a secret at 64 KiB — something larger is a file, and files belong in `storage cp` where they stream.
 
+### Applications deployed before ADR 0018 need `farcast run` again
+
+Since [ADR 0018](../../docs/adr/0018-thin-device-storage.md) decision 1 the keyholder's data path admits only callers that present a leaf from the instance CA. `farcast run` mints one per application and delivers it beside the egress credential; the SDK presents it. An application deployed **before** its instance's keyholder was upgraded holds no leaf and is refused the moment the new keyholder starts — reported by the SDK as `ErrStorageUnavailable`, not as a seal. `farcast storage deploy` says so when it upgrades, and `farcast run` again is the remedy. There is deliberately no mode in which the keyholder waits for stragglers: that would be the fail-open the decision forbids.
+
 ### The one thing that would fail silently
 
 The operator writes a key that an application reads, and the two are computed in different packages: the CLI from the keyring, the application from the `FARCAST_SECRETS_PREFIX` Planck rendered from the recorded scope prefix. A divergence would not fail loudly — it would store a secret nothing ever fetches.

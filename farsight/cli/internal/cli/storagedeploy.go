@@ -269,6 +269,14 @@ func (r deployResult) Human(w io.Writer) error {
 	fprintf(w, "\nEvery replica is SEALED and will not become ready until you unseal it.\n")
 	fprintf(w, "Run: farcast storage unseal %s\n", r.Instance)
 
+	// The keyholder admits only callers that present a leaf (ADR 0018
+	// decision 1), and a leaf is issued at 'farcast run'. An application
+	// deployed before this keyholder holds none and is refused the moment
+	// the new one starts — as ErrStorageUnavailable, which looks like an
+	// outage to whoever did not read this line.
+	fprintf(w, "\nApplications deployed before this keyholder hold no storage identity and will be\n")
+	fprintf(w, "refused by it. Run 'farcast run' again for each of them to issue one.\n")
+
 	// The grant itself was printed BEFORE the deploy — see writeBucketGrant.
 	// All that belongs here is the reminder that it has to be in place before
 	// the unseal above will work.

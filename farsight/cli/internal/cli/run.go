@@ -329,6 +329,23 @@ func (c *runCommand) translate(env *Env, meta *config.InstanceMetadata, namespac
 		cfg.StorageScope = meta.Keyholder.Scope
 		cfg.StorageCAPEM = mtls.CACertPEM
 		cfg.StorageServerName = identity.KeyholderServerName(meta.Name)
+		// Every application gets its own leaf for the keyholder's data path
+		// (ADR 0018 decision 1), minted here because this is the machine that
+		// holds the CA key. A machine without it cannot deploy an application
+		// that uses storage, and says so rather than deploying one that
+		// reaches nothing.
+		if len(mtls.CAKeyPEM) == 0 {
+			return nil, fmt.Errorf("this machine holds no CA key for %q, so it cannot give applications a storage identity; "+
+				"deploy from the machine that installed the instance", meta.Name)
+		}
+		cfg.Identities = make(map[string]translate.AppIdentity, len(m.Apps))
+		for _, app := range m.Apps {
+			certPEM, keyPEM, err := identity.IssueAppClient(mtls.CACertPEM, mtls.CAKeyPEM, meta.Name, namespace, app.Name)
+			if err != nil {
+				return nil, fmt.Errorf("issue a storage identity for %s: %w", app.Name, err)
+			}
+			cfg.Identities[app.Name] = translate.AppIdentity{CertPEM: certPEM, KeyPEM: keyPEM}
+		}
 		if prefix := meta.Keyholder.ScopePrefix; prefix != "" {
 			// The secrets root is built here because this is the one place
 			// that holds both halves: the recorded scope prefix, and (through

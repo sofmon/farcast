@@ -588,6 +588,43 @@ func TestStorageIsWiredWhenTheInstanceHasAKeyholder(t *testing.T) {
 			t.Errorf("storage is not wired into the translated workloads: no %s", want)
 		}
 	}
+	// Each application is also given its identity on the data path, minted
+	// from this machine's CA key (ADR 0018 decision 1).
+	for _, want := range []string{"FARCAST_STORAGE_CLIENT_CERT", "FARCAST_STORAGE_CLIENT_KEY", "BEGIN PRIVATE KEY"} {
+		if !strings.Contains(workloads, want) {
+			t.Errorf("no storage identity reached the workloads: no %s", want)
+		}
+	}
+}
+
+// A machine without the CA key cannot mint an application's storage identity,
+// and must say so rather than deploy an application that reaches nothing.
+func TestRunRefusesStorageWithoutTheCAKey(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	meta := runnableInstance(t, dir, "p43")
+	meta.Keyholder = &config.Keyholder{Deployed: true, Scope: "apps", ScopePrefix: "app/"}
+	if err := dir.SaveInstanceMetadata("p43", meta); err != nil {
+		t.Fatal(err)
+	}
+	mtls, err := dir.LoadInstanceMTLS("p43")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mtls.CAKeyPEM = nil
+	if err := dir.SaveInstanceMTLS("p43", mtls); err != nil {
+		t.Fatal(err)
+	}
+	env, _ := testEnv(dir, output.ModeHuman)
+	f := newFakeRun(twoAppManifest)
+	err = runCmd(f).Run(context.Background(), env, []string{"p43", "github.com/example/my-platform"})
+	if err == nil || !strings.Contains(err.Error(), "CA key") {
+		t.Fatalf("err = %v, want a refusal naming the missing CA key", err)
+	}
+	for name := range appliedKinds(t, f) {
+		if strings.HasPrefix(name, "Deployment/") {
+			t.Errorf("%s was deployed without a storage identity", name)
+		}
+	}
 }
 
 func TestWithoutAKeyholderNoStorageIsWired(t *testing.T) {

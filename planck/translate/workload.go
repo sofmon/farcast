@@ -49,6 +49,22 @@ metadata:
 # is reminted on every deploy.
 stringData:
   FARCAST_FATLINE_PROXY: {{.ProxyURL}}
+{{- if $.HasStorage}}
+  # This application's identity on the keyholder's data path (ADR 0018
+  # decision 1): the leaf that names it farcast://<instance>/app/<ns>/<name>,
+  # and the key that proves it. The keyholder derives what this application
+  # may reach from the name — its scope, and its own secrets and nobody
+  # else's — and admits nothing it cannot identify.
+  #
+  # Same class as the credential above (ADR 0013 decision 8): scoped,
+  # rotated on every deploy, and worth exactly one application's storage to
+  # whoever reads it — which a cloud that can read the keyholder's memory
+  # already has. It binds neighbours, tenants and thieves, not the provider.
+  FARCAST_STORAGE_CLIENT_CERT: |
+{{.ClientCert}}
+  FARCAST_STORAGE_CLIENT_KEY: |
+{{.ClientKey}}
+{{- end}}
 ---
 apiVersion: v1
 kind: ConfigMap
