@@ -142,18 +142,135 @@ The message is wrong in the direction that costs something. It sends an operator
 
 ---
 
-## Re-walk after ADR 0018 decision 1 — not yet walked
+## Re-walk after ADR 0018 decisions 1 and 5 — walked 2026-10-06
 
-Identity on the keyholder's data path changes three of the answers above, and each is a claim about a live cluster rather than a unit test.
+**Walked against instance `p54` on GKE Autopilot in `us-central1`, released the same day.** About three hours of billing against a ~$77.17/month floor — roughly **$0.30**, unreconciled against an invoice. Teardown verified independently against the cloud APIs rather than from local state: clusters, buckets, registries, forwarding rules, addresses, target pools, disks and VM instances all zero.
 
-- **#4 changes shape.** From inside `alpha`'s pod, a `GET` of `alpha`'s own secret succeeds with the leaf the platform mounted; the same `GET` of `beta`'s secret returns `403 permission`; and a `curl` with `--cacert` but **no client certificate** fails the TLS handshake outright — no HTTP status at all. That last one is the listener refusing, and it is the property the whole decision rests on.
-- **#5 inverts entirely.** `alpha` reading `beta`'s secret — the demonstration ADR 0017 asked for — now **fails**, and so does `alpha` reading `beta`'s *ordinary* objects: decision 5 gave each application its own scope, so `beta`'s key space is not addressable with `alpha`'s leaf and not openable with `alpha`'s keys. The fixture's `neighbour's secret` line should report `refused`. Confirm both, because "secrets are separated" and "everything is separated" are different claims and only the second is now true.
-- **Scopes are minted at deploy, and handed over there.** `farcast run` mints `app/<ns>/<app>/` per application, says so with the key-loss warning, and gives the new scopes to a keyholder that is **already serving** — before the workloads exist, so the application does not start into a keyholder that has never heard of it. Expect `The keyholder now holds …` and a ledger entry per replica.
-- **A sealed keyholder is left sealed.** Seal the instance, then deploy a new application: `run` must report that the scopes are waiting, name `farcast storage unseal`, deploy the workloads anyway, and write **no** ledger entry. Pushing a bundle to a sealed keyholder *is* an unseal, and a deploy performing one as a side effect would hide a seal nobody has seen — so walk this deliberately, including with an `--hold` seal, where a deploy that unsealed would be clearing an operator's own decision.
-- **An instance with no applications unseals.** Deploy a keyholder and unseal before deploying anything: it must report an empty bundle and become ready, rather than refusing.
-- **Deploy order.** Upgrade the keyholder with `storage deploy` while an application from *before* the upgrade is running: it must report `ErrStorageUnavailable` naming the missing leaf, and `farcast run` again must restore it without any change to the application.
+**Four of the five criteria passed. The fifth was not reachable** from a fresh install, and is recorded as unwalked rather than inferred from the other four.
 
-Criteria 11–15: an unidentified client is refused at the handshake; an application's own objects are served and every one of a neighbour's is refused with `permission`; a pre-upgrade application is refused with a message that names the leaf and recovers on redeploy; `run` mints a scope per application and hands it to a serving keyholder, while leaving a sealed one sealed; an instance with no applications unseals and becomes ready.
+Both toolchain images were re-checked before the walk and still resolved — which means [ADR 0011](../adr/0011-build-toolchain-mirroring.md) risk 4, the *fetcher* being re-tiered the way the builder was, has not happened. The mirrored digests were verified against the upstream `linux/amd64` manifests and matched exactly, so the instance's registry holds images identical to upstream and the command's claim that *"nothing here has to be believed"* is itself checked.
+
+### 11. An unidentified client is refused at the handshake — ✅
+
+From inside `alpha`'s pod, with the CA and server name the platform gave it, and no client certificate:
+
+```
+curl: (56) OpenSSL SSL_read: error:0A00045C:SSL routines::tlsv13 alert certificate required
+http_code=000
+```
+
+**`http_code=000` — no HTTP status at all**, and the server's own alert names the reason. The *listener* refused. A 403 would have meant the listener accepted the connection and the handler refused, which is a strictly weaker property and the one a mutation had to expose in the unit suite because the test could not tell them apart.
+
+### 12. Own objects served, every neighbour object refused — ✅
+
+With the leaf Planck mounted (it arrives in the application's Secret, not its ConfigMap, which is right for a private key):
+
+| Request, as `alpha` | Result |
+|---|---|
+| GET own secret | 200 |
+| PUT own ordinary object | 204 |
+| GET own ordinary object | 200 |
+| PUT under own `secrets/` | 403 `permission` |
+| DELETE own secret | 403 `permission` |
+| GET `beta`'s secret, with `alpha`'s scope | 403 `permission` |
+| GET `beta`'s secret, **claiming `beta`'s scope** | 403 `permission` |
+| GET `beta`'s **ordinary** object, claiming `beta`'s scope | 403 `permission` |
+
+The last two matter most: a compromised `alpha` explicitly asserting `beta`'s scope name is still refused, because identity is checked before the key is decoded. And ordinary objects are refused exactly as secrets are — so **"everything is separated"**, not merely "secrets are separated". This inverts [the original criterion 5](#5-can-one-application-read-its-neighbours-secret), where the neighbour read succeeded and the runbook said that was the point.
+
+Confirmed in the key material too: `keys.yaml` gives each application its own **name key and its own KEK**. A neighbour can neither compute the stored name nor open the object — refused twice over.
+
+### 13. A pre-upgrade application — ⏸ not reachable, not walked
+
+This asks for an application deployed *before* decision 1 existed, then a keyholder upgraded underneath it. On a fresh install with today's binary every application gets a client leaf, so the state cannot occur. Walking it honestly needs a CLI built at `36db52e` deploying first, then today's binary upgrading the keyholder.
+
+`storage deploy` does print the error path preemptively — *"Applications deployed before this keyholder hold no storage identity and will be refused by it. Run 'farcast run' again for each of them"* — so the CLI knows the condition and names the fix. That is not the same as watching it happen, and this criterion stays open.
+
+### 14. `run` mints a scope per application, hands it over, and leaves a sealed keyholder sealed — ✅
+
+**14a, hand-over.** `run` minted `app/sdk-demo/alpha/` and `app/sdk-demo/beta/` with the key-loss warning, then — the keyholder already serving — reported `The keyholder now holds alpha, beta's scope (generation 2)` and wrote **one ledger entry per replica, each with a distinct boot label**. The hand-over happened before the workloads existed.
+
+**14b, sealed.** With the instance sealed, deploying a new namespace minted new scopes, reported them **waiting**, named `farcast storage unseal`, deployed the workloads anyway, and wrote **no ledger entry** — byte-for-byte identical ledger before and after. Repeated against a deliberate `--hold`: same result, hold still in force with its reason intact. A deploy did not clear an operator's decision.
+
+The scopes minted while sealed were not stranded: the next unseal came back holding them.
+
+### 15. An instance with no applications unseals — ✅
+
+Run before anything was deployed, the only moment it is reachable:
+
+```
+replica 0  unsealed   generation 1
+replica 1  unsealed   generation 1
+2 of 2 replicas are unsealed at generation 1, holding no application scopes:
+this instance has no applications yet.
+```
+
+An empty bundle, and the replicas became ready rather than refusing. Confirmed three ways — the unseal output, both pods going 1/1, and `storage key list` showing a keyring with no application scopes.
+
+Waiting for the bucket IAM grant to propagate before unsealing got this at **generation 1 on a single attempt**, where [the first 5.3 walk](#3-smaller-things-recorded-rather-than-fixed) burned a generation on a premature attempt. The 403 crash-loop reproduced exactly as the 3.2 runbook warns; it is the normal path, not a flake.
+
+### Regressions re-checked in passing
+
+Both defects the first walk found are still fixed: applications logged `instance=p54 app=alpha` and `app=beta` and were distinguishable, and `secret set` says *"picks it up on its next read … no restart needed"*. Rotation without restart was observed directly — `state=not-found` at 14:09:20, `state=present bytes=16` at 14:09:50, pod restart count 0 throughout.
+
+## What the re-walk found
+
+Seven defects, none of them findable by a unit test. **Two were fixed and re-verified on `p54` before teardown**; five are recorded and deliberately not patched against a billing clock.
+
+### 1. `storage unseal` wrote ledger entries with no boot label — fixed, re-verified
+
+`run` and `keeper` both set `Boot` on the entries they write; the operator-unseal path did not, though the state it had just read carried one. Visible directly in `p54`'s ledger: the criterion-15 entries had no `boot`, the criterion-14a entries did.
+
+The boot label is the whole audit primitive — one reseed per distinct boot is a cluster restarting, two into one boot is a live process being handed material it already held. An entry with no boot cannot be placed against a process, and **operator unseal is the most common way material reaches a keyholder**. It is one line, and it quietly weakened the detector that criterion 6 of [the 5.4 runbook](phase-5-4-validation.md) exists to test.
+
+**Fixed and re-verified live:** new operator-unseal entries carry distinct boots where the pre-fix ones read `MISSING`.
+
+### 2. `storage key list` showed a third of the keyring — fixed, re-verified
+
+It read only master-level `NameKeys()` and `KEKs()`. `p54`'s keyring held **14 key ids** — two master, plus a name key and a KEK for each of six application scopes — and the command printed two.
+
+A decision-5 regression: with one shared scope the master keys were nearly the whole story; with a scope per application they are a small minority, and the per-scope **name** keys are the unrotatable ones. An operator deciding whether a rotation covered everything was looking at a fraction of the keyring.
+
+**Fixed and re-verified live:** all six scopes now listed with their prefixes and key ids.
+
+### 3. A hold issued while a replica is down leaves the instance serving
+
+Delete `datasphered-0`, then immediately `storage seal --hold`. The command reports `replica 0 NOT SEALED — 502 Bad Gateway` and holds replica 1. Replica 0 returns `restart-sealed`, carrying no hold; the keeper re-seeds it; the instance reports **"Storage is serving."**
+
+So an operator who deliberately held the instance ends up with storage up, through ordinary restart timing rather than an attack. Nothing is hidden — the unreachable replica is named, and `seal --hold` already warns a hold lives only until the pod restarts. What is missing is follow-through: the command reads as instance-level, reports per-replica, and nothing flags that the instance as a whole is **not** held. No non-zero exit, no "re-run when all replicas are reachable".
+
+### 4. `storage key rekey <instance>` is rejected as "a local path"
+
+Its own usage says `rekey <instance>[:<prefix>]`, prefix optional. `parseLocator` treats an operand with no colon as a local path, so the documented bare form never reaches the instance branch — while `storage ls <instance>` accepts it. The error tells an operator who typed an instance name that they typed a path. Workaround: a trailing colon.
+
+### 5. `storage key rekey` cannot retire what a keeper device holds
+
+**The most serious finding of this walk.** `keeper revoke` tells the operator, verbatim: *"If the device was lost, retire what it HOLDS: `farcast storage rekey p54`. Rekey changes the scope keys, so that device's bundle opens nothing written afterwards."*
+
+Measured on `p54`, four objects stored, all under per-application scopes:
+
+```
+storage key rekey p54: -y                      -> rewritten: 0, already active: 0
+storage key rekey p54:app/sdk-demo/alpha/ -y   -> rewritten: 0
+every key id in keys.yaml, master and scope    -> UNCHANGED
+storage ls p54:                                -> all 4 objects still readable
+```
+
+While walking the key space it emits, once per object, `datasphere: recover name of stored object …: this keyring did not write that object`. Rekey operates at master level only; every object lives under a scope whose name key it cannot use and whose KEK it does not rotate. A revoked device's bundle holds exactly those keys.
+
+**Revoke-plus-rekey currently binds nothing.** The per-object warnings do reach stderr and the result honestly says `rewritten: 0`, so nothing is concealed — but it ends with a green `✓ rekeyed`, never says the scope keys were untouched, and `keeper revoke` makes a promise this command does not keep. Same blind spot as finding 2, with a security consequence instead of a display one.
+
+### 6. `release` reports a cluster "(deleted)" while the delete is still running
+
+`release` printed `cluster: farcast-p54 (deleted)` and removed the local state. The GKE API reported `STOPPING` with `DELETE_CLUSTER` **RUNNING**; the cluster actually disappeared **200 seconds later**.
+
+It completed, so nothing was stranded. But on the one command whose purpose is to stop billing, "deleted" and "deletion started" are different claims — and the local record is gone either way, so a failed delete would leave a billing cluster, no local trace, and a transcript saying it was deleted. Independent verification after `release` has to stay mandatory, which is why criterion 10 is written the way it is.
+
+### 7. Releasing an instance leaves that machine's keeper state behind
+
+After `release`, `instances/p54` was gone and `keepers/p54` remained — bundle, CA, leaf, key and ledger for an instance that no longer exists. Defensible by design: a keeper is a role, usually on a different machine, and the ledger is deliberately kept. But on a machine holding both, `release` knows the directory is there and says nothing.
+
+---
 
 ## Criteria
 
@@ -170,4 +287,16 @@ Criteria 11–15: an unidentified client is refused at the handshake; an applica
 | 9 | `--force` rotates, `rm` removes, and the application sees both | ✅ (rotation seen with no restart) |
 | 10 | Teardown leaves no billable resource — verified independently, not from local state | ✅ |
 
-Both defects the walk found were fixed **and re-verified on the same live instance** before teardown, which is what [the 5.2 walk](phase-5-2-validation.md) could not do.
+Criterion 5 was **inverted on purpose** by [ADR 0018](../adr/0018-thin-device-storage.md) decision 5 and is superseded by criterion 12 below. It is left in place rather than rewritten, because the 2026-09-10 walk recorded it passing and a reader comparing the two records needs to see that the behaviour changed under them.
+
+### Re-walk criteria, 2026-10-06
+
+| # | Criterion | Result |
+|---|---|---|
+| 11 | An unidentified client is refused at the **handshake**, with no HTTP status | ✅ `tlsv13 alert certificate required`, `http_code=000` |
+| 12 | An application's own objects are served and **every** neighbour object — secret or ordinary — is refused with `permission` | ✅ including a claim of the neighbour's own scope name |
+| 13 | A pre-upgrade application is refused with a message naming the leaf, and recovers on redeploy | ⏸ **not reachable** from a fresh install; needs a CLI built at `36db52e` |
+| 14 | `run` mints a scope per application and hands it to a serving keyholder, while leaving a sealed **and** a held one sealed | ✅ ledger byte-identical across both sealed deploys |
+| 15 | An instance with no applications unseals and becomes ready | ✅ generation 1, single attempt |
+
+Both defects the first walk found were fixed **and re-verified on the same live instance** before teardown, which is what [the 5.2 walk](phase-5-2-validation.md) could not do. The re-walk held to the same standard: of the [seven defects it found](#what-the-re-walk-found), the two cheapest were fixed and re-verified on `p54` before it was released.

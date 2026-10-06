@@ -105,6 +105,21 @@ func (*keyListCommand) Run(_ context.Context, env *Env, args []string) error {
 	for i, e := range keyring.KEKs() {
 		result.Keys = append(result.Keys, keyInfo{ID: e.ID.String(), Created: stamp(e.Created), Active: i == 0})
 	}
+	// Every scope's keys too. Since ADR 0018 decision 5 each application has
+	// its own scope, so the master keys are a small minority of what the
+	// keyring holds — and a scope's NAME key is one of the unrotatable ones.
+	// An operator deciding whether a rotation covered everything has to be
+	// able to see them.
+	for _, s := range keyring.Scopes() {
+		sk := scopeKeys{Name: s.Name, Prefix: s.Prefix, Created: stamp(s.Created)}
+		for i, e := range s.Keyring().NameKeys() {
+			sk.NameKeys = append(sk.NameKeys, keyInfo{ID: e.ID.String(), Created: stamp(e.Created), Active: i == 0})
+		}
+		for i, e := range s.Keyring().KEKs() {
+			sk.Keys = append(sk.Keys, keyInfo{ID: e.ID.String(), Created: stamp(e.Created), Active: i == 0})
+		}
+		result.Scopes = append(result.Scopes, sk)
+	}
 	return env.Printer.Print(result)
 }
 
@@ -114,26 +129,43 @@ type keyInfo struct {
 	Active  bool   `json:"active"`
 }
 
-type keyListResult struct {
-	Instance string    `json:"instance"`
+// scopeKeys is one scope's key ids. A scope owns a subtree of the key space
+// and has its own name key and KEK, so it is a separate listing rather than
+// more rows under the instance's own.
+type scopeKeys struct {
+	Name     string    `json:"name"`
+	Prefix   string    `json:"prefix"`
+	Created  string    `json:"created,omitempty"`
 	NameKeys []keyInfo `json:"name_keys"`
 	Keys     []keyInfo `json:"keys"`
 }
 
+type keyListResult struct {
+	Instance string      `json:"instance"`
+	NameKeys []keyInfo   `json:"name_keys"`
+	Keys     []keyInfo   `json:"keys"`
+	Scopes   []scopeKeys `json:"scopes,omitempty"`
+}
+
 func (r keyListResult) Human(w io.Writer) error {
 	fprintf(w, "keyring for %q\n", r.Instance)
-	show := func(label string, keys []keyInfo) {
-		fprintf(w, "  %s\n", label)
+	show := func(indent, label string, keys []keyInfo) {
+		fprintf(w, "%s%s\n", indent, label)
 		for _, k := range keys {
 			marker := " "
 			if k.Active {
 				marker = "*"
 			}
-			fprintf(w, "   %s %s  %s\n", marker, k.ID, k.Created)
+			fprintf(w, "%s %s %s  %s\n", indent, marker, k.ID, k.Created)
 		}
 	}
-	show("name keys (stable — addressing cannot rotate)", r.NameKeys)
-	show("key-encryption keys (* = wraps new writes)", r.Keys)
+	show("  ", "name keys (stable — addressing cannot rotate)", r.NameKeys)
+	show("  ", "key-encryption keys (* = wraps new writes)", r.Keys)
+	for _, s := range r.Scopes {
+		fprintf(w, "  scope %s  (%s)\n", s.Name, s.Prefix)
+		show("    ", "name keys (stable — addressing cannot rotate)", s.NameKeys)
+		show("    ", "key-encryption keys (* = wraps new writes)", s.Keys)
+	}
 	return nil
 }
 

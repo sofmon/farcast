@@ -1,8 +1,12 @@
 # Phase 5.4 — Live Validation
 
-**Status: written, not yet walked.**
+**Status: walked 2026-10-06, from the operator's machine only.** Seven of ten criteria passed; three genuinely need a second machine and are recorded as unwalked.
 
-Phase 5.4 is the first time FarCast lets something other than a person hand a cluster its key material. Everything about it was designed from what could go wrong, and the unit suite proves each refusal bites under mutation — 18 mutations, every one caught, three of which exposed a test that was passing for the wrong reason. None of that is the same as watching a device re-seed a real keyholder that a real node upgrade sealed.
+The walk shared instance `p54` with [the 5.3 re-walk](phase-5-3-validation.md), which is where the full record and all seven defects live — 5.4 criterion 3 needs an application recovering from `ErrStorageSealed`, so the applications had to be deployed anyway, and deploying them is most of the 5.3 re-walk. One cluster, both phases, about three hours and roughly $0.30.
+
+**The keeper was installed on the operator's own machine, by decision.** That proves the mechanics and says nothing about the property — the bundle sat beside the keyring it is supposed to be independent of. Criterion 2 is therefore open, not passed, and criteria 8 and 9 with it.
+
+Phase 5.4 is the first time FarCast lets something other than a person hand a cluster its key material. Everything about it was designed from what could go wrong, and the unit suite proves each refusal bites under mutation — 18 mutations, every one caught, three of which exposed a test that was passing for the wrong reason. None of that was the same as watching a device re-seed a real keyholder that a real restart sealed — which the 2026-10-06 walk did, and which is also where it found that the documented remedy for a lost device rotates nothing.
 
 Designed by [ADR 0008](../adr/0008-in-cluster-key-delivery.md)'s keeper fleet, on the unseal protocol 3.2 shaped for exactly this.
 
@@ -12,7 +16,7 @@ Designed by [ADR 0008](../adr/0008-in-cluster-key-delivery.md)'s keeper fleet, o
 
 An instance installed, connected, keyholder deployed and unsealed at least once — the state [the 3.2 runbook](phase-3-2-validation.md) leaves behind. FatLine's PDB and second replica matter here rather than being a nicety: [ADR 0008](../adr/0008-in-cluster-key-delivery.md) makes them a **prerequisite** of the fleet, because no keeper re-seeds through a drained tunnel.
 
-A second machine is genuinely needed for the parts that matter. A keeper installed on the operator's own laptop proves the mechanics and proves nothing about the property — the whole point is a device that holds a bundle and does not hold the keyring.
+A second machine is genuinely needed for the parts that matter. A keeper installed on the operator's own laptop proves the mechanics and proves nothing about the property — the whole point is a device that holds a bundle and does not hold the keyring. The 2026-10-06 walk did exactly that, deliberately, and the three criteria it could not answer are the measure of what the shortcut costs.
 
 ---
 
@@ -105,13 +109,27 @@ Two keepers double the bundles at rest and double the solicitation endpoints. Co
 
 ## Criteria
 
-1. An enrolment packet carries a bundle and a device leaf, and neither the keyring nor the CA key.
-2. A machine with no FarCast state becomes a keeper from the packet alone.
-3. A restart-sealed replica is re-seeded unattended, and an application recovers without restarting.
-4. An operator hold is refused by the device **and** by the keyholder independently.
-5. An exhausted budget refuses, legibly, and leaves storage sealed.
-6. `keeper status` reports a clean fleet as clean, and flags a process re-seeded twice.
-7. `revoke` states its limits, and a revoked device demonstrably still works until rekey.
-8. A rebooted keeper resumes with its ledger, budget and file modes intact.
-9. Two devices are visible as a fleet, with expiries, and their budgets read as a total.
-10. Teardown leaves no billable resource — verified independently, not from local state.
+| # | Criterion | Result |
+|---|---|---|
+| 1 | An enrolment packet carries a bundle and a device leaf, and neither the keyring nor the CA key | ✅ master key ids absent from the bundle; leaf `farcast://p54/keeper/study-vm`, clientAuth only |
+| 2 | A machine with no FarCast state becomes a keeper from the packet alone | ⏸ **not walked** — installed on the operator's machine, which holds the keyring |
+| 3 | A restart-sealed replica is re-seeded unattended, and an application recovers without restarting | ✅ `re-seeded … (process bbf993a8)`; `alpha` kept reading at restart count 0 |
+| 4 | An operator hold is refused by the device **and** by the keyholder independently | ✅ device declined by name and spent no budget; a hand-made push with a valid leaf was refused by the keyholder |
+| 5 | An exhausted budget refuses, legibly, and leaves storage sealed | ✅ `budget-exhausted — 2 of 2 in the last 30 days, none expires before 2026-11-05`; replica stayed sealed |
+| 6 | `keeper status` reports a clean fleet as clean, and flags a process re-seeded twice | ✅ both states seen — `nothing to explain`, then `1 PROCESS(ES) RE-SEEDED MORE THAN ONCE: process 4b94f94a re-seeded 2 times` |
+| 7 | `revoke` states its limits, and a revoked device demonstrably still works until rekey | ⚠️ first half ✅; the **rekey half failed** — see below |
+| 8 | A rebooted keeper resumes with its ledger, budget and file modes intact | ⏸ **partly** — modes confirmed 0600 inside 0700; the reboot was not performed and the backup exclusion has no Linux equivalent to check |
+| 9 | Two devices are visible as a fleet, with expiries, and their budgets read as a total | ⏸ **not walked** — needs a second device |
+| 10 | Teardown leaves no billable resource — verified independently, not from local state | ✅ all eight resource classes zero against the cloud APIs |
+
+### Criterion 7 is the one that failed
+
+Both documented halves behaved: `revoke` said plainly that it *"did not reach the cluster, and it did not invalidate the device's certificate"*, named `storage rekey`, and warned that rekey *"does not reach backwards"*. A device revoked seconds earlier then re-seeded a live replica, exactly as the ADR says it would.
+
+The remedy is what failed. `storage key rekey` rotated **no key at all** and re-encrypted **0 of 4 objects**, because every object lives under a per-application scope it cannot address. The bundle a lost device holds is untouched by the command an operator is told to run. Full measurements in [the 5.3 re-walk's finding 5](phase-5-3-validation.md#5-storage-key-rekey-cannot-retire-what-a-keeper-device-holds).
+
+Until that is fixed, **revocation has no teeth**: the only bound on a lost keeper is its certificate's own 90-day expiry.
+
+### What a second machine still owes
+
+Criteria 2, 8 and 9. On Linux, `keeper install` refuses without `--accept-backup-risk` — there is no single backup pipeline it can verifiably exclude from, so it will not promise what nobody checked. Walking that refusal, and then the no-cloud-credential inventory on a device that holds nothing else, is what criterion 2 actually asks for. The macOS exclusion path was confirmed here (`backup excluded, and the exclusion was read back`), so the remaining gap is the device property, not the mechanism.

@@ -372,6 +372,12 @@ func (c *storageUnsealCommand) Run(ctx context.Context, env *Env, args []string)
 			states = append(states, replicaState{Ordinal: i, Error: pushErr.Error()})
 		} else {
 			entry.Phase = st.Phase
+			// The process this push landed in. Without it an operator unseal
+			// is the one way material reaches a keyholder that the audit
+			// cannot place against a boot — and 'keeper status' counts
+			// reseeds per DISTINCT process, so an entry with no boot is
+			// invisible to exactly the reconstruction an incident needs.
+			entry.Boot = st.Boot
 			loaded++
 			states = append(states, replicaState{Ordinal: i, Phase: st.Phase, Generation: st.Generation, Scopes: st.Scopes})
 		}
