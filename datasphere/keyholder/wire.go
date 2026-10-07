@@ -34,6 +34,8 @@ const (
 	CodeGenerationOld    = "generation-too-old"
 	CodeInstanceMismatch = "instance-mismatch"
 	CodeBadRequest       = "bad-request"
+	CodeNotServing       = "not-serving"
+	CodeAlreadyServing   = "already-serving"
 )
 
 // errorResponse is the body every failure carries.
@@ -82,6 +84,10 @@ func classify(err error) (status int, code string) {
 		return http.StatusConflict, CodeGenerationOld
 	case errors.Is(err, ErrInstanceMismatch):
 		return http.StatusConflict, CodeInstanceMismatch
+	case errors.Is(err, ErrNotServing):
+		return http.StatusConflict, CodeNotServing
+	case errors.Is(err, ErrAlreadyServing):
+		return http.StatusConflict, CodeAlreadyServing
 	case errors.Is(err, ErrEnvelopeInvalid):
 		// One status and one code for every envelope failure, matching the
 		// single error the opener returns: which check refused is not a

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -671,26 +672,93 @@ func (d Dir) CreateInstanceKeyring(name string, data []byte) error {
 		return fmt.Errorf("create %s: %w", dir, err)
 	}
 	path := d.InstanceKeyringPath(name)
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	unlock, err := lockFile(path + ".lock")
 	if err != nil {
-		return err
+		return fmt.Errorf("lock %s: %w", path, err)
 	}
-	defer func() { _ = file.Close() }()
-	if _, err := file.Write(data); err != nil {
+	defer unlock()
+	// Written whole to a temporary name, then linked into place: a link
+	// never replaces an existing file, and a write that failed half way
+	// leaves no keys.yaml at all rather than a truncated one the next
+	// attempt refuses to overwrite.
+	f, err := os.CreateTemp(dir, ".tmp-keys-")
+	if err != nil {
 		return fmt.Errorf("write %s: %w", path, err)
 	}
-	return nil
+	tmp := f.Name()
+	defer func() { _ = os.Remove(tmp) }()
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	return os.Link(tmp, path)
 }
 
-// SaveInstanceKeyring replaces an instance's keyring. Every caller of this
-// must have merged rather than replaced its contents — see
+// ErrKeyringChanged is a keyring write refused because the file is no longer
+// what the writer read: another command wrote it in between.
+//
+// A keyring written over another loses every key the other held, and some of
+// those keys may exist nowhere else — a scope 'farcast run' minted a moment
+// ago, already handed to the keyholder. So the second writer stops, and the
+// operator runs it again against the file as it now is.
+var ErrKeyringChanged = errors.New("the keyring changed on disk since it was read")
+
+// SaveInstanceKeyring replaces an instance's keyring, provided it still holds
+// exactly expected — the bytes the caller read and built data from. Every
+// caller must have merged rather than replaced what it read — see
 // datasphere.Keyring.Merge — because a keyring written over another loses
 // every key the other held.
-func (d Dir) SaveInstanceKeyring(name string, data []byte) error {
+//
+// The write is atomic. A write that truncated the file and then failed —
+// a full disk, a crash — would leave the most dangerous file in the system
+// unparseable, and with it every key this machine holds.
+//
+// The compare and the replace are one critical section, under a lock every
+// farcast process takes: two writers that both read the same file would
+// otherwise both pass the compare, and the second rename would drop what the
+// first wrote.
+//
+// It refuses a keys.yaml that is a symlink or has another hard link. The
+// replace is a rename of a new file over the name, so the link's other end
+// would keep the old contents and silently stop receiving keys — a backup
+// copy that goes stale without a word.
+func (d Dir) SaveInstanceKeyring(name string, expected, data []byte) error {
 	if err := os.MkdirAll(d.datasphereDir(name), 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(d.InstanceKeyringPath(name), data, 0o600)
+	path := d.InstanceKeyringPath(name)
+	unlock, err := lockFile(path + ".lock")
+	if err != nil {
+		return fmt.Errorf("lock %s: %w", path, err)
+	}
+	defer unlock()
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("read %s before replacing it: %w", path, err)
+	}
+	if !info.Mode().IsRegular() || linkCount(info) > 1 {
+		return fmt.Errorf("%s is a link, not a file of its own: replacing it would leave the link's other end behind, "+
+			"silently missing every key added from now on. Keep the keyring itself at this path, and back the directory up instead", path)
+	}
+	current, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read %s before replacing it: %w", path, err)
+	}
+	if !bytes.Equal(current, expected) {
+		return fmt.Errorf("%w: %s", ErrKeyringChanged, path)
+	}
+	return writeFileAtomic(path, data)
 }
 
 func (d Dir) fatlineDir(name string) string {

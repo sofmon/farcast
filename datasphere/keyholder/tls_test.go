@@ -1,11 +1,13 @@
 package keyholder
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"errors"
 	"math/big"
 	"net"
@@ -214,4 +216,84 @@ func clientTemplate(uri string) *x509.Certificate {
 		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 		URIs: []*url.URL{u},
 	}
+}
+
+// F8, through the listener production uses. The handler-level tests prove the
+// policy; this proves it holds when a genuine keeper leaf, issued by the
+// instance CA and admitted by AllowPusher, asks over real mutual TLS — which
+// is the situation the bypass was found in.
+func TestAKeeperOverRealTLSHasNoOperatorPower(t *testing.T) {
+	h := newHarness(t)
+	ca := newHandshakeCA(t)
+	pool := x509.NewCertPool()
+	pool.AddCert(ca.cert)
+	srv := httptest.NewUnstartedServer(h.control)
+	srv.TLS = ControlTLS(ca.issue(t, serverTemplate()), pool, AllowPusher("prod"))
+	srv.StartTLS()
+	defer srv.Close()
+
+	client := func(uri string) *http.Client {
+		leaf := ca.issue(t, clientTemplate(uri))
+		return &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{
+			RootCAs: pool, MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{leaf}}}}
+	}
+	operator, keeper := client(asOperator), client(asKeeper)
+	post := func(c *http.Client, path, ct string, body []byte) int {
+		t.Helper()
+		req, err := http.NewRequest("POST", srv.URL+path, bytes.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ct != "" {
+			req.Header.Set("Content-Type", ct)
+		}
+		resp, err := c.Do(req)
+		if err != nil {
+			t.Fatalf("POST %s: %v", path, err)
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode
+	}
+	held := func(want string) {
+		t.Helper()
+		st := h.vault.State()
+		if st.Phase != PhaseOperatorHold || st.HoldReason != want {
+			t.Fatalf("phase %s %q, want operator-hold %q", st.Phase, st.HoldReason, want)
+		}
+	}
+
+	h.unseal(t, 1)
+	if code := post(operator, "/v1/seal?hold=true&reason=operator-decision", "", nil); code != http.StatusOK {
+		t.Fatalf("the operator could not place a hold: %d", code)
+	}
+	held("operator-decision")
+
+	if code := post(keeper, "/v1/release-hold", "", nil); code != http.StatusForbidden {
+		t.Errorf("a keeper releasing the hold = %d, want 403", code)
+	}
+	held("operator-decision")
+
+	resp, err := keeper.Get(srv.URL + SealChallengePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ch Challenge
+	err = json.NewDecoder(resp.Body).Decode(&ch)
+	_ = resp.Body.Close()
+	if err != nil {
+		t.Fatalf("a keeper may still fetch a challenge, and decode it: %v", err)
+	}
+	sealed, err := SealBundle(marshalBundle(t, "prod", 2), "prod", ch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code := post(keeper, "/v1/unseal?intent=operator-unseal", ContentTypeSealed, sealed); code != http.StatusForbidden {
+		t.Errorf("a keeper claiming operator-unseal through a hold = %d, want 403", code)
+	}
+	held("operator-decision")
+
+	if code := post(keeper, "/v1/seal?hold=true&reason=keeper-says-so", "", nil); code != http.StatusForbidden {
+		t.Errorf("a keeper placing a hold = %d, want 403", code)
+	}
+	held("operator-decision")
 }

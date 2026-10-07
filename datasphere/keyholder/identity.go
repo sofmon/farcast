@@ -63,10 +63,11 @@ var ErrNotAuthorized = errors.New("keyholder: this identity is not authorized fo
 // ErrNoIdentity reports a data-path request that carried no client leaf.
 //
 // It can only arise when the listener was configured without mutual TLS —
-// DataTLS makes the handshake itself refuse — so it is the guard against a
-// composition root wiring the handler behind the wrong listener, rather than
-// a condition an application should ever see.
-var ErrNoIdentity = errors.New("keyholder: the data path requires a client identity")
+// DataTLS and ControlTLS make the handshake itself refuse — so it is the guard
+// against a composition root wiring a handler behind the wrong listener,
+// rather than a condition an application or a keeper should ever see. Both
+// the data and the control surface raise it, so it names neither.
+var ErrNoIdentity = errors.New("keyholder: this surface requires a client identity")
 
 // ParseIdentity reads a leaf URI for one instance.
 //
@@ -138,6 +139,32 @@ func (id Identity) MayReach(scopeName string) bool {
 		return false
 	}
 }
+
+// MayPush reports whether this identity may push a bundle with an intent.
+//
+// The intent arrives in the request, so it is a claim, and before this check
+// it was the whole of the authorization: a keeper that asked with
+// intent=operator-unseal was treated as a person, and walked through an
+// operator hold. What a caller may claim now follows from the leaf the CA
+// issued it. A keeper re-seeds and nothing else — that role is the entire
+// point of handing an unattended device a leaf at all. The operator may claim
+// any intent, the conservative restart-reseed included.
+func (id Identity) MayPush(intent Intent) bool {
+	switch id.Role {
+	case RoleOperator:
+		return intent == IntentOperator || intent == IntentHandOver || intent == IntentReseed
+	case RoleKeeper:
+		return intent == IntentReseed
+	default:
+		return false
+	}
+}
+
+// MaySeal reports whether this identity may seal, place an operator hold, or
+// release one. Only the operator. An operator hold is a person's decision; a
+// keeper that could release one could clear it, and a keeper that could place
+// one could put a decision in the operator's name.
+func (id Identity) MaySeal() bool { return id.Role == RoleOperator }
 
 // A note on secrets, and why there is no separate check for them.
 //

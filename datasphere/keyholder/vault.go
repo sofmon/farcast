@@ -45,6 +45,9 @@ const (
 
 // Intent is what the pusher claims to be doing. It is carried on the wire from
 // day one so that phase 5.4 adds a keeper driver rather than a new protocol.
+//
+// It is a claim, and the server no longer takes it on trust: which intents a
+// caller may claim follows from the role on its leaf (Identity.MayPush).
 type Intent string
 
 const (
@@ -52,8 +55,22 @@ const (
 	IntentOperator Intent = "operator-unseal"
 	// IntentReseed is an unattended keeper restoring material after a
 	// restart. It may never clear an operator hold — that is the whole
-	// point of the distinction.
+	// point of the distinction — and it only ever reaches a replica that is
+	// sealed: a re-seed into a replica already serving would replace the keys
+	// it serves with whatever the pusher holds, which is exactly what a lost
+	// keeper's old bundle is.
 	IntentReseed Intent = "restart-reseed"
+	// IntentHandOver is the operator's machine giving keys to a replica that
+	// is ALREADY serving: a new application's scope from `farcast run`, or
+	// the rotated KEKs from `farcast storage key rotate`. It never unseals.
+	//
+	// It exists because pushing a bundle to a sealed replica IS an unseal, and
+	// a deploy or a rotation must never perform one as a side effect. The CLI
+	// used to enforce that by reading the state and then pushing with
+	// operator-unseal — two round trips apart, with an intent the vault accepts
+	// even under a hold. A replica that restarted, or was held, in between was
+	// unsealed anyway. Refusing here makes the guarantee the keyholder's.
+	IntentHandOver Intent = "hand-over"
 )
 
 // Errors a caller maps onto the wire and, beyond it, onto SDK sentinels.
@@ -69,6 +86,13 @@ var (
 	ErrGenerationTooOld = errors.New("keyholder: bundle generation is older than the one already held")
 	// ErrInstanceMismatch reports a bundle assembled for another instance.
 	ErrInstanceMismatch = errors.New("keyholder: bundle names a different instance")
+	// ErrNotServing reports a hand-over to a replica that is sealed. A
+	// hand-over adds keys to a serving replica and never unseals one.
+	ErrNotServing = errors.New("keyholder: a hand-over only reaches a replica that is already serving; this one is sealed")
+	// ErrAlreadyServing reports a re-seed aimed at a replica that holds keys.
+	// A re-seed restores a replica that restarted; it never replaces the keys
+	// of one that is serving.
+	ErrAlreadyServing = errors.New("keyholder: a re-seed only reaches a replica that restarted; this one is serving")
 	// ErrOutOfScope reports a logical key outside every scope held.
 	ErrOutOfScope = errors.New("keyholder: key is outside every scope this keyholder holds")
 )
@@ -87,6 +111,24 @@ type State struct {
 	// keeper fleet's ledgers be reconciled against how many times the cluster
 	// actually restarted, and it is disclosed only on the control surface.
 	Boot string
+
+	// Keys lists, per scope held, the IDs of every key-encryption key the
+	// scope holds, the active one — which wraps new writes — first. Disclosed
+	// only on the control surface.
+	//
+	// It is what lets a pusher answer "does this replica hold the keys I
+	// sent" exactly. The generation cannot: it counts pushes, and every
+	// operator unseal advances it whether or not a single key changed. Every
+	// ID and not only the active one, because a rotation reaches a fleet in
+	// two steps — the new key held everywhere, then made active — and the
+	// first step changes nothing a single active ID would show. The rekey gate
+	// reads this before moving any object onto a rotated KEK, and a keeper
+	// reads it to tell that its bundle predates a rotation.
+	//
+	// A key ID is not secret: it sits in plaintext at bytes 5-12 of every
+	// object the cloud stores. It stays off the unauthenticated status surface
+	// regardless, because nothing there needs it.
+	Keys map[string][]string
 }
 
 // Sealed reports whether storage is unavailable in this state.
@@ -168,8 +210,18 @@ func (v *Vault) State() State {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 	names := make([]string, len(v.scopes))
+	var keys map[string][]string
 	for i, s := range v.scopes {
 		names[i] = s.Name
+		keks := s.Keyring().KEKs()
+		ids := make([]string, len(keks))
+		for j, e := range keks {
+			ids[j] = e.ID.String()
+		}
+		if keys == nil {
+			keys = make(map[string][]string, len(v.scopes))
+		}
+		keys[s.Name] = ids
 	}
 	return State{
 		Phase:      v.phase,
@@ -178,6 +230,7 @@ func (v *Vault) State() State {
 		HoldReason: v.holdReason,
 		Scopes:     names,
 		Boot:       v.boot,
+		Keys:       keys,
 	}
 }
 
@@ -208,6 +261,19 @@ func (v *Vault) Unseal(b *datasphere.Bundle, intent Intent) error {
 		// staging needs to see which is which, and neither name is secret.
 		return fmt.Errorf("%w: bundle is for %q, this keyholder serves %q",
 			ErrInstanceMismatch, b.Instance(), v.instance)
+	}
+	// Before the hold check, so a hand-over's refusal always says the same
+	// thing: this replica is not serving, and a hand-over does not change that.
+	if intent == IntentHandOver && v.phase != PhaseUnsealed {
+		return fmt.Errorf("%w (phase %s)", ErrNotServing, v.phase)
+	}
+	// The mirror image. Without it a keeper could push its bundle into a
+	// replica that is serving — at any generation above the one it holds —
+	// and replace that replica's keys wholesale. An honest keeper never
+	// tries: it re-seeds only what it finds sealed. A lost one is not honest,
+	// and its bundle predates every rotation since it was enrolled.
+	if intent == IntentReseed && v.phase == PhaseUnsealed {
+		return fmt.Errorf("%w (generation %d)", ErrAlreadyServing, v.generation)
 	}
 	if v.phase == PhaseOperatorHold && intent != IntentOperator {
 		return fmt.Errorf("%w (held since %s: %s)",
@@ -288,6 +354,21 @@ func (v *Vault) ReleaseHold() State {
 // A sealed vault reports ErrSealed and a key outside every scope reports
 // ErrOutOfScope, and the two are distinct all the way to the application: a
 // seal is temporary and clears, while out-of-scope never will.
+//
+// The scope returned is the CALLER's own copy, and the caller must Zero it
+// when its request ends. It used to be the vault's, sharing key bytes with
+// what the vault holds — so an unseal at a new generation, which zeroes the
+// scopes it replaces, zeroed them under every request still in flight. A
+// write caught between resolving its scope and sealing its body (the whole of
+// its upload) then wrapped its data key under an all-zero KEK that still
+// carried the real key ID: unreadable to its owner, and readable by anyone
+// who tried a key of zeros. That is the object the cloud ends up storing.
+//
+// Copying per request is what makes the vault's zeroing safe to do at all. It
+// has one consequence worth stating: a request already admitted finishes with
+// the material it was admitted with, even across a Seal, and wipes it on the
+// way out. A sealed vault holds no key material; a request it admitted earlier
+// holds its own until it returns.
 func (v *Vault) Scope(logicalKey string) (datasphere.Scope, error) {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
@@ -296,7 +377,7 @@ func (v *Vault) Scope(logicalKey string) (datasphere.Scope, error) {
 	}
 	for _, s := range v.scopes {
 		if s.Owns(logicalKey) {
-			return s, nil
+			return s.Clone(), nil
 		}
 	}
 	return datasphere.Scope{}, ErrOutOfScope

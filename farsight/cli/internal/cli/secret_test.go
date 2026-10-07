@@ -67,9 +67,7 @@ func mintAppScopes(t *testing.T, env *Env, namespace string, apps ...string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := env.ConfigDir.SaveInstanceKeyring("prod", encoded); err != nil {
-		t.Fatal(err)
-	}
+	replaceKeyring(t, env.ConfigDir, "prod", encoded)
 }
 
 func setSecret(t *testing.T, env *Env, args []string, cmd *secretSetCommand) error {

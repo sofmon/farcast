@@ -495,16 +495,40 @@ func keeperCheck(ctx context.Context, env *Env, store *keeper.Store, cfg keeper.
 	if err != nil {
 		return nil, err
 	}
+	return keeperCheckWith(ctx, env, store, cfg, client, bundle)
+}
 
+// keeperCheckWith is everything a keeper decides and does once it can reach
+// the replicas. It is split from the dial so that the decision — above all,
+// the fleet-wide staleness verdict handed to every Decide — runs under test:
+// that wiring is what stops a keeper enrolled before a rotation putting the
+// retired keys back into a replica that restarted, and nothing could reach it
+// while it lived behind a real tunnel.
+func keeperCheckWith(ctx context.Context, env *Env, store *keeper.Store, cfg keeper.Config, client sealStateClient, bundle []byte) ([]keeper.Decision, error) {
 	entries, err := keyholder.ReadLedger(store.LedgerPath())
 	if err != nil {
 		return nil, err
 	}
+	// Every replica first. Whether this device's bundle is out of date is a
+	// question about the whole fleet: a replica that restarted holds nothing
+	// to compare against, and the one that did not is what says the keys moved.
+	states := make([]keyholder.State, keeperReplicas)
+	stErrs := make([]error, keeperReplicas)
+	for i := range keeperReplicas {
+		states[i], stErrs[i] = client.State(ctx, i)
+	}
+	parsed, err := datasphere.ParseBundle(bundle)
+	if err != nil {
+		return nil, fmt.Errorf("this device's bundle could not be read: %w", err)
+	}
+	fleet := keeper.FleetOf(parsed, states, stErrs)
+	parsed.Zero()
+
 	decisions := make([]keeper.Decision, 0, keeperReplicas)
 	for i := range keeperReplicas {
 		budget := keeper.Budget(entries, cfg.Budget, cfg.Window, time.Now().UTC())
-		st, stErr := client.State(ctx, i)
-		d := keeper.Decide(st, stErr, i, cfg.Generation, budget)
+		st, stErr := states[i], stErrs[i]
+		d := keeper.Decide(st, stErr, i, cfg.Generation, budget, fleet)
 		decisions = append(decisions, d)
 		if d.Action != keeper.ActionReseed {
 			keeperReport(env, cfg, d, st)
@@ -516,10 +540,16 @@ func keeperCheck(ctx context.Context, env *Env, store *keeper.Store, cfg keeper.
 			Intent: keeper.IntentReseed, Generation: cfg.Generation,
 			Device: cfg.Device, Boot: st.Boot, Result: "ok",
 		}
-		if pushErr != nil {
+		switch {
+		case keyholder.AlreadyServing(pushErr):
+			// Unsealed between the read and the push — by the operator, or by
+			// another keeper. Nothing to do, and nothing went wrong.
+			entry.Result = "refused"
+			d.Action, d.Reason = keeper.ActionNone, "already serving: another pusher reached it first"
+		case pushErr != nil:
 			entry.Result = "refused"
 			d.Action, d.Reason = keeper.ActionUnknown, pushErr.Error()
-		} else {
+		default:
 			entry.Phase = pushed.Phase
 			// The boot the push actually landed in, which is what the audit
 			// counts. It should equal what State reported a moment ago, and
@@ -776,10 +806,21 @@ fleet and an audit can still attribute its old ledger entries. It does not
 reach into the cluster, and the device's certificate stays cryptographically
 valid until it expires.
 
-What actually retires a stolen device's BUNDLE is 'farcast storage rekey': it
-changes the scope keys, after which the material that device holds opens
-nothing written since. That is the answer to a lost device, and this command
-prints it rather than implying it already happened.`)
+What retires a lost device's BUNDLE is rotating the keys it holds, and this
+command prints how rather than implying it already happened:
+
+  farcast storage key rotate <instance>   new keys for every application; the
+                                          bundle opens nothing written after
+  farcast storage key rekey <instance>    moves existing objects onto them
+  farcast keeper enroll ...               every keeper you keep: their bundles
+                                          predate the rotation
+
+What that does not undo is printed too. Names stay computable, because a
+scope's name key cannot rotate. And until the device's certificate expires it
+can still re-seed a keyholder replica that restarts, with its old keys. A
+replica already serving refuses a re-seed, and an honest keeper never tries;
+a device in someone else's hands may, and 'farcast storage state' flags a
+replica serving keys other than this machine's keyring.`)
 }
 
 func (c *keeperRevokeCommand) SetFlags(fs *flag.FlagSet) {
@@ -837,7 +878,21 @@ func (c *keeperRevokeCommand) Run(_ context.Context, env *Env, args []string) er
 	}
 	return env.Printer.Print(keeperRevokeResult{
 		Instance: name, Device: device, Expires: found.Expires, Remaining: remaining,
+		Remedy: revokeRemedy(name),
 	})
+}
+
+// revokeRemedy is what retires a revoked device's bundle, in the order it has
+// to happen. The command it used to print, 'farcast storage rekey', does not
+// exist; and rekey on its own moves objects onto keys a rotation has to mint
+// first — on the 2026-10-06 walk the pair rewrote nothing, because neither
+// reached an application's scope.
+func revokeRemedy(instance string) []string {
+	return []string{
+		"farcast storage key rotate " + instance,
+		"farcast storage key rekey " + instance,
+		"farcast keeper enroll " + instance + " <device> --out <path> --passphrase-file <path>   (each keeper you keep)",
+	}
 }
 
 type keeperRevokeResult struct {
@@ -845,6 +900,10 @@ type keeperRevokeResult struct {
 	Device    string    `json:"device"`
 	Expires   time.Time `json:"leaf_expires,omitzero"`
 	Remaining int       `json:"remaining"`
+	// Remedy is what retires the device's bundle, in order. It is in the
+	// result rather than only in the prose, so a script that revokes a device
+	// is told the same thing a person is.
+	Remedy []string `json:"remedy"`
 }
 
 func (r keeperRevokeResult) Human(w io.Writer) error {
@@ -854,9 +913,22 @@ func (r keeperRevokeResult) Human(w io.Writer) error {
 	if !r.Expires.IsZero() {
 		fprintf(w, "That certificate stops working on its own at %s.\n", r.Expires.UTC().Format(time.RFC3339))
 	}
-	fprintf(w, "If the device was lost, retire what it HOLDS:\n\n  farcast storage rekey %s\n\n", r.Instance)
-	fprintln(w, "Rekey changes the scope keys, so that device's bundle opens nothing written afterwards.")
-	fprintln(w, "It does not reach backwards: anything it already read, it already read.")
+	fprintln(w, "\nIf the device was lost, retire what it HOLDS — its bundle carries every application's keys:")
+	fprintln(w)
+	for _, step := range r.Remedy {
+		fprintf(w, "  %s\n", step)
+	}
+	fprintln(w, "\nRotate gives every application new keys, so the bundle opens nothing written")
+	fprintln(w, "afterwards; rekey moves what is already stored onto them. What that does not undo:")
+	fprintln(w, "  - it does not reach backwards: anything the device already read, or that")
+	fprintln(w, "    anyone captured before the rekey, stays exposed")
+	fprintln(w, "  - names: a scope's name key cannot rotate, so the bundle can still compute")
+	fprintln(w, "    where each application's objects are stored")
+	fprintln(w, "  - until its certificate expires, the device can still re-seed a keyholder")
+	fprintln(w, "    replica that restarts, with its old keys. A replica already serving refuses")
+	fprintln(w, "    it, and an honest keeper never tries; a device in someone else's hands may.")
+	fprintf(w, "    'farcast storage state %s' flags a replica serving keys other than this\n", r.Instance)
+	fprintln(w, "    machine's keyring — the generation is no sign, since a bundle carries any.")
 	if r.Remaining < 2 {
 		fprintf(w, "\n%q now has %d active keeper(s). Enrol another before you rely on unattended recovery.\n",
 			r.Instance, r.Remaining)

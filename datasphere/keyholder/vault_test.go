@@ -1,6 +1,7 @@
 package keyholder
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"sync"
@@ -224,23 +225,39 @@ func TestSealDropsScopes(t *testing.T) {
 	if len(v.State().Scopes) != 2 {
 		t.Fatal("guard: the fixture's two scopes did not load")
 	}
-	// Hold the scope the VAULT took — not the caller's bundle, which the vault
-	// no longer shares material with — so the wipe is observable after the seal.
-	held, err := v.Scope("app/apps/web/x")
+	// Observe the material the VAULT owns. This test used to watch it through
+	// v.Scope(), which only worked because Scope handed out the vault's own
+	// bytes — the aliasing that let a push zero the keys of a request still in
+	// flight (see TestAPushDoesNotZeroKeysARequestIsStillUsing). Scope now
+	// returns a copy, so the vault's slice is the only honest place to look.
+	owned := append([]datasphere.Scope(nil), v.scopes...)
+	for _, s := range owned {
+		if s.Zeroed() {
+			t.Fatal("guard: scope material is already zero before the seal")
+		}
+	}
+	// A request admitted before the seal holds its own copy.
+	admitted, err := v.Scope("app/apps/web/x")
 	if err != nil {
 		t.Fatalf("Scope: %v", err)
-	}
-	if held.Zeroed() {
-		t.Fatal("guard: scope material is already zero before the seal")
 	}
 
 	v.Seal(false, "")
 	if got := v.State().Scopes; len(got) != 0 {
 		t.Errorf("scopes survived the seal: %v", got)
 	}
-	if !held.Zeroed() {
-		t.Error("Seal dropped the scopes without wiping their material")
+	for _, s := range owned {
+		if !s.Zeroed() {
+			t.Errorf("Seal dropped scope %q without wiping its material", s.Name)
+		}
 	}
+	// The seal stops new requests and leaves an admitted one to finish with
+	// the keys it was admitted with — and to wipe them itself. Zeroing them
+	// here instead is the defect, not the safeguard.
+	if admitted.Zeroed() {
+		t.Error("Seal zeroed a copy belonging to a request it had already admitted")
+	}
+	admitted.Zero()
 	if _, err := v.Scope("app/apps/web/x"); !errors.Is(err, ErrSealed) {
 		t.Errorf("a sealed vault still resolved a scope: %v", err)
 	}
@@ -323,5 +340,134 @@ func TestUnsealTakesOwnershipOfKeyMaterial(t *testing.T) {
 	if after.Zeroed() {
 		t.Fatal("the vault is serving zeroed key material: every object it writes " +
 			"would be encrypted under a key of all zeros, and the operator's keyring could not address it")
+	}
+}
+
+// appKeyring is a master keyring holding one scope per application, so a test
+// can rotate it and bundle each version — the shape a real rotation pushes.
+func appKeyring(t *testing.T, namespace string, apps ...string) datasphere.Keyring {
+	t.Helper()
+	k, err := datasphere.NewKeyring()
+	if err != nil {
+		t.Fatalf("NewKeyring: %v", err)
+	}
+	for _, app := range apps {
+		s, err := datasphere.NewAppScope(namespace, app)
+		if err != nil {
+			t.Fatalf("NewAppScope(%s): %v", app, err)
+		}
+		if k, err = k.AddScope(s); err != nil {
+			t.Fatalf("AddScope(%s): %v", app, err)
+		}
+	}
+	return k
+}
+
+func bundleOf(t *testing.T, generation uint64, k datasphere.Keyring) *datasphere.Bundle {
+	t.Helper()
+	b, err := datasphere.NewBundle("prod", generation, k.Scopes())
+	if err != nil {
+		t.Fatalf("NewBundle: %v", err)
+	}
+	return b
+}
+
+// The defect a probe found on 2026-10-06. An unseal at a new generation zeroes
+// the scopes it replaces, and Vault.Scope used to hand requests those very
+// scopes — so a write admitted before a push, and sealed after it, wrapped its
+// data key under an all-zero KEK carrying the real key ID. The object then
+// failed integrity under the real keys and opened under a key of zeros. Every
+// `farcast run` that handed scopes to a serving keyholder took this path.
+func TestAPushDoesNotZeroKeysARequestIsStillUsing(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	k := appKeyring(t, "apps", "web", "api")
+	rotated, _, err := k.RotateScopeKEKs()
+	if err != nil {
+		t.Fatalf("RotateScopeKEKs: %v", err)
+	}
+	if err := h.vault.Unseal(bundleOf(t, 1, k), IntentOperator); err != nil {
+		t.Fatalf("unseal gen 1: %v", err)
+	}
+
+	const key = "app/apps/web/in-flight"
+	held, err := h.vault.Scope(key) // a request resolves its scope...
+	if err != nil {
+		t.Fatalf("Scope: %v", err)
+	}
+	inflight, err := h.srv.cfg.Stores(held)
+	if err != nil {
+		t.Fatalf("Stores: %v", err)
+	}
+
+	// ...the operator pushes a rotated bundle while that request is still
+	// reading its body...
+	if err := h.vault.Unseal(bundleOf(t, 2, rotated), IntentOperator); err != nil {
+		t.Fatalf("unseal gen 2: %v", err)
+	}
+	if held.Zeroed() {
+		t.Fatal("the push zeroed keys an admitted request was still using")
+	}
+
+	// ...and only then does the request seal and store its object.
+	if err := inflight.Write(ctx, key, []byte("written in flight")); err != nil {
+		t.Fatalf("in-flight Write: %v", err)
+	}
+	held.Zero()
+
+	// The keyholder at generation 2 reads it with the real keys. Under the
+	// defect this failed integrity, because the data key had been wrapped
+	// under zeros.
+	now, err := h.vault.Scope(key)
+	if err != nil {
+		t.Fatalf("Scope at gen 2: %v", err)
+	}
+	defer now.Zero()
+	store, err := h.srv.cfg.Stores(now)
+	if err != nil {
+		t.Fatalf("Stores at gen 2: %v", err)
+	}
+	got, err := store.Read(ctx, key)
+	if err != nil {
+		t.Fatalf("an object written in flight across a push no longer reads: %v", err)
+	}
+	if string(got) != "written in flight" {
+		t.Errorf("read %q", got)
+	}
+}
+
+// The other half of the same change: a request wiping its own copy must never
+// reach what the vault holds. Were Vault.Scope ever to share bytes again, the
+// first request to finish would zero the keyholder for everyone after it.
+func TestARequestWipingItsKeysLeavesTheVaultServing(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	if err := h.vault.Unseal(bundleOf(t, 1, appKeyring(t, "apps", "web")), IntentOperator); err != nil {
+		t.Fatalf("unseal: %v", err)
+	}
+	const key = "app/apps/web/x"
+	first, err := h.vault.Scope(key)
+	if err != nil {
+		t.Fatalf("Scope: %v", err)
+	}
+	first.Zero()
+
+	second, err := h.vault.Scope(key)
+	if err != nil {
+		t.Fatalf("Scope after a wipe: %v", err)
+	}
+	defer second.Zero()
+	if second.Zeroed() {
+		t.Fatal("one request wiping its keys zeroed the vault's")
+	}
+	store, err := h.srv.cfg.Stores(second)
+	if err != nil {
+		t.Fatalf("Stores: %v", err)
+	}
+	if err := store.Write(ctx, key, []byte("still serving")); err != nil {
+		t.Fatalf("Write after another request's wipe: %v", err)
+	}
+	if got, err := store.Read(ctx, key); err != nil || string(got) != "still serving" {
+		t.Fatalf("Read after another request's wipe: %q, %v", got, err)
 	}
 }

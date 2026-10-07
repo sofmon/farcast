@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -445,8 +446,11 @@ func (c *runCommand) ensureAppScopes(env *Env, instance, namespace string, m par
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := env.ConfigDir.SaveInstanceKeyring(instance, encoded); err != nil {
-		return nil, nil, fmt.Errorf("record the new storage scopes: %w", err)
+	if err := env.ConfigDir.SaveInstanceKeyring(instance, raw, encoded); err != nil {
+		if errors.Is(err, config.ErrKeyringChanged) {
+			return nil, nil, fmt.Errorf("record the new storage scopes: %w — another farcast command wrote it meanwhile; nothing was deployed, so run this again", err)
+		}
+		return nil, nil, fmt.Errorf("record the new storage scopes: %w — nothing was deployed", err)
 	}
 	fprintf(env.Err, "Minted a storage scope for %s in %q. %s\n",
 		strings.Join(minted, ", "), namespace, datasphere.KeyLossWarning)
@@ -475,97 +479,66 @@ func (c *runCommand) ensureAppScopes(env *Env, instance, namespace string, m par
 // documented, recoverable state that one command fixes — where a deploy
 // abandoned halfway is not.
 func (c *runCommand) handScopesToTheKeyholder(ctx context.Context, env *Env, meta *config.InstanceMetadata, minted []string) {
-	open := c.newKeyholder
-	if open == nil {
-		open = func(ctx context.Context, env *Env, instance string) (sealStateClient, func(), error) {
-			return keyholderClient(ctx, env, instance)
-		}
-	}
-	client, done, err := open(ctx, env, meta.Name)
-	if err != nil {
-		c.sealedNotice(env, meta.Name, minted, fmt.Sprintf("the keyholder could not be reached: %v", err))
-		return
-	}
-	defer done()
-
-	raw, err := env.ConfigDir.LoadInstanceKeyring(meta.Name)
+	apps := strings.Join(minted, ", ")
+	keys, err := keyringOf(env, meta.Name)
 	if err != nil {
 		c.sealedNotice(env, meta.Name, minted, err.Error())
 		return
 	}
-	keys, err := datasphere.ParseKeyring(raw)
-	if err != nil {
-		c.sealedNotice(env, meta.Name, minted, err.Error())
-		return
-	}
-	scopes, generation := bundleScopes(meta, keys)
-	bundle, err := datasphere.NewBundle(meta.Name, generation, scopes)
-	if err != nil {
-		c.sealedNotice(env, meta.Name, minted, err.Error())
-		return
-	}
-	defer bundle.Zero()
-	payload, err := bundle.Marshal()
-	if err != nil {
-		c.sealedNotice(env, meta.Name, minted, err.Error())
-		return
-	}
-	defer clear(payload)
-
-	total := replicaCount(meta)
-	ledgerPath := env.ConfigDir.InstanceUnsealLedgerPath(meta.Name)
-	loaded, sealed := 0, 0
-	for i := range total {
-		st, err := client.State(ctx, i)
-		switch {
-		case err != nil:
-			fprintf(env.Err, "warning: keyholder replica %d did not answer, so it does not hold the new scopes: %v\n", i, err)
-			continue
-		case st.Sealed():
-			// Left alone on purpose. See the doc comment.
-			sealed++
-			continue
-		}
-		pushed, perr := client.Unseal(ctx, i, payload, "operator-unseal")
-		entry := keyholder.LedgerEntry{
-			Time: time.Now().UTC(), Instance: meta.Name, Ordinal: i,
-			Intent: "operator-unseal", Generation: generation, Boot: st.Boot, Result: "ok",
-		}
-		if perr != nil {
-			entry.Result = "refused"
-			fprintf(env.Err, "warning: keyholder replica %d refused the new scopes: %v\n", i, perr)
-		} else {
-			entry.Phase = pushed.Phase
-			if pushed.Boot != "" {
-				entry.Boot = pushed.Boot
-			}
-			loaded++
-		}
-		// The ledger records where key material went, and this is a place it
-		// goes. A push nobody wrote down is the one an audit cannot account
-		// for later.
-		if lerr := keyholder.AppendLedger(ledgerPath, entry); lerr != nil {
-			fprintf(env.Err, "warning: the unseal ledger could not be written: %v\n", lerr)
-		}
-	}
-
+	res := handOverKeys(ctx, env, meta, keyholderOpener(c.newKeyholder), keys, handOverOptions{})
 	switch {
-	case sealed > 0:
+	case res.Unsafe:
+		// Not a seal, and an unseal now would refuse for the same reason: the
+		// refusal says what to fix first. Re-running this deploy afterwards
+		// would not hand the scope over — it exists by then, and only a scope
+		// minted by this run is handed over — so the step after the fix is an
+		// unseal.
+		fprintf(env.Err, "The keyholder was not handed %s's scope: %s.\n", apps, res.Problem)
+		fprintf(env.Err, "Once that is fixed, 'farcast storage unseal %s' hands it over. Until then a replica without the scope\n"+
+			"refuses those applications' storage requests (ErrPermission), and a sealed one answers ErrStorageSealed.\n", meta.Name)
+	case res.Problem != "":
+		c.sealedNotice(env, meta.Name, minted, res.Problem)
+	case !res.Activated && res.Cause == heldNoneServing:
+		c.sealedNotice(env, meta.Name, minted, res.Reason)
+	case !res.Activated:
+		// The new scope went over with the first push — no replica held it,
+		// so nothing was held back for it. Another application's key was: a
+		// serving replica lacked it, and the hand-over stopped before using
+		// it. Which replicas still hold the scope, a later read says.
+		fprintf(env.Err, "The keyholder took %s's scope with the first of two pushes (generation %d), but another application's\n"+
+			"current key is not in use yet, because %s.\n", apps, res.Generation, res.Reason)
+		fprintf(env.Err, "Run 'farcast storage state %s' to see each replica, and 'farcast storage unseal %s' once they answer.\n",
+			meta.Name, meta.Name)
+	case res.Complete():
+		fprintf(env.Err, "The keyholder now holds %s's scope (generation %d).\n", apps, res.Generation)
+	case len(res.Waiting) > 0:
 		c.sealedNotice(env, meta.Name, minted,
-			fmt.Sprintf("%d of %d keyholder replicas are sealed", sealed, total))
-	case loaded == 0:
+			fmt.Sprintf("%d of %d keyholder replicas are sealed", len(res.Waiting), res.Total))
+	case len(res.Loaded)+len(res.HeldOnly) == 0:
 		c.sealedNotice(env, meta.Name, minted, "no replica took them")
 	default:
-		fprintf(env.Err, "The keyholder now holds %s's scope (generation %d).\n",
-			strings.Join(minted, ", "), generation)
-		meta.Keyholder.Generation = generation
-		meta.UpdatedAt = time.Now().UTC()
-		if err := env.ConfigDir.SaveInstanceMetadata(meta.Name, meta); err != nil {
-			// Recording behind the cluster is the safe direction: 'storage
-			// state' reads each replica's own generation, so a lagging record
-			// shows up there rather than hiding a replica holding material
-			// nobody wrote down.
-			fprintf(env.Err, "warning: the keyholder took generation %d but recording it failed: %v\n", generation, err)
+		// Some replicas hold the scope and some did not answer or declined.
+		// Not a success: a request routed to one without it is refused. A
+		// replica that took only the first of two pushes holds the scope
+		// too — the push carried it — and serves it.
+		fprintf(env.Err, "The keyholder holds %s's scope on %d of %d replicas (generation %d); the rest are named above.\n",
+			apps, len(res.Loaded)+len(res.HeldOnly), res.Total, res.Generation)
+		fprintf(env.Err, "Run 'farcast storage state %s' to see each replica, and 'farcast storage unseal %s' once they answer.\n",
+			meta.Name, meta.Name)
+	}
+	// Said whether or not the hand-over finished: the next unseal gives the
+	// replicas the new scope either way. A keeper's bundle carries only the
+	// scopes that existed when it was enrolled, and a keyholder replaces its
+	// whole set on a push — so a keeper re-seeding a restarted replica now
+	// would leave it serving, and refusing every request for the new
+	// application. Keepers see the new scope on a serving replica and refuse
+	// to re-seed instead, which is right and, unannounced, a fleet quietly
+	// switched off.
+	if kept := keepersToReenrol(meta); len(kept) > 0 {
+		fprintf(env.Err, "\nEvery keeper's bundle predates %s, so each refuses to re-seed a replica that restarts\n"+
+			"until it is re-enrolled — a replica restored without %s would refuse its requests:\n", apps, apps)
+		for _, d := range kept {
+			fprintf(env.Err, "      farcast keeper enroll %s %s --out <path> --passphrase-file <path>\n", meta.Name, d)
 		}
 	}
 }

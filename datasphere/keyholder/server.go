@@ -156,15 +156,32 @@ func (s *Server) StatusHandler() http.Handler {
 // ControlHandler serves the operator and, from 5.4, keeper devices. Every
 // route here changes or reports the seal state; none of them touch stored
 // data. The caller wraps it in mTLS that admits only operator and keeper
-// leaves — this handler assumes its peer is already authenticated.
+// leaves.
+//
+// Authenticated is not authorized. This handler used to assume that a peer
+// the listener admitted could do anything the surface offers, and the
+// listener admits every keeper — so any keeper could release an operator
+// hold, unseal through one by claiming intent=operator-unseal, or place a hold
+// in the operator's name. Each route now reads the caller's identity and
+// decides from its role, the same way the data path does. It also no longer
+// depends on the listener being configured correctly: ControlTLS skips its
+// URI check entirely when it is given no allow function.
 func (s *Server) ControlHandler() http.Handler {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("GET /v1/state", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET /v1/state", func(w http.ResponseWriter, r *http.Request) {
+		if _, err := s.controlCaller(r); err != nil {
+			s.fail(w, r, err)
+			return
+		}
 		writeJSON(w, http.StatusOK, controlStateBody(s.cfg.Instance, s.cfg.Vault.State()))
 	})
 
-	mux.HandleFunc("GET "+SealChallengePath, func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET "+SealChallengePath, func(w http.ResponseWriter, r *http.Request) {
+		if _, err := s.controlCaller(r); err != nil {
+			s.fail(w, r, err)
+			return
+		}
 		ch, err := s.challenger.Issue()
 		if err != nil {
 			s.log.Warn("challenge refused", "error", err)
@@ -176,15 +193,27 @@ func (s *Server) ControlHandler() http.Handler {
 	})
 
 	mux.HandleFunc("POST /v1/unseal", func(w http.ResponseWriter, r *http.Request) {
+		id, err := s.controlCaller(r)
+		if err != nil {
+			s.fail(w, r, err)
+			return
+		}
 		intent := Intent(r.URL.Query().Get("intent"))
 		switch intent {
-		case IntentOperator, IntentReseed:
+		case IntentOperator, IntentReseed, IntentHandOver:
 		case "":
 			// Absent intent is the conservative one: a caller that does
 			// not claim to be a person is not treated as one.
 			intent = IntentReseed
 		default:
 			s.fail(w, r, fmt.Errorf("%w: unknown intent %q", datasphere.ErrBundleInvalid, intent))
+			return
+		}
+		// Refused before the body is read: a caller that may not make this
+		// claim learns nothing about the envelope, the bundle or the vault.
+		if !id.MayPush(intent) {
+			s.log.Warn("unseal refused for role", "role", id.Role, "intent", intent)
+			s.fail(w, r, fmt.Errorf("%w: %s %q may not push with intent %q", ErrNotAuthorized, id.Role, id.Name, intent))
 			return
 		}
 
@@ -230,6 +259,10 @@ func (s *Server) ControlHandler() http.Handler {
 	})
 
 	mux.HandleFunc("POST /v1/seal", func(w http.ResponseWriter, r *http.Request) {
+		if err := s.mayChangeSeal(r); err != nil {
+			s.fail(w, r, err)
+			return
+		}
 		hold := r.URL.Query().Get("hold") == "true"
 		reason := r.URL.Query().Get("reason")
 		st := s.cfg.Vault.Seal(hold, reason)
@@ -238,6 +271,10 @@ func (s *Server) ControlHandler() http.Handler {
 	})
 
 	mux.HandleFunc("POST /v1/release-hold", func(w http.ResponseWriter, r *http.Request) {
+		if err := s.mayChangeSeal(r); err != nil {
+			s.fail(w, r, err)
+			return
+		}
 		st := s.cfg.Vault.ReleaseHold()
 		s.log.Info("hold released", "phase", st.Phase)
 		writeJSON(w, http.StatusOK, controlStateBody(s.cfg.Instance, st))
@@ -257,11 +294,12 @@ func (s *Server) DataHandler() http.Handler {
 }
 
 func (s *Server) read(w http.ResponseWriter, r *http.Request) {
-	key, _, _, store, err := s.resolve(r, HeaderKey)
+	key, _, scope, store, err := s.resolve(r, HeaderKey)
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
+	defer scope.Zero()
 	data, err := store.Read(r.Context(), key)
 	if err != nil {
 		s.fail(w, r, err)
@@ -278,6 +316,7 @@ func (s *Server) write(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
+	defer scope.Zero()
 	if err := refuseSecretMutation(id, scope, key); err != nil {
 		// Refused before the body is read, so an application cannot spend the
 		// instance's bandwidth on a write that was never going to happen.
@@ -302,6 +341,7 @@ func (s *Server) delete(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
+	defer scope.Zero()
 	if err := refuseSecretMutation(id, scope, key); err != nil {
 		s.fail(w, r, err)
 		return
@@ -314,11 +354,12 @@ func (s *Server) delete(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) list(w http.ResponseWriter, r *http.Request) {
-	prefix, _, _, store, err := s.resolve(r, HeaderPrefix)
+	prefix, _, scope, store, err := s.resolve(r, HeaderPrefix)
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
+	defer scope.Zero()
 	keys, err := store.List(r.Context(), prefix)
 	if err != nil {
 		// A sealed or failing List must never answer with an empty set and
@@ -328,6 +369,33 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"keys": keys})
+}
+
+// controlCaller identifies who is asking on the control surface, and refuses
+// any role with no business there. The listener should already have refused
+// them; this does not rely on it.
+func (s *Server) controlCaller(r *http.Request) (Identity, error) {
+	id, err := identityFrom(r, s.cfg.Instance)
+	if err != nil {
+		return Identity{}, err
+	}
+	if id.Role != RoleOperator && id.Role != RoleKeeper {
+		return Identity{}, fmt.Errorf("%w: %s %q has no business on the control surface", ErrNotAuthorized, id.Role, id.Name)
+	}
+	return id, nil
+}
+
+// mayChangeSeal admits only a caller that may seal, hold or release a hold.
+func (s *Server) mayChangeSeal(r *http.Request) error {
+	id, err := s.controlCaller(r)
+	if err != nil {
+		return err
+	}
+	if !id.MaySeal() {
+		s.log.Warn("seal change refused for role", "role", id.Role, "path", r.URL.Path)
+		return fmt.Errorf("%w: %s %q may not change the seal state", ErrNotAuthorized, id.Role, id.Name)
+	}
+	return nil
 }
 
 // resolve decodes the requested logical key and returns a Store over the scope
@@ -361,19 +429,25 @@ func (s *Server) resolve(r *http.Request, header string) (string, Identity, data
 		return "", id, none, nil, fmt.Errorf("%w: missing %s header", ErrOutOfScope, HeaderScope)
 	}
 
+	// The vault hands back this request's own copy of the scope's keys; see
+	// Vault.Scope. Every refusal below wipes it before returning, and on
+	// success the handler that asked for it wipes it once the request ends.
 	scope, err := s.cfg.Vault.Scope(key)
 	if err != nil {
 		return "", id, none, nil, err
 	}
 	// What the caller may reach follows from the role its leaf names.
 	if !id.MayReach(scope.Name) {
+		scope.Zero()
 		return "", id, none, nil, fmt.Errorf("%w: %s %q may not reach scope %q", ErrNotAuthorized, id.Role, id.Name, scope.Name)
 	}
 	if scope.Name != declared {
+		scope.Zero()
 		return "", id, none, nil, fmt.Errorf("%w: key belongs to scope %q, request declared %q", ErrOutOfScope, scope.Name, declared)
 	}
 	store, err := s.cfg.Stores(scope)
 	if err != nil {
+		scope.Zero()
 		return "", id, none, nil, err
 	}
 	return key, id, scope, store, nil
@@ -384,9 +458,10 @@ func (s *Server) resolve(r *http.Request, header string) (string, Identity, data
 // It was written when the data path could not tell one application from
 // another (ADR 0017 decision 3), and it was the one rule that path could
 // enforce honestly: not WHOSE secret, but that no application writes one.
-// Identity on the path (ADR 0018 decision 1) adds the whose — see
-// Identity.MayTouchSecret, applied in resolve — and this rule stays, narrowed
-// to the role it was always about.
+// Identity on the path (ADR 0018 decision 1) adds the whose — decision 5
+// gave each application its own scope, so resolve refuses a neighbour's
+// subtree outright — and this rule stays, narrowed to the role it was always
+// about.
 //
 // Listing the secrets ROOT is still not refused: the parent prefix is
 // listable, so refusing it would imply an enumeration boundary that does not
@@ -456,6 +531,9 @@ type stateResponse struct {
 
 	// Boot is set on the control surface only. See controlStateBody.
 	Boot string `json:"boot,omitempty"`
+	// Keys is set on the control surface only: scope name to the hex IDs of
+	// every KEK it holds, the active one first. See State.Keys.
+	Keys map[string][]string `json:"keys,omitempty"`
 }
 
 // stateBody is what the UNAUTHENTICATED status endpoint answers.
@@ -482,6 +560,7 @@ func stateBody(instance string, st State) stateResponse {
 func controlStateBody(instance string, st State) stateResponse {
 	body := stateBody(instance, st)
 	body.Boot = st.Boot
+	body.Keys = st.Keys
 	return body
 }
 

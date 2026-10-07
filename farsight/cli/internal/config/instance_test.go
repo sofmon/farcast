@@ -2,9 +2,12 @@ package config
 
 import (
 	"errors"
+	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -376,5 +379,160 @@ func TestSaveInstanceMetadataIsAtomicAndPrivate(t *testing.T) {
 		if strings.HasPrefix(e.Name(), ".tmp-") {
 			t.Errorf("left a temporary file behind: %s", e.Name())
 		}
+	}
+}
+
+// A keyring write replaces only the file its writer read. Rotate holds its
+// keyring across a prompt and a network round trip; a 'farcast run' that minted
+// a scope meanwhile — and handed it to the keyholder — would otherwise exist
+// only in the replicas' memory.
+func TestSaveInstanceKeyringRefusesAFileThatChanged(t *testing.T) {
+	d := Dir(t.TempDir())
+	if err := d.CreateInstanceKeyring("prod", []byte("first")); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SaveInstanceKeyring("prod", []byte("first"), []byte("second")); err != nil {
+		t.Fatalf("a write against the file as read: %v", err)
+	}
+	err := d.SaveInstanceKeyring("prod", []byte("first"), []byte("third"))
+	if !errors.Is(err, ErrKeyringChanged) {
+		t.Fatalf("a write against a file that changed = %v; want ErrKeyringChanged", err)
+	}
+	if got, _ := d.LoadInstanceKeyring("prod"); string(got) != "second" {
+		t.Errorf("a refused write changed the file: %q", got)
+	}
+}
+
+// The write is atomic: one that fails leaves the previous file whole. A
+// truncate-then-write that failed half way left keys.yaml unparseable — every
+// key this machine holds, gone.
+func TestAFailedKeyringSaveLeavesThePreviousFile(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes through a read-only directory")
+	}
+	d := Dir(t.TempDir())
+	if err := d.CreateInstanceKeyring("prod", []byte("whole")); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Dir(d.InstanceKeyringPath("prod"))
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chmod(dir, 0o700) }()
+	if err := d.SaveInstanceKeyring("prod", []byte("whole"), []byte("replacement")); err == nil {
+		t.Fatal("guard: a write into a read-only directory succeeded")
+	}
+	if got, err := os.ReadFile(d.InstanceKeyringPath("prod")); err != nil || string(got) != "whole" {
+		t.Errorf("a failed save left %q (%v); want the previous file whole", got, err)
+	}
+	info, err := os.Stat(d.InstanceKeyringPath("prod"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Errorf("keyring mode %04o; want 0600", info.Mode().Perm())
+	}
+}
+
+// The compare and the replace are one step. Two writers that read the same
+// keyring used to both pass the compare, and the second rename dropped what
+// the first wrote — a scope 'farcast run' had already handed to the keyholder.
+func TestConcurrentKeyringWritersNeverBothWin(t *testing.T) {
+	d := Dir(t.TempDir())
+	if err := d.CreateInstanceKeyring("prod", []byte("read by both")); err != nil {
+		t.Fatal(err)
+	}
+	const writers = 16
+	errs := make(chan error, writers)
+	var start sync.WaitGroup
+	start.Add(1)
+	for i := range writers {
+		go func() {
+			start.Wait()
+			errs <- d.SaveInstanceKeyring("prod", []byte("read by both"), []byte(fmt.Sprintf("writer %d", i)))
+		}()
+	}
+	start.Done()
+	won := 0
+	for range writers {
+		err := <-errs
+		switch {
+		case err == nil:
+			won++
+		case !errors.Is(err, ErrKeyringChanged):
+			t.Errorf("a losing writer failed with %v; want ErrKeyringChanged", err)
+		}
+	}
+	if won != 1 {
+		t.Errorf("%d writers replaced a keyring they all read; exactly one may", won)
+	}
+}
+
+// A linked keys.yaml would be replaced by a plain file, leaving the link's
+// other end — often the copy being backed up — silently stale.
+func TestAKeyringWriteRefusesALinkedFile(t *testing.T) {
+	for name, link := range map[string]func(target, path string) error{
+		"symlink":   os.Symlink,
+		"hard link": os.Link,
+	} {
+		t.Run(name, func(t *testing.T) {
+			d := Dir(t.TempDir())
+			if err := d.CreateInstanceKeyring("prod", []byte("original")); err != nil {
+				t.Fatal(err)
+			}
+			path := d.InstanceKeyringPath("prod")
+			elsewhere := filepath.Join(t.TempDir(), "backed-up-keys.yaml")
+			if name == "symlink" {
+				if err := os.Rename(path, elsewhere); err != nil {
+					t.Fatal(err)
+				}
+				if err := link(elsewhere, path); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := link(path, elsewhere); err != nil {
+				t.Fatal(err)
+			}
+			err := d.SaveInstanceKeyring("prod", []byte("original"), []byte("replacement"))
+			if err == nil || !strings.Contains(err.Error(), "link") {
+				t.Fatalf("a write over a %s = %v; want a refusal naming the link", name, err)
+			}
+			if got, _ := os.ReadFile(elsewhere); string(got) != "original" {
+				t.Errorf("the link's other end holds %q", got)
+			}
+		})
+	}
+}
+
+// Review 5, finding 9. The first keyring write never overwrites one that is
+// there, and one that fails leaves no keys.yaml at all — not a truncated one
+// the next attempt refuses to replace.
+func TestCreateInstanceKeyringIsWholeOrAbsent(t *testing.T) {
+	d := Dir(t.TempDir())
+	if err := d.CreateInstanceKeyring("prod", []byte("first")); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.CreateInstanceKeyring("prod", []byte("second")); !errors.Is(err, fs.ErrExist) {
+		t.Errorf("a second create = %v; want ErrExist", err)
+	}
+	if got, _ := d.LoadInstanceKeyring("prod"); string(got) != "first" {
+		t.Errorf("a refused create changed the keyring: %q", got)
+	}
+	if os.Geteuid() == 0 {
+		return
+	}
+	e := Dir(t.TempDir())
+	dir := filepath.Dir(e.InstanceKeyringPath("prod"))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chmod(dir, 0o700) }()
+	if err := e.CreateInstanceKeyring("prod", []byte("never")); err == nil {
+		t.Fatal("guard: a create into a read-only directory succeeded")
+	}
+	if _, err := os.Lstat(e.InstanceKeyringPath("prod")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("a failed create left a keys.yaml behind: %v", err)
 	}
 }

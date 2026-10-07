@@ -516,3 +516,348 @@ func TestAppScopesCoexistButNotWithARootScope(t *testing.T) {
 		t.Error("a scope owning the application root was accepted alongside per-application scopes")
 	}
 }
+
+// twoAppScopes is a master keyring holding two application scopes, the shape
+// every instance has had since ADR 0018 decision 5.
+func twoAppScopes(t *testing.T) Keyring {
+	t.Helper()
+	k := testKeyring(t)
+	for _, app := range []string{"alpha", "beta"} {
+		s, err := NewAppScope("demo", app)
+		if err != nil {
+			t.Fatalf("NewAppScope(%s): %v", app, err)
+		}
+		if k, err = k.AddScope(s); err != nil {
+			t.Fatalf("AddScope(%s): %v", app, err)
+		}
+	}
+	return k
+}
+
+func TestRotateScopeKEKsPrependsAFreshKEKToEveryScope(t *testing.T) {
+	before := twoAppScopes(t)
+	after, rotated, err := before.RotateScopeKEKs()
+	if err != nil {
+		t.Fatalf("RotateScopeKEKs: %v", err)
+	}
+	if len(rotated) != 2 {
+		t.Fatalf("rotated %d scopes, want 2", len(rotated))
+	}
+	for i, s := range after.Scopes() {
+		was := before.Scopes()[i]
+		r := rotated[i]
+		if r.Scope != s.Name {
+			t.Errorf("rotation %d names scope %q, keyring has %q", i, r.Scope, s.Name)
+		}
+		keks := s.Keyring().KEKs()
+		if len(keks) != len(was.Keyring().KEKs())+1 {
+			t.Fatalf("scope %q has %d KEKs, want one more than %d", s.Name, len(keks), len(was.Keyring().KEKs()))
+		}
+		if keks[0].ID != r.Active {
+			t.Errorf("scope %q: the active KEK is not the one the rotation reports", s.Name)
+		}
+		if keks[1].ID != r.Previous || r.Previous != was.Keyring().KEKs()[0].ID {
+			t.Errorf("scope %q: the previous KEK was not kept second", s.Name)
+		}
+		if r.Active == r.Previous {
+			t.Errorf("scope %q: rotated to the key it already had", s.Name)
+		}
+		// Addressing must not move: a new active name key would make every
+		// object in the scope unlistable.
+		gotNames, wantNames := s.Keyring().NameKeys(), was.Keyring().NameKeys()
+		if len(gotNames) != len(wantNames) {
+			t.Fatalf("scope %q: name keys went from %d to %d", s.Name, len(wantNames), len(gotNames))
+		}
+		for j := range gotNames {
+			if gotNames[j].ID != wantNames[j].ID {
+				t.Errorf("scope %q: name key %d changed", s.Name, j)
+			}
+		}
+		if s.Prefix != was.Prefix || s.Created != was.Created {
+			t.Errorf("scope %q: prefix or creation time changed", s.Name)
+		}
+	}
+	// Each scope gets its own key: one shared fresh KEK would let one
+	// application's bundle open another's new writes.
+	if rotated[0].Active == rotated[1].Active {
+		t.Error("two scopes were rotated onto the same KEK")
+	}
+}
+
+func TestRotateScopeKEKsLeavesTheReceiverAndTheMasterAlone(t *testing.T) {
+	before := twoAppScopes(t)
+	activeBefore := before.Scopes()[0].Keyring().KEKs()[0].ID
+	masterBefore := before.KEKs()[0].ID
+
+	after, _, err := before.RotateScopeKEKs()
+	if err != nil {
+		t.Fatalf("RotateScopeKEKs: %v", err)
+	}
+	if got := before.Scopes()[0].Keyring().KEKs()[0].ID; got != activeBefore {
+		t.Error("rotating mutated the receiver's scope")
+	}
+	if after.KEKs()[0].ID != masterBefore || len(after.KEKs()) != len(before.KEKs()) {
+		t.Error("rotating scope KEKs touched the master KEKs")
+	}
+}
+
+func TestRotateScopeKEKsWithNoScopesIsANoOp(t *testing.T) {
+	k := testKeyring(t)
+	after, rotated, err := k.RotateScopeKEKs()
+	if err != nil {
+		t.Fatalf("RotateScopeKEKs: %v", err)
+	}
+	if len(rotated) != 0 || len(after.Scopes()) != 0 {
+		t.Errorf("a keyring with no scopes reported %d rotations", len(rotated))
+	}
+}
+
+// The property `keeper revoke` depends on: material captured before the
+// rotation — which is exactly what a lost keeper's bundle is — cannot open
+// what the scope writes afterwards, and cannot open what a rekey moved.
+func TestRotateScopeKEKsRetiresWhatAnOldBundleCanOpen(t *testing.T) {
+	ctx := context.Background()
+	fake := newFakeProvider()
+	before := twoAppScopes(t)
+	alphaBefore := before.Scopes()[0]
+	prefix := alphaBefore.Prefix
+
+	oldStore, err := NewStore(fake, "farcast-test-bucket", alphaBefore.Keyring())
+	if err != nil {
+		t.Fatalf("NewStore(old): %v", err)
+	}
+	if err := oldStore.Write(ctx, prefix+"before", []byte("written before")); err != nil {
+		t.Fatalf("Write(before): %v", err)
+	}
+
+	after, rotated, err := before.RotateScopeKEKs()
+	if err != nil {
+		t.Fatalf("RotateScopeKEKs: %v", err)
+	}
+	newStore, err := NewStore(fake, "farcast-test-bucket", after.Scopes()[0].Keyring())
+	if err != nil {
+		t.Fatalf("NewStore(new): %v", err)
+	}
+
+	// The rotated scope still reads what was there.
+	if got, err := newStore.Read(ctx, prefix+"before"); err != nil || string(got) != "written before" {
+		t.Fatalf("the rotated scope lost an older object: %q, %v", got, err)
+	}
+	// New writes go under the new key, which the old material does not hold.
+	if err := newStore.Write(ctx, prefix+"after", []byte("written after")); err != nil {
+		t.Fatalf("Write(after): %v", err)
+	}
+	if KeyID(storedKeyID(t, fake, newStore, prefix+"after")) != rotated[0].Active {
+		t.Error("a write after the rotation was not wrapped under the new KEK")
+	}
+	if _, err := oldStore.Read(ctx, prefix+"after"); !errors.Is(err, ErrUnknownKey) {
+		t.Errorf("pre-rotation material opened a post-rotation write: err = %v", err)
+	}
+
+	// And a rekey moves the older object out of the old material's reach.
+	moved, err := newStore.Rekey(ctx, prefix+"before")
+	if err != nil || !moved {
+		t.Fatalf("Rekey(before) = %v, %v; want moved", moved, err)
+	}
+	if _, err := oldStore.Read(ctx, prefix+"before"); !errors.Is(err, ErrUnknownKey) {
+		t.Errorf("pre-rotation material still opens a rekeyed object: err = %v", err)
+	}
+	if got, err := newStore.Read(ctx, prefix+"before"); err != nil || string(got) != "written before" {
+		t.Errorf("the rekeyed object no longer reads: %q, %v", got, err)
+	}
+}
+
+func TestARotatedKeyringRoundTripsActiveFirst(t *testing.T) {
+	after, rotated, err := twoAppScopes(t).RotateScopeKEKs()
+	if err != nil {
+		t.Fatalf("RotateScopeKEKs: %v", err)
+	}
+	data, err := after.Marshal()
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	back, err := ParseKeyring(data)
+	if err != nil {
+		t.Fatalf("ParseKeyring: %v", err)
+	}
+	for i, s := range back.Scopes() {
+		if s.Keyring().KEKs()[0].ID != rotated[i].Active {
+			t.Errorf("scope %q came back with the wrong active KEK", s.Name)
+		}
+	}
+}
+
+// zeroReader mints the same bytes every time, so every key ID collides.
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) { clear(p); return len(p), nil }
+
+// A rotation must never hand back a keyring Marshal would refuse — by the time
+// the caller marshals, the old keyring may already be gone. With key IDs drawn
+// from a reader that repeats, the new KEK collides with the one it replaces.
+func TestRotateScopeKEKsRefusesACollidingKeyID(t *testing.T) {
+	saved := keyRand
+	keyRand = zeroReader{}
+	defer func() { keyRand = saved }()
+
+	before := twoAppScopes(t)
+	activeBefore := before.Scopes()[0].Keyring().KEKs()[0].ID
+	if _, _, err := before.RotateScopeKEKs(); !errors.Is(err, ErrKeyringInvalid) {
+		t.Fatalf("RotateScopeKEKs with a colliding key ID = %v; want ErrKeyringInvalid", err)
+	}
+	if before.Scopes()[0].Keyring().KEKs()[0].ID != activeBefore || len(before.Scopes()[0].Keyring().KEKs()) != 1 {
+		t.Error("a refused rotation changed the receiver")
+	}
+}
+
+// previousKeys is what a rotation's hand-over keeps active while every
+// replica takes the new keys.
+func previousKeys(rotations []ScopeRotation) map[string]KeyID {
+	out := make(map[string]KeyID, len(rotations))
+	for _, r := range rotations {
+		out[r.Scope] = r.Previous
+	}
+	return out
+}
+
+func TestWithScopeActiveHoldsTheNewKeyWithoutActivatingIt(t *testing.T) {
+	before := twoAppScopes(t)
+	rotated, rotations, err := before.RotateScopeKEKs()
+	if err != nil {
+		t.Fatalf("RotateScopeKEKs: %v", err)
+	}
+	held, err := rotated.WithScopeActive(previousKeys(rotations))
+	if err != nil {
+		t.Fatalf("WithScopeActive: %v", err)
+	}
+	for i, s := range held.Scopes() {
+		keks := s.Keyring().KEKs()
+		r := rotations[i]
+		if keks[0].ID != r.Previous {
+			t.Errorf("scope %q: active KEK is %s, want the previous key %s — holding a key must not activate it", s.Name, keks[0].ID, r.Previous)
+		}
+		ids := map[KeyID]bool{}
+		for _, e := range keks {
+			ids[e.ID] = true
+		}
+		if !ids[r.Active] {
+			t.Errorf("scope %q: the new key is not held", s.Name)
+		}
+		if len(keks) != len(rotated.Scopes()[i].Keyring().KEKs()) || len(ids) != len(keks) {
+			t.Errorf("scope %q: changing the active key changed which keys the scope holds", s.Name)
+		}
+	}
+	// The receiver is untouched: it is what activation pushes.
+	for i, s := range rotated.Scopes() {
+		if s.Keyring().KEKs()[0].ID != rotations[i].Active {
+			t.Errorf("WithScopeActive mutated the rotated keyring's scope %q", s.Name)
+		}
+	}
+	// And the move is reversible: activating the new key again restores the
+	// rotated keyring's active key without losing the previous one.
+	back, err := held.WithScopeActive(func() map[string]KeyID {
+		out := map[string]KeyID{}
+		for _, r := range rotations {
+			out[r.Scope] = r.Active
+		}
+		return out
+	}())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, s := range back.Scopes() {
+		keks := s.Keyring().KEKs()
+		if keks[0].ID != rotations[i].Active || len(keks) != 2 {
+			t.Errorf("scope %q after re-activation: %v", s.Name, keks)
+		}
+	}
+}
+
+// Choosing a key from the middle of a scope's list moves that one key and
+// keeps every other — the newer ones before it and the older ones after.
+func TestWithScopeActiveKeepsEveryKeyAroundTheOneItMoves(t *testing.T) {
+	once, first, err := twoAppScopes(t).RotateScopeKEKs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	twice, _, err := once.RotateScopeKEKs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	middle := map[string]KeyID{}
+	for _, r := range first {
+		middle[r.Scope] = r.Active
+	}
+	moved, err := twice.WithScopeActive(middle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, s := range moved.Scopes() {
+		want := twice.Scopes()[i].Keyring().KEKs()
+		got := s.Keyring().KEKs()
+		if len(got) != 3 || got[0].ID != middle[s.Name] {
+			t.Fatalf("scope %q: %v; want %s active and all three keys", s.Name, got, middle[s.Name])
+		}
+		if got[1].ID != want[0].ID || got[2].ID != want[2].ID {
+			t.Errorf("scope %q: %v; want the newer key, then the older, behind the one moved", s.Name, got)
+		}
+	}
+}
+
+// A key the scope does not hold is refused, not added: WithScopeActive only
+// ever chooses among keys a scope already has. That includes asking a keyring
+// that never took a rotation to make the rotation's key active.
+func TestWithScopeActiveRefusesAKeyTheScopeDoesNotHold(t *testing.T) {
+	before := twoAppScopes(t)
+	rotated, rotations, err := before.RotateScopeKEKs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	activate := map[string]KeyID{rotations[0].Scope: rotations[0].Active}
+	if _, err := before.WithScopeActive(activate); !errors.Is(err, ErrKeyringInvalid) {
+		t.Errorf("activating a key the scope never held = %v; want ErrKeyringInvalid", err)
+	}
+	// A key held by ANOTHER scope is not this scope's to use.
+	crossed := map[string]KeyID{rotations[0].Scope: rotations[1].Active}
+	if _, err := rotated.WithScopeActive(crossed); !errors.Is(err, ErrKeyringInvalid) {
+		t.Errorf("activating another scope's key = %v; want ErrKeyringInvalid", err)
+	}
+	absent := map[string]KeyID{"app-nobody-here": rotations[0].Active}
+	if _, err := rotated.WithScopeActive(absent); !errors.Is(err, ErrKeyringInvalid) {
+		t.Errorf("naming an absent scope = %v; want ErrKeyringInvalid", err)
+	}
+}
+
+// Two machines that each deployed the same application before syncing hold two
+// scopes with one name and different name keys. A merge used to accept them,
+// keep this side's name key active, and so re-address every object the other
+// side's keys had named: unlistable and unreadable, here and — once pushed —
+// in the keyholder.
+func TestMergeRefusesAScopeMintedTwice(t *testing.T) {
+	mint := func() Keyring {
+		k, err := NewKeyring()
+		if err != nil {
+			t.Fatal(err)
+		}
+		s, err := NewAppScope("demo", "alpha")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if k, err = k.AddScope(s); err != nil {
+			t.Fatal(err)
+		}
+		return k
+	}
+	here, there := mint(), mint()
+	if _, err := here.Merge(there); !errors.Is(err, ErrKeyringInvalid) || !strings.Contains(err.Error(), "minted twice") {
+		t.Fatalf("Merge of a scope minted twice = %v; want a refusal", err)
+	}
+	// The ordinary case still merges: the same scope, rotated on one side.
+	rotated, _, err := here.RotateScopeKEKs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := here.Merge(rotated); err != nil {
+		t.Errorf("Merge of the same scope after a rotation = %v; want it merged", err)
+	}
+}

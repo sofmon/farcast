@@ -185,9 +185,7 @@ func reproSession(t *testing.T) (*storage.Session, *reproProvider, config.Dir) {
 	if merr != nil {
 		t.Fatal(merr)
 	}
-	if err := dir.SaveInstanceKeyring(name, encoded); err != nil {
-		t.Fatal(err)
-	}
+	replaceKeyring(t, dir, name, encoded)
 	generation := meta.Keyholder.Generation + 1
 
 	// 3. The bundle crosses the wire and is installed in a real vault.

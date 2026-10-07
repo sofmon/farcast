@@ -46,6 +46,10 @@ type Bundle struct {
 // Generation orders bundles. A keyholder refuses a generation older than the
 // one it already holds, so a bundle captured before a rotation cannot be
 // replayed to put retired keys back into service.
+//
+// The bundle SHARES the scopes' key bytes; it does not copy them. Zero wipes
+// them wherever they are held, so a caller that still needs the keyring it
+// built the bundle from — to push again, or to save — builds it from clones.
 func NewBundle(instance string, generation uint64, scopes []Scope) (*Bundle, error) {
 	if strings.TrimSpace(instance) == "" {
 		return nil, fmt.Errorf("%w: bundle must name its instance", ErrBundleInvalid)

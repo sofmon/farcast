@@ -1095,20 +1095,95 @@ func TestRunSaysWhatMintingAScopeMeans(t *testing.T) {
 
 // fakeStateKeyholder answers State and records what was pushed, so a test can
 // tell "handed the scopes over" from "left it alone".
+// fakeStateKeyholder behaves like a keyholder fleet, replica by replica: it
+// parses what it is pushed, refuses a hand-over to a sealed replica, treats an
+// equal generation on a serving replica as a retry that installs nothing, and
+// reports the keys it holds. The fake it replaces ignored the payload and the
+// intent and answered success to anything — which is why no test could see a
+// hand-over that installed nothing, or one that unsealed a sealed replica.
 type fakeStateKeyholder struct {
-	phase  string
-	pushes int
-	boots  []string
+	phase   string // the phase every replica starts in
+	pushes  int
+	boots   []string
+	intents []string
+	sent    []uint64 // the generation of every bundle pushed
+	reps    map[int]*fakeReplica
 }
 
-func (f *fakeStateKeyholder) State(_ context.Context, _ int) (keyholder.State, error) {
-	return keyholder.State{Phase: f.phase, Boot: "b0"}, nil
+type fakeReplica struct {
+	phase      string
+	generation uint64
+	keys       map[string][]string
 }
 
-func (f *fakeStateKeyholder) Unseal(_ context.Context, _ int, _ []byte, _ string) (keyholder.State, error) {
+func (f *fakeStateKeyholder) replica(i int) *fakeReplica {
+	if f.reps == nil {
+		f.reps = map[int]*fakeReplica{}
+	}
+	r, ok := f.reps[i]
+	if !ok {
+		r = &fakeReplica{phase: f.phase}
+		f.reps[i] = r
+	}
+	return r
+}
+
+func (f *fakeStateKeyholder) State(_ context.Context, i int) (keyholder.State, error) {
+	r := f.replica(i)
+	return keyholder.State{Phase: r.phase, Generation: r.generation, Keys: copyKeys(r.keys), Boot: "b0"}, nil
+}
+
+func (f *fakeStateKeyholder) Unseal(_ context.Context, i int, payload []byte, intent string) (keyholder.State, error) {
 	f.pushes++
 	f.boots = append(f.boots, "b0")
-	return keyholder.State{Phase: "unsealed", Boot: "b0"}, nil
+	f.intents = append(f.intents, intent)
+	r := f.replica(i)
+	if intent == keyholder.IntentHandOver && r.phase != "unsealed" {
+		return keyholder.State{}, &keyholder.Refusal{Ordinal: i, Code: "not-serving", Reason: "sealed (not-serving)"}
+	}
+	if intent == "restart-reseed" && r.phase == "unsealed" {
+		return keyholder.State{}, &keyholder.Refusal{Ordinal: i, Code: "already-serving", Reason: "serving (already-serving)"}
+	}
+	b, err := datasphere.ParseBundle(payload)
+	if err != nil {
+		return keyholder.State{}, err
+	}
+	defer b.Zero()
+	for _, sc := range b.Scopes() {
+		// A real keyholder would install these and serve every application
+		// from bytes of zeroes — self-consistent from inside, readable by
+		// anyone from outside — so a bundle carrying wiped material is a
+		// failure no test may wave through.
+		if sc.Zeroed() {
+			return keyholder.State{}, fmt.Errorf("replica %d was pushed wiped key material for %s", i, sc.Name)
+		}
+	}
+	f.sent = append(f.sent, b.Generation())
+	if b.Generation() < r.generation {
+		return keyholder.State{}, &keyholder.Refusal{Ordinal: i, Code: "generation-too-old", Reason: "older (generation-too-old)"}
+	}
+	if r.phase == "unsealed" && b.Generation() == r.generation {
+		// A retry: the real vault installs nothing and answers success.
+		return keyholder.State{Phase: r.phase, Generation: r.generation, Keys: copyKeys(r.keys), Boot: "b0"}, nil
+	}
+	r.phase, r.generation, r.keys = "unsealed", b.Generation(), map[string][]string{}
+	for _, sc := range b.Scopes() {
+		for _, e := range sc.Keyring().KEKs() {
+			r.keys[sc.Name] = append(r.keys[sc.Name], e.ID.String())
+		}
+	}
+	return keyholder.State{Phase: r.phase, Generation: r.generation, Keys: copyKeys(r.keys), Boot: "b0"}, nil
+}
+
+func copyKeys(m map[string][]string) map[string][]string {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string][]string, len(m))
+	for k, v := range m {
+		out[k] = append([]string(nil), v...)
+	}
+	return out
 }
 
 // Pushing a bundle to a SEALED keyholder is an unseal: the same call, the same

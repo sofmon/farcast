@@ -16,6 +16,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -48,6 +49,46 @@ type State struct {
 	// restarting, and two into the same boot is a live process being asked for
 	// key material it already held.
 	Boot string `json:"boot,omitempty"`
+
+	// Keys lists, per scope this replica holds, the IDs of every
+	// key-encryption key the scope holds, the active one first — control
+	// surface only. It is how a pusher tells whether a replica holds the keys
+	// it sent; the generation cannot, because it advances on every unseal
+	// whether or not a key changed.
+	Keys map[string][]string `json:"keys,omitempty"`
+}
+
+// Intents a pusher may claim. The keyholder decides which a caller may use
+// from the leaf it presents; these are the names on the wire.
+const (
+	IntentOperator = string(dskeyholder.IntentOperator)
+	IntentHandOver = string(dskeyholder.IntentHandOver)
+)
+
+// Refusal is a replica declining a request, with the keyholder's own code.
+type Refusal struct {
+	Ordinal int
+	Code    string
+	Reason  string
+}
+
+func (r *Refusal) Error() string {
+	return fmt.Sprintf("replica %d refused: %s", r.Ordinal, r.Reason)
+}
+
+// NotServing reports a hand-over that a replica refused because it is
+// sealed. That is not a failure of the hand-over — a hand-over never unseals
+// — so a caller treats the replica as waiting, not as broken.
+func NotServing(err error) bool {
+	var r *Refusal
+	return errors.As(err, &r) && r.Code == dskeyholder.CodeNotServing
+}
+
+// AlreadyServing reports a re-seed a replica refused because it holds keys.
+// A re-seed only restores a replica that restarted.
+func AlreadyServing(err error) bool {
+	var r *Refusal
+	return errors.As(err, &r) && r.Code == dskeyholder.CodeAlreadyServing
 }
 
 // Sealed reports whether this replica is holding no key material.
@@ -189,7 +230,8 @@ func (c *Client) call(ctx context.Context, ordinal int, method, path, contentTyp
 		return fmt.Errorf("reading from replica %d: %w", ordinal, err)
 	}
 	if resp.StatusCode/100 != 2 {
-		return fmt.Errorf("replica %d refused: %s", ordinal, refusalReason(payload, resp.Status))
+		code, reason := refusalReason(payload, resp.Status)
+		return &Refusal{Ordinal: ordinal, Code: code, Reason: reason}
 	}
 	if out == nil {
 		return nil
@@ -200,19 +242,21 @@ func (c *Client) call(ctx context.Context, ordinal int, method, path, contentTyp
 	return nil
 }
 
-// refusalReason pulls the keyholder's own message out of an error body.
-func refusalReason(payload []byte, fallback string) string {
+// refusalReason pulls the keyholder's own code and message out of an error
+// body. The reason keeps the code in parentheses, so the text an operator reads
+// is unchanged by the code now also being returned on its own.
+func refusalReason(payload []byte, fallback string) (code, reason string) {
 	var body struct {
 		Code    string `json:"code"`
 		Message string `json:"message"`
 	}
 	if json.Unmarshal(payload, &body) == nil && body.Message != "" {
 		if body.Code != "" {
-			return body.Message + " (" + body.Code + ")"
+			return body.Code, body.Message + " (" + body.Code + ")"
 		}
-		return body.Message
+		return "", body.Message
 	}
-	return fallback
+	return "", fallback
 }
 
 // urlQueryEscape is a minimal escaper for the one free-text value that reaches

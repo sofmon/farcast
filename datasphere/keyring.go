@@ -243,11 +243,127 @@ func (k Keyring) AddScope(s Scope) (Keyring, error) {
 
 // AddKEK prepends a key-encryption key, making it the one that wraps new
 // writes and leaving every existing entry in place to keep decrypting older
-// blobs. This is the whole of rotation's shape; the sweep that retires the old
-// entry is 3.3's `storage rekey`.
+// blobs. This is the whole of rotation's shape; the sweep that moves older
+// objects onto the new entry is `farcast storage key rekey`.
+//
+// It rotates the MASTER key space only. Every application's objects live
+// under a scope with its own KEKs (ADR 0018 decision 5) — see RotateScopeKEKs.
 func (k Keyring) AddKEK(e KeyEntry) Keyring {
 	k.keys = append([]KeyEntry{e}, k.keys...)
 	return k
+}
+
+// ScopeRotation records one scope whose key-encryption key a rotation moved.
+type ScopeRotation struct {
+	Scope string
+	// Previous was the active KEK until the rotation. It stays in the scope,
+	// because every object written before the rotation is wrapped under it.
+	Previous KeyID
+	// Active wraps the scope's new writes from now on.
+	Active KeyID
+}
+
+// RotateScopeKEKs prepends a freshly minted key-encryption key to every scope,
+// making it the one that wraps that scope's new writes, and returns which key
+// replaced which.
+//
+// It exists because AddKEK cannot reach a scope, and since ADR 0018 decision 5
+// a scope is where every application object lives. A keeper's bundle carries
+// scope keys and never the master's, so rotating only the master — which was
+// all `storage key rotate` could do — retired nothing a lost keeper holds.
+//
+// Prepend-only, deliberately, in the same spirit as Merge. It never drops an
+// old KEK, so every object stays readable throughout, and it never touches a
+// name key, because a scope's name key decides where its objects are found: a
+// new active name key would make every one of them unlistable and unreadable.
+// That is also its limit, stated rather than implied — a holder of an old
+// bundle can still compute this scope's stored names, before and after.
+//
+// The receiver is not modified; the returned keyring shares no scope slice
+// with it.
+func (k Keyring) RotateScopeKEKs() (Keyring, []ScopeRotation, error) {
+	if len(k.scopes) == 0 {
+		return k, nil, nil
+	}
+	scopes := make([]Scope, len(k.scopes))
+	rotated := make([]ScopeRotation, 0, len(k.scopes))
+	for i, s := range k.scopes {
+		previous, err := s.keys.ActiveKEK()
+		if err != nil {
+			return Keyring{}, nil, fmt.Errorf("scope %q: %w", s.Name, err)
+		}
+		entry, err := NewKey()
+		if err != nil {
+			return Keyring{}, nil, err
+		}
+		next := s
+		next.keys = s.keys.AddKEK(entry)
+		// AddKEK validates nothing; a rotation must never hand back a keyring
+		// that Marshal would refuse after the old one has been overwritten.
+		if err := next.Valid(); err != nil {
+			return Keyring{}, nil, fmt.Errorf("scope %q after rotation: %w", s.Name, err)
+		}
+		scopes[i] = next
+		rotated = append(rotated, ScopeRotation{Scope: s.Name, Previous: previous.ID, Active: entry.ID})
+	}
+	k.scopes = scopes
+	return k, rotated, nil
+}
+
+// WithScopeActive returns this keyring with each named scope's active
+// key-encryption key set to the given one, which the scope must already hold.
+// Nothing is added or dropped, and a scope's other keys keep their order.
+//
+// It is how a key reaches a fleet of keyholder replicas without being used.
+// Making a new KEK active on one replica before another holds it at all splits
+// them: an object written through the first is unreadable through the second.
+// So every replica is first handed the new key to HOLD — this keyring, with an
+// older key still active — and only once each one confirms is the new key made
+// active. A rotation is the obvious case; any hand-over whose keys some serving
+// replica lacks is the same one.
+//
+// The receiver is not modified. It refuses a scope this keyring does not hold,
+// and a key that scope does not.
+func (k Keyring) WithScopeActive(active map[string]KeyID) (Keyring, error) {
+	pending := make(map[string]KeyID, len(active))
+	for name, id := range active {
+		pending[name] = id
+	}
+	scopes := make([]Scope, len(k.scopes))
+	for i, s := range k.scopes {
+		scopes[i] = s
+		id, ok := pending[s.Name]
+		if !ok {
+			continue
+		}
+		delete(pending, s.Name)
+		keys := s.keys.keys
+		at := -1
+		for j, e := range keys {
+			if e.ID == id {
+				at = j
+				break
+			}
+		}
+		if at < 0 {
+			return Keyring{}, fmt.Errorf("%w: scope %q holds no key-encryption key %s", ErrKeyringInvalid, s.Name, id)
+		}
+		reordered := make([]KeyEntry, 0, len(keys))
+		reordered = append(reordered, keys[at])
+		reordered = append(reordered, keys[:at]...)
+		reordered = append(reordered, keys[at+1:]...)
+		next := s
+		next.keys.keys = reordered
+		if err := next.Valid(); err != nil {
+			return Keyring{}, fmt.Errorf("scope %q: %w", s.Name, err)
+		}
+		scopes[i] = next
+	}
+	for name := range pending {
+		return Keyring{}, fmt.Errorf("%w: no scope %q in this keyring", ErrKeyringInvalid, name)
+	}
+	k.scopes = scopes
+	return k, nil
 }
 
 // Merge adds entries from other that this keyring does not already hold, and
@@ -309,6 +425,16 @@ func mergeScopes(live, incoming []Scope) ([]Scope, error) {
 			return nil, fmt.Errorf("%w: scope %q appears with two prefixes (%q and %q); refusing to merge",
 				ErrKeyringInvalid, s.Name, out[i].Prefix, s.Prefix)
 		}
+		// Same name, no name key in common: two machines each minted this
+		// scope on their own. Merged, this side's name key would stay active
+		// and every object the other side's keys named would become
+		// unlistable and unreadable — to the keyholder too, once this keyring
+		// reached it. Which side's objects to keep is the operator's call,
+		// never a merge's.
+		if !shareAnEntry(out[i].keys.nameKeys, s.keys.nameKeys) {
+			return nil, fmt.Errorf("%w: scope %q was minted twice, independently — the two copies share no name key, "+
+				"so objects named under one cannot be found under the other; refusing to merge", ErrKeyringInvalid, s.Name)
+		}
 		merged, err := out[i].keys.Merge(s.keys)
 		if err != nil {
 			return nil, fmt.Errorf("scope %q: %w", s.Name, err)
@@ -316,6 +442,18 @@ func mergeScopes(live, incoming []Scope) ([]Scope, error) {
 		out[i].keys = merged
 	}
 	return out, nil
+}
+
+// shareAnEntry reports whether two key lists hold any key ID in common.
+func shareAnEntry(a, b []KeyEntry) bool {
+	for _, x := range a {
+		for _, y := range b {
+			if x.ID == y.ID {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func mergeEntries(live, incoming []KeyEntry, what string) ([]KeyEntry, error) {

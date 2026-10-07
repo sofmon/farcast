@@ -10,9 +10,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
 	"testing"
 
@@ -143,7 +145,7 @@ func TestControlUnsealAndRefusals(t *testing.T) {
 	// envelope carries becomes optional in practice.
 	t.Run("a bare bundle is refused", func(t *testing.T) {
 		h := newHarness(t)
-		w := do(h.control, "POST", "/v1/unseal?intent=operator-unseal", nil, marshalBundle(t, "prod", 1))
+		w := doAs(h.control, asOperator, "POST", "/v1/unseal?intent=operator-unseal", nil, marshalBundle(t, "prod", 1))
 		if w.Code == http.StatusOK {
 			t.Fatal("an unsealed bundle was accepted")
 		}
@@ -155,7 +157,7 @@ func TestControlUnsealAndRefusals(t *testing.T) {
 	// A challenge is single-use, so a captured push cannot be replayed.
 	t.Run("a replayed envelope is refused", func(t *testing.T) {
 		h := newHarness(t)
-		cw := do(h.control, "GET", SealChallengePath, nil, nil)
+		cw := doAs(h.control, asOperator, "GET", SealChallengePath, nil, nil)
 		var ch Challenge
 		if err := json.Unmarshal(cw.Body.Bytes(), &ch); err != nil {
 			t.Fatalf("decode challenge: %v", err)
@@ -165,11 +167,11 @@ func TestControlUnsealAndRefusals(t *testing.T) {
 			t.Fatalf("SealBundle: %v", err)
 		}
 		hdr := map[string]string{"Content-Type": ContentTypeSealed}
-		if w := do(h.control, "POST", "/v1/unseal?intent=operator-unseal", hdr, sealed); w.Code != http.StatusOK {
+		if w := doAs(h.control, asOperator, "POST", "/v1/unseal?intent=operator-unseal", hdr, sealed); w.Code != http.StatusOK {
 			t.Fatalf("first push = %d: %s", w.Code, w.Body)
 		}
 		h.vault.Seal(false, "")
-		if w := do(h.control, "POST", "/v1/unseal?intent=operator-unseal", hdr, sealed); w.Code == http.StatusOK {
+		if w := doAs(h.control, asOperator, "POST", "/v1/unseal?intent=operator-unseal", hdr, sealed); w.Code == http.StatusOK {
 			t.Fatal("a replayed envelope was accepted")
 		}
 		if h.vault.Ready() {
@@ -189,7 +191,7 @@ func TestControlUnsealAndRefusals(t *testing.T) {
 		h := newHarness(t)
 		h.unseal(t, 1)
 		h.vault.Seal(true, "maintenance")
-		w := h.push(t, "prod", 2, IntentReseed)
+		w := h.pushAs(t, asKeeper, "prod", 2, IntentReseed)
 		if w.Code != http.StatusConflict || w.Header().Get(HeaderCode) != CodeOperatorHold {
 			t.Fatalf("= %d/%q, want 409/%s", w.Code, w.Header().Get(HeaderCode), CodeOperatorHold)
 		}
@@ -439,7 +441,15 @@ func marshalBundle(t *testing.T, instance string, generation uint64) []byte {
 // does, so nothing is proved against a shortcut that production cannot take.
 func (h *harness) push(t *testing.T, instance string, generation uint64, intent Intent) *httptest.ResponseRecorder {
 	t.Helper()
-	cw := do(h.control, "GET", SealChallengePath, nil, nil)
+	return h.pushAs(t, asOperator, instance, generation, intent)
+}
+
+// pushAs is push made by a named caller. The control surface decides what a
+// caller may claim from the leaf it presents, so who pushes is part of the
+// test, not a detail of it.
+func (h *harness) pushAs(t *testing.T, uri, instance string, generation uint64, intent Intent) *httptest.ResponseRecorder {
+	t.Helper()
+	cw := doAs(h.control, uri, "GET", SealChallengePath, nil, nil)
 	if cw.Code != http.StatusOK {
 		t.Fatalf("challenge = %d: %s", cw.Code, cw.Body)
 	}
@@ -451,7 +461,7 @@ func (h *harness) push(t *testing.T, instance string, generation uint64, intent 
 	if err != nil {
 		t.Fatalf("SealBundle: %v", err)
 	}
-	return do(h.control, "POST", "/v1/unseal?intent="+string(intent),
+	return doAs(h.control, uri, "POST", "/v1/unseal?intent="+string(intent),
 		map[string]string{"Content-Type": ContentTypeSealed}, sealed)
 }
 
@@ -560,7 +570,7 @@ func TestBootLabelIsControlSurfaceOnly(t *testing.T) {
 	var control struct {
 		Boot string `json:"boot"`
 	}
-	mustJSON(t, do(h.control, "GET", "/v1/state", nil, nil), &control)
+	mustJSON(t, doAs(h.control, asOperator, "GET", "/v1/state", nil, nil), &control)
 	if control.Boot == "" {
 		t.Fatal("the control surface reported no boot label; a keeper cannot record which process it seeded")
 	}
@@ -574,7 +584,7 @@ func TestBootLabelIsControlSurfaceOnly(t *testing.T) {
 	var afterUnseal struct {
 		Boot string `json:"boot"`
 	}
-	mustJSON(t, do(h.control, "GET", "/v1/state", nil, nil), &afterUnseal)
+	mustJSON(t, doAs(h.control, asOperator, "GET", "/v1/state", nil, nil), &afterUnseal)
 	if afterUnseal.Boot != control.Boot {
 		t.Errorf("the boot label changed within one process: %q then %q", control.Boot, afterUnseal.Boot)
 	}
@@ -840,4 +850,295 @@ func TestScopeHeaderIsACrossCheckNotAnAuthorization(t *testing.T) {
 	if w := doAs(h.data, asKeeper, "GET", "/v1/object", objHeaders("app/apps/web/doc", appScopeName), nil); w.Code != http.StatusForbidden {
 		t.Errorf("a keeper declaring the scope = %d, want 403", w.Code)
 	}
+}
+
+// F8, found 2026-10-06. Every control route used to take its authority from
+// the request — the intent from the query string, and nothing at all for seal
+// and release — so any keeper the listener admitted had the operator's power
+// over seal state. These pin that it no longer does.
+func TestAKeeperCannotChangeTheSealState(t *testing.T) {
+	for _, path := range []string{
+		"/v1/seal",
+		"/v1/seal?hold=true&reason=keeper-says-so",
+		"/v1/release-hold",
+	} {
+		t.Run(path, func(t *testing.T) {
+			h := newHarness(t)
+			h.unseal(t, 1)
+			h.vault.Seal(true, "operator decision")
+			before := h.vault.State()
+
+			w := doAs(h.control, asKeeper, "POST", path, nil, nil)
+			if w.Code != http.StatusForbidden || w.Header().Get(HeaderCode) != CodePermission {
+				t.Fatalf("a keeper's %s = %d/%q, want 403/%s", path, w.Code, w.Header().Get(HeaderCode), CodePermission)
+			}
+			after := h.vault.State()
+			if after.Phase != before.Phase || after.HoldReason != before.HoldReason {
+				t.Errorf("a refused keeper still changed the seal state: %s %q -> %s %q",
+					before.Phase, before.HoldReason, after.Phase, after.HoldReason)
+			}
+		})
+	}
+	// And the operator still can — a refusal that also stopped the operator
+	// would pass the test above for the wrong reason.
+	h := newHarness(t)
+	h.unseal(t, 1)
+	if w := doAs(h.control, asOperator, "POST", "/v1/seal?hold=true&reason=maintenance", nil, nil); w.Code != http.StatusOK {
+		t.Fatalf("the operator's hold = %d", w.Code)
+	}
+	if w := doAs(h.control, asOperator, "POST", "/v1/release-hold", nil, nil); w.Code != http.StatusOK {
+		t.Fatalf("the operator's release = %d", w.Code)
+	}
+	if h.vault.State().Phase == PhaseOperatorHold {
+		t.Error("the operator's release did not release the hold")
+	}
+}
+
+func TestAKeeperCannotClaimToBeAPerson(t *testing.T) {
+	for _, intent := range []Intent{IntentOperator, IntentHandOver} {
+		t.Run(string(intent), func(t *testing.T) {
+			h := newHarness(t)
+			h.unseal(t, 1)
+			h.vault.Seal(true, "operator decision")
+
+			w := h.pushAs(t, asKeeper, "prod", 2, intent)
+			if w.Code != http.StatusForbidden || w.Header().Get(HeaderCode) != CodePermission {
+				t.Fatalf("a keeper claiming %q = %d/%q, want 403/%s", intent, w.Code, w.Header().Get(HeaderCode), CodePermission)
+			}
+			if st := h.vault.State(); st.Phase != PhaseOperatorHold || st.Generation != 1 {
+				t.Errorf("a keeper's claim moved the vault: phase %s, generation %d", st.Phase, st.Generation)
+			}
+		})
+	}
+}
+
+// A hand-over adds keys to a serving replica and never unseals a sealed one.
+// The CLI used to promise that with a state read followed by an
+// operator-unseal push; the keyholder now refuses it itself.
+func TestAHandOverNeverUnsealsASealedReplica(t *testing.T) {
+	t.Run("restart-sealed", func(t *testing.T) {
+		h := newHarness(t) // a fresh process is restart-sealed
+		w := h.push(t, "prod", 1, IntentHandOver)
+		if w.Code != http.StatusConflict || w.Header().Get(HeaderCode) != CodeNotServing {
+			t.Fatalf("= %d/%q, want 409/%s", w.Code, w.Header().Get(HeaderCode), CodeNotServing)
+		}
+		if h.vault.Ready() {
+			t.Fatal("a hand-over unsealed a restart-sealed replica")
+		}
+	})
+	t.Run("operator hold", func(t *testing.T) {
+		h := newHarness(t)
+		h.unseal(t, 1)
+		h.vault.Seal(true, "operator decision")
+		w := h.push(t, "prod", 2, IntentHandOver)
+		if w.Code != http.StatusConflict || w.Header().Get(HeaderCode) != CodeNotServing {
+			t.Fatalf("= %d/%q, want 409/%s", w.Code, w.Header().Get(HeaderCode), CodeNotServing)
+		}
+		if st := h.vault.State(); st.Phase != PhaseOperatorHold || st.HoldReason != "operator decision" {
+			t.Fatalf("a hand-over disturbed an operator hold: %s %q", st.Phase, st.HoldReason)
+		}
+	})
+	t.Run("serving", func(t *testing.T) {
+		h := newHarness(t)
+		h.unseal(t, 1)
+		w := h.push(t, "prod", 2, IntentHandOver)
+		if w.Code != http.StatusOK {
+			t.Fatalf("a hand-over to a serving replica = %d: %s", w.Code, w.Body)
+		}
+		if st := h.vault.State(); st.Phase != PhaseUnsealed || st.Generation != 2 {
+			t.Fatalf("after a hand-over: phase %s, generation %d; want unsealed at 2", st.Phase, st.Generation)
+		}
+	})
+}
+
+// Defence in depth: ControlTLS skips its URI check when it is given no allow
+// function, so the handler refuses every role but the two it serves.
+func TestTheControlSurfaceRefusesEveryOtherCaller(t *testing.T) {
+	for _, who := range []string{"", asWeb, asDevice} {
+		h := newHarness(t)
+		for _, req := range []struct{ method, path string }{
+			{"GET", "/v1/state"},
+			{"GET", SealChallengePath},
+			{"POST", "/v1/unseal?intent=operator-unseal"},
+			{"POST", "/v1/seal?hold=true"},
+			{"POST", "/v1/release-hold"},
+		} {
+			w := doAs(h.control, who, req.method, req.path, nil, nil)
+			if w.Code != http.StatusForbidden || w.Header().Get(HeaderCode) != CodePermission {
+				t.Errorf("caller %q %s %s = %d/%q, want 403/%s", who, req.method, req.path, w.Code, w.Header().Get(HeaderCode), CodePermission)
+			}
+		}
+	}
+}
+
+// The rekey gate, a rotation's hand-over and a keeper's staleness check all
+// ask "which keys does this replica hold". The generation cannot answer it,
+// because every operator unseal advances it whether or not a key changed. The
+// KEK IDs per scope, active first, answer it exactly — every one of them, since
+// a rotation's first step adds a key without making it active.
+func TestHeldKeysAreReportedOnTheControlSurfaceOnly(t *testing.T) {
+	h := newHarness(t)
+	k := appKeyring(t, "apps", "web", "api")
+	if err := h.vault.Unseal(bundleOf(t, 1, k), IntentOperator); err != nil {
+		t.Fatalf("unseal: %v", err)
+	}
+
+	var public struct {
+		Keys map[string][]string `json:"keys"`
+	}
+	mustJSON(t, do(h.status, "GET", "/v1/state", nil, nil), &public)
+	if len(public.Keys) != 0 {
+		t.Errorf("the unauthenticated status endpoint disclosed key IDs: %v", public.Keys)
+	}
+
+	read := func() map[string][]string {
+		t.Helper()
+		var control struct {
+			Keys map[string][]string `json:"keys"`
+		}
+		mustJSON(t, doAs(h.control, asKeeper, "GET", "/v1/state", nil, nil), &control)
+		return control.Keys
+	}
+	ids := func(k datasphere.Keyring, scope string) []string {
+		for _, sc := range k.Scopes() {
+			if sc.Name == scope {
+				var out []string
+				for _, e := range sc.Keyring().KEKs() {
+					out = append(out, e.ID.String())
+				}
+				return out
+			}
+		}
+		return nil
+	}
+	got := read()
+	for _, sc := range k.Scopes() {
+		if !slices.Equal(got[sc.Name], ids(k, sc.Name)) {
+			t.Errorf("scope %q reported %v, want %v", sc.Name, got[sc.Name], ids(k, sc.Name))
+		}
+	}
+
+	// A staged rotation adds a key without activating it: the active ID does
+	// not move, and only the full list shows the replica holds the new key.
+	rotated, rotations, err := k.RotateScopeKEKs()
+	if err != nil {
+		t.Fatalf("RotateScopeKEKs: %v", err)
+	}
+	previous := map[string]datasphere.KeyID{}
+	for _, r := range rotations {
+		previous[r.Scope] = r.Previous
+	}
+	staged, err := rotated.WithScopeActive(previous)
+	if err != nil {
+		t.Fatalf("WithScopeActive: %v", err)
+	}
+	if err := h.vault.Unseal(bundleOf(t, 2, staged), IntentHandOver); err != nil {
+		t.Fatalf("hand-over of the staged keyring: %v", err)
+	}
+	got = read()
+	for _, r := range rotations {
+		list := got[r.Scope]
+		if len(list) < 2 || list[0] != r.Previous.String() || !slices.Contains(list, r.Active.String()) {
+			t.Errorf("staged scope %q reported %v; want the previous key active and the new one held", r.Scope, list)
+		}
+	}
+
+	// Activation moves the new key to the front.
+	if err := h.vault.Unseal(bundleOf(t, 3, rotated), IntentHandOver); err != nil {
+		t.Fatalf("hand-over of the rotated keyring: %v", err)
+	}
+	got = read()
+	for _, r := range rotations {
+		if list := got[r.Scope]; len(list) == 0 || list[0] != r.Active.String() {
+			t.Errorf("after activation scope %q reported %v; want %s active", r.Scope, list, r.Active)
+		}
+	}
+
+	// A sealed replica holds nothing, so it reports nothing.
+	h.vault.Seal(false, "")
+	if got := read(); len(got) != 0 {
+		t.Errorf("a sealed replica reported key IDs: %v", got)
+	}
+}
+
+// A keeper re-seeds a replica that restarted. Aimed at one that is serving, a
+// re-seed would replace every key it serves with whatever the keeper holds —
+// for a lost keeper, the bundle from before every rotation since.
+func TestAReseedNeverReplacesAServingReplicasKeys(t *testing.T) {
+	h := newHarness(t)
+	h.unseal(t, 1)
+	before := h.vault.State()
+
+	w := h.pushAs(t, asKeeper, "prod", 9, IntentReseed)
+	if w.Code != http.StatusConflict || w.Header().Get(HeaderCode) != CodeAlreadyServing {
+		t.Fatalf("a re-seed into a serving replica = %d/%q, want 409/%s", w.Code, w.Header().Get(HeaderCode), CodeAlreadyServing)
+	}
+	after := h.vault.State()
+	if after.Generation != before.Generation || !maps.EqualFunc(after.Keys, before.Keys, slices.Equal) {
+		t.Errorf("a refused re-seed still replaced the keys: generation %d -> %d", before.Generation, after.Generation)
+	}
+
+	// And the one it is for still works: a replica that restarted.
+	h.vault.Seal(false, "")
+	if w := h.pushAs(t, asKeeper, "prod", 9, IntentReseed); w.Code != http.StatusOK {
+		t.Fatalf("a re-seed into a restart-sealed replica = %d: %s", w.Code, w.Body)
+	}
+}
+
+// Each request gets its own copy of its scope's keys (see Vault.Scope), and
+// wipes it when it ends. The Stores hook is handed that copy — its key slices
+// share their backing arrays with the request's — so capturing it there shows
+// whether the handler wiped what it held.
+func TestEveryDataRouteWipesItsCopyOfTheKeys(t *testing.T) {
+	v := New("prod")
+	p := newMemProvider()
+	var captured []datasphere.Scope
+	srv, err := NewServer(Config{
+		Instance: "prod",
+		Vault:    v,
+		Stores: func(s datasphere.Scope) (*datasphere.Store, error) {
+			captured = append(captured, s)
+			return datasphere.NewStore(p, "farcast-test-bucket", s.Keyring())
+		},
+		Log: slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := v.Unseal(mustBundle(t, "prod", 1), IntentOperator); err != nil {
+		t.Fatal(err)
+	}
+	data := srv.DataHandler()
+	const key = "app/apps/web/doc"
+	for _, req := range []struct {
+		method, path string
+		headers      map[string]string
+		body         []byte
+	}{
+		{"PUT", "/v1/object", objHeaders(key, appScopeName), []byte("x")},
+		{"GET", "/v1/object", objHeaders(key, appScopeName), nil},
+		{"GET", "/v1/list", map[string]string{HeaderPrefix: base64.StdEncoding.EncodeToString([]byte("app/apps/web/")), HeaderScope: appScopeName}, nil},
+		{"DELETE", "/v1/object", objHeaders(key, appScopeName), nil},
+	} {
+		captured = nil
+		w := doAs(data, asWeb, req.method, req.path, req.headers, req.body)
+		if w.Code/100 != 2 {
+			t.Fatalf("%s %s = %d: %s", req.method, req.path, w.Code, w.Body)
+		}
+		if len(captured) != 1 {
+			t.Fatalf("%s %s built %d stores, want 1", req.method, req.path, len(captured))
+		}
+		if !captured[0].Zeroed() {
+			t.Errorf("%s %s returned holding its copy of the keys unwiped", req.method, req.path)
+		}
+	}
+	// And the vault's own keys are untouched by any of it.
+	if st := v.State(); st.Phase != PhaseUnsealed || len(st.Keys) == 0 {
+		t.Fatalf("the vault after four requests: %s, %d scopes' keys", st.Phase, len(st.Keys))
+	}
+	again, err := v.Scope(key)
+	if err != nil || again.Zeroed() {
+		t.Fatalf("the vault's keys were wiped along with a request's: %v", err)
+	}
+	again.Zero()
 }

@@ -21,9 +21,12 @@ import (
 // devices, each with its own revocable leaf.
 //
 // The keeper form is honored from day one so that 5.4 adds a driver rather
-// than a protocol. A keeper's authority is still narrower than an operator's,
-// but that distinction is enforced by intent in the vault, not here: this
-// answers only "may this peer speak to the control surface at all".
+// than a protocol. A keeper's authority is narrower than an operator's, and
+// that is enforced per route by the role on the leaf (Server.controlCaller,
+// Identity.MayPush, Identity.MaySeal), not here: this answers only "may this
+// peer speak to the control surface at all". It once said the distinction
+// was enforced "by intent in the vault" — and the intent was whatever the
+// request claimed, so any keeper could act as the operator.
 func AllowPusher(instance string) func(uri string) bool {
 	operator := "farcast://" + instance + "/operator"
 	keeper := "farcast://" + instance + "/keeper/"

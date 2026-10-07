@@ -86,23 +86,26 @@ func TestUnsealNamesFatLineWhenTheTunnelIsAbsent(t *testing.T) {
 // — and an instance with no applications yields an empty bundle rather than a
 // refusal, because a keyholder that cannot unseal is one that never becomes
 // ready.
-func TestBundleScopesReadsTheKeyringAndMintsNothing(t *testing.T) {
-	dir, _ := keyholderInstance(t, true)
+func TestUnsealHandsOverWhatTheKeyringHoldsAndMintsNothing(t *testing.T) {
+	dir, env := keyholderInstance(t, true)
 	keys, err := datasphere.NewKeyring()
 	if err != nil {
 		t.Fatalf("NewKeyring: %v", err)
 	}
-	meta, _ := dir.LoadInstanceMetadata("prod")
+	saveKeyring(t, dir, "prod", keys)
+	kh := &fakeStateKeyholder{phase: "restart-sealed"}
+	c := &storageUnsealCommand{newKeyholder: openerFor(kh)}
 
-	scopes, generation := bundleScopes(meta, keys)
-	if len(scopes) != 0 {
-		t.Errorf("an instance with no applications yielded %d scope(s)", len(scopes))
+	if err := c.Run(context.Background(), env, []string{"prod"}); err != nil {
+		t.Fatalf("an instance with no applications could not unseal: %v", err)
 	}
-	if generation != 1 {
-		t.Errorf("generation = %d, want 1", generation)
+	if got := len(liveKeyring(t, dir, "prod").Scopes()); got != 0 {
+		t.Errorf("unseal minted %d scope(s)", got)
 	}
-	if _, err := datasphere.NewBundle("prod", generation, scopes); err != nil {
-		t.Errorf("an empty bundle was refused, so this keyholder could never unseal: %v", err)
+	for i := range 2 {
+		if r := kh.replica(i); r.phase != "unsealed" || len(r.keys) != 0 {
+			t.Errorf("replica %d: %s holding %v; want unsealed with no scopes", i, r.phase, r.keys)
+		}
 	}
 
 	// With applications deployed, every one of their scopes travels: a bundle
@@ -117,39 +120,37 @@ func TestBundleScopesReadsTheKeyringAndMintsNothing(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	scopes, _ = bundleScopes(meta, keys)
-	if len(scopes) != 2 {
-		t.Errorf("bundle carries %d scope(s), want both applications'", len(scopes))
+	saveKeyring(t, dir, "prod", keys)
+	if err := c.Run(context.Background(), env, []string{"prod"}); err != nil {
+		t.Fatalf("unseal: %v", err)
+	}
+	for i := range 2 {
+		if !sameKeys(kh.replica(i).keys, heldKeys(keys)) {
+			t.Errorf("replica %d holds %v; want both applications' scopes", i, kh.replica(i).keys)
+		}
 	}
 }
 
 // Generations only ever move forward: a keyholder refuses anything older, so a
 // captured bundle cannot be replayed to reinstate retired keys.
 func TestUnsealAdvancesTheGeneration(t *testing.T) {
-	dir, _ := keyholderInstance(t, true)
-	keys, _ := datasphere.NewKeyring()
-	encoded, _ := keys.Marshal()
-	_ = dir.CreateInstanceKeyring("prod", encoded)
+	dir, env := keyholderInstance(t, true)
+	scopedKeyring(t, dir, "prod", "demo", "alpha")
+	c := &storageUnsealCommand{newKeyholder: openerFor(&fakeStateKeyholder{phase: "restart-sealed"})}
 
 	var last uint64
 	for i := range 3 {
-		meta, _ := dir.LoadInstanceMetadata("prod")
-		reloadedKeys := keys
-		if saved, err := dir.LoadInstanceKeyring("prod"); err == nil {
-			if k, err := datasphere.ParseKeyring(saved); err == nil {
-				reloadedKeys = k
-			}
+		if err := c.Run(context.Background(), env, []string{"prod"}); err != nil {
+			t.Fatalf("round %d: %v", i, err)
 		}
-		_, generation := bundleScopes(meta, reloadedKeys)
-		if generation <= last {
-			t.Fatalf("round %d: generation went backwards: %d after %d", i, generation, last)
-		}
-		last = generation
-		// Stand in for the push landing, which is what records it now.
-		meta.Keyholder.Generation = generation
-		if err := dir.SaveInstanceMetadata("prod", meta); err != nil {
+		meta, err := dir.LoadInstanceMetadata("prod")
+		if err != nil {
 			t.Fatal(err)
 		}
+		if meta.Keyholder.Generation <= last {
+			t.Fatalf("round %d: generation went backwards: %d after %d", i, meta.Keyholder.Generation, last)
+		}
+		last = meta.Keyholder.Generation
 	}
 }
 
@@ -159,12 +160,17 @@ type fakeKeyholder struct {
 	calls int
 }
 
+// State answers as a replica that restarted and has never been unsealed.
+func (f *fakeKeyholder) State(context.Context, int) (keyholder.State, error) {
+	return keyholder.State{Phase: "restart-sealed"}, nil
+}
+
 func (f *fakeKeyholder) Unseal(_ context.Context, _ int, _ []byte, _ string) (keyholder.State, error) {
 	f.calls++
 	if f.err != nil {
 		return keyholder.State{}, f.err
 	}
-	return keyholder.State{Phase: "unsealed", Scopes: []string{"app-apps-web"}}, nil
+	return keyholder.State{Phase: "unsealed"}, nil
 }
 
 // unsealWith wires an unseal command to a fake keyholder and gives the
@@ -182,11 +188,7 @@ func unsealWith(t *testing.T, dir config.Dir, f *fakeKeyholder) *storageUnsealCo
 	if err := dir.CreateInstanceKeyring("prod", encoded); err != nil {
 		t.Fatal(err)
 	}
-	return &storageUnsealCommand{
-		connect: func(context.Context, *Env, string) (keyholderPusher, func(), error) {
-			return f, func() {}, nil
-		},
-	}
+	return &storageUnsealCommand{newKeyholder: openerFor(f)}
 }
 
 // An unseal that reaches no replica must not advance the generation.
@@ -708,5 +710,70 @@ func TestStorageDeploySaysToRedeployApplications(t *testing.T) {
 		if !strings.Contains(buf.String(), want) {
 			t.Errorf("deploy output does not mention %q:\n%s", want, buf.String())
 		}
+	}
+}
+
+// unsealScoped is an unseal of an instance whose keyring holds application
+// scopes — what every instance holds since ADR 0018 decision 5. The fixture
+// above holds none, which makes "did it install the keys" trivially true.
+func unsealScoped(t *testing.T, kh sealStateClient) (config.Dir, *Env, *storageUnsealCommand) {
+	t.Helper()
+	dir, env := keyholderInstance(t, true)
+	scopedKeyring(t, dir, "prod", "demo", "alpha")
+	return dir, env, &storageUnsealCommand{newKeyholder: openerFor(kh)}
+}
+
+// H2 in the remedy itself. 'storage unseal' is what every refusal in this CLI
+// tells the operator to run, and it chose record+1 blindly. With the record one
+// behind a serving replica, that was the number the replica already held: it
+// installed nothing, and unseal reported success.
+func TestUnsealClearsAGenerationTheRecordNeverSaw(t *testing.T) {
+	kh := &fakeStateKeyholder{phase: "unsealed"}
+	dir, env, c := unsealScoped(t, kh)
+	// Replica 0 already serves generation 1 — from before alpha's scope was
+	// minted — and the record says 0.
+	kh.replica(0).generation, kh.replica(0).keys = 1, map[string][]string{}
+
+	if err := c.Run(context.Background(), env, []string{"prod"}); err != nil {
+		t.Fatalf("unseal: %v", err)
+	}
+	want := heldKeys(liveKeyring(t, dir, "prod"))
+	for i := range 2 {
+		if !sameKeys(kh.replica(i).keys, want) {
+			t.Errorf("replica %d holds %v after unseal; want the keyring's %v", i, kh.replica(i).keys, want)
+		}
+	}
+	meta, err := dir.LoadInstanceMetadata("prod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Keyholder.Generation <= 1 {
+		t.Errorf("recorded generation %d; want above the 1 a replica already held", meta.Keyholder.Generation)
+	}
+}
+
+func TestUnsealNeverReportsAnIgnoredPushAsSuccess(t *testing.T) {
+	kh := &installsNothing{fakeStateKeyholder: &fakeStateKeyholder{phase: "restart-sealed"}}
+	dir, env, c := unsealScoped(t, kh)
+
+	err := c.Run(context.Background(), env, []string{"prod"})
+	if err == nil {
+		t.Fatal("an unseal no replica installed was reported as success")
+	}
+	entries, lerr := keyholder.ReadLedger(dir.InstanceUnsealLedgerPath("prod"))
+	if lerr != nil {
+		t.Fatal(lerr)
+	}
+	for _, e := range entries {
+		if e.Result != "not-installed" {
+			t.Errorf("ledger entry %+v; want not-installed", e)
+		}
+	}
+	meta, merr := dir.LoadInstanceMetadata("prod")
+	if merr != nil {
+		t.Fatal(merr)
+	}
+	if meta.Keyholder.Generation != 0 {
+		t.Errorf("recorded generation %d that no replica took", meta.Keyholder.Generation)
 	}
 }
