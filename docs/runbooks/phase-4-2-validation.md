@@ -35,16 +35,22 @@ kubectl config current-context
 
 ```bash
 farcast build "$INSTANCE" --repo https://github.com/sofmon/farcast.git \
-  --app prover --builder-image cgr.dev/chainguard/kaniko:latest
+  --app prover --builder-image gcr.io/kaniko-project/executor:v1.23.2
 ```
 
-Expected: a refusal that **resolves the tag, reports the digest, and explains why it will not just use it** — resolving on every build is trust-on-first-use, not pinning. Record the digest it prints:
+Expected: a refusal that **resolves the tag, reports the digest, and explains why it will not just use it** — resolving on every build is trust-on-first-use, not pinning.
+
+If the resolve itself fails, the registry is unreachable or the image has moved; that is a finding about the image's location, not about FarCast.
+
+Then mirror the toolchain into the instance's own registry and record it there, rather than holding a digest in a shell variable:
 
 ```bash
-KANIKO=<the digest-pinned reference from that output>
+farcast toolchain "$INSTANCE" --builder gcr.io/kaniko-project/executor:v1.23.2 --fetcher cgr.dev/chainguard/git:latest-dev
 ```
 
-If the resolve itself fails, the registry is unreachable or the image has moved; that is a finding about the fork's location, not about FarCast.
+It refuses both tags and prints the digest each resolves to today. Run it again with the two `…@sha256:…` references it printed. That copy is what lands in `farcast-<instance>/system/…` and in the instance's metadata. `farcast toolchain "$INSTANCE"` with no flags reports what is recorded, and every later `build` and `run` uses it when no image flag is given.
+
+*(Corrected 2026-10-08: this step used `cgr.dev/chainguard/kaniko:latest` and told you to keep the digest in `KANIKO=`. That image no longer resolves for an anonymous puller, and the shell variable is how the 4.2 review was lost: nothing wrote it down ([the 4.3 runbook's finding 2](phase-4-3-validation.md#2-the-builder-image-was-withdrawn-seven-days-after-it-was-reviewed--and-the-review-had-not-been-written-down)). [ADR 0011](../adr/0011-build-toolchain-mirroring.md) decision 4 settles on Google's archived Kaniko, `gcr.io/kaniko-project/executor:v1.23.2`, as a named stopgap, and decision 5 says a reviewed digest is recorded, not remembered. `build` also now refuses, before resolving anything, an instance with no deployed kernel. The build is a billed Job and only the kernel counts it.)*
 
 ## 2. Grant the builder its push identity
 
@@ -67,8 +73,10 @@ farcast build "$INSTANCE" \
   --app prover \
   --containerfile manifest/examples/with-build/Containerfile \
   --context manifest/examples/with-build \
-  --builder-image "$KANIKO" --yes
+  --yes
 ```
+
+No `--builder-image`: the build uses the mirrored builder step 1 recorded.
 
 While it runs, confirm the two things only a cluster can tell you:
 
@@ -105,6 +113,15 @@ Expected: Kaniko reporting that it executed the `RUN` command. A build that only
 
 ## 5. Meter the namespace before deploying into it
 
+*(Superseded 2026-10-08, together with step 6. Both were written before `farcast run` existed. `run` (4.3) creates the namespace, labels it, meters it, renders the workloads and applies them in one command, and it refuses an instance with no kernel before it fetches anything. Hand-rendering is no longer how an application reaches an instance, and `/tmp/render.go` below no longer works: `translate.Render` refuses an application with no egress credential ([ADR 0013](../adr/0013-per-application-egress-identity.md)), and one with no storage identity when storage is wired. `run` mints both. The two steps are kept as the 2026-09-07 walk ran them. To reach the state steps 7 and 9 expect, deploy the same application into this runbook's namespace instead:*
+
+```bash
+farcast run "$INSTANCE" github.com/sofmon/farcast \
+  --manifest manifest/examples/manifest-elsewhere/farcast --namespace "$APPS"
+```
+
+*`manifest-elsewhere` is the same `prover` built from the same Containerfile. Its paths are repository-relative, which `with-build`'s `./Containerfile` is not from the repository root. `--namespace` puts it in `with-build`. Then continue at step 6's checks (`kubectl -n "$APPS" get deploy,svc,networkpolicy` onward). With storage deployed, `run` also mints `prover`'s scope and wires its storage variables, so step 6's note about storage being left unwired no longer applies.)*
+
 Doing this *after* deploying would leave the application running, billing, and counted nowhere — which is the failure the 4.1 walk found in another form.
 
 ```bash
@@ -121,6 +138,8 @@ kubectl -n "$NS" get pods -l app.kubernetes.io/name=technocore   # same pod, sam
 ```
 
 ## 6. Deploy the translated workloads
+
+*(Superseded 2026-10-08 — see the note at step 5. Skip to the checks after the render block.)*
 
 There is no `farcast run` yet (4.3), so the translator's output is applied by hand — which is also the clearest way to see what it produced.
 
@@ -205,8 +224,10 @@ Only if you have a repository-scoped, read-only credential to hand. It is the ca
 kubectl -n "$NS" create secret generic demo-git \
   --from-literal=username=<user> --from-literal=token=<repo-scoped read-only token>
 farcast build "$INSTANCE" --repo https://github.com/<you>/<private>.git \
-  --app demo --builder-image "$KANIKO" --git-secret demo-git --yes
+  --app demo --git-secret demo-git --yes
 ```
+
+*(Corrected 2026-10-08: `--builder-image "$KANIKO"` dropped; the mirrored builder from step 1 is used.)*
 
 Expected: the clone succeeds and the credential appears **nowhere in the Job's arguments** — `kubectl -n "$NS" get job build-… -o yaml` should show it only as a `secretKeyRef`.
 
@@ -216,7 +237,7 @@ Expected: the clone succeeds and the credential appears **nowhere in the Job's a
 kubectl -n "$NS" logs deploy/technocore --tail=3 | grep reconciled
 ```
 
-Expected: `pods` includes the application, `unclassified=0`, and `rate_per_hour` risen by the app's requests (100m/128Mi ≈ `$0.0037/hour`). A `pods` count that did not move means the metering path is broken — the 4.1 failure, recurring per-namespace.
+Expected: `pods` includes the application, `unclassified=0`, and `rate_per_hour` risen by the app's requests (100m/128Mi = `$0.0050625/hour`, `$3.70/month`). A `pods` count that did not move means the metering path is broken — the 4.1 failure, recurring per-namespace. *(Corrected 2026-10-08: this read `≈ $0.0037/hour`, which was wrong. The 2026-09-07 walk measured `$0.0050625` per pod, as the results below show. Six Pods now come to 2 × 0.00759375 for FatLine with its Shrike sidecar, plus 4 × 0.0050625, which is `$0.0354/hour`. With the carrier's `$0.025/hour` overhead, expect `rate_per_hour=0.0604`.)*
 
 ## 10. Tear down
 

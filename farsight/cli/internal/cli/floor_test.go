@@ -90,10 +90,10 @@ func TestTheKernelLineMatchesItsManifest(t *testing.T) {
 
 func TestWarnIfBelowFloorSaysWhatCannotBeMet(t *testing.T) {
 	var buf bytes.Buffer
-	limit := config.CostLimit{Amount: 50, Currency: "USD", Period: "monthly"}
+	limit := config.CostLimit{Amount: 30, Currency: "USD", Period: "monthly"}
 	below := warnIfBelowFloor(&buf, limit, floorFull(&config.InstanceMetadata{}), "a fully provisioned instance")
 	if !below {
-		t.Fatal("USD 50 is below the ~$73 floor and must be reported as such")
+		t.Fatal("USD 30 is below even the metered part of the floor and must be reported as such")
 	}
 	out := buf.String()
 	for _, want := range []string{"below what", "limit", "cluster", "carrier", "total", "estimates"} {
@@ -105,6 +105,47 @@ func TestWarnIfBelowFloorSaysWhatCannotBeMet(t *testing.T) {
 	// the shutdown will handle it.
 	if !strings.Contains(out, "never stops the tunnel") {
 		t.Error("the warning does not explain that a shutdown cannot reach the floor")
+	}
+}
+
+// A limit between what the kernel meters and the modelled total is a different
+// failure from one below both: the kernel would never act, because the line
+// that puts the bill over is one it cannot see. Saying "the shutdown cannot
+// reach the floor" there would be wrong — it never starts.
+func TestWarnIfBelowFloorDistinguishesWhatTheKernelMeters(t *testing.T) {
+	f := floorFull(&config.InstanceMetadata{})
+	if f.Metered <= 0 || f.Metered >= f.Total {
+		t.Fatalf("metered %.2f of %.2f: the cluster line must be the unmetered part", f.Metered, f.Total)
+	}
+	var metered float64
+	for _, it := range f.Items {
+		if it.Unmetered != (it.Name == "cluster") {
+			t.Errorf("%s: unmetered = %v; only the modelled cluster line is outside the kernel's meter", it.Name, it.Unmetered)
+		}
+		if !it.Unmetered {
+			metered += it.MonthlyUSD
+		}
+	}
+	if math.Abs(metered-f.Metered) > 1e-9 {
+		t.Errorf("Metered = %.4f, the metered lines sum to %.4f", f.Metered, metered)
+	}
+
+	var buf bytes.Buffer
+	limit := config.CostLimit{Amount: (f.Metered + f.Total) / 2, Currency: "USD", Period: "monthly"}
+	if !warnIfBelowFloor(&buf, limit, f, "a fully provisioned instance") {
+		t.Fatal("a limit below the modelled total must still warn")
+	}
+	out := buf.String()
+	if !strings.Contains(out, "clears what TechnoCore meters") || !strings.Contains(out, "cannot observe") {
+		t.Errorf("the warning does not say the gap is the unmetered line:\n%s", out)
+	}
+	if strings.Contains(out, "never stops the tunnel") {
+		t.Errorf("the warning describes a shutdown that would never start:\n%s", out)
+	}
+	for _, want := range []string{"metered by TechnoCore", "not metered by TechnoCore"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the lines do not say which are metered (%q):\n%s", want, out)
+		}
 	}
 }
 

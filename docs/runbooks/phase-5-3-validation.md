@@ -14,20 +14,32 @@ The fixture is [`sdk/go/examples/demo`](../../sdk/go/examples/demo/main.go), dep
 
 ## Prerequisites
 
-An instance installed, connected, toolchain mirrored, kernel deployed, and a keyholder deployed and unsealed — the state [the 3.2 runbook](phase-3-2-validation.md) leaves behind. The builder's push grant applied **before** the first build ([the 4.2 runbook](phase-4-2-validation.md), and the 5.1b walk that proved what happens otherwise).
+An instance installed, connected, toolchain mirrored, kernel deployed, and a keyholder deployed and unsealed — the state [the 3.2 runbook](phase-3-2-validation.md) leaves behind. The builder's push grant applied **before** the first build ([the 4.2 runbook](phase-4-2-validation.md), and the 5.1b walk that proved what happens otherwise). Mirroring the toolchain is [the 4.3 runbook's step 1a](phase-4-3-validation.md#1a-mirror-the-toolchain). The kernel comes before the first `farcast run`, which refuses an instance without one.
 
 The application needs to do one thing this repository's sample applications do not yet do: call `farcast.Config()` and `farcast.Secrets()` and report what it got. Build a small one against `github.com/sofmon/farcast/sdk/go` that exposes an endpoint printing the *presence* — never the value — of each.
+
+*(Corrected 2026-10-08: nothing needs building by hand. That application exists: [`sdk/go/examples/demo`](../../sdk/go/examples/demo/main.go), deployed through [`manifest/examples/sdk-demo/farcast`](../../manifest/examples/sdk-demo/farcast) as `alpha` and `beta` in namespace `sdk-demo`. Deploy it before section 1, because `farcast secret set` refuses an application that was never deployed. The scope its secret lives in is minted by `run`.)*
+
+Before anything billable: `./check.sh --model` passes at the commit being walked; record the commit and the check's summary line with the results.
+
+Then deploy the fixture:
+
+```bash
+farcast run "$INSTANCE" github.com/sofmon/farcast --manifest manifest/examples/sdk-demo/farcast
+```
 
 ---
 
 ## 1. Does a secret written here reach an application there?
 
 ```bash
-printf '%s' 'alpha-db-hunter2' | farcast secret set p53 alpha DB_PASSWORD
-printf '%s' 'beta-db-s3cret'   | farcast secret set p53 beta  DB_PASSWORD
-echo 'alpha-token-with-newline' | farcast secret set p53 alpha API_TOKEN
-farcast secret ls p53
+printf '%s' 'alpha-db-hunter2' | farcast secret set "$INSTANCE" sdk-demo/alpha DB_PASSWORD
+printf '%s' 'beta-db-s3cret'   | farcast secret set "$INSTANCE" sdk-demo/beta  DB_PASSWORD
+echo 'alpha-token-with-newline' | farcast secret set "$INSTANCE" sdk-demo/alpha API_TOKEN
+farcast secret ls "$INSTANCE"
 ```
+
+*(Corrected 2026-10-08: the 2026-09-10 walk typed `farcast secret set p53 alpha DB_PASSWORD`. The command now names the application as `<namespace>/<app>`, because each application has its own scope (`farcast secret set <instance> <namespace>/<app> <NAME>`, `farsight/cli/internal/cli/secret.go`), and `rm` takes the same form. The prefix it writes to is now `app/sdk-demo/alpha/secrets/`, inside `alpha`'s own scope, where the walk below recorded the old shared `app/secrets/alpha/`.)*
 
 **Result: ✅.** `secret ls` listed three secrets by application and name and printed no value. `alpha` reported `state=present bytes=16` and `beta` reported `bytes=14` — each its own, on the first attempt, with no intervention between the write here and the read there.
 
@@ -81,6 +93,8 @@ This exercises the path [ADR 0008](../adr/0008-in-cluster-key-delivery.md) built
 
 `farcast storage unseal p53` restored service on the next tick with **zero restarts** — the pod's restart count was 0 before and 0 after.
 
+*(Corrected 2026-10-08: this pass does not stand on the evidence given. Until 2026-10-08 Planck rendered `FARCAST_STORAGE_STATUS_ENDPOINT` as `https://` against the status listener, which serves plain HTTP (`planck/translate/workload.go`). The SDK's probe therefore failed its handshake. With every replica sealed and the data Service empty, an application got `ErrStorageUnavailable`, not `ErrStorageSealed`. What the walk saw was most likely the data path's own sealed answer, read in the seconds before readiness took the endpoints away. The endpoint is now rendered `http://`, and a re-walk must check this criterion as follows. Run `farcast storage seal "$INSTANCE"`, which seals both replicas. Wait at least 20 seconds, until `kubectl -n farcast-system get endpoints datasphered` shows none. Only then confirm, on the application's next tick, that it reports `state=sealed` and not `unavailable`. Then run `farcast storage unseal "$INSTANCE"` and confirm it recovers with zero restarts. An application deployed by a CLI from before the fix still carries `https://` until `farcast run` deploys it again.)*
+
 *(Minor: `farcast storage seal` takes no `-y`, while `secret rm`, `run`, `connect` and `release` all do. An inconsistency, recorded rather than fixed here.)*
 
 ## 7. Does `Config()` refuse the platform's namespace in a real pod?
@@ -107,6 +121,13 @@ The fixture deliberately logs a `Secret`, formats it every way `fmt` offers, and
 **Result: ✅.** Every route redacted, marshalling failed loudly, and grepping both applications' entire log streams for the three plaintext values returned **zero**.
 
 ## 9. Rotation and removal
+
+```bash
+printf '%s' '<a new 34-byte value>' | farcast secret set "$INSTANCE" sdk-demo/alpha DB_PASSWORD --force
+farcast secret rm "$INSTANCE" sdk-demo/alpha DB_PASSWORD -y
+```
+
+*(Added 2026-10-08: the walk ran these in the old `<app>` form; both now take `<namespace>/<app>`.)*
 
 **Result: ✅.** `--force` rotated to a 34-byte value and the running application reported `bytes=34` on its next tick — **without a restart**, because the SDK holds no cache. `farcast secret rm` then produced `state=not-found`, `farcast: no such secret` — not the stale value, and not a seal.
 
@@ -185,6 +206,8 @@ Confirmed in the key material too: `keys.yaml` gives each application its own **
 This asks for an application deployed *before* decision 1 existed, then a keyholder upgraded underneath it. On a fresh install with today's binary every application gets a client leaf, so the state cannot occur. Walking it honestly needs a CLI built at `36db52e` deploying first, then today's binary upgrading the keyholder.
 
 `storage deploy` does print the error path preemptively — *"Applications deployed before this keyholder hold no storage identity and will be refused by it. Run 'farcast run' again for each of them"* — so the CLI knows the condition and names the fix. That is not the same as watching it happen, and this criterion stays open.
+
+*(Retired 2026-10-08: the state this criterion asks for can no longer be upgraded into. A CLI from before per-application scopes, the one at `36db52e` included, minted the shared `app` scope, which owns all of `app/`. No per-application scope can be minted beside it, because a scope owns its whole subtree. FarCast has no migration from it, since its objects are named under a name key no per-application scope holds. Since 2026-10-08 `farcast run` refuses such a keyring before it fetches anything, saying to copy the data out with `farcast storage cp` and reinstall (`refuseSharedAppScope` in `farsight/cli/internal/cli/run.go`). So "redeploy and recover" has no path to walk. Every walk instance created with such a CLI was released the same day, so no instance in this state exists to be stranded.)*
 
 ### 14. `run` mints a scope per application, hands it over, and leaves a sealed keyholder sealed — ✅
 
@@ -270,9 +293,13 @@ While walking the key space it emits, once per object, `datasphere: recover name
 
 It completed, so nothing was stranded. But on the one command whose purpose is to stop billing, "deleted" and "deletion started" are different claims — and the local record is gone either way, so a failed delete would leave a billing cluster, no local trace, and a transcript saying it was deleted. Independent verification after `release` has to stay mandatory, which is why criterion 10 is written the way it is.
 
+*(Fixed 2026-10-08: `release` now waits, bounded at 15 minutes, until the cloud reports the cluster gone, and only then deletes the registry, the bucket and the local record. If the wait runs out or is interrupted, it says the cluster "is still being deleted", keeps the instance record, and names `farcast release <instance>` as the way to wait for that same delete. A cluster in `STOPPING` after a successful `release` is now a finding. Independent verification stays mandatory regardless.)*
+
 ### 7. Releasing an instance leaves that machine's keeper state behind
 
 After `release`, `instances/p54` was gone and `keepers/p54` remained — bundle, CA, leaf, key and ledger for an instance that no longer exists. Defensible by design: a keeper is a role, usually on a different machine, and the ledger is deliberately kept. But on a machine holding both, `release` knows the directory is there and says nothing.
+
+*(Fixed 2026-10-08: on the releasing machine, `release` now wipes the bundle and leaf key of a keeper for that instance and keeps its ledger. The keeper is proven by its CA, not by its name. `release` also names the keepers enrolled on other devices, which it cannot reach, and says to run `farcast keeper uninstall <instance>` on each.)*
 
 ### Found while fixing findings 4 and 5 — both fixed, neither walked
 
@@ -295,7 +322,7 @@ The hand-over itself also changed. It used to read each replica's state and then
 | 3 | No Kubernetes Secret or ConfigMap anywhere holds the value | ✅ |
 | 4 | An application's `PUT` and `DELETE` under `secrets/` are refused with `permission` | ✅ |
 | 5 | An application's `GET` of a **neighbour's** secret succeeds, matching ADR 0017 rather than the name | ✅ |
-| 6 | A seal reports as a seal, and clears without a restart | ✅ |
+| 6 | A seal reports as a seal, and clears without a restart | ✅ as recorded. **Reopened 2026-10-08:** the status endpoint was rendered `https://` against a plain-HTTP listener, so a fully sealed instance read as unavailable; re-check as section 6's correction says |
 | 7 | `Config()` refuses `FARCAST_*` in a pod that genuinely has those variables set | ✅ |
 | 8 | A `Secret` reaches no log, no error and no marshalled document in the clear | ✅ |
 | 9 | `--force` rotates, `rm` removes, and the application sees both | ✅ (rotation seen with no restart) |
@@ -309,8 +336,8 @@ Criterion 5 was **inverted on purpose** by [ADR 0018](../adr/0018-thin-device-st
 |---|---|---|
 | 11 | An unidentified client is refused at the **handshake**, with no HTTP status | ✅ `tlsv13 alert certificate required`, `http_code=000` |
 | 12 | An application's own objects are served and **every** neighbour object — secret or ordinary — is refused with `permission` | ✅ including a claim of the neighbour's own scope name |
-| 13 | A pre-upgrade application is refused with a message naming the leaf, and recovers on redeploy | ⏸ **not reachable** from a fresh install; needs a CLI built at `36db52e` |
-| 14 | `run` mints a scope per application and hands it to a serving keyholder, while leaving a sealed **and** a held one sealed | ✅ ledger byte-identical across both sealed deploys. The hand-over path carried a write-corrupting defect this walk could not exercise; fixed 2026-10-06, not re-walked |
+| 13 | A pre-upgrade application is refused with a message naming the leaf, and recovers on redeploy | ⏸ **not reachable** from a fresh install; needs a CLI built at `36db52e`. **Retired 2026-10-08:** such a CLI mints the shared `app` scope, which `run` now refuses before fetching anything, so there is no recovery to walk (see the note under section 13 above) |
+| 14 | `run` mints a scope per application and hands it to a serving keyholder, while leaving a sealed **and** a held one sealed | ✅ ledger byte-identical across both sealed deploys. The hand-over path carried a write-corrupting defect this walk could not exercise; fixed 2026-10-06, not re-walked. The procedure for re-walking it with a write in flight is in [the consolidated walk runbook](phase-5-session-a.md) |
 | 15 | An instance with no applications unseals and becomes ready | ✅ generation 1, single attempt |
 
 Both defects the first walk found were fixed **and re-verified on the same live instance** before teardown, which is what [the 5.2 walk](phase-5-2-validation.md) could not do. The re-walk held to the same standard: of the [seven defects it found](#what-the-re-walk-found), the two cheapest were fixed and re-verified on `p54` before it was released.

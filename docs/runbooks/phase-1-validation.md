@@ -12,16 +12,21 @@ real `DeleteCluster`, and local state round-tripping across two commands.
 **Cost & time.** A short create→delete cycle of an *empty* Autopilot cluster is
 cheap — the first zonal/Autopilot cluster's management fee is covered by the GKE
 free tier, and an empty cluster runs no billable Pods. Budget **~5–10 min** for
-create; `release` itself returns in seconds, with GCP finishing the delete over
-**~3–5 min** in the background. The mandatory cost limit is only *recorded* in
+create and **~3–5 min** for `release`, which waits until GCP reports the cluster gone.
+The mandatory cost limit is only *recorded* in
 Phase 1 (TechnoCore enforces it in 4.1), so it will not stop anything — `release`
 is what guarantees no lingering charges.
+*(Corrected 2026-10-08: `release` used to return as soon as GCP accepted the delete;
+it now waits, bounded at 15 minutes, until the cluster is gone — see Step 8.)*
 
 > **Status.** Executed end-to-end against a real GCP project on **2026-08-24** — all six
 > success criteria passed, including live confirmation of the private control plane
 > (a `*.gke.goog` DNS endpoint, no public control-plane IP). One behavioural note from
 > the live run: `release` returns once GCP *accepts* the delete — the cluster stays
 > `STOPPING` for a few more minutes (see Steps 8–9).
+> *(Corrected 2026-10-08: that note describes the CLI of the 2026-08-24 run. `release`
+> now waits until GCP reports the cluster gone, so no `STOPPING` cluster remains once it
+> returns; Steps 8–9 and the criteria below say what to expect now.)*
 
 ---
 
@@ -119,9 +124,16 @@ Step 1/2 before continuing.
   --project "$PROJECT_ID" \
   --region "$REGION" \
   --credentials "$KEY" \
-  --cost-limit 50 \
+  --cost-limit 100 \
   --yes
 ```
+
+*(Corrected 2026-10-08: the limit was `50`. Install checks the limit against what a
+fully provisioned instance costs standing still — about USD 77.42/month, of which the
+modelled ~USD 37 cluster line is not something TechnoCore meters — and a limit of 50
+now draws a warning that it clears what TechnoCore meters but not the cluster line.
+100 clears the whole floor, so a clean install prints no warning. The floor itself is
+in `farsight/cli/internal/cli/floor.go`.)*
 
 This **blocks for several minutes** while Autopilot provisions. ✅ Expect, on
 success:
@@ -132,10 +144,14 @@ success:
   region:      us-central1
   cluster:     farcast-validate
   endpoint:    <uid>.us-central1.gke.goog        ← a DNS endpoint, not an IP
-  cost limit:  USD 50.00 / monthly
+  registry:    us-central1-docker.pkg.dev/<project>/farcast-validate (instance images, ~$0/mo)
+  cost limit:  USD 100.00 / monthly
   state:       running
   config:      .../.farcast-validation/instances/validate
 ```
+
+No "The cost limit is below what a fully provisioned instance costs" block should
+appear above it; if it does, the limit or the floor has moved.
 
 The `endpoint` being a `*.gke.goog` **DNS** name (no public IP) is the visible
 proof the private control plane (ADR 0004) took effect.
@@ -177,26 +193,37 @@ instance — you only name it:
 ./farcast release "$INSTANCE" --yes
 ```
 
-This returns as soon as GCP **accepts** the delete — the cluster then finishes deleting in
-the background, showing as `STOPPING` for another ~3–5 minutes (see Step 9). ✅ Expect:
+This **blocks for ~3–5 minutes**: it waits until GCP reports the cluster gone, then deletes
+the instance's image registry, and only then removes the local record. ✅ Expect:
 
 ```
 ✓ instance "validate" released
   provider:    gke
   cluster:     farcast-validate (deleted)
+  registry:    farcast-validate (deleted)
   state:       removed
 ```
+
+*(Corrected 2026-10-08: `release` used to return as soon as GCP **accepted** the delete,
+leaving the cluster `STOPPING` for minutes afterwards. It now waits, bounded at 15
+minutes. If that wait runs out or you interrupt it, the delete carries on in the cloud,
+the command fails with "cluster … is still being deleted … re-run 'farcast release
+validate'", and the instance record is **kept** so a re-run waits on that same delete.
+On an instance that has keepers, `release` also wipes the bundle and leaf key of a keeper
+installed on this machine for the instance — keeping its ledger — and names keepers
+enrolled on other devices, which it cannot reach. Neither applies to this walk.)*
 
 ## 9. Verify teardown & clean up
 
 ```bash
-gcloud container clusters list --project "$PROJECT_ID"     # STOPPING at first, then gone
+gcloud container clusters list --project "$PROJECT_ID"     # farcast-validate absent
+gcloud artifacts repositories list --project "$PROJECT_ID" --location "$REGION"   # farcast-validate absent
 ls "$FARCAST_CONFIG_HOME/instances/"                        # 'validate' gone
 ```
 
-✅ Expect: the local record gone immediately. The cluster may still be listed as `STOPPING`
-for a few minutes after `release` returns — re-run the list until `farcast-validate` is gone
-(no lingering charges).
+✅ Expect: the cluster and the registry are already absent when `release` returns — no
+`STOPPING` entry — and the local record is gone (no lingering charges). A cluster still
+listed after a *successful* `release` is a finding, not a wait.
 
 Optional final cleanup once you're satisfied:
 
@@ -212,7 +239,7 @@ gcloud iam service-accounts keys list --iam-account "$SA"  # then delete keys if
 
 | Symptom | Cause & fix |
 |---|---|
-| `could not find default credentials` | You omitted `--credentials` and have no ADC. Pass `--credentials "$KEY"`, or run `gcloud auth application-default login`. |
+| `could not find default credentials` | You omitted `--credentials`. Pass `--credentials "$KEY"`. Do not reach for `gcloud auth application-default login`: this project never uses Application Default Credentials — FarCast gets the explicit service-account key, and `gcloud` runs under the operator's own configuration. *(Corrected 2026-10-08: this row used to suggest ADC.)* |
 | `PERMISSION_DENIED` on create | The installer SA lacks `roles/container.admin`. Re-check Step 2. |
 | `... does not have permission to act as ... compute@developer` | Missing `roles/iam.serviceAccountUser` (Step 2), or the **default compute SA is disabled** on the project (org-policy). Enable it or grant actAs on the node SA. |
 | `Kubernetes Engine API has not been used/enabled` | Step 1 not done (or still propagating — wait a minute). |
@@ -251,7 +278,7 @@ go run ./planck/cmd/planck delete --provider gke --project "$PROJECT_ID" --locat
 - [ ] `farcast install` finishes with `state: running` and a `*.gke.goog` endpoint.
 - [ ] `gcloud` shows the cluster `RUNNING`, Autopilot, **no public control-plane IP**.
 - [ ] Local state exists with `0700`/`0600` perms and `status: running`.
-- [ ] `farcast release` succeeds (delete accepted by GCP) and removes local state.
-- [ ] `gcloud` shows the cluster gone — `STOPPING` at first, absent a few minutes later; no lingering billable resources.
+- [ ] `farcast release` succeeds — it returns only once GCP reports the cluster gone — and removes local state.
+- [ ] `gcloud` shows the cluster and the registry gone as soon as `release` returns — no `STOPPING` entry; no lingering billable resources. *(Corrected 2026-10-08: this used to expect `STOPPING` at first, absent a few minutes later.)*
 
 If all six pass, Phase 1 is validated end-to-end and you're clear to start Phase 2.

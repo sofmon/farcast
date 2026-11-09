@@ -45,7 +45,14 @@ model behind it, within a clamp.
 
 Every figure comes from the kernel's own checkpoint rather than being modelled
 again here, so what is shown is what enforcement is acting on. It is as recent
-as the last checkpoint, and says when that was.`)
+as the last checkpoint, and says when that was.
+
+The load-balancer carrier is metered as instance overhead: it counts against
+the limit and is shown on its own, never inside an application's share,
+because no application can be stopped to remove it. Some charges the kernel
+cannot see from inside the cluster at all — carrier data, bucket storage and
+operations, registry storage — and the report names them every time; only
+'confirmed' catches those.`)
 }
 
 func (c *costsCommand) SetFlags(*flag.FlagSet) {}
@@ -115,6 +122,7 @@ func (c *costsCommand) Run(ctx context.Context, env *Env, args []string) error {
 		ObservedAgo:   since(cp.Observed.At),
 		RecordedLimit: meta.CostLimit.Amount,
 		Apps:          appSpend(ledger.ByApp()),
+		Overhead:      appSpend(ledger.ByOverhead()),
 	}
 	for _, d := range accrual.Discrepancies {
 		res.Discrepancies = append(res.Discrepancies, d.String())
@@ -166,7 +174,10 @@ type costsResult struct {
 	ObservedAgo   string             `json:"observed_ago,omitempty"`
 	RecordedLimit float64            `json:"recorded_limit,omitempty"`
 
-	Apps          []appCost `json:"apps,omitempty"`
+	Apps []appCost `json:"apps,omitempty"`
+	// Overhead is the instance-level spending no application owns — today the
+	// load-balancer carrier.
+	Overhead      []appCost `json:"overhead,omitempty"`
 	Discrepancies []string  `json:"discrepancies,omitempty"`
 }
 
@@ -206,6 +217,9 @@ func (r costsResult) Human(w io.Writer) error {
 
 	fprintf(w, "\n  rate       %s %.4f/hour across %s",
 		cur, r.Observed.RateHourlyUSD, plural(r.Observed.Pods, "pod", "pods"))
+	if r.Observed.Overhead > 0 {
+		fprintf(w, " and the carrier")
+	}
 	if c := regionCaveat(r.Region); c != "" {
 		fprintf(w, ", %s", c)
 	}
@@ -231,6 +245,26 @@ func (r costsResult) Human(w io.Writer) error {
 		fprintf(w, "\nAttribution is from 'expected' only — the provider bills the instance, not\n")
 		fprintf(w, "the applications in it, so a confirmed total can never be split this way.\n")
 	}
+
+	if len(r.Overhead) > 0 {
+		fprintf(w, "\nInstance overhead (never attributed to an application):\n")
+		for _, o := range r.Overhead {
+			fprintf(w, "  %-24s %s %8.2f\n", o.Name, cur, o.USD)
+		}
+	}
+	if r.Observed.Carrier == string(kernel.CarrierUnobserved) {
+		fprintf(w, "\nThe kernel could not read the carrier's Service, so it is billing it as present.\n")
+	}
+
+	// Always printed. A figure that looks complete is the failure this guards
+	// against: these charges reach the bill and never reach 'expected'.
+	fprintf(w, "\nNot metered — the kernel cannot see these from inside the cluster:\n")
+	fprintf(w, "  data through the carrier (egress and load-balancer processing)\n")
+	fprintf(w, "  bucket storage and operations\n")
+	fprintf(w, "  registry storage\n")
+	fprintf(w, "  the cluster's own managed workloads (modelled at about $%d/month in the floor, unverified)\n", emptyClusterMonthlyUSD)
+	fprintf(w, "  the GKE cluster fee, if the free credit is spent on another cluster\n")
+	fprintf(w, "'confirmed' is what catches them.\n")
 
 	if r.Observed.Unclassified > 0 {
 		fprintf(w, "\n%s carry no tier label and are protected from a cost shutdown as a result.\n",

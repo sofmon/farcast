@@ -36,7 +36,15 @@ const (
 // alongside the plain one without the route changing.
 const (
 	ContentTypeSealed = "application/vnd.farcast.sealed-bundle"
+	ContentTypePin    = "application/json"
 )
+
+// PinOverride is the value of the unseal route's pin parameter that skips the
+// key pin. Only the operator, unsealing, may send it.
+const PinOverride = "override"
+
+// PinPath is where the operator raises a running replica's key pin.
+const PinPath = "/v1/pin"
 
 // SealChallengePath is where a pusher fetches the single-use challenge it must
 // answer before this process will accept key material.
@@ -216,6 +224,27 @@ func (s *Server) ControlHandler() http.Handler {
 			s.fail(w, r, fmt.Errorf("%w: %s %q may not push with intent %q", ErrNotAuthorized, id.Role, id.Name, intent))
 			return
 		}
+		var belowPin bool
+		switch pin := r.URL.Query().Get("pin"); pin {
+		case "":
+		case PinOverride:
+			belowPin = true
+		default:
+			s.fail(w, r, fmt.Errorf("%w: unknown pin parameter %q", datasphere.ErrBundleInvalid, pin))
+			return
+		}
+		// A person past a pin no keyring satisfies any more. Never a keeper,
+		// and never a push that is not an unseal: the pin is the keeper's
+		// guard and the hand-over's, and the way past it is a person's act.
+		// The role check is defence in depth — MayPush above already refuses
+		// a keeper that claims operator-unseal, and mutation testing confirms
+		// it is not load-bearing for refusal today. It stays so that this
+		// line does not depend on that one.
+		if belowPin && (id.Role != RoleOperator || intent != IntentOperator) {
+			s.log.Warn("unseal below the key pin refused", "role", id.Role, "intent", intent)
+			s.fail(w, r, fmt.Errorf("%w: only the operator unsealing may push below the key pin", ErrNotAuthorized))
+			return
+		}
 
 		// The envelope is the only way in. The boundary is Open below,
 		// which refuses anything that is not a well-formed envelope
@@ -238,6 +267,14 @@ func (s *Server) ControlHandler() http.Handler {
 			s.fail(w, r, err)
 			return
 		}
+		// A keeper pushes the bundle its leaf was issued for, byte for byte,
+		// or nothing.
+		if err := id.bindsBundle(payload); err != nil {
+			clear(payload)
+			s.log.Warn("keeper bundle refused", "keeper", id.Name, "error", err)
+			s.fail(w, r, err)
+			return
+		}
 		bundle, err := datasphere.ParseBundle(payload)
 		clear(payload)
 		if err != nil {
@@ -246,7 +283,11 @@ func (s *Server) ControlHandler() http.Handler {
 		}
 		defer bundle.Zero()
 
-		if err := s.cfg.Vault.Unseal(bundle, intent); err != nil {
+		unseal := func() error { return s.cfg.Vault.Unseal(bundle, intent) }
+		if belowPin {
+			unseal = func() error { return s.cfg.Vault.UnsealBelowPin(bundle) }
+		}
+		if err := unseal(); err != nil {
 			// Logged without the bundle: a refusal names phases and
 			// generations, never material.
 			s.log.Warn("unseal refused", "intent", intent, "generation", bundle.Generation(), "error", err)
@@ -254,7 +295,41 @@ func (s *Server) ControlHandler() http.Handler {
 			return
 		}
 		st := s.cfg.Vault.State()
+		if belowPin {
+			s.log.Warn("unsealed below the key pin", "generation", st.Generation, "scopes", len(st.Scopes),
+				"serving_below", st.Pin.ServingBelow)
+		}
 		s.log.Info("unsealed", "intent", intent, "generation", st.Generation, "scopes", len(st.Scopes))
+		writeJSON(w, http.StatusOK, controlStateBody(s.cfg.Instance, st))
+	})
+
+	// The operator raising a running replica's key pin. The environment is
+	// read once, at start; without this a replica that was sealed when a
+	// rotation moved the pin would keep the old one until it next restarted,
+	// and that is exactly the window a lost keeper's old bundle needs.
+	mux.HandleFunc("POST "+PinPath, func(w http.ResponseWriter, r *http.Request) {
+		if err := s.mayChangeSeal(r); err != nil {
+			s.fail(w, r, err)
+			return
+		}
+		if ct := r.Header.Get("Content-Type"); ct != ContentTypePin {
+			s.fail(w, r, fmt.Errorf("%w: a key pin is sent as %s", ErrPinInvalid, ContentTypePin))
+			return
+		}
+		raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, MaxPinBytes))
+		if err != nil {
+			s.fail(w, r, fmt.Errorf("%w: unreadable body", ErrPinInvalid))
+			return
+		}
+		pin, present, err := ParsePin(string(raw))
+		if err != nil || !present {
+			s.fail(w, r, fmt.Errorf("%w: %v", ErrPinInvalid, err))
+			return
+		}
+		replace := r.URL.Query().Get("replace") == "true"
+		st := s.cfg.Vault.RaisePin(pin, replace)
+		s.log.Info("key pin raised", "replace", replace,
+			"require", len(st.Pin.Require), "retired", len(st.Pin.Retired), "serving_below", st.Pin.ServingBelow)
 		writeJSON(w, http.StatusOK, controlStateBody(s.cfg.Instance, st))
 	})
 
@@ -509,6 +584,8 @@ func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 func safeMessage(err error) string {
 	for _, known := range []error{
 		ErrSealed, ErrOperatorHold, ErrGenerationTooOld, ErrInstanceMismatch, ErrOutOfScope,
+		ErrNotServing, ErrAlreadyServing, ErrWouldDrop,
+		ErrBelowPin, ErrPinUnreadable, ErrPinInvalid, ErrKeeperBundle,
 		ErrSecretsReadOnly, ErrNotAuthorized, ErrNoIdentity,
 		datasphere.ErrObjectNotFound, datasphere.ErrIntegrity, datasphere.ErrUnknownKey,
 		datasphere.ErrInvalidKey, datasphere.ErrTooLarge, datasphere.ErrBundleInvalid,
@@ -534,6 +611,9 @@ type stateResponse struct {
 	// Keys is set on the control surface only: scope name to the hex IDs of
 	// every KEK it holds, the active one first. See State.Keys.
 	Keys map[string][]string `json:"keys,omitempty"`
+	// Pin is set on the control surface only: the key pin this replica
+	// enforces. Nil from an image that predates the pin.
+	Pin *PinReport `json:"pin,omitempty"`
 }
 
 // stateBody is what the UNAUTHENTICATED status endpoint answers.
@@ -561,6 +641,10 @@ func controlStateBody(instance string, st State) stateResponse {
 	body := stateBody(instance, st)
 	body.Boot = st.Boot
 	body.Keys = st.Keys
+	if st.Pin.Status != "" {
+		pin := st.Pin
+		body.Pin = &pin
+	}
 	return body
 }
 

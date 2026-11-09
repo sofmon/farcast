@@ -67,8 +67,11 @@ The build runs as a one-shot Job with its own deadline, is stopped by nothing
 except that deadline, and reports the digest it pushed through the Pod's
 status. Deploying that image pins it by digest.
 
-At 4.3 'farcast run' will read the manifest and call this for each app; today
-the app and its Containerfile are given explicitly.`)
+An instance with no kernel is refused: the build is a billed Job, and nothing
+would count it against the cost limit.
+
+'farcast run' reads a repository's manifest and builds every application in it;
+this builds one, with its Containerfile given explicitly.`)
 }
 
 func (c *buildCommand) SetFlags(fs *flag.FlagSet) {
@@ -111,6 +114,11 @@ func (c *buildCommand) Run(ctx context.Context, env *Env, args []string) error {
 	}
 	if meta.Registry == nil || meta.Registry.Prefix == "" {
 		return fmt.Errorf("instance %q has no image registry recorded; run 'farcast connect %s' first", name, name)
+	}
+	// Before the builder is resolved: the build is a billed Job in
+	// farcast-system, which only a kernel meters.
+	if err := requireKernel(name, meta, "this build"); err != nil {
+		return err
 	}
 
 	builder, err := c.resolveBuilder(ctx, env, meta)

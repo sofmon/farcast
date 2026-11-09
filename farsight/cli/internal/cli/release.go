@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/sofmon/farcast/datasphere"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
+	"github.com/sofmon/farcast/farsight/cli/internal/keeper"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
 	"github.com/sofmon/farcast/farsight/cli/internal/storage"
 	"github.com/sofmon/farcast/planck"
@@ -48,6 +50,19 @@ final. Copy it out with 'farcast storage cp' first, or pass --delete-data.
 --delete-data is a scope flag, not a consent flag: --yes never implies it, so
 the confirmation you click through daily cannot destroy the irreplaceable
 thing. A bucket with no objects needs neither.
+
+release waits until the cloud reports the cluster gone, up to 15 minutes.
+Interrupting it, or the wait running out, once the cloud has accepted the
+delete stops the waiting and not the delete: the cloud carries on, the
+instance record is kept, and running release again waits for that same
+delete. Stopped before the cloud confirmed a delete, it says so — the cluster
+may still be running — and the record is kept just the same.
+
+A keeper on this machine for the released instance — proven by its CA, not by
+its name — has its bundle and leaf key wiped. Its ledger is kept: it is the
+record of what that device did with key material. Keepers on other devices are
+named; release cannot reach them, and 'farcast keeper uninstall' on each does
+the same there.
 
 With --output json the command prints one JSON result and never prompts.`)
 }
@@ -90,8 +105,10 @@ func (c *releaseCommand) Run(ctx context.Context, env *Env, args []string) error
 		return err
 	}
 
+	plan := planKeeper(env, name, meta)
+
 	interactive := env.Printer.Mode == output.ModeHuman && isTerminal(env.In)
-	ok, err := c.confirm(interactive, newPrompter(env.In, env.Err), env.Err, meta, stored)
+	ok, err := c.confirm(interactive, newPrompter(env.In, env.Err), env.Err, meta, stored, plan)
 	if err != nil {
 		return err
 	}
@@ -121,8 +138,23 @@ func (c *releaseCommand) Run(ctx context.Context, env *Env, args []string) error
 	if interactive || env.Verbose {
 		fprintf(env.Err, "Destroying %s — this can take several minutes…\n", meta.Cluster)
 	}
+	// DeleteCluster returns once the cluster is gone, and a re-run while the
+	// cloud is still deleting waits on that delete rather than asking again.
 	ref := planck.ClusterRef{Name: meta.Cluster, Location: meta.Region}
-	if err := p.DeleteCluster(ctx, ref); err != nil {
+	dctx, cancel := context.WithTimeout(ctx, clusterDeleteTimeout)
+	defer cancel()
+	if err := p.DeleteCluster(dctx, ref); err != nil {
+		switch {
+		case errors.Is(err, planck.ErrDeleteInProgress):
+			return fmt.Errorf("cluster %q is still being deleted: %w; the cloud continues the delete without this command, "+
+				"and the instance is kept — re-run 'farcast release %s' to wait for it to finish", meta.Cluster, err, name)
+		case dctx.Err() != nil || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled):
+			// Stopped before the cloud confirmed a delete: it may never have
+			// been sent, and the cluster may be running — and billing — as
+			// before. Saying "the cloud continues" here would be a guess.
+			return fmt.Errorf("release stopped before the cloud confirmed deleting cluster %q (%w); it may still be running and billing. "+
+				"The instance is kept — re-run 'farcast release %s'", meta.Cluster, err, name)
+		}
 		return fmt.Errorf("destroying cluster %q failed: %w; the instance is kept — re-run 'farcast release %s'",
 			meta.Cluster, err, name)
 	}
@@ -148,6 +180,12 @@ func (c *releaseCommand) Run(ctx context.Context, env *Env, args []string) error
 		return fmt.Errorf("cluster and registry destroyed but destroying the storage bucket failed: %w; the instance is kept — re-run 'farcast release %s --delete-data'", err, name)
 	}
 
+	// After every cloud resource, before local state: a failure here leaves
+	// the record a re-run proves the keeper against. Nothing billable rides
+	// on it, so a failure is a warning.
+	keeperDone := plan.execute(env)
+	elsewhere := keepersElsewhere(meta.Keepers, plan)
+
 	if err := env.ConfigDir.RemoveInstance(name); err != nil {
 		return fmt.Errorf("cloud resources destroyed but removing local state failed: %w", err)
 	}
@@ -159,6 +197,8 @@ func (c *releaseCommand) Run(ctx context.Context, env *Env, args []string) error
 		Registry:    registry,
 		Bucket:      bucket,
 		DeletedData: stored.Objects,
+		Keeper:      keeperDone,
+		Elsewhere:   elsewhere,
 		Status:      "released",
 	})
 }
@@ -281,7 +321,7 @@ func deleteRegistry(ctx context.Context, p planck.Provider, meta *config.Instanc
 // silently. Otherwise it requires an interactive session and asks the operator
 // to retype the instance name (stronger than a y/N, because release is
 // destructive); a non-interactive session without --yes is a usage error.
-func (c *releaseCommand) confirm(interactive bool, p *prompter, errw io.Writer, meta *config.InstanceMetadata, stored datasphere.Usage) (bool, error) {
+func (c *releaseCommand) confirm(interactive bool, p *prompter, errw io.Writer, meta *config.InstanceMetadata, stored datasphere.Usage, plan *keeperPlan) (bool, error) {
 	if c.assumeYes {
 		return true, nil
 	}
@@ -292,6 +332,12 @@ func (c *releaseCommand) confirm(interactive bool, p *prompter, errw io.Writer, 
 	if stored.Objects > 0 {
 		fprintf(errw, "  storage:     %s (%d objects, %s) — PERMANENTLY UNREADABLE after this\n",
 			meta.Storage.Bucket, stored.Objects, humanBytes(stored.StoredBytes))
+	}
+	if plan != nil && plan.store != nil {
+		fprintf(errw, "  keeper:      this machine's bundle and leaf key for %q — its ledger is kept\n", meta.Name)
+	}
+	if others := keepersElsewhere(meta.Keepers, plan); len(others) > 0 {
+		fprintf(errw, "  keepers:     %d other device(s) hold this instance's bundle; release cannot reach them\n", len(others))
 	}
 	typed, err := p.line(fmt.Sprintf("Retype the instance name %q to confirm destruction", meta.Name))
 	if err != nil {
@@ -324,8 +370,12 @@ type releaseResult struct {
 	// DeletedData is how many stored objects went with the instance. It is
 	// reported because it is the one number in this result that cannot be
 	// undone by reinstalling.
-	DeletedData int64  `json:"deleted_objects,omitempty"`
-	Status      string `json:"status"`
+	DeletedData int64 `json:"deleted_objects,omitempty"`
+	// Keeper is what happened to a keeper on this machine for the instance.
+	Keeper *releaseKeeper `json:"keeper,omitempty"`
+	// Elsewhere are keeper devices still holding the instance's bundle.
+	Elsewhere []string `json:"keepers_elsewhere,omitempty"`
+	Status    string   `json:"status"`
 }
 
 func (r releaseResult) Human(w io.Writer) error {
@@ -342,6 +392,115 @@ func (r releaseResult) Human(w io.Writer) error {
 			fprintf(w, "  storage:     %s (deleted — it held nothing)\n", r.Bucket)
 		}
 	}
+	if k := r.Keeper; k != nil {
+		switch k.Action {
+		case "wiped":
+			fprintf(w, "  keeper:      bundle and leaf key wiped; ledger kept at %s — 'farcast keeper status' still reads it\n", k.Ledger)
+		case "failed":
+			fprintf(w, "  keeper:      NOT wiped — %s\n", k.Reason)
+		default:
+			fprintf(w, "  keeper:      %s %s — %s\n", k.Dir, k.Action, k.Reason)
+		}
+	}
+	if len(r.Elsewhere) > 0 {
+		fprintf(w, "  elsewhere:   %s still hold this instance's bundle — run 'farcast keeper uninstall %s' on each\n",
+			strings.Join(r.Elsewhere, ", "), r.Name)
+	}
 	fprintln(w, "  state:       removed")
 	return nil
+}
+
+// clusterDeleteTimeout bounds how long release waits for the cluster to be
+// gone. The 5.3 re-walk measured ~200 s after the delete was accepted. Expiry
+// stops the wait, not the delete: the cloud continues it, and a re-run waits
+// on it.
+var clusterDeleteTimeout = 15 * time.Minute
+
+// releaseKeeper is what release did with a keeper on this machine.
+type releaseKeeper struct {
+	Dir    string `json:"dir"`
+	Action string `json:"action"` // wiped | kept | untouched | failed
+	Reason string `json:"reason,omitempty"`
+	Ledger string `json:"ledger,omitempty"`
+}
+
+// keeperPlan is decided before the confirmation and carried out after the
+// cloud resources are gone.
+type keeperPlan struct {
+	report releaseKeeper
+	store  *keeper.Store // set when the material is to be wiped
+	device string
+}
+
+// planKeeper decides what release does with a keeper on this machine for the
+// instance — read-only, before anything is confirmed.
+//
+// The bundle and leaf key go with the instance, when provably its: release
+// already destroys the keyring they derive from, and afterwards they have no
+// lawful use — only the power to open ciphertext the cloud may still hold. The
+// ledger never goes.
+func planKeeper(env *Env, name string, meta *config.InstanceMetadata) *keeperPlan {
+	dir := env.ConfigDir.KeeperDir(name)
+	store, err := keeper.OpenStore(dir)
+	if err != nil {
+		return nil // nothing enrolled here
+	}
+	plan := &keeperPlan{report: releaseKeeper{Dir: dir, Ledger: store.LedgerPath()}}
+	if cfg, err := store.Config(); err == nil {
+		plan.device = cfg.Device
+	}
+	mine, err := env.ConfigDir.LoadInstanceCACert(name)
+	theirs, terr := store.CACert()
+	switch {
+	case err != nil || terr != nil:
+		plan.report.Action, plan.report.Reason = "untouched", "nothing proves it belongs to this instance (no CA to compare)"
+	case !bytes.Equal(mine, theirs):
+		plan.report.Action, plan.report.Reason = "untouched", fmt.Sprintf("it keeps a different instance also named %q", name)
+	case (meta.Storage == nil || meta.Storage.Bucket == "") && keyringHeld(env, name):
+		plan.report.Action, plan.report.Reason = "kept", "a bucket this release could not find may hold data only this bundle opens"
+	default:
+		plan.store = store
+	}
+	return plan
+}
+
+func keyringHeld(env *Env, name string) bool {
+	held, err := env.ConfigDir.InstanceKeyringExists(name)
+	return err == nil && held
+}
+
+// execute wipes what the plan said to, and reports.
+func (p *keeperPlan) execute(env *Env) *releaseKeeper {
+	if p == nil {
+		return nil
+	}
+	if p.store == nil {
+		return &p.report
+	}
+	if err := p.store.Wipe("instance released", time.Now()); err != nil {
+		fprintf(env.Err, "warning: this machine's keeper material was not wiped: %v\n", err)
+		p.report.Action = "failed"
+		p.report.Reason = fmt.Sprintf("%v — delete bundle.yaml and leaf.key in %s by hand, and keep ledger.jsonl", err, p.report.Dir)
+		return &p.report
+	}
+	p.report.Action = "wiped"
+	return &p.report
+}
+
+// keepersElsewhere names every enrolled device other than this machine's
+// wiped keeper. A revoked one is named too: revoke does not reach the device,
+// so it still holds a bundle.
+func keepersElsewhere(keepers []config.Keeper, plan *keeperPlan) []string {
+	var out []string
+	for _, k := range keepers {
+		if plan != nil && plan.store != nil && k.Device == plan.device {
+			continue
+		}
+		name := k.Device
+		if k.Revoked {
+			name += " (revoked)"
+		}
+		out = append(out, name)
+	}
+	return out
 }

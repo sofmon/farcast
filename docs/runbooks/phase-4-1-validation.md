@@ -45,7 +45,11 @@ kubectl label namespace "$APPS" app.kubernetes.io/managed-by=farcast
 farcast kernel deploy "$INSTANCE" --namespaces "$NS,$APPS"
 ```
 
+(`farcast-system` is metered whether or not `--namespaces` names it, because every fetch and build Job runs there.)
+
 Expected before the prompt: a breakdown of what the instance costs standing still, and — if the instance's limit is below that total — an explanation that the kernel would reach the limit before a single application ran. **The `USD 50` limit used by the earlier runbooks is below the modelled floor of about `$73`, so this warning firing is the expected result, not a problem with the instance.**
+
+*(Corrected 2026-10-08: the floor is now about **USD 77.42/month**. It is the cluster at ~37, which is modelled and **not** metered by TechnoCore, plus four lines TechnoCore does meter: the load-balancer carrier at ~18.25, FatLine's two Pods at ~11.09 (each carries a Shrike sidecar), the keyholder pair at ~7.39 and the kernel at ~3.70. The metered part totals ~40.42. The Phase 1 runbook now installs at `USD 100`, which clears the whole floor, so **no warning is expected here**. The deploy result still prints a `floor ~USD 77.42/mo fully provisioned (estimated)` line. An instance installed at `USD 50` gets the second form of the warning, not the first: the limit "clears what TechnoCore meters … but not the modelled cluster line".)*
 
 Confirm and let it deploy.
 
@@ -62,11 +66,13 @@ This is the step that catches a least-privilege grant that is minimal but wrong.
 kubectl -n "$NS" logs deploy/technocore --tail=40
 ```
 
-Expected: a `technocore starting` line naming the instance, the limit and the price-table date, followed by `reconciled` lines every 30 seconds carrying `pods=`, `rate_per_hour=`, `total=` and `level=ok`.
+Expected: a `technocore starting` line naming the instance, the limit and the price-table date, followed by `reconciled` lines every `--interval` (default 30s; the deploy result's `interval` line says which) carrying `pods=`, `rate_per_hour=`, `overhead_per_hour=`, `carrier=`, `total=` and `level=ok`.
 
 **A `forbidden` in these logs is the failure this step exists to find.** Check which verb was refused before changing anything — the fix is a rule in [`technocore/deploy`](../../technocore/deploy/), not a broader binding applied by hand.
 
 **Whether a projection warning appears here depends on the limit.** The instance burns about `$0.025/hour` before any application, which projects to roughly `$18` over a month — under a `USD 100` limit, so nothing is expected yet. Step 9b provokes the warning deliberately.
+
+*(Corrected 2026-10-08: the instance now burns about `$0.0554/hour` before any application. That is `$0.0304` for the five system Pods plus `$0.025` for the load-balancer carrier, which the kernel meters as instance overhead. It projects to roughly `$40` over a month, still under `USD 100`, so nothing is expected yet.)*
 
 ## 4. The RBAC is minimal — the grants are not cluster-wide
 
@@ -99,6 +105,8 @@ kubectl -n "$NS" logs deploy/technocore --tail=5 | grep reconciled
 ```
 
 Cross-check `rate_per_hour` by hand: every FarCast system pod requests 100m/128Mi, which is `$0.0050625/hour` at [ADR 0003](../adr/0003-gke-autopilot.md)'s rates. With FatLine at two replicas, `datasphered` at two and the kernel at one, expect about `$0.0253/hour`.
+
+*(Corrected 2026-10-08: two things changed. A FatLine Pod now requests **150m/192Mi**, which is FatLine's 100m/128Mi plus the Shrike sidecar's 50m/64Mi (`fatline/deploy/deploy.go`), and costs `$0.00759375/hour`. The keyholder and kernel Pods are still 100m/128Mi at `$0.0050625/hour`, so the five Pods come to 2 × 0.00759375 + 3 × 0.0050625 = **`$0.0304/hour`**. The kernel also now meters the load-balancer carrier as instance overhead at `$0.025/hour` (`technocore/pricing` `CarrierHourlyUSD`), and `rate_per_hour` includes it. So expect `rate_per_hour=0.0554` with `overhead_per_hour=0.0250 carrier=load-balancer`, while no fetch or build Job Pod is running. Those Jobs run in `farcast-system` and are metered too. `farcast costs` lists the carrier under "Instance overhead (never attributed to an application)", and it always prints a "Not metered" block: carrier data, bucket storage and operations, registry storage, and the cluster fee.)*
 
 If the figure is a multiple of that, Autopilot is raising the pods to a higher floor than the model assumes — which is exactly the kind of thing decision 10 exists to catch, and worth recording here even though step 11 is where it gets settled.
 
@@ -202,6 +210,8 @@ kubectl -n "$APPS" label pods -l app.kubernetes.io/name=costly farcast.sofmon.co
 
 With the test application running the instance burns about `$0.05/hour`, which projects to roughly `$36` for the month. A limit of `USD 30` is therefore over on the projection and nowhere near it on the accrual.
 
+*(Corrected 2026-10-08: with the carrier now metered and FatLine at 150m/192Mi, the instance burns about `$0.0801/hour` with the test application running: `$0.0554` standing plus `$0.0247`. A full month at that rate is roughly `$58`. The projection is what has accrued plus the rate times the hours left in the period. So `USD 30` is over on the projection only if about 16 days or more of the month remain (30 ÷ 0.0801 ≈ 375 hours). Later in the month, pick a limit below `rate_per_hour × hours left` and still well above `total`.)*
+
 ```bash
 # Set cost_limit.amount to 30 in metadata.yaml, then redeploy.
 "${EDITOR:-vi}" "$INSTANCE_DIR/metadata.yaml"
@@ -212,6 +222,8 @@ kubectl -n "$NS" logs deploy/technocore --tail=20
 ```
 
 Expected: `on course to exceed the limit before the period ends` with a `projected` figure above 30 and an `at` timestamp — and `level=ok` throughout.
+
+*(Noted 2026-10-08: each redeploy in this runbook (here, in step 10 and when the limit is restored) now keeps the `--adapt`, `--adapt-cooldown` and `--interval` recorded in the instance's metadata unless it names them. The namespaces were already carried forward. This walk never sets them, so the redeploys run the defaults: adapting off, a 6h cooldown, a 30s interval. Before 2026-10-08 a redeploy that did not repeat `--adapt` silently turned adapting off, and the deploy result now prints `interval` and `adapting` lines so a carried value can be seen.)*
 
 ```bash
 kubectl -n "$APPS" get deploy costly     # replicas 1 — NOT stopped
@@ -250,6 +262,8 @@ farcast storage state "$INSTANCE"                          # every replica still
 
 The logs must carry `stopped to contain cost` for `costly`, and — once nothing stoppable remains — `at the instance floor` naming what is still burning and the two levers that remain.
 
+*(Corrected 2026-10-08: the floor line's `still_burning_per_hour` now includes the carrier, so expect about `0.0554`, which is the five system Pods' `0.0304` plus `carrier_per_hour=0.0250`, with `remaining_levers` naming the carrier and the instance. The kernel takes neither lever.)*
+
 **`storage state` is the check that matters here, and it has to be that command specifically.** `storage ls` would pass whatever happened: it runs on this machine against the recorded bucket and never touches the cluster. `storage state` reaches each keyholder replica *through the tunnel*, so it fails if the shutdown stopped either FatLine or `datasphered` — which is exactly the outcome the last-to-die classification exists to prevent.
 
 Restore the real limit and redeploy before continuing:
@@ -260,9 +274,11 @@ farcast kernel deploy "$INSTANCE" --namespaces "$NS,$APPS" --yes
 kubectl -n "$APPS" scale deploy/costly --replicas=1
 ```
 
+As in 9b, the redeploy carries forward whatever `--adapt`, `--adapt-cooldown` and `--interval` were recorded. Check the result's `interval` and `adapting` lines read what you expect.
+
 ## 11. Reconcile against a real bill — a second session, ≥24h later
 
-**This is the criterion the whole cost pillar rests on, and it cannot be rushed.** Every figure in this phase — the `$73` floor, `$3.70` per pod, ADR 0003's `$37` empty cluster — is modelled from a published rate card and has never been checked.
+**This is the criterion the whole cost pillar rests on, and it cannot be rushed.** Every figure in this phase — the `~$77.42` floor, `$3.70` per 100m/128Mi pod, the `~$18.25` carrier, ADR 0003's `$37` empty cluster — is modelled from a published rate card and has never been checked. *(Corrected 2026-10-08: the floor here read `$73`. That was before FatLine's Pods carried the Shrike sidecar, which adds ~$3.70, and before the carrier was priced per hour as `$0.025 × 730`, which adds ~$0.25.)*
 
 Leave the instance running. After at least a full UTC day has passed *and* the provider's figures for that day have settled (allow another day), read the actual cost of the instance's project for that window from the billing console, then:
 

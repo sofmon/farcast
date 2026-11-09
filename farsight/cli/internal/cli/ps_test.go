@@ -67,7 +67,7 @@ func workloadOf(kind, ns, name string, desired, ready int, tier string) cluster.
 func meteringInstance(t *testing.T, dir config.Dir, name string, namespaces ...string) *config.InstanceMetadata {
 	t.Helper()
 	meta := buildableInstance(t, dir, name)
-	meta.Kernel = &config.Kernel{Deployed: true, Namespaces: append([]string{tcdeploy.DefaultNamespace}, namespaces...)}
+	meta.Kernel = &config.Kernel{Deployed: true, Applied: true, Namespaces: append([]string{tcdeploy.DefaultNamespace}, namespaces...)}
 	meta.CostLimit = config.CostLimit{Amount: 100, Currency: "USD", Period: "monthly"}
 	if err := dir.SaveInstanceMetadata(name, meta); err != nil {
 		t.Fatal(err)

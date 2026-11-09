@@ -2,9 +2,12 @@ package main
 
 import (
 	"bytes"
+	"log/slog"
 	"os/exec"
 	"strings"
 	"testing"
+
+	"github.com/sofmon/farcast/datasphere/keyholder"
 )
 
 func runServe(t *testing.T, args ...string) (int, string) {
@@ -124,5 +127,32 @@ func TestUsageMentionsServe(t *testing.T) {
 	run([]string{"datasphere"}, &out, &errw)
 	if !strings.Contains(errw.String(), "serve") {
 		t.Error("usage does not mention serve")
+	}
+}
+
+// An unreadable pin never stops the process: a replica that exited on it
+// would crash-loop sealed, beyond even the operator's unseal.
+func TestTheVaultStartsUnderWhateverPinItIsGiven(t *testing.T) {
+	for name, tc := range map[string]struct {
+		raw  string
+		want keyholder.PinStatus
+		log  string
+	}{
+		"absent":  {"", keyholder.PinAbsent, "no key pin loaded"},
+		"valid":   {`{"version":1,"require":["00000000000000aa"],"retired":[]}`, keyholder.PinValid, "key pin loaded"},
+		"invalid": {`{"version":1,"require":["x"]}`, keyholder.PinInvalid, "key pin unreadable"},
+	} {
+		var buf bytes.Buffer
+		v := newVault("prod", tc.raw, slog.New(slog.NewJSONHandler(&buf, nil)))
+		st := v.State()
+		if st.Pin.Status != tc.want || !st.Sealed() {
+			t.Errorf("%s: pin %s, sealed %v; want %s and sealed", name, st.Pin.Status, st.Sealed(), tc.want)
+		}
+		if !strings.Contains(buf.String(), tc.log) {
+			t.Errorf("%s: start-up log %q does not say %q", name, buf.String(), tc.log)
+		}
+	}
+	if keyholder.EnvKeyPin != "DATASPHERED_KEY_PIN" {
+		t.Errorf("the pin is read from %s; the manifest sets DATASPHERED_KEY_PIN", keyholder.EnvKeyPin)
 	}
 }

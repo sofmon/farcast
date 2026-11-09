@@ -503,6 +503,21 @@ func TestEveryCommandTheCLIAdvisesExists(t *testing.T) {
 		t.Error("guard: rekey against a sealed keyholder did not refuse")
 	}
 
+	// release naming keepers on other devices, and what to run there.
+	{
+		env, out, dir, _ := keeperRelease(t)
+		if _, err := dir.UpdateInstanceMetadata("prod", func(m *config.InstanceMetadata) error {
+			m.Keepers = append(m.Keepers, config.Keeper{Device: "laptop"})
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := (&releaseCommand{assumeYes: true}).Run(context.Background(), env, []string{"prod"}); err != nil {
+			t.Fatal(err)
+		}
+		printed.WriteString(out.String())
+	}
+
 	// run's partial hand-over and its keeper notice.
 	printed.WriteString(runWith(t, "p91",
 		&flakyKeyholder{fakeStateKeyholder: &fakeStateKeyholder{phase: "unsealed"}, refuseNth: map[int]int{1: 1}},
@@ -518,7 +533,7 @@ func TestEveryCommandTheCLIAdvisesExists(t *testing.T) {
 		resolves(t, line)
 	}
 	// A collector that found nothing would pass for the wrong reason.
-	for _, want := range []string{"storage key rotate", "storage key rekey", "keeper enroll", "storage unseal", "storage state"} {
+	for _, want := range []string{"storage key rotate", "storage key rekey", "keeper enroll", "storage unseal", "storage state", "keeper uninstall"} {
 		if !slices.ContainsFunc(found, func(c string) bool { return strings.Contains(c, want) }) {
 			t.Errorf("no advised command mentions %q; the collector missed it or the advice changed:\n%v", want, found)
 		}
@@ -720,6 +735,9 @@ func TestAKeeperDoesNotReseedBesideAReplicaThatDidNotAnswer(t *testing.T) {
 	fleet := servingFleet(t, env, meta, dir)
 	mustRotate(t, env, "prod", fleet)
 	fleet.replica(0).phase, fleet.replica(0).keys, fleet.replica(0).generation = "restart-sealed", nil, 0
+	// Without a key pin — the pin would refuse this bundle first, which
+	// TestAKeeperRefusesWhatThePinRefusesWithNothingServing covers.
+	unpin(t, dir, "prod", fleet)
 	pushes := fleet.pushes
 
 	silent := &flakyKeyholder{fakeStateKeyholder: fleet, silent: map[int]bool{1: true}}
@@ -731,4 +749,105 @@ func TestAKeeperDoesNotReseedBesideAReplicaThatDidNotAnswer(t *testing.T) {
 		t.Fatalf("replica 0: %s (%s) after %d push(es); want unchecked and no push", decisions[0].Action, decisions[0].Reason, fleet.pushes-pushes)
 	}
 	noSplit(t, fleet)
+}
+
+// The case the key pin exists for. Every replica restarted after a rotation,
+// so none serves to compare with — before the pin, a keeper enrolled before
+// the rotation re-seeded the old keys into both. The pin each replica loaded
+// at start is the reference, and the keeper reads it from the sealed replicas.
+func TestAKeeperRefusesWhatThePinRefusesWithNothingServing(t *testing.T) {
+	env, dir, store, cfg := installedKeeper(t)
+	meta, err := dir.LoadInstanceMetadata("prod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fleet := servingFleet(t, env, meta, dir)
+	mustRotate(t, env, "prod", fleet)
+	if fleet.replica(0).pin == nil {
+		t.Fatal("guard: the rotation did not hand the replicas the pin")
+	}
+	for i := range 2 {
+		fleet.replica(i).phase, fleet.replica(i).keys, fleet.replica(i).generation = "restart-sealed", nil, 0
+	}
+	pushes := fleet.pushes
+
+	decisions, err := keeperCheckWith(context.Background(), env, store, cfg, fleet, storeBundle(t, store))
+	if err != nil {
+		t.Fatalf("keeperCheckWith: %v", err)
+	}
+	for _, d := range decisions {
+		if d.Action != keeper.ActionStale || !strings.Contains(d.Reason, "key pin") {
+			t.Errorf("replica %d: %s (%s); want stale, naming the pin", d.Ordinal, d.Action, d.Reason)
+		}
+	}
+	if fleet.pushes != pushes {
+		t.Errorf("%d push(es) of a pre-rotation bundle into a fleet with nothing serving", fleet.pushes-pushes)
+	}
+
+	// And a modified keeper that skips its own check is refused by the
+	// keyholder: the fake fleet enforces the pin as the vault does.
+	if _, err := fleet.Unseal(context.Background(), 0, storeBundle(t, store), keeper.IntentReseed); !keyholder.BelowPin(err) {
+		t.Errorf("a pre-rotation bundle pushed regardless = %v; want below-pin", err)
+	}
+	if fleet.replica(0).phase != "restart-sealed" {
+		t.Error("a bundle below the pin unsealed the replica")
+	}
+}
+
+// A keeper checks its own leaf before dialling: a leaf that does not bind the
+// bundle beside it is refused by every keyholder, every pass.
+func TestAKeeperChecksItsLeafBindsItsBundle(t *testing.T) {
+	m, err := identity.Mint("prod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle := []byte("version: 1\n")
+	bound, _, err := identity.IssueKeeperClient(m.CACertPEM, m.CAKeyPEM, "prod", "laptop", bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := leafBindsBundle(bound, bundle); err != nil {
+		t.Errorf("a leaf bound to its bundle: %v", err)
+	}
+	if err := leafBindsBundle(bound, []byte("version: 1\nother: true\n")); err == nil {
+		t.Error("a leaf bound to another bundle passed")
+	}
+	// The operator's leaf binds nothing, like a keeper's from before binding.
+	if err := leafBindsBundle(m.ClientCertPEM, bundle); err == nil || !strings.Contains(err.Error(), "re-enrol") {
+		t.Errorf("an unbound leaf = %v; want a refusal naming re-enrolment", err)
+	}
+}
+
+// A push refused because the replica cannot read its pin names the repair,
+// not a re-enrolment that would be refused the same way.
+func TestAKeeperRefusedOnAnUnreadablePinNamesTheRepair(t *testing.T) {
+	env, dir, store, cfg := installedKeeper(t)
+	meta, err := dir.LoadInstanceMetadata("prod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fleet := servingFleet(t, env, meta, dir)
+	for i := range 2 {
+		fleet.replica(i).phase, fleet.replica(i).keys, fleet.replica(i).generation = "restart-sealed", nil, 0
+	}
+	unreadable := &refusesWith{fakeStateKeyholder: fleet, code: "pin-unreadable"}
+	decisions, err := keeperCheckWith(context.Background(), env, store, cfg, unreadable, storeBundle(t, store))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range decisions {
+		if d.Action != keeper.ActionStale || !strings.Contains(d.Reason, "storage key pin") || strings.Contains(d.Reason, "re-enrol") {
+			t.Errorf("replica %d: %s (%s); want stale, naming 'storage key pin' and not re-enrolment", d.Ordinal, d.Action, d.Reason)
+		}
+	}
+}
+
+// refusesWith answers every push with one keyholder code.
+type refusesWith struct {
+	*fakeStateKeyholder
+	code string
+}
+
+func (r *refusesWith) Unseal(_ context.Context, i int, _ []byte, _ string) (keyholder.State, error) {
+	return keyholder.State{}, &keyholder.Refusal{Ordinal: i, Code: r.code, Reason: r.code, Status: 409}
 }

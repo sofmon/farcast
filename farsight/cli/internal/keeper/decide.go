@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/sofmon/farcast/datasphere"
+	dskeyholder "github.com/sofmon/farcast/datasphere/keyholder"
 	"github.com/sofmon/farcast/farsight/cli/internal/keyholder"
 )
 
@@ -56,6 +57,11 @@ type Fleet struct {
 	// Unchecked names a replica that did not answer, which leaves the
 	// bundle unchecked against it.
 	Unchecked string
+	// Pinned says why a replica's key pin refuses this device's bundle. It
+	// is read from every replica that answered, sealed ones included: the pin
+	// is the reference that survives a restart, so it is there exactly when
+	// no serving replica is.
+	Pinned string
 }
 
 // FleetOf reads the whole fleet's answers once. A replica that did not answer
@@ -63,7 +69,7 @@ type Fleet struct {
 // was merely lost was no reference at all, and a keeper enrolled before a
 // rotation re-seeded the old keys beside it.
 func FleetOf(mine *datasphere.Bundle, states []keyholder.State, errs []error) Fleet {
-	f := Fleet{Mismatch: Mismatch(mine, states)}
+	f := Fleet{Mismatch: Mismatch(mine, states), Pinned: Pinned(mine, states, errs)}
 	for i, err := range errs {
 		if err != nil {
 			f.Unchecked = fmt.Sprintf("replica %d did not answer, so whether it serves keys this device's bundle lacks cannot be checked; the next pass retries", i)
@@ -71,6 +77,62 @@ func FleetOf(mine *datasphere.Bundle, states []keyholder.State, errs []error) Fl
 		}
 	}
 	return f
+}
+
+// Pinned reports why a replica's key pin refuses this device's bundle, or ""
+// when none does. The keyholder refuses such a bundle itself; deciding it here
+// keeps the keeper from spending a push, and a ledger line, on a refusal it
+// can see coming — and says why in words.
+//
+// A replica that cannot read its pin is not named here: that is a fact about
+// that replica, which refuses every re-seed whatever the bundle, and it is
+// Decide's to say for that replica alone. Here it would stop a re-seed of a
+// different replica whose own pin accepts the bundle.
+func Pinned(mine *datasphere.Bundle, states []keyholder.State, errs []error) string {
+	keys := dskeyholder.KeysOf(mine)
+	for i, st := range states {
+		if i < len(errs) && errs[i] != nil || st.Pin == nil {
+			continue
+		}
+		switch st.Pin.Status {
+		case dskeyholder.PinValid:
+			p, ok := pinOf(st.Pin)
+			if !ok {
+				return fmt.Sprintf("replica %d reports a key pin this device cannot read", i)
+			}
+			if err := p.Admits(keys); err != nil {
+				return fmt.Sprintf("replica %d's key pin refuses this device's bundle (%v) — the instance's keys were rotated, or an application added, "+
+					"after it was enrolled; re-enrol it", i, err)
+			}
+		}
+	}
+	return ""
+}
+
+// PinUnreadableReason is why a keeper leaves alone a replica that cannot read
+// its key pin. Re-enrolling changes nothing: the replica refuses every
+// re-seed until the operator repairs the pin.
+func PinUnreadableReason(ordinal int) string {
+	return fmt.Sprintf("replica %d cannot read its key pin and refuses every re-seed; the operator's 'farcast storage key pin' repairs it", ordinal)
+}
+
+func pinOf(r *dskeyholder.PinReport) (dskeyholder.Pin, bool) {
+	var p dskeyholder.Pin
+	for _, s := range r.Require {
+		id, err := datasphere.ParseKeyID(s)
+		if err != nil {
+			return dskeyholder.Pin{}, false
+		}
+		p.Require = append(p.Require, id)
+	}
+	for _, s := range r.Retired {
+		id, err := datasphere.ParseKeyID(s)
+		if err != nil {
+			return dskeyholder.Pin{}, false
+		}
+		p.Retired = append(p.Retired, id)
+	}
+	return p, true
 }
 
 // Decision is what a keeper concluded about one replica, and why.
@@ -108,6 +170,10 @@ func Decide(st keyholder.State, err error, ordinal int, mine uint64, budget Budg
 	case st.Generation > mine:
 		d.Action = ActionStale
 		d.Reason = fmt.Sprintf("the cluster has held generation %d and this device carries %d; re-enrol it", st.Generation, mine)
+	case st.Pin != nil && st.Pin.Status == dskeyholder.PinInvalid:
+		d.Action, d.Reason = ActionStale, PinUnreadableReason(ordinal)
+	case fleet.Pinned != "":
+		d.Action, d.Reason = ActionStale, fleet.Pinned
 	case fleet.Mismatch != "":
 		d.Action, d.Reason = ActionStale, fleet.Mismatch
 	case fleet.Unchecked != "":
@@ -207,8 +273,8 @@ func humanWindow(d time.Duration) string {
 //
 // A restarted replica holds nothing to compare, so the verdict leans on the
 // replicas that did not restart. With all of them restarted at once there is
-// no reference, and a keeper re-seeds what it holds; refusing that is the
-// in-cluster key-id pin ADR 0008 specifies and this does not provide.
+// no serving reference; the key pin is the one that survives a restart, and
+// Pinned reads it — and the keyholder enforces it whatever this decides.
 func Mismatch(mine *datasphere.Bundle, states []keyholder.State) string {
 	held := make(map[string]map[string]datasphere.KeyEntry, len(mine.Scopes()))
 	active := make(map[string]string, len(mine.Scopes()))

@@ -122,7 +122,18 @@ func (ca *CA) IssueClient(identity string) (Leaf, error) {
 	return ca.issue(identity, x509.ExtKeyUsageClientAuth)
 }
 
-func (ca *CA) issue(identity string, eku x509.ExtKeyUsage) (Leaf, error) {
+// IssueClientBinding issues a client leaf that carries, beside its identity, a
+// further URI SAN that binds it to something — a keeper's bundle digest. The
+// identity stays the subject and the first URI.
+func (ca *CA) IssueClientBinding(identity, binding string) (Leaf, error) {
+	u, err := url.Parse(binding)
+	if err != nil || u.Scheme == "" || u.Opaque == "" {
+		return Leaf{}, errors.New("fatline: a binding must be an opaque URI")
+	}
+	return ca.issue(identity, x509.ExtKeyUsageClientAuth, u)
+}
+
+func (ca *CA) issue(identity string, eku x509.ExtKeyUsage, bindings ...*url.URL) (Leaf, error) {
 	if identity == "" {
 		return Leaf{}, errors.New("fatline: empty certificate identity")
 	}
@@ -145,6 +156,7 @@ func (ca *CA) issue(identity string, eku x509.ExtKeyUsage) (Leaf, error) {
 		BasicConstraintsValid: true,
 	}
 	applyIdentitySAN(tmpl, identity)
+	tmpl.URIs = append(tmpl.URIs, bindings...)
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca.Cert, pub, ca.key)
 	if err != nil {
 		return Leaf{}, fmt.Errorf("fatline: create leaf cert: %w", err)
@@ -177,7 +189,8 @@ func PoolFromPEM(caPEM []byte) (*x509.CertPool, error) {
 // ServerTLSConfig builds the server leg: TLS 1.3 only, RequireAndVerifyClientCert
 // against clientCA, and — when verifyClientIdentity is non-nil — an additional
 // check that the verified peer carries an authorized URI-SAN identity, so a
-// valid cert from our CA is necessary but not sufficient.
+// valid cert from our CA is necessary but not sufficient. fatline.New never
+// passes nil: the tunnel admits by a fixed rule (fatline/admit.go).
 func ServerTLSConfig(serverCert tls.Certificate, clientCA *x509.CertPool, verifyClientIdentity func(uri string) bool) *tls.Config {
 	cfg := &tls.Config{
 		MinVersion:   tls.VersionTLS13,

@@ -18,6 +18,12 @@ import (
 // not exist.
 var ErrClusterNotFound = errors.New("planck: cluster not found")
 
+// ErrDeleteInProgress reports a cluster delete the cloud has accepted, or one
+// already under way, that had not finished when the caller stopped waiting.
+// It is distinct from every other failure of DeleteCluster: only this one
+// means the cloud continues the delete without the caller.
+var ErrDeleteInProgress = errors.New("planck: the cluster is still being deleted")
+
 // Factory builds a Provider from its configuration.
 type Factory func(cfg Config) (Provider, error)
 

@@ -180,6 +180,17 @@ func (c *Client) Scale(ctx context.Context, namespace, name string, replicas int
 	return c.do(ctx, http.MethodPatch, path, "", "application/merge-patch+json", []byte(body), nil)
 }
 
+// GetService reads one Service. A missing one is ErrNotFound.
+func (c *Client) GetService(ctx context.Context, namespace, name string) (*Service, error) {
+	var out Service
+	path := fmt.Sprintf("/api/v1/namespaces/%s/services/%s",
+		url.PathEscape(namespace), url.PathEscape(name))
+	if err := c.get(ctx, path, "", &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // GetConfigMap reads a ConfigMap. A missing one is ErrNotFound, which callers
 // are expected to treat as "no checkpoint yet" rather than as a failure.
 func (c *Client) GetConfigMap(ctx context.Context, namespace, name string) (*ConfigMap, error) {

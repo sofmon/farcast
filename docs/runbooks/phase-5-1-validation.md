@@ -10,7 +10,7 @@ Designed by [ADR 0014](../adr/0014-observed-usage.md) (compute) and [ADR 0015](.
 
 ## Prerequisites
 
-An instance installed and connected, with the kernel deployed and the build toolchain mirrored — the state [the 4.3 runbook](phase-4-3-validation.md) leaves behind.
+An instance installed and connected, with the kernel deployed and the build toolchain mirrored — the state [the 4.3 runbook](phase-4-3-validation.md) leaves behind. "Mirrored" means [the 4.3 runbook's step 1a](phase-4-3-validation.md#1a-mirror-the-toolchain): `farcast toolchain "$INSTANCE" --builder gcr.io/kaniko-project/executor:v1.23.2 --fetcher cgr.dev/chainguard/git:latest-dev`, refused with the digests, then re-run with the `@sha256:` references it printed. The kernel has to be deployed before the first `farcast run`, which since 2026-10-08 refuses an instance without one.
 
 ---
 
@@ -120,6 +120,15 @@ The warning turns on the **replica count**, not on the monitor naming itself, so
 
 All 42 ticks reported `unrefreshed=0`. metrics-server's window measured **30.323 s** against the kernel's 30 s tick, so a reading had always advanced by the time it was read. The guard against counting one measurement twice is therefore **defensive rather than load-bearing at the default interval** — it is unit-tested, and it was not exercised live. A shorter `--interval` would exercise it.
 
+*(Added 2026-10-08: the interval can now be set from the CLI, and it is recorded. To walk criterion 12:*
+
+```bash
+farcast kernel deploy "$INSTANCE" --interval=10s
+kubectl -n farcast-system logs deploy/technocore --since=5m | grep "observed usage"
+```
+
+*At a 10-second tick against a ~30-second refresh, about two ticks in three read a reading that has not moved. Expect `observed usage` lines with `unrefreshed=N` above zero, including ticks whose readings were **all** unrefreshed, logged as `sampled=0 unrefreshed=N`. Before 2026-10-08 such a tick logged nothing, so the dedupe could not be seen working. Record those lines as the evidence, then restore the default with `farcast kernel deploy "$INSTANCE" --interval=0`. The deploy warns that 10s is a validation value below the default. Like `--adapt` and `--adapt-cooldown`, the interval is carried forward by later deploys that do not name it.)*
+
 ### 3. The 5.2 case, in three numbers
 
 | workload | CPU peak observed | CPU reserved | memory peak | memory reserved |
@@ -165,5 +174,5 @@ Worth recording because the mistake is instructive: the NetworkPolicy is what ma
 | 9 | An unidentified caller appears, named as such | ✅ |
 | 10 | The report distinguishes "not measured" from "measured as zero" | ✅ — both states seen |
 | 11 | The network counts are not presented as more than they are | ✅ **after a fix** — see finding 1 |
-| 12 | The reading-dedupe is exercised | ⚠️ **not exercised** — see finding 2 |
+| 12 | The reading-dedupe is exercised | ⚠️ **not exercised** — see finding 2, which now gives the `--interval=10s` procedure |
 | 13 | `farcast run` produces the policy the boundary enforces | ⛔ **not walked here** — see finding 4 |

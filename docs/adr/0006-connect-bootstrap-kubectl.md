@@ -31,7 +31,7 @@ Two facts make a subprocess approach natural rather than a compromise:
 
 1. **`farcast connect` deploys FatLine by shelling to `kubectl` (K2), not by vendoring a Kubernetes client.** The CLI renders FatLine's workload as YAML ([`fatline/deploy`](../../fatline/README.md)) and pipes it to `kubectl apply -f -` over the per-instance kubeconfig; it awaits the rollout and reads the Service external IP the same way. This adds an external-tool runtime dependency (`kubectl`, plus the `gke-gcloud-auth-plugin` the kubeconfig already needs) and **no new Go dependency** — keeping the credential-holding binary's supply-chain surface minimal.
 
-2. **The kubectl invocation sits behind an injectable `Runner` seam.** The `farsight/cli/internal/cluster` wrapper exposes apply / rollout / external-IP over a `Runner` interface, so the connect orchestration is unit-tested with a fake and the real cloud path is integration-gated (never in CI — the cost pillar, as for [Planck](../../planck/README.md)).
+2. **The kubectl invocation sits behind an injectable `Runner` seam.** The `farsight/cli/internal/cluster` wrapper exposes apply / rollout / external-IP over a `Runner` interface, so the connect orchestration is unit-tested with a fake and the real cloud path is integration-gated (never run by `./check.sh` — the cost pillar, as for [Planck](../../planck/README.md)).
 
 3. **Secrets cross the boundary via stdin, never argv or temp files.** The mTLS Secret (CA certificate + server leaf+key — never the CA private key) is base64-embedded in the manifest applied on `kubectl` **stdin**. No key material appears on a command line or in a world-readable temp file.
 

@@ -1,9 +1,13 @@
 package keyholder
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/sofmon/farcast/datasphere"
@@ -53,6 +57,57 @@ type Identity struct {
 	// name for an app. Namespace is set for an app only.
 	Name      string
 	Namespace string
+
+	// BundleDigest is set for a keeper only: the digest of the one bundle its
+	// leaf was issued for (KeeperBundleURIPrefix). Empty is a leaf that binds
+	// none, which is a keeper enrolled before the binding existed.
+	BundleDigest string
+}
+
+// KeeperBundleURIPrefix starts the second URI SAN a keeper's leaf carries: the
+// digest of the bundle it was enrolled with. It mirrors fatline/identity, which
+// issues it; a test asserts the two agree.
+//
+// It is what makes "a stolen leaf without its bundle cannot substitute keys"
+// true. A key ID is a label (ADR 0008 decision 3), so a pin of IDs admits a
+// bundle that carries keys of its own making under the pinned labels; the
+// digest admits one bundle exactly, the one the operator's CA signed for.
+const KeeperBundleURIPrefix = "urn:farcast:keeper-bundle:sha256:"
+
+// keeperBundleDomain separates this digest from every other SHA-256 of a
+// bundle's bytes.
+const keeperBundleDomain = "farcast-keeper-bundle-v1"
+
+// KeeperBundleDigest is the hex digest a keeper's leaf binds: SHA-256 over a
+// domain label and the marshalled bundle. It is a digest of key material and
+// so is never written anywhere the cloud stores; it rests on the device beside
+// the bundle it names and travels only inside TLS.
+func KeeperBundleDigest(payload []byte) string {
+	h := sha256.New()
+	h.Write([]byte(keeperBundleDomain))
+	h.Write(payload)
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// ErrKeeperBundle reports a keeper pushing a bundle other than the one its
+// leaf was issued for, or a keeper whose leaf binds none.
+var ErrKeeperBundle = errors.New("keyholder: a keeper may push only the bundle its leaf was issued for; re-enrol it")
+
+// bindsBundle checks a keeper's push against the bundle its leaf names. Every
+// other role is unaffected. A keeper leaf that binds no bundle is refused: it
+// predates the binding, and re-enrolment — which every rotation already
+// requires — issues one that does.
+func (id Identity) bindsBundle(payload []byte) error {
+	if id.Role != RoleKeeper {
+		return nil
+	}
+	if id.BundleDigest == "" {
+		return fmt.Errorf("%w: this leaf binds no bundle", ErrKeeperBundle)
+	}
+	if subtle.ConstantTimeCompare([]byte(KeeperBundleDigest(payload)), []byte(id.BundleDigest)) != 1 {
+		return ErrKeeperBundle
+	}
+	return nil
 }
 
 // ErrNotAuthorized reports a caller the data path identified and will not
@@ -193,10 +248,39 @@ func identityFrom(r *http.Request, instance string) (Identity, error) {
 	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
 		return Identity{}, ErrNoIdentity
 	}
-	for _, u := range r.TLS.PeerCertificates[0].URIs {
-		if id, err := ParseIdentity(u.String(), instance); err == nil {
-			return id, nil
+	uris := r.TLS.PeerCertificates[0].URIs
+	for _, u := range uris {
+		id, err := ParseIdentity(u.String(), instance)
+		if err != nil {
+			continue
 		}
+		if id.Role == RoleKeeper {
+			if id.BundleDigest, err = bundleDigestOf(uris); err != nil {
+				return Identity{}, err
+			}
+		}
+		return id, nil
 	}
 	return Identity{}, fmt.Errorf("%w: the client leaf carries no identity for this instance", ErrNotAuthorized)
+}
+
+// bundleDigestOf reads the bundle digest a keeper leaf carries. More than one
+// is refused rather than chosen between: a leaf that names two bundles binds
+// neither.
+func bundleDigestOf(uris []*url.URL) (string, error) {
+	digest := ""
+	for _, u := range uris {
+		d, ok := strings.CutPrefix(u.String(), KeeperBundleURIPrefix)
+		if !ok {
+			continue
+		}
+		if digest != "" {
+			return "", fmt.Errorf("%w: the leaf names more than one bundle", ErrNotAuthorized)
+		}
+		if b, err := hex.DecodeString(d); err != nil || len(b) != sha256.Size || d != strings.ToLower(d) {
+			return "", fmt.Errorf("%w: the leaf's bundle digest is malformed", ErrNotAuthorized)
+		}
+		digest = d
+	}
+	return digest, nil
 }

@@ -38,12 +38,17 @@ var kernelMonthlyUSD = pricing.WorkloadMonthlyUSD(tcdeploy.Replicas,
 type instanceFloor struct {
 	Items []floorItem
 	Total float64
+	// Metered is the part of Total TechnoCore counts against the limit; the
+	// rest is a modelled line it cannot observe.
+	Metered float64
 }
 
 type floorItem struct {
 	Name       string
 	MonthlyUSD float64
 	Why        string
+	// Unmetered marks a line TechnoCore does not count.
+	Unmetered bool
 }
 
 func (f instanceFloor) print(w io.Writer, currency string) {
@@ -58,9 +63,9 @@ func (f instanceFloor) print(w io.Writer, currency string) {
 // floorNow is the standing cost of what this instance actually runs today.
 func floorNow(meta *config.InstanceMetadata) instanceFloor {
 	f := instanceFloor{}
-	f.add("cluster", emptyClusterMonthlyUSD, "Autopilot's own managed workloads (ADR 0003, modelled)")
+	f.addUnmetered("cluster", emptyClusterMonthlyUSD, "Autopilot cluster (ADR 0003, modelled, unverified, not metered by TechnoCore)")
 	if meta.Carrier != nil && meta.Carrier.Endpoint != "" {
-		f.add("carrier", nlbMonthlyUSD, "the public mTLS load balancer (ADR 0005)")
+		f.add("carrier", pricing.CarrierMonthlyUSD, "the public mTLS load balancer (ADR 0005), metered by TechnoCore")
 	}
 	if meta.FatLineDeployed {
 		f.add("fatline", pricing.WorkloadMonthlyUSD(fldeploy.DefaultReplicas,
@@ -87,8 +92,8 @@ func floorNow(meta *config.InstanceMetadata) instanceFloor {
 // guaranteed to breach two commands later.
 func floorFull(meta *config.InstanceMetadata) instanceFloor {
 	f := instanceFloor{}
-	f.add("cluster", emptyClusterMonthlyUSD, "Autopilot's own managed workloads (ADR 0003, modelled)")
-	f.add("carrier", nlbMonthlyUSD, "the public mTLS load balancer (ADR 0005)")
+	f.addUnmetered("cluster", emptyClusterMonthlyUSD, "Autopilot cluster (ADR 0003, modelled, unverified, not metered by TechnoCore)")
+	f.add("carrier", pricing.CarrierMonthlyUSD, "the public mTLS load balancer (ADR 0005), metered by TechnoCore")
 	f.add("fatline", pricing.WorkloadMonthlyUSD(fldeploy.DefaultReplicas,
 		fldeploy.PodRequestCPUMilli, fldeploy.PodRequestMemMiB),
 		"the tunnel and its Shrike monitor, two replicas (ADR 0009 decision 11)")
@@ -101,6 +106,13 @@ func floorFull(meta *config.InstanceMetadata) instanceFloor {
 
 func (f *instanceFloor) add(name string, usd float64, why string) {
 	f.Items = append(f.Items, floorItem{Name: name, MonthlyUSD: usd, Why: why})
+	f.Total += usd
+	f.Metered += usd
+}
+
+// addUnmetered adds a line TechnoCore cannot observe and so never counts.
+func (f *instanceFloor) addUnmetered(name string, usd float64, why string) {
+	f.Items = append(f.Items, floorItem{Name: name, MonthlyUSD: usd, Why: why, Unmetered: true})
 	f.Total += usd
 }
 
@@ -124,10 +136,17 @@ func warnIfBelowFloor(w io.Writer, limit config.CostLimit, f instanceFloor, what
 	fprintf(w, "\nThe cost limit is below what %s costs standing still.\n", what)
 	fprintf(w, "  limit          %s %.2f/%s\n", limit.Currency, limit.Amount, limit.Period)
 	f.print(w, limit.Currency)
-	fprintf(w, "\nTechnoCore would reach the limit before a single application ran, stop every\n"+
-		"application it is allowed to stop, and still be over — it never stops the tunnel\n"+
-		"or the key holder, because that would make storage impossible to unseal while the\n"+
-		"instance kept billing.\n")
+	if limit.Amount < f.Metered {
+		fprintf(w, "\nTechnoCore would reach the limit before a single application ran, stop every\n"+
+			"application it is allowed to stop, and still be over — it never stops the tunnel\n"+
+			"or the key holder, because that would make storage impossible to unseal while the\n"+
+			"instance kept billing.\n")
+	} else {
+		fprintf(w, "\nThe limit clears what TechnoCore meters standing still (~%s %.2f) but not the\n"+
+			"modelled cluster line, which it cannot observe. If that line is real, the bill\n"+
+			"passes the limit with nothing TechnoCore counts — and nothing it can stop.\n",
+			limit.Currency, f.Metered)
+	}
 	fprintf(w, "These are estimates from published prices, not a bill; the cluster line dominates\n"+
 		"and is the least certain of them.\n")
 	return true

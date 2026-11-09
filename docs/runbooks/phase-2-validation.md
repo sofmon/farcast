@@ -52,10 +52,7 @@ accepted; the cluster shows `STOPPING` while it completes).
 From the repo root:
 
 ```bash
-go test -race ./...        # all unit + race tests (incl. tunnel mTLS e2e, allowlist/inspector races)
-go vet ./...
-gofmt -l . | grep -v '^vendor/' || echo "gofmt clean"
-golangci-lint run ./...    # if installed
+./check.sh   # both Go modules: gofmt, vendor, build, vet, golangci-lint (mandatory), go test -race
 
 # Build into ./bin/ — `go build -o fatline …` at the root would land the binary
 # *inside* the fatline/ source dir (Go writes -o <existing-dir> as dir/<name>).
@@ -65,8 +62,8 @@ go build -o ./bin/fatline ./fatline/cmd/fatline
 go build -o ./bin/shrike  ./shrike/cmd/shrike
 ```
 
-✅ Expect: tests pass, vet/lint clean, three binaries in `./bin/`. The `go test`
-run alone already proves the FatLine mTLS tunnel handshake, the per-instance CA
+✅ Expect: `./check.sh` passes, three binaries in `./bin/`. Its `go test`
+step alone already proves the FatLine mTLS tunnel handshake, the per-instance CA
 mint/verify, the deny-by-default allowlist (under `-race`), and Shrike's
 violation table + wire round-trip.
 
@@ -96,7 +93,7 @@ apps:
   - name: web
     containerfile: Containerfile
     external:
-      - host: api.stripe.com
+      - host: localhost
         reason: payments
 EOF
 
@@ -110,7 +107,7 @@ cat > "$TMP/policy.json" <<EOF
   "apps": [
     { "name": "web", "namespace": "validate",
       "credential_sha256": "$(printf '%s' "$WEB_CRED" | sha256_hex)",
-      "external": [ { "host": "api.stripe.com", "reason": "payments" } ] },
+      "external": [ { "host": "localhost", "reason": "payments" } ] },
     { "name": "worker", "namespace": "validate",
       "credential_sha256": "$(printf '%s' "$WORKER_CRED" | sha256_hex)" }
   ]
@@ -140,16 +137,17 @@ ANON="http://127.0.0.1:18131"
 # DENIED — undeclared host (deny-by-default), repeated to exercise de-dup:
 for i in 1 2 3; do curl -s -o /dev/null -x "$WEB" https://evil.example.com --max-time 3; done
 # DENIED — cleartext http to a declared host (confidentiality is part of deny-by-default):
-curl -s -o /dev/null -x "$WEB" http://api.stripe.com --max-time 3
-# ALLOWED — a declared host (the CONNECT is permitted; the upstream dial may or may
-# not complete depending on your network, but FatLine emits the allow):
-curl -s -o /dev/null -x "$WEB" https://api.stripe.com --max-time 5
+curl -s -o /dev/null -x "$WEB" http://localhost:18133 --max-time 3
+# ALLOWED — a declared host. FatLine allows the CONNECT and dials localhost:18133,
+# where nothing listens: the refused dial shows as `fails: 1` under `allowed`, and
+# nothing leaves the machine.
+curl -s -o /dev/null -x "$WEB" https://localhost:18133 --max-time 3
 # DENIED — no credential at all: FatLine cannot say who is asking, so there is
 # nothing to check the request against. Distinct from "you may not go there".
-curl -s -o /dev/null -x "$ANON" https://api.stripe.com --max-time 3
+curl -s -o /dev/null -x "$ANON" https://localhost:18133 --max-time 3
 # DENIED — worker asking for the host WEB declared, under its own identity.
 # This is the property 4.4 exists for, and it is visible without a cluster.
-curl -s -o /dev/null -x "$WORKER" https://api.stripe.com --max-time 3
+curl -s -o /dev/null -x "$WORKER" https://localhost:18133 --max-time 3
 sleep 1
 
 echo "=== Shrike security picture ==="
@@ -157,16 +155,17 @@ curl -s http://127.0.0.1:18132/_shrike/status   # | python3 -m json.tool
 ```
 
 ✅ Expect the Shrike status JSON to show:
-- `declared: ["api.stripe.com"]`,
+- `declared: ["localhost"]`,
 - a **`warning`** violation for `evil.example.com` with **`count: 3`** and
   **`"app": "web"`** (the three denials de-duplicated into one class),
 - an **`info`** violation for the cleartext attempt (`cleartext_not_allowed`),
   also attributed to `web`,
-- `api.stripe.com` under `allowed` (it was permitted),
+- `localhost` under `allowed` for `web`, with `allows: 1` and `fails: 1` (it was
+  permitted, and the dial was refused on loopback),
 - a **`warning`** violation with reason **`unknown_app`** and **no** `app` field
   — an unidentified caller has no application to name,
 - a **`warning`** violation with reason `not_in_allowlist` and **`"app": "worker"`**
-  for `api.stripe.com` — the same host `web` is allowed to reach.
+  for `localhost` — the same host `web` is allowed to reach.
 
 The last two are what per-application enforcement looks like from the outside:
 two applications denied the same host are two entries, not one.
@@ -481,7 +480,7 @@ left billing.
 ## Success criteria
 
 **Part A (local, free):**
-- [ ] `go test -race ./...`, `go vet`, lint all clean; three binaries build.
+- [ ] `./check.sh` passes (both modules, lint included); three binaries build.
 - [ ] Shrike status shows the undeclared host as a `warning` with `count: 3`, the cleartext attempt as `info`, and the declared host under `allowed`.
 - [ ] `connect`'s no-cloud surface returns the right exit codes.
 

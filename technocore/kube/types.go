@@ -212,6 +212,22 @@ func (s *LabelSelector) Matches(labels map[string]string) bool {
 	return true
 }
 
+// ServiceTypeLoadBalancer is the Service type that bills a load balancer.
+const ServiceTypeLoadBalancer = "LoadBalancer"
+
+// ServiceSpec is the one part of a Service TechnoCore reads: its type.
+type ServiceSpec struct {
+	Type string `json:"type"`
+}
+
+// Service is read for exactly one reason: whether FatLine's tunnel is fronted
+// by a billed load balancer (ADR 0005), which is instance overhead the kernel
+// meters (ADR 0009 decision 4).
+type Service struct {
+	Metadata ObjectMeta  `json:"metadata"`
+	Spec     ServiceSpec `json:"spec"`
+}
+
 // ConfigMap is where the cost ledger is checkpointed. It is the one piece of
 // cloud-resident state TechnoCore keeps, and it discloses nothing: the
 // provider computed every number in it before TechnoCore did.

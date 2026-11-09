@@ -258,7 +258,7 @@ gcloud iam service-accounts delete "$SA" --project "$PROJECT_ID"
 ## Optional — the gated integration tests
 
 The same lifecycle runs as Go tests, which also assert the wire details this runbook
-only eyeballs. They are gated twice over and never run in CI:
+only eyeballs. They are gated twice over and never run by `./check.sh`:
 
 ```bash
 export FARCAST_GCS_TEST_PROJECT="$PROJECT_ID" FARCAST_GCS_TEST_LOCATION="$REGION" FARCAST_GCS_TEST_CREDENTIALS="$KEY" FARCAST_GCS_TEST_BUCKET=1
@@ -361,8 +361,13 @@ mkfile -n 64m big.bin 2>/dev/null || head -c 67108864 /dev/urandom > big.bin
 ```
 
 ```bash
-farcast storage cp ./big.bin validate:app/big.bin && farcast storage ls -l validate: && farcast storage cp validate:app/big.bin ./big.out && cmp big.bin big.out && echo "round trip byte-exact"
+farcast storage cp ./big.bin validate:data/big.bin && farcast storage ls -l validate: && farcast storage cp validate:data/big.bin ./big.out && cmp big.bin big.out && echo "round trip byte-exact"
 ```
+
+*(Corrected 2026-10-08: the key was `app/big.bin`. `app/` is now the per-application
+tree — each application owns `app/<namespace>/<app>/` under its own scope (ADR 0018
+decision 5, `datasphere/scope.go`) — so an operator's test object stays off it.
+`data/` is outside every application's scope and means nothing to any of them.)*
 
 A 64 MiB file cannot fit the buffered format, so this proves the chunked v2 path
 end to end. Then confirm what the cloud holds is still opaque:

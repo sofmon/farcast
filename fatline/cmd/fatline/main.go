@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"flag"
 	"fmt"
@@ -22,6 +23,7 @@ import (
 
 	"github.com/sofmon/farcast/fatline"
 	"github.com/sofmon/farcast/fatline/event"
+	"github.com/sofmon/farcast/fatline/identity"
 	fcrypto "github.com/sofmon/farcast/fatline/internal/crypto"
 	"github.com/sofmon/farcast/fatline/policy"
 	"github.com/sofmon/farcast/shrike"
@@ -50,10 +52,13 @@ func run(args []string) error {
 		policyPath   = fs.String("policy", "", "path to the per-application egress policy (ADR 0013); absent means no application can be identified, so none may reach anything")
 		endpoint     = fs.String("endpoint", "", "externally advertised endpoint, reported in status")
 		streamRoutes routeFlag
+		keeperRoutes routeNames
 		shrikeSocket = fs.String("shrike-socket", "", "if set, stream egress events to a Shrike sidecar at this Unix socket (else log via slog)")
 	)
 	fs.Var(&streamRoutes, "stream-route",
 		"in-instance service the operator may reach through the tunnel, as name=host:port[=ordinals] (repeatable)")
+	fs.Var(&keeperRoutes, "keeper-route",
+		"a stream route a keeper device may open as well as the operator (repeatable); every other route is the operator's alone")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -68,6 +73,7 @@ func run(args []string) error {
 
 	cfg := fatline.Config{
 		StreamRoutes: routes,
+		KeeperRoutes: keeperRoutes,
 		TunnelListen: *tunnelListen,
 		EgressListen: *egressListen,
 		Endpoint:     *endpoint,
@@ -89,8 +95,15 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
+		instance, err := tunnelInstance(cert)
+		if err != nil {
+			return err
+		}
 		cfg.ServerCert = cert
 		cfg.ClientCA = pool
+		cfg.Instance = instance
+		fmt.Fprintf(os.Stderr, "fatline: tunnel admits %s and %s<device>, nothing else\n",
+			identity.OperatorURI(instance), identity.KeeperURI(instance, ""))
 	}
 
 	if *policyPath != "" {
@@ -208,6 +221,42 @@ func watchPolicy(ctx context.Context, path string, every time.Duration, srv *fat
 		srv.ReloadPolicy(doc)
 		log("fatline: egress policy reloaded (%d applications)\n", len(doc.Apps))
 	}
+}
+
+// tunnelInstance reads which instance this FatLine serves from its own server
+// leaf: the <instance>.fatline.farcast name every client pins. A second source
+// — a flag — could only disagree with the name clients already verify, so
+// there is none; a leaf that does not name exactly one instance stops the
+// tunnel from starting rather than admitting identities it cannot derive.
+func tunnelInstance(cert tls.Certificate) (string, error) {
+	if len(cert.Certificate) == 0 {
+		return "", errors.New("fatline: the server certificate is empty")
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return "", fmt.Errorf("fatline: parse the server certificate: %w", err)
+	}
+	var found []string
+	for _, name := range leaf.DNSNames {
+		if inst, ok := identity.InstanceFromServerName(name); ok {
+			found = append(found, inst)
+		}
+	}
+	if len(found) != 1 {
+		return "", fmt.Errorf("fatline: the server certificate must name exactly one instance as <instance>.fatline.farcast (found %d); "+
+			"refusing to open a tunnel whose admitted identities cannot be derived", len(found))
+	}
+	return found[0], nil
+}
+
+// routeNames collects repeatable --keeper-route values.
+type routeNames []string
+
+func (r *routeNames) String() string { return strings.Join(*r, ",") }
+
+func (r *routeNames) Set(v string) error {
+	*r = append(*r, v)
+	return nil
 }
 
 // routeFlag collects repeatable --stream-route values.

@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -49,11 +50,15 @@ type Config struct {
 
 	// ServerCert is this listener's server leaf + key (server leg of the mTLS).
 	ServerCert tls.Certificate
-	// ClientCA verifies operator client certificates (no system-root fallback).
+	// ClientCA verifies client leaves (no system-root fallback).
 	ClientCA *x509.CertPool
-	// AllowClientIdentity authorizes a verified client's URI-SAN identity. Nil
-	// accepts any client presenting a CA-signed certificate.
-	AllowClientIdentity func(uri string) bool
+	// Instance names the instance whose leaves the tunnel admits. Required
+	// with TunnelListen. The rule is fixed: this instance's operator and its
+	// named keeper devices, and nothing else its CA issues.
+	Instance string
+	// KeeperRoutes are the stream routes a keeper device may open. Every
+	// other route is the operator's alone. Each must name a configured route.
+	KeeperRoutes []string
 
 	// Allowlist is the egress policy for an instance with no per-application
 	// policy: declared external hosts, deny-by-default, one shared list.
@@ -89,6 +94,7 @@ type Config struct {
 // Server is the FatLine data plane: the ingress tunnel and the egress proxy.
 type Server struct {
 	cfg      Config
+	admits   func(uri string) bool
 	allow    *allowlist.List
 	egress   Egress
 	sessions *router.Table
@@ -109,6 +115,14 @@ func New(cfg Config) (*Server, error) {
 	if err := validateStreamRoutes(cfg.StreamRoutes); err != nil {
 		return nil, err
 	}
+	if cfg.TunnelListen != "" && cfg.Instance == "" {
+		return nil, errors.New("fatline: the tunnel needs the instance it serves (Config.Instance); it admits that instance's operator and keeper leaves and nothing else")
+	}
+	for _, name := range cfg.KeeperRoutes {
+		if !slices.ContainsFunc(cfg.StreamRoutes, func(r StreamRoute) bool { return r.Name == name }) {
+			return nil, fmt.Errorf("fatline: keeper route %q names no configured stream route", name)
+		}
+	}
 	al := allowlist.New(cfg.Allowlist)
 	if cfg.Policy != nil {
 		al = allowlist.NewPerApp(cfg.Policy.ByTenant())
@@ -122,6 +136,7 @@ func New(cfg Config) (*Server, error) {
 
 	s := &Server{
 		cfg:      cfg,
+		admits:   tunnelAdmits(cfg.Instance),
 		allow:    al,
 		sessions: router.NewTable(),
 		events:   buffered,
@@ -162,8 +177,8 @@ func (s *Server) Serve(ctx context.Context) error {
 	if s.cfg.TunnelListen != "" {
 		tunnelSrv = &http.Server{
 			Addr:      s.cfg.TunnelListen,
-			Handler:   s.ingressHandler(),
-			TLSConfig: fcrypto.ServerTLSConfig(s.cfg.ServerCert, s.cfg.ClientCA, s.cfg.AllowClientIdentity),
+			Handler:   s.admit(s.ingressHandler()),
+			TLSConfig: fcrypto.ServerTLSConfig(s.cfg.ServerCert, s.cfg.ClientCA, s.admits),
 			ConnState: s.sessions.ConnState,
 		}
 		wg.Go(func() {

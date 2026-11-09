@@ -127,15 +127,87 @@ func (p *provider) ClusterStatus(ctx context.Context, ref planck.ClusterRef) (pl
 	return mapStatus(st.RawStatus), nil
 }
 
+// DeleteCluster returns once the cluster is gone, not once the delete is
+// accepted. 'farcast release' reported "(deleted)" on acceptance and dropped
+// the instance record while GKE was still deleting — about 200 seconds on the
+// 5.3 walk — so a delete that then failed left a cluster billing with nothing
+// tracking it.
 func (p *provider) DeleteCluster(ctx context.Context, ref planck.ClusterRef) error {
+	if ref.Location == "" {
+		ref.Location = p.defaultLocation
+	}
 	api, err := p.client()
 	if err != nil {
 		return err
 	}
-	if err := api.delete(ctx, ref); err != nil {
-		return fmt.Errorf("gke: delete cluster %q: %w", ref.Name, err)
+	st, exists, err := api.get(ctx, ref)
+	if err != nil {
+		return fmt.Errorf("gke: look up cluster %q: %w", ref.Name, err)
 	}
-	return nil
+	if !exists {
+		return nil // idempotent: nothing to delete or wait for
+	}
+	op := ""
+	if mapStatus(st.RawStatus) != planck.StatusDeleting {
+		if op, err = api.delete(ctx, ref); err != nil {
+			return fmt.Errorf("gke: delete cluster %q: %w", ref.Name, err)
+		}
+	}
+	// A delete already running — an earlier release that timed out or was
+	// interrupted — is waited on rather than requested again: GKE refuses a
+	// second operation while one is in flight.
+	return p.waitDeleted(ctx, api, ref, op)
+}
+
+// waitDeleted polls until the cluster no longer exists. That absence is the
+// only success: an operation reported done says the cloud stopped working on
+// it, not that nothing is left to bill.
+func (p *provider) waitDeleted(ctx context.Context, api clusterAPI, ref planck.ClusterRef, op string) error {
+	stillDeleting := func(err error) error {
+		return fmt.Errorf("gke: cluster %q: %w (%w)", ref.Name, planck.ErrDeleteInProgress, err)
+	}
+	sawStopping := false
+	for {
+		if op != "" {
+			done, err := api.operationDone(ctx, op)
+			switch {
+			case ctx.Err() != nil:
+				// gRPC reports an expired context as its own status, not as
+				// the context's error: ask the context first.
+				return stillDeleting(ctx.Err())
+			case err != nil:
+				return fmt.Errorf("gke: delete cluster %q: %w", ref.Name, err)
+			case done:
+				op = ""
+			}
+		}
+		st, exists, err := api.get(ctx, ref)
+		switch {
+		case ctx.Err() != nil:
+			return stillDeleting(ctx.Err())
+		case err != nil:
+			return fmt.Errorf("gke: poll cluster %q: %w", ref.Name, err)
+		case !exists:
+			return nil
+		}
+		switch mapStatus(st.RawStatus) {
+		case planck.StatusDeleting:
+			sawStopping = true
+		case planck.StatusError, planck.StatusRunning:
+			// Before STOPPING has been seen this may be the state from before
+			// the request — and deleting a cluster a failed install left in
+			// ERROR is an ordinary path.
+			if sawStopping {
+				return fmt.Errorf("gke: cluster %q is %s again after deletion began; the delete did not complete",
+					ref.Name, mapStatus(st.RawStatus))
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return stillDeleting(ctx.Err())
+		case <-time.After(p.pollInterval):
+		}
+	}
 }
 
 // planCreate resolves a ClusterSpec into a defaults-filled createInput. It is

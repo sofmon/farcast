@@ -4,10 +4,12 @@ import (
 	"context"
 	"crypto/tls"
 	"net"
+	"net/http"
 	"testing"
 	"time"
 
 	"github.com/sofmon/farcast/fatline"
+	"github.com/sofmon/farcast/fatline/identity"
 	fcrypto "github.com/sofmon/farcast/fatline/internal/crypto"
 	"github.com/sofmon/farcast/fatline/tunnel"
 	"github.com/sofmon/farcast/manifest/parser"
@@ -81,6 +83,7 @@ func TestTunnelEndToEnd(t *testing.T) {
 	addr := freeAddr(t)
 	startServer(t, fatline.Config{
 		TunnelListen: addr,
+		Instance:     "inst",
 		ServerCert:   serverCert(t, ca, "127.0.0.1"),
 		ClientCA:     ca.CertPool(),
 		Allowlist:    []parser.External{{Host: "api.stripe.com"}},
@@ -111,6 +114,7 @@ func TestTunnelRejectsForeignClient(t *testing.T) {
 	addr := freeAddr(t)
 	startServer(t, fatline.Config{
 		TunnelListen: addr,
+		Instance:     "inst",
 		ServerCert:   serverCert(t, ca, "127.0.0.1"),
 		ClientCA:     ca.CertPool(),
 	})
@@ -123,30 +127,63 @@ func TestTunnelRejectsForeignClient(t *testing.T) {
 	}
 }
 
-func TestTunnelClientIdentityAuthorization(t *testing.T) {
+// The public tunnel admits this instance's operator and its named keepers,
+// and nothing else its CA issues. It admitted every leaf: an application's,
+// whose key rests in a Kubernetes Secret, opened the public carrier from
+// anywhere and read every application's egress through the Shrike route.
+func TestTunnelAdmitsOnlyOperatorAndKeepers(t *testing.T) {
 	ca, _ := fcrypto.NewCA("inst")
 	addr := freeAddr(t)
 	startServer(t, fatline.Config{
-		TunnelListen:        addr,
-		ServerCert:          serverCert(t, ca, "127.0.0.1"),
-		ClientCA:            ca.CertPool(),
-		AllowClientIdentity: func(uri string) bool { return uri == "farcast://inst/operator" },
+		TunnelListen: addr,
+		Instance:     "inst",
+		ServerCert:   serverCert(t, ca, "127.0.0.1"),
+		ClientCA:     ca.CertPool(),
+		StreamRoutes: []fatline.StreamRoute{{Name: "shrike", Addr: startEchoPlain(t)}},
 	})
 	pool := ca.CertPool()
 
-	ctx1, c1 := context.WithTimeout(t.Context(), 3*time.Second)
-	defer c1()
-	okID := tunnel.ClientIdentity{Cert: clientCert(t, ca, "farcast://inst/operator"), CA: pool, ServerName: "127.0.0.1"}
-	if conn, err := tunnel.Connect(ctx1, "https://"+addr, okID); err != nil {
-		t.Fatalf("authorized operator rejected: %v", err)
-	} else {
+	for _, uri := range []string{identity.OperatorURI("inst"), identity.KeeperURI("inst", "laptop")} {
+		ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+		conn, err := tunnel.Connect(ctx, "https://"+addr, tunnel.ClientIdentity{Cert: clientCert(t, ca, uri), CA: pool, ServerName: "127.0.0.1"})
+		if err != nil {
+			cancel()
+			t.Errorf("%s was refused: %v", uri, err)
+			continue
+		}
+		if _, err := conn.Status(ctx); err != nil {
+			t.Errorf("%s could not read status: %v", uri, err)
+		}
 		_ = conn.Close()
+		cancel()
 	}
 
-	ctx2, c2 := context.WithTimeout(t.Context(), 3*time.Second)
-	defer c2()
-	badID := tunnel.ClientIdentity{Cert: clientCert(t, ca, "farcast://inst/intruder"), CA: pool, ServerName: "127.0.0.1"}
-	if _, err := tunnel.Connect(ctx2, "https://"+addr, badID); err == nil {
-		t.Fatal("expected an unauthorized client identity (valid CA cert, wrong SAN) to be rejected")
+	refused := map[string]tls.Certificate{
+		"an application":                 clientCert(t, ca, identity.AppURI("inst", "shop", "api")),
+		"a device":                       clientCert(t, ca, identity.DeviceURI("inst", "tablet")),
+		"an unknown role":                clientCert(t, ca, "farcast://inst/intruder"),
+		"another instance's operator":    clientCert(t, ca, identity.OperatorURI("other")),
+		"an unnamed keeper":              clientCert(t, ca, "farcast://inst/keeper/"),
+		"a keeper with a path":           clientCert(t, ca, "farcast://inst/keeper/a/b"),
+		"a leaf with no identity at all": clientCert(t, ca, "laptop.example"),
+	}
+	for name, cert := range refused {
+		client := &http.Client{Timeout: 3 * time.Second, Transport: &http.Transport{
+			TLSClientConfig:   fcrypto.ClientTLSConfig(cert, pool, "127.0.0.1"),
+			ForceAttemptHTTP2: true,
+		}}
+		for _, req := range []struct{ method, path string }{
+			{http.MethodGet, fatline.StatusPath},
+			{http.MethodPost, fatline.StreamPathPrefix + "shrike"},
+		} {
+			r, _ := http.NewRequestWithContext(t.Context(), req.method, "https://"+addr+req.path, nil)
+			// TLS 1.3 completes the client's half before the server's alert,
+			// so the refusal arrives on the first exchange, not the dial: any
+			// response at all means the request reached the handler.
+			if resp, err := client.Do(r); err == nil {
+				_ = resp.Body.Close()
+				t.Errorf("%s reached %s %s (status %d); the handshake should have refused it", name, req.method, req.path, resp.StatusCode)
+			}
+		}
 	}
 }

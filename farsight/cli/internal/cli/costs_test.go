@@ -149,3 +149,115 @@ func TestCostsWithoutAKernelRefuses(t *testing.T) {
 		t.Fatalf("costs without a kernel did not say what to do: %v", err)
 	}
 }
+
+// overheadCheckpoint is checkpointFor with a carrier on the ledger and in the
+// observation, in the state the kernel last saw it.
+func overheadCheckpoint(t *testing.T, byApp map[string]float64, carrierUSD float64, state kernel.CarrierState) string {
+	t.Helper()
+	start := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	ledger, err := cost.NewLedger(start, start.AddDate(0, 1, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := start.Add(48 * time.Hour)
+	for app, usd := range byApp {
+		ledger.Accrue(at, app, usd, time.Hour)
+	}
+	ledger.AccrueOverhead(at, kernel.OverheadCarrier, carrierUSD, time.Hour)
+	raw, err := json.Marshal(kernel.Checkpoint{
+		Version: kernel.CheckpointVersion,
+		Ledger:  ledger.Snapshot(),
+		Last:    at,
+		Observed: kernel.Observation{
+			At: at, Pods: 6, RateHourlyUSD: 0.06, Overhead: 0.025, Carrier: string(state),
+			Level: "ok", Limit: 100,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw)
+}
+
+func runCosts(t *testing.T, body string, mode output.Mode) string {
+	t.Helper()
+	dir := config.Dir(t.TempDir())
+	meteringInstance(t, dir, "p43")
+	env, out := testEnv(dir, mode)
+	f := costsReader(t, body)
+	c := &costsCommand{}
+	c.newCluster = func(string) configMapReader { return f }
+	if err := c.Run(context.Background(), env, []string{"p43"}); err != nil {
+		t.Fatal(err)
+	}
+	return out.String()
+}
+
+// The carrier counts against the limit but belongs to no application: shown
+// inside the breakdown it would read as something stopping an app removes.
+func TestCostsShowsOverheadOutsideTheAppBreakdown(t *testing.T) {
+	shown := runCosts(t, overheadCheckpoint(t, map[string]float64{"api": 20}, 7, kernel.CarrierLoadBalancer), output.ModeHuman)
+
+	apps, rest, ok := strings.Cut(shown, "By application:")
+	if !ok {
+		t.Fatalf("no application breakdown:\n%s", shown)
+	}
+	byApp, overhead, ok := strings.Cut(rest, "Instance overhead")
+	if !ok {
+		t.Fatalf("no overhead section:\n%s", shown)
+	}
+	if strings.Contains(byApp, "carrier") {
+		t.Errorf("the carrier is listed as an application:\n%s", byApp)
+	}
+	if !strings.Contains(overhead, "carrier") || !strings.Contains(overhead, "7.00") {
+		t.Errorf("the overhead section does not show the carrier's 7.00:\n%s", overhead)
+	}
+	if !strings.Contains(apps, "27.00") {
+		t.Errorf("expected does not include the carrier (want 27.00):\n%s", apps)
+	}
+	if !strings.Contains(shown, "and the carrier") {
+		t.Errorf("the rate line does not say it includes the carrier:\n%s", shown)
+	}
+	if strings.Contains(shown, "billing it as present") {
+		t.Errorf("an observed carrier is reported as unobserved:\n%s", shown)
+	}
+
+	js := runCosts(t, overheadCheckpoint(t, map[string]float64{"api": 20}, 7, kernel.CarrierLoadBalancer), output.ModeJSON)
+	var res struct {
+		Apps     []appCost `json:"apps"`
+		Overhead []appCost `json:"overhead"`
+	}
+	if err := json.Unmarshal([]byte(js), &res); err != nil {
+		t.Fatalf("%v:\n%s", err, js)
+	}
+	if len(res.Apps) != 1 || res.Apps[0].Name != "api" {
+		t.Errorf("apps = %+v, want api alone", res.Apps)
+	}
+	if len(res.Overhead) != 1 || res.Overhead[0].Name != kernel.OverheadCarrier || res.Overhead[0].USD != 7 {
+		t.Errorf("overhead = %+v, want the carrier at 7", res.Overhead)
+	}
+}
+
+func TestCostsSaysWhenTheCarrierWasNotObserved(t *testing.T) {
+	shown := runCosts(t, overheadCheckpoint(t, nil, 1, kernel.CarrierUnobserved), output.ModeHuman)
+	if !strings.Contains(shown, "billing it as present") {
+		t.Errorf("an unobserved carrier is not called out:\n%s", shown)
+	}
+}
+
+// What the kernel cannot see is named every time, including when nothing
+// else is wrong: a report that looks complete is the failure.
+func TestCostsNamesWhatTheMeterCannotSee(t *testing.T) {
+	for name, body := range map[string]string{
+		"apps only":    checkpointFor(t, 100, 0.03, map[string]float64{"api": 20}, nil),
+		"with carrier": overheadCheckpoint(t, nil, 1, kernel.CarrierLoadBalancer),
+		"empty":        checkpointFor(t, 100, 0, nil, nil),
+	} {
+		shown := runCosts(t, body, output.ModeHuman)
+		for _, want := range []string{"Not metered", "carrier", "bucket storage", "registry storage", "managed workloads", "cluster fee", "'confirmed' is what catches them"} {
+			if !strings.Contains(shown, want) {
+				t.Errorf("%s: the report does not name %q:\n%s", name, want, shown)
+			}
+		}
+	}
+}

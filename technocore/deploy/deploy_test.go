@@ -2,10 +2,15 @@ package deploy
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/goccy/go-yaml"
+
+	fldeploy "github.com/sofmon/farcast/fatline/deploy"
+	"github.com/sofmon/farcast/technocore/kernel"
 )
 
 const testImage = "us-central1-docker.pkg.dev/p/farcast-i/system/technocore@sha256:" +
@@ -476,5 +481,105 @@ func TestTheBindingReferencesTheClusterRoleTheWorkloadRenders(t *testing.T) {
 	}
 	if got := at(t, docs(t, out)[0], "roleRef", "name"); got != roleName {
 		t.Errorf("the binding references ClusterRole %v; the workload renders %v", got, roleName)
+	}
+}
+
+// The kernel reads FatLine's tunnel Service to see whether the instance pays
+// for a load balancer — GET only, pinned by name, in its own namespace's Role.
+// Nothing else in the stream may name Services: list would show every Service
+// there, and the ClusterRole reaches every application's namespace.
+func TestTheKernelMayGetTheCarrierAndNothingElseAboutServices(t *testing.T) {
+	out, err := Render(sampleConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := 0
+	for _, kind := range []string{"Role", "ClusterRole"} {
+		for _, doc := range ofKind(t, out, kind) {
+			for _, r := range at(t, doc, "rules").([]any) {
+				rule := r.(map[string]any)
+				resources := fmt.Sprint(rule["resources"])
+				if !strings.Contains(resources, "services") {
+					continue
+				}
+				if kind != "Role" || fmt.Sprint(rule["verbs"]) != "[get]" || fmt.Sprint(rule["resourceNames"]) != "["+kernel.CarrierService+"]" {
+					t.Errorf("%s grants %v on %v, names %v; want get on %s in the Role only", kind, rule["verbs"], resources, rule["resourceNames"], kernel.CarrierService)
+				}
+				found++
+			}
+		}
+	}
+	if found != 1 {
+		t.Errorf("%d rule(s) name services; want exactly the carrier's", found)
+	}
+	if carrierService != kernel.CarrierService || kernel.CarrierService != fldeploy.DefaultName || kernel.CarrierNamespace != fldeploy.DefaultNamespace {
+		t.Errorf("the carrier's name is not the one FatLine deploys: %q, %q, %q/%q", carrierService, kernel.CarrierService, fldeploy.DefaultNamespace, fldeploy.DefaultName)
+	}
+}
+
+// containerArgs is the kernel container's argument list, as rendered.
+func containerArgs(t *testing.T, c Config) []string {
+	t.Helper()
+	out, err := Render(c)
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	var args []string
+	in := false
+	for _, line := range strings.Split(string(out), "\n") {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case trimmed == "args:":
+			in = true
+		case in && strings.HasPrefix(trimmed, "- "):
+			args = append(args, strings.TrimPrefix(trimmed, "- "))
+		case in && strings.HasPrefix(trimmed, "#"):
+		case in:
+			in = false
+		}
+	}
+	return args
+}
+
+// ADR 0016 decision 3: adapting is off unless asked, and visible as an
+// argument when it is on. The cooldown means something only with it, and the
+// interval only when it is not the default.
+func TestRenderAdaptCooldownAndIntervalArguments(t *testing.T) {
+	has := func(args []string, prefix string) bool {
+		for _, a := range args {
+			if strings.HasPrefix(a, prefix) {
+				return true
+			}
+		}
+		return false
+	}
+	off := containerArgs(t, sampleConfig())
+	if has(off, "--adapt") || has(off, "--interval") {
+		t.Errorf("defaults rendered %v; want neither --adapt nor --interval", off)
+	}
+
+	c := sampleConfig()
+	c.Adapt, c.AdaptCooldown, c.Interval = true, 2*time.Minute, 10*time.Second
+	on := containerArgs(t, c)
+	for _, want := range []string{"--adapt", "--adapt-cooldown=2m0s", "--interval=10s"} {
+		if !slices.Contains(on, want) {
+			t.Errorf("args %v lack %s", on, want)
+		}
+	}
+
+	c.Adapt = false
+	if args := containerArgs(t, c); has(args, "--adapt") || !slices.Contains(args, "--interval=10s") {
+		t.Errorf("adapt off rendered %v; want the interval and no adapt argument at all", args)
+	}
+
+	for _, bad := range []Config{
+		func() Config { c := sampleConfig(); c.Interval = 4 * time.Second; return c }(),
+		func() Config { c := sampleConfig(); c.Interval = 6 * time.Minute; return c }(),
+		func() Config { c := sampleConfig(); c.Adapt, c.AdaptCooldown = true, 30*time.Second; return c }(),
+		func() Config { c := sampleConfig(); c.Interval = -time.Second; return c }(),
+	} {
+		if _, err := Render(bad); err == nil {
+			t.Errorf("rendered interval %s, cooldown %s; want it refused", bad.Interval, bad.AdaptCooldown)
+		}
 	}
 }

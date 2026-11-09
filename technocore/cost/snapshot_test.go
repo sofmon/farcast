@@ -2,6 +2,7 @@ package cost
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
@@ -113,6 +114,12 @@ func TestRestoreRefusesCorruptContent(t *testing.T) {
 		t.Error("negative expected spend must be refused")
 	}
 
+	negOverhead := base(t)
+	negOverhead.Overhead = map[string]float64{"carrier": -1}
+	if _, err := Restore(negOverhead); err == nil {
+		t.Error("negative overhead must be refused")
+	}
+
 	negApp := base(t)
 	negApp.Apps["web"] = -5
 	if _, err := Restore(negApp); err == nil {
@@ -133,7 +140,8 @@ func TestRestoreRefusesCorruptContent(t *testing.T) {
 // to be exported. If this breaks, something changed what gets written.
 func TestSnapshotShapeIsStable(t *testing.T) {
 	l := newLedger(t)
-	l.Accrue(periodStart, "web", 1, time.Hour)
+	l.Accrue(periodStart.Add(time.Hour), "web", 1, time.Hour)
+	l.AccrueOverhead(periodStart.Add(time.Hour), "carrier", 0.025, time.Hour)
 	blob, err := json.Marshal(l.Snapshot())
 	if err != nil {
 		t.Fatal(err)
@@ -142,7 +150,7 @@ func TestSnapshotShapeIsStable(t *testing.T) {
 	if err := json.Unmarshal(blob, &generic); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"version", "period_start", "period_end", "hourly", "apps", "confirmations"}
+	want := []string{"version", "period_start", "period_end", "hourly", "apps", "confirmations", "overhead"}
 	if len(generic) != len(want) {
 		t.Errorf("snapshot has %d fields (%v), want exactly %v", len(generic), keysOf(generic), want)
 	}
@@ -159,4 +167,26 @@ func keysOf(m map[string]any) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// Overhead is additive and omitted when empty: a checkpoint written before it
+// existed restores with none, and an older reader sees nothing new.
+func TestOverheadRoundTripsAndIsOmittedWhenEmpty(t *testing.T) {
+	l := newLedger(t)
+	l.Accrue(periodStart.Add(time.Hour), "web", 1, time.Hour)
+	blob, err := json.Marshal(l.Snapshot())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(blob), `"overhead"`) {
+		t.Errorf("a ledger with no overhead wrote an overhead key: %s", blob)
+	}
+	l.AccrueOverhead(periodStart.Add(2*time.Hour), "carrier", 0.025, time.Hour)
+	back, err := Restore(l.Snapshot())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := back.ByOverhead()["carrier"]; got != 0.025 {
+		t.Errorf("restored overhead = %v, want 0.025", got)
+	}
 }

@@ -2,6 +2,8 @@ package fatline
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -12,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sofmon/farcast/fatline/identity"
 	fcrypto "github.com/sofmon/farcast/fatline/internal/crypto"
 	"github.com/sofmon/farcast/manifest/parser"
 )
@@ -65,7 +68,7 @@ func TestStatusReflectsAllowlist(t *testing.T) {
 }
 
 func TestIngressStatusHandler(t *testing.T) {
-	s, _ := New(Config{TunnelListen: "127.0.0.1:0", Allowlist: []parser.External{{Host: "a.com"}}, Endpoint: "edge.example"})
+	s, _ := New(Config{TunnelListen: "127.0.0.1:0", Instance: "inst", Allowlist: []parser.External{{Host: "a.com"}}, Endpoint: "edge.example"})
 	ts := httptest.NewServer(s.ingressHandler())
 	defer ts.Close()
 
@@ -134,6 +137,81 @@ func TestStringRedaction(t *testing.T) {
 	} {
 		if strings.Contains(str, keyChunk) {
 			t.Fatalf("private key material leaked in stringification: %q", str)
+		}
+	}
+}
+
+// The tunnel admits by a rule that needs the instance; with none, there is
+// nothing it could admit, and it refuses to start rather than admit everything.
+func TestNewRequiresInstanceForTunnel(t *testing.T) {
+	if _, err := New(Config{TunnelListen: "127.0.0.1:0"}); err == nil {
+		t.Error("a tunnel with no instance was accepted")
+	}
+	if _, err := New(Config{TunnelListen: "127.0.0.1:0", Instance: "inst"}); err != nil {
+		t.Errorf("a tunnel with an instance was refused: %v", err)
+	}
+	if _, err := New(Config{EgressListen: "127.0.0.1:0"}); err != nil {
+		t.Errorf("an egress-only FatLine needs no instance: %v", err)
+	}
+}
+
+func TestTunnelAdmitsRule(t *testing.T) {
+	admits := tunnelAdmits("prod")
+	for uri, want := range map[string]bool{
+		identity.OperatorURI("prod"):           true,
+		identity.KeeperURI("prod", "laptop"):   true,
+		identity.AppURI("prod", "shop", "api"): false,
+		identity.DeviceURI("prod", "tablet"):   false,
+		identity.OperatorURI("other"):          false,
+		identity.OperatorURI("prod") + "x":     false,
+		"x" + identity.OperatorURI("prod"):     false,
+		identity.KeeperURI("prod", ""):         false,
+		identity.KeeperURI("prod", "a/b"):      false,
+		identity.KeeperURI("prod", "a?b"):      false,
+		identity.KeeperURI("other", "laptop"):  false,
+		"farcast://prod/intruder":              false,
+		"":                                     false,
+	} {
+		if got := admits(uri); got != want {
+			t.Errorf("admits(%q) = %v, want %v", uri, got, want)
+		}
+	}
+	if tunnelAdmits("")("farcast:///operator") {
+		t.Error("a tunnel with no instance admitted an empty-instance operator")
+	}
+}
+
+// The handshake is the boundary; every request is checked again.
+func TestAdmitChecksEachRequest(t *testing.T) {
+	s, err := New(Config{TunnelListen: "127.0.0.1:0", Instance: "inst"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf := func(uri string) *tls.ConnectionState {
+		u, err := url.Parse(uri)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &tls.ConnectionState{PeerCertificates: []*x509.Certificate{{URIs: []*url.URL{u}}}}
+	}
+	for name, tc := range map[string]struct {
+		cs   *tls.ConnectionState
+		want int
+	}{
+		"no TLS":         {nil, http.StatusForbidden},
+		"no certificate": {&tls.ConnectionState{}, http.StatusForbidden},
+		"an application": {leaf(identity.AppURI("inst", "shop", "api")), http.StatusForbidden},
+		"a keeper":       {leaf(identity.KeeperURI("inst", "laptop")), http.StatusOK},
+		"the operator":   {leaf(identity.OperatorURI("inst")), http.StatusOK},
+	} {
+		called := false
+		h := s.admit(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { called = true }))
+		req := httptest.NewRequest(http.MethodGet, StatusPath, nil)
+		req.TLS = tc.cs
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != tc.want || called != (tc.want == http.StatusOK) {
+			t.Errorf("%s: status %d, handler called %v; want %d", name, rec.Code, called, tc.want)
 		}
 	}
 }

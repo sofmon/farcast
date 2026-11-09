@@ -414,3 +414,25 @@ func TestAnExternallyConstructedAPIErrorUnwrapsCorrectly(t *testing.T) {
 		t.Errorf("Error() = %q, want the status code", got)
 	}
 }
+
+func TestGetServiceReadsTheType(t *testing.T) {
+	var seen capture
+	s := server(t, http.StatusOK, `{"metadata":{"name":"fatline"},"spec":{"type":"LoadBalancer"}}`, &seen)
+	svc, err := client(t, s.URL, tokenFileWith(t, "t")).GetService(context.Background(), "farcast-system", "fatline")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seen.method != http.MethodGet || seen.path != "/api/v1/namespaces/farcast-system/services/fatline" || seen.query != "" {
+		t.Errorf("request = %s %s?%s", seen.method, seen.path, seen.query)
+	}
+	if svc.Spec.Type != ServiceTypeLoadBalancer {
+		t.Errorf("type = %q", svc.Spec.Type)
+	}
+}
+
+func TestGetServiceReportsAMissingOneAsNotFound(t *testing.T) {
+	s := server(t, http.StatusNotFound, `{"kind":"Status","code":404,"reason":"NotFound"}`, nil)
+	if _, err := client(t, s.URL, tokenFileWith(t, "t")).GetService(context.Background(), "farcast-system", "fatline"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+}

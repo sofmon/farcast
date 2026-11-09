@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -45,6 +46,8 @@ type storageDeployCommand struct {
 	// A seam, because whether this command mints at all is the fix for a real
 	// defect and deserves a test that does not need a cloud.
 	ensureStorage func(ctx context.Context, env *Env, instance string) error
+	// newPinStore reaches the key pin; nil reaches the cluster.
+	newPinStore pinStoreOpener
 }
 
 func (c *storageDeployCommand) ensureDefaults() {
@@ -107,6 +110,29 @@ func (c *storageDeployCommand) Run(ctx context.Context, env *Env, args []string)
 		// ever unseal.
 		return fmt.Errorf("instance %q is not connected; run 'farcast connect %s' first — "+
 			"the keyholder is reachable only through the FatLine tunnel", name, name)
+	}
+	// The key pin is read before anything is spent. A deploy restarts every
+	// replica, and each one comes back enforcing the pin: from a keyring the
+	// pin already refuses, nothing here could unseal them afterwards.
+	openPin := c.newPinStore
+	if openPin == nil {
+		openPin = defaultPinStore
+	}
+	ps, err := openPin(env.ConfigDir.InstanceKubeconfigPath(name))
+	if err != nil {
+		return fmt.Errorf("the key pin could not be reached, so nothing was deployed: %w", err)
+	}
+	cur, present, _, invalid, err := readPin(ctx, ps)
+	if err != nil {
+		return fmt.Errorf("%w; nothing was deployed", err)
+	}
+	if present && invalid == nil {
+		if k, kerr := keyringOf(env, name); kerr == nil {
+			if behind := pinVerdict(cur, k); behind != nil {
+				return fmt.Errorf("%v. Deploying restarts every replica, and none of them could be unsealed from here afterwards, so nothing was deployed. "+
+					"Bring this keyring up to date ('farcast storage key import'), or deploy from the machine that rotated", behind)
+			}
+		}
 	}
 	// Ask before creating anything, not after.
 	//
@@ -189,6 +215,18 @@ func (c *storageDeployCommand) Run(ctx context.Context, env *Env, args []string)
 	})
 	if err != nil {
 		return err
+	}
+
+	// Before the replicas exist, and always: TechnoCore may create ConfigMaps
+	// in this namespace, so the pin is this machine's only if this machine
+	// created it. No apply touches it afterwards — an apply is
+	// last-writer-wins, and could move it backwards.
+	if _, err := pinOnDeploy(ctx, ps, env, name); err != nil {
+		var behind *pinBehind
+		if errors.As(err, &behind) {
+			return fmt.Errorf("%v; nothing was deployed", behind)
+		}
+		return fmt.Errorf("the key pin could not be written, so nothing was deployed: %w. %s re-arms it", err, pinRemedy(name))
 	}
 
 	// Recorded BEFORE the apply, like every other billable thing this CLI

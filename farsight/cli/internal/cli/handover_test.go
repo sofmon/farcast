@@ -853,6 +853,9 @@ func TestUnsealHoldsANewKeyBackFromAReplicaThatLacksIt(t *testing.T) {
 	base := servingFleet(t, env, meta, dir)
 	rotateWith(t, env, "p93", base)
 	base.replica(1).keys = heldKeys(before)
+	// A replica serving keys from before a rotation is what the key pin now
+	// refuses outright; this is the two-step unseal on an instance without one.
+	unpin(t, dir, "p93", base)
 
 	err := (&storageUnsealCommand{newKeyholder: openerFor(&flakyKeyholder{fakeStateKeyholder: base, refuseNth: map[int]int{1: 1}})}).
 		Run(context.Background(), env, []string{"p93"})
@@ -1275,6 +1278,7 @@ func TestUnsealThatCouldNotActivateIsNotSuccess(t *testing.T) {
 	base := servingFleet(t, env, meta, dir)
 	rotateWith(t, env, "p105", base)
 	base.replica(1).keys = heldKeys(before)
+	unpin(t, dir, "p105", base) // an instance without a key pin; see TestUnsealHoldsANewKeyBackFromAReplicaThatLacksIt
 
 	err := (&storageUnsealCommand{newKeyholder: openerFor(&reseededBetween{fakeStateKeyholder: base, old: heldKeys(before)})}).
 		Run(context.Background(), env, []string{"p105"})
@@ -1547,7 +1551,16 @@ func TestStorageStateCallsABehindKeyringBehind(t *testing.T) {
 	mustRotate(t, env, "p116", base) // the other machine's rotation: the fleet uses its key
 	theirs := liveKeyring(t, dir, "p116")
 	saveKeyring(t, dir, "p116", before) // this machine never saw it
-	rotateWith(t, env, "p116", base)    // refused as behind; its own new key stays held
+	// Refused before anything is minted: the instance's key pin requires the
+	// other machine's key, and this keyring lacks it.
+	unchanged := liveKeyring(t, dir, "p116")
+	if err := (&keyRotateCommand{assumeYes: true, newKeyholder: openerFor(base)}).Run(context.Background(), env, []string{"p116"}); err == nil ||
+		!strings.Contains(err.Error(), "behind the instance's key pin") {
+		t.Fatalf("rotate from a keyring behind the pin = %v; want it refused as behind", err)
+	}
+	if !sameKeys(heldKeys(liveKeyring(t, dir, "p116")), heldKeys(unchanged)) {
+		t.Fatal("a rotation refused as behind minted keys anyway")
+	}
 	merged, err := liveKeyring(t, dir, "p116").Merge(theirs)
 	if err != nil {
 		t.Fatal(err)
@@ -1576,6 +1589,7 @@ func TestUnsealReportsAReplicaItUnsealedAsUnsealed(t *testing.T) {
 	base := servingFleet(t, env, meta, dir)
 	mustRotate(t, env, "p117", base)
 	base.replica(0).keys = heldKeys(before)
+	unpin(t, dir, "p117", base) // an instance without a key pin; see TestUnsealHoldsANewKeyBackFromAReplicaThatLacksIt
 	base.replica(1).phase, base.replica(1).keys, base.replica(1).generation = "restart-sealed", nil, 0
 
 	err := (&storageUnsealCommand{newKeyholder: openerFor(&flakyKeyholder{fakeStateKeyholder: base, refuseNth: map[int]int{1: 2}})}).
@@ -1624,16 +1638,71 @@ func TestARotationThatDidNotFinishFails(t *testing.T) {
 // replicas can read — the keyring it hands over, not the one it started from.
 // Here replica 1 was re-seeded with keys from before this machine's last
 // rotation, so the key this machine uses is one it lacks; the hand-over keeps
-// an older key in use, and this machine has to follow it.
+// an older key in use, and this machine has to follow it. With no key pin —
+// an instance from before it — that is still what happens.
 func TestRotateSavesTheKeyringItHandsOver(t *testing.T) {
 	dir, meta, env, _, before := backdatedInstance(t, "p119", "alpha")
 	base := servingFleet(t, env, meta, dir)
 	mustRotate(t, env, "p119", base)
 	base.replica(1).keys = heldKeys(before)
+	unpin(t, dir, "p119", base)
 
 	rotateWith(t, env, "p119", &flakyKeyholder{fakeStateKeyholder: base, refuseNth: map[int]int{1: 1}})
 	writesUnderHeldKeys(t, dir, "p119", base)
 	noSplit(t, base)
+}
+
+// unpin removes an instance's key pin, from the cluster and from every
+// replica: an instance from before the pin.
+func unpin(t *testing.T, dir config.Dir, instance string, kh *fakeStateKeyholder) {
+	t.Helper()
+	ps := pinStoreOf(dir, instance)
+	ps.mu.Lock()
+	ps.exists, ps.value = false, ""
+	ps.mu.Unlock()
+	for _, r := range kh.reps {
+		r.pin = nil
+	}
+}
+
+// With the pin, the same fleet is not followed back. The key the hold would
+// fall back to is one the last rotation retired, so a replica serving it is
+// serving keys from before that rotation, and every replica enforcing the pin
+// would refuse the push. Nothing is pushed, this machine stays on the key it
+// was using, and an unseal — which brings that replica forward rather than
+// the fleet back — mends it.
+func TestARotationDoesNotFollowAReplicaBackOntoARetiredKey(t *testing.T) {
+	dir, meta, env, _, before := backdatedInstance(t, "p131", "alpha")
+	base := servingFleet(t, env, meta, dir)
+	mustRotate(t, env, "p131", base)
+	base.replica(1).keys = heldKeys(before)
+	using := liveKeyring(t, dir, "p131").Scopes()[0].Keyring().KEKs()[0].ID
+	pushes := base.pushes
+
+	err := (&keyRotateCommand{assumeYes: true, newKeyholder: openerFor(base)}).Run(context.Background(), env, []string{"p131"})
+	if err == nil || !strings.Contains(err.Error(), "farcast storage key rotate p131") {
+		t.Fatalf("rotate = %v; want it unfinished", err)
+	}
+	if base.pushes != pushes {
+		t.Errorf("%d pushes were made toward a retired key", base.pushes-pushes)
+	}
+	if got := liveKeyring(t, dir, "p131").Scopes()[0].Keyring().KEKs()[0].ID; got != using {
+		t.Errorf("this machine now writes under %s; it was on %s, and the fallback is retired", got, using)
+	}
+	// An unseal cannot hand it over in two steps either: the only key both
+	// replicas share is the retired one. It says so, and what does work.
+	err = (&storageUnsealCommand{newKeyholder: openerFor(base)}).Run(context.Background(), env, []string{"p131"})
+	if err == nil || !strings.Contains(err.Error(), "farcast storage seal p131") || base.pushes != pushes {
+		t.Fatalf("unseal = %v after %d pushes; want a refusal naming seal-then-unseal, and nothing pushed", err, base.pushes-pushes)
+	}
+	for i := range 2 { // 'farcast storage seal p131'
+		base.replica(i).phase, base.replica(i).keys = "restart-sealed", nil
+	}
+	if err := (&storageUnsealCommand{newKeyholder: openerFor(base)}).Run(context.Background(), env, []string{"p131"}); err != nil {
+		t.Fatalf("unseal after a seal: %v", err)
+	}
+	noSplit(t, base)
+	writesUnderHeldKeys(t, dir, "p131", base)
 }
 
 // ---------------------------------------------------------------- the fourth review
@@ -2112,5 +2181,153 @@ func TestARotationIsNotUndoneOnAnAnswerItCouldNotConfirm(t *testing.T) {
 		if !slices.Contains(base.replica(i).keys["app-demo-alpha"], disk[0]) {
 			t.Errorf("this machine writes under %s, which replica %d does not hold", disk[0], i)
 		}
+	}
+}
+
+// ---------------------------------------------------------------- the keyholder's own drop refusal
+
+// gainsKeysBeforePush is another machine's push landing in the gap: just
+// before this command's push number nth to replica at, that replica gains keys
+// this machine's keyring lacks.
+type gainsKeysBeforePush struct {
+	*fakeStateKeyholder
+	at, nth int
+	extra   map[string][]string
+	seen    map[int]int
+}
+
+func (g *gainsKeysBeforePush) Unseal(ctx context.Context, i int, payload []byte, intent string) (keyholder.State, error) {
+	if g.seen == nil {
+		g.seen = map[int]int{}
+	}
+	g.seen[i]++
+	if i == g.at && g.seen[i] == g.nth {
+		r := g.replica(i)
+		for name, ids := range g.extra {
+			r.keys[name] = append(r.keys[name], ids...)
+		}
+	}
+	return g.fakeStateKeyholder.Unseal(ctx, i, payload, intent)
+}
+
+var anotherMachinesKey = map[string][]string{"app-demo-alpha": {"00000000000000ee"}}
+
+// A serving replica that gained keys between the read and the push refuses the
+// push (the keyholder's ErrWouldDrop), and unseal — which pushes serving
+// replicas first — then leaves a sealed replica sealed rather than unseal it
+// beside one it would be split from.
+func TestUnsealStopsWhenAServingReplicaSaysThisKeyringIsBehind(t *testing.T) {
+	dir, meta, env, _ := handOverInstance(t, "p140")
+	scopedKeyring(t, dir, "p140", "demo", "alpha")
+	base := servingFleet(t, env, meta, dir)
+	base.replica(0).phase, base.replica(0).keys, base.replica(0).generation = "restart-sealed", nil, 0
+	recorded := meta.Keyholder.Generation
+
+	err := (&storageUnsealCommand{newKeyholder: openerFor(&gainsKeysBeforePush{fakeStateKeyholder: base, at: 1, nth: 1, extra: anotherMachinesKey})}).
+		Run(context.Background(), env, []string{"p140"})
+	if err == nil || !strings.Contains(err.Error(), "behind the instance's") {
+		t.Fatalf("unseal = %v; want it to say this keyring is behind", err)
+	}
+	if base.replica(0).phase != "restart-sealed" {
+		t.Error("the sealed replica was unsealed from a keyring behind the serving one")
+	}
+	if !slices.Contains(base.replica(1).keys["app-demo-alpha"], "00000000000000ee") {
+		t.Errorf("the serving replica lost the key another machine gave it: %v", base.replica(1).keys)
+	}
+	entries, lerr := keyholder.ReadLedger(dir.InstanceUnsealLedgerPath("p140"))
+	if lerr != nil {
+		t.Fatal(lerr)
+	}
+	var mine []keyholder.LedgerEntry
+	for _, e := range entries {
+		if e.Intent == keyholder.IntentOperator {
+			mine = append(mine, e)
+		}
+	}
+	if len(mine) != 1 || mine[0].Ordinal != 1 || mine[0].Result != "refused" {
+		t.Errorf("ledger %+v; want one refused push to replica 1 and nothing for the replica never pushed", mine)
+	}
+	if got, _ := dir.LoadInstanceMetadata("p140"); got.Keyholder.Generation != recorded {
+		t.Errorf("a refused unseal advanced the recorded generation to %d", got.Keyholder.Generation)
+	}
+	noSplit(t, base)
+}
+
+// Once a serving replica refuses, the next serving replica is not pushed
+// either: it would refuse too, and its row says why it was skipped.
+func TestAfterABehindRefusalNoOtherServingReplicaIsPushed(t *testing.T) {
+	dir, meta, env, out := handOverInstance(t, "p141")
+	scopedKeyring(t, dir, "p141", "demo", "alpha")
+	base := servingFleet(t, env, meta, dir)
+	gains := &gainsKeysBeforePush{fakeStateKeyholder: base, at: 0, nth: 1, extra: anotherMachinesKey}
+
+	if err := (&storageUnsealCommand{newKeyholder: openerFor(gains)}).Run(context.Background(), env, []string{"p141"}); err == nil {
+		t.Fatal("an unseal refused as behind was reported as success")
+	}
+	if gains.seen[1] != 0 {
+		t.Errorf("replica 1 was pushed %d time(s) after replica 0 said this keyring is behind", gains.seen[1])
+	}
+	if !strings.Contains(out.String(), "not pushed: replica 0 said this keyring is behind") {
+		t.Errorf("the skipped replica's row does not say why:\n%s", out.String())
+	}
+}
+
+// A new application's hand-over refused as behind says so, and what follows.
+func TestRunSaysWhenTheKeyholderRefusesThisKeyringAsBehind(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	meta := runnableInstance(t, dir, "p142")
+	meta.Keyholder = &config.Keyholder{Deployed: true, Replicas: 2}
+	if err := dir.SaveInstanceMetadata("p142", meta); err != nil {
+		t.Fatal(err)
+	}
+	mintKeyring(t, dir, "p142")
+	kh := &fakeStateKeyholder{phase: "unsealed"}
+	for i := range 2 {
+		kh.replica(i).keys = map[string][]string{}
+	}
+	env, _, errBuf := testEnvBoth(dir, output.ModeHuman)
+	c := runCmd(newFakeRun(twoAppManifest))
+	gains := &gainsKeysBeforePush{fakeStateKeyholder: kh, at: 0, nth: 1, extra: map[string][]string{"app-elsewhere-other": {"00000000000000ee"}}}
+	c.newKeyholder = func(context.Context, *Env, string) (sealStateClient, func(), error) { return gains, func() {}, nil }
+	if err := c.Run(context.Background(), env, []string{"p142", "github.com/example/my-platform"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(errBuf.String(), "behind the instance's") || !strings.Contains(errBuf.String(), "farcast storage unseal p142") {
+		t.Errorf("run did not say the keyholder refused this keyring, or what follows:\n%s", errBuf.String())
+	}
+}
+
+// Refused at the held step: nothing is in use anywhere, this machine included.
+func TestARotationRefusedAsBehindAtTheHeldStepUsesNothing(t *testing.T) {
+	dir, meta, env, _ := handOverInstance(t, "p143")
+	scopedKeyring(t, dir, "p143", "demo", "alpha")
+	base := servingFleet(t, env, meta, dir)
+	before := heldKeys(liveKeyring(t, dir, "p143"))["app-demo-alpha"][0]
+
+	err := (&keyRotateCommand{assumeYes: true, newKeyholder: openerFor(&gainsKeysBeforePush{fakeStateKeyholder: base, at: 0, nth: 1, extra: anotherMachinesKey})}).
+		Run(context.Background(), env, []string{"p143"})
+	var unfinished rotationUnfinished
+	if !errors.As(err, &unfinished) || !strings.Contains(err.Error(), "behind the instance's") {
+		t.Fatalf("rotate = %v; want an unfinished rotation saying this keyring is behind", err)
+	}
+	if got := heldKeys(liveKeyring(t, dir, "p143"))["app-demo-alpha"]; got[0] != before || len(got) != 2 {
+		t.Errorf("this machine now holds %v; want the new key held and %s still in use", got, before)
+	}
+	noSplit(t, base)
+	writesUnderHeldKeys(t, dir, "p143", base)
+}
+
+// Refused at the activation step: the replicas already hold the new keys, so
+// whichever use them, none is split.
+func TestARotationRefusedAsBehindAtActivationSplitsNothing(t *testing.T) {
+	dir, meta, env, out := handOverInstance(t, "p144")
+	scopedKeyring(t, dir, "p144", "demo", "alpha")
+	base := servingFleet(t, env, meta, dir)
+
+	rotateWith(t, env, "p144", &gainsKeysBeforePush{fakeStateKeyholder: base, at: 1, nth: 2, extra: anotherMachinesKey})
+	noSplit(t, base)
+	writesUnderHeldKeys(t, dir, "p144", base)
+	if !strings.Contains(out.String(), "behind the instance's") {
+		t.Errorf("rotate did not say a replica refused this keyring as behind:\n%s", out.String())
 	}
 }

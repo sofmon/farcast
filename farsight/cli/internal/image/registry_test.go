@@ -16,8 +16,8 @@ import (
 
 // testRegistry is a small in-memory registry over httptest — enough for the
 // builder to pull a base from and push an image to, with no network and no
-// cloud account (cloud-touching tests are integration-gated and never run in
-// CI, per the cost pillar).
+// cloud account (cloud-touching tests are integration-gated and never run by
+// ./check.sh, per the cost pillar).
 type testRegistry struct {
 	t   *testing.T
 	srv *httptest.Server

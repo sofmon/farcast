@@ -38,6 +38,8 @@ farcast storage deploy "$INSTANCE"
 
 **This creates the bucket and the keyring if the instance has neither.** It used to refuse and tell you to "run a 'farcast storage' command first so the bucket is minted" — and the only such command that mints is one that *writes*. The Phase 4.3 walk followed that literally, wrote to `app/`, and stranded the object: nothing owned `app/` yet, so it landed in the master key space, and the first unseal minted the `app` scope over the prefix. See [ADR 0008](../adr/0008-in-cluster-key-delivery.md) decision 9.
 
+*(Corrected 2026-10-08: the keyring this mints holds **no application scope**. There is no shared `app` scope any more; each application gets its own — `app-<namespace>-<app>`, owning `app/<namespace>/<app>/` — minted by `farcast run` when it first deploys that application ([ADR 0018](../adr/0018-thin-device-storage.md) decision 5, `datasphere/scope.go`). The key-loss warning is printed here, where the keyring is created.)*
+
 Expect a cost confirmation naming the standing compute, then a build-and-push of `system/datasphered` if the instance registry does not already have it (no container engine involved — the CLI compiles the Go binary and pushes an OCI image directly).
 
 **The command must NOT wait for the pods to become ready.** It should return promptly saying every replica is SEALED and telling you to run `unseal`. If it hangs waiting for a rollout, that is a bug: sealed replicas never become Ready, so the wait could only ever time out.
@@ -114,6 +116,15 @@ farcast storage unseal "$INSTANCE"
 
 The first run mints the `app` scope, records it in `keys.yaml` **before pushing anything**, and prints the key-loss warning. Expect `2 of 2` and a generation number.
 
+*(Corrected 2026-10-08: unseal mints nothing. It hands over the keyring `storage deploy` created, and on an instance with no applications that keyring holds no application scopes, so expect:*
+
+```
+2 of 2 replicas are unsealed at generation <G>, holding no application scopes:
+this instance has no applications yet. 'farcast run' mints a scope for each one.
+```
+
+*That is not a failure: the replicas become ready with an empty bundle, and each `farcast run` later mints its application's scope and hands it to the serving replicas.)*
+
 ```bash
 farcast storage state "$INSTANCE"
 kubectl -n "$NS" get pods -l app.kubernetes.io/name=datasphered
@@ -128,32 +139,41 @@ Confirm the push was recorded locally:
 cat "$INSTANCE_DIR/datasphere/unseal-ledger.jsonl"
 ```
 
-Expect one line per replica, with the generation and `"result":"ok"`. This is the record phase 5.4's keeper audit reads; it must exist from the first push.
+Expect one line per replica, with the generation, `"result":"ok"`, and a `"boot"` naming the keyholder process the push landed in — a different value for each replica. This is the record phase 5.4's keeper audit reads; it must exist from the first push, and an entry with no `boot` cannot be placed against a process. *(Corrected 2026-10-08: `boot` was not listed. Operator-unseal entries lacked it until the 2026-10-06 re-walk found and fixed that.)*
 
 ## 5. The crux — operator and keyholder agree about names
 
 This is the step that proves the scope actually works. Write through the keyholder, then read the same object from your own machine with the CLI. If these disagree, the scope's key material is wrong and nothing else in this phase matters.
 
-Port-forward the data path and write an object as an application would:
+*(Corrected 2026-10-08: this step used to port-forward the data Service and `curl` a write claiming `X-Farcast-Scope: app`, key `app/hello`. That cannot work any more, for two reasons. There is no `app` scope (step 1's note). And the data port now requires a client certificate: it admits only a caller presenting a leaf the instance CA issued, refuses one with none at the handshake, and decides which scope a caller may reach from the application its leaf names — `farcast://<instance>/app/<namespace>/<app>` — not from a header ([ADR 0018](../adr/0018-thin-device-storage.md) decision 1; `DataTLS` in `datasphere/keyholder/tls.go`). So the write has to come from inside an application's pod, with that application's own leaf.)*
+
+**This step needs an application, and so it needs what `farcast run` needs.** `run` refuses, before it fetches anything, an instance with no kernel. Deploy the kernel ([the 4.1 runbook](phase-4-1-validation.md), step 2), mirror the build toolchain ([the 4.3 runbook](phase-4-3-validation.md#1a-mirror-the-toolchain), step 1a), and apply the builder's push grant ([the 4.2 runbook](phase-4-2-validation.md), step 2). Then deploy the SDK fixture, two applications called `alpha` and `beta` in namespace `sdk-demo`:
 
 ```bash
-kubectl -n "$NS" port-forward svc/datasphered 8443:8443 &
-CA="$INSTANCE_DIR/fatline/ca.crt"
-
-printf 'hello from inside the cluster' | curl -sS --cacert "$CA" \
-  --connect-to "$INSTANCE.datasphered.farcast:8443:127.0.0.1:8443" \
-  -X PUT "https://$INSTANCE.datasphered.farcast:8443/v1/object" \
-  -H "X-Farcast-Scope: app" \
-  -H "X-Farcast-Key: $(printf 'app/hello' | base64)" \
-  --data-binary @-
+farcast run "$INSTANCE" github.com/sofmon/farcast --manifest manifest/examples/sdk-demo/farcast
 ```
+
+`run` mints a scope for each application, records them in `keys.yaml` before it deploys anything, and hands them to the serving replicas. If you are walking 3.2 on its own, every other step here works without an application. Come back to this one once the instance has a kernel and the fixture.
+
+Now write an object as `alpha`, from inside its own pod and with its own leaf. Planck puts the leaf and its key in the application's Secret, and the CA, endpoint, server name and scope in its ConfigMap. The fixture's image is Alpine, whose curl is built against OpenSSL and can load the Ed25519 leaf that macOS's LibreSSL curl cannot (finding 4 below):
+
+```bash
+kubectl -n sdk-demo exec deploy/alpha -- sh -c 'umask 077
+ printf "%s" "$FARCAST_STORAGE_CA" >/tmp/ca.crt; printf "%s" "$FARCAST_STORAGE_CLIENT_CERT" >/tmp/l.crt; printf "%s" "$FARCAST_STORAGE_CLIENT_KEY" >/tmp/l.key
+ H=${FARCAST_STORAGE_ENDPOINT#https://}; HOST=${H%:*}; P=${H##*:}
+ printf "hello from inside the cluster" | curl -sS -w "http_code=%{http_code}\n" --cacert /tmp/ca.crt --cert /tmp/l.crt --key /tmp/l.key \
+  --connect-to "$FARCAST_STORAGE_SERVER_NAME:$P:$HOST:$P" -X PUT "https://$FARCAST_STORAGE_SERVER_NAME:$P/v1/object" \
+  -H "X-Farcast-Scope: $FARCAST_STORAGE_SCOPE" -H "X-Farcast-Key: $(printf app/sdk-demo/alpha/hello | base64)" --data-binary @-; rm -f /tmp/l.key'
+```
+
+Expect `http_code=204`. The key is the full logical name. It has to sit under `app/sdk-demo/alpha/`, the prefix `alpha`'s scope owns, and the scope header is only a cross-check that the keyholder refuses if it disagrees with the leaf. The copy of the private key is deleted as the command ends. It is the same key the pod already holds in its environment.
 
 Now read it back **from the operator's machine, through the ordinary CLI**:
 
 ```bash
-farcast storage ls "$INSTANCE:app/"
-farcast storage cp "$INSTANCE:app/hello" /tmp/hello.readback
-cat /tmp/hello.readback
+farcast storage ls "$INSTANCE:app/sdk-demo/alpha/"
+farcast storage cp "$INSTANCE:app/sdk-demo/alpha/hello" ./hello.readback
+cat ./hello.readback
 ```
 
 Expect the object to list, and the file to contain `hello from inside the cluster`.
@@ -161,7 +181,7 @@ Expect the object to list, and the file to contain `hello from inside the cluste
 **If the listing is empty, do not guess — ask what it queried:**
 
 ```bash
-farcast storage ls "$INSTANCE:app/" --explain
+farcast storage ls "$INSTANCE:app/sdk-demo/alpha/" --explain
 ```
 
 That reports, per key space, the prefix it owns, the opaque prefix it queried, how many objects the provider holds under it, and how many names were recovered. A key space that queried a prefix with **0 objects under it** does not address the data written there, and its key ids should be compared against the writer's — which is the single fact the 2026-08-31 run could not obtain. That proves the keyring on this laptop and the bundle in the cluster are the same key material, and that the stateless name-recovery promise survives scoping.
@@ -172,7 +192,7 @@ That reports, per key space, the prefix it owns, the opaque prefix it queried, h
 gcloud storage ls --recursive "gs://<bucket>" | head
 ```
 
-Expect tokenized names with no recognisable `app/hello`. Fetch one and confirm it begins with the `FCDS` magic and is otherwise ciphertext.
+Expect tokenized names with no recognisable `app/sdk-demo/alpha/hello` (or `app/hello`, on a run from before 2026-10-08). Fetch one and confirm it begins with the `FCDS` magic and is otherwise ciphertext.
 
 ## 7. Kill one replica — storage keeps serving
 
@@ -231,18 +251,21 @@ Expect every replica's generation to equal the recorded one, and no replica to r
 ## 11. Tear down
 
 ```bash
-kubectl -n "$NS" delete statefulset,svc,pdb,secret -l app.kubernetes.io/name=datasphered
+kubectl -n "$NS" delete statefulset,svc,pdb,networkpolicy,serviceaccount,configmap -l app.kubernetes.io/name=datasphered
+kubectl -n "$NS" delete secret -l app.kubernetes.io/part-of=datasphered
 ```
 
-Then confirm `farcast release "$INSTANCE"` still tears the instance down cleanly, and that nothing keyholder-shaped is left billing.
+*(Corrected 2026-10-08: the command used to be `delete statefulset,svc,pdb,secret -l app.kubernetes.io/name=datasphered`, which left the keyholder's NetworkPolicy and ServiceAccount, since neither kind was listed. It also left its transport Secret, which carries `app.kubernetes.io/part-of`, not `name`, so the selector never matched it. The `configmap` kind now also removes the key pin, `datasphered-pin`. None of these bills anything, and `release` deletes the cluster that holds them, so this matters only if the instance is kept.)*
+
+Then confirm `farcast release "$INSTANCE"` still tears the instance down cleanly, and that nothing keyholder-shaped is left billing. `release` returns once the cloud reports the cluster gone, not when the delete is accepted.
 
 ## Success criteria
 
 1. `storage deploy` returns without waiting for readiness, and says the replicas are sealed.
 2. Two pods land on different nodes, with a PDB; both are `0/1` and neither restarts.
 3. With every replica sealed, the data Service has no endpoints and the status Service still reports `restart-sealed`.
-4. `storage unseal` reports `2 of 2`, both pods become Ready, and the ledger records both pushes.
-5. **An object written through the keyholder reads back byte-exact through `farcast storage cp` on the operator's machine.**
+4. `storage unseal` reports `2 of 2`, both pods become Ready, and the ledger records both pushes, each with its own `boot`.
+5. **An object an application writes through the keyholder, with its own leaf, reads back byte-exact through `farcast storage cp` on the operator's machine.**
 6. `gcloud` shows only tokenized names and `FCDS` ciphertext.
 7. Deleting one replica does not interrupt service; deleting both yields a reportable seal and no data loss.
 8. An operator hold refuses a keeper-intent reseed, and does not survive a pod restart.
@@ -253,7 +276,7 @@ Then confirm `farcast release "$INSTANCE"` still tears the instance down cleanly
 
 - **The SDK's own client against a real application.** Applications cannot be deployed until Planck's translator (4.2) and `farcast run` (4.3), so step 5 exercises the data path with `curl` rather than through `farcast.Storage()`. The wire contract is the same, but an application actually classifying `ErrStorageSealed` is untested against a cluster until 4.3.
 - **A full node-pool upgrade.** Steps 7 and 8 simulate the seal by deleting pods. A real Autopilot auto-upgrade, with its own PDB handling and one-hour drain budget, is the event the design is really about and it cannot be triggered on demand.
-- **NetworkPolicy isolation.** In 3.2 any pod in the cluster can reach the keyholder's data port; access control is network reachability plus the declared scope. The policy that contains this is 4.2's, and per-application identity is 4.x's. This is stated in the SDK README rather than implied.
+- **NetworkPolicy isolation.** In 3.2 any pod in the cluster can reach the keyholder's data port; access control is network reachability plus the declared scope. The policy that contains this is 4.2's, and per-application identity is 4.x's. This is stated in the SDK README rather than implied. *(Superseded 2026-10-08: neither half is true of the current keyholder. Its NetworkPolicy admits to the data port only pods labelled `farcast.sofmon.com/tier: app` in a FarCast-managed namespace. The port itself requires a client leaf naming the application, and the keyholder derives the reachable scope from that leaf ([ADR 0018](../adr/0018-thin-device-storage.md) decision 1). The 5.3 re-walk confirmed live that a caller with no leaf is refused at the handshake and a neighbour's objects are refused with `permission`.)*
 - **The keeper fleet.** Phases 5.4 and 7.5. The protocol carries the intent and the ledger already, so 5.4 adds a driver rather than a format.
 - **The real standing cost.** The cost gate prints an estimate derived from the workload's declared requests. Autopilot raises Pods below its per-Pod minimum, and that minimum differs between clusters with and without bursting support — so **read the actual bill after one cycle** and, if it disagrees materially, amend ADR 0008 decision 6 with the measured figure rather than the estimated one.
 

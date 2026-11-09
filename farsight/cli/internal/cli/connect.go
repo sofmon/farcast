@@ -18,10 +18,6 @@ import (
 	"github.com/sofmon/farcast/technocore/pricing"
 )
 
-// nlbMonthlyUSD is the standing cost estimate for the public mTLS load balancer
-// (ADR 0005), surfaced and confirmed against the instance's cost limit.
-const nlbMonthlyUSD = 18
-
 // registryMonthlyCost is what the instance's image registry costs, surfaced but
 // never gated (ADR 0007 decision 8): FatLine's image is ~20 MB and same-region
 // pulls are free, so it rounds to zero against the ~$18/mo carrier. Gating cents
@@ -420,13 +416,13 @@ func (c *connectCommand) confirmCost(env *Env, meta *config.InstanceMetadata) (b
 		return true, nil
 	}
 	if !isInteractive(env) {
-		return false, usagef("connecting provisions a public load balancer (~$%d/mo) and runs FatLine continuously (~$%.0f/mo); pass --yes to confirm",
-			nlbMonthlyUSD, fatlineMonthlyUSD)
+		return false, usagef("connecting provisions a public load balancer (~$%.0f/mo) and runs FatLine continuously (~$%.0f/mo); pass --yes to confirm",
+			pricing.CarrierMonthlyUSD, fatlineMonthlyUSD)
 	}
-	fprintf(env.Err, "Connecting %q provisions a public mTLS load balancer (~$%d/month) and runs FatLine's %d replicas "+
+	fprintf(env.Err, "Connecting %q provisions a public mTLS load balancer (~$%.0f/month) and runs FatLine's %d replicas "+
 		"continuously (~$%.0f/month) — ~$%.0f/month standing, against the cost limit %s %.0f/%s.\n",
-		meta.Name, nlbMonthlyUSD, deploy.DefaultReplicas, fatlineMonthlyUSD,
-		float64(nlbMonthlyUSD)+fatlineMonthlyUSD,
+		meta.Name, pricing.CarrierMonthlyUSD, deploy.DefaultReplicas, fatlineMonthlyUSD,
+		pricing.CarrierMonthlyUSD+fatlineMonthlyUSD,
 		meta.CostLimit.Currency, meta.CostLimit.Amount, meta.CostLimit.Period)
 	return newPrompter(env.In, env.Err).yesNo("Provision it and connect?")
 }
@@ -566,7 +562,7 @@ func (r connectResult) Human(w io.Writer) error {
 	if r.Image != "" {
 		fprintf(w, "  image:       %s\n", r.Image)
 	}
-	fprintf(w, "  cost:        load balancer ~$%d/mo + FatLine and Shrike ~$%.0f/mo + registry %s/mo (limit: %s %.0f/%s)\n",
-		nlbMonthlyUSD, fatlineMonthlyUSD, registryMonthlyCost, r.costLimit.Currency, r.costLimit.Amount, r.costLimit.Period)
+	fprintf(w, "  cost:        load balancer ~$%.0f/mo + FatLine and Shrike ~$%.0f/mo + registry %s/mo (limit: %s %.0f/%s)\n",
+		pricing.CarrierMonthlyUSD, fatlineMonthlyUSD, registryMonthlyCost, r.costLimit.Currency, r.costLimit.Amount, r.costLimit.Period)
 	return nil
 }

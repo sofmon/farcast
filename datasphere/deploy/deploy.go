@@ -24,6 +24,15 @@
 //     rollout, an eviction under bin-packing. They do not survive a full pool
 //     walk or a zonal loss, and the ADR says so rather than implying otherwise.
 //
+// And one for the key pin (finding 4). It reaches the process as an `env`
+// value from its own ConfigMap through an OPTIONAL configMapKeyRef, and it is
+// never in the pod template — not even as a hash the way the mTLS material
+// is. Every rotation and every `farcast run` moves the pin, and a pod-template
+// change rolls the StatefulSet, which seals every replica. The ConfigMap is
+// rendered apart from this stream (RenderPin) because an apply is
+// last-writer-wins and could move the pin backwards; the CLI creates it, or
+// compares-and-swaps it.
+//
 // [ADR 0008]: ../../docs/adr/0008-in-cluster-key-delivery.md
 // [fatline/deploy]: ../../fatline/deploy
 package deploy
@@ -33,6 +42,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -70,6 +80,12 @@ const (
 	DefaultProvider = "gcs"
 
 	secretName = "datasphered-mtls"
+
+	// PinKey is the pin ConfigMap's one key.
+	PinKey = "pin"
+	// envKeyPin is datasphere/keyholder.EnvKeyPin; a test pins the two
+	// together without this package importing the keyholder.
+	envKeyPin = "DATASPHERED_KEY_PIN"
 	// digestMarker pins the image by content. ADR 0008 decision 1: deployed
 	// pinned by digest.
 	digestMarker = "@sha256:"
@@ -180,6 +196,9 @@ func Render(c Config) ([]byte, error) {
 		StatusPort:      c.StatusPort,
 		UnsealPort:      c.UnsealPort,
 		SecretName:      secretName,
+		PinConfigMap:    PinConfigMapName(c.Name),
+		PinKey:          PinKey,
+		EnvKeyPin:       envKeyPin,
 		CACert:          base64.StdEncoding.EncodeToString(c.CACertPEM),
 		ServerCert:      base64.StdEncoding.EncodeToString(c.ServerCertPEM),
 		ServerKey:       base64.StdEncoding.EncodeToString(c.ServerKeyPEM),
@@ -190,6 +209,53 @@ func Render(c Config) ([]byte, error) {
 		return nil, fmt.Errorf("deploy: render workload: %w", err)
 	}
 	return buf.Bytes(), nil
+}
+
+// PinConfigMapName names the ConfigMap that holds a keyholder's key pin.
+func PinConfigMapName(name string) string {
+	if name == "" {
+		name = DefaultName
+	}
+	return name + "-pin"
+}
+
+// RenderPin renders the pin ConfigMap as JSON for `kubectl create -f -`, or,
+// with the resourceVersion it was read at, for `kubectl replace -f -` — which
+// the API server refuses if anything wrote in between. The value is the pin as
+// datasphere/keyholder marshals it; it is JSON inside JSON, so the document is
+// built by encoding/json rather than a template.
+//
+// It is never part of Render's stream: see the package comment.
+func RenderPin(namespace, name, value, resourceVersion string) ([]byte, error) {
+	if namespace == "" {
+		namespace = DefaultNamespace
+	}
+	if name == "" {
+		name = DefaultName
+	}
+	meta := map[string]any{
+		"name":      PinConfigMapName(name),
+		"namespace": namespace,
+		"labels": map[string]string{
+			"app.kubernetes.io/name":       name,
+			"app.kubernetes.io/managed-by": "farcast",
+			"app.kubernetes.io/part-of":    name,
+		},
+	}
+	if resourceVersion != "" {
+		meta["resourceVersion"] = resourceVersion
+	}
+	doc := map[string]any{
+		"apiVersion": "v1",
+		"kind":       "ConfigMap",
+		"metadata":   meta,
+		"data":       map[string]string{PinKey: value},
+	}
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return nil, fmt.Errorf("deploy: render key pin: %w", err)
+	}
+	return out, nil
 }
 
 // hasDigest reports whether an image reference is pinned by content digest.
@@ -245,6 +311,9 @@ type templateData struct {
 	StatusPort    int
 	UnsealPort    int
 	SecretName    string
+	PinConfigMap  string
+	PinKey        string
+	EnvKeyPin     string
 	MTLSHash      string
 	CACert        string
 	ServerCert    string
@@ -445,6 +514,17 @@ spec:
                 secretKeyRef:
                   name: {{.SecretName}}
                   key: server.key
+            # The key pin (ADR 0008 finding 4). optional: true is load-bearing:
+            # a required reference to a ConfigMap or key that is missing fails
+            # the container with CreateContainerConfigError, which is a sealed
+            # replica that never starts and that no unseal can reach. Absent,
+            # the keyholder starts and checks nothing, as before the pin.
+            - name: {{.EnvKeyPin}}
+              valueFrom:
+                configMapKeyRef:
+                  name: {{.PinConfigMap}}
+                  key: {{.PinKey}}
+                  optional: true
           ports:
             - name: data
               containerPort: {{.DataPort}}
@@ -519,12 +599,13 @@ metadata:
     app.kubernetes.io/managed-by: farcast
 # Who may reach the keyholder, and on which port.
 #
-# This is a control, not tidiness. The SDK's storage client authenticates the
-# SERVER and presents no client certificate of its own (sdk/go/storageclient.go
-# builds a tls.Config with RootCAs and no Certificates), so the data port
-# cannot tell one caller from another. Until this policy existed, anything that
-# could route to the port could read and write the instance's storage. The
-# network is the control, and this is it.
+# This is a control, not tidiness. When it was written the SDK's storage client
+# presented no client certificate, so the data port could not tell one caller
+# from another and anything that could route to it could read and write the
+# instance's storage. Since ADR 0018 decision 1 the port also requires a client
+# leaf and decides from its role what a caller may reach, so this is now one of
+# two controls rather than the only one — and it stays, because network position
+# and identity fail in different ways.
 spec:
   podSelector:
     matchLabels:

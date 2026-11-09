@@ -1,7 +1,8 @@
 //go:build integration
 
 // These tests drive the real GKE adapter against a live GCP project. They are
-// excluded from normal builds and CI by the //go:build integration tag to
+// excluded from normal builds and test runs (./check.sh only type-checks them)
+// by the //go:build integration tag to
 // protect FarCast's cost pillar: creating a cluster costs real money and takes
 // several minutes. Run them deliberately.
 //

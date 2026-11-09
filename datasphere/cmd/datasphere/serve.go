@@ -81,8 +81,8 @@ func serve(ctx context.Context, opt options, sopt serveOptions, out, errw io.Wri
 		return fail(errw, "datasphere: %v\n", err)
 	}
 
-	vault := keyholder.New(opt.instance)
 	log := slog.New(slog.NewJSONHandler(out, nil))
+	vault := newVault(opt.instance, os.Getenv(keyholder.EnvKeyPin), log)
 	srv, err := keyholder.NewServer(keyholder.Config{
 		Instance: opt.instance,
 		Vault:    vault,
@@ -175,6 +175,24 @@ func serve(ctx context.Context, opt options, sopt serveOptions, out, errw io.Wri
 }
 
 // loadTransport reads the listener identity from the environment.
+// newVault starts the vault under the key pin the environment carries (ADR
+// 0008 finding 4). An unreadable pin is logged and the process starts anyway:
+// a replica that exited on it would crash-loop sealed, and not even the
+// operator could unseal it. It refuses keepers instead, and says why.
+func newVault(instance, rawPin string, log *slog.Logger) *keyholder.Vault {
+	vault := keyholder.NewWithPin(instance, rawPin)
+	switch pin := vault.State().Pin; pin.Status {
+	case keyholder.PinInvalid:
+		log.Error("key pin unreadable; keepers are refused until the operator raises a valid one",
+			"error", pin.Error)
+	case keyholder.PinValid:
+		log.Info("key pin loaded", "require", len(pin.Require), "retired", len(pin.Retired))
+	default:
+		log.Warn("no key pin loaded; a restarted replica checks no bundle against the instance's keys")
+	}
+	return vault
+}
+
 func loadTransport(errw io.Writer) (tls.Certificate, *x509.CertPool, int) {
 	caPEM := os.Getenv(envTLSCA)
 	certPEM := os.Getenv(envTLSCert)

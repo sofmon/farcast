@@ -13,9 +13,11 @@ import (
 // deployable image. Neither is FarCast's code, both run inside the instance,
 // and one of them holds a credential that can write to the registry.
 const (
-	// kanikoRepo is where the maintained Kaniko lives. Google archived the
-	// original in June 2025 (ADR 0010 decision 10); this is the fork.
-	kanikoRepo = "cgr.dev/chainguard/kaniko"
+	// kanikoRepo is Google's archived Kaniko, the stopgap ADR 0011 decision 4
+	// records. The maintained fork ADR 0010 chose stopped answering anonymous
+	// pullers (the 4.3 walk) and now lives behind an org-scoped, authenticated
+	// path, so this is unmaintained, and named as such wherever it is offered.
+	kanikoRepo = "gcr.io/kaniko-project/executor:v1.23.2"
 
 	// gitRepo is a minimal, maintained image with git and a shell in it. The
 	// -dev variant is the one that has the shell; the plain variant's
@@ -28,7 +30,8 @@ const (
 type toolchainKind struct {
 	what string // "builder" / "fetcher"
 	flag string // the flag that supplies it
-	repo string // where a maintained one lives
+	repo string // the reference to start from
+	hint string // what that reference is, said honestly
 	why  string // why an unpinned one is worse for THIS image specifically
 
 	get func(*config.Toolchain) string
@@ -40,6 +43,8 @@ var (
 		what: "builder",
 		flag: "--builder-image",
 		repo: kanikoRepo,
+		hint: "ADR 0011 decision 4 settles on " + kanikoRepo + " — Google's archived Kaniko,\n" +
+			"unmaintained, and a stopgap until a maintained builder clears ADR 0010's bar",
 		why: "a builder image runs arbitrary build steps while holding a\n" +
 			"credential for your registry, so resolving a tag on every build would mean silently\n" +
 			"running whatever it points at next.",
@@ -50,6 +55,7 @@ var (
 		what: "fetcher",
 		flag: "--fetcher-image",
 		repo: gitRepo,
+		hint: "A maintained one lives at " + gitRepo,
 		why: "the fetcher decides which bytes the approval gate shows you, so a tag\n" +
 			"resolved fresh on every run is a reviewer you have not reviewed.",
 		get: func(t *config.Toolchain) string { return t.Fetcher },
@@ -72,9 +78,9 @@ func resolveToolchainImage(ctx context.Context, env *Env, meta *config.InstanceM
 	}
 	if ref == "" {
 		return "", usagef("%s is required and must be digest-pinned.\n"+
-			"A maintained one lives at %s.\n"+
+			"%s.\n"+
 			"Pass that repository with a tag once and this command will report the digest to pin;\n"+
-			"pass the digest and %q remembers it.", k.flag, k.repo, meta.Name)
+			"pass the digest and %q remembers it.", k.flag, k.hint, meta.Name)
 	}
 	if isDigestPinned(ref) {
 		return ref, nil

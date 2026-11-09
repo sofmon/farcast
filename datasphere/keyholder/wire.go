@@ -36,6 +36,10 @@ const (
 	CodeBadRequest       = "bad-request"
 	CodeNotServing       = "not-serving"
 	CodeAlreadyServing   = "already-serving"
+	CodeWouldDrop        = "would-drop"
+	CodeBelowPin         = "below-pin"
+	CodePinUnreadable    = "pin-unreadable"
+	CodeKeeperBundle     = "keeper-bundle"
 )
 
 // errorResponse is the body every failure carries.
@@ -88,6 +92,16 @@ func classify(err error) (status int, code string) {
 		return http.StatusConflict, CodeNotServing
 	case errors.Is(err, ErrAlreadyServing):
 		return http.StatusConflict, CodeAlreadyServing
+	case errors.Is(err, ErrWouldDrop):
+		return http.StatusConflict, CodeWouldDrop
+	case errors.Is(err, ErrBelowPin):
+		return http.StatusConflict, CodeBelowPin
+	case errors.Is(err, ErrPinUnreadable):
+		return http.StatusConflict, CodePinUnreadable
+	case errors.Is(err, ErrKeeperBundle):
+		return http.StatusForbidden, CodeKeeperBundle
+	case errors.Is(err, ErrPinInvalid):
+		return http.StatusBadRequest, CodeBadRequest
 	case errors.Is(err, ErrEnvelopeInvalid):
 		// One status and one code for every envelope failure, matching the
 		// single error the opener returns: which check refused is not a

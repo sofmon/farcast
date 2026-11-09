@@ -14,9 +14,11 @@ import (
 
 	"github.com/sofmon/farcast/farsight/cli/internal/cluster"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
+	"github.com/sofmon/farcast/farsight/cli/internal/keyholder"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
 	fldeploy "github.com/sofmon/farcast/fatline/deploy"
 	"github.com/sofmon/farcast/fatline/event"
+	"github.com/sofmon/farcast/fatline/identity"
 	"github.com/sofmon/farcast/manifest/parser"
 	"github.com/sofmon/farcast/shrike"
 	"github.com/sofmon/farcast/technocore/adapt"
@@ -664,5 +666,23 @@ func TestUsageOmitsRightSizingWhenThereIsNone(t *testing.T) {
 	shown := runUsage(t, dir, profilesFor(t, at, func(*usage.Store) {}, nil), output.ModeHuman)
 	if strings.Contains(shown, "Right-sizing") {
 		t.Errorf("an empty right-sizing section was printed:\n%s", shown)
+	}
+}
+
+// The workload FatLine is deployed with lets a keeper open the keyholder's
+// route and nothing else: Shrike's route is the operator's alone.
+func TestTheRenderedWorkloadLimitsKeepersToTheKeyholder(t *testing.T) {
+	m, err := identity.Mint("prod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := renderWorkload("reg/fatline@sha256:aa", "reg/shrike@sha256:bb", fldeploy.Carrier(""),
+		config.MTLSMaterial{CACertPEM: m.CACertPEM, ServerCertPEM: m.ServerCertPEM, ServerKeyPEM: m.ServerKeyPEM})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rendered := string(out)
+	if want := "--keeper-route=" + keyholder.StreamRoute; strings.Count(rendered, "--keeper-route=") != 1 || !strings.Contains(rendered, want) {
+		t.Errorf("want exactly %q among the keeper routes:\n%s", want, rendered)
 	}
 }

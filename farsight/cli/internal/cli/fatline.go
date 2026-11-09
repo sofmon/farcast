@@ -424,10 +424,13 @@ func deployCarrier(c *config.Carrier) (deploy.Carrier, error) {
 // is not part of Config at all, stays on this machine.
 func renderWorkload(img, shrikeImg string, carrier deploy.Carrier, mtls config.MTLSMaterial) ([]byte, error) {
 	return deploy.Render(deploy.Config{
-		Image:         img,
-		ShrikeImage:   shrikeImg,
-		Carrier:       carrier,
-		StreamRoutes:  systemStreamRoutes(),
+		Image:        img,
+		ShrikeImage:  shrikeImg,
+		Carrier:      carrier,
+		StreamRoutes: systemStreamRoutes(),
+		// A keeper re-seeds a restarted keyholder replica and does nothing
+		// else: Shrike's route, and any later one, is the operator's alone.
+		KeeperRoutes:  []string{keyholder.StreamRoute},
 		CACertPEM:     mtls.CACertPEM,
 		ServerCertPEM: mtls.ServerCertPEM,
 		ServerKeyPEM:  mtls.ServerKeyPEM,

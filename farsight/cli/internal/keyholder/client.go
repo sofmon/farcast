@@ -56,6 +56,10 @@ type State struct {
 	// it sent; the generation cannot, because it advances on every unseal
 	// whether or not a key changed.
 	Keys map[string][]string `json:"keys,omitempty"`
+
+	// Pin is the key pin this replica enforces — control surface only. Nil
+	// is an image that predates the pin.
+	Pin *dskeyholder.PinReport `json:"pin,omitempty"`
 }
 
 // Intents a pusher may claim. The keyholder decides which a caller may use
@@ -63,6 +67,11 @@ type State struct {
 const (
 	IntentOperator = string(dskeyholder.IntentOperator)
 	IntentHandOver = string(dskeyholder.IntentHandOver)
+	// IntentOperatorBelowPin is an operator unseal past the key pin. It is
+	// not an intent on the wire — Unseal sends operator-unseal with the pin
+	// override — but it is what the caller asked for, and the ledger and the
+	// result say so.
+	IntentOperatorBelowPin = IntentOperator + "+below-pin"
 )
 
 // Refusal is a replica declining a request, with the keyholder's own code.
@@ -70,6 +79,8 @@ type Refusal struct {
 	Ordinal int
 	Code    string
 	Reason  string
+	// Status is the HTTP status the replica answered with.
+	Status int
 }
 
 func (r *Refusal) Error() string {
@@ -89,6 +100,50 @@ func NotServing(err error) bool {
 func AlreadyServing(err error) bool {
 	var r *Refusal
 	return errors.As(err, &r) && r.Code == dskeyholder.CodeAlreadyServing
+}
+
+// WouldDrop reports a push a SERVING replica refused because the bundle lacks a
+// key or scope it holds: the pusher's keyring is behind the instance's.
+func WouldDrop(err error) bool {
+	var r *Refusal
+	return errors.As(err, &r) && r.Code == dskeyholder.CodeWouldDrop
+}
+
+// GenerationTooOld reports a push a replica refused because it has held a
+// newer generation — which, when it is serving, means another pusher reached
+// it first.
+func GenerationTooOld(err error) bool {
+	var r *Refusal
+	return errors.As(err, &r) && r.Code == dskeyholder.CodeGenerationOld
+}
+
+// BelowPin reports a push a replica refused because the bundle predates the
+// instance's key pin: this keyring lacks a key the instance has, or writes
+// under one it retired.
+func BelowPin(err error) bool {
+	var r *Refusal
+	return errors.As(err, &r) && r.Code == dskeyholder.CodeBelowPin
+}
+
+// PinUnreadable reports a re-seed a replica refused because it cannot read its
+// own key pin.
+func PinUnreadable(err error) bool {
+	var r *Refusal
+	return errors.As(err, &r) && r.Code == dskeyholder.CodePinUnreadable
+}
+
+// KeeperBundle reports a keeper's push refused because its leaf binds another
+// bundle, or none.
+func KeeperBundle(err error) bool {
+	var r *Refusal
+	return errors.As(err, &r) && r.Code == dskeyholder.CodeKeeperBundle
+}
+
+// Unsupported reports a route the replica does not have: its image predates
+// it.
+func Unsupported(err error) bool {
+	var r *Refusal
+	return errors.As(err, &r) && r.Status == http.StatusNotFound && r.Code == ""
 }
 
 // Sealed reports whether this replica is holding no key material.
@@ -157,7 +212,24 @@ func (c *Client) Unseal(ctx context.Context, ordinal int, bundle []byte, intent 
 	}
 	var st State
 	path := "/v1/unseal?intent=" + intent
+	if intent == IntentOperatorBelowPin {
+		path = "/v1/unseal?intent=" + IntentOperator + "&pin=" + dskeyholder.PinOverride
+	}
 	err = c.call(ctx, ordinal, http.MethodPost, path, dskeyholder.ContentTypeSealed, sealed, &st)
+	return st, err
+}
+
+// RaisePin hands a running replica the key pin, which it unions with its own,
+// or takes in place of its own when replace is set. A replica reads the pin
+// from its environment only when it starts; this is how one that is already
+// running learns a pin written since.
+func (c *Client) RaisePin(ctx context.Context, ordinal int, pin string, replace bool) (State, error) {
+	path := dskeyholder.PinPath
+	if replace {
+		path += "?replace=true"
+	}
+	var st State
+	err := c.call(ctx, ordinal, http.MethodPost, path, dskeyholder.ContentTypePin, []byte(pin), &st)
 	return st, err
 }
 
@@ -231,7 +303,7 @@ func (c *Client) call(ctx context.Context, ordinal int, method, path, contentTyp
 	}
 	if resp.StatusCode/100 != 2 {
 		code, reason := refusalReason(payload, resp.Status)
-		return &Refusal{Ordinal: ordinal, Code: code, Reason: reason}
+		return &Refusal{Ordinal: ordinal, Code: code, Reason: reason, Status: resp.StatusCode}
 	}
 	if out == nil {
 		return nil

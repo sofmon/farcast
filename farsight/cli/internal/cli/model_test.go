@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/sofmon/farcast/datasphere"
+	dskeyholder "github.com/sofmon/farcast/datasphere/keyholder"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/keeper"
 	"github.com/sofmon/farcast/farsight/cli/internal/keyholder"
@@ -44,10 +45,12 @@ import (
 //
 // They take minutes, so they run only when asked:
 //
-//	FARCAST_MODEL=1 go test -mod=vendor ./farsight/cli/internal/cli/ -run TestHandOverModel
+//	./check.sh --model
+//	FARCAST_MODEL=1 go test -mod=vendor -timeout 30m ./farsight/cli/internal/cli/ -run TestHandOverModel
 //
-// FARCAST_MODEL_SEEDS, _STEPS and _SEED0 size a run; _SILENT, _REFUSE, _LOST
-// and _RESTART set how often each fault strikes. A failure prints the seed and
+// FARCAST_MODEL_SEEDS, _STEPS and _SEED0 size a run; _SILENT, _REFUSE, _LOST,
+// _RESTART and _PINFAIL (a key-pin write that fails) set how often each fault
+// strikes. A failure prints the seed and
 // every step that led to it, and FARCAST_MODEL_SEED0 with FARCAST_MODEL_SEEDS=1
 // replays it.
 
@@ -92,6 +95,66 @@ type faultyFleet struct {
 	rng                           *rand.Rand
 	silent, refuse, lost, restart float64
 	log                           *[]string
+	// reload is the pin a replica loads when it restarts: the ConfigMap's.
+	reload func() *dskeyholder.Pin
+}
+
+// RaisePin fails the way State does: no answer.
+func (f *faultyFleet) RaisePin(ctx context.Context, i int, pin string, replace bool) (keyholder.State, error) {
+	if f.rng.Float64() < f.silent {
+		*f.log = append(*f.log, fmt.Sprintf("    RaisePin(%d): no answer", i))
+		return keyholder.State{}, errors.New("no route to replica")
+	}
+	*f.log = append(*f.log, fmt.Sprintf("    RaisePin(%d) %s", i, pin))
+	return f.fakeStateKeyholder.RaisePin(ctx, i, pin, replace)
+}
+
+// faultyPins is the pin ConfigMap behind credentials that sometimes fail.
+type faultyPins struct {
+	*fakePinStore
+	rng  *rand.Rand
+	fail float64
+	log  *[]string
+}
+
+func (f *faultyPins) CreateConfigMap(ctx context.Context, manifest []byte) error {
+	if f.rng.Float64() < f.fail {
+		*f.log = append(*f.log, "    pin write: failed")
+		return errors.New("the API server is unreachable")
+	}
+	return f.fakePinStore.CreateConfigMap(ctx, manifest)
+}
+
+func (f *faultyPins) ReplaceConfigMap(ctx context.Context, manifest []byte) error {
+	if f.rng.Float64() < f.fail {
+		*f.log = append(*f.log, "    pin write: failed")
+		return errors.New("the API server is unreachable")
+	}
+	return f.fakePinStore.ReplaceConfigMap(ctx, manifest)
+}
+
+// loaded is the pin a replica reads from the ConfigMap when it starts.
+func (f *fakePinStore) loaded() *dskeyholder.Pin {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	p, present, err := dskeyholder.ParsePin(f.value)
+	if !f.exists || !present || err != nil {
+		return nil
+	}
+	return &p
+}
+
+// pinGuards reports whether every replica enforces a pin that refuses these
+// keys — when it does, nothing can install them, and the model's stated
+// limits do not apply.
+func pinGuards(kh *fakeStateKeyholder, keys map[string][]string) bool {
+	for i := range 2 {
+		r := kh.replica(i)
+		if r.pin == nil || r.pin.Admits(keys) == nil {
+			return false
+		}
+	}
+	return true
 }
 
 func (f *faultyFleet) State(ctx context.Context, i int) (keyholder.State, error) {
@@ -117,6 +180,9 @@ func (f *faultyFleet) Unseal(ctx context.Context, i int, payload []byte, intent 
 		*f.log = append(*f.log, fmt.Sprintf("    replica %d restarts", i))
 		r := f.replica(i)
 		r.phase, r.keys, r.generation = "restart-sealed", nil, 0
+		if f.reload != nil {
+			r.pin = f.reload()
+		}
 	}
 	return st, err
 }
@@ -291,7 +357,7 @@ func TestHandOverModelOneMachine(t *testing.T) {
 			return
 		}
 	}
-	coverage.require(t, "finish a rotation", "unseal every replica", "re-seed a replica")
+	coverage.require(t, "finish a rotation", "unseal every replica", "re-seed a replica", "refuse a bundle below the pin")
 }
 
 // Two operator machines with keyrings that drift apart: each rotates, unseals
@@ -305,7 +371,8 @@ func TestHandOverModelTwoMachines(t *testing.T) {
 			return
 		}
 	}
-	coverage.require(t, "finish a rotation", "unseal every replica", "re-seed a replica", "import another machine's keyring", "refuse a keyring behind the fleet")
+	coverage.require(t, "finish a rotation", "unseal every replica", "re-seed a replica", "import another machine's keyring", "refuse a keyring behind the fleet",
+		"refuse a bundle below the pin")
 }
 
 func runModel(t *testing.T, seed int64, steps, nMachines int, coverage modelCoverage) bool {
@@ -346,6 +413,18 @@ func runModel(t *testing.T, seed int64, steps, nMachines int, coverage modelCove
 		lost:    modelRate(t, "FARCAST_MODEL_LOST", 0.05),
 		restart: modelRate(t, "FARCAST_MODEL_RESTART", 0.04),
 	}
+	// One pin ConfigMap for the instance, shared by every machine, written as
+	// 'storage deploy' would and loaded by every replica.
+	cm := &fakePinStore{}
+	pins := &faultyPins{fakePinStore: cm, rng: rng, fail: modelRate(t, "FARCAST_MODEL_PINFAIL", 0.1), log: &log}
+	pinOpener := func(string) (pinStore, error) { return pins, nil }
+	if _, err := writePin(ctx, cm, liveKeyring(t, first, instance), true, false); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 2 {
+		base.replica(i).pin = cm.loaded()
+	}
+	fleet.reload = cm.loaded
 	modelViolations(t, instance, machines, base)
 
 	var keeperBundle []byte
@@ -358,7 +437,7 @@ func runModel(t *testing.T, seed int64, steps, nMachines int, coverage modelCove
 		switch {
 		case op < 20:
 			log = append(log, fmt.Sprintf("step %d: machine %d rotates", step, mi))
-			err := (&keyRotateCommand{assumeYes: true, newKeyholder: openerFor(fleet)}).Run(ctx, m.env, []string{instance})
+			err := (&keyRotateCommand{assumeYes: true, newKeyholder: openerFor(fleet), newPinStore: pinOpener}).Run(ctx, m.env, []string{instance})
 			log = append(log, fmt.Sprintf("  -> %v", err))
 			switch {
 			case err == nil:
@@ -368,10 +447,12 @@ func runModel(t *testing.T, seed int64, steps, nMachines int, coverage modelCove
 			}
 		case op < 35:
 			others := heldKeys(liveKeyring(t, machines[(mi+1)%nMachines].dir, instance))
-			if !anyServing(base) && !covers(heldKeys(liveKeyring(t, m.dir, instance)), others) {
-				// Stated limit (ADR 0008): with every replica sealed there is
-				// nothing to compare a keyring against, so an unseal from one
-				// older than another machine's is not caught.
+			mine := heldKeys(liveKeyring(t, m.dir, instance))
+			if !anyServing(base) && !covers(mine, others) && !pinGuards(base, mine) {
+				// Stated limit (ADR 0008): with every replica sealed, an
+				// unseal from a keyring older than another machine's is
+				// caught by the key pin — unless writing or raising the pin
+				// failed, which the operator was told about.
 				continue
 			}
 			log = append(log, fmt.Sprintf("step %d: machine %d unseals", step, mi))
@@ -400,7 +481,9 @@ func runModel(t *testing.T, seed int64, steps, nMachines int, coverage modelCove
 			if err != nil {
 				t.Fatal(err)
 			}
-			res := handOverKeys(ctx, m.env, md, openerFor(fleet), liveKeyring(t, m.dir, instance), handOverOptions{})
+			rc := &runCommand{newKeyholder: openerFor(fleet), newPinStore: pinOpener}
+			keys := liveKeyring(t, m.dir, instance)
+			res := handOverKeys(ctx, m.env, md, openerFor(fleet), keys, handOverOptions{beforePush: rc.pinScopes(ctx, m.env, md, keys)})
 			log = append(log, fmt.Sprintf("  -> problem=%q activated=%v cause=%q loaded=%v", res.Problem, res.Activated, res.Cause, res.Loaded))
 			if res.Unsafe && strings.Contains(res.Problem, "behind the instance's") {
 				coverage["refuse a keyring behind the fleet"]++
@@ -420,7 +503,42 @@ func runModel(t *testing.T, seed int64, steps, nMachines int, coverage modelCove
 			log = append(log, fmt.Sprintf("step %d: replica %d restarts", step, i))
 			r := base.replica(i)
 			r.phase, r.keys, r.generation = "restart-sealed", nil, 0
-		case op < 78:
+			r.pin = cm.loaded()
+		case op < 76:
+			// A modified keeper: it skips every check of its own and pushes
+			// its bundle into whatever is sealed. Only the keyholder stands in
+			// its way, and the key pin is what it enforces.
+			if keeperBundle == nil {
+				continue
+			}
+			parsed, err := datasphere.ParseBundle(keeperBundle)
+			if err != nil {
+				t.Fatal(err)
+			}
+			keys := dskeyholder.KeysOf(parsed)
+			parsed.Zero()
+			current := true
+			for _, mm := range machines {
+				current = current && covers(keys, heldKeys(liveKeyring(t, mm.dir, instance)))
+			}
+			log = append(log, fmt.Sprintf("step %d: a modified keeper pushes regardless", step))
+			for i := range 2 {
+				r := base.replica(i)
+				if r.phase == "unsealed" {
+					continue
+				}
+				if !current && (r.pin == nil || r.pin.Admits(keys) == nil) {
+					// Stated limit: this replica enforces no pin that
+					// refuses the bundle — a pin write or raise failed.
+					continue
+				}
+				_, err := fleet.fakeStateKeyholder.Unseal(ctx, i, keeperBundle, keeper.IntentReseed)
+				log = append(log, fmt.Sprintf("  replica %d: %v", i, err))
+				if keyholder.BelowPin(err) {
+					coverage["refuse a bundle below the pin"]++
+				}
+			}
+		case op < 80:
 			md, err := m.dir.LoadInstanceMetadata(instance)
 			if err != nil {
 				t.Fatal(err)
@@ -440,9 +558,22 @@ func runModel(t *testing.T, seed int64, steps, nMachines int, coverage modelCove
 				continue
 			}
 			if !anyServing(base) {
-				// Stated limit (ADR 0008): with every replica restarted at
-				// once there is nothing to compare a keeper's bundle against.
-				continue
+				parsed, err := datasphere.ParseBundle(keeperBundle)
+				if err != nil {
+					t.Fatal(err)
+				}
+				keys := dskeyholder.KeysOf(parsed)
+				parsed.Zero()
+				current := true
+				for _, mm := range machines {
+					current = current && covers(keys, heldKeys(liveKeyring(t, mm.dir, instance)))
+				}
+				if !current && !pinGuards(base, keys) {
+					// Stated limit (ADR 0008): with every replica restarted
+					// at once, the key pin is the only reference — and it is
+					// not one when writing or raising it failed.
+					continue
+				}
 			}
 			// keeperCheckWith's decision, without the device store it needs:
 			// the fleet read once, the verdict, a re-seed where it says so.
@@ -479,7 +610,19 @@ func runModel(t *testing.T, seed int64, steps, nMachines int, coverage modelCove
 			r := base.replica(i)
 			log = append(log, fmt.Sprintf("  replica %d %s, generation %d, holds %v", i, r.phase, r.generation, r.keys))
 		}
-		if bad := modelViolations(t, instance, machines, base); len(bad) > 0 {
+		bad := modelViolations(t, instance, machines, base)
+		// Never ahead: the pin must admit some machine's keyring, or the
+		// operator is locked out of their own instance.
+		if p := cm.loaded(); p != nil {
+			admitted := false
+			for _, mm := range machines {
+				admitted = admitted || p.Admits(heldKeys(liveKeyring(t, mm.dir, instance))) == nil
+			}
+			if !admitted {
+				bad = append(bad, fmt.Sprintf("the key pin %s refuses every machine's keyring", p.Marshal()))
+			}
+		}
+		if len(bad) > 0 {
 			t.Errorf("seed %d, step %d:\n  %s\n\nhow it got there:\n%s\n\nreplay with FARCAST_MODEL=1 FARCAST_MODEL_SEED0=%d FARCAST_MODEL_SEEDS=1",
 				seed, step, strings.Join(bad, "\n  "), strings.Join(log, "\n"), seed)
 			return false

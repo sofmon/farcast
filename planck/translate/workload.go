@@ -95,7 +95,11 @@ data:
   # FatLine which application is asking.
 {{- if $.HasStorage}}
   FARCAST_STORAGE_ENDPOINT: https://{{$.StorageService}}.{{$.SystemNamespace}}.svc.cluster.local:{{$.StoragePort}}
-  FARCAST_STORAGE_STATUS_ENDPOINT: https://{{$.StorageStatusService}}.{{$.SystemNamespace}}.svc.cluster.local:{{$.StorageStatusPort}}
+  # Plain http, and that is not an oversight: the status listener is the one
+  # the kubelet probes and the one that must answer while sealed, so it has no
+  # TLS at all (datasphere/cmd/datasphere serve). Rendered https, the SDK's
+  # probe failed its handshake and reported a seal as an outage.
+  FARCAST_STORAGE_STATUS_ENDPOINT: http://{{$.StorageStatusService}}.{{$.SystemNamespace}}.svc.cluster.local:{{$.StorageStatusPort}}
   # The scope this application owns, and nobody else does. It is a
   # cross-check the keyholder refuses on mismatch rather than a claim: what
   # this application may reach follows from the leaf below (ADR 0018).

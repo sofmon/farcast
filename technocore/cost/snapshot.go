@@ -33,6 +33,11 @@ type Snapshot struct {
 
 	Apps          map[string]float64 `json:"apps"`
 	Confirmations []Confirmation     `json:"confirmations"`
+
+	// Overhead is instance-level standing charges. Additive and omitted when
+	// empty, so the version stays: a checkpoint written before it restores
+	// with none, and an older reader ignores it.
+	Overhead map[string]float64 `json:"overhead,omitempty"`
 }
 
 // Snapshot captures the ledger for checkpointing.
@@ -49,6 +54,12 @@ func (l *Ledger) Snapshot() Snapshot {
 	}
 	for k, v := range l.apps {
 		s.Apps[k] = v
+	}
+	if len(l.overhead) > 0 {
+		s.Overhead = make(map[string]float64, len(l.overhead))
+		for k, v := range l.overhead {
+			s.Overhead[k] = v
+		}
 	}
 	s.Confirmations = append([]Confirmation(nil), l.confirmations...)
 	return s
@@ -84,6 +95,12 @@ func Restore(s Snapshot) (*Ledger, error) {
 			return nil, fmt.Errorf("cost: restore: negative spend %.4f for %q", v, k)
 		}
 		l.apps[k] = v
+	}
+	for k, v := range s.Overhead {
+		if v < 0 {
+			return nil, fmt.Errorf("cost: restore: negative overhead %.4f for %q", v, k)
+		}
+		l.overhead[k] = v
 	}
 	for _, c := range s.Confirmations {
 		if _, err := l.Confirm(c); err != nil {

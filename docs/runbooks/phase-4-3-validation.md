@@ -18,6 +18,7 @@ Everything below was designed against fakes and rendered YAML. The claims that m
 ## Prerequisites
 
 - An instance that has completed [the Phase 4.2 runbook](phase-4-2-validation.md): installed, connected, storage deployed and unsealed, kernel deployed, and with the builder's Workload Identity push grant already applied. **`run` does not apply that grant.** This runbook used to say it printed it "like `build` does"; both halves of that were wrong until 2026-09-09. `build` printed it only on the SUCCESS path — after a build that had already worked, where it cannot be needed — and `run` printed it nowhere at all. A missing grant therefore failed at push, after the clone and the build had both been paid for, with nothing but the registry's own permission string to go on. Both now recognise a refused push and print the grant on the failure, which is where it belongs.
+- **The kernel must be deployed before the first `run`.** Since 2026-10-08 `run` refuses an instance with no kernel before it reads anything ("run 'farcast kernel deploy <instance>' first"). The read, the builds and the applications all bill, and a namespace the kernel does not meter is outside the cost limit.
 - **A valid gcloud user session** — `gcloud auth print-access-token >/dev/null` must succeed.
 - The repository is this one, `github.com/sofmon/farcast`, and it is public, so no Git credential is involved. Step 10 covers the private case and is optional.
 
@@ -44,14 +45,28 @@ farcast run "$INSTANCE" github.com/sofmon/farcast \
   --fetcher-image cgr.dev/chainguard/git:latest-dev
 ```
 
-Expected: a refusal that **resolves the tag, reports the digest, and says why it will not simply use it** — the fetcher decides which bytes the approval gate shows, so a tag resolved fresh on every run is a reviewer nobody reviewed. Record it:
-
-```bash
-GIT_IMAGE=<the digest-pinned reference from that output>
-KANIKO=<the digest-pinned Kaniko reference from the 4.2 walk>
-```
+Expected: a refusal that **resolves the tag, reports the digest, and says why it will not simply use it** — the fetcher decides which bytes the approval gate shows, so a tag resolved fresh on every run is a reviewer nobody reviewed. Nothing is recorded by a refused run.
 
 If the resolve itself fails, Chainguard has moved the image or dropped it from the free tier. That is a finding about the image, not about FarCast — note that pulling **by digest** stays available across all their tiers, which is why pinning is also what keeps this working.
+
+### 1a. Mirror the toolchain
+
+This is the step every later runbook means by "toolchain mirrored". Both images are copied into the instance's own registry and recorded in its metadata, so no third party's catalogue has to stay available and nothing has to be held in a shell variable ([ADR 0011](../adr/0011-build-toolchain-mirroring.md) decisions 1 and 5):
+
+```bash
+farcast toolchain "$INSTANCE" --builder gcr.io/kaniko-project/executor:v1.23.2 --fetcher cgr.dev/chainguard/git:latest-dev
+```
+
+It refuses both tags, copies nothing, and prints the `…@sha256:…` reference each resolves to today. Run it again with exactly those two references:
+
+```bash
+farcast toolchain "$INSTANCE" --builder '<the builder reference it printed>' --fetcher '<the fetcher reference it printed>'
+farcast toolchain "$INSTANCE"      # no flags: reports what is recorded
+```
+
+If the 4.2 walk already did this on the same instance, the second command alone confirms it. Every `farcast run` and `farcast build` from here on uses the recorded images when no image flag is given. Do not pass `--fetcher-image` or `--builder-image` after mirroring: an explicitly passed digest is recorded in place of the mirrored copy.
+
+*(Corrected 2026-10-08: this step used to record `GIT_IMAGE=` and `KANIKO=` in shell variables, with Kaniko's digest carried over from the 4.2 walk. The 4.3 walk's own finding 2 is why that is gone. The builder is now `gcr.io/kaniko-project/executor:v1.23.2`, Google's archived Kaniko, which ADR 0011 decision 4 names as a stopgap. `cgr.dev/chainguard/kaniko` no longer resolves for an anonymous puller.)*
 
 ## 2. Read the manifest, and refuse it
 
@@ -59,8 +74,7 @@ Run it and answer **no** at the prompt.
 
 ```bash
 farcast run "$INSTANCE" github.com/sofmon/farcast \
-  --manifest "$MANIFEST" \
-  --fetcher-image "$GIT_IMAGE" --builder-image "$KANIKO"
+  --manifest "$MANIFEST"
 ```
 
 Expected, in order:
@@ -93,8 +107,7 @@ Same command, answer `y`.
 
 ```bash
 farcast run "$INSTANCE" github.com/sofmon/farcast \
-  --manifest "$MANIFEST" \
-  --fetcher-image "$GIT_IMAGE" --builder-image "$KANIKO"
+  --manifest "$MANIFEST"
 ```
 
 Expected: the read, the review, `[1/1] Building prover inside "<instance>"…`, then a result naming the deployment, the commit, the manifest digest, and the **digest-pinned** image.
@@ -150,6 +163,8 @@ Expected:
 - `rate USD 0.0xxx/hour across N pods, observed <n>m ago`.
 - A per-application breakdown, followed by the sentence saying attribution can only come from `expected` because the provider bills the instance rather than the applications in it.
 
+*(Corrected 2026-10-08: the rate line now reads `across N pods and the carrier`. A section "Instance overhead (never attributed to an application)" lists the carrier, and a "Not metered" block is always printed naming what the kernel cannot see: data through the carrier, bucket storage and operations, registry storage, and the cluster fee. The rate counts every metered Pod, so a fetch or build Job Pod still running in `farcast-system` raises it until it completes.)*
+
 Cross-check the rate against the cluster, the way the 4.2 walk did:
 
 ```bash
@@ -157,6 +172,8 @@ kubectl get pods -A -l app.kubernetes.io/managed-by=farcast --no-headers | grep 
 ```
 
 `pods × 0.0050625` should equal the reported hourly rate for 100m/128Mi pods, and the pod count should match. A mismatch here is the model disagreeing with the cluster, which is the single most important number in the system.
+
+*(Corrected 2026-10-08: the two FatLine Pods are 150m/192Mi each, FatLine plus its Shrike sidecar, and the carrier is metered as overhead. So the rate should equal **2 × 0.00759375 + (pods − 2) × 0.0050625 + 0.025**. With the five system Pods and `prover`, that is `0.0604`. The pod count should still match.)*
 
 ## 8. It is metered
 
@@ -180,6 +197,8 @@ grep -A4 toolchain "$FARCAST_STATE/instances/$INSTANCE/metadata.yaml"
 ```
 
 Expected: it runs without `--fetcher-image` or `--builder-image`, and the metadata records both digests. This is [ADR 0010](../adr/0010-application-image-builds.md) decision 10's "reviewed constant" — reviewed once, written down, not re-derived on every build.
+
+*(Noted 2026-10-08: with step 1a, no run in this walk passes an image flag. The recorded digests are the mirrored copies in the instance's own registry, `<registry prefix>/system/…`, not the upstream references. The second command above should show those.)*
 
 ## 10. A private repository (optional)
 
@@ -220,7 +239,7 @@ And, if the instance is not being kept:
 farcast release "$INSTANCE"
 ```
 
-**Confirm nothing is left billing:** the cluster, the registry repository, the storage bucket and the load-balancer carrier.
+**Confirm nothing is left billing:** the cluster, the registry repository, the storage bucket and the load-balancer carrier. `release` returns only once the cloud reports the cluster gone, so nothing should still show as `STOPPING`.
 
 ---
 
@@ -294,6 +313,8 @@ The listing recovers the name through master; the read routes through `app` and 
 The message is the sharper half: `stored data failed integrity check`. Nothing is corrupt; the wrong key was tried. Telling an operator that encrypted storage failed an integrity check, in a system whose whole premise is that the cloud cannot tamper with their data, sends them hunting for corruption that does not exist. "Cannot decrypt because this is not my object" and "decrypted and the tag did not verify" must not share a message.
 
 **Fixed on 2026-09-08**, and the smallest real fix was indeed to remove the trap rather than handle it: `storage deploy` now mints the bucket and the keyring itself, and the `app` scope is created *with* the keyring so the prefix has an owner before any write can happen. An unseal-time collision check was considered and rejected — unseal deliberately touches no cloud, so such a check would either break recovery or silently skip itself. The misleading message is fixed too: a header that does not parse is still an integrity failure, one that parses and whose name will not open reports `ErrForeignObject`, and a listing spanning key spaces now reports only objects **no** key space could name. Recorded as [ADR 0008](../adr/0008-in-cluster-key-delivery.md) decisions 9 and 10.
+
+*(Superseded, noted 2026-10-08: there is no shared `app` scope any more. `storage deploy` mints the keyring with no application scope, and `farcast run` mints one scope per application, `app/<namespace>/<app>/`, before it deploys that application ([ADR 0018](../adr/0018-thin-device-storage.md) decision 5). An operator's own test objects belong outside `app/` altogether.)*
 
 ### Not a finding: the meter briefly reported five pods for six
 

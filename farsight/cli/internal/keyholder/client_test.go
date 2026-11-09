@@ -246,10 +246,23 @@ func TestARefusalCarriesTheKeyholdersCode(t *testing.T) {
 	for _, other := range []error{
 		&Refusal{Ordinal: 0, Code: "permission", Reason: "no"},
 		&Refusal{Ordinal: 0, Code: "", Reason: "502 Bad Gateway"},
+		&Refusal{Ordinal: 0, Code: "would-drop", Reason: "drops"},
 		errors.New("not-serving"),
 	} {
 		if NotServing(other) {
 			t.Errorf("NotServing(%v) = true", other)
+		}
+	}
+	// Each code is recognised by its own helper and by no other.
+	helpers := map[string]func(error) bool{
+		"not-serving": NotServing, "already-serving": AlreadyServing,
+		"would-drop": WouldDrop, "generation-too-old": GenerationTooOld,
+	}
+	for code := range helpers {
+		for name, is := range helpers {
+			if got := is(&Refusal{Code: code}); got != (code == name) {
+				t.Errorf("a %s refusal: the %s helper says %v", code, name, got)
+			}
 		}
 	}
 	if code, reason := refusalReason([]byte("<html>gateway</html>"), "502 Bad Gateway"); code != "" || reason != "502 Bad Gateway" {
@@ -371,5 +384,117 @@ func TestARefusedHandOverArrivesAsNotServing(t *testing.T) {
 	}
 	if _, err := c.Unseal(ctx, 0, bundleFor(t, "prod", 9), "restart-reseed"); !AlreadyServing(err) {
 		t.Fatalf("a re-seed into a serving keyholder returned %v; want an already-serving refusal", err)
+	}
+}
+
+// Over the real wire: a serving keyholder refuses a push that would take a key
+// away with its own code, and accepts it once sealed on purpose.
+func TestAPushThatWouldDropAKeyArrivesAsWouldDrop(t *testing.T) {
+	m, err := identity.Mint("prod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	kh := startKeyholder(t, "prod", m)
+	c := newClient(t, "prod", m, kh.addr)
+	ctx := context.Background()
+	k := twoScopes(t)
+	if _, err := c.Unseal(ctx, 0, keyringBundle(t, 1, k), IntentOperator); err != nil {
+		t.Fatal(err)
+	}
+	fewer, err := datasphere.NewBundle("prod", 2, k.Scopes()[:1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := fewer.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, intent := range []string{IntentOperator, IntentHandOver} {
+		_, err := c.Unseal(ctx, 0, raw, intent)
+		var r *Refusal
+		if !WouldDrop(err) || !errors.As(err, &r) || r.Code != "would-drop" {
+			t.Fatalf("%s dropping a scope = %v; want a would-drop refusal", intent, err)
+		}
+	}
+	if st, err := c.State(ctx, 0); err != nil || len(st.Keys) != 2 {
+		t.Fatalf("after the refusals the replica holds %v (%v); want both scopes", st.Keys, err)
+	}
+	if _, err := c.Seal(ctx, 0, false, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Unseal(ctx, 0, raw, IntentOperator); err != nil {
+		t.Errorf("after a deliberate seal the push was refused: %v", err)
+	}
+}
+
+// twoScopes is a keyring holding two applications' scopes.
+func twoScopes(t *testing.T) datasphere.Keyring {
+	t.Helper()
+	k, err := datasphere.NewKeyring()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, app := range []string{"web", "api"} {
+		s, err := datasphere.NewAppScope("apps", app)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if k, err = k.AddScope(s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return k
+}
+
+// The pin over the real wire: raised live, reported back, enforced on a push,
+// and passed only by the operator's explicit override.
+func TestThePinCrossesTheRealWire(t *testing.T) {
+	m, err := identity.Mint("prod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	kh := startKeyholder(t, "prod", m)
+	c := newClient(t, "prod", m, kh.addr)
+	ctx := context.Background()
+
+	old := twoScopes(t)
+	rotated, _, err := old.RotateScopeKEKs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pin dskeyholder.Pin
+	for _, s := range rotated.Scopes() {
+		for _, e := range s.Keyring().KEKs() {
+			pin.Require = append(pin.Require, e.ID)
+		}
+	}
+	st, err := c.RaisePin(ctx, 0, pin.Marshal(), false)
+	if err != nil {
+		t.Fatalf("RaisePin: %v", err)
+	}
+	if st.Pin == nil || st.Pin.Status != dskeyholder.PinValid || len(st.Pin.Require) != len(pin.Require) {
+		t.Fatalf("the raise answered %+v", st.Pin)
+	}
+
+	_, err = c.Unseal(ctx, 0, keyringBundle(t, 1, old), IntentOperator)
+	if !BelowPin(err) {
+		t.Fatalf("a pre-rotation unseal = %v; want below-pin", err)
+	}
+	if _, err := c.Unseal(ctx, 0, keyringBundle(t, 1, old), IntentOperatorBelowPin); err != nil {
+		t.Fatalf("the operator's override: %v", err)
+	}
+	if st, err := c.State(ctx, 0); err != nil || st.Sealed() || st.Pin == nil || !st.Pin.ServingBelow {
+		t.Errorf("after the override: %+v, %v; want serving and reporting it is below the pin", st.Pin, err)
+	}
+	if _, err := c.RaisePin(ctx, 0, "{", false); err == nil {
+		t.Error("an invalid pin was raised")
+	}
+}
+
+// A replica whose image predates the pin answers 404 to the raise, which the
+// caller must be able to tell from a refusal.
+func TestUnsupportedIsA404WithNoCode(t *testing.T) {
+	if !Unsupported(&Refusal{Status: 404}) || Unsupported(&Refusal{Status: 404, Code: "permission"}) || Unsupported(&Refusal{Status: 409}) {
+		t.Error("Unsupported misclassifies")
 	}
 }

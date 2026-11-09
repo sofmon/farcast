@@ -15,6 +15,9 @@ import (
 	"fmt"
 	"strings"
 	"text/template"
+	"time"
+
+	"github.com/sofmon/farcast/technocore/kernel"
 )
 
 // Defaults for the TechnoCore workload.
@@ -73,6 +76,13 @@ type Config struct {
 	// `kubectl describe pod` says plainly whether the kernel in this cluster
 	// is allowed to change an application's reservation.
 	Adapt bool
+
+	// Interval is how often the kernel reconciles, and AdaptCooldown how long
+	// a resized workload is left alone. Zero is the binary's default and
+	// renders no argument; anything else must be inside the kernel's bounds.
+	// The cooldown is rendered only with Adapt, where it means something.
+	Interval      time.Duration
+	AdaptCooldown time.Duration
 }
 
 func (c *Config) withDefaults() {
@@ -112,6 +122,12 @@ func Render(c Config) ([]byte, error) {
 	if c.CostLimit <= 0 {
 		return nil, fmt.Errorf("deploy: cost limit must be positive, got %v — a kernel with no limit enforces nothing", c.CostLimit)
 	}
+	if err := kernel.CheckInterval(c.Interval); err != nil {
+		return nil, fmt.Errorf("deploy: %w", err)
+	}
+	if err := kernel.CheckCooldown(c.AdaptCooldown); err != nil {
+		return nil, fmt.Errorf("deploy: %w", err)
+	}
 	for _, ns := range c.Meter {
 		if ns == "kube-system" || strings.HasPrefix(ns, "kube-") {
 			return nil, fmt.Errorf("deploy: refusing to grant the kernel access to %q; FarCast operates outside the managed namespaces (ADR 0003)", ns)
@@ -132,15 +148,27 @@ func Render(c Config) ([]byte, error) {
 		CostCurrency:    c.CostCurrency,
 		CostPeriod:      c.CostPeriod,
 		Adapt:           c.Adapt,
+		IntervalArg:     durationArg(c.Interval),
+		CooldownArg:     durationArg(c.AdaptCooldown),
 		Replicas:        Replicas,
 		RequestCPUMilli: RequestCPUMilli,
 		RequestMemMiB:   RequestMemMiB,
+		CarrierService:  carrierService,
 	}
 	var buf bytes.Buffer
 	if err := workloadTemplate.Execute(&buf, data); err != nil {
 		return nil, fmt.Errorf("deploy: render workload: %w", err)
 	}
 	return buf.Bytes(), nil
+}
+
+// durationArg renders a non-default duration for an argument; zero renders
+// nothing, so the binary's own default applies.
+func durationArg(d time.Duration) string {
+	if d == 0 {
+		return ""
+	}
+	return d.String()
 }
 
 func hasDigest(image string) bool {
@@ -172,7 +200,14 @@ type templateData struct {
 	RequestCPUMilli int
 	RequestMemMiB   int
 	Adapt           bool
+	IntervalArg     string
+	CooldownArg     string
+	CarrierService  string
 }
+
+// carrierService is FatLine's tunnel Service, the one Service the kernel may
+// read. A test pins it to kernel.CarrierService and fatline/deploy's name.
+const carrierService = "fatline"
 
 // workloadTemplate renders the kernel.
 //
@@ -303,6 +338,16 @@ rules:
     resources: ["configmaps"]
     resourceNames: ["{{.Name}}-profiles"]
     verbs: ["get", "update", "patch"]
+  # FatLine's tunnel Service, read on every tick so the kernel sees whether
+  # the instance pays for the public load balancer (ADR 0005) and meters it as
+  # instance overhead (ADR 0009 decision 4). GET only, pinned by name, and in
+  # this Role rather than the ClusterRole every metered namespace binds: list
+  # would return every Service here, and the ClusterRole would reach every
+  # application's.
+  - apiGroups: [""]
+    resources: ["services"]
+    resourceNames: ["{{.CarrierService}}"]
+    verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -383,6 +428,12 @@ spec:
             # The kernel may change an application's reservation. Everything
             # else it writes removes capacity; this one can add it.
             - --adapt
+{{- if .CooldownArg}}
+            - --adapt-cooldown={{.CooldownArg}}
+{{- end}}
+{{- end}}
+{{- if .IntervalArg}}
+            - --interval={{.IntervalArg}}
 {{- end}}
           resources:
             requests:

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -122,6 +123,14 @@ func (s *Server) streamHandler(w http.ResponseWriter, r *http.Request) {
 		// reported as unknown, never with the list of known ones.
 		s.emitStream(name, "unknown_route", 0, 0)
 		http.Error(w, "unknown route", http.StatusNotFound)
+		return
+	}
+	// A keeper device re-seeds a restarted keyholder replica and does nothing
+	// else (ADR 0008 finding 4): it reaches the routes listed for it, and the
+	// operator reaches all of them.
+	if s.isKeeper(r.TLS) && !slices.Contains(s.cfg.KeeperRoutes, name) {
+		s.emitStream(name, "role_refused", 0, 0)
+		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 	addr, err := route.resolve(r.URL.Query().Get("ordinal"))

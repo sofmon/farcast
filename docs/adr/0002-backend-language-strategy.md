@@ -98,11 +98,11 @@ Build FatLine in Go first (it is needed early in Phase 2 regardless). Then bench
 **Negative / risks**
 
 - **Polyglot seam at the most security-critical boundary** if FatLine goes Rust. The strongest argument against this decision is *compounding correctness*: with no human reviewer, the compiler is the only reviewer, and Rust statically eliminates whole defect classes across every trusting layer — including the Go modules whose output FatLine trusts (TechnoCore's cost numbers, Planck's translation, the SDK). If a single defect anywhere in the trust chain is judged catastrophic, and the residual Go ecosystem edges are judged cheap for an AI to fill, then all-Rust-while-greenfield would dominate and this polyglot answer would be a worst-of-both-worlds middle. We judge the ecosystem tax to be concentrated in the highest-leverage, hardest-to-get-right modules (Planck provisioning, the operator loops) and the compounding-correctness benefit to be real but diffuse — so Go-default wins. This is a catastrophe-tolerance judgment, not a fact dispute, and should be revisited if the threat model hardens.
-- Go's memory safety is *conditional* on the absence of data races. This must be actively defended in CI (see below), not assumed.
+- Go's memory safety is *conditional* on the absence of data races. This must be actively defended by the repository check (see below), not assumed.
 
 **Mandated guardrails (make either language safe without a human reviewer)**
 
-- **Go modules:** `go test -race`, `go vet`, and `golangci-lint` in CI.
+- **Go modules:** `go test -race`, `go vet`, and `golangci-lint`, for every Go module, run by `./check.sh`. *(Amended 2026-10-08: this said "in CI" and no CI existed; the guardrails ran from a runbook script that skipped `sdk/go` and skipped lint when the linter was absent. `./check.sh` is the gate, and it fails rather than skips.)*
 - **Any Rust module:** `#![forbid(unsafe_code)]`, clippy and `cargo-geiger`, plus **cancellation-safety integration tests** — the one genuinely silent, untooled Rust AI hazard identified in review (data loss when a future is dropped mid-`select!`, non-atomic state across `.await`). Multithreaded / race-style integration tests for the shared session and allowlist state.
 
 ---

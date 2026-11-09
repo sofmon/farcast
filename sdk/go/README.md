@@ -502,7 +502,7 @@ The SDK is pre-1.0 (`v0.x`). The contract may change between minor versions whil
 Per [`../../AGENTS.md`](../../AGENTS.md) ("Language guardrails") and [ADR 0002](../../docs/adr/0002-backend-language-strategy.md), the SDK is held to the same Go safety bar as every module:
 
 - `go test -race` — Go's memory safety is conditional on the absence of data races; `-race` defends it. The logger is a process-wide singleton reached from many goroutines, so its concurrency is covered explicitly.
-- `go vet` and `golangci-lint` in CI.
+- `go vet` and `golangci-lint`, run against this module by the repository's `./check.sh` — separately from the root module, whose `./...` does not reach a nested module.
 - Tests sit beside the code they cover (`farcast_test.go` alongside `farcast.go`).
 - The off-instance behaviour (graceful identity defaults, stdout logging, the `SetLogWriter` seam) is what makes the SDK unit-testable without a live instance, and is itself tested.
 

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/sofmon/farcast/datasphere"
+	dskeyholder "github.com/sofmon/farcast/datasphere/keyholder"
 	"github.com/sofmon/farcast/farsight/cli/internal/keyholder"
 )
 
@@ -341,5 +342,31 @@ func TestAReplicaThatDidNotAnswerStopsAReseed(t *testing.T) {
 	// With every replica answering, the same bundle re-seeds.
 	if d := Decide(states[0], nil, 0, 1, allowed(), FleetOf(bundleFrom(t, before), states, []error{nil, nil})); d.Action != ActionReseed {
 		t.Errorf("Decide = %s (%s) with every replica answering; want reseed", d.Action, d.Reason)
+	}
+}
+
+// An unreadable pin is one replica's fact. It refuses every re-seed, so the
+// keeper leaves that replica alone — and re-seeds another whose own pin
+// accepts the bundle, rather than standing down for the fleet.
+func TestAnUnreadablePinStopsOnlyThatReplica(t *testing.T) {
+	scope, err := datasphere.NewAppScope("apps", "web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mine, err := datasphere.NewBundle("prod", 1, []datasphere.Scope{scope})
+	if err != nil {
+		t.Fatal(err)
+	}
+	states := []keyholder.State{
+		{Phase: "restart-sealed", Pin: &dskeyholder.PinReport{Status: dskeyholder.PinInvalid, Error: "not JSON"}},
+		{Phase: "restart-sealed", Pin: &dskeyholder.PinReport{Status: dskeyholder.PinAbsent}},
+	}
+	fleet := FleetOf(mine, states, []error{nil, nil})
+	budget := BudgetState{Allowed: true}
+	if d := Decide(states[0], nil, 0, 1, budget, fleet); d.Action != ActionStale || !strings.Contains(d.Reason, "storage key pin") {
+		t.Errorf("replica 0 = %s (%s); want stale, naming the repair", d.Action, d.Reason)
+	}
+	if d := Decide(states[1], nil, 1, 1, budget, fleet); d.Action != ActionReseed {
+		t.Errorf("replica 1 = %s (%s); want a re-seed: its own pin does not refuse", d.Action, d.Reason)
 	}
 }

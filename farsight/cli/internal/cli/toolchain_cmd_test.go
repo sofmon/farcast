@@ -213,3 +213,22 @@ func TestAFailedMirrorRecordsNothing(t *testing.T) {
 		t.Errorf("a failed mirror was recorded anyway: %s", meta.Toolchain.Builder)
 	}
 }
+
+// With nothing recorded, the refusal names where to start — and says plainly
+// that the builder it names is unmaintained (ADR 0011 decision 4). The fork it
+// used to name stopped answering anonymous pullers on the 4.3 walk.
+func TestTheMissingBuilderRefusalNamesADR0011sImageHonestly(t *testing.T) {
+	meta := &config.InstanceMetadata{Name: "p60"}
+	_, err := resolveToolchainImage(context.Background(), nil, meta, builderKind, "", nil)
+	if err == nil {
+		t.Fatal("no builder was refused")
+	}
+	for _, want := range []string{"gcr.io/kaniko-project/executor:v1.23.2", "unmaintained", "ADR 0011"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not say %q:\n%v", want, err)
+		}
+	}
+	if strings.Contains(err.Error(), "cgr.dev/chainguard/kaniko") {
+		t.Errorf("the refusal names the fork that no longer answers:\n%v", err)
+	}
+}

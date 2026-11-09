@@ -183,7 +183,11 @@ func TestInstallRefusesASyncedPathEvenWithForce(t *testing.T) {
 	}
 }
 
-func TestRemoveKeepsTheLedger(t *testing.T) {
+// Wiping deletes the two files that could open anything — the bundle and the
+// leaf key — and keeps the ledger an audit reads afterwards, and the record
+// 'keeper status' needs to read it. The old Remove deleted the record too,
+// which made the kept ledger unreadable.
+func TestWipeKeepsTheLedgerAndTheRecord(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "prod")
 	store, err := Install(dir, samplePacket(), true)
 	if err != nil {
@@ -194,19 +198,55 @@ func TestRemoveKeepsTheLedger(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("AppendLedger: %v", err)
 	}
-	if err := store.Remove(); err != nil {
-		t.Fatalf("Remove: %v", err)
+	first := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	if err := store.Wipe("instance released", first); err != nil {
+		t.Fatalf("Wipe: %v", err)
 	}
-	for _, f := range []string{bundleFile, leafKey, configFile} {
+	for _, f := range []string{bundleFile, leafKey} {
 		if _, err := os.Stat(filepath.Join(dir, f)); !os.IsNotExist(err) {
-			t.Errorf("%s survived Remove", f)
+			t.Errorf("%s survived Wipe", f)
 		}
 	}
-	// The ledger is what an audit reads afterwards. A device that erased its
-	// own history on the way out would remove exactly the evidence.
+	for _, f := range []string{configFile, caFile, leafFile} {
+		if _, err := os.Stat(filepath.Join(dir, f)); err != nil {
+			t.Errorf("%s did not survive Wipe: %v", f, err)
+		}
+	}
 	entries, err := keyholder.ReadLedger(store.LedgerPath())
 	if err != nil || len(entries) != 1 {
-		t.Errorf("the ledger did not survive Remove: %d entries, %v", len(entries), err)
+		t.Errorf("the ledger did not survive Wipe: %d entries, %v", len(entries), err)
+	}
+	cfg, err := store.Config()
+	if err != nil || !cfg.WipedAt.Equal(first) || cfg.WipedReason != "instance released" {
+		t.Errorf("the record does not say it was wiped: %+v, %v", cfg, err)
+	}
+	if _, _, _, _, err := store.Material(); !errors.Is(err, ErrWiped) {
+		t.Errorf("Material after Wipe = %v; want ErrWiped", err)
+	}
+	// Idempotent, and the first date and reason stand.
+	if err := store.Wipe("again", first.Add(time.Hour)); err != nil {
+		t.Fatalf("second Wipe: %v", err)
+	}
+	if cfg, _ := store.Config(); !cfg.WipedAt.Equal(first) || cfg.WipedReason != "instance released" {
+		t.Errorf("a second Wipe rewrote the first: %+v", cfg)
+	}
+}
+
+// Enrolling again over a wiped directory makes it a keeper again.
+func TestReinstallClearsAWipe(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "prod")
+	store, err := Install(dir, samplePacket(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Wipe("uninstalled", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if store, err = Install(dir, samplePacket(), true); err != nil {
+		t.Fatalf("reinstall: %v", err)
+	}
+	if _, _, _, _, err := store.Material(); err != nil {
+		t.Errorf("a reinstalled keeper's material = %v", err)
 	}
 }
 

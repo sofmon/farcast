@@ -76,6 +76,8 @@ func (r *Reconciler) Shutdown(ctx context.Context, rep Report, now time.Time) (S
 	}
 
 	out := ShutdownResult{At: now, Unclassified: rep.Unclassified}
+	// Targets only: instance overhead — the carrier — is never one, and the
+	// kernel has no write on Services to stop it with.
 	for _, t := range rep.Stoppable() {
 		// Belt and braces. Stoppable already filters, and this is the last
 		// line before an irreversible call against a live cluster — the one
@@ -121,7 +123,7 @@ func (rep Report) AtFloor() bool {
 }
 
 // SystemProtected is the reason the floor exists, stated as a number: what the
-// instance still burns after every application is stopped.
+// protected Pods still burn after every application is stopped.
 func (rep Report) SystemProtected() float64 {
 	var sum float64
 	for _, w := range rep.Workloads {
@@ -131,3 +133,7 @@ func (rep Report) SystemProtected() float64 {
 	}
 	return sum
 }
+
+// FloorHourlyUSD is what still burns once every application is stopped: the
+// protected Pods, and overhead no shutdown can reach (decision 8).
+func (rep Report) FloorHourlyUSD() float64 { return rep.SystemProtected() + rep.RateOverheadUSD }

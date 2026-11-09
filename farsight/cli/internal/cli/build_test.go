@@ -62,7 +62,7 @@ func succeeded(digest string) cluster.JobResult {
 
 func TestBuildRunsInTheInstanceAndPinsWhatItPushed(t *testing.T) {
 	dir := config.Dir(t.TempDir())
-	buildableInstance(t, dir, "p42")
+	meteringInstance(t, dir, "p42")
 	env, out := testEnv(dir, output.ModeHuman)
 
 	sha := "sha256:" + strings.Repeat("c", 64)
@@ -103,7 +103,7 @@ func TestBuildRunsInTheInstanceAndPinsWhatItPushed(t *testing.T) {
 // pinning.
 func TestABuilderTagIsRefusedWithTheDigestToUse(t *testing.T) {
 	dir := config.Dir(t.TempDir())
-	buildableInstance(t, dir, "p42")
+	meteringInstance(t, dir, "p42")
 	env, _ := testEnv(dir, output.ModeHuman)
 
 	fj := &fakeJobs{}
@@ -132,7 +132,7 @@ func TestABuilderTagIsRefusedWithTheDigestToUse(t *testing.T) {
 
 func TestABuilderImageIsRequired(t *testing.T) {
 	dir := config.Dir(t.TempDir())
-	buildableInstance(t, dir, "p42")
+	meteringInstance(t, dir, "p42")
 	env, _ := testEnv(dir, output.ModeHuman)
 	c := buildCmd(&fakeJobs{})
 	c.repo, c.app = "https://github.com/example/repo.git", "api"
@@ -146,7 +146,7 @@ func TestABuilderImageIsRequired(t *testing.T) {
 // failed" helps nobody; the Containerfile said why.
 func TestAFailedBuildShowsTheBuildsOwnOutput(t *testing.T) {
 	dir := config.Dir(t.TempDir())
-	buildableInstance(t, dir, "p42")
+	meteringInstance(t, dir, "p42")
 	env, _ := testEnv(dir, output.ModeHuman)
 
 	fj := &fakeJobs{
@@ -173,7 +173,7 @@ func TestAFailedBuildShowsTheBuildsOwnOutput(t *testing.T) {
 // deploying an unpinned image is what ADR 0007 decision 4 forbids.
 func TestABuildThatReportsNoDigestIsAFailure(t *testing.T) {
 	dir := config.Dir(t.TempDir())
-	buildableInstance(t, dir, "p42")
+	meteringInstance(t, dir, "p42")
 	env, _ := testEnv(dir, output.ModeHuman)
 
 	for name, msg := range map[string]string{
@@ -195,7 +195,7 @@ func TestABuildThatReportsNoDigestIsAFailure(t *testing.T) {
 // keyholder's bucket grant.
 func TestTheResultPrintsThePushGrant(t *testing.T) {
 	dir := config.Dir(t.TempDir())
-	buildableInstance(t, dir, "p42")
+	meteringInstance(t, dir, "p42")
 	env, out := testEnv(dir, output.ModeHuman)
 
 	fj := &fakeJobs{result: succeeded("sha256:" + strings.Repeat("c", 64))}
@@ -224,7 +224,7 @@ func TestBuildRefusesWithoutARegistryOrRequiredFlags(t *testing.T) {
 		t.Error("an instance with no registry was accepted")
 	}
 
-	buildableInstance(t, dir, "p42")
+	meteringInstance(t, dir, "p42")
 	for name, mutate := range map[string]func(*buildCommand){
 		"no repo": func(c *buildCommand) { c.repo = "" },
 		"no app":  func(c *buildCommand) { c.app = "" },
@@ -240,7 +240,7 @@ func TestBuildRefusesWithoutARegistryOrRequiredFlags(t *testing.T) {
 
 func TestAWaitFailureSurfaces(t *testing.T) {
 	dir := config.Dir(t.TempDir())
-	buildableInstance(t, dir, "p42")
+	meteringInstance(t, dir, "p42")
 	env, _ := testEnv(dir, output.ModeHuman)
 	fj := &fakeJobs{waitErr: errors.New("apiserver unreachable")}
 	c := buildCmd(fj)
@@ -252,7 +252,7 @@ func TestAWaitFailureSurfaces(t *testing.T) {
 
 func TestTheDestinationFollowsTheRegistryPathConvention(t *testing.T) {
 	dir := config.Dir(t.TempDir())
-	meta := buildableInstance(t, dir, "p42")
+	meta := meteringInstance(t, dir, "p42")
 	env, _ := testEnv(dir, output.ModeHuman)
 
 	fj := &fakeJobs{result: succeeded("sha256:" + strings.Repeat("c", 64))}
@@ -275,7 +275,7 @@ func TestTheDestinationFollowsTheRegistryPathConvention(t *testing.T) {
 // it was printed only on the SUCCESS path, where it cannot be needed.
 func TestAFailedBuildNamesTheGrantWhenThePushWasRefused(t *testing.T) {
 	dir := config.Dir(t.TempDir())
-	buildableInstance(t, dir, "p42")
+	meteringInstance(t, dir, "p42")
 	env, _ := testEnv(dir, output.ModeHuman)
 
 	fj := &fakeJobs{result: cluster.JobResult{Succeeded: false}, logs: arDenial}
@@ -290,5 +290,27 @@ func TestAFailedBuildNamesTheGrantWhenThePushWasRefused(t *testing.T) {
 		if !strings.Contains(errOut, want) {
 			t.Errorf("the failure does not name the grant (%q missing):\n%s", want, errOut)
 		}
+	}
+}
+
+// A build is a billed Job in farcast-system, which only a kernel meters. With
+// no kernel it is refused before the builder is even resolved.
+func TestBuildWithoutAKernelRefusesBeforeAnythingIsSpent(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	buildableInstance(t, dir, "p42")
+	env, _ := testEnv(dir, output.ModeHuman)
+	fj := &fakeJobs{}
+	c := buildCmd(fj)
+	fb := &fakeBuilder{}
+	c.newBuilder = func(func(string)) imageBuilder { return fb }
+	c.repo, c.app = "https://github.com/example/app", "api"
+	c.builderImage = "cgr.dev/chainguard/kaniko:latest" // a tag: resolving it would be the first thing spent
+
+	err := c.Run(context.Background(), env, []string{"p42"})
+	if err == nil || !strings.Contains(err.Error(), "farcast kernel deploy p42") {
+		t.Fatalf("build = %v; want a refusal naming 'farcast kernel deploy p42'", err)
+	}
+	if len(fj.applied) != 0 || len(fb.resolved) != 0 {
+		t.Errorf("build spent before refusing: %d applied, %d resolved", len(fj.applied), len(fb.resolved))
 	}
 }

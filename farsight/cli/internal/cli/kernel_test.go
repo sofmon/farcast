@@ -2,8 +2,11 @@ package cli
 
 import (
 	"context"
+	"errors"
+	"flag"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
@@ -208,7 +211,7 @@ func TestKernelDeployRefusesAnUnconnectedInstance(t *testing.T) {
 // cheap moment to notice.
 func TestKernelDeployGateNamesTheFloorNonInteractively(t *testing.T) {
 	dir := config.Dir(t.TempDir())
-	connectedInstance(t, dir, "p41") // USD 50, below the ~$73 floor
+	connectedInstance(t, dir, "p41") // USD 50: clears the metered ~$40, not the modelled ~$77
 	env, _ := testEnv(dir, output.ModeHuman)
 
 	c := testKernelDeploy(&fakeCluster{}, &fakeBuilder{})
@@ -225,7 +228,7 @@ func TestKernelDeployGateNamesTheFloorNonInteractively(t *testing.T) {
 		t.Fatalf("err = %v, want the refusal to name the floor", err)
 	}
 	warned := env.Err.(interface{ String() string }).String()
-	if !strings.Contains(warned, "below what") || !strings.Contains(warned, "never stops the tunnel") {
+	if !strings.Contains(warned, "below what") || !strings.Contains(warned, "cannot observe") {
 		t.Errorf("the gate did not explain the floor:\n%s", warned)
 	}
 }
@@ -280,14 +283,18 @@ func TestKernelDeployMetersTheNamespacesItWasGiven(t *testing.T) {
 	}
 }
 
-func TestParseNamespacesDefaultsToFarCastsOwn(t *testing.T) {
+// farcast-system is metered whatever the flag says: every fetch and build Job
+// runs there, and a kernel told to meter only applications left them
+// uncounted.
+func TestParseNamespacesAlwaysMetersFarCastsOwn(t *testing.T) {
 	cases := map[string][]string{
-		"":                        {tcdeploy.DefaultNamespace},
-		"   ":                     {tcdeploy.DefaultNamespace},
-		",,":                      {tcdeploy.DefaultNamespace},
-		"a,b":                     {"a", "b"},
-		" a , b ,":                {"a", "b"},
-		tcdeploy.DefaultNamespace: {tcdeploy.DefaultNamespace},
+		"":                               {tcdeploy.DefaultNamespace},
+		"   ":                            {tcdeploy.DefaultNamespace},
+		",,":                             {tcdeploy.DefaultNamespace},
+		"a,b":                            {tcdeploy.DefaultNamespace, "a", "b"},
+		" a , b ,":                       {tcdeploy.DefaultNamespace, "a", "b"},
+		tcdeploy.DefaultNamespace:        {tcdeploy.DefaultNamespace},
+		"a," + tcdeploy.DefaultNamespace: {tcdeploy.DefaultNamespace, "a"},
 	}
 	for in, want := range cases {
 		got := parseNamespaces(in)
@@ -337,5 +344,154 @@ func TestTheGateChecksTheProvisionedFloorNotTodaysWorkloads(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "floor") {
 		t.Fatalf("err = %v; a limit below the PROVISIONED floor must be flagged even though "+
 			"it clears what is running today", err)
+	}
+}
+
+// deployKernelWith runs 'kernel deploy' with these flags, parsed the way the
+// command line parses them, and returns the manifest it applied.
+func deployKernelWith(t *testing.T, dir config.Dir, name string, flags ...string) (string, error) {
+	t.Helper()
+	fc := &fakeCluster{}
+	c := testKernelDeploy(fc, &fakeBuilder{})
+	fs := flag.NewFlagSet("deploy", flag.ContinueOnError)
+	c.SetFlags(fs)
+	c.deployer.assumeYes = true
+	if err := fs.Parse(flags); err != nil {
+		t.Fatalf("parse %v: %v", flags, err)
+	}
+	env, _ := testEnv(dir, output.ModeHuman)
+	err := c.Run(context.Background(), env, []string{name})
+	var applied string
+	for _, m := range fc.applied {
+		applied += string(m)
+	}
+	return applied, err
+}
+
+// The 5.2 walk's hand-patched cooldown, and the defect behind it: every
+// 'kernel deploy' silently switched adapting off, because nothing recorded
+// that it had been on.
+func TestKernelDeployRecordsAndCarriesItsFlagsForward(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	connectedInstance(t, dir, "p50")
+
+	applied, err := deployKernelWith(t, dir, "p50", "--adapt", "--adapt-cooldown=2m", "--interval=10s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"- --adapt\n", "--adapt-cooldown=2m0s", "--interval=10s"} {
+		if !strings.Contains(applied, want) {
+			t.Errorf("the manifest lacks %q", want)
+		}
+	}
+	meta, err := dir.LoadInstanceMetadata("p50")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if k := meta.Kernel; !k.Adapt || k.AdaptCooldown != 2*time.Minute || k.Interval != 10*time.Second {
+		t.Fatalf("recorded %+v", k)
+	}
+
+	// A redeploy that names nothing keeps all three.
+	applied, err = deployKernelWith(t, dir, "p50")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"- --adapt\n", "--adapt-cooldown=2m0s", "--interval=10s"} {
+		if !strings.Contains(applied, want) {
+			t.Errorf("a redeploy dropped %q", want)
+		}
+	}
+
+	// --adapt=false turns it off, and =0 restores a default.
+	applied, err = deployKernelWith(t, dir, "p50", "--adapt=false", "--interval=0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(applied, "--adapt") || strings.Contains(applied, "--interval") {
+		t.Errorf("--adapt=false --interval=0 still rendered adapt or an interval")
+	}
+	if meta, _ = dir.LoadInstanceMetadata("p50"); meta.Kernel.Adapt || meta.Kernel.Interval != 0 || meta.Kernel.AdaptCooldown != 2*time.Minute {
+		t.Errorf("recorded %+v; want adapting off, the default interval, and the cooldown kept", meta.Kernel)
+	}
+}
+
+// A value outside the kernel's bounds is refused before anything is built or
+// applied.
+func TestKernelDeployRefusesAnIntervalOutsideTheBoundsBeforeBuilding(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	connectedInstance(t, dir, "p51")
+	fc := &fakeCluster{}
+	fb := &fakeBuilder{}
+	c := testKernelDeploy(fc, fb)
+	fs := flag.NewFlagSet("deploy", flag.ContinueOnError)
+	c.SetFlags(fs)
+	if err := fs.Parse([]string{"--interval=1s"}); err != nil {
+		t.Fatal(err)
+	}
+	c.deployer.assumeYes = true
+	env, _ := testEnv(dir, output.ModeHuman)
+	if err := c.Run(context.Background(), env, []string{"p51"}); err == nil || !strings.Contains(err.Error(), "--interval") {
+		t.Fatalf("--interval=1s = %v; want it refused naming the flag", err)
+	}
+	if len(fc.applied) != 0 || len(fb.built) != 0 {
+		t.Errorf("a refused deploy built %d image(s) and applied %d manifest(s)", len(fb.built), len(fc.applied))
+	}
+}
+
+// 'kernel confirm' writes the whole set it holds, so a redeploy that dropped
+// the recorded confirmations would have the next one erase every figure
+// before it — in the cluster too.
+func TestKernelDeployKeepsTheRecordedConfirmations(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	connectedInstance(t, dir, "p52")
+	if _, err := deployKernelWith(t, dir, "p52"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dir.UpdateInstanceMetadata("p52", func(m *config.InstanceMetadata) error {
+		m.Kernel.Confirmations = []config.KernelConfirmation{{}}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := deployKernelWith(t, dir, "p52"); err != nil {
+		t.Fatal(err)
+	}
+	meta, err := dir.LoadInstanceMetadata("p52")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(meta.Kernel.Confirmations) != 1 {
+		t.Errorf("a redeploy left %d confirmations; want the 1 recorded", len(meta.Kernel.Confirmations))
+	}
+}
+
+// A kernel deploy whose apply failed leaves its record — so it can be torn
+// down — and must not open the gate run and build check.
+func TestAFailedKernelApplyKeepsRunAndBuildRefused(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	connectedInstance(t, dir, "p53")
+	fc := &fakeCluster{applyErr: errors.New("the API server said no")}
+	c := testKernelDeploy(fc, &fakeBuilder{})
+	env, _ := testEnv(dir, output.ModeHuman)
+	if err := c.Run(context.Background(), env, []string{"p53"}); err == nil {
+		t.Fatal("a failed apply reported success")
+	}
+	meta, err := dir.LoadInstanceMetadata("p53")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Kernel == nil || !meta.Kernel.Deployed {
+		t.Fatal("guard: the failed deploy left no record to tear down")
+	}
+	if err := requireKernel("p53", meta, "this"); err == nil {
+		t.Error("the gate opened for a kernel whose apply failed")
+	}
+	fc.applyErr = nil
+	if err := c.Run(context.Background(), env, []string{"p53"}); err != nil {
+		t.Fatal(err)
+	}
+	if meta, _ = dir.LoadInstanceMetadata("p53"); requireKernel("p53", meta, "this") != nil {
+		t.Error("the gate stayed shut after a kernel deploy applied")
 	}
 }

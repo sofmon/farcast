@@ -55,10 +55,14 @@ type Checkpoint struct {
 
 // Observation is one reconcile's view of the cluster, as the kernel saw it.
 type Observation struct {
-	At            time.Time `json:"at,omitzero"`
-	Pods          int       `json:"pods,omitempty"`
-	Unclassified  int       `json:"unclassified,omitempty"`
-	RateHourlyUSD float64   `json:"rate_per_hour,omitempty"`
+	At           time.Time `json:"at,omitzero"`
+	Pods         int       `json:"pods,omitempty"`
+	Unclassified int       `json:"unclassified,omitempty"`
+	// RateHourlyUSD includes Overhead, the instance-level charges — today the
+	// load-balancer carrier — that belong to no application.
+	RateHourlyUSD float64 `json:"rate_per_hour,omitempty"`
+	Overhead      float64 `json:"overhead_per_hour,omitempty"`
+	Carrier       string  `json:"carrier,omitempty"`
 
 	// Level is the assessment the kernel is acting on, and Limit the figure it
 	// is acting against. Both are the KERNEL's, not local state's: when a

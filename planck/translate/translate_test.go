@@ -247,6 +247,13 @@ func TestTheSDKContractReachesTheContainer(t *testing.T) {
 	if !strings.HasPrefix(cm["FARCAST_STORAGE_ENDPOINT"].(string), "https://") {
 		t.Error("the storage endpoint must be https")
 	}
+	// The status listener has no TLS: it answers the kubelet, and it answers
+	// while sealed. An https URL fails the SDK's probe at the handshake, so an
+	// application with every replica sealed saw ErrStorageUnavailable where
+	// the contract is ErrStorageSealed.
+	if !strings.HasPrefix(cm["FARCAST_STORAGE_STATUS_ENDPOINT"].(string), "http://") {
+		t.Errorf("the status endpoint is %q; the listener is plain http", cm["FARCAST_STORAGE_STATUS_ENDPOINT"])
+	}
 	if !strings.Contains(cm["FARCAST_STORAGE_CA"].(string), "BEGIN CERTIFICATE") {
 		t.Errorf("the CA did not survive rendering: %q", cm["FARCAST_STORAGE_CA"])
 	}

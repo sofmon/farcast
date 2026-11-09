@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/sofmon/farcast/datasphere"
+	dskeyholder "github.com/sofmon/farcast/datasphere/keyholder"
 	"github.com/sofmon/farcast/farsight/cli/internal/keyholder"
 	fldeploy "github.com/sofmon/farcast/fatline/deploy"
 	"github.com/sofmon/farcast/fatline/policy"
@@ -66,6 +67,8 @@ type fakeRunCluster struct {
 	buildLogs  string
 	fetchFails bool
 	applyErr   error
+	// applyErrOn fails only an apply whose stream contains this.
+	applyErrOn string
 	rolloutErr error
 }
 
@@ -84,6 +87,9 @@ func (f *fakeRunCluster) Apply(_ context.Context, m []byte) error {
 		if yaml.Unmarshal([]byte(d), &doc) == nil && doc.Kind == "Job" {
 			f.jobs[doc.Metadata.Name] = true
 		}
+	}
+	if f.applyErrOn != "" && strings.Contains(string(m), f.applyErrOn) {
+		return errors.New("the API server said no")
 	}
 	return f.applyErr
 }
@@ -155,7 +161,7 @@ func newFakeRun(manifest string) *fakeRunCluster {
 func runnableInstance(t *testing.T, dir config.Dir, name string) *config.InstanceMetadata {
 	t.Helper()
 	meta := buildableInstance(t, dir, name)
-	meta.Kernel = &config.Kernel{Deployed: true, Namespaces: []string{"farcast-system"}}
+	meta.Kernel = &config.Kernel{Deployed: true, Applied: true, Namespaces: []string{"farcast-system"}}
 	meta.CostLimit = config.CostLimit{Amount: 500, Currency: "USD", Period: "monthly"}
 	if err := dir.SaveInstanceMetadata(name, meta); err != nil {
 		t.Fatal(err)
@@ -429,23 +435,73 @@ func TestRunMetersWhatItDeployed(t *testing.T) {
 	}
 }
 
-// Deploying without a kernel is allowed and is reported. Silence would leave
-// applications running, billing, and outside the one guard that stops them.
-func TestRunWithoutAKernelSaysSoLoudly(t *testing.T) {
-	dir := config.Dir(t.TempDir())
-	meta := buildableInstance(t, dir, "p43")
-	meta.CostLimit = config.CostLimit{Amount: 500, Currency: "USD", Period: "monthly"}
-	if err := dir.SaveInstanceMetadata("p43", meta); err != nil {
-		t.Fatal(err)
-	}
-	env, out := testEnv(dir, output.ModeHuman)
+// An instance with no kernel is refused before anything is read. The read,
+// every build and the workloads all bill, and a namespace the kernel does not
+// meter is neither counted against the limit nor stoppable by it. It used to
+// deploy and print NOT METERED — after the money was already being spent.
+func TestRunWithoutAKernelRefusesBeforeAnythingIsSpent(t *testing.T) {
+	for name, kernel := range map[string]*config.Kernel{
+		"no kernel recorded":     nil,
+		"recorded, not deployed": {},
+		// Recorded before the apply, and the apply failed.
+		"recorded, never applied": {Deployed: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := config.Dir(t.TempDir())
+			meta := buildableInstance(t, dir, "p43")
+			meta.CostLimit = config.CostLimit{Amount: 500, Currency: "USD", Period: "monthly"}
+			meta.Kernel = kernel
+			if err := dir.SaveInstanceMetadata("p43", meta); err != nil {
+				t.Fatal(err)
+			}
+			env, out := testEnv(dir, output.ModeHuman)
+			f := newFakeRun(twoAppManifest)
+			c := runCmd(f)
+			fb := &fakeBuilder{}
+			c.newBuilder = func(func(string)) imageBuilder { return fb }
+			c.fetcherImage = "cgr.dev/chainguard/git:latest-dev" // a tag: resolving it would be the first thing spent
 
+			err := c.Run(context.Background(), env, []string{"p43", "github.com/example/my-platform"})
+			if err == nil || !strings.Contains(err.Error(), "farcast kernel deploy p43") {
+				t.Fatalf("run = %v; want a refusal naming 'farcast kernel deploy p43'", err)
+			}
+			if len(f.applied) != 0 || len(f.waited) != 0 || len(fb.resolved) != 0 {
+				t.Errorf("run spent before refusing: %d applied, %d waited, %d resolved", len(f.applied), len(f.waited), len(fb.resolved))
+			}
+			if got, err := dir.LoadInstanceMetadata("p43"); err != nil || got.Toolchain != nil {
+				t.Errorf("run recorded a toolchain before refusing: %+v, %v", got.Toolchain, err)
+			}
+			if out.Len() != 0 {
+				t.Errorf("run printed a result for a deploy it refused:\n%s", out.String())
+			}
+		})
+	}
+}
+
+// The NOT METERED report stays for the one way it can still happen: the
+// workloads applied and the metering of their namespace then failed. It must
+// say how to fix it.
+func TestRunThatCannotMeterSaysSoLoudly(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	runnableInstance(t, dir, "p43")
+	env, out := testEnv(dir, output.ModeHuman)
 	f := newFakeRun(twoAppManifest)
+	f.applyErrOn = "ConfigMap\nmetadata:\n  name: " + kernel.DefaultNamespacesName
 	if err := runCmd(f).Run(context.Background(), env, []string{"p43", "github.com/example/my-platform"}); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out.String(), "NOT METERED") {
-		t.Errorf("a deployment nothing is counting did not say so:\n%s", out.String())
+	if !strings.Contains(out.String(), "NOT METERED") || !strings.Contains(out.String(), "farcast kernel meter p43 my-platform") {
+		t.Errorf("a deployment nothing is counting did not say so, or how to fix it:\n%s", out.String())
+	}
+	if _, ok := appliedKinds(t, f)["Deployment/api"]; !ok {
+		t.Errorf("the workloads were not applied: %v", appliedKinds(t, f))
+	}
+	meta, err := dir.LoadInstanceMetadata("p43")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contains(meta.Kernel.Namespaces, "my-platform") {
+		t.Errorf("a namespace whose metering failed is recorded as metered: %v", meta.Kernel.Namespaces)
 	}
 }
 
@@ -1114,6 +1170,39 @@ type fakeReplica struct {
 	phase      string
 	generation uint64
 	keys       map[string][]string
+	// pin is the key pin this replica enforces, as the vault does; nil is
+	// none. It is loaded when the replica starts and raised live.
+	pin *dskeyholder.Pin
+}
+
+// pinReport is what a replica says of its pin.
+func (r *fakeReplica) pinReport() *dskeyholder.PinReport {
+	if r.pin == nil {
+		return &dskeyholder.PinReport{Status: dskeyholder.PinAbsent}
+	}
+	rep := &dskeyholder.PinReport{Status: dskeyholder.PinValid}
+	for _, id := range r.pin.Require {
+		rep.Require = append(rep.Require, id.String())
+	}
+	for _, id := range r.pin.Retired {
+		rep.Retired = append(rep.Retired, id.String())
+	}
+	rep.ServingBelow = r.phase == "unsealed" && r.pin.Admits(r.keys) != nil
+	return rep
+}
+
+// RaisePin is the vault's: union, or replace.
+func (f *fakeStateKeyholder) RaisePin(_ context.Context, i int, raw string, replace bool) (keyholder.State, error) {
+	p, present, err := dskeyholder.ParsePin(raw)
+	if err != nil || !present {
+		return keyholder.State{}, &keyholder.Refusal{Ordinal: i, Code: "bad-request", Reason: "invalid pin (bad-request)", Status: 400}
+	}
+	r := f.replica(i)
+	if r.pin != nil && !replace {
+		p = r.pin.Union(p)
+	}
+	r.pin = &p
+	return f.State(context.Background(), i)
 }
 
 func (f *fakeStateKeyholder) replica(i int) *fakeReplica {
@@ -1130,7 +1219,7 @@ func (f *fakeStateKeyholder) replica(i int) *fakeReplica {
 
 func (f *fakeStateKeyholder) State(_ context.Context, i int) (keyholder.State, error) {
 	r := f.replica(i)
-	return keyholder.State{Phase: r.phase, Generation: r.generation, Keys: copyKeys(r.keys), Boot: "b0"}, nil
+	return keyholder.State{Phase: r.phase, Generation: r.generation, Keys: copyKeys(r.keys), Boot: "b0", Pin: r.pinReport()}, nil
 }
 
 func (f *fakeStateKeyholder) Unseal(_ context.Context, i int, payload []byte, intent string) (keyholder.State, error) {
@@ -1159,8 +1248,36 @@ func (f *fakeStateKeyholder) Unseal(_ context.Context, i int, payload []byte, in
 		}
 	}
 	f.sent = append(f.sent, b.Generation())
+	// The vault checks the pin after the hold and before the generation, on
+	// every push but the operator's deliberate one past it.
+	if r.pin != nil && intent != keyholder.IntentOperatorBelowPin {
+		if err := r.pin.Admits(dskeyholder.KeysOf(b)); err != nil {
+			return keyholder.State{}, &keyholder.Refusal{Ordinal: i, Code: dskeyholder.CodeBelowPin, Reason: err.Error() + " (below-pin)", Status: 409}
+		}
+	}
 	if b.Generation() < r.generation {
 		return keyholder.State{}, &keyholder.Refusal{Ordinal: i, Code: "generation-too-old", Reason: "older (generation-too-old)"}
+	}
+	// A serving keyholder never takes a key or scope away (the vault's
+	// ErrWouldDrop): a push lacking one it holds is refused.
+	if r.phase == "unsealed" {
+		carried := map[string]map[string]bool{}
+		for _, sc := range b.Scopes() {
+			carried[sc.Name] = map[string]bool{}
+			for _, e := range sc.Keyring().KEKs() {
+				carried[sc.Name][e.ID.String()] = true
+			}
+		}
+		for name, ids := range r.keys {
+			if carried[name] == nil {
+				return keyholder.State{}, &keyholder.Refusal{Ordinal: i, Code: "would-drop", Reason: "drops a served scope (would-drop)"}
+			}
+			for _, id := range ids {
+				if !carried[name][id] {
+					return keyholder.State{}, &keyholder.Refusal{Ordinal: i, Code: "would-drop", Reason: "drops a served key (would-drop)"}
+				}
+			}
+		}
 	}
 	if r.phase == "unsealed" && b.Generation() == r.generation {
 		// A retry: the real vault installs nothing and answers success.
@@ -1346,5 +1463,45 @@ func TestRunLeavesTheKeyholderAloneWhenNothingIsMinted(t *testing.T) {
 	}
 	if strings.Contains(second, "farcast storage unseal") {
 		t.Errorf("a redeploy that minted nothing still went to the keyholder:\n%s", second)
+	}
+}
+
+// An instance from before per-application scopes holds one scope owning all of
+// app/. No application's scope can be minted beside it, and there is no
+// migration — so run says that, and deploys nothing, rather than failing on an
+// overlap the operator cannot act on.
+func TestRunRefusesAKeyringWithTheSharedAppScope(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	meta := runnableInstance(t, dir, "p44")
+	meta.Keyholder = &config.Keyholder{Deployed: true, Replicas: 2}
+	if err := dir.SaveInstanceMetadata("p44", meta); err != nil {
+		t.Fatal(err)
+	}
+	k, err := datasphere.NewKeyring()
+	if err != nil {
+		t.Fatal(err)
+	}
+	shared, err := datasphere.NewScope("app", "app/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if k, err = k.AddScope(shared); err != nil {
+		t.Fatal(err)
+	}
+	saveKeyring(t, dir, "p44", k)
+
+	env, _ := testEnv(dir, output.ModeHuman)
+	f := newFakeRun(twoAppManifest)
+	c := runCmd(f)
+	c.newKeyholder = openerFor(&fakeStateKeyholder{phase: "unsealed"})
+	err = c.Run(context.Background(), env, []string{"p44", "github.com/example/my-platform"})
+	if err == nil || !strings.Contains(err.Error(), "shared before per-application scopes") || !strings.Contains(err.Error(), "install a new one") {
+		t.Fatalf("run on a legacy keyring = %v; want it refused, naming the way out", err)
+	}
+	if len(f.applied) != 0 {
+		t.Errorf("run applied %d manifests on a keyring it refused", len(f.applied))
+	}
+	if after := liveKeyring(t, dir, "p44"); len(after.Scopes()) != 1 {
+		t.Errorf("the refused run changed the keyring: %d scopes", len(after.Scopes()))
 	}
 }

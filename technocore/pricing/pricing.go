@@ -1,4 +1,6 @@
-// Package pricing turns declared Pod resource requests into money.
+// Package pricing turns declared Pod resource requests — and the one other
+// standing charge the kernel can observe, the load-balancer carrier — into
+// money.
 //
 // It exists because GKE Autopilot bills a Pod's *requests* — not its usage —
 // so the standing cost of a FarCast workload is a pure function of numbers
@@ -36,6 +38,18 @@ const (
 	// 720 would understate every monthly figure by 1.4%, which is small and
 	// wrong in the direction that flatters us.
 	HoursPerMonth = 730
+)
+
+// CarrierHourlyUSD is the standing price of ADR 0005's carrier — the public,
+// mTLS-gated L4 passthrough load balancer, one forwarding rule per instance —
+// which is ADR 0005's "~$18/mo" stated per hour. It is the one non-Pod
+// standing charge TechnoCore meters, because it is the one it can observe: a
+// Service of type LoadBalancer. Same Region and AsOf caveat as the rate card,
+// and believed to cover a project's first five forwarding rules — a second
+// load balancer would be the time to revisit it.
+const (
+	CarrierHourlyUSD  = 0.025
+	CarrierMonthlyUSD = CarrierHourlyUSD * HoursPerMonth
 )
 
 // Autopilot raises a Pod's billed requests to a per-Pod floor, and the floor

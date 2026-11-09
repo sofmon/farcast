@@ -60,8 +60,9 @@ func instanceTunnel(ctx context.Context, env *Env, name string) (*tunnel.Conn, c
 // keyholder, which speaks mTLS inside the relay. The difference is what is at
 // stake on each hop: the keyholder's protects key material against something
 // the cloud could stand up in its place, while this stream ends on the
-// loopback of the very Pod that relayed it, and carries decision counts. The
-// operator is already authenticated by the tunnel itself.
+// loopback of the very Pod that relayed it, and carries decision counts. Who
+// reaches it is settled by the tunnel: it admits only the operator and the
+// instance's keeper devices, and this route is the operator's alone.
 func fetchNetwork(ctx context.Context, d streamDialer) (shrike.Snapshot, error) {
 	ctx, cancel := context.WithTimeout(ctx, networkTimeout)
 	defer cancel()

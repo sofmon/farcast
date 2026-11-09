@@ -54,6 +54,8 @@ type runCommand struct {
 	// sealed replica — is one no unit test could otherwise reach: the real
 	// path needs a tunnel and a cluster.
 	newKeyholder func(ctx context.Context, env *Env, instance string) (sealStateClient, func(), error)
+	// newPinStore reaches the key pin; nil reaches the cluster.
+	newPinStore pinStoreOpener
 }
 
 // sealStateClient is the part of the keyholder client a deploy uses: ask what
@@ -87,6 +89,11 @@ what you approved.
 The gate is the external service declarations. Nothing an application can reach
 is implicit — FatLine denies every outbound host that the manifest does not
 name, so what is listed at the prompt is the whole of it.
+
+An instance with no kernel is refused before anything is read. The read, the
+builds and the applications all bill, and a namespace the kernel does not meter
+is neither counted against the cost limit nor stoppable by it — run
+'farcast kernel deploy <instance>' first.
 
 Both images this runs inside the instance are third-party and must be
 digest-pinned. Pass each once and the instance remembers it.`)
@@ -131,6 +138,21 @@ func (c *runCommand) Run(ctx context.Context, env *Env, args []string) error {
 	}
 	if meta.Registry == nil || meta.Registry.Prefix == "" {
 		return fmt.Errorf("instance %q has no image registry recorded; run 'farcast connect %s' first", name, name)
+	}
+	// Checked before anything is fetched. The read, every build and the
+	// workloads all bill, and on an instance with no kernel none of it is
+	// counted against the limit or stoppable by it.
+	if err := requireKernel(name, meta, "what this deploys"); err != nil {
+		return err
+	}
+	// And a keyring no application's scope can be minted into: found after
+	// the fetch and the builds, those would have been spent for nothing.
+	if meta.Keyholder != nil && meta.Keyholder.Deployed {
+		if k, err := keyringOf(env, name); err == nil {
+			if err := refuseSharedAppScope(name, k); err != nil {
+				return err
+			}
+		}
 	}
 	// Checked before anything is fetched. An unusable namespace found after
 	// the read and the builds would have cost real money to discover.
@@ -414,6 +436,9 @@ func (c *runCommand) ensureAppScopes(env *Env, instance, namespace string, m par
 	if err != nil {
 		return nil, nil, err
 	}
+	if err := refuseSharedAppScope(instance, keys); err != nil {
+		return nil, nil, err
+	}
 
 	out := make(map[string]datasphere.Scope, len(m.Apps))
 	minted := make([]string, 0, len(m.Apps))
@@ -457,6 +482,70 @@ func (c *runCommand) ensureAppScopes(env *Env, instance, namespace string, m par
 	return out, minted, nil
 }
 
+// pinScopes is the hand-over's beforePush for 'farcast run': it raises the
+// instance's key pin to require the scopes just minted, once the hand-over has
+// checked this keyring against every replica that answered and before any
+// replica is handed them. From then on a replica that restarts refuses a
+// keeper's bundle that lacks them, rather than serving without them and
+// refusing those applications' requests. Run never retires a key.
+//
+// Not before the check: a pin raised from a keyring the fleet then refuses as
+// behind would lock out the machine whose keys the fleet serves. And like the
+// hand-over, nothing here fails the deploy.
+func (c *runCommand) pinScopes(ctx context.Context, env *Env, meta *config.InstanceMetadata, keys datasphere.Keyring) func(sealStateClient) error {
+	return func(client sealStateClient) error {
+		c.raiseScopePin(ctx, env, meta, keys, client)
+		return nil
+	}
+}
+
+func (c *runCommand) raiseScopePin(ctx context.Context, env *Env, meta *config.InstanceMetadata, keys datasphere.Keyring, client sealStateClient) {
+	open := c.newPinStore
+	if open == nil {
+		open = defaultPinStore
+	}
+	ps, err := open(env.ConfigDir.InstanceKubeconfigPath(meta.Name))
+	var w pinWrite
+	if err == nil {
+		w, err = writePin(ctx, ps, keys, false, false)
+	}
+	var behind *pinBehind
+	switch {
+	case errors.As(err, &behind):
+		fprintf(env.Err, "warning: %v; the keyholder will refuse the hand-over.\n", behind)
+		return
+	case err != nil:
+		fprintf(env.Err, "warning: the instance's key pin was not raised (%v): a replica that restarts still admits a keeper's bundle without "+
+			"the new scope. %s raises it.\n", err, pinRemedy(meta.Name))
+		return
+	case !w.Changed:
+		return
+	}
+	for _, row := range raisePins(ctx, client, replicaCount(meta), w.Pin, false, meta.Name, heldKeys(keys)) {
+		if !row.Raised {
+			fprintf(env.Err, "warning: keyholder replica %d %s\n", row.Ordinal, row.Note)
+		}
+	}
+}
+
+// refuseSharedAppScope refuses a keyring holding the scope every application
+// shared before ADR 0018 decision 5: one owning the whole application root.
+// No application's own scope can be minted beside it, and there is no
+// migration from it.
+func refuseSharedAppScope(instance string, k datasphere.Keyring) error {
+	for _, s := range k.Scopes() {
+		if s.Prefix != datasphere.AppScopeRoot+datasphere.ScopePrefixSuffix {
+			continue
+		}
+		return fmt.Errorf("instance %q's keyring holds %q, the one application scope every application shared before "+
+			"per-application scopes (ADR 0018 decision 5). It owns all of %s, so no application's own scope can be minted beside it, "+
+			"and FarCast has no migration from it: its objects are named under its name key, which no per-application scope holds. "+
+			"Nothing was deployed. Copy out what you need ('farcast storage cp'), then release the instance and install a new one",
+			instance, s.Name, s.Prefix)
+	}
+	return nil
+}
+
 // handScopesToTheKeyholder gives a running keyholder the scopes just minted.
 //
 // A new application's keys exist on this machine the moment they are minted
@@ -485,7 +574,7 @@ func (c *runCommand) handScopesToTheKeyholder(ctx context.Context, env *Env, met
 		c.sealedNotice(env, meta.Name, minted, err.Error())
 		return
 	}
-	res := handOverKeys(ctx, env, meta, keyholderOpener(c.newKeyholder), keys, handOverOptions{})
+	res := handOverKeys(ctx, env, meta, keyholderOpener(c.newKeyholder), keys, handOverOptions{beforePush: c.pinScopes(ctx, env, meta, keys)})
 	switch {
 	case res.Unsafe:
 		// Not a seal, and an unseal now would refuse for the same reason: the
@@ -495,6 +584,10 @@ func (c *runCommand) handScopesToTheKeyholder(ctx context.Context, env *Env, met
 		// unseal.
 		fprintf(env.Err, "The keyholder was not handed %s's scope: %s.\n", apps, res.Problem)
 		fprintf(env.Err, "Once that is fixed, 'farcast storage unseal %s' hands it over. Until then a replica without the scope\n"+
+			"refuses those applications' storage requests (ErrPermission), and a sealed one answers ErrStorageSealed.\n", meta.Name)
+	case res.Behind != "":
+		fprintf(env.Err, "The keyholder was not handed %s's scope everywhere: %s.\n", apps, res.Behind)
+		fprintf(env.Err, "Once this keyring is up to date, 'farcast storage unseal %s' hands it over. Until then a replica without the scope\n"+
 			"refuses those applications' storage requests (ErrPermission), and a sealed one answers ErrStorageSealed.\n", meta.Name)
 	case res.Problem != "":
 		c.sealedNotice(env, meta.Name, minted, res.Problem)
@@ -532,8 +625,9 @@ func (c *runCommand) handScopesToTheKeyholder(ctx context.Context, env *Env, met
 	// whole set on a push — so a keeper re-seeding a restarted replica now
 	// would leave it serving, and refusing every request for the new
 	// application. Keepers see the new scope on a serving replica and refuse
-	// to re-seed instead, which is right and, unannounced, a fleet quietly
-	// switched off.
+	// to re-seed instead — and a replica that loaded the key pin refuses them
+	// itself, serving replica or none — which is right and, unannounced, a
+	// fleet quietly switched off.
 	if kept := keepersToReenrol(meta); len(kept) > 0 {
 		fprintf(env.Err, "\nEvery keeper's bundle predates %s, so each refuses to re-seed a replica that restarts\n"+
 			"until it is re-enrolled — a replica restored without %s would refuse its requests:\n", apps, apps)
@@ -556,6 +650,8 @@ func (c *runCommand) sealedNotice(env *Env, instance string, minted []string, wh
 // are already running and billing, and unmetering them is not a fix for not
 // being able to meter them.
 func (c *runCommand) meter(ctx context.Context, env *Env, cl jobWaiter, meta *config.InstanceMetadata, name, namespace string) (bool, error) {
+	// Unreachable from Run, which refuses an instance with no kernel before
+	// anything is read; kept because the line below dereferences Kernel.
 	if meta.Kernel == nil || !meta.Kernel.Deployed {
 		return false, fmt.Errorf("instance %q has no kernel, so %q is not counted against the cost limit; "+
 			"run 'farcast kernel deploy %s'", name, namespace, name)
@@ -702,6 +798,7 @@ func (r runResult) Human(w io.Writer) error {
 	if !r.Metered {
 		fprintf(w, "\nNOT METERED: %s\n", r.MeterError)
 		fprintf(w, "These applications are running and are not counted against the cost limit.\n")
+		fprintf(w, "Run 'farcast kernel meter %s %s' to count them.\n", r.Instance, r.Namespace)
 	}
 
 	// The commit and the digest are the whole of what a device that cannot

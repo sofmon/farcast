@@ -24,7 +24,7 @@ const (
 // fakeRegistry is an in-memory OCI registry over httptest: enough of the
 // protocol to exercise the client's pull, push, and authentication paths
 // without a network or a cloud account (the cost pillar keeps cloud-touching
-// tests out of CI entirely).
+// tests out of ./check.sh's test run entirely).
 type fakeRegistry struct {
 	t   *testing.T
 	srv *httptest.Server

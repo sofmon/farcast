@@ -1,8 +1,9 @@
-# Lint configuration for FarCast.
+# Lint configuration for FarCast — both Go modules.
 #
-# It exists mostly so the bar is the same everywhere. docs/runbooks/phase-2-part-a.sh
-# gates on a clean run, and without a config that gate means whatever the
-# operator's installed golangci-lint happens to check this month.
+# It exists mostly so the bar is the same everywhere. ./check.sh gates on a
+# clean run for the root module and for sdk/go, passing this file explicitly to
+# both; without a config that gate means whatever the operator's installed
+# golangci-lint happens to check this month.
 version: "2"
 
 linters:

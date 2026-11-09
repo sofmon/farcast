@@ -54,6 +54,24 @@ func run(args []string) error {
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
+	// Zero is the default for both; anything else is held to the bounds a
+	// deploy renders within, so a hand-applied manifest cannot set what
+	// 'farcast kernel deploy' would refuse.
+	if *interval < 0 || *cooldown < 0 {
+		return errors.New("--interval and --adapt-cooldown must not be negative")
+	}
+	if *interval == 0 {
+		*interval = kernel.DefaultInterval
+	}
+	if err := kernel.CheckInterval(*interval); err != nil {
+		return fmt.Errorf("--interval: %w", err)
+	}
+	if *cooldown == 0 {
+		*cooldown = kernel.DefaultCooldown
+	}
+	if err := kernel.CheckCooldown(*cooldown); err != nil {
+		return fmt.Errorf("--adapt-cooldown: %w", err)
+	}
 
 	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
@@ -186,6 +204,7 @@ type supervisor struct {
 	lastLevel      cost.Level
 	lastCheckpoint time.Time
 	warnedProject  bool
+	lastCarrier    kernel.CarrierState
 }
 
 func (s *supervisor) observe(rep kernel.Report, err error) {
@@ -211,15 +230,28 @@ func (s *supervisor) observe(rep kernel.Report, err error) {
 			"calibration", fmt.Sprintf("%.3f", rep.Accrual.Calibration))
 	}
 
+	if rep.Carrier != s.lastCarrier {
+		if rep.Carrier == kernel.CarrierUnobserved {
+			s.log.Warn("could not read FatLine's Service; the carrier is billed as present", "err", rep.CarrierErr)
+		} else {
+			s.log.Info("carrier", "state", string(rep.Carrier), "per_hour", round(rep.RateOverheadUSD))
+		}
+		s.lastCarrier = rep.Carrier
+	}
+
 	s.log.Info("reconciled",
 		"pods", len(rep.Workloads), "unclassified", rep.Unclassified,
 		"rate_per_hour", round(rep.RateHourlyUSD),
+		"overhead_per_hour", round(rep.RateOverheadUSD), "carrier", string(rep.Carrier),
 		"expected", round(rep.Accrual.Expected), "confirmed", round(rep.Accrual.Confirmed),
 		"has_confirmation", rep.Accrual.HasConfirmation,
 		"total", round(a.Total), "limit", round(a.Limit), "level", a.Level.String(),
 		"billed", rep.Billed.String(), "reconstructed", rep.Reconstructed)
 
-	if rep.UsageSampled > 0 || len(rep.UsageUnavailable) > 0 {
+	// A tick whose every reading was unrefreshed is logged too: that is the
+	// dedupe working, and a log that only ever showed sampled readings could
+	// not show it (5.1 criterion 12).
+	if rep.UsageSampled > 0 || rep.UsageRepeated > 0 || len(rep.UsageUnavailable) > 0 {
 		s.log.Info("observed usage",
 			"sampled", rep.UsageSampled, "unrefreshed", rep.UsageRepeated,
 			"unavailable", rep.UsageUnavailable)
@@ -323,7 +355,8 @@ func (s *supervisor) act(ctx context.Context, rep kernel.Report) {
 		// the levers that would reduce it destroy operator-visible capability
 		// or data. The kernel names them and takes neither.
 		s.log.Error("at the instance floor: every application is stopped and spending is still over",
-			"still_burning_per_hour", round(rep.SystemProtected()),
+			"still_burning_per_hour", round(rep.FloorHourlyUSD()),
+			"carrier_per_hour", round(rep.RateOverheadUSD),
 			"remaining_levers", "release the load-balancer carrier, or release the instance")
 	}
 }

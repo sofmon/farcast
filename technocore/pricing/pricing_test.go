@@ -88,3 +88,13 @@ func TestPodHourlyUSDIsTheMonthlyFigureOverTheConvention(t *testing.T) {
 		t.Error("the per-Pod floor must apply to the hourly figure too")
 	}
 }
+
+// ADR 0005's "~$18/mo", per hour.
+func TestTheCarrierPriceIsADR0005s(t *testing.T) {
+	if CarrierMonthlyUSD != CarrierHourlyUSD*HoursPerMonth {
+		t.Errorf("monthly %v is not hourly %v over %d hours", CarrierMonthlyUSD, CarrierHourlyUSD, HoursPerMonth)
+	}
+	if CarrierMonthlyUSD < 18 || CarrierMonthlyUSD > 18.5 {
+		t.Errorf("CarrierMonthlyUSD = %v; ADR 0005 prices it at about $18", CarrierMonthlyUSD)
+	}
+}

@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"flag"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/sofmon/farcast/datasphere"
+	dskeyholder "github.com/sofmon/farcast/datasphere/keyholder"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/keyholder"
 )
@@ -92,6 +94,11 @@ Sealed is a normal state of a healthy instance, not a fault: key material
 lives only in memory, so any restart leaves a replica sealed until someone
 unseals it. Applications receive ErrStorageSealed meanwhile; nothing is lost.
 
+Each replica also reports the key pin it enforces, compared with this
+machine's keyring: current, behind it ('farcast storage key pin' raises it),
+ahead of it (this keyring is behind the instance), absent, unreadable, or
+serving keys it would refuse.
+
 This reads through the FatLine tunnel and changes nothing.`)
 }
 
@@ -144,6 +151,11 @@ func (c *storageStateCommand) Run(ctx context.Context, env *Env, args []string) 
 			current := rs.KeysDiffer == ""
 			rs.KeysCurrent = &current
 		}
+		var mine *datasphere.Keyring
+		if kerr == nil {
+			mine = &keys
+		}
+		rs.PinStatus, rs.PinNote = pinStateOf(st.Pin, mine, name)
 		states = append(states, rs)
 	}
 	return env.Printer.Print(stateResult{Instance: name, Replicas: states,
@@ -167,9 +179,13 @@ type replicaState struct {
 	KeysBehind bool `json:"keys_behind,omitempty"`
 	// Outdated marks a replica whose keyholder image cannot say which keys it
 	// holds.
-	Outdated bool   `json:"outdated,omitempty"`
-	Note     string `json:"note,omitempty"`
-	Error    string `json:"error,omitempty"`
+	Outdated bool `json:"outdated,omitempty"`
+	// PinStatus is the key pin this replica enforces, against this machine's
+	// keyring; PinNote says what it means when it is not current.
+	PinStatus string `json:"pin_status,omitempty"`
+	PinNote   string `json:"pin_note,omitempty"`
+	Note      string `json:"note,omitempty"`
+	Error     string `json:"error,omitempty"`
 }
 
 type stateResult struct {
@@ -210,6 +226,9 @@ func (r stateResult) Human(w io.Writer) error {
 			fprintf(w, "  replica %d  %s\n", s.Ordinal, reason)
 			sealed++
 		}
+		if s.PinNote != "" {
+			fprintf(w, "             key pin: %s\n", s.PinNote)
+		}
 	}
 	if sealed == len(r.Replicas) {
 		fprintf(w, "\nEvery replica is sealed: applications are receiving ErrStorageSealed.\n"+
@@ -237,6 +256,36 @@ func (r stateResult) Human(w io.Writer) error {
 			"a hand-over that did not finish, or a lost or revoked keeper.\n", differ, r.Instance)
 	}
 	return nil
+}
+
+// pinStateOf says what a replica's key pin is, against this machine's keyring
+// when there is one. It reads nothing from the cluster: the replica's own
+// report is what it enforces, and 'storage state' stays tunnel-only.
+func pinStateOf(rep *dskeyholder.PinReport, keys *datasphere.Keyring, instance string) (status, note string) {
+	remedy := pinRemedy(instance)
+	switch {
+	case rep == nil:
+		return "unknown", fmt.Sprintf("its keyholder image predates the key pin; 'farcast storage deploy %s' updates it", instance)
+	case rep.Status == dskeyholder.PinAbsent:
+		return "absent", "none loaded — a restarted replica checks no bundle against the instance's keys; " + remedy + " writes it"
+	case rep.Status == dskeyholder.PinInvalid:
+		return "invalid", "unreadable, so it refuses every keeper; " + remedy + " repairs it"
+	case rep.ServingBelow:
+		return "serving-below", "it serves keys its own pin refuses — unsealed past it, or overtaken by a raise"
+	case keys == nil:
+		return "valid", ""
+	}
+	p, ok := pinFromReport(rep)
+	if !ok {
+		return "invalid", "reported in a form this CLI cannot read"
+	}
+	if b := pinVerdict(p, *keys); b != nil {
+		return "ahead", "it refuses this machine's keyring: " + b.Error()
+	}
+	if !p.Union(pinFor(*keys)).Equal(p) {
+		return "behind", "behind this machine's keyring; " + remedy + " raises it"
+	}
+	return "current", ""
 }
 
 // ---------------------------------------------------------------- seal
@@ -329,6 +378,7 @@ type storageUnsealCommand struct {
 	// newKeyholder reaches the replicas; nil dials them.
 	newKeyholder keyholderOpener
 	unchecked    bool
+	belowPin     bool
 }
 
 func (*storageUnsealCommand) Name() string     { return "unseal" }
@@ -336,7 +386,7 @@ func (*storageUnsealCommand) Synopsis() string { return "Hand the keyholder its 
 
 func (*storageUnsealCommand) Usage() string {
 	return strings.TrimSpace(`
-Usage: farcast storage unseal <instance> [--unchecked]
+Usage: farcast storage unseal <instance> [--unchecked] [--below-pin]
 
 Hand every keyholder replica the key material for the instance's application
 scopes, so applications can read and write again. A replica that is already
@@ -355,12 +405,27 @@ holds keys this machine's keyring lacks, or uses a newer one, unseal refuses:
 this keyring is behind the instance's, and pushing it would take those keys
 away.
 
+The keyholder holds every serving replica to the same rule itself: it refuses
+a push that lacks a key or scope it holds, even one that arrived after this
+command asked — and unseal, which pushes serving replicas first, then stops
+before unsealing any sealed one. 'farcast storage seal' then 'farcast storage
+unseal' is the deliberate way past it.
+
 A replica that does not say what it holds is never pushed, and while one is
 silent a SEALED replica is not unsealed either: the silent one may be serving
 keys this keyring lacks — another machine's rotation — and a replica unsealed
 beside it from this keyring could not read what it writes. --unchecked
 unseals the sealed replicas anyway, for when this machine's keyring is known
 to be the instance's current one and storage must come back now.
+
+Every replica also enforces the instance's key pin: the key IDs a bundle must
+hold, and the ones no scope may write under any more. A keyring the pin
+refuses is behind the instance even when no replica serves to show it, and
+unseal refuses it before pushing anything. --below-pin unseals past the pin,
+for when the keys it requires are gone from every machine. It needs no cloud
+access, so it works when nothing else does; the replicas report that they
+serve below the pin until 'farcast storage key pin --replace' lowers it to
+this keyring, which does need the cloud.
 
 This command changes nothing in the cluster. It deploys nothing, applies
 nothing and restarts nothing; if the keyholder is absent it says so and stops.
@@ -370,6 +435,7 @@ and no way to make things worse.`)
 
 func (c *storageUnsealCommand) SetFlags(fs *flag.FlagSet) {
 	fs.BoolVar(&c.unchecked, "unchecked", false, "unseal sealed replicas although another replica did not answer")
+	fs.BoolVar(&c.belowPin, "below-pin", false, "unseal past the instance's key pin, when the keys it requires are gone everywhere")
 }
 
 func (c *storageUnsealCommand) Run(ctx context.Context, env *Env, args []string) error {
@@ -423,18 +489,29 @@ func (c *storageUnsealCommand) Run(ctx context.Context, env *Env, args []string)
 	// effect of recovery. A keyring with no scopes is an instance with no
 	// applications, and its bundle is empty rather than refused — that
 	// keyholder still unseals, and is ready for the first application.
-	res := handOverKeys(ctx, env, meta, reuseKeyholder(client), keys, handOverOptions{unseal: true, unchecked: c.unchecked})
+	if c.belowPin {
+		fprintf(env.Err, "Unsealing past the instance's key pin. A replica unsealed this way serves keys the pin refuses,\n"+
+			"and reports it, until 'farcast storage key pin %s --replace' lowers the pin to this keyring.\n", name)
+	}
+	res := handOverKeys(ctx, env, meta, reuseKeyholder(client), keys, handOverOptions{unseal: true, unchecked: c.unchecked, belowPin: c.belowPin})
 	if res.Problem != "" {
 		return fmt.Errorf("nothing was pushed: %s", res.Problem)
 	}
+	notYet := res.Reason
+	if res.Behind != "" {
+		notYet = ""
+	}
 	if err := env.Printer.Print(unsealResult{
 		Instance: name, Scopes: len(keys.Scopes()), Generation: res.Generation,
-		Loaded: len(res.Loaded), Total: res.Total, Replicas: res.Rows, NotYetActive: res.Reason,
+		Loaded: len(res.Loaded), Total: res.Total, Replicas: res.Rows, NotYetActive: notYet,
 	}); err != nil {
 		return err
 	}
 	if res.RecordErr != nil {
 		return res.RecordErr
+	}
+	if res.Behind != "" {
+		return errors.New(res.Behind)
 	}
 	if !res.Activated {
 		took := "every replica took"
@@ -576,6 +653,11 @@ type handOverResult struct {
 	// LeftSealed are sealed replicas an unseal did not unseal, because
 	// another replica did not answer and could not be checked against.
 	LeftSealed []int
+	// Behind is set when a serving replica refused a push because this
+	// keyring lacks something it holds — another machine changed the keys
+	// after this hand-over read them. Unlike Problem, earlier replicas may
+	// already hold this keyring; nothing further was pushed from it.
+	Behind string
 }
 
 // Why a hand-over that held its new keys back did not go on to use them.
@@ -590,6 +672,9 @@ const (
 	heldChanged = "changed"
 	// heldUnrecorded: this machine could not record them as in use.
 	heldUnrecorded = "unrecorded"
+	// heldBehind: a serving replica refused them, holding keys this keyring
+	// lacks.
+	heldBehind = "behind"
 )
 
 // Complete reports whether every replica now holds, and uses, the keys sent.
@@ -617,11 +702,22 @@ type handOverOptions struct {
 	// beforeActivate runs once every replica holds every key the keyring
 	// makes active, and before any is told to use one. A rotation saves its
 	// keyring here: until then this machine's own writes must stay under a
-	// key every replica holds.
-	beforeActivate func() error
+	// key every replica holds. It is also where a rotation moves the key pin,
+	// with the hand-over's own client, so every replica enforces the new keys
+	// before any writes under them.
+	beforeActivate func(client sealStateClient) error
+	// beforePush runs once the keyring has been checked against every
+	// replica that answered, and before anything is pushed. 'farcast run'
+	// moves the key pin here: written any earlier, a pin raised from a
+	// keyring the fleet then refuses as behind would lock out the machine
+	// whose keys the fleet serves.
+	beforePush func(client sealStateClient) error
 	// unchecked lets an unseal unseal a sealed replica although another
 	// replica did not answer — the operator's override, naming the risk.
 	unchecked bool
+	// belowPin lets an unseal push past the instance's key pin: the operator's
+	// way past a pin no keyring can meet any more. Never a hand-over's.
+	belowPin bool
 }
 
 // handOverKeys gives the keyholder fleet a keyring without ever leaving one
@@ -669,7 +765,7 @@ func handOverKeys(ctx context.Context, env *Env, meta *config.InstanceMetadata, 
 	h := &handOver{ctx: ctx, env: env, meta: meta, client: client, opts: opts, total: res.Total,
 		highest: meta.Keyholder.Generation}
 	defer h.record(&res)
-	defer func() { res.LeftSealed = h.leftSealed }()
+	defer func() { res.LeftSealed, res.Behind = h.leftSealed, h.behind }()
 
 	states := h.read()
 	plan, err := planHandOver(meta.Name, keys, states, opts.rotated)
@@ -677,6 +773,29 @@ func handOverKeys(ctx context.Context, env *Env, meta *config.InstanceMetadata, 
 		var fc foreignCopy
 		res.Problem, res.Unsafe, res.ForeignCopy = err.Error(), true, errors.As(err, &fc)
 		return res
+	}
+	// The key pin, as each replica reported it. A keyring a replica's pin
+	// refuses is behind the instance even when no replica serves to show it —
+	// which is what the pin is for — and one that some replicas would take and
+	// others refuse would split them.
+	if !opts.unseal || !opts.belowPin {
+		if i, why := pinRefuses(states, keys); why != nil {
+			res.Problem, res.Unsafe = belowPin(i, why, meta.Name).Error(), true
+			return res
+		}
+		if plan.held != nil {
+			if i, why := pinRefuses(states, *plan.held); why != nil {
+				res.Problem, res.Unsafe = holdBelowPin(i, why, meta.Name, anyAnswerServing(states)).Error(), true
+				return res
+			}
+		}
+	}
+	if opts.beforePush != nil {
+		if err := opts.beforePush(client); err != nil {
+			var behind *pinBehind
+			res.Problem, res.Unsafe = err.Error(), errors.As(err, &behind)
+			return res
+		}
 	}
 	// An unseal unseals a sealed replica only when every other replica could
 	// be checked. One that did not answer may be serving keys this keyring
@@ -687,6 +806,13 @@ func handOverKeys(ctx context.Context, env *Env, meta *config.InstanceMetadata, 
 	if plan.held != nil {
 		if opts.beforeHold != nil {
 			if err := opts.beforeHold(*plan.held); err != nil {
+				// The instance's key pin refusing the hold is a reason not
+				// to push, not a failure to record it.
+				var behind *pinBehind
+				if errors.As(err, &behind) {
+					res.Problem, res.Unsafe = err.Error(), true
+					return res
+				}
 				res.Problem = fmt.Sprintf("this machine could not record the keys it was about to hand over: %v", err)
 				return res
 			}
@@ -698,6 +824,9 @@ func handOverKeys(ctx context.Context, env *Env, meta *config.InstanceMetadata, 
 		}
 		res.handOverStep, res.Held = step, &step
 		switch {
+		case h.behind != "":
+			res.Cause, res.Reason = heldBehind, "a serving replica holds keys this keyring lacks"
+			return res
 		case !step.everyServingReplicaHolds():
 			res.Cause = heldMissed
 			res.Reason = fmt.Sprintf("%d replica(s) did not take them", len(step.Unreached)+len(step.Refused))
@@ -753,7 +882,15 @@ func handOverKeys(ctx context.Context, env *Env, meta *config.InstanceMetadata, 
 		}
 	}
 	if opts.beforeActivate != nil {
-		if err := opts.beforeActivate(); err != nil {
+		if err := opts.beforeActivate(client); err != nil {
+			var behind *pinBehind
+			if errors.As(err, &behind) {
+				// The pin moved past this keyring while the keys were held:
+				// another machine rotated or deployed meanwhile.
+				res.Cause = heldChanged
+				res.Reason = fmt.Sprintf("the instance's key pin moved past this keyring meanwhile (%v)", behind)
+				return res
+			}
 			res.Cause = heldUnrecorded
 			res.Reason = fmt.Sprintf("this machine could not save its keyring with them in use: %v", err)
 			return res
@@ -806,6 +943,13 @@ type handOver struct {
 	// leftSealed is each one it kept sealed.
 	leaveSealed bool
 	leftSealed  []int
+	// behind is why a replica refused this keyring as behind the instance's,
+	// and behindAt which one; once set, nothing more is pushed.
+	behind   string
+	behindAt int
+	// skipped were not pushed at all, after a replica said this keyring is
+	// behind; there is no lost answer of theirs to confirm.
+	skipped map[int]bool
 }
 
 // confirmRefused asks each replica that refused the keyring itself what it
@@ -814,6 +958,9 @@ type handOver struct {
 func (h *handOver) confirmRefused(res *handOverResult, keys datasphere.Keyring) {
 	want := heldKeys(keys)
 	for _, i := range slices.Clone(res.Refused) {
+		if h.skipped[i] {
+			continue
+		}
 		st, err := h.client.State(h.ctx, i)
 		switch {
 		case err != nil:
@@ -892,10 +1039,54 @@ func (h *handOver) push(keys datasphere.Keyring, states []*keyholder.State) (han
 	intent := keyholder.IntentHandOver
 	if h.opts.unseal {
 		intent = keyholder.IntentOperator
+		if h.opts.belowPin {
+			intent = keyholder.IntentOperatorBelowPin
+		}
+	}
+
+	// Serving replicas first. One may refuse this keyring as behind — another
+	// machine moved its keys since they were read — and that has to be known
+	// before a sealed replica is unsealed from it.
+	order := make([]int, 0, len(states))
+	for i, st := range states {
+		if st != nil && !st.Sealed() {
+			order = append(order, i)
+		}
+	}
+	for i, st := range states {
+		if st == nil || st.Sealed() {
+			order = append(order, i)
+		}
 	}
 
 	ledgerPath := h.env.ConfigDir.InstanceUnsealLedgerPath(h.meta.Name)
-	for i, st := range states {
+	for _, i := range order {
+		st := states[i]
+		// Once a replica has said this keyring is behind, nothing more is
+		// pushed from it: not to a serving replica, which would refuse it
+		// too, and not to a sealed one, which would accept it and then serve
+		// keys the other cannot read.
+		if h.behind != "" && st != nil {
+			switch {
+			case !st.Sealed():
+				if h.skipped == nil {
+					h.skipped = map[int]bool{}
+				}
+				h.skipped[i] = true
+				step.Refused = append(step.Refused, i)
+				step.Rows = append(step.Rows, replicaState{Ordinal: i,
+					Error: fmt.Sprintf("not pushed: replica %d said this keyring is behind the instance's", h.behindAt)})
+				continue
+			case h.opts.unseal:
+				step.Waiting = append(step.Waiting, i)
+				step.Rows = append(step.Rows, replicaState{Ordinal: i,
+					Error: fmt.Sprintf("%s, and left so: replica %d holds keys this machine's keyring lacks", st.Phase, h.behindAt)})
+				if !slices.Contains(h.leftSealed, i) {
+					h.leftSealed = append(h.leftSealed, i)
+				}
+				continue
+			}
+		}
 		// Never pushed blind, not even by an unseal. A replica that did not
 		// say what it holds could be serving keys this keyring lacks, and an
 		// operator push replaces everything a replica holds.
@@ -937,6 +1128,25 @@ func (h *handOver) push(keys datasphere.Keyring, states []*keyholder.State) (han
 			entry.Result = "refused"
 			step.Waiting = append(step.Waiting, i)
 			step.Rows = append(step.Rows, replicaState{Ordinal: i, Phase: "sealed"})
+		case keyholder.BelowPin(perr):
+			// The pin moved after this command read it: another machine
+			// rotated or deployed meanwhile. Nothing more is pushed from a
+			// keyring the instance has moved past.
+			entry.Result = "refused"
+			h.behind, h.behindAt = belowPinRefused(i, perr, h.meta.Name).Error(), i
+			h.warn("warning: keyholder replica %d refused the keys: this keyring is below the instance's key pin\n", i)
+			step.Refused = append(step.Refused, i)
+			step.Rows = append(step.Rows, replicaState{Ordinal: i, Error: h.behind})
+		case keyholder.WouldDrop(perr) || (keyholder.GenerationTooOld(perr) && h.gainedKeys(i, keys)):
+			// Another machine pushed this replica keys this keyring lacks
+			// between the read and this push. The keyholder refuses to drop
+			// them (or, holding a higher generation, refuses this one);
+			// either way this keyring is behind.
+			entry.Result = "refused"
+			h.behind, h.behindAt = h.behindReason(i, keys), i
+			h.warn("warning: keyholder replica %d refused the keys: this keyring is behind the instance's\n", i)
+			step.Refused = append(step.Refused, i)
+			step.Rows = append(step.Rows, replicaState{Ordinal: i, Error: h.behind})
 		case perr != nil:
 			entry.Result = "refused"
 			h.warn("warning: keyholder replica %d refused the keys: %v\n", i, perr)
@@ -951,6 +1161,13 @@ func (h *handOver) push(keys datasphere.Keyring, states []*keyholder.State) (han
 			h.warn("warning: keyholder replica %d %s\n", i, why)
 			step.Refused = append(step.Refused, i)
 			step.Rows = append(step.Rows, replicaState{Ordinal: i, Error: why})
+		case !sameKeys(pushed.Keys, want) && !pushed.Sealed() && keysAgainst(pushed, keys).behind():
+			// A keyholder from before the drop refusal, answering an
+			// equal-generation race with what another machine pushed.
+			entry.Result, entry.Phase = "not-installed", pushed.Phase
+			h.behind, h.behindAt = h.behindReason(i, keys), i
+			step.Refused = append(step.Refused, i)
+			step.Rows = append(step.Rows, replicaState{Ordinal: i, Error: h.behind})
 		case !sameKeys(pushed.Keys, want):
 			// A 200 that installed nothing is the failure a fresh generation
 			// exists to prevent, and it must never read as success.
@@ -973,7 +1190,30 @@ func (h *handOver) push(keys datasphere.Keyring, states []*keyholder.State) (han
 			fprintf(h.env.Err, "warning: the unseal ledger could not be written: %v\n", lerr)
 		}
 	}
+	slices.SortFunc(step.Rows, func(a, b replicaState) int { return cmp.Compare(a.Ordinal, b.Ordinal) })
+	for _, list := range []*[]int{&step.Loaded, &step.Waiting, &step.Unreached, &step.Refused} {
+		slices.Sort(*list)
+	}
 	return step, nil
+}
+
+// gainedKeys reports whether a replica, asked again, is serving keys this
+// keyring is behind.
+func (h *handOver) gainedKeys(i int, keys datasphere.Keyring) bool {
+	st, err := h.client.State(h.ctx, i)
+	return err == nil && !st.Sealed() && keysAgainst(st, keys).behind()
+}
+
+// behindReason says why a replica refused this keyring as behind, as precisely
+// as asking it again allows.
+func (h *handOver) behindReason(i int, keys datasphere.Keyring) string {
+	if st, err := h.client.State(h.ctx, i); err == nil && !st.Sealed() {
+		if why := checkReplica(h.meta.Name, keys, i, st); why != nil {
+			return fmt.Sprintf("replica %d refused the push: it gained keys after this command asked what it holds — "+
+				"another machine changed the instance's keys meanwhile. %v", i, why)
+		}
+	}
+	return keyringBehind(i, behindKey, "holds a key or scope this machine's keyring does not", h.meta.Name).Error()
 }
 
 // record saves the highest generation a replica took.
@@ -1014,45 +1254,12 @@ type handOverPlan struct {
 // unanswered replica cannot hold a key minted a moment ago — while a keyring
 // whose active keys every replica took before is pushed to it in one.
 func planHandOver(instance string, keys datasphere.Keyring, states []*keyholder.State, rotated map[string]datasphere.KeyID) (handOverPlan, error) {
-	ours := make(map[string]map[string]datasphere.KeyEntry, len(keys.Scopes()))
-	for _, s := range keys.Scopes() {
-		entries := map[string]datasphere.KeyEntry{}
-		for _, e := range s.Keyring().KEKs() {
-			entries[e.ID.String()] = e
-		}
-		ours[s.Name] = entries
-	}
 	for i, st := range states {
 		if st == nil || st.Sealed() {
 			continue
 		}
-		if outdatedImage(*st) {
-			return handOverPlan{}, fmt.Errorf("replica %d runs a keyholder older than this CLI: it does not say which keys it holds, "+
-				"so nothing can check that a push would leave every replica able to read what the others write. "+
-				"Run 'farcast storage deploy %s' to update it — the replicas restart sealed — and then 'farcast storage unseal %s'",
-				i, instance, instance)
-		}
-		for _, name := range slices.Sorted(maps.Keys(st.Keys)) {
-			theirs := st.Keys[name]
-			mine, ok := ours[name]
-			if !ok {
-				return handOverPlan{}, keyringBehind(i, behindScope, "serves scope "+name+", which this machine's keyring does not hold", instance)
-			}
-			if len(theirs) > 0 && !slices.ContainsFunc(theirs, func(id string) bool { _, ok := mine[id]; return ok }) {
-				return handOverPlan{}, mintedTwice(i, name)
-			}
-			for _, id := range theirs {
-				if _, ok := mine[id]; !ok {
-					return handOverPlan{}, keyringBehind(i, behindKey, fmt.Sprintf("holds key %s for %s, which this machine's keyring does not", id, name), instance)
-				}
-			}
-			if len(theirs) > 0 {
-				scope, _ := keys.ScopeNamed(name)
-				active := scope.Keyring().KEKs()[0]
-				if using := mine[theirs[0]]; using.ID != active.ID && using.Created.After(active.Created) {
-					return handOverPlan{}, keyringBehind(i, behindActive, fmt.Sprintf("writes %s under key %s, which is newer than the one this machine's keyring makes active", name, theirs[0]), instance)
-				}
-			}
+		if err := checkReplica(instance, keys, i, *st); err != nil {
+			return handOverPlan{}, err
 		}
 	}
 
@@ -1128,6 +1335,49 @@ func planHandOver(instance string, keys datasphere.Keyring, states []*keyholder.
 	return handOverPlan{held: &held, scopes: scopes}, nil
 }
 
+// checkReplica refuses this keyring for a serving replica it cannot safely be
+// pushed to: a keyholder too old to say what it holds, or one holding keys
+// this keyring is behind.
+func checkReplica(instance string, keys datasphere.Keyring, i int, st keyholder.State) error {
+	if outdatedImage(st) {
+		return fmt.Errorf("replica %d runs a keyholder older than this CLI: it does not say which keys it holds, "+
+			"so nothing can check that a push would leave every replica able to read what the others write. "+
+			"Run 'farcast storage deploy %s' to update it — the replicas restart sealed — and then 'farcast storage unseal %s'",
+			i, instance, instance)
+	}
+	ours := make(map[string]map[string]datasphere.KeyEntry, len(keys.Scopes()))
+	for _, s := range keys.Scopes() {
+		entries := map[string]datasphere.KeyEntry{}
+		for _, e := range s.Keyring().KEKs() {
+			entries[e.ID.String()] = e
+		}
+		ours[s.Name] = entries
+	}
+	for _, name := range slices.Sorted(maps.Keys(st.Keys)) {
+		theirs := st.Keys[name]
+		mine, ok := ours[name]
+		if !ok {
+			return keyringBehind(i, behindScope, "serves scope "+name+", which this machine's keyring does not hold", instance)
+		}
+		if len(theirs) > 0 && !slices.ContainsFunc(theirs, func(id string) bool { _, ok := mine[id]; return ok }) {
+			return mintedTwice(i, name)
+		}
+		for _, id := range theirs {
+			if _, ok := mine[id]; !ok {
+				return keyringBehind(i, behindKey, fmt.Sprintf("holds key %s for %s, which this machine's keyring does not", id, name), instance)
+			}
+		}
+		if len(theirs) > 0 {
+			scope, _ := keys.ScopeNamed(name)
+			active := scope.Keyring().KEKs()[0]
+			if using := mine[theirs[0]]; using.ID != active.ID && using.Created.After(active.Created) {
+				return keyringBehind(i, behindActive, fmt.Sprintf("writes %s under key %s, which is newer than the one this machine's keyring makes active", name, theirs[0]), instance)
+			}
+		}
+	}
+	return nil
+}
+
 // keyringBehind refuses a push of a keyring older than what a serving replica
 // holds.
 //
@@ -1166,6 +1416,90 @@ func keyringBehind(replica int, kind behindKind, what, instance string) error {
 			"and whatever was written under them stays unreadable", instance)
 	}
 	return errors.New(msg)
+}
+
+// pinRefuses reports the first replica whose key pin refuses these keys. A
+// replica that did not answer, or reports no valid pin, has nothing to say.
+func pinRefuses(states []*keyholder.State, k datasphere.Keyring) (int, *pinBehind) {
+	for i, st := range states {
+		if st == nil || st.Pin == nil || st.Pin.Status != dskeyholder.PinValid {
+			continue
+		}
+		p, ok := pinFromReport(st.Pin)
+		if !ok {
+			continue
+		}
+		if b := pinVerdict(p, k); b != nil {
+			return i, b
+		}
+	}
+	return -1, nil
+}
+
+// anyAnswerServing reports whether any replica that answered is serving.
+func anyAnswerServing(states []*keyholder.State) bool {
+	return slices.ContainsFunc(states, func(st *keyholder.State) bool { return st != nil && !st.Sealed() })
+}
+
+// pinFromReport is a replica's reported pin, parsed.
+func pinFromReport(r *dskeyholder.PinReport) (dskeyholder.Pin, bool) {
+	var p dskeyholder.Pin
+	for _, list := range []struct {
+		from []string
+		to   *[]datasphere.KeyID
+	}{{r.Require, &p.Require}, {r.Retired, &p.Retired}} {
+		for _, s := range list.from {
+			id, err := datasphere.ParseKeyID(s)
+			if err != nil {
+				return dskeyholder.Pin{}, false
+			}
+			*list.to = append(*list.to, id)
+		}
+	}
+	return p, true
+}
+
+// belowPin is a keyring a replica's key pin refuses: this machine is behind
+// the instance, though no serving replica need show it.
+func belowPin(replica int, why *pinBehind, instance string) error {
+	return fmt.Errorf("replica %d enforces the instance's key pin, and %v. %s", replica, why, behindRemedy(why, instance))
+}
+
+// belowPinRefused is belowPin for a refusal a replica answered a push with,
+// where only its words are known.
+func belowPinRefused(replica int, why error, instance string) error {
+	return fmt.Errorf("replica %d enforces the instance's key pin, and this keyring is below it (%v). %s",
+		replica, why, behindRemedy(&pinBehind{Missing: []string{"?"}}, instance))
+}
+
+// behindRemedy says what brings a keyring the pin refuses up to date. The two
+// cases have different remedies, and an import fixes only the first: it adds
+// keys, and keeps this machine's own key in use.
+func behindRemedy(b *pinBehind, instance string) string {
+	if len(b.Missing) == 0 {
+		return fmt.Sprintf("This keyring holds every key the pin requires but writes under one it retired — it imported another machine's "+
+			"rotation and kept its own key in use, which an import always does. Run this from the machine that rotated; or, with a replica "+
+			"serving the instance's current key, 'farcast storage key rotate %s' here moves this keyring past it. With every replica sealed "+
+			"and that machine gone, 'farcast storage key pin %s --replace' stops retiring the key this keyring uses — every key the pin "+
+			"requires stays required — and then unseal and rotate from here", instance, instance)
+	}
+	return fmt.Sprintf("This keyring is behind the instance's — another machine rotated or deployed an application, or this one was restored "+
+		"or imported from an older copy. Bring it up to date: 'farcast storage key export' on the machine that changed the keys, "+
+		"then 'farcast storage key import' here — or run this from that machine. If the keys the pin requires are gone from every machine, "+
+		"'farcast storage unseal %s --below-pin' unseals past it, and 'farcast storage key pin %s --replace' lowers it", instance, instance)
+}
+
+// holdBelowPin is a hand-over whose first step the pin refuses: the key the
+// hold would keep in use is one the pin retired.
+func holdBelowPin(replica int, why *pinBehind, instance string, serving bool) error {
+	if !serving {
+		return fmt.Errorf("the key this keyring would keep in use while the new ones are held is one the instance's key pin retired "+
+			"(replica %d: %v). %s", replica, why, behindRemedy(&pinBehind{RetiredActive: why.RetiredActive}, instance))
+	}
+	return fmt.Errorf("a serving replica holds keys from before the instance's last rotation: the only key every serving replica shares "+
+		"is one the key pin retired, and replica %d refuses to be handed it (%v). "+
+		"'farcast storage seal %s', then 'farcast storage unseal %s', puts every replica on this machine's keys",
+		replica, why, instance, instance)
 }
 
 // mintedTwice refuses a push of a scope a serving replica holds a different

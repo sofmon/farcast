@@ -1,7 +1,7 @@
 //go:build integration
 
 // These tests speak to a real, public container registry. They are opt-in
-// (`-tags=integration`) and never run in CI, like every other cloud-touching
+// (`-tags=integration`) and never run by ./check.sh, like every other cloud-touching
 // test in this repository. Unlike the rest, they cost nothing: pulling a public
 // image anonymously is free and read-only, which is exactly why they are worth
 // running *before* the billable Phase 2 Part B validation — they prove the parts

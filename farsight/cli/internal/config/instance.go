@@ -207,7 +207,12 @@ type Keeper struct {
 // When the recorded limit and the instance's limit diverge, the cluster is
 // still acting on the old one until it is redeployed.
 type Kernel struct {
+	// Deployed records that a kernel may exist and must be torn down; it is
+	// written before the apply, like every billable thing this CLI creates.
+	// Applied records that the apply succeeded — what 'farcast run' and
+	// 'farcast build' require before they spend anything.
 	Deployed bool   `yaml:"deployed,omitempty"`
+	Applied  bool   `yaml:"applied,omitempty"`
 	Image    string `yaml:"image,omitempty"` // digest-pinned
 	Replicas int    `yaml:"replicas,omitempty"`
 
@@ -228,6 +233,13 @@ type Kernel struct {
 	// The kernel is granted read-only access to them in the cluster, so this
 	// record — not the cluster's copy — is what a later push appends to.
 	Confirmations []KernelConfirmation `yaml:"confirmations,omitempty"`
+
+	// Adapt, Interval and AdaptCooldown are what the kernel was deployed
+	// with, so a redeploy that does not name them keeps them. Zero durations
+	// are the kernel's defaults.
+	Adapt         bool          `yaml:"adapt,omitempty"`
+	Interval      time.Duration `yaml:"interval,omitempty"`
+	AdaptCooldown time.Duration `yaml:"adapt_cooldown,omitempty"`
 
 	RecordedAt time.Time `yaml:"recorded_at,omitempty"`
 }
@@ -803,6 +815,13 @@ func (d Dir) SaveInstanceMTLS(name string, m MTLSMaterial) error {
 		}
 	}
 	return nil
+}
+
+// LoadInstanceCACert reads only the instance CA's certificate — public, and
+// enough to prove what was enrolled under it, without bringing the CA's
+// private key into memory.
+func (d Dir) LoadInstanceCACert(name string) ([]byte, error) {
+	return os.ReadFile(filepath.Join(d.fatlineDir(name), caCertFile))
 }
 
 // LoadInstanceMTLS reads the per-instance mTLS material.

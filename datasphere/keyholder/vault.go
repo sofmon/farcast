@@ -70,6 +70,9 @@ const (
 	// operator-unseal — two round trips apart, with an intent the vault accepts
 	// even under a hold. A replica that restarted, or was held, in between was
 	// unsealed anyway. Refusing here makes the guarantee the keyholder's.
+	//
+	// Like an operator unseal into a serving replica, a hand-over adds keys or
+	// moves which one is in use, and never takes one away (ErrWouldDrop).
 	IntentHandOver Intent = "hand-over"
 )
 
@@ -93,6 +96,12 @@ var (
 	// A re-seed restores a replica that restarted; it never replaces the keys
 	// of one that is serving.
 	ErrAlreadyServing = errors.New("keyholder: a re-seed only reaches a replica that restarted; this one is serving")
+	// ErrWouldDrop reports a push to a SERVING replica whose bundle lacks a
+	// scope, or a key-encryption key of a scope, that the replica holds. A
+	// push adds keys or moves which one is in use; it never takes one away,
+	// because whatever was written under it would become unreadable. Seal the
+	// replica first to replace its keys deliberately.
+	ErrWouldDrop = errors.New("keyholder: this replica serves a key or scope the bundle does not carry, and a push never takes one away — the pusher's keyring is behind the instance's; seal the replica first to replace its keys deliberately")
 	// ErrOutOfScope reports a logical key outside every scope held.
 	ErrOutOfScope = errors.New("keyholder: key is outside every scope this keyholder holds")
 )
@@ -129,6 +138,10 @@ type State struct {
 	// object the cloud stores. It stays off the unauthenticated status surface
 	// regardless, because nothing there needs it.
 	Keys map[string][]string
+
+	// Pin is the key pin this replica enforces. Disclosed only on the control
+	// surface, like Keys.
+	Pin PinReport
 }
 
 // Sealed reports whether storage is unavailable in this state.
@@ -157,21 +170,41 @@ type Vault struct {
 	generation uint64
 	scopes     []datasphere.Scope
 
+	// pin is what every push is checked against; see pin.go. It is read once
+	// at start and raised in place by the operator, never lowered by a push.
+	pin       Pin
+	pinStatus PinStatus
+	pinErr    string
+
 	now func() time.Time
 }
 
 // New returns a sealed vault. There is no constructor that returns an unsealed
 // one: a keyholder always starts sealed, and the only way out is a push from
 // outside the cluster.
-func New(instance string) *Vault {
+func New(instance string) *Vault { return NewWithPin(instance, "") }
+
+// NewWithPin returns a sealed vault that enforces a key pin. An empty pin is
+// absent and checks nothing. A pin that does not parse does not stop the
+// vault: a replica that refused to start could not be unsealed even by the
+// operator, so it starts, refuses keepers, and reports why.
+func NewWithPin(instance, rawPin string) *Vault {
 	now := func() time.Time { return time.Now().UTC() }
-	return &Vault{
-		instance: instance,
-		phase:    PhaseRestartSealed,
-		since:    now(),
-		now:      now,
-		boot:     newBootID(),
+	v := &Vault{
+		instance:  instance,
+		phase:     PhaseRestartSealed,
+		since:     now(),
+		now:       now,
+		boot:      newBootID(),
+		pinStatus: PinAbsent,
 	}
+	switch p, present, err := ParsePin(rawPin); {
+	case err != nil:
+		v.pinStatus, v.pinErr = PinInvalid, err.Error()
+	case present:
+		v.pin, v.pinStatus = p, PinValid
+	}
+	return v
 }
 
 // bootIDLen is the length of a process's boot label, in bytes.
@@ -231,7 +264,36 @@ func (v *Vault) State() State {
 		Scopes:     names,
 		Boot:       v.boot,
 		Keys:       keys,
+		Pin:        v.pinReportLocked(keys),
 	}
+}
+
+// pinReportLocked reports the pin. ServingBelow is worked out each time rather
+// than remembered, so it also shows a replica that a later raise overtook.
+func (v *Vault) pinReportLocked(keys map[string][]string) PinReport {
+	r := PinReport{Status: v.pinStatus, Error: v.pinErr}
+	if v.pinStatus == PinValid {
+		r.Require = idStrings(v.pin.Require)
+		r.Retired = idStrings(v.pin.Retired)
+		r.ServingBelow = v.phase == PhaseUnsealed && v.pin.Admits(keys) != nil
+	}
+	return r
+}
+
+// RaisePin replaces what this replica enforces with the union of its pin and
+// p, or with p alone when replace is set. It is how a running replica takes a
+// pin the operator wrote after it started: the environment is read only once.
+// A pin that was absent or unreadable becomes valid.
+func (v *Vault) RaisePin(p Pin, replace bool) State {
+	v.mu.Lock()
+	if replace || v.pinStatus != PinValid {
+		v.pin = Pin{Require: canonIDs(p.Require), Retired: canonIDs(p.Retired)}
+	} else {
+		v.pin = v.pin.Union(p)
+	}
+	v.pinStatus, v.pinErr = PinValid, ""
+	v.mu.Unlock()
+	return v.State()
 }
 
 // Ready reports whether the keyholder should receive application traffic. It
@@ -248,8 +310,21 @@ func (v *Vault) Ready() bool {
 // The checks are ordered so that the cheapest refusals that reveal nothing
 // come first. Installation is atomic: the new scope set is built entirely
 // before the old one is dropped, so no request ever observes a half-loaded
-// vault.
+// vault. It replaces the whole set — but on a serving replica never removes
+// anything from it (ErrWouldDrop); seal first to do that.
 func (v *Vault) Unseal(b *datasphere.Bundle, intent Intent) error {
+	return v.unseal(b, intent, false)
+}
+
+// UnsealBelowPin is an operator unseal that the key pin does not check. It is
+// the way past a pin no keyring can satisfy any more — the keys it requires
+// are gone everywhere — and it needs no cloud access, which is the point
+// (ADR 0008 decision 9). Every other check still applies.
+func (v *Vault) UnsealBelowPin(b *datasphere.Bundle) error {
+	return v.unseal(b, IntentOperator, true)
+}
+
+func (v *Vault) unseal(b *datasphere.Bundle, intent Intent, belowPin bool) error {
 	if b == nil {
 		return fmt.Errorf("keyholder: nil bundle")
 	}
@@ -279,9 +354,35 @@ func (v *Vault) Unseal(b *datasphere.Bundle, intent Intent) error {
 		return fmt.Errorf("%w (held since %s: %s)",
 			ErrOperatorHold, v.since.Format(time.RFC3339), v.holdReason)
 	}
+	// After the hold, so a keeper at a hold still hears about the hold; before
+	// the generation and the idempotent return, so a retry is checked against
+	// the pin as it is now. Every push, sealed or serving: the pin is written
+	// only from a keyring that is already saved, so a legitimate bundle always
+	// passes it, and checking a serving replica too covers a push from another
+	// machine between the pusher's read and its push.
+	switch {
+	case belowPin:
+	case v.pinStatus == PinInvalid && intent == IntentReseed:
+		return fmt.Errorf("%w: %s", ErrPinUnreadable, v.pinErr)
+	case v.pinStatus == PinValid:
+		if err := v.pin.Admits(KeysOf(b)); err != nil {
+			return err
+		}
+	}
 	if b.Generation() < v.generation {
 		return fmt.Errorf("%w: bundle is generation %d, this keyholder has held %d",
 			ErrGenerationTooOld, b.Generation(), v.generation)
+	}
+	// Under the same lock as the install. The pusher read this replica's
+	// keys a moment ago; another machine may have pushed newer ones since,
+	// and replacing those would leave everything written under them
+	// unreadable. Membership only: which key is in use is the pusher's to
+	// move — moving it back to an older held key is how a hand-over keeps a
+	// key out of use until every replica holds it.
+	if v.phase == PhaseUnsealed {
+		if err := v.dropsLocked(b); err != nil {
+			return err
+		}
 	}
 	if v.phase == PhaseUnsealed && b.Generation() == v.generation {
 		// Idempotent: re-pushing the same generation is what lets an
@@ -297,6 +398,10 @@ func (v *Vault) Unseal(b *datasphere.Bundle, intent Intent) error {
 	scopes := make([]datasphere.Scope, 0, len(b.Scopes()))
 	for _, s := range b.Scopes() {
 		if err := s.Valid(); err != nil {
+			// The copies already made are key material too.
+			for _, c := range scopes {
+				c.Zero()
+			}
 			return err
 		}
 		scopes = append(scopes, s.Clone())
@@ -307,6 +412,31 @@ func (v *Vault) Unseal(b *datasphere.Bundle, intent Intent) error {
 	v.phase = PhaseUnsealed
 	v.holdReason = ""
 	v.since = v.now()
+	return nil
+}
+
+// dropsLocked reports a bundle that lacks a scope, or a key-encryption key of
+// a scope, that this replica holds. The caller holds v.mu.
+func (v *Vault) dropsLocked(b *datasphere.Bundle) error {
+	carried := make(map[string]map[datasphere.KeyID]bool, len(b.Scopes()))
+	for _, s := range b.Scopes() {
+		ids := map[datasphere.KeyID]bool{}
+		for _, e := range s.Keyring().KEKs() {
+			ids[e.ID] = true
+		}
+		carried[s.Name] = ids
+	}
+	for _, s := range v.scopes {
+		ids, ok := carried[s.Name]
+		if !ok {
+			return fmt.Errorf("%w (scope %s)", ErrWouldDrop, s.Name)
+		}
+		for _, e := range s.Keyring().KEKs() {
+			if !ids[e.ID] {
+				return fmt.Errorf("%w (key %s of scope %s)", ErrWouldDrop, e.ID, s.Name)
+			}
+		}
+	}
 	return nil
 }
 
@@ -329,7 +459,8 @@ func (v *Vault) Seal(hold bool, reason string) State {
 		v.holdReason = ""
 	}
 	v.since = v.now()
-	return State{Phase: v.phase, Since: v.since, Generation: v.generation, HoldReason: v.holdReason}
+	return State{Phase: v.phase, Since: v.since, Generation: v.generation, HoldReason: v.holdReason,
+		Boot: v.boot, Pin: v.pinReportLocked(nil)}
 }
 
 // ReleaseHold converts an operator hold back into an ordinary restart seal,
@@ -346,7 +477,7 @@ func (v *Vault) ReleaseHold() State {
 		v.holdReason = ""
 		v.since = v.now()
 	}
-	return State{Phase: v.phase, Since: v.since, Generation: v.generation}
+	return State{Phase: v.phase, Since: v.since, Generation: v.generation, Boot: v.boot, Pin: v.pinReportLocked(nil)}
 }
 
 // Scope returns the scope owning a logical key.

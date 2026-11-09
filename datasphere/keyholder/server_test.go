@@ -449,6 +449,22 @@ func (h *harness) push(t *testing.T, instance string, generation uint64, intent 
 // test, not a detail of it.
 func (h *harness) pushAs(t *testing.T, uri, instance string, generation uint64, intent Intent) *httptest.ResponseRecorder {
 	t.Helper()
+	return h.pushRawAs(t, uri, marshalBundle(t, instance, generation), intent)
+}
+
+// pushBundleAs pushes a given bundle, so a test can push the same keys twice,
+// or a keyring that has moved on.
+func (h *harness) pushBundleAs(t *testing.T, uri string, b *datasphere.Bundle, intent Intent) *httptest.ResponseRecorder {
+	t.Helper()
+	raw, err := b.Marshal()
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	return h.pushRawAs(t, uri, raw, intent)
+}
+
+func (h *harness) pushRawAs(t *testing.T, uri string, raw []byte, intent Intent) *httptest.ResponseRecorder {
+	t.Helper()
 	cw := doAs(h.control, uri, "GET", SealChallengePath, nil, nil)
 	if cw.Code != http.StatusOK {
 		t.Fatalf("challenge = %d: %s", cw.Code, cw.Body)
@@ -457,12 +473,43 @@ func (h *harness) pushAs(t *testing.T, uri, instance string, generation uint64, 
 	if err := json.Unmarshal(cw.Body.Bytes(), &ch); err != nil {
 		t.Fatalf("decode challenge: %v", err)
 	}
-	sealed, err := SealBundle(marshalBundle(t, instance, generation), h.srv.cfg.Instance, ch)
+	sealed, err := SealBundle(raw, h.srv.cfg.Instance, ch)
 	if err != nil {
 		t.Fatalf("SealBundle: %v", err)
 	}
-	return doAs(h.control, uri, "POST", "/v1/unseal?intent="+string(intent),
-		map[string]string{"Content-Type": ContentTypeSealed}, sealed)
+	// A keeper's leaf binds the bundle it was enrolled with; this one was
+	// enrolled with the bundle it pushes. Tests of the binding itself use
+	// pushWithLeaf.
+	leaf := []string{uri}
+	if strings.Contains(uri, "/keeper/") {
+		leaf = append(leaf, KeeperBundleURIPrefix+KeeperBundleDigest(raw))
+	}
+	return h.pushWithLeaf(t, leaf, sealed, "/v1/unseal?intent="+string(intent))
+}
+
+// pushWithLeaf posts a sealed bundle as a caller whose leaf carries exactly
+// these URIs.
+func (h *harness) pushWithLeaf(t *testing.T, uris []string, sealed []byte, target string) *httptest.ResponseRecorder {
+	t.Helper()
+	return doAsLeaf(h.control, uris, "POST", target, map[string]string{"Content-Type": ContentTypeSealed}, sealed)
+}
+
+// sealFor answers a fresh challenge with a payload, as uri.
+func (h *harness) sealFor(t *testing.T, uri string, raw []byte) []byte {
+	t.Helper()
+	cw := doAs(h.control, uri, "GET", SealChallengePath, nil, nil)
+	if cw.Code != http.StatusOK {
+		t.Fatalf("challenge = %d: %s", cw.Code, cw.Body)
+	}
+	var ch Challenge
+	if err := json.Unmarshal(cw.Body.Bytes(), &ch); err != nil {
+		t.Fatalf("decode challenge: %v", err)
+	}
+	sealed, err := SealBundle(raw, h.srv.cfg.Instance, ch)
+	if err != nil {
+		t.Fatalf("SealBundle: %v", err)
+	}
+	return sealed
 }
 
 // safeMessage is the guard that stops a logical name escaping in an error
@@ -646,6 +693,15 @@ const (
 // doAs is do with a client identity on the connection. An empty uri is a
 // request that arrived with no peer certificate at all.
 func doAs(h http.Handler, uri, method, target string, headers map[string]string, body []byte) *httptest.ResponseRecorder {
+	var uris []string
+	if uri != "" {
+		uris = []string{uri}
+	}
+	return doAsLeaf(h, uris, method, target, headers, body)
+}
+
+// doAsLeaf is doAs with a leaf carrying every URI given, in order.
+func doAsLeaf(h http.Handler, uris []string, method, target string, headers map[string]string, body []byte) *httptest.ResponseRecorder {
 	var r io.Reader
 	if body != nil {
 		r = bytes.NewReader(body)
@@ -654,12 +710,16 @@ func doAs(h http.Handler, uri, method, target string, headers map[string]string,
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	if uri != "" {
-		u, err := url.Parse(uri)
-		if err != nil {
-			panic(err)
+	if len(uris) > 0 {
+		cert := &x509.Certificate{}
+		for _, uri := range uris {
+			u, err := url.Parse(uri)
+			if err != nil {
+				panic(err)
+			}
+			cert.URIs = append(cert.URIs, u)
 		}
-		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{{URIs: []*url.URL{u}}}}
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{cert}}
 	}
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, req)
@@ -940,8 +1000,11 @@ func TestAHandOverNeverUnsealsASealedReplica(t *testing.T) {
 	})
 	t.Run("serving", func(t *testing.T) {
 		h := newHarness(t)
-		h.unseal(t, 1)
-		w := h.push(t, "prod", 2, IntentHandOver)
+		k := appKeyring(t, "apps", "web", "api")
+		if err := h.vault.Unseal(bundleOf(t, 1, k), IntentOperator); err != nil {
+			t.Fatal(err)
+		}
+		w := h.pushBundleAs(t, asOperator, bundleOf(t, 2, k), IntentHandOver)
 		if w.Code != http.StatusOK {
 			t.Fatalf("a hand-over to a serving replica = %d: %s", w.Code, w.Body)
 		}
@@ -1141,4 +1204,234 @@ func TestEveryDataRouteWipesItsCopyOfTheKeys(t *testing.T) {
 		t.Fatalf("the vault's keys were wiped along with a request's: %v", err)
 	}
 	again.Zero()
+}
+
+// Over the real control surface: a push that would take a served key away is
+// refused with its own code, changes nothing, and is accepted once the replica
+// is sealed deliberately.
+func TestAPushThatWouldDropServedKeysIsRefused(t *testing.T) {
+	for _, intent := range []Intent{IntentOperator, IntentHandOver} {
+		h := newHarness(t)
+		k := appKeyring(t, "apps", "web", "api")
+		if err := h.vault.Unseal(bundleOf(t, 1, k), IntentOperator); err != nil {
+			t.Fatal(err)
+		}
+		before := maps.Clone(h.vault.State().Keys)
+		fewer, err := datasphere.NewBundle("prod", 2, k.Scopes()[:1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		w := h.pushBundleAs(t, asOperator, fewer, intent)
+		if w.Code != http.StatusConflict || w.Header().Get(HeaderCode) != CodeWouldDrop || !strings.Contains(w.Body.String(), ErrWouldDrop.Error()) {
+			t.Fatalf("%s dropping a scope = %d/%q: %s", intent, w.Code, w.Header().Get(HeaderCode), w.Body)
+		}
+		if st := h.vault.State(); st.Generation != 1 || !maps.EqualFunc(st.Keys, before, slices.Equal) {
+			t.Errorf("%s: a refused push changed the replica: generation %d, keys %v", intent, st.Generation, st.Keys)
+		}
+		if sw := doAs(h.control, asOperator, "POST", "/v1/seal", nil, nil); sw.Code != http.StatusOK {
+			t.Fatalf("seal = %d: %s", sw.Code, sw.Body)
+		}
+		again, _ := datasphere.NewBundle("prod", 3, k.Scopes()[:1])
+		if w := h.pushBundleAs(t, asOperator, again, IntentOperator); w.Code != http.StatusOK {
+			t.Errorf("after a deliberate seal the push was still refused: %d %s", w.Code, w.Body)
+		}
+	}
+}
+
+// newHarnessWith is newHarness over a given vault, so a test can start a
+// replica with a pin as the environment would give it.
+func newHarnessWith(t *testing.T, v *Vault) *harness {
+	t.Helper()
+	h := newHarness(t)
+	h.vault = v
+	h.srv.cfg.Vault = v
+	h.status, h.control, h.data = h.srv.StatusHandler(), h.srv.ControlHandler(), h.srv.DataHandler()
+	return h
+}
+
+func codeOf(w *httptest.ResponseRecorder) string { return w.Header().Get(HeaderCode) }
+
+// The same vector lives in fatline/identity's tests: the CA there issues the
+// digest this package checks, and the modules mirror rather than import.
+func TestKeeperBundleDigestMirrorsFatline(t *testing.T) {
+	const want = "66f2f344be17652ffb333e89fa3e3306f7efc493f5d77c7d1a663f63c20137d2"
+	if got := KeeperBundleDigest([]byte("version: 1\n")); got != want {
+		t.Errorf("KeeperBundleDigest = %s, want %s", got, want)
+	}
+	if KeeperBundleURIPrefix != "urn:farcast:keeper-bundle:sha256:" {
+		t.Errorf("prefix = %q", KeeperBundleURIPrefix)
+	}
+}
+
+// A keeper's leaf names one bundle; the keyholder takes that bundle from it,
+// byte for byte, and nothing else. A key ID is a label, so the key pin alone
+// would admit keys of a thief's making under the labels it pins.
+func TestAKeeperPushesOnlyTheBundleItsLeafBinds(t *testing.T) {
+	raw := marshalBundle(t, "prod", 1)
+	other := marshalBundle(t, "prod", 1)
+	bind := func(b []byte) string { return KeeperBundleURIPrefix + KeeperBundleDigest(b) }
+	target := "/v1/unseal?intent=" + string(IntentReseed)
+
+	for name, tc := range map[string]struct {
+		leaf []string
+		code string
+	}{
+		"no binding":       {[]string{asKeeper}, CodeKeeperBundle},
+		"another bundle":   {[]string{asKeeper, bind(other)}, CodeKeeperBundle},
+		"two bindings":     {[]string{asKeeper, bind(raw), bind(other)}, CodePermission},
+		"malformed":        {[]string{asKeeper, KeeperBundleURIPrefix + "zz"}, CodePermission},
+		"upper-case hex":   {[]string{asKeeper, KeeperBundleURIPrefix + strings.ToUpper(KeeperBundleDigest(raw))}, CodePermission},
+		"binding first":    {[]string{bind(raw), asKeeper}, ""},
+		"its own bundle":   {[]string{asKeeper, bind(raw)}, ""},
+		"operator unbound": {[]string{asOperator}, ""},
+	} {
+		h := newHarness(t)
+		w := h.pushWithLeaf(t, tc.leaf, h.sealFor(t, asKeeper, raw), target)
+		if tc.code == "" {
+			if w.Code != http.StatusOK {
+				t.Errorf("%s: = %d/%q, want 200: %s", name, w.Code, codeOf(w), w.Body)
+			}
+			continue
+		}
+		if codeOf(w) != tc.code {
+			t.Errorf("%s: = %d/%q, want %q", name, w.Code, codeOf(w), tc.code)
+		}
+		if !h.vault.State().Sealed() {
+			t.Errorf("%s: a refused push unsealed the replica", name)
+		}
+	}
+}
+
+func TestUnsealBelowThePinIsTheOperatorsAlone(t *testing.T) {
+	old := appKeyring(t, "apps", "web")
+	rotated, _, err := old.RotateScopeKEKs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleRaw, err := bundleOf(t, 1, old).Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Refused before the body is read, for everyone who may not make the
+	// claim: no body is sent, so a refusal that read one would say bad-request.
+	for name, tc := range map[string]struct{ uri, intent string }{
+		"keeper":             {asKeeper, string(IntentReseed)},
+		"operator reseed":    {asOperator, string(IntentReseed)},
+		"operator hand-over": {asOperator, string(IntentHandOver)},
+	} {
+		h := newHarnessWith(t, NewWithPin("prod", pinOf(t, rotated, true)))
+		w := doAs(h.control, tc.uri, "POST", "/v1/unseal?intent="+tc.intent+"&pin="+PinOverride, nil, nil)
+		if w.Code != http.StatusForbidden || codeOf(w) != CodePermission {
+			t.Errorf("%s below the pin = %d/%q; want 403 permission", name, w.Code, codeOf(w))
+		}
+	}
+
+	h := newHarnessWith(t, NewWithPin("prod", pinOf(t, rotated, true)))
+	if w := doAs(h.control, asOperator, "POST", "/v1/unseal?intent=operator-unseal&pin=please", nil, nil); codeOf(w) != CodeBadRequest {
+		t.Errorf("an unknown pin parameter = %d/%q; want bad-request", w.Code, codeOf(w))
+	}
+	w := h.pushRawAs(t, asOperator, staleRaw, IntentOperator)
+	if w.Code != http.StatusConflict || codeOf(w) != CodeBelowPin {
+		t.Fatalf("a stale operator unseal = %d/%q; want 409 below-pin", w.Code, codeOf(w))
+	}
+	w = h.pushWithLeaf(t, []string{asOperator}, h.sealFor(t, asOperator, staleRaw),
+		"/v1/unseal?intent=operator-unseal&pin="+PinOverride)
+	if w.Code != http.StatusOK {
+		t.Fatalf("the operator below the pin = %d/%q: %s", w.Code, codeOf(w), w.Body)
+	}
+	var st stateResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Pin == nil || !st.Pin.ServingBelow {
+		t.Errorf("the answer does not report serving below the pin: %+v", st.Pin)
+	}
+}
+
+func TestAnUnreadablePinRefusesAKeeperOnTheWire(t *testing.T) {
+	h := newHarnessWith(t, NewWithPin("prod", "{"))
+	w := h.pushAs(t, asKeeper, "prod", 1, IntentReseed)
+	if w.Code != http.StatusConflict || codeOf(w) != CodePinUnreadable {
+		t.Errorf("a re-seed under an unreadable pin = %d/%q; want 409 pin-unreadable", w.Code, codeOf(w))
+	}
+	if w := h.push(t, "prod", 1, IntentOperator); w.Code != http.StatusOK {
+		t.Errorf("the operator under an unreadable pin = %d/%q", w.Code, codeOf(w))
+	}
+}
+
+func TestThePinRouteIsTheOperatorsAndRaisesLive(t *testing.T) {
+	a, b := "00000000000000aa", "00000000000000bb"
+	body := []byte(`{"version":1,"require":["` + a + `"],"retired":[]}`)
+	asJSON := map[string]string{"Content-Type": ContentTypePin}
+
+	h := newHarness(t)
+	for _, uri := range []string{asKeeper, asDevice, ""} {
+		if w := doAs(h.control, uri, "POST", PinPath, asJSON, body); w.Code != http.StatusForbidden {
+			t.Errorf("%q raising the pin = %d, want 403", uri, w.Code)
+		}
+	}
+	if h.vault.State().Pin.Status != PinAbsent {
+		t.Fatal("a refused raise changed the pin")
+	}
+	for name, tc := range map[string]struct {
+		headers map[string]string
+		body    []byte
+	}{
+		"wrong type": {map[string]string{"Content-Type": "text/plain"}, body},
+		"empty":      {asJSON, []byte("  ")},
+		"invalid":    {asJSON, []byte(`{"version":9}`)},
+		"oversize":   {asJSON, bytes.Repeat([]byte(" "), MaxPinBytes+1)},
+	} {
+		if w := doAs(h.control, asOperator, "POST", PinPath, tc.headers, tc.body); w.Code != http.StatusBadRequest {
+			t.Errorf("%s = %d/%q, want 400", name, w.Code, codeOf(w))
+		}
+	}
+
+	w := doAs(h.control, asOperator, "POST", PinPath, asJSON, body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("raise = %d: %s", w.Code, w.Body)
+	}
+	w = doAs(h.control, asOperator, "POST", PinPath, asJSON, []byte(`{"version":1,"require":["`+b+`"],"retired":[]}`))
+	var st stateResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Pin == nil || st.Pin.Status != PinValid || !slices.Equal(st.Pin.Require, []string{a, b}) {
+		t.Errorf("a second raise did not union: %+v", st.Pin)
+	}
+	w = doAs(h.control, asOperator, "POST", PinPath+"?replace=true", asJSON, []byte(`{"version":1,"require":["`+b+`"],"retired":[]}`))
+	if err := json.Unmarshal(w.Body.Bytes(), &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Pin == nil || !slices.Equal(st.Pin.Require, []string{b}) {
+		t.Errorf("replace did not replace: %+v", st.Pin)
+	}
+}
+
+// The pin is on the authenticated surface only, beside the keys it names.
+func TestThePinIsReportedOnTheControlSurfaceOnly(t *testing.T) {
+	h := newHarnessWith(t, NewWithPin("prod", `{"version":1,"require":["00000000000000aa"],"retired":[]}`))
+	var ctl, pub map[string]any
+	if err := json.Unmarshal(doAs(h.control, asOperator, "GET", "/v1/state", nil, nil).Body.Bytes(), &ctl); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(do(h.status, "GET", "/v1/state", nil, nil).Body.Bytes(), &pub); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := ctl["pin"]; !ok {
+		t.Errorf("the control state carries no pin: %v", ctl)
+	}
+	if _, ok := pub["pin"]; ok {
+		t.Errorf("the unauthenticated state carries the pin: %v", pub)
+	}
+	// Sealing answers with the pin too, so a caller never reads a seal's
+	// answer as "this image has no pin".
+	var sealed stateResponse
+	if err := json.Unmarshal(doAs(h.control, asOperator, "POST", "/v1/seal", nil, nil).Body.Bytes(), &sealed); err != nil {
+		t.Fatal(err)
+	}
+	if sealed.Pin == nil || sealed.Pin.Status != PinValid {
+		t.Errorf("seal answered without the pin: %+v", sealed.Pin)
+	}
 }

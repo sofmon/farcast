@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -68,12 +69,13 @@ func newKeeperCommand() Command {
 	subs.Register(&keeperRunCommand{})
 	subs.Register(&keeperStatusCommand{})
 	subs.Register(&keeperRevokeCommand{})
+	subs.Register(&keeperUninstallCommand{})
 	return &group{
 		name:     "keeper",
-		synopsis: "Devices that re-seed a restart-sealed instance unattended (enroll, install, run, status, revoke)",
+		synopsis: "Devices that re-seed a restart-sealed instance unattended (enroll, install, run, status, revoke, uninstall)",
 		subs:     subs,
 		usage: `
-Usage: farcast keeper <enroll|install|run|status|revoke> [flags] [arguments]
+Usage: farcast keeper <enroll|install|run|status|revoke|uninstall> [flags] [arguments]
 
 A keeper is an operator-owned device that hands a restarted keyholder its key
 material back, so storage recovers in minutes instead of whenever somebody
@@ -85,6 +87,7 @@ Subcommands:
   run      Keep an instance: watch, and re-seed         (keeper device)
   status   Reconcile what this machine's ledgers record (either)
   revoke   Withdraw a device from the fleet             (operator's machine)
+  uninstall Wipe this device's bundle and key, keep its ledger (keeper device)
 
 What a keeper holds is a derived scope bundle and its own device leaf — exactly
 what an unsealed keyholder already holds in RAM, and nothing more. It never
@@ -212,7 +215,7 @@ func (c *keeperEnrollCommand) Run(_ context.Context, env *Env, args []string) er
 	}
 	defer clear(payload)
 
-	leafCert, leafKey, err := identity.IssueKeeperClient(mtls.CACertPEM, mtls.CAKeyPEM, name, device)
+	leafCert, leafKey, err := identity.IssueKeeperClient(mtls.CACertPEM, mtls.CAKeyPEM, name, device, payload)
 	if err != nil {
 		return err
 	}
@@ -442,6 +445,10 @@ func (c *keeperRunCommand) Run(ctx context.Context, env *Env, args []string) err
 	if err != nil {
 		return err
 	}
+	if !cfg.WipedAt.IsZero() {
+		return fmt.Errorf("%w on %s (%s); its ledger remains, and 'farcast keeper status %s' still reads it",
+			keeper.ErrWiped, cfg.WipedAt.Format("2006-01-02"), cfg.WipedReason, name)
+	}
 	if c.once {
 		_, err := keeperCheck(ctx, env, store, cfg)
 		return err
@@ -449,6 +456,11 @@ func (c *keeperRunCommand) Run(ctx context.Context, env *Env, args []string) err
 	fprintf(env.Err, "Keeping %q as %q — checking about every %s, outbound only.\n", cfg.Instance, cfg.Device, c.interval)
 	for {
 		if _, err := keeperCheck(ctx, env, store, cfg); err != nil {
+			if errors.Is(err, keeper.ErrWiped) {
+				// Wiped while running — an uninstall, or a release on this
+				// machine. Nothing is left to keep.
+				return err
+			}
 			// A failed check is reported and never fatal. The one job of this
 			// process is to be running when the cluster next needs it, and a
 			// keeper that exited on an unreachable tunnel would be absent for
@@ -484,6 +496,12 @@ func keeperCheck(ctx context.Context, env *Env, store *keeper.Store, cfg keeper.
 	}
 	defer clear(bundle)
 	defer clear(leafKey)
+	// Before dialling: a leaf that does not bind this bundle is refused by
+	// every keyholder, and saying so here is cheaper and clearer than a
+	// refusal per replica per pass.
+	if err := leafBindsBundle(leafCert, bundle); err != nil {
+		return nil, err
+	}
 
 	conn, err := keeperTunnel(ctx, cfg, caPEM, leafCert, leafKey)
 	if err != nil {
@@ -546,6 +564,18 @@ func keeperCheckWith(ctx context.Context, env *Env, store *keeper.Store, cfg kee
 			// another keeper. Nothing to do, and nothing went wrong.
 			entry.Result = "refused"
 			d.Action, d.Reason = keeper.ActionNone, "already serving: another pusher reached it first"
+		case keyholder.PinUnreadable(pushErr):
+			// It restarted between the read and the push and cannot read its
+			// pin: it refuses every re-seed whatever the bundle, so a
+			// re-enrolment would change nothing.
+			entry.Result = "refused"
+			d.Action, d.Reason = keeper.ActionStale, keeper.PinUnreadableReason(i)
+		case keyholder.BelowPin(pushErr), keyholder.KeeperBundle(pushErr):
+			// The keyholder's own refusal of this device's bundle: the pin
+			// moved past it since the read, or the leaf does not bind it.
+			// Either way only a re-enrolment changes the answer.
+			entry.Result = "refused"
+			d.Action, d.Reason = keeper.ActionStale, pushErr.Error()+"; re-enrol this device"
 		case pushErr != nil:
 			entry.Result = "refused"
 			d.Action, d.Reason = keeper.ActionUnknown, pushErr.Error()
@@ -569,6 +599,29 @@ func keeperCheckWith(ctx context.Context, env *Env, store *keeper.Store, cfg kee
 		keeperReport(env, cfg, d, st)
 	}
 	return decisions, nil
+}
+
+// leafBindsBundle checks that this device's leaf names the bundle it holds.
+// The keyholder refuses a keeper's push of any other bundle — and of any
+// bundle at all from a leaf that names none, which is a keeper enrolled
+// before the binding existed.
+func leafBindsBundle(leafPEM, bundle []byte) error {
+	block, _ := pem.Decode(leafPEM)
+	if block == nil {
+		return errors.New("this device's leaf is unreadable; re-enrol it")
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return fmt.Errorf("this device's leaf is unreadable (%v); re-enrol it", err)
+	}
+	want := identity.KeeperBundleURIPrefix + identity.KeeperBundleDigest(bundle)
+	for _, u := range cert.URIs {
+		if u.String() == want {
+			return nil
+		}
+	}
+	return errors.New("this device's leaf does not bind the bundle it holds — it was enrolled before the keyholder required that — " +
+		"so every keyholder refuses its re-seeds; re-enrol it with 'farcast keeper enroll' on the operator's machine")
 }
 
 // keeperReplicas is how many replicas a keeper checks.
@@ -667,6 +720,7 @@ func (*keeperStatusCommand) Run(_ context.Context, env *Env, args []string) erro
 		audit := keeper.Reconcile(name, ledger)
 		budget := keeper.Budget(ledger, cfg.Budget, cfg.Window, time.Now().UTC())
 		entry.Device, entry.Generation = cfg.Device, cfg.Generation
+		entry.Wiped, entry.WipedReason = cfg.WipedAt, cfg.WipedReason
 		entry.BackupExcluded, entry.BackupNote = cfg.BackupExcluded, cfg.BackupNote
 		entry.Reseeds, entry.Boots, entry.Refused = audit.Reseeds, audit.Boots, audit.Refused
 		entry.Unlabelled = audit.Unlabelled
@@ -704,7 +758,11 @@ type keeperStatusEntry struct {
 	BackupExcluded bool     `json:"backup_excluded"`
 	BackupNote     string   `json:"backup_note,omitempty"`
 	Divergent      []string `json:"divergent,omitempty"`
-	Error          string   `json:"error,omitempty"`
+	// Wiped is when this device's bundle and key were wiped; its ledger and
+	// record remain, which is what this entry reads.
+	Wiped       time.Time `json:"wiped,omitzero"`
+	WipedReason string    `json:"wiped_reason,omitempty"`
+	Error       string    `json:"error,omitempty"`
 }
 
 type fleetRow struct {
@@ -746,6 +804,9 @@ func (r keeperStatusResult) Human(w io.Writer) error {
 			continue
 		}
 		fprintf(w, "%s (as %q, bundle generation %d)\n", e.Instance, e.Device, e.Generation)
+		if !e.Wiped.IsZero() {
+			fprintf(w, "  material    wiped %s (%s) — this device no longer keeps it\n", e.Wiped.Format("2006-01-02"), e.WipedReason)
+		}
 		fprintf(w, "  reseeds     %d into %d distinct keyholder processes", e.Reseeds, e.Boots)
 		if e.Refused > 0 {
 			fprintf(w, ", %d refused", e.Refused)
@@ -983,4 +1044,77 @@ func leafExpiry(certPEM []byte) time.Time {
 		return time.Time{}
 	}
 	return cert.NotAfter.UTC()
+}
+
+// ------------------------------------------------------------- uninstall
+
+type keeperUninstallCommand struct{ assumeYes bool }
+
+func (*keeperUninstallCommand) Name() string { return "uninstall" }
+func (*keeperUninstallCommand) Synopsis() string {
+	return "Wipe this device's bundle and leaf key, and keep its ledger"
+}
+
+func (*keeperUninstallCommand) Usage() string {
+	return strings.TrimSpace(`
+Usage: farcast keeper uninstall <instance> [-y]
+
+Run on a keeper DEVICE. Delete the two files here that could open anything —
+the bundle and the leaf's private key — and stop keeping the instance.
+
+The ledger stays, and so does the record 'farcast keeper status' needs to read
+it: it is the evidence of what this device did with key material, and a device
+that erased its own history on the way out would remove exactly what an audit
+reads afterwards. The certificates stay too; they are public.
+
+This does not revoke the device — the operator's 'farcast keeper revoke' does
+that, on the machine that enrolled it — and it reaches nothing in the cluster.
+Enrol and install again to keep the instance once more.`)
+}
+
+func (c *keeperUninstallCommand) SetFlags(fs *flag.FlagSet) {
+	fs.BoolVar(&c.assumeYes, "yes", false, "skip the confirmation")
+	fs.BoolVar(&c.assumeYes, "y", false, "skip the confirmation")
+}
+
+func (c *keeperUninstallCommand) Run(_ context.Context, env *Env, args []string) error {
+	if len(args) != 1 {
+		return usagef("keeper uninstall takes one instance argument")
+	}
+	name := args[0]
+	store, err := keeper.OpenStore(env.ConfigDir.KeeperDir(name))
+	if err != nil {
+		return err
+	}
+	if !c.assumeYes {
+		interactive := env.Printer.Mode == output.ModeHuman && isTerminal(env.In)
+		if !interactive {
+			return usagef("refusing to uninstall %q's keeper without confirmation; pass --yes", name)
+		}
+		answer, perr := newPrompter(env.In, env.Err).line(fmt.Sprintf("Type the instance name to wipe this device's bundle and key for it (%s)", name))
+		if perr != nil {
+			return perr
+		}
+		if strings.TrimSpace(answer) != name {
+			fprintln(env.Err, "Aborted.")
+			return nil
+		}
+	}
+	if err := store.Wipe("uninstalled on this device", time.Now()); err != nil {
+		return err
+	}
+	return env.Printer.Print(keeperUninstallResult{Instance: name, Dir: store.Dir(), Ledger: store.LedgerPath(), Status: "wiped"})
+}
+
+type keeperUninstallResult struct {
+	Instance string `json:"instance"`
+	Dir      string `json:"dir"`
+	Ledger   string `json:"ledger"`
+	Status   string `json:"status"`
+}
+
+func (r keeperUninstallResult) Human(w io.Writer) error {
+	fprintf(w, "✓ this device no longer keeps %q: its bundle and leaf key are wiped\n", r.Instance)
+	fprintf(w, "  ledger kept at %s — 'farcast keeper status %s' still reads it\n", r.Ledger, r.Instance)
+	return nil
 }

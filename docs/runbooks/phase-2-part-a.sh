@@ -5,16 +5,19 @@
 # Runs every operation from "Part A" of docs/runbooks/phase-2-validation.md and
 # STOPS and PRINTS on the first error (failed command OR failed assertion):
 #
-#   A0  guardrails (go test -race / vet / gofmt / golangci-lint) + build to ./bin
+#   A0  ./check.sh (both Go modules: gofmt, vendor, build, vet, golangci-lint,
+#       go test -race) + build to ./bin
 #   A1  FatLine egress + Shrike sidecar over loopback, with assertions on the
 #       live Shrike security picture (declared host, warning×3, cleartext info,
 #       allowed host) and the alert log
 #   A2  the tunnel / per-instance-CA / identity tests (mTLS handshake, SAN)
 #   A3  `farcast connect` no-cloud surface (exit codes 2 / 2 / 1)
 #
-# Safe: NO cloud, NO cost. It builds binaries into ./bin and runs two loopback
-# servers on 127.0.0.1:18131 (FatLine egress) and 127.0.0.1:18132 (Shrike status),
-# which are torn down on exit. macOS-friendly (works on the stock bash 3.2).
+# Safe: NO cloud, NO cost, and nothing leaves the machine. It builds binaries
+# into ./bin and runs two loopback servers on 127.0.0.1:18131 (FatLine egress)
+# and 127.0.0.1:18132 (Shrike status), which are torn down on exit; the one
+# allowed egress dials localhost:18133, where nothing listens. macOS-friendly
+# (works on the stock bash 3.2).
 #
 # Usage:  bash docs/runbooks/phase-2-part-a.sh
 
@@ -35,6 +38,10 @@ die()  { printf '\n%s  ✗ %s%s\n' "$RED$BOLD" "$1" "$RST" >&2; exit 1; }
 # ---- config ----------------------------------------------------------------
 EGRESS_PORT=18131
 STATUS_PORT=18132
+# The declared upstream. Nothing listens here, on purpose: the allowed request
+# is dialled and refused on loopback, so the walk proves the allow path without
+# a single packet leaving the machine.
+UPSTREAM_PORT=18133
 SHRIKE_PID=''
 FATLINE_PID=''
 TMP=''
@@ -84,18 +91,11 @@ ok "go $(go version | awk '{print $3}'); curl present"
 HAVE_PY=0
 if command -v python3 >/dev/null; then HAVE_PY=1; ok "python3 present (precise JSON assertions)"; else note "python3 absent — JSON assertions fall back to grep"; fi
 
-# ---- A0 — guardrails & build ----------------------------------------------
-step "A0 — guardrails (test -race / vet / gofmt / lint) and build"
-go test -race ./...
-ok "go test -race ./... passed"
-go vet ./...
-ok "go vet clean"
-# vendor/ is upstream code and .claude/ holds agent worktrees, each with a
-# vendor/ of its own; neither is this repository's to reformat.
-FMT=$(gofmt -l . | grep -v '^vendor/' | grep -v '^\.claude/' || true)
-if [ -n "$FMT" ]; then die "gofmt would reformat: $FMT"; fi
-ok "gofmt clean"
-if command -v golangci-lint >/dev/null; then golangci-lint run ./...; ok "golangci-lint: 0 issues"; else note "golangci-lint not installed — skipped"; fi
+# ---- A0 — repository check & build ----------------------------------------
+step "A0 — repository check (./check.sh) and build"
+# Both Go modules, the vendor check and golangci-lint — which is mandatory: a
+# missing linter fails the check rather than being skipped.
+bash "$ROOT/check.sh"
 mkdir -p bin
 go build -o ./bin/farcast ./farsight/cli/cmd/farcast
 go build -o ./bin/fatline ./fatline/cmd/fatline
@@ -106,6 +106,7 @@ ok "built ./bin/{farcast,fatline,shrike}"
 step "A1 — FatLine egress + Shrike sidecar (deny-by-default + monitoring)"
 if port_open "$EGRESS_PORT"; then die "127.0.0.1:$EGRESS_PORT is already in use"; fi
 if port_open "$STATUS_PORT"; then die "127.0.0.1:$STATUS_PORT is already in use"; fi
+if port_open "$UPSTREAM_PORT"; then die "127.0.0.1:$UPSTREAM_PORT is already in use; the allowed request must find nothing there"; fi
 
 TMP=$(mktemp -d)
 SOCK="$TMP/shrike.sock"
@@ -115,7 +116,7 @@ apps:
   - name: web
     containerfile: Containerfile
     external:
-      - host: api.stripe.com
+      - host: localhost
         reason: payments
 EOF
 
@@ -135,7 +136,7 @@ cat > "$TMP/policy.json" <<EOF
   "apps": [
     { "name": "web", "namespace": "validate",
       "credential_sha256": "$(printf '%s' "$WEB_CRED" | sha256_hex)",
-      "external": [ { "host": "api.stripe.com", "reason": "payments" } ] },
+      "external": [ { "host": "localhost", "reason": "payments" } ] },
     { "name": "worker", "namespace": "validate",
       "credential_sha256": "$(printf '%s' "$WORKER_CRED" | sha256_hex)" }
   ]
@@ -160,12 +161,12 @@ ANON="http://127.0.0.1:$EGRESS_PORT"
 # Traffic-generating curls exit non-zero by design (denied/timeout) — ignore them;
 # the proof is the Shrike picture, not curl's exit code.
 for _ in 1 2 3; do curl -s -o /dev/null -x "$WEB" https://evil.example.com --max-time 3 || true; done
-curl -s -o /dev/null -x "$WEB"    http://api.stripe.com  --max-time 3 || true
-curl -s -o /dev/null -x "$WEB"    https://api.stripe.com --max-time 5 || true
-curl -s -o /dev/null -x "$ANON"   https://api.stripe.com --max-time 3 || true
-curl -s -o /dev/null -x "$WORKER" https://api.stripe.com --max-time 3 || true
+curl -s -o /dev/null -x "$WEB"    "http://localhost:$UPSTREAM_PORT"  --max-time 3 || true
+curl -s -o /dev/null -x "$WEB"    "https://localhost:$UPSTREAM_PORT" --max-time 3 || true
+curl -s -o /dev/null -x "$ANON"   "https://localhost:$UPSTREAM_PORT" --max-time 3 || true
+curl -s -o /dev/null -x "$WORKER" "https://localhost:$UPSTREAM_PORT" --max-time 3 || true
 sleep 1   # let buffered events drain over the sidecar wire
-ok "drove 3 denied (undeclared) + 1 cleartext + 1 allowed + 1 unidentified + 1 wrong-application request through the proxy"
+ok "drove 3 denied (undeclared) + 1 cleartext + 1 allowed (dialled on loopback, refused) + 1 unidentified + 1 wrong-application request through the proxy"
 
 curl -fsS "http://127.0.0.1:$STATUS_PORT/_shrike/status" > "$TMP/status.json" || die "could not fetch Shrike status"
 note "$(cat "$TMP/status.json")"
@@ -175,8 +176,8 @@ if [ "$HAVE_PY" = 1 ]; then
 import sys, json
 d = json.load(open(sys.argv[1]))
 errs = []
-if "api.stripe.com" not in d.get("declared", []):
-    errs.append("declared should contain api.stripe.com; got %r" % d.get("declared"))
+if "localhost" not in d.get("declared", []):
+    errs.append("declared should contain localhost; got %r" % d.get("declared"))
 # Keyed by application as well as reason and host: since 4.4 two applications
 # denied the same host are two problems, not one, and a picture that merged
 # them would hide exactly what this phase enforces.
@@ -186,28 +187,31 @@ if not w or w.get("severity") != "warning" or w.get("count") != 3:
     errs.append("expected warning x3 for web -> evil.example.com; got %r" % w)
 if w and w.get("namespace") != "validate":
     errs.append("the violation should name web's namespace; got %r" % w.get("namespace"))
-c = viol.get(("cleartext_not_allowed", "api.stripe.com", "web"))
+c = viol.get(("cleartext_not_allowed", "localhost", "web"))
 if not c or c.get("severity") != "info":
-    errs.append("expected info cleartext for web -> api.stripe.com; got %r" % c)
-if "api.stripe.com" not in {a.get("host") for a in d.get("allowed", [])}:
-    errs.append("api.stripe.com should appear under allowed; got %r" % d.get("allowed"))
+    errs.append("expected info cleartext for web -> localhost; got %r" % c)
+# Allowed, AND dialled and refused: proof the allow path ran and the dial
+# stayed on this machine, where nothing listens.
+a = [r for r in d.get("allowed", []) if r.get("host") == "localhost" and r.get("app") == "web"]
+if not a or a[0].get("allows", 0) < 1 or a[0].get("fails", 0) < 1:
+    errs.append("web -> localhost should be allowed and its dial should fail; got %r" % d.get("allowed"))
 
 # The two properties 4.4 added, both invisible before it.
-u = viol.get(("unknown_app", "api.stripe.com", ""))
+u = viol.get(("unknown_app", "localhost", ""))
 if not u:
     errs.append("a caller with no credential should be refused as unknown_app, unattributed; got %r" % list(viol))
 if u and u.get("app"):
     errs.append("an unidentified caller must not be attributed to an application; got %r" % u.get("app"))
-x = viol.get(("not_in_allowlist", "api.stripe.com", "worker"))
+x = viol.get(("not_in_allowlist", "localhost", "worker"))
 if not x:
     errs.append("worker must not reach the host web declared; got %r" % list(viol))
 for e in errs:
     sys.stderr.write("      - %s\n" % e)
 sys.exit(1 if errs else 0)
 PY
-  ok "verified: declared api.stripe.com · web→evil.example.com warning×3 · cleartext info · api.stripe.com allowed · no-credential unknown_app · worker refused web's host"
+  ok "verified: declared localhost · web→evil.example.com warning×3 · cleartext info · localhost allowed and its dial refused · no-credential unknown_app · worker refused web's host"
 else
-  grep -q '"declared":\["api.stripe.com"\]' "$TMP/status.json" || die "declared host missing"
+  grep -q '"declared":\["localhost"\]'      "$TMP/status.json" || die "declared host missing"
   grep -q 'evil.example.com'                "$TMP/status.json" || die "evil.example.com violation missing"
   grep -q 'cleartext_not_allowed'           "$TMP/status.json" || die "cleartext violation missing"
   grep -q '"count":3'                        "$TMP/status.json" || die "expected a count:3 violation"
@@ -241,6 +245,8 @@ for kind in allow deny; do
 done
 grep -q 'egress kind=deny.*app=web' "$TMP/fatline.log" ||
   die "FatLine's own log does not name the application on a denial — see $TMP/fatline.log"
+grep -q 'egress kind=fail.*host=localhost' "$TMP/fatline.log" ||
+  die "FatLine did not log the allowed dial failing on loopback — see $TMP/fatline.log"
 ok "FatLine still logged every decision itself while streaming to the sidecar ($(grep -c 'egress kind=' "$TMP/fatline.log") events)"
 
 kill "$FATLINE_PID" "$SHRIKE_PID" 2>/dev/null || true

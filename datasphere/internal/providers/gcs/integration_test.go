@@ -1,7 +1,8 @@
 //go:build integration
 
 // These tests drive the GCS adapter against a live Google Cloud project. They
-// are excluded from normal builds and CI by the //go:build integration tag:
+// are excluded from normal builds and test runs (./check.sh only type-checks
+// them) by the //go:build integration tag:
 // they need real credentials and — for the lifecycle test — create a real
 // bucket that bills real money. Run them deliberately.
 //

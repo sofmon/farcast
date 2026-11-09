@@ -16,6 +16,7 @@ package kernel
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"sort"
@@ -34,6 +35,44 @@ import (
 // freshness nothing here needs and cost an API call every time; an hour would
 // leave a runaway workload unbilled for an hour.
 const DefaultInterval = 30 * time.Second
+
+// The bounds an operator may set the interval and the resize cooldown to.
+//
+// Shorter values exist for walking a behaviour in minutes rather than hours —
+// the 5.1 dedupe at a 10s interval, the 5.2 cooldown at 2m. The floors keep a
+// mistyped value from turning the kernel into an API-server load generator or
+// a resize loop; the ceilings keep one from switching enforcement or resizing
+// off in all but name.
+const (
+	MinInterval = 5 * time.Second
+	MaxInterval = 5 * time.Minute
+	MinCooldown = time.Minute
+	MaxCooldown = 30 * 24 * time.Hour
+)
+
+// CheckInterval refuses an interval outside the bounds. Zero is the default
+// and is accepted.
+func CheckInterval(d time.Duration) error {
+	if d == 0 {
+		return nil
+	}
+	if d < MinInterval || d > MaxInterval {
+		return fmt.Errorf("interval %s is outside %s–%s", d, MinInterval, MaxInterval)
+	}
+	return nil
+}
+
+// CheckCooldown refuses a resize cooldown outside the bounds. Zero is the
+// default and is accepted.
+func CheckCooldown(d time.Duration) error {
+	if d == 0 {
+		return nil
+	}
+	if d < MinCooldown || d > MaxCooldown {
+		return fmt.Errorf("adapt cooldown %s is outside %s–%s", d, MinCooldown, MaxCooldown)
+	}
+	return nil
+}
 
 // Cluster is the slice of the Kubernetes client this loop needs. It is an
 // interface so the loop is tested against fixtures rather than a cluster.
@@ -57,6 +96,40 @@ type Cluster interface {
 	// walk watched Autopilot raise a below-floor request in the pod template
 	// itself while answering 200.
 	SetRequests(ctx context.Context, namespace, name, container string, cpuMilli, memMiB int, annotations map[string]string) (int, int, error)
+	// GetService reads one Service — FatLine's, to see whether the instance
+	// pays for the public load balancer. Read only, and only that one.
+	GetService(ctx context.Context, namespace, name string) (*kube.Service, error)
+}
+
+// The carrier: FatLine's tunnel Service. When it is of type LoadBalancer the
+// instance pays for a forwarding rule whether or not anything runs, and that
+// is instance overhead — counted, never attributed to an application, never
+// stopped (ADR 0009 decisions 4 and 8).
+const (
+	CarrierNamespace = DefaultNamespace // FatLine and the kernel share it
+	CarrierService   = "fatline"        // fatline/deploy.DefaultName; a test pins the two together
+	OverheadCarrier  = "carrier"        // the ledger's key for it
+)
+
+// CarrierState is what a tick saw of the carrier.
+type CarrierState string
+
+const (
+	CarrierLoadBalancer CarrierState = "load-balancer" // billed
+	CarrierInternal     CarrierState = "internal"      // ClusterIP: nothing billed
+	CarrierAbsent       CarrierState = "absent"        // not connected yet
+	// CarrierUnobserved is a read that failed. The carrier is billed as
+	// present: under-reporting is the worse failure, and the operator's own
+	// floor assumes one.
+	CarrierUnobserved CarrierState = "unobserved"
+)
+
+// Overhead is an instance-level standing charge.
+type Overhead struct {
+	Name      string
+	HourlyUSD float64
+	// Assumed marks a charge billed without being seen.
+	Assumed bool
 }
 
 // ManagedBy selects the workloads FarCast created. A kernel that metered
@@ -256,6 +329,9 @@ type Report struct {
 	// instance is currently burning. Ledger.ByApp is dollars ACCRUED for the
 	// period. Two different quantities that read identically in prose, so
 	// they are not allowed to share a name.
+	//
+	// RateHourlyUSD includes the instance's overhead; RateByTier and
+	// RateByApp never do — overhead belongs to no workload and no application.
 	RateHourlyUSD float64
 	RateByTier    map[tier.Tier]float64
 	RateByApp     map[string]float64
@@ -278,6 +354,15 @@ type Report struct {
 	// instance that is spending, which is why THAT one is fatal and this is
 	// not.
 	UsageUnavailable []string
+
+	// Overhead is the instance-level standing charges this tick billed, and
+	// RateOverheadUSD their hourly sum. Never a Workload, never a Target.
+	Overhead        []Overhead
+	RateOverheadUSD float64
+	// Carrier is what this tick saw of FatLine's load balancer, and CarrierErr
+	// why it could not see it.
+	Carrier    CarrierState
+	CarrierErr string
 }
 
 // Complete reports whether this tick saw every namespace it was asked to.
@@ -404,6 +489,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, now time.Time) (Report, erro
 	if err := r.collectTargets(ctx, &rep); err != nil {
 		return Report{}, err
 	}
+	r.observeCarrier(ctx, &rep)
 
 	// After the workloads are known and before anything is accrued: a
 	// reading is only attributed to an application the meter has already
@@ -419,6 +505,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, now time.Time) (Report, erro
 		for _, w := range rep.Workloads {
 			r.Ledger.Accrue(now, w.App, w.HourlyUSD, billed)
 		}
+		// A reconstructed gap assumes the carrier stood throughout, as it
+		// assumes the observed Pods did.
+		for _, o := range rep.Overhead {
+			r.Ledger.AccrueOverhead(now, o.Name, o.HourlyUSD, billed)
+		}
 	}
 	r.Last = now
 
@@ -430,12 +521,43 @@ func (r *Reconciler) Reconcile(ctx context.Context, now time.Time) (Report, erro
 		Pods:          len(rep.Workloads),
 		Unclassified:  rep.Unclassified,
 		RateHourlyUSD: rep.RateHourlyUSD,
+		Overhead:      rep.RateOverheadUSD,
+		Carrier:       string(rep.Carrier),
 		Level:         rep.Assessment.Level.String(),
 		Limit:         r.Limit,
 		Incomplete:    !rep.Complete(),
 		Unreachable:   rep.Unreachable,
 	}
 	return rep, nil
+}
+
+// observeCarrier reads FatLine's Service and bills the load balancer it fronts.
+//
+// A failed read never fails the tick and never counts as an unreachable
+// namespace. It hides nothing a shutdown could stop, and a persistent refusal
+// here would otherwise stop all metering — the fault the kernel exists to
+// prevent. It is billed as present instead.
+func (r *Reconciler) observeCarrier(ctx context.Context, rep *Report) {
+	svc, err := r.Cluster.GetService(ctx, CarrierNamespace, CarrierService)
+	switch {
+	case errors.Is(err, kube.ErrNotFound):
+		rep.Carrier = CarrierAbsent
+		return
+	case err != nil:
+		rep.Carrier, rep.CarrierErr = CarrierUnobserved, safeNamespaceError(err)
+	case svc.Spec.Type == kube.ServiceTypeLoadBalancer:
+		// The type, not the status: the forwarding rule can exist before the
+		// status says so, and a Service being deleted is still billed while
+		// GKE's finalizer holds it.
+		rep.Carrier = CarrierLoadBalancer
+	default:
+		rep.Carrier = CarrierInternal
+		return
+	}
+	h := pricing.CarrierHourlyUSD
+	rep.Overhead = append(rep.Overhead, Overhead{Name: OverheadCarrier, HourlyUSD: h, Assumed: rep.Carrier == CarrierUnobserved})
+	rep.RateOverheadUSD += h
+	rep.RateHourlyUSD += h
 }
 
 // collectTargets lists the deployments in each namespace and attributes the

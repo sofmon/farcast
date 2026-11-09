@@ -2,11 +2,14 @@ package deploy
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/goccy/go-yaml"
+
+	"github.com/sofmon/farcast/datasphere/keyholder"
 )
 
 // digest is a syntactically valid content digest; the tests care that the image
@@ -225,10 +228,12 @@ func TestRenderHasNoVolumes(t *testing.T) {
 	// Belt and braces over the raw stream, so a volume added under a key this
 	// test does not walk still fails. Comment lines are stripped first: the
 	// template *talks about* emptyDir in the comment explaining why there is
-	// none, and prose is not a manifest key.
+	// none, and prose is not a manifest key. A configMap VOLUME is the key
+	// "configMap:"; the key pin's env reference is "configMapKeyRef:", which
+	// is an env value and the same path the TLS material takes.
 	for _, forbidden := range []string{
 		"volumes:", "volumeMounts:", "volumeClaimTemplates:",
-		"emptyDir", "hostPath", "persistentVolumeClaim", "downwardAPI", "configMap", "projected:",
+		"emptyDir", "hostPath", "persistentVolumeClaim", "downwardAPI", "configMap:", "projected:",
 	} {
 		if strings.Contains(stripComments(out), forbidden) {
 			t.Errorf("rendered workload contains %q; ADR 0008 decision 1 permits no volumes of any kind", forbidden)
@@ -859,5 +864,83 @@ func TestThePolicySelectsTheKeyholder(t *testing.T) {
 	np := docs["NetworkPolicy/datasphered"]
 	if got := dig(np, "spec", "podSelector", "matchLabels", "app.kubernetes.io/name"); got != "datasphered" {
 		t.Errorf("policy selects %v, want datasphered", got)
+	}
+}
+
+// The key pin reaches the process through env from its own ConfigMap, and the
+// reference is optional: a required one to a missing ConfigMap is a container
+// that never starts — a sealed replica no unseal can reach.
+func TestRenderReadsTheKeyPinThroughAnOptionalEnvRef(t *testing.T) {
+	if envKeyPin != keyholder.EnvKeyPin {
+		t.Fatalf("the manifest sets %s and the keyholder reads %s", envKeyPin, keyholder.EnvKeyPin)
+	}
+	_, docs := render(t, sampleConfig())
+	env, ok := dig(docs["StatefulSet/datasphered"], "spec", "template", "spec", "containers", "0", "env").([]any)
+	if !ok {
+		t.Fatal("container has no env")
+	}
+	var found map[string]any
+	for _, e := range env {
+		if m, _ := e.(map[string]any); m["name"] == keyholder.EnvKeyPin {
+			found = m
+		}
+	}
+	if found == nil {
+		t.Fatalf("%s is not in the container env", keyholder.EnvKeyPin)
+	}
+	ref, _ := dig(found, "valueFrom", "configMapKeyRef").(map[string]any)
+	if ref["name"] != PinConfigMapName("") || ref["name"] != "datasphered-pin" || ref["key"] != PinKey || ref["optional"] != true {
+		t.Errorf("the pin reference is %v; want datasphered-pin/%s, optional", ref, PinKey)
+	}
+}
+
+// Every rotation and every run moves the pin. In the pod template it would
+// roll the StatefulSet each time, and a roll seals every replica — so Render
+// takes no pin at all, and nothing about one can reach the template.
+func TestRenderIsTheSameWhateverThePin(t *testing.T) {
+	out, _ := render(t, sampleConfig())
+	if strings.Contains(stripComments(out), "require") || strings.Contains(stripComments(out), "kind: ConfigMap") {
+		t.Errorf("the workload stream carries the pin or its ConfigMap:\n%s", out)
+	}
+}
+
+func TestRenderPinIsALabelledConfigMap(t *testing.T) {
+	value := `{"version":1,"require":["00000000000000aa"],"retired":[]}`
+	out, err := RenderPin("", "", value, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Kind     string `json:"kind"`
+		Metadata struct {
+			Name      string            `json:"name"`
+			Namespace string            `json:"namespace"`
+			Labels    map[string]string `json:"labels"`
+		} `json:"metadata"`
+		Data map[string]string `json:"data"`
+	}
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatalf("%v:\n%s", err, out)
+	}
+	if doc.Kind != "ConfigMap" || doc.Metadata.Name != "datasphered-pin" || doc.Metadata.Namespace != DefaultNamespace {
+		t.Errorf("rendered %+v", doc)
+	}
+	if doc.Metadata.Labels["app.kubernetes.io/managed-by"] != "farcast" || doc.Metadata.Labels["app.kubernetes.io/name"] != DefaultName {
+		t.Errorf("labels = %v", doc.Metadata.Labels)
+	}
+	if _, present, err := keyholder.ParsePin(doc.Data[PinKey]); err != nil || !present || doc.Data[PinKey] != value {
+		t.Errorf("value %q does not round-trip: present %v, %v", doc.Data[PinKey], present, err)
+	}
+	if strings.Contains(string(out), "resourceVersion") {
+		t.Errorf("a create carries a resourceVersion: %s", out)
+	}
+	// A replace names the version it was read at, so the API server refuses
+	// it if anything wrote in between.
+	out, err = RenderPin("", "", value, "4711")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), `"resourceVersion":"4711"`) {
+		t.Errorf("a replace does not carry the version it was read at: %s", out)
 	}
 }

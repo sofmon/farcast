@@ -115,6 +115,11 @@ type Ledger struct {
 	// being able to say which application caused it.
 	apps map[string]float64
 
+	// overhead is expected USD per instance-level standing charge — the
+	// carrier — for the period to date. It counts toward the total and every
+	// threshold, and is never attributed to an application.
+	overhead map[string]float64
+
 	confirmations []Confirmation
 	discrepancies []Discrepancy
 }
@@ -129,6 +134,7 @@ func NewLedger(start, end time.Time) (*Ledger, error) {
 		periodEnd:   end.UTC(),
 		hourly:      map[int64]float64{},
 		apps:        map[string]float64{},
+		overhead:    map[string]float64{},
 	}, nil
 }
 
@@ -149,7 +155,32 @@ func (l *Ledger) Accrue(now time.Time, app string, usdPerHour float64, d time.Du
 		return
 	}
 	l.apps[app] += usdPerHour * d.Hours()
+	l.spread(now, usdPerHour, d)
+}
 
+// AccrueOverhead records an instance-level standing charge (ADR 0009 decision
+// 4). It lands in the hourly buckets — so the total, every threshold and every
+// confirmation comparison include it — and never in the per-application
+// figures, so nothing can attribute it to an application or stop it.
+func (l *Ledger) AccrueOverhead(now time.Time, item string, usdPerHour float64, d time.Duration) {
+	if d <= 0 || usdPerHour <= 0 {
+		return
+	}
+	l.overhead[item] += usdPerHour * d.Hours()
+	l.spread(now, usdPerHour, d)
+}
+
+// ByOverhead is expected USD per instance-level charge for the period to date.
+func (l *Ledger) ByOverhead() map[string]float64 {
+	out := make(map[string]float64, len(l.overhead))
+	for k, v := range l.overhead {
+		out[k] = v
+	}
+	return out
+}
+
+// spread distributes an interval's cost over the hour buckets it spans.
+func (l *Ledger) spread(now time.Time, usdPerHour float64, d time.Duration) {
 	for cur := now.Add(-d); cur.Before(now); {
 		h := hourKey(cur)
 		next := time.Unix((h+1)*3600, 0).UTC()

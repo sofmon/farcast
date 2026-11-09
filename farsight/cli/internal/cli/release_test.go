@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -15,7 +16,10 @@ import (
 
 	"github.com/sofmon/farcast/datasphere"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
+	"github.com/sofmon/farcast/farsight/cli/internal/keeper"
+	"github.com/sofmon/farcast/farsight/cli/internal/keyholder"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
+	"github.com/sofmon/farcast/fatline/identity"
 	"github.com/sofmon/farcast/planck"
 )
 
@@ -485,11 +489,11 @@ func TestReleaseConfirmRetypeName(t *testing.T) {
 	meta := &config.InstanceMetadata{Name: "prod"}
 	cmd := &releaseCommand{}
 
-	ok, err := cmd.confirm(true, newPrompter(strings.NewReader("prod\n"), io.Discard), io.Discard, meta, datasphere.Usage{})
+	ok, err := cmd.confirm(true, newPrompter(strings.NewReader("prod\n"), io.Discard), io.Discard, meta, datasphere.Usage{}, nil)
 	if err != nil || !ok {
 		t.Fatalf("confirm(correct name) = %v,%v; want true,nil", ok, err)
 	}
-	ok, err = cmd.confirm(true, newPrompter(strings.NewReader("nope\n"), io.Discard), io.Discard, meta, datasphere.Usage{})
+	ok, err = cmd.confirm(true, newPrompter(strings.NewReader("nope\n"), io.Discard), io.Discard, meta, datasphere.Usage{}, nil)
 	if err != nil || ok {
 		t.Fatalf("confirm(wrong name) = %v,%v; want false,nil", ok, err)
 	}
@@ -896,7 +900,7 @@ func TestReleaseConfirmationNamesTheStoredData(t *testing.T) {
 
 	var buf strings.Builder
 	ok, err := cmd.confirm(true, newPrompter(strings.NewReader("prod\n"), io.Discard), &buf,
-		meta, datasphere.Usage{Objects: 3, StoredBytes: 4096})
+		meta, datasphere.Usage{Objects: 3, StoredBytes: 4096}, nil)
 	if err != nil || !ok {
 		t.Fatalf("confirm = %v,%v; want true,nil", ok, err)
 	}
@@ -909,7 +913,7 @@ func TestReleaseConfirmationNamesTheStoredData(t *testing.T) {
 	// An empty bucket produces no extra line, so a routine teardown reads
 	// exactly as it did before the gate existed.
 	buf.Reset()
-	if _, err := cmd.confirm(true, newPrompter(strings.NewReader("prod\n"), io.Discard), &buf, meta, datasphere.Usage{}); err != nil {
+	if _, err := cmd.confirm(true, newPrompter(strings.NewReader("prod\n"), io.Discard), &buf, meta, datasphere.Usage{}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(buf.String(), "storage:") {
@@ -957,5 +961,226 @@ func TestReleaseSucceedsWhenTheBucketIsAlreadyGone(t *testing.T) {
 	// should be told which half had already happened.
 	if !strings.Contains(errb.String(), "no longer exists") {
 		t.Errorf("stderr = %q, want a note that the recorded bucket is already gone", errb.String())
+	}
+}
+
+// blockingDelete is a cluster delete that is still running when release stops
+// waiting: it blocks until its context ends.
+type blockingDelete struct {
+	*fakeProvider
+	deadline time.Time
+	hadOne   bool
+	// neverSent stops before any delete reached the cloud.
+	neverSent bool
+}
+
+func (b *blockingDelete) DeleteCluster(ctx context.Context, _ planck.ClusterRef) error {
+	b.deadline, b.hadOne = ctx.Deadline()
+	<-ctx.Done()
+	if b.neverSent {
+		return fmt.Errorf("gke: look up cluster: %w", ctx.Err())
+	}
+	return fmt.Errorf("gke: cluster: %w (%w)", planck.ErrDeleteInProgress, ctx.Err())
+}
+
+// Release waits for the cluster to be gone, under a deadline — not forever, and
+// not just until the cloud accepts the request.
+func TestReleaseWaitsUnderADeadline(t *testing.T) {
+	saved := clusterDeleteTimeout
+	clusterDeleteTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { clusterDeleteTimeout = saved })
+	b := &blockingDelete{fakeProvider: &fakeProvider{}}
+	env, out, _, dir := newInstallEnv(t, output.ModeHuman)
+	recordInstance(t, dir, "prod", registerProvider(t, b))
+	ds := giveStorage(t, dir, "prod")
+	start := time.Now()
+
+	err := (&releaseCommand{assumeYes: true}).Run(context.Background(), env, []string{"prod"})
+	if !b.hadOne || b.deadline.After(start.Add(clusterDeleteTimeout+time.Second)) {
+		t.Errorf("the cluster delete ran without the release deadline (deadline %v, set %v)", b.deadline, b.hadOne)
+	}
+	// 5.3 finding 6: it used to report "(deleted)" and drop the record while
+	// the cloud was still deleting.
+	if err == nil || !strings.Contains(err.Error(), "still being deleted") || !strings.Contains(err.Error(), "re-run 'farcast release prod'") {
+		t.Fatalf("release = %v; want 'still being deleted' and the re-run", err)
+	}
+	if len(b.regDeleted) != 0 || ds.deletes != 0 {
+		t.Errorf("release went on to delete the registry or bucket while the cluster was still being deleted")
+	}
+	meta, lerr := dir.LoadInstanceMetadata("prod")
+	if lerr != nil || meta.Status != config.InstanceDeleting {
+		t.Errorf("the instance record was not kept, marked deleting: %+v, %v", meta, lerr)
+	}
+	if strings.Contains(out.String(), "(deleted)") {
+		t.Errorf("release printed (deleted) for a cluster still being deleted:\n%s", out.String())
+	}
+}
+
+// Ctrl-C stops the waiting the same way: the instance stays recorded.
+func TestReleaseInterruptedKeepsState(t *testing.T) {
+	b := &blockingDelete{fakeProvider: &fakeProvider{}}
+	env, _, _, dir := newInstallEnv(t, output.ModeHuman)
+	recordInstance(t, dir, "prod", registerProvider(t, b))
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(20 * time.Millisecond); cancel() }()
+
+	err := (&releaseCommand{assumeYes: true}).Run(ctx, env, []string{"prod"})
+	if err == nil || !strings.Contains(err.Error(), "still being deleted") {
+		t.Fatalf("release = %v; want 'still being deleted'", err)
+	}
+	if exists, _ := dir.InstanceExists("prod"); !exists {
+		t.Error("an interrupted release removed the instance record")
+	}
+}
+
+// keeperRelease is the instance keeperEnv records, made releasable through a
+// fake provider, with an empty bucket on record.
+func keeperRelease(t *testing.T) (*Env, *bytes.Buffer, config.Dir, *fakeStorage) {
+	t.Helper()
+	env, out, _, dir, passFile := keeperEnv(t, output.ModeHuman)
+	packet := enroll(t, env, passFile, "study-desktop")
+	if err := (&keeperInstallCommand{passphraseFile: passFile, acceptRisk: true}).Run(context.Background(), env, []string{packet}); err != nil {
+		t.Fatalf("keeper install: %v", err)
+	}
+	prov := registerFake(t, &fakeProvider{})
+	if _, err := dir.UpdateInstanceMetadata("prod", func(m *config.InstanceMetadata) error {
+		m.Provider = prov
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ds := giveStorage(t, dir, "prod")
+	return env, out, dir, ds
+}
+
+// 5.3 finding 7. Release destroyed the keyring and left this machine's keeper
+// holding a bundle derived from it — with no lawful use left, only the power
+// to open what the cloud may still hold. The bundle and leaf key go; the
+// ledger, the evidence of what the device did, stays and is still read.
+func TestReleaseWipesThisMachinesKeeperAndKeepsItsLedger(t *testing.T) {
+	env, out, dir, _ := keeperRelease(t)
+	kdir := dir.KeeperDir("prod")
+	store, err := keeper.OpenStore(kdir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := keyholder.AppendLedger(store.LedgerPath(), keyholder.LedgerEntry{
+		Time: time.Now().UTC(), Instance: "prod", Intent: keeper.IntentReseed, Result: "ok", Boot: "b1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&releaseCommand{assumeYes: true}).Run(context.Background(), env, []string{"prod"}); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	for _, f := range []string{"bundle.yaml", "leaf.key"} {
+		if _, err := os.Stat(filepath.Join(kdir, f)); !os.IsNotExist(err) {
+			t.Errorf("%s survived the release", f)
+		}
+	}
+	for _, f := range []string{"keeper.yaml", "ca.crt", "leaf.crt", "ledger.jsonl"} {
+		if _, err := os.Stat(filepath.Join(kdir, f)); err != nil {
+			t.Errorf("%s did not survive the release: %v", f, err)
+		}
+	}
+	if !strings.Contains(out.String(), "ledger kept") {
+		t.Errorf("release did not say the ledger was kept:\n%s", out.String())
+	}
+	out.Reset()
+	if err := (&keeperStatusCommand{}).Run(context.Background(), env, []string{"prod"}); err != nil || !strings.Contains(out.String(), "wiped") || !strings.Contains(out.String(), "reseeds     1") {
+		t.Errorf("keeper status after release = %v:\n%s", err, out.String())
+	}
+	if err := (&keeperRunCommand{once: true}).Run(context.Background(), env, []string{"prod"}); !errors.Is(err, keeper.ErrWiped) {
+		t.Errorf("keeper run after release = %v; want ErrWiped", err)
+	}
+}
+
+// A keeper directory with the released instance's name but another CA belongs
+// to another instance — names are local labels — and is left alone.
+func TestReleaseLeavesAForeignKeeperUntouched(t *testing.T) {
+	env, out, dir, _ := keeperRelease(t)
+	other, err := identity.Mint("prod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mtls, err := dir.LoadInstanceMTLS("prod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mtls.CACertPEM = other.CACertPEM
+	if err := dir.SaveInstanceMTLS("prod", mtls); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&releaseCommand{assumeYes: true}).Run(context.Background(), env, []string{"prod"}); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir.KeeperDir("prod"), "bundle.yaml")); err != nil {
+		t.Errorf("another instance's keeper bundle was wiped: %v", err)
+	}
+	if !strings.Contains(out.String(), "different instance") {
+		t.Errorf("release did not say why it left the keeper alone:\n%s", out.String())
+	}
+}
+
+// Keepers on other devices are out of reach; release names them, revoked ones
+// included — revoke does not reach a device either.
+func TestReleaseNamesKeepersOnOtherDevices(t *testing.T) {
+	env, out, dir, _ := keeperRelease(t)
+	if _, err := dir.UpdateInstanceMetadata("prod", func(m *config.InstanceMetadata) error {
+		m.Keepers = append(m.Keepers, config.Keeper{Device: "phone", Revoked: true}, config.Keeper{Device: "laptop"})
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&releaseCommand{assumeYes: true}).Run(context.Background(), env, []string{"prod"}); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	text := out.String()
+	if !strings.Contains(text, "phone (revoked)") || !strings.Contains(text, "laptop") || strings.Contains(text, "study-desktop,") ||
+		!strings.Contains(text, "farcast keeper uninstall prod") {
+		t.Errorf("release did not name the other devices, or what to run there:\n%s", text)
+	}
+}
+
+// 'keeper uninstall' on a device does what release does on the operator's
+// machine: the bundle and key go, the ledger and the record stay.
+func TestKeeperUninstallWipesAndKeepsTheLedger(t *testing.T) {
+	env, out, _, dir, passFile := keeperEnv(t, output.ModeHuman)
+	packet := enroll(t, env, passFile, "laptop")
+	if err := (&keeperInstallCommand{passphraseFile: passFile, acceptRisk: true}).Run(context.Background(), env, []string{packet}); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&keeperUninstallCommand{}).Run(context.Background(), env, []string{"prod"}); err == nil {
+		t.Error("an uninstall without confirmation, non-interactive, went ahead")
+	}
+	if err := (&keeperUninstallCommand{assumeYes: true}).Run(context.Background(), env, []string{"prod"}); err != nil {
+		t.Fatalf("keeper uninstall: %v", err)
+	}
+	kdir := dir.KeeperDir("prod")
+	if _, err := os.Stat(filepath.Join(kdir, "bundle.yaml")); !os.IsNotExist(err) {
+		t.Error("the bundle survived uninstall")
+	}
+	if _, err := os.Stat(filepath.Join(kdir, "keeper.yaml")); err != nil {
+		t.Errorf("the record did not survive uninstall: %v", err)
+	}
+	if !strings.Contains(out.String(), "ledger kept") {
+		t.Errorf("uninstall did not say the ledger was kept:\n%s", out.String())
+	}
+}
+
+// Stopped before the cloud confirmed a delete — at the lookup, say — release
+// must not claim the cloud is deleting: the cluster may be running and billing.
+func TestReleaseStoppedBeforeADeleteSaysTheClusterMayBeRunning(t *testing.T) {
+	b := &blockingDelete{fakeProvider: &fakeProvider{}, neverSent: true}
+	env, _, _, dir := newInstallEnv(t, output.ModeHuman)
+	recordInstance(t, dir, "prod", registerProvider(t, b))
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(20 * time.Millisecond); cancel() }()
+
+	err := (&releaseCommand{assumeYes: true}).Run(ctx, env, []string{"prod"})
+	if err == nil || strings.Contains(err.Error(), "the cloud continues") || !strings.Contains(err.Error(), "may still be running and billing") {
+		t.Fatalf("release = %v; want it to say the cluster may still be running, not that the cloud is deleting it", err)
+	}
+	if exists, _ := dir.InstanceExists("prod"); !exists {
+		t.Error("the instance record was removed")
 	}
 }

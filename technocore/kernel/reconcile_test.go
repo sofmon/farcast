@@ -43,6 +43,24 @@ type fakeCluster struct {
 	// other than what was asked for.
 	storeCPU int
 	storeMem int
+
+	// services is keyed namespace/name; a missing one is ErrNotFound, so a
+	// test that does not mention the carrier meters none.
+	services   map[string]kube.Service
+	serviceErr error
+	serviceHit []string
+}
+
+func (f *fakeCluster) GetService(_ context.Context, ns, name string) (*kube.Service, error) {
+	f.serviceHit = append(f.serviceHit, ns+"/"+name)
+	if f.serviceErr != nil {
+		return nil, f.serviceErr
+	}
+	svc, ok := f.services[ns+"/"+name]
+	if !ok {
+		return nil, kube.ErrNotFound
+	}
+	return &svc, nil
 }
 
 func (f *fakeCluster) SetRequests(_ context.Context, ns, name, container string, cpu, mem int, anns map[string]string) (int, int, error) {

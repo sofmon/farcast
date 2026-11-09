@@ -322,3 +322,46 @@ func TestWorkloadsAsksForBothKindsAndKeepsThem(t *testing.T) {
 		t.Errorf("fatline came back as %q", kinds["fatline"])
 	}
 }
+
+func TestConfigMapDataCarriesTheVersionItWasReadAt(t *testing.T) {
+	ctx := context.Background()
+	fr := &fakeRunner{out: map[string][]byte{"get": []byte(`{"metadata":{"resourceVersion":"42"},"data":{"pin":"x"}}`)}}
+	data, rv, found, err := NewWithRunner(fr).ConfigMapData(ctx, "farcast-system", "datasphered-pin")
+	if err != nil || !found || rv != "42" || data["pin"] != "x" {
+		t.Fatalf("= %v, %q, %v, %v", data, rv, found, err)
+	}
+	want := []string{"get", "configmap", "datasphered-pin", "-n", "farcast-system", "--ignore-not-found", "-o", "json"}
+	if !slices.Equal(fr.calls[0], want) {
+		t.Errorf("argv = %v, want %v", fr.calls[0], want)
+	}
+
+	if _, _, found, err := NewWithRunner(&fakeRunner{}).ConfigMapData(ctx, "ns", "name"); found || err != nil {
+		t.Errorf("an absent ConfigMap = found %v, %v", found, err)
+	}
+	// Without a version there is nothing to compare a replace against, and a
+	// replace without one is last-writer-wins.
+	fr = &fakeRunner{out: map[string][]byte{"get": []byte(`{"data":{"pin":"x"}}`)}}
+	if _, _, _, err := NewWithRunner(fr).ConfigMapData(ctx, "ns", "name"); err == nil {
+		t.Error("a ConfigMap with no resourceVersion was read as comparable")
+	}
+}
+
+// Create never overwrites and replace is refused on a stale version: neither
+// is apply, which is last-writer-wins and could move the pin backwards.
+func TestConfigMapWritesNeverApply(t *testing.T) {
+	ctx := context.Background()
+	fr := &fakeRunner{}
+	c := NewWithRunner(fr)
+	if err := c.CreateConfigMap(ctx, []byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ReplaceConfigMap(ctx, []byte("b")); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(fr.calls[0], []string{"create", "-f", "-"}) || string(fr.stdins[0]) != "a" {
+		t.Errorf("create = %v %q", fr.calls[0], fr.stdins[0])
+	}
+	if !slices.Equal(fr.calls[1], []string{"replace", "-f", "-"}) || string(fr.stdins[1]) != "b" {
+		t.Errorf("replace = %v %q", fr.calls[1], fr.stdins[1])
+	}
+}

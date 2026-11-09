@@ -1,6 +1,7 @@
 package keeper
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -44,7 +45,17 @@ type Config struct {
 	// actually returned rather than from what was intended.
 	BackupExcluded bool   `yaml:"backup_excluded"`
 	BackupNote     string `yaml:"backup_note,omitempty"`
+
+	// WipedAt is when this device's key material was wiped, and WipedReason
+	// why. The record and the ledger stay: the ledger is the evidence an
+	// audit reads, and 'keeper status' needs the record to read it.
+	WipedAt     time.Time `yaml:"wiped_at,omitzero"`
+	WipedReason string    `yaml:"wiped_reason,omitempty"`
 }
+
+// ErrWiped is a keeper whose material was wiped: it holds a record and a
+// ledger, and nothing it could push.
+var ErrWiped = errors.New("keeper: this device's material was wiped")
 
 // Store is one enrolled keeper's on-device state.
 type Store struct{ dir string }
@@ -158,6 +169,9 @@ func (s *Store) Config() (Config, error) {
 // key material in memory for the entire uptime of the device, to save a read of
 // a local file once a month.
 func (s *Store) Material() (caCertPEM, leafCertPEM, leafKeyPEM, bundle []byte, err error) {
+	if cfg, cerr := s.Config(); cerr == nil && !cfg.WipedAt.IsZero() {
+		return nil, nil, nil, nil, fmt.Errorf("%w on %s (%s)", ErrWiped, cfg.WipedAt.Format("2006-01-02"), cfg.WipedReason)
+	}
 	read := func(name string) []byte {
 		if err != nil {
 			return nil
@@ -179,13 +193,39 @@ func (s *Store) Material() (caCertPEM, leafCertPEM, leafKeyPEM, bundle []byte, e
 	return caCertPEM, leafCertPEM, leafKeyPEM, bundle, nil
 }
 
-// Remove deletes this keeper's material from the device.
+// CACert is the instance CA this keeper was enrolled under. It is public, and
+// it is what proves a keeper directory belongs to a given instance — names
+// are local labels, and another machine's instance may share one.
+func (s *Store) CACert() ([]byte, error) {
+	return os.ReadFile(filepath.Join(s.dir, caFile))
+}
+
+// Wipe deletes the two files on this device that could open anything: the
+// bundle and the leaf's private key.
 //
-// The ledger is deliberately KEPT: it is the record of what this device did
-// with key material, and a device that erased its own history on the way out
-// would remove exactly the evidence an audit needs afterwards.
-func (s *Store) Remove() error {
-	for _, f := range []string{caFile, leafFile, leafKey, bundleFile, configFile} {
+// The ledger is deliberately KEPT, and so is the record 'keeper status' needs
+// to read it (ADR 0008: a device that erased its own history on the way out
+// would remove exactly the evidence an audit needs afterwards). The
+// certificates stay too: they are public, and the leaf names the identity
+// every ledger entry was made under. The record is marked first, so a crash
+// part way leaves a keeper that refuses to run rather than one that has lost
+// its explanation. Idempotent: the first reason and date stand.
+func (s *Store) Wipe(reason string, at time.Time) error {
+	cfg, err := s.Config()
+	if err != nil {
+		return err
+	}
+	if cfg.WipedAt.IsZero() {
+		cfg.WipedAt, cfg.WipedReason = at.UTC(), reason
+		out, err := yaml.Marshal(cfg)
+		if err != nil {
+			return fmt.Errorf("keeper: encode the keeper record: %w", err)
+		}
+		if err := writeSecret(filepath.Join(s.dir, configFile), out); err != nil {
+			return err
+		}
+	}
+	for _, f := range []string{leafKey, bundleFile} {
 		if err := os.Remove(filepath.Join(s.dir, f)); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("keeper: removing %s: %w", f, err)
 		}

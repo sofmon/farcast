@@ -300,3 +300,41 @@ func TestAPartialHourIsSplitProportionally(t *testing.T) {
 	closeTo(t, l.expectedIn(periodStart.Add(time.Hour), periodStart.Add(2*time.Hour)), 1, "hour 1")
 	closeTo(t, l.Accrued().Total, 2, "total")
 }
+
+// Overhead counts toward the total and is never an application's.
+func TestOverheadCountsTowardTheTotalButIsNeverAnApplication(t *testing.T) {
+	l := newLedger(t)
+	at := periodStart.Add(time.Hour)
+	l.Accrue(at, "web", 1, time.Hour)
+	l.AccrueOverhead(at, "carrier", 0.025, time.Hour)
+	l.AccrueOverhead(at, "carrier", 0, time.Hour)
+	l.AccrueOverhead(at, "carrier", 1, 0)
+	if _, ok := l.ByApp()["carrier"]; ok {
+		t.Error("overhead was attributed to an application")
+	}
+	if got := l.ByOverhead()["carrier"]; got != 0.025 {
+		t.Errorf("overhead = %v, want 0.025 (zero rate or duration accrues nothing)", got)
+	}
+	if got := l.Accrued().Expected; got < 1.0249 || got > 1.0251 {
+		t.Errorf("expected = %v, want the application plus the carrier", got)
+	}
+}
+
+// The calibration finding behind metering the carrier: a provider's figure
+// includes the load balancer, so a model without it reads every confirmation
+// as Pods costing more than they do, and scales every price up.
+func TestAConfirmationOfPodsPlusTheCarrierCalibratesToOne(t *testing.T) {
+	l := newLedger(t)
+	for h := 1; h <= 24; h++ {
+		at := periodStart.Add(time.Duration(h) * time.Hour)
+		l.Accrue(at, "web", 0.03, time.Hour)
+		l.AccrueOverhead(at, "carrier", 0.025, time.Hour)
+	}
+	d, err := l.Confirm(Confirmation{Start: periodStart, End: periodStart.Add(24 * time.Hour), USD: 24 * 0.055})
+	if err != nil || d != nil {
+		t.Fatalf("confirm = %v, %v", d, err)
+	}
+	if got := l.Accrued().Calibration; got < 0.999 || got > 1.001 {
+		t.Errorf("calibration = %v; want 1 when the model includes the carrier", got)
+	}
+}

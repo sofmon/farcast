@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/sofmon/farcast/fatline"
+	"github.com/sofmon/farcast/fatline/identity"
 	fcrypto "github.com/sofmon/farcast/fatline/internal/crypto"
 	"github.com/sofmon/farcast/fatline/tunnel"
 )
@@ -160,6 +161,7 @@ func TestStreamPayloadNeverAppearsInFatLinesBytes(t *testing.T) {
 	addr := freeAddr(t)
 	startServer(t, fatline.Config{
 		TunnelListen: addr,
+		Instance:     "inst",
 		ServerCert:   serverCert(t, ca, "127.0.0.1"),
 		ClientCA:     ca.CertPool(),
 		Endpoint:     addr,
@@ -211,6 +213,7 @@ func TestRecorderSeesPlaintextWhenNotWrapped(t *testing.T) {
 	addr := freeAddr(t)
 	startServer(t, fatline.Config{
 		TunnelListen: addr,
+		Instance:     "inst",
 		ServerCert:   serverCert(t, ca, "127.0.0.1"),
 		ClientCA:     ca.CertPool(),
 		Endpoint:     addr,
@@ -245,6 +248,7 @@ func TestStreamRouteIsClosed(t *testing.T) {
 	addr := freeAddr(t)
 	startServer(t, fatline.Config{
 		TunnelListen: addr,
+		Instance:     "inst",
 		ServerCert:   serverCert(t, ca, "127.0.0.1"),
 		ClientCA:     ca.CertPool(),
 		Endpoint:     addr,
@@ -271,6 +275,7 @@ func TestStreamOrdinals(t *testing.T) {
 	addr := freeAddr(t)
 	startServer(t, fatline.Config{
 		TunnelListen: addr,
+		Instance:     "inst",
 		ServerCert:   serverCert(t, ca, "127.0.0.1"),
 		ClientCA:     ca.CertPool(),
 		Endpoint:     addr,
@@ -301,7 +306,7 @@ func TestStreamOrdinals(t *testing.T) {
 
 func TestStreamRouteValidation(t *testing.T) {
 	base := func(routes []fatline.StreamRoute) fatline.Config {
-		return fatline.Config{TunnelListen: "127.0.0.1:0", StreamRoutes: routes}
+		return fatline.Config{TunnelListen: "127.0.0.1:0", Instance: "inst", StreamRoutes: routes}
 	}
 	bad := [][]fatline.StreamRoute{
 		{{Name: "", Addr: "x:1"}},
@@ -314,6 +319,63 @@ func TestStreamRouteValidation(t *testing.T) {
 	for _, routes := range bad {
 		if _, err := fatline.New(base(routes)); err == nil {
 			t.Errorf("New accepted an invalid route table: %+v", routes)
+		}
+	}
+	// The control: without it, every case above could fail for some other
+	// reason and the test would pass having checked nothing.
+	if _, err := fatline.New(base([]fatline.StreamRoute{{Name: "a", Addr: "x:1"}})); err != nil {
+		t.Errorf("New refused a valid route table: %v", err)
+	}
+	// A keeper route must name a configured route.
+	cfg := base([]fatline.StreamRoute{{Name: "a", Addr: "x:1"}})
+	cfg.KeeperRoutes = []string{"b"}
+	if _, err := fatline.New(cfg); err == nil {
+		t.Error("New accepted a keeper route that names no configured route")
+	}
+}
+
+// A keeper device re-seeds a restarted keyholder replica and does nothing else
+// (ADR 0008 finding 4): it opens the routes listed for it, and the operator
+// opens every route.
+func TestAKeeperOpensOnlyItsRoutes(t *testing.T) {
+	ca, _ := fcrypto.NewCA("inst")
+	addr := freeAddr(t)
+	startServer(t, fatline.Config{
+		TunnelListen: addr,
+		Instance:     "inst",
+		ServerCert:   serverCert(t, ca, "127.0.0.1"),
+		ClientCA:     ca.CertPool(),
+		Endpoint:     addr,
+		StreamRoutes: []fatline.StreamRoute{
+			{Name: "keyholder", Addr: startEchoPlain(t)},
+			{Name: "shrike", Addr: startEchoPlain(t)},
+		},
+		KeeperRoutes: []string{"keyholder"},
+	})
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	keeper, err := tunnel.Connect(ctx, "https://"+addr, tunnel.ClientIdentity{
+		Cert: clientCert(t, ca, identity.KeeperURI("inst", "laptop")), CA: ca.CertPool(), ServerName: "127.0.0.1"})
+	if err != nil {
+		t.Fatalf("connect as a keeper: %v", err)
+	}
+	defer func() { _ = keeper.Close() }()
+	operator := operatorConn(t, ca, addr)
+
+	if c, err := keeper.DialStream(ctx, "keyholder", -1); err != nil {
+		t.Errorf("a keeper could not open its own route: %v", err)
+	} else {
+		_ = c.Close()
+	}
+	if c, err := keeper.DialStream(ctx, "shrike", -1); err == nil {
+		_ = c.Close()
+		t.Error("a keeper opened the operator's Shrike route")
+	}
+	for _, route := range []string{"keyholder", "shrike"} {
+		if c, err := operator.DialStream(ctx, route, -1); err != nil {
+			t.Errorf("the operator could not open %s: %v", route, err)
+		} else {
+			_ = c.Close()
 		}
 	}
 }

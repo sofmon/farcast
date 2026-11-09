@@ -1,6 +1,6 @@
-// Package cluster is a minimal kubectl-subprocess wrapper for the connect-time
-// FatLine bootstrap: apply a manifest stream, await a rollout, and read a
-// Service's external IP. It deliberately shells to kubectl rather than vendoring
+// Package cluster is a minimal kubectl-subprocess wrapper: apply a manifest
+// stream, await a rollout, read a Service's external IP, read the kernel's
+// checkpoint, and create or compare-and-replace the keyholder's key pin. It deliberately shells to kubectl rather than vendoring
 // a Kubernetes client — the CLI holds cloud credentials, so its dependency
 // surface is a security concern (ADR 0006), and the stored kubeconfig already
 // drives the control plane through the gke-gcloud-auth-plugin exec credential.
@@ -345,6 +345,49 @@ func (c *Client) ConfigMapValue(ctx context.Context, namespace, name, key string
 		return "", true, fmt.Errorf("cluster: %s/%s has no %q", namespace, name, key)
 	}
 	return value, true, nil
+}
+
+// ConfigMapData returns a ConfigMap's data and its resourceVersion, and
+// reports whether it exists. The resourceVersion is what ReplaceConfigMap
+// compares against: a write only over what was read.
+func (c *Client) ConfigMapData(ctx context.Context, namespace, name string) (map[string]string, string, bool, error) {
+	out, err := c.runner.Run(ctx, nil, "get", "configmap", name, "-n", namespace,
+		"--ignore-not-found", "-o", "json")
+	if err != nil {
+		return nil, "", false, err
+	}
+	if len(bytes.TrimSpace(out)) == 0 {
+		return nil, "", false, nil
+	}
+	var cm struct {
+		Metadata struct {
+			ResourceVersion string `json:"resourceVersion"`
+		} `json:"metadata"`
+		Data map[string]string `json:"data"`
+	}
+	if err := json.Unmarshal(out, &cm); err != nil {
+		return nil, "", false, fmt.Errorf("cluster: read %s/%s: %w", namespace, name, err)
+	}
+	if cm.Metadata.ResourceVersion == "" {
+		return nil, "", false, fmt.Errorf("cluster: %s/%s carries no resourceVersion", namespace, name)
+	}
+	return cm.Data, cm.Metadata.ResourceVersion, true, nil
+}
+
+// CreateConfigMap creates a ConfigMap and fails if it already exists. Unlike
+// Apply it never overwrites: the caller read "absent" and writes only over
+// that.
+func (c *Client) CreateConfigMap(ctx context.Context, manifest []byte) error {
+	_, err := c.runner.Run(ctx, manifest, "create", "-f", "-")
+	return err
+}
+
+// ReplaceConfigMap replaces a ConfigMap whose manifest names the
+// resourceVersion it was read at; the API server refuses it with a conflict
+// if anything has written since.
+func (c *Client) ReplaceConfigMap(ctx context.Context, manifest []byte) error {
+	_, err := c.runner.Run(ctx, manifest, "replace", "-f", "-")
+	return err
 }
 
 // Namespaces lists every namespace in the cluster.

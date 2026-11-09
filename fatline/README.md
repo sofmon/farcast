@@ -120,7 +120,8 @@ type Config struct {
 	EgressListen        string              // forward-proxy address (FARCAST_FATLINE_PROXY)
 	ServerCert          tls.Certificate     // this listener's server leaf + key
 	ClientCA            *x509.CertPool      // the per-instance CA — verifies operator clients
-	AllowClientIdentity func(uri string) bool // authorize a verified client's URI SAN (nil = any CA-signed cert)
+	Instance            string              // which instance this is; required with TunnelListen
+	KeeperRoutes        []string            // the stream routes a keeper leaf may open (the keyholder's)
 	Allowlist           []parser.External   // egress policy, deny-by-default
 	Events              event.Sink          // egress decisions; Shrike implements this in 2.2
 	Endpoint            string              // advertised endpoint, reported in status
@@ -223,6 +224,7 @@ FatLine's tunnel is mutually authenticated against **one per-instance Root CA** 
 - **The CA is the crown jewel and is operator-held — it never enters the cluster.** FatLine is shipped the CA *certificate* (to verify clients) plus its own *server leaf + key*; it is never given the CA private key. So a cloud compromise of the in-cluster Secret can read only the rotatable server leaf (which authenticates *this listener*), never mint new identities.
 - **Leg 1 — client verifies server.** The client trusts **only** the instance CA (`RootCAs`, no system-root fallback) and pins the server's `ServerName`/SAN.
 - **Leg 2 — server verifies client.** `tls.RequireAndVerifyClientCert` against the instance CA, plus a `VerifyConnection` SAN-identity check, so *"a valid cert from our CA"* is necessary but not sufficient. That SAN hook is the seam the 4.4 per-app identity and multi-operator models build on.
+- **Who the public tunnel admits — a fixed rule, not configuration.** *(Since 2026-10-08.)* This instance's operator leaf (`farcast://<instance>/operator`) and named keeper leaves (`farcast://<instance>/keeper/<device>`), and nothing else the CA issues. An application's leaf rests in a Kubernetes Secret, readable by whatever reads that namespace and by the cloud; before this rule any instance-CA leaf opened the public carrier, so one application's leaf could reach every stream route from anywhere. Thin-device leaves join only with the data route [ADR 0018](../docs/adr/0018-thin-device-storage.md) decision 7 specifies. The instance is read from FatLine's own server leaf (`<instance>.fatline.farcast`), the rule is applied at the handshake and re-checked on every request, and a keeper may open only `KeeperRoutes` — the keyholder's route; any other route answers `403` and is logged as `role_refused`.
 - **Choices.** TLS 1.3 only (a closed FarCast-to-FarCast channel — no 1.2 fallback to misconfigure), **ed25519** leaves/CA (ECDSA P-256 fallback only if a peer rejects ed25519), `crypto/rand` serials, CA validity 1–2 y, leaves 90 d. All stdlib: `crypto/tls`, `crypto/x509`, `crypto/ed25519`, `encoding/pem`.
 - **Identity SAN.** Operator identity is a SPIFFE-style URI SAN — `farcast://<instance>/operator` — so it composes with the per-app identities (`farcast://<instance>/app/<name>`) that 4.4 will pin. The server-leaf SAN is a single `serverIdentity` input, so the *same* issuance code serves whichever carrier 2.3 binds (a public DNS/IP, an in-cluster service name, or a URI identity).
 - **Storage.** Operator side: `ca.crt`, `ca.key`, `client.crt`, `client.key` (plus the rotatable `server.crt`/`server.key`) at `0600` under the instance's `fatline/` subdirectory in the [CLI instance store](../farsight/cli/README.md#configuration--credential-storage). Server side: the `fatline-mtls` Kubernetes `Secret` (`ca.crt`/`server.crt`/`server.key` — never `ca.key`).
@@ -269,7 +271,7 @@ Per [AGENTS.md](../AGENTS.md) and [ADR 0002](../docs/adr/0002-backend-language-s
 - **Egress** against `httptest`: a declared host is proxied; an undeclared host and an empty allowlist are denied; table-driven coverage of case-fold / trailing-dot / IP-literal-deny, `CONNECT` vs absolute-URI, the **fragmented-ClientHello SNI buffer/replay**, the `403`/`ErrDenied` deny behavior, and exactly-one-event-per-decision.
 - **Lifecycle** — `ctx`-cancellation drains cleanly (the Go-side analogue of the cancellation-safety tests ADR 0002 mandates for any future Rust data plane).
 - **Secret-safety** — TLS keys never appear in any log or `String()` output (the same guard Planck applies to its kubeconfig).
-- **Integration** — a real-cluster end-to-end test sits behind `//go:build integration` and is **never in CI** (cost pillar), mirroring [Planck](../planck/README.md#testing-strategy).
+- **Integration** — a real-cluster end-to-end test sits behind `//go:build integration` and is **never run by `./check.sh`** (cost pillar), mirroring [Planck](../planck/README.md#testing-strategy).
 
 ---
 

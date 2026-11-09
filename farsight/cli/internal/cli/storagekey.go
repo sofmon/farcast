@@ -42,12 +42,13 @@ func newStorageKeyCommand() Command {
 	subs.Register(&keyImportCommand{})
 	subs.Register(&keyRotateCommand{})
 	subs.Register(&keyRekeyCommand{})
+	subs.Register(&keyPinCommand{})
 	return &group{
 		name:     "key",
 		synopsis: "Manage the instance's storage keyring",
 		subs:     subs,
 		usage: `
-Usage: farcast storage key <list|export|import|rotate|rekey> <instance> [flags]
+Usage: farcast storage key <list|export|import|rotate|rekey|pin> <instance> [flags]
 
 The instance's storage keyring lives at <instance>/datasphere/keys.yaml, beside
 the data-plane CA key. Losing it is the permanent, unrecoverable loss of every
@@ -59,6 +60,7 @@ Subcommands:
   import   Merge an armored copy into the live keyring
   rotate   Add a new key-encryption key and make it active
   rekey    Rewrite stored objects under the active key-encryption key
+  pin      Write the in-cluster key pin from this keyring
 
 The supported backup is the one you already owe the CA key: copy the instance
 directory offline. export is for the case that does not cover — moving a
@@ -357,6 +359,8 @@ type keyRotateCommand struct {
 	assumeYes bool
 	// newKeyholder reaches the keyholder for the hand-over; nil dials it.
 	newKeyholder keyholderOpener
+	// newPinStore reaches the key pin; nil reaches the cluster.
+	newPinStore pinStoreOpener
 }
 
 func (*keyRotateCommand) Name() string     { return "rotate" }
@@ -386,6 +390,14 @@ This is what retires what a lost keeper device holds: its bundle carries the
 scope keys from before the rotation, and opens nothing written afterwards.
 
 ` + rotationScopeWarning + `
+
+The in-cluster key pin follows the rotation: it requires the new keys as soon
+as every replica is about to hold them, and retires the old ones once the new
+ones are in use. From then on a replica that restarts refuses any bundle from
+before the rotation — a keeper's included — even with no serving replica left
+to compare it against. Writing the pin needs kubectl and this instance's cloud
+credentials; if it cannot be written the rotation still happens, this exits
+non-zero, and 'farcast storage key pin' writes it afterwards.
 
 Once the new keys are in use, run 'farcast storage key rekey' to move existing
 objects onto them. Then re-enrol every keeper: each one's bundle predates the
@@ -423,6 +435,36 @@ func (c *keyRotateCommand) Run(ctx context.Context, env *Env, args []string) err
 			return nil
 		}
 	}
+	// The pin is read before anything is minted. A keyring that lacks a key
+	// the pin requires is behind the instance: rotating from it would put a
+	// replica onto keys that omit another machine's, and every replica would
+	// refuse them anyway. One that holds every required key and only writes
+	// under a retired one — what an import leaves — is left to the hand-over:
+	// with a replica serving the instance's current key, the hold keeps that
+	// key in use and the rotation moves this keyring past it. It is not moved
+	// onto "the newest key the pin does not retire" here: that can be a key an
+	// unfinished rotation left held on one machine only, which no replica
+	// holds — the randomized model found exactly that split.
+	var ps pinStore
+	var pinErr error
+	if m, err := env.ConfigDir.LoadInstanceMetadata(instance); err == nil && pinMeta(m) {
+		open := c.newPinStore
+		if open == nil {
+			open = defaultPinStore
+		}
+		if ps, pinErr = open(env.ConfigDir.InstanceKubeconfigPath(instance)); pinErr == nil {
+			cur, present, _, invalid, err := readPin(ctx, ps)
+			switch {
+			case err != nil:
+				pinErr = err
+			case present && invalid == nil:
+				if b := pinVerdict(cur, keyring); b != nil && len(b.Missing) > 0 {
+					return fmt.Errorf("%v, so nothing was rotated: %w", b,
+						keyringBehind(0, behindKey, "is held to keys this machine's keyring lacks by the instance's key pin", instance))
+				}
+			}
+		}
+	}
 	entry, err := datasphere.NewKey()
 	if err != nil {
 		return err
@@ -447,7 +489,8 @@ func (c *keyRotateCommand) Run(ctx context.Context, env *Env, args []string) err
 	// trip, and a 'farcast run' or 'key import' in between writes keys.yaml
 	// too: written over, the scope run just minted — and handed to the
 	// keyholder — would exist only in the replicas' memory.
-	last := raw
+	last, lastK := raw, keyring
+	checked := false
 	save := func(k datasphere.Keyring) error {
 		data, err := k.Marshal()
 		if err != nil {
@@ -456,7 +499,7 @@ func (c *keyRotateCommand) Run(ctx context.Context, env *Env, args []string) err
 		if err := env.ConfigDir.SaveInstanceKeyring(instance, last, data); err != nil {
 			return err
 		}
-		last = data
+		last, lastK = data, k
 		return nil
 	}
 	// Saved before any replica sees the new keys — they exist nowhere else
@@ -501,10 +544,54 @@ func (c *keyRotateCommand) Run(ctx context.Context, env *Env, args []string) err
 			rotated: previous,
 			beforeHold: func(k datasphere.Keyring) error {
 				pushedHeld = &k
+				// Checked before the save. The hold keeps in use a key every
+				// serving replica has; if the pin retired it, a replica is
+				// serving keys from before the instance's last rotation, every
+				// replica enforcing the pin would refuse the push, and saved
+				// first this machine would be left writing under a retired key.
+				if ps != nil && pinErr == nil {
+					if b := pinVerdictAt(ctx, ps, k); b != nil {
+						return fmt.Errorf("%w — a serving replica lacks the key this machine writes under, and the key the hand-over would fall back to is one the pin retired. "+
+							"'farcast storage unseal %s' brings that replica to this machine's keys; then rotate again", b, instance)
+					}
+				}
 				return save(k)
 			},
-			beforeActivate: func() error { return save(rotated) },
+			// The pin moves here, and not before the hold: only now has every
+			// serving replica confirmed — asked twice — that it holds the new
+			// keys, so this keyring is behind none of them. Written earlier,
+			// a pin from a keyring the fleet then refused as behind would lock
+			// out the machine whose keys the fleet serves. It is handed to
+			// every replica live before any is told to use the new keys, so a
+			// sealed one cannot be re-seeded without them in between. It is
+			// written from the keyring already saved — the held one, which
+			// holds every key the active one does — and retires nothing yet:
+			// the old keys may still be put back.
+			beforeActivate: func(client sealStateClient) error {
+				if ps != nil && pinErr == nil && pushedHeld != nil {
+					w, err := writePin(ctx, ps, *pushedHeld, false, false)
+					var behind *pinBehind
+					switch {
+					case errors.As(err, &behind):
+						return behind
+					case err != nil:
+						pinErr = err
+					default:
+						for _, row := range raisePins(ctx, client, replicaCount(meta), w.Pin, false, instance, heldKeys(*pushedHeld)) {
+							if !row.Raised {
+								fprintf(env.Err, "warning: keyholder replica %d %s\n", row.Ordinal, row.Note)
+							}
+						}
+					}
+				}
+				return save(rotated)
+			},
 		})
+		// The pin follows only a hand-over that checked this keyring against
+		// the fleet. One that never reached the replicas, or found this
+		// keyring behind them, has nothing to say about what the instance's
+		// keys are.
+		checked = res.Problem == "" && res.Behind == ""
 		result.Keyholder = describeRotation(res, instance)
 		// In use means some replica writes under the new keys. A push that
 		// reached none leaves this machine alone on them — beside replicas
@@ -519,6 +606,10 @@ func (c *keyRotateCommand) Run(ctx context.Context, env *Env, args []string) err
 			// fleet. Every replica holds the new keys, so leaving it on them
 			// splits nothing.
 			result.Keyholder += ". This machine's keyring stays on the new keys: a replica that refused them did not say afterwards what it holds"
+		case ps != nil && pinVerdictAt(ctx, ps, *pushedHeld) != nil:
+			// Another machine finished a rotation meanwhile and retired the
+			// keys this one would go back to; the replicas would refuse them.
+			result.Keyholder += ". This machine's keyring stays on the new keys: the instance's key pin has retired the ones it would go back to"
 		default:
 			if err := save(*pushedHeld); err != nil {
 				result.Keyholder += fmt.Sprintf(". This machine's keyring could NOT be put back (%v): it writes under the new keys, which no replica uses", err)
@@ -530,6 +621,13 @@ func (c *keyRotateCommand) Run(ctx context.Context, env *Env, args []string) err
 			// rotation puts new ones in use.
 			result.Next = fmt.Sprintf("farcast storage unseal %s, then farcast storage key rotate %s", instance, instance)
 			result.Unfinished = fmt.Sprintf("every replica is sealed, so the applications' new keys are not in use: run 'farcast storage unseal %s', then 'farcast storage key rotate %s' again", instance, instance)
+		case res.Behind != "":
+			result.Next = ""
+			result.Unfinished = "this keyring is behind the instance's — a replica took another machine's keys while this rotation ran (above); " +
+				"bring this keyring up to date, then rotate again"
+			if result.Active {
+				result.Status = "partial"
+			}
 		case !result.Active && res.ForeignCopy:
 			result.Next = ""
 			result.Unfinished = "a replica serves another machine's copy of a scope this machine minted too, so the applications' new keys are not in use: " +
@@ -556,8 +654,21 @@ func (c *keyRotateCommand) Run(ctx context.Context, env *Env, args []string) err
 	if merr == nil && len(scopes) > 0 {
 		result.Reenrol = keepersToReenrol(meta)
 	}
+	// The pin follows what this machine now writes under, and only now
+	// retires: whatever was put back has been put back.
+	var pinUnwritten error
+	switch {
+	case merr != nil || !pinMeta(meta) || len(scopes) == 0:
+	case !checked:
+		result.Pin = "not moved: the hand-over did not check this keyring against the replicas, so it says nothing about the instance's keys"
+	default:
+		result.Pin, pinUnwritten = c.finishPin(ctx, env, meta, ps, pinErr, lastK)
+	}
 	if err := env.Printer.Print(result); err != nil {
 		return err
+	}
+	if pinUnwritten != nil && result.Unfinished == "" {
+		return pinUnwritten
 	}
 	if result.Unfinished != "" {
 		// Not success: what an operator rotates for — retiring what a lost
@@ -566,6 +677,64 @@ func (c *keyRotateCommand) Run(ctx context.Context, env *Env, args []string) err
 		return rotationUnfinished(result.Unfinished)
 	}
 	return nil
+}
+
+// finishPin writes the pin from the keyring this rotation left saved, retiring
+// what it replaced, and hands it to every replica now. It never blocks the
+// rotation: the keys moved whether or not the pin did, and the error it returns
+// is printed after the result.
+func (c *keyRotateCommand) finishPin(ctx context.Context, env *Env, meta *config.InstanceMetadata, ps pinStore, pinErr error, k datasphere.Keyring) (string, error) {
+	unwritten := func(err error) (string, error) {
+		var behind *pinBehind
+		if errors.As(err, &behind) {
+			// Ahead, not behind: the pin already refuses what this rotation
+			// would have it refuse, and this keyring is what it is ahead of.
+			line := fmt.Sprintf("NOT moved: %v. %s", behind, behindRemedy(behind, meta.Name))
+			return line, rotationUnfinished("the key pin is ahead of this keyring; " + behindRemedy(behind, meta.Name))
+		}
+		line := fmt.Sprintf("NOT written (%v): a replica that restarts may still admit a bundle from before this rotation. Run %s, then 'farcast storage key rekey %s'",
+			err, pinRemedy(meta.Name), meta.Name)
+		return line, rotationUnfinished("the key pin was not written; " + pinRemedy(meta.Name) + " writes it")
+	}
+	if ps == nil || pinErr != nil {
+		if pinErr == nil {
+			pinErr = errors.New("the pin was not reached")
+		}
+		return unwritten(pinErr)
+	}
+	w, err := writePin(ctx, ps, k, true, false)
+	if err != nil {
+		return unwritten(err)
+	}
+	line := fmt.Sprintf("requires %s, retires %s", plural(len(w.Pin.Require), "key", "keys"), plural(len(w.Pin.Retired), "key", "keys"))
+	open := c.newKeyholder
+	if open == nil {
+		open = openKeyholder
+	}
+	client, done, err := open(ctx, env, meta.Name)
+	if err != nil {
+		return line + fmt.Sprintf("; not handed to the replicas live (%v) — each loads it when it next restarts", err), nil
+	}
+	defer done()
+	raised := 0
+	for _, row := range raisePins(ctx, client, replicaCount(meta), w.Pin, false, meta.Name, heldKeys(k)) {
+		if row.Raised {
+			raised++
+		} else {
+			fprintf(env.Err, "warning: keyholder replica %d %s\n", row.Ordinal, row.Note)
+		}
+	}
+	return line + fmt.Sprintf("; %d of %d replicas enforce it now", raised, replicaCount(meta)), nil
+}
+
+// pinVerdictAt reads the instance's pin and checks a keyring against it. No
+// pin, or one that cannot be read, has nothing to say, so it reads as nil.
+func pinVerdictAt(ctx context.Context, ps pinStore, k datasphere.Keyring) *pinBehind {
+	cur, present, _, invalid, err := readPin(ctx, ps)
+	if err != nil || !present || invalid != nil {
+		return nil
+	}
+	return pinVerdict(cur, k)
 }
 
 // rotationUnfinished is a rotation that did not reach every serving replica,
@@ -595,6 +764,10 @@ func describeRotation(res handOverResult, instance string) string {
 		return fmt.Sprintf("not handed the new keys: %s. %s", res.Problem, unused)
 	case res.Problem != "":
 		return fmt.Sprintf("not handed the new keys: %s. %s. Run %s again once that is fixed", res.Problem, unused, again)
+	case res.Behind != "" && len(res.Loaded) == 0:
+		return fmt.Sprintf("not handed the new keys: %s. %s", res.Behind, unused)
+	case res.Behind != "":
+		return fmt.Sprintf("%d of %d replicas write under the new keys (generation %d); then %s", len(res.Loaded), res.Total, res.Generation, res.Behind)
 	case !res.Activated && res.Cause == heldNoneServing:
 		return fmt.Sprintf("%s: %s, and with none serving nothing would stop a keeper re-seeding the keys from before. "+
 			"Run 'farcast storage unseal %s', then %s again", unused, res.Reason, instance, again)
@@ -647,8 +820,11 @@ type keyRotateResult struct {
 	// every replica that serves.
 	Unfinished string   `json:"unfinished,omitempty"`
 	Reenrol    []string `json:"reenrol,omitempty"`
-	Next       string   `json:"next"`
-	Status     string   `json:"status"`
+	// Pin says what the instance's key pin now holds, or that it could not be
+	// written.
+	Pin    string `json:"pin,omitempty"`
+	Next   string `json:"next"`
+	Status string `json:"status"`
 }
 
 func (r keyRotateResult) Human(w io.Writer) error {
@@ -663,6 +839,9 @@ func (r keyRotateResult) Human(w io.Writer) error {
 	}
 	if r.Keyholder != "" {
 		fprintf(w, "  keyholder: %s\n", r.Keyholder)
+	}
+	if r.Pin != "" {
+		fprintf(w, "  key pin:   %s\n", r.Pin)
 	}
 	if r.Active && r.Unfinished == "" {
 		fprintf(w, "  existing objects still read under their original keys; move them with:\n      %s\n", r.Next)

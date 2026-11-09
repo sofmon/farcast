@@ -156,6 +156,9 @@ type Config struct {
 	// address — that is what keeps an operator credential from becoming a
 	// general port-forward into the cluster.
 	StreamRoutes []string
+	// KeeperRoutes names the stream routes a keeper device may open as well
+	// as the operator. Every other route is the operator's alone.
+	KeeperRoutes []string
 
 	// ShrikeImage co-schedules the Shrike monitor as a sidecar. Empty renders
 	// FatLine alone, which is what every deployment did before 2.2's sidecar
@@ -225,6 +228,7 @@ func Render(c Config) ([]byte, error) {
 		ServerCert:      base64.StdEncoding.EncodeToString(c.ServerCertPEM),
 		ServerKey:       base64.StdEncoding.EncodeToString(c.ServerKeyPEM),
 		StreamRoutes:    c.StreamRoutes,
+		KeeperRoutes:    c.KeeperRoutes,
 		MTLSHash:        mtlsHash(c.CACertPEM, c.ServerCertPEM, c.ServerKeyPEM),
 
 		ShrikeImage:           c.ShrikeImage,
@@ -262,6 +266,7 @@ func mtlsHash(parts ...[]byte) string {
 
 type templateData struct {
 	StreamRoutes    []string
+	KeeperRoutes    []string
 	Namespace       string
 	Name            string
 	Image           string
@@ -409,6 +414,9 @@ spec:
 {{- end}}
 {{- range .StreamRoutes}}
             - --stream-route={{.}}
+{{- end}}
+{{- range .KeeperRoutes}}
+            - --keeper-route={{.}}
 {{- end}}
           ports:
             - name: tunnel

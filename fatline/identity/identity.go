@@ -5,17 +5,22 @@
 // The trust root is one self-signed CA per instance — the instance's sovereign
 // data-plane identity, with no public CA, ACME, or Google IAM in the path
 // (ADR 0005). The CA issues an operator client leaf (URI SAN
-// farcast://<instance>/operator) and a FatLine server leaf (DNS SAN
-// <instance>.fatline.farcast, the pinned server name). The CA private key is
-// the crown jewel: the operator holds it and it is NEVER shipped to the
-// cluster — only the CA certificate and the server leaf+key are.
+// farcast://<instance>/operator), a FatLine server leaf (DNS SAN
+// <instance>.fatline.farcast, the pinned server name), and later keeper and
+// application client leaves. FatLine's public tunnel admits the operator's
+// and the keepers' and nothing else. The CA private key is the crown jewel:
+// the operator holds it and it is NEVER shipped to the cluster — only the CA
+// certificate and the server leaf+key are.
 package identity
 
 import (
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 
 	fcrypto "github.com/sofmon/farcast/fatline/internal/crypto"
 )
@@ -31,7 +36,21 @@ func OperatorURI(instance string) string {
 // public DNS — so the certificate is independent of whatever address the
 // carrier actually listens on (ADR 0005's carrier-independent server identity).
 func ServerName(instance string) string {
-	return instance + ".fatline.farcast"
+	return instance + serverNameSuffix
+}
+
+const serverNameSuffix = ".fatline.farcast"
+
+// InstanceFromServerName is ServerName's inverse. It accepts exactly one label
+// before the suffix: FatLine reads which instance it serves from its own
+// server leaf, and anything looser would let a malformed leaf name a
+// different one.
+func InstanceFromServerName(name string) (string, bool) {
+	inst, ok := strings.CutSuffix(name, serverNameSuffix)
+	if !ok || inst == "" || strings.Contains(inst, ".") {
+		return "", false
+	}
+	return inst, true
 }
 
 // KeyholderServerName is the DataSphere keyholder's pinned identity (a DNS
@@ -45,6 +64,26 @@ func KeyholderServerName(instance string) string {
 // is named so that one can be revoked without revoking the fleet.
 func KeeperURI(instance, device string) string {
 	return "farcast://" + instance + "/keeper/" + device
+}
+
+// KeeperBundleURIPrefix starts the URI SAN that binds a keeper's leaf to the
+// one bundle it was enrolled with. The keyholder refuses a keeper's push whose
+// bundle does not hash to it: a key ID is a label, so without this a leaf
+// could push keys of its own making under the IDs the instance pins.
+// datasphere/keyholder mirrors it; a test asserts the two agree.
+const KeeperBundleURIPrefix = "urn:farcast:keeper-bundle:sha256:"
+
+const keeperBundleDomain = "farcast-keeper-bundle-v1"
+
+// KeeperBundleDigest is the digest a keeper leaf binds: SHA-256 over a domain
+// label and the marshalled bundle. It is a function of key material, so it
+// rests only on the device beside the bundle and is never written where the
+// cloud stores anything.
+func KeeperBundleDigest(bundle []byte) string {
+	h := sha256.New()
+	h.Write([]byte(keeperBundleDomain))
+	h.Write(bundle)
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // AppURI is the identity a deployed application presents to the keyholder's
@@ -125,18 +164,26 @@ func IssueKeyholderServer(caCertPEM, caKeyPEM []byte, instance string) (certPEM,
 // only automatic revocation: a device that is never re-enrolled stops being
 // able to re-seed. `keeper revoke` is immediate for the operator's own records
 // and bounded by this date in the cluster.
-func IssueKeeperClient(caCertPEM, caKeyPEM []byte, instance, device string) (certPEM, keyPEM []byte, err error) {
+//
+// It also binds the bundle the device is given (KeeperBundleURIPrefix), so the
+// leaf re-seeds with that bundle and no other: a stolen leaf cannot carry keys
+// of its own making, and once a rotation moves the instance's key pin past the
+// bundle, the leaf can push nothing at all.
+func IssueKeeperClient(caCertPEM, caKeyPEM []byte, instance, device string, bundle []byte) (certPEM, keyPEM []byte, err error) {
 	if instance == "" {
 		return nil, nil, errors.New("identity: empty instance name")
 	}
 	if device == "" {
 		return nil, nil, errors.New("identity: empty device name")
 	}
+	if len(bundle) == 0 {
+		return nil, nil, errors.New("identity: a keeper leaf binds a bundle, and none was given")
+	}
 	ca, err := fcrypto.LoadCA(caCertPEM, caKeyPEM)
 	if err != nil {
 		return nil, nil, err
 	}
-	leaf, err := ca.IssueClient(KeeperURI(instance, device))
+	leaf, err := ca.IssueClientBinding(KeeperURI(instance, device), KeeperBundleURIPrefix+KeeperBundleDigest(bundle))
 	if err != nil {
 		return nil, nil, fmt.Errorf("identity: issue keeper client cert: %w", err)
 	}

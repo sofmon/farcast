@@ -1,8 +1,8 @@
 //go:build integration
 
 // These tests drive the instance-registry capability (ADR 0007) against a live
-// GCP project. They are excluded from normal builds and CI by the
-// //go:build integration tag: they create real cloud resources and need real
+// GCP project. They are excluded from normal builds and test runs (./check.sh
+// only type-checks them) by the //go:build integration tag: they create real cloud resources and need real
 // credentials. Run them deliberately.
 //
 // Token minting only (cheap, creates nothing — one OAuth2 token exchange):

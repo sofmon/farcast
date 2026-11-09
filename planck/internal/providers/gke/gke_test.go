@@ -20,6 +20,10 @@ type fakeClient struct {
 	createErr   error
 	deleteErr   error
 	deleteCalls int
+	deleteOp    string     // the operation delete returns
+	opStates    []opResult // returned by successive operationDone() calls; the last repeats
+	opCalls     int
+	opNames     []string
 }
 
 type stateResult struct {
@@ -33,6 +37,9 @@ func (f *fakeClient) validate(context.Context) error { return f.validateErr }
 func (f *fakeClient) get(context.Context, planck.ClusterRef) (clusterState, bool, error) {
 	i := f.getCalls
 	f.getCalls++
+	if len(f.states) == 0 {
+		return clusterState{}, false, nil
+	}
 	if i >= len(f.states) {
 		i = len(f.states) - 1
 	}
@@ -48,9 +55,22 @@ func (f *fakeClient) create(_ context.Context, in createInput) error {
 	return nil
 }
 
-func (f *fakeClient) delete(context.Context, planck.ClusterRef) error {
+func (f *fakeClient) delete(context.Context, planck.ClusterRef) (string, error) {
 	f.deleteCalls++
-	return f.deleteErr
+	return f.deleteOp, f.deleteErr
+}
+
+func (f *fakeClient) operationDone(_ context.Context, op string) (bool, error) {
+	f.opNames = append(f.opNames, op)
+	i := f.opCalls
+	f.opCalls++
+	if len(f.opStates) == 0 {
+		return true, nil
+	}
+	if i >= len(f.opStates) {
+		i = len(f.opStates) - 1
+	}
+	return f.opStates[i].done, f.opStates[i].err
 }
 
 func newTestProvider(api clusterAPI) *provider {
@@ -139,13 +159,105 @@ func TestClusterStatusNotFound(t *testing.T) {
 }
 
 func TestDeleteClusterIdempotent(t *testing.T) {
-	api := &fakeClient{} // delete returns nil even though no cluster exists
+	api := &fakeClient{states: []stateResult{{exists: false}}}
 	p := newTestProvider(api)
 	if err := p.DeleteCluster(context.Background(), planck.ClusterRef{Name: "demo"}); err != nil {
 		t.Fatalf("DeleteCluster: %v", err)
 	}
-	if api.deleteCalls != 1 {
-		t.Errorf("delete called %d times, want 1", api.deleteCalls)
+	if api.deleteCalls != 0 {
+		t.Errorf("delete called %d times for an absent cluster, want 0", api.deleteCalls)
+	}
+}
+
+var (
+	running  = stateResult{state: clusterState{RawStatus: "RUNNING"}, exists: true}
+	stopping = stateResult{state: clusterState{RawStatus: "STOPPING"}, exists: true}
+	failed   = stateResult{state: clusterState{RawStatus: "ERROR"}, exists: true}
+	gone     = stateResult{exists: false}
+)
+
+// Release dropped the instance record the moment GKE accepted the delete —
+// about 200 seconds before the cluster was gone on the 5.3 walk. The delete
+// now returns once the cluster is absent.
+func TestDeleteClusterWaitsUntilGone(t *testing.T) {
+	api := &fakeClient{states: []stateResult{running, stopping, stopping, gone},
+		deleteOp: "projects/p/locations/l/operations/op-1", opStates: []opResult{{done: false}, {done: false}, {done: true}}}
+	if err := newTestProvider(api).DeleteCluster(context.Background(), planck.ClusterRef{Name: "demo"}); err != nil {
+		t.Fatalf("DeleteCluster: %v", err)
+	}
+	if api.getCalls != 4 || len(api.opNames) == 0 || api.opNames[0] != api.deleteOp {
+		t.Errorf("returned after %d look(s), waiting on %v; want it to wait until the cluster is gone", api.getCalls, api.opNames)
+	}
+}
+
+func TestDeleteClusterOperationFailureIsAnError(t *testing.T) {
+	api := &fakeClient{states: []stateResult{running, stopping}, deleteOp: "op",
+		opStates: []opResult{{done: true, err: errors.New("quota")}}}
+	err := newTestProvider(api).DeleteCluster(context.Background(), planck.ClusterRef{Name: "demo"})
+	if err == nil || !strings.Contains(err.Error(), "demo") {
+		t.Fatalf("DeleteCluster = %v; want the failed operation, naming the cluster", err)
+	}
+}
+
+// A delete already in flight — an earlier release interrupted — is waited on,
+// not requested again: GKE refuses a second operation meanwhile.
+func TestDeleteClusterAlreadyStoppingWaitsWithoutReissuing(t *testing.T) {
+	api := &fakeClient{states: []stateResult{stopping, stopping, gone}}
+	if err := newTestProvider(api).DeleteCluster(context.Background(), planck.ClusterRef{Name: "demo"}); err != nil {
+		t.Fatalf("DeleteCluster: %v", err)
+	}
+	if api.deleteCalls != 0 {
+		t.Errorf("a second delete was requested while one was running")
+	}
+}
+
+func TestDeleteClusterContextCancelledWhileStopping(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	api := &fakeClient{states: []stateResult{running, stopping}}
+	p := newTestProvider(api)
+	p.pollInterval = 50 * time.Millisecond
+	go func() { time.Sleep(20 * time.Millisecond); cancel() }()
+	err := p.DeleteCluster(ctx, planck.ClusterRef{Name: "demo"})
+	if !errors.Is(err, context.Canceled) || !errors.Is(err, planck.ErrDeleteInProgress) || api.deleteCalls != 1 {
+		t.Fatalf("DeleteCluster = %v after %d delete(s); want 'still being deleted' wrapping context.Canceled", err, api.deleteCalls)
+	}
+}
+
+func TestDeleteClusterThatComesBackIsAFailure(t *testing.T) {
+	for name, after := range map[string]stateResult{"error": failed, "running": running} {
+		api := &fakeClient{states: []stateResult{running, stopping, after}}
+		if err := newTestProvider(api).DeleteCluster(context.Background(), planck.ClusterRef{Name: "demo"}); err == nil {
+			t.Errorf("a cluster %s again after STOPPING was reported deleted", name)
+		}
+	}
+}
+
+// Right after the request the cluster may still show the state from before
+// it — and deleting one a failed install left in ERROR is ordinary.
+func TestDeleteClusterStaleStateBeforeStoppingIsNotAFailure(t *testing.T) {
+	api := &fakeClient{states: []stateResult{failed, failed, stopping, gone}, deleteOp: "op", opStates: []opResult{{done: false}}}
+	if err := newTestProvider(api).DeleteCluster(context.Background(), planck.ClusterRef{Name: "demo"}); err != nil {
+		t.Fatalf("DeleteCluster: %v", err)
+	}
+}
+
+func TestDeleteClusterGoneRightAfterTheRequest(t *testing.T) {
+	api := &fakeClient{states: []stateResult{running, gone}}
+	if err := newTestProvider(api).DeleteCluster(context.Background(), planck.ClusterRef{Name: "demo"}); err != nil || api.deleteCalls != 1 {
+		t.Fatalf("DeleteCluster = %v after %d delete(s)", err, api.deleteCalls)
+	}
+}
+
+func TestOperationPath(t *testing.T) {
+	c := &gkeClient{project: "p"}
+	for in, want := range map[string]string{
+		"op-1":                                   "projects/p/locations/l/operations/op-1",
+		"projects/p/locations/l/operations/op-2": "projects/p/locations/l/operations/op-2",
+		"":                                       "",
+	} {
+		if got := c.operationPath("l", in); got != want {
+			t.Errorf("operationPath(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
 
@@ -226,9 +338,8 @@ func TestNewRequiresProject(t *testing.T) {
 func TestLazyClientWiring(t *testing.T) {
 	orig := newClient
 	t.Cleanup(func() { newClient = orig })
-	fake := &fakeClient{states: []stateResult{
-		{state: clusterState{RawStatus: "RUNNING", Endpoint: "uid.us-central1.gke.goog"}, exists: true},
-	}}
+	up := stateResult{state: clusterState{RawStatus: "RUNNING", Endpoint: "uid.us-central1.gke.goog"}, exists: true}
+	fake := &fakeClient{states: []stateResult{up, up, up, up, {exists: false}}}
 	built := 0
 	newClient = func(planck.Config) (clusterAPI, error) {
 		built++

@@ -206,3 +206,55 @@ func TestIssueAppClientChainsToCAWithItsOwnURI(t *testing.T) {
 		}
 	}
 }
+
+func TestInstanceFromServerName(t *testing.T) {
+	if got, ok := InstanceFromServerName(ServerName("prod")); !ok || got != "prod" {
+		t.Errorf("round trip = %q, %v", got, ok)
+	}
+	for _, name := range []string{"", "fatline.farcast", ".fatline.farcast", "a.b.fatline.farcast",
+		"prod.datasphered.farcast", "prod.fatline.farcast.evil", "prod"} {
+		if got, ok := InstanceFromServerName(name); ok {
+			t.Errorf("InstanceFromServerName(%q) = %q; want refused", name, got)
+		}
+	}
+}
+
+// The same vector lives in datasphere/keyholder's tests: this package issues
+// the digest and the keyholder checks it, and the two mirror rather than
+// import.
+func TestKeeperBundleDigestMirrorsTheKeyholder(t *testing.T) {
+	const want = "66f2f344be17652ffb333e89fa3e3306f7efc493f5d77c7d1a663f63c20137d2"
+	if got := KeeperBundleDigest([]byte("version: 1\n")); got != want {
+		t.Errorf("KeeperBundleDigest = %s, want %s", got, want)
+	}
+}
+
+// A keeper's leaf names the device first and the bundle second. The device URI
+// is what every listener admits on; the bundle URI is what the keyholder holds
+// the push to.
+func TestAKeeperLeafBindsItsBundle(t *testing.T) {
+	m, err := Mint("prod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle := []byte("version: 1\n")
+	certPEM, _, err := IssueKeeperClient(m.CACertPEM, m.CAKeyPEM, "prod", "laptop", bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, _ := pem.Decode(certPEM)
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cert.URIs) != 2 || cert.URIs[0].String() != KeeperURI("prod", "laptop") ||
+		cert.URIs[1].String() != KeeperBundleURIPrefix+KeeperBundleDigest(bundle) {
+		t.Errorf("URIs = %v; want the keeper, then its bundle", cert.URIs)
+	}
+	if cert.Subject.CommonName != KeeperURI("prod", "laptop") {
+		t.Errorf("subject = %q", cert.Subject.CommonName)
+	}
+	if _, _, err := IssueKeeperClient(m.CACertPEM, m.CAKeyPEM, "prod", "laptop", nil); err == nil {
+		t.Error("a keeper leaf was issued binding no bundle")
+	}
+}

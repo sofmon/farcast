@@ -3,6 +3,7 @@ package gke
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	container "cloud.google.com/go/container/apiv1"
 	"cloud.google.com/go/container/apiv1/containerpb"
@@ -27,8 +28,14 @@ type clusterAPI interface {
 	// create requests creation of a cluster. It returns once the create
 	// operation is accepted (not necessarily ready).
 	create(ctx context.Context, in createInput) error
-	// delete requests deletion; deleting an absent cluster returns nil.
-	delete(ctx context.Context, ref planck.ClusterRef) error
+	// delete requests deletion and returns the long-running operation to wait
+	// on ("projects/P/locations/L/operations/OP"), or "" when there is
+	// nothing to wait on (cluster absent, or the cloud finished inline). A
+	// terminal operation error is returned as an error.
+	delete(ctx context.Context, ref planck.ClusterRef) (string, error)
+	// operationDone reports whether a cluster operation has finished,
+	// surfacing its terminal error if it failed.
+	operationDone(ctx context.Context, op string) (bool, error)
 }
 
 // createInput is the neutral, defaults-resolved description of the cluster to
@@ -171,10 +178,43 @@ func privateControlPlaneConfig() *containerpb.ControlPlaneEndpointsConfig {
 	}
 }
 
-func (c *gkeClient) delete(ctx context.Context, ref planck.ClusterRef) error {
-	_, err := c.svc.DeleteCluster(ctx, &containerpb.DeleteClusterRequest{Name: c.clusterPath(ref)})
+func (c *gkeClient) delete(ctx context.Context, ref planck.ClusterRef) (string, error) {
+	op, err := c.svc.DeleteCluster(ctx, &containerpb.DeleteClusterRequest{Name: c.clusterPath(ref)})
 	if status.Code(err) == codes.NotFound {
-		return nil // already gone — deletion is idempotent
+		return "", nil // already gone — deletion is idempotent
 	}
-	return err
+	if err != nil {
+		return "", err
+	}
+	if op.GetStatus() == containerpb.Operation_DONE {
+		if e := op.GetError(); e != nil && e.GetCode() != 0 {
+			return "", fmt.Errorf("operation %s failed: %s (code %d)", op.GetName(), e.GetMessage(), e.GetCode())
+		}
+		return "", nil
+	}
+	return c.operationPath(ref.Location, op.GetName()), nil
+}
+
+// operationPath is a cluster operation's full name. The project id, not the
+// operation's self link, which carries the project NUMBER.
+func (c *gkeClient) operationPath(location, op string) string {
+	switch {
+	case op == "":
+		return ""
+	case strings.HasPrefix(op, "projects/"):
+		return op
+	default:
+		return c.locationPath(location) + "/operations/" + op
+	}
+}
+
+func (c *gkeClient) operationDone(ctx context.Context, op string) (bool, error) {
+	got, err := c.svc.GetOperation(ctx, &containerpb.GetOperationRequest{Name: op})
+	if err != nil {
+		return false, err
+	}
+	if e := got.GetError(); e != nil && e.GetCode() != 0 {
+		return true, fmt.Errorf("operation %s failed: %s (code %d)", op, e.GetMessage(), e.GetCode())
+	}
+	return got.GetStatus() == containerpb.Operation_DONE, nil
 }

@@ -18,6 +18,35 @@ An instance installed, connected, keyholder deployed and unsealed at least once 
 
 A second machine is genuinely needed for the parts that matter. A keeper installed on the operator's own laptop proves the mechanics and proves nothing about the property — the whole point is a device that holds a bundle and does not hold the keyring. The 2026-10-06 walk did exactly that, deliberately, and the three criteria it could not answer are the measure of what the shortcut costs.
 
+Before anything billable: `./check.sh --model` passes at the commit being walked; record the commit and the check's summary line with the results.
+
+**Every keeper enrolled before 2026-10-08 must be re-enrolled; none of them works against the current keyholder.** Two things changed, both described in [ADR 0008's *The in-cluster key pin, and a keeper bound to its bundle*](../adr/0008-in-cluster-key-delivery.md#the-in-cluster-key-pin-and-a-keeper-bound-to-its-bundle):
+
+- **A keeper's leaf now binds its bundle.** `keeper enroll` issues the leaf with a second URI SAN, `urn:farcast:keeper-bundle:sha256:…`, a digest over the exact bundle the device is given. The keyholder refuses, with code `keeper-bundle`, a keeper push whose leaf binds no bundle or a different one. A leaf from before the change binds none, so every push it makes is refused.
+- **The keyholder enforces an in-cluster key pin.** A ConfigMap, `datasphered-pin` in `farcast-system`, holds two flat sets of KEK ids: the keys a bundle must hold, and the keys no scope may write under any more. It holds no scope names. Every replica reads the pin at start and refuses, with code `below-pin`, a bundle that falls short of it, whether the replica is sealed or serving. `rotate` and `run` raise it.
+
+FatLine's public tunnel also admits only the operator's leaf and keeper leaves now, and a keeper may open only the keyholder's stream route. An application's leaf is refused at the handshake.
+
+### The walk probe
+
+Several checks below need a client the CLI refuses to be: a keeper claiming the operator's authority, a device pushing a bundle that is not its own, a hand-made request with an intent of your choosing. Until 2026-10-08 there was no tooling for that, and "a hand-made request" was left to the walker. There is now a build-tagged probe, which is Go in this repository and adds no tool to the operator's machine. It runs from the checkout being walked:
+
+```bash
+# go test runs in the package's directory, so relative paths are resolved
+# against FARCAST_WALK_CWD — the directory you run from.
+probe() { FARCAST_WALK=1 FARCAST_WALK_INSTANCE="$INSTANCE" FARCAST_WALK_CWD="$PWD" "$@" \
+  go test -mod=vendor -tags walk -count=1 -run TestWalkProbe -v ./farsight/cli/internal/cli/; }
+# e.g. probe env FARCAST_WALK_PROBE=state
+
+# As the enrolled device, with its own leaf and bundle from its newest packet.
+# It is a function rather than one long variable, so it works in zsh too.
+PACKET=./study.packet
+asdevice() { probe env FARCAST_WALK_LEAF=packet:"$PACKET" FARCAST_WALK_BUNDLE=packet:"$PACKET" \
+  FARCAST_WALK_PASSPHRASE_FILE=./pass "$@"; }
+```
+
+`FARCAST_WALK_PROBE` is one of `packet`, `state`, `push`, `seal`, `release-hold`, `tunnel` or `open`. The inputs are listed in the header of [`walkprobe_test.go`](../../farsight/cli/internal/cli/walkprobe_test.go): `FARCAST_WALK_LEAF` (`operator` | `store:<dir>` | `packet:<file>`), `FARCAST_WALK_BUNDLE` (`store:<dir>` | `packet:<file>` | `keys:<file>` | `keys:@live`, this machine's keyring), `FARCAST_WALK_PASSPHRASE_FILE`, `FARCAST_WALK_ORDINAL`, `FARCAST_WALK_INTENT`, `FARCAST_WALK_GENERATION`, `FARCAST_WALK_CERT` and `FARCAST_WALK_KEY` for `tunnel`, `FARCAST_WALK_PACKET` and `FARCAST_WALK_OBJECT` for `packet` and `open`, and `FARCAST_WALK_HOLD=1` to make `seal` a hold. It prints key ids and never key material. The packet and its passphrase file stay on the operator's machine after enrolment, so `packet:"$PACKET"` is the device's leaf and bundle there. `keeper enroll` refuses to overwrite its `--out` file. So each time the device is re-enrolled (section 5's `--budget 1`, section 6a), write the new packet to a new path, install it on the device, and set `PACKET` to it. [The consolidated walk runbook](phase-5-session-a.md) runs every check below in one session.
+
 ---
 
 ## 1. Does enrolment produce something only that device can use?
@@ -29,6 +58,12 @@ farcast keeper enroll "$INSTANCE" study-desktop --out ./study.packet --passphras
 **Expect:** a 0600 packet, a reported expiry about 90 days out, and — with one device enrolled — the line saying two are wanted.
 
 Then check what is *not* in it. The packet is armored, so open it with the passphrase and confirm the CA key and the keyring are absent, and that the leaf's URI is `farcast://<instance>/keeper/study-desktop`. The unit suite asserts this; the walk should confirm it against a real instance's own material, because the assertion is only as good as the fixture behind it.
+
+```bash
+probe env FARCAST_WALK_PROBE=packet FARCAST_WALK_PACKET=./study.packet FARCAST_WALK_PASSPHRASE_FILE=./pass
+```
+
+**Expect:** two leaf URIs, `farcast://<instance>/keeper/study-desktop` and `urn:farcast:keeper-bundle:sha256:…`, a clientAuth-only extended key usage and an expiry about 90 days out. Then `the leaf binds the bundle it carries`, the bundle's scopes with their KEK ids, and `checked against this machine's keyring: no master key in the bundle`. The probe prints `FAIL` and fails if the packet carries a master key id or any private key besides the leaf's. *(Corrected 2026-10-08: this step said "open it" with nothing to open it with. The probe is that tool, and the second URI is new.)*
 
 ## 2. Does a device with no FarCast state become a keeper?
 
@@ -60,7 +95,7 @@ farcast keeper run "$INSTANCE" --once
 
 **Expect:** `replica 0: re-seeded … (process <boot>)`, storage serving again, and a ledger entry naming the device and the boot.
 
-Then the part worth watching: an application that was receiving `ErrStorageSealed` recovers **without a restart**, exactly as it does after a manual unseal.
+Then the part worth watching: replica 0 rejoins the data Service's endpoints and the application keeps serving **without a restart**, exactly as after a manual unseal. *(Corrected 2026-10-08: with only `datasphered-0` deleted, replica 1 is still serving and the Service routes to it, so the application never sees `ErrStorageSealed` here. To watch an application recover from a seal, delete both Pods — and since the status-endpoint fix of 2026-10-08, an application with every replica sealed reports `sealed` rather than unavailable.)*
 
 ## 4. Does it refuse an operator hold?
 
@@ -71,7 +106,21 @@ farcast keeper run "$INSTANCE" --once
 
 **Expect:** `hold — sealed by the operator: runbook`, no push attempted, and no ledger entry. Then confirm the second line of defence by pushing anyway with a hand-made request: the keyholder must refuse `restart-reseed` against a hold on its own, without relying on the device's good behaviour.
 
+```bash
+asdevice FARCAST_WALK_PROBE=push FARCAST_WALK_INTENT=restart-reseed FARCAST_WALK_ORDINAL=0
+```
+
+**Expect** `replica 0 REFUSED` with code `operator-hold`, and the hold still in place in `farcast storage state "$INSTANCE"`.
+
 And then push the way a **modified** keeper would, because the honest request is not the threat. With the device's own leaf: `POST /v1/release-hold`, `POST /v1/seal?hold=true`, and an unseal claiming `intent=operator-unseal`. **Expect `403 permission` for all three, and the hold untouched.** Until 2026-10-06 all three succeeded: the control surface took its authority from the request, and the walk's own probe passed only because it declared its intent honestly.
+
+```bash
+asdevice FARCAST_WALK_PROBE=release-hold FARCAST_WALK_ORDINAL=0
+asdevice FARCAST_WALK_PROBE=seal FARCAST_WALK_HOLD=1 FARCAST_WALK_ORDINAL=1
+asdevice FARCAST_WALK_PROBE=push FARCAST_WALK_INTENT=operator-unseal FARCAST_WALK_ORDINAL=0
+```
+
+*(Added 2026-10-08: until now this step named no tool for the hand-made requests. The probe is that tool.)*
 
 ## 5. Does the budget refuse, and is the refusal legible?
 
@@ -85,6 +134,10 @@ This is the criterion the boot label exists for, and it needs a push that a rest
 
 The 2026-10-06 walk produced one by pushing a second time into a replica that was **serving** — and that push is now refused outright (`409 already-serving`): a re-seed only reaches a replica that restarted. That is the better outcome, a solicitation into a live process stopped rather than detected afterwards, and it is worth confirming first. With the device's own leaf, push `restart-reseed` at a serving replica: **expect `already-serving`, and the replica's keys untouched** (`farcast storage state` shows no replica flagged).
 
+```bash
+asdevice FARCAST_WALK_PROBE=push FARCAST_WALK_INTENT=restart-reseed FARCAST_WALK_ORDINAL=0   # replica 0 serving
+```
+
 The audit can still be walked, because a plain seal is indistinguishable from a restart by design. Re-seed a restarted replica; seal it with `farcast storage seal` — no `--hold`, and **no restart**; then let the keeper re-seed it again. Same process, two re-seeds.
 
 ```bash
@@ -92,6 +145,29 @@ farcast keeper status "$INSTANCE"
 ```
 
 **Expect:** `PROCESS(ES) RE-SEEDED MORE THAN ONCE`, naming the boot and the count. A clean fleet must report *nothing to explain*; the walk should see both states, because a detector that only ever says "fine" has not been tested. A refused push is counted and reported separately, and never trips the flag.
+
+## 6a. Does a keeper stand down once the instance holds keys it lacks?
+
+*(Added 2026-10-08.)* A keeper's bundle carries the scopes that existed when it was enrolled. A keyholder replaces its whole set on a push, so a keeper re-seeding a restarted replica after a new application was deployed would leave that replica serving without the new application's keys, and refusing every request for it. The key pin is what lets a restarted replica, which holds nothing to compare against, know that.
+
+Deploy a fresh set of applications, so `run` mints new scopes. `--namespace` mints them without editing the manifest:
+
+```bash
+farcast run "$INSTANCE" github.com/sofmon/farcast --manifest manifest/examples/sdk-demo/farcast --namespace sdk-demo-2
+```
+
+**Expect:** the new scopes minted with the key-loss warning, then handed to the serving replicas. The key pin is raised silently. A `warning: the instance's key pin was not raised` line means it was not, and the rest of this step cannot pass. `kubectl -n farcast-system get configmap datasphered-pin -o yaml` shows more `require` key ids than before, and no scope name. The output ends with a re-enrol list. It starts *"Every keeper's bundle predates …"* and gives one `farcast keeper enroll "$INSTANCE" study-desktop --out <path> --passphrase-file <path>` line per enrolled device.
+
+Then, before re-enrolling anything, restart a replica and let the keeper look:
+
+```bash
+wc -l < "<the device's config dir>/keepers/$INSTANCE/ledger.jsonl"    # on the device: note the count
+kubectl -n farcast-system delete pod datasphered-0
+farcast storage state "$INSTANCE"                                      # replica 0 restart-sealed
+farcast keeper run "$INSTANCE" --once                                  # on the device
+```
+
+**Expect** `replica 0: stale-bundle`, with a reason naming the key pin: the replica's pin refuses this device's bundle because an application was added. Expect also no push, the device's ledger line count unchanged, and replica 0 still `restart-sealed`. Then recover it from the operator's machine with `farcast storage unseal "$INSTANCE"`. Re-enrol and reinstall the device from the list `run` printed before going on. Its next packet binds the new bundle. `enroll` refuses to overwrite an existing file, so give it a new `--out`, such as `./study-2.packet`, and set `PACKET` to it so `asdevice` presents the device as it now is.
 
 ## 7. Does revocation say what it does not do?
 
@@ -109,6 +185,55 @@ farcast storage key rekey "$INSTANCE" -y       # moves stored objects onto them
 ```
 
 **Expect:** rotate reports a new KEK for **every application scope**, not only the instance's own, and that all replicas hold them and write under them; rekey reports a non-zero `rewritten` count. Then the half that matters for a fleet: with one replica made unreachable — its State call must fail; a replica caught mid-restart answers restart-sealed, which is a different case (below) — rotate must report the new keys **held on some and in use on none, this machine included**, and exit non-zero: it hands a rotation over in two steps, and activates only once every serving replica holds the new key and still holds it when asked again. `farcast storage key list` must show each application scope's active key unchanged from before that rotate. `farcast storage unseal` run now must **not** make the new keys active (it hands over this machine's keyring, in which they are held). Then, with every replica answering, run rotate once more: it must report all replicas holding and writing under the newest keys, and `farcast storage state` must flag no replica. Finally, copy a `keys.yaml` from before the rotation over this machine's and run `farcast storage unseal`: it must **refuse** (this keyring is behind the instance's) and push nothing — restore the current file afterwards. The sealed cases: with one replica restart-sealed and the other serving, rotate finishes and reports one replica sealed, to receive the keys on the next unseal; with **every** replica sealed it must stop at the hold, say so, and leave each scope's active key unchanged — with none serving, nothing would stop a keeper re-seeding the keys from before. And with one replica sealed and the other unreachable, `farcast storage unseal` must leave the sealed one sealed and name `--unchecked`; with `--unchecked` it unseals it, and still does not push the unreachable one. Then open an object with the material the revoked device's packet carries: it must fail (`blob is sealed under a key the keyring does not hold`). The 2026-10-06 walk ran this as written then — `storage rekey` — and found the command did not exist and the real pair rewrote 0 of 4 objects; this is the re-walk of that.
+
+*(Added 2026-10-08: how to do the two hand-made parts of this step.)*
+
+**Making one replica unreachable.** Scale the keyholder down by one:
+
+```bash
+kubectl -n farcast-system scale statefulset datasphered --replicas=1
+farcast storage state "$INSTANCE"      # replica 1: an error, not a phase
+```
+
+The CLI keeps asking for ordinal 1, because it reads the replica count recorded in the instance's metadata and not the cluster's. FatLine's relay then cannot dial `datasphered-1`. It logs `dial_failed` and the CLI sees a `502`, which is the failed State call the step needs. When the unreachable-replica checks are done:
+
+```bash
+kubectl -n farcast-system scale statefulset datasphered --replicas=2
+```
+
+That recreates replica 1, restart-sealed, which is the starting point of the sealed cases above. **Caveat:** scaling down destroys replica 1's process and its keys. It is not just silent. So this tests the CLI's handling of a replica that does not answer. It does not test a replica that is silent to the operator while still serving applications, and nothing here can produce that case by hand.
+
+**Opening an object with the revoked device's keys,** after `rekey` has rewritten it:
+
+```bash
+probe env FARCAST_WALK_PROBE=open FARCAST_WALK_PACKET="$PACKET" FARCAST_WALK_PASSPHRASE_FILE=./pass \
+  FARCAST_WALK_OBJECT='<an application object rekey rewrote, e.g. app/sdk-demo/alpha/hello>'
+```
+
+**Expect** `ErrUnknownKey — the object is under a key this device never held`. The device can still compute the object's stored name, since names are not rotated, but it cannot open the object. `READ … this device's keys still open it` is the failure this step exists to catch.
+
+### 7a. The key pin, with no serving replica left, and the bundle a keeper leaf is bound to
+
+*(Added 2026-10-08.)* Run this after the rotation has finished with every replica answering, and before the device is re-enrolled, so that `$PACKET` still holds its pre-rotation bundle. Before the pin existed, a replica that had restarted held nothing to compare a bundle against. With the whole fleet restarted at once, a keeper enrolled before a rotation re-seeded the retired keys and nothing refused it. Seal the fleet that way:
+
+```bash
+kubectl -n farcast-system delete pod -l app.kubernetes.io/name=datasphered
+farcast storage state "$INSTANCE"                       # both restart-sealed; none serving
+farcast keeper run "$INSTANCE" --once                   # on the device
+asdevice FARCAST_WALK_PROBE=push FARCAST_WALK_INTENT=restart-reseed FARCAST_WALK_ORDINAL=0
+```
+
+**Expect** the keeper to report `stale-bundle`, naming the key pin, and push nothing. That is the device behaving. The probe then pushes anyway, as a device that does not behave would. Expect `replica 0 REFUSED` with code `below-pin`. That is the keyholder refusing on its own, with no serving replica to compare against. Both replicas stay `restart-sealed`.
+
+Then, still with both sealed, present the device's leaf with a bundle that is current and satisfies the pin but is not the one the leaf was issued for. The operator's own keyring will do:
+
+```bash
+probe env FARCAST_WALK_PROBE=push FARCAST_WALK_LEAF=packet:"$PACKET" FARCAST_WALK_PASSPHRASE_FILE=./pass \
+  FARCAST_WALK_BUNDLE=keys:@live \
+  FARCAST_WALK_INTENT=restart-reseed FARCAST_WALK_ORDINAL=0
+```
+
+**Expect** `replica 0 REFUSED` with code `keeper-bundle`. The leaf's `urn:farcast:keeper-bundle:sha256:…` names one bundle, and a stolen keeper leaf can push only that bundle, which the pin refuses after a rotation. Then `farcast storage unseal "$INSTANCE"` brings both replicas back on the operator's keys. Re-enrol any keeper being kept.
 
 ## 8. Does the device survive its own restart, and the platform's?
 
@@ -134,6 +259,9 @@ Two keepers double the bundles at rest and double the solicitation endpoints. Co
 | 8 | A rebooted keeper resumes with its ledger, budget and file modes intact | ⏸ **partly** — modes confirmed 0600 inside 0700; the reboot was not performed and the backup exclusion has no Linux equivalent to check |
 | 9 | Two devices are visible as a fleet, with expiries, and their budgets read as a total | ⏸ **not walked** — needs a second device |
 | 10 | Teardown leaves no billable resource — verified independently, not from local state | ✅ all eight resource classes zero against the cloud APIs |
+| 11 | A restarted replica refuses a pre-rotation bundle with no serving replica left (the key pin, `below-pin`) | ⏸ **added 2026-10-08, not yet walked** — section 7a |
+| 12 | A keeper leaf pushing a bundle other than its own is refused (`keeper-bundle`) | ⏸ **added 2026-10-08, not yet walked** — section 7a |
+| 13 | After a `run` that mints a scope, a keeper refuses to re-seed a restarted replica (`stale-bundle`, naming the pin), writes no ledger entry, and `storage unseal` recovers the replica | ⏸ **added 2026-10-08, not yet walked** — section 6a |
 
 ### Criterion 7 is the one that failed
 
@@ -143,7 +271,7 @@ The remedy is what failed. `storage key rekey` rotated **no key at all** and re-
 
 Until that is fixed, **revocation has no teeth**: the only bound on a lost keeper is its certificate's own 90-day expiry.
 
-**Fixed 2026-10-06, not re-walked.** `rotate` now gives every scope a new KEK and hands it to serving replicas; `rekey` rewrites each object under its own scope's key and refuses to move any until every replica holds it; `revoke` prints that sequence. A unit test drives exactly the walk's failure — the material a keeper enrolled before the rotation would carry — and proves it opens none of the applications' objects afterwards. The re-walk is the procedure in section 7 above. What it still cannot do is stated in the command and in [ADR 0008](../adr/0008-in-cluster-key-delivery.md#what-the-2026-10-06-walk-found-and-what-changed): names stay computable, and a restarted replica can still be re-seeded with old keys by a device that is not honest, until the in-cluster key-id pin exists.
+**Fixed 2026-10-06, not re-walked.** `rotate` now gives every scope a new KEK and hands it to serving replicas; `rekey` rewrites each object under its own scope's key and refuses to move any until every replica holds it; `revoke` prints that sequence. A unit test drives exactly the walk's failure — the material a keeper enrolled before the rotation would carry — and proves it opens none of the applications' objects afterwards. The re-walk is the procedure in section 7 above. What it still cannot do is stated in the command and in [ADR 0008](../adr/0008-in-cluster-key-delivery.md#what-the-2026-10-06-walk-found-and-what-changed): names stay computable, and a restarted replica can still be re-seeded with old keys by a device that is not honest, until the in-cluster key-id pin exists. *(Updated 2026-10-08: the pin exists now, together with the keeper-bundle binding. Section 7a and criteria 11–12 are its walk. Names stay computable.)*
 
 ### What a second machine still owes
 
