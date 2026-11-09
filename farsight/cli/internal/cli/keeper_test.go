@@ -16,10 +16,12 @@ import (
 	"encoding/pem"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/goccy/go-yaml"
 
@@ -386,6 +388,96 @@ func TestKeeperReEnrolmentReadmitsARevokedDevice(t *testing.T) {
 	}
 	if meta.Keepers[0].Revoked {
 		t.Error("re-enrolling did not readmit the device")
+	}
+}
+
+// Budgets add across a fleet while each device refuses only against its own
+// (ADR 0008 finding 6), so the machine that enrolled the fleet reads them as a
+// total: two devices at 8 and 1 a month admit 9 re-seeds a month, which no
+// single device's status shows. A revoked device leaves the total.
+func TestKeeperStatusTotalsTheFleetBudget(t *testing.T) {
+	env, out, _, _, passFile := keeperEnv(t, output.ModeHuman)
+	_ = enroll(t, env, passFile, "study-desktop")
+	small := &keeperEnrollCommand{
+		out: filepath.Join(t.TempDir(), "laptop.packet"), passphraseFile: passFile,
+		budget: 1, window: keeper.DefaultWindow,
+	}
+	if err := small.Run(context.Background(), env, []string{"prod", "laptop"}); err != nil {
+		t.Fatal(err)
+	}
+
+	status := func() string {
+		t.Helper()
+		out.Reset()
+		if err := (&keeperStatusCommand{}).Run(context.Background(), env, nil); err != nil {
+			t.Fatalf("keeper status: %v", err)
+		}
+		return out.String()
+	}
+	got := status()
+	for _, want := range []string{
+		"study-desktop  until ", "budget 8 per 30 days", "laptop  until ", "budget 1 per 30 days",
+		"fleet budget: up to 9 reseeds per 30 days across 2 device(s)",
+		"a total of limits, not of use",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("status lacks %q:\n%s", want, got)
+		}
+	}
+
+	if err := (&keeperRevokeCommand{assumeYes: true}).Run(context.Background(), env, []string{"prod", "laptop"}); err != nil {
+		t.Fatal(err)
+	}
+	got = status()
+	if !strings.Contains(got, "fleet budget: up to 8 reseeds per 30 days across 1 device(s)") {
+		t.Errorf("a revoked device still counts toward the fleet budget:\n%s", got)
+	}
+	if strings.Contains(got, "budget 1 per") {
+		t.Errorf("a revoked device's row still shows a budget it can no longer use:\n%s", got)
+	}
+}
+
+// The total is per window — a sum across windows means nothing — and counts
+// only keepers that can still push.
+func TestFleetBudgetsGroupByWindowAndSkipWhatCannotPush(t *testing.T) {
+	now := time.Date(2026, 11, 9, 0, 0, 0, 0, time.UTC)
+	month, week := keeper.DefaultWindow, 7*24*time.Hour
+	fleet := map[string][]config.Keeper{
+		"prod": {
+			{Device: "a", Budget: 8, Window: month, Expires: now.Add(time.Hour)},
+			{Device: "b", Budget: 2, Window: month},
+			{Device: "c", Budget: 3, Window: week},
+			{Device: "revoked", Budget: 50, Window: month, Revoked: true},
+			{Device: "expired", Budget: 50, Window: month, Expires: now},
+			{Device: "legacy", Budget: 4},
+		},
+		"lab": {{Device: "z", Budget: 1, Window: month}},
+	}
+	got := fleetBudgets(fleet, now)
+	want := []fleetBudget{
+		{Instance: "lab", Window: "30 days", Devices: 1, Reseeds: 1},
+		{Instance: "prod", Window: "", Devices: 1, Reseeds: 4},
+		{Instance: "prod", Window: "30 days", Devices: 2, Reseeds: 10},
+		{Instance: "prod", Window: "7 days", Devices: 1, Reseeds: 3},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("fleetBudgets =\n %+v\nwant\n %+v", got, want)
+	}
+
+	// A budget with no window cannot be added to anyone's, and the line says
+	// what to do about it rather than printing a sum without a period.
+	var buf bytes.Buffer
+	if err := (keeperStatusResult{Fleet: fleetRows(fleet), FleetBudget: got}).Human(&buf); err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range []string{
+		"fleet budget: 4 reseed(s) across 1 device(s) enrolled before windows were recorded — re-enrol them to total it",
+		"fleet budget: up to 10 reseeds per 30 days across 2 device(s)",
+		"fleet budget: up to 3 reseeds per 7 days across 1 device(s)",
+	} {
+		if !strings.Contains(buf.String(), line) {
+			t.Errorf("status lacks %q:\n%s", line, buf.String())
+		}
 	}
 }
 

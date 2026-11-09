@@ -201,9 +201,9 @@ type BudgetState struct {
 
 func (b BudgetState) String() string {
 	if b.Allowed {
-		return fmt.Sprintf("%d of %d reseeds used in the last %s", b.Used, b.Limit, humanWindow(b.Window))
+		return fmt.Sprintf("%d of %d reseeds used in the last %s", b.Used, b.Limit, HumanWindow(b.Window))
 	}
-	msg := fmt.Sprintf("the reseed budget is spent: %d of %d in the last %s", b.Used, b.Limit, humanWindow(b.Window))
+	msg := fmt.Sprintf("the reseed budget is spent: %d of %d in the last %s", b.Used, b.Limit, HumanWindow(b.Window))
 	if !b.Oldest.IsZero() {
 		msg += fmt.Sprintf(", and none expires before %s", b.Oldest.Add(b.Window).UTC().Format(time.RFC3339))
 	}
@@ -232,7 +232,9 @@ func Budget(entries []keyholder.LedgerEntry, limit int, window time.Duration, no
 	return b
 }
 
-func humanWindow(d time.Duration) string {
+// HumanWindow names a budget window the way an operator sets it: in days once
+// it is a day or more.
+func HumanWindow(d time.Duration) string {
 	if d >= 24*time.Hour {
 		return fmt.Sprintf("%d days", int(d.Hours()/24))
 	}

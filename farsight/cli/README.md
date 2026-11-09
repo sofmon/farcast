@@ -806,7 +806,7 @@ farcast keeper revoke  <instance> <device> [-y]
 farcast keeper uninstall <instance>
 ```
 
-`enroll` and `revoke` run on the machine holding the CA key. `install`, `run` and `uninstall` run on the device — `uninstall` wipes its bundle and leaf key and keeps its ledger and record, and `farcast release` does the same to a keeper installed on the releasing machine. `status` runs on either and reads whatever ledgers that machine has.
+`enroll` and `revoke` run on the machine holding the CA key. `install`, `run` and `uninstall` run on the device — `uninstall` wipes its bundle and leaf key and keeps its ledger and record, and `farcast release` does the same to a keeper installed on the releasing machine. `status` runs on either and reads whatever ledgers that machine has. On the machine that enrolled the fleet it also lists each device with its expiry and budget, and totals the budgets of the devices that can still push, per window: two devices at 8 a month admit 16 re-seeds a month, which no one device's status shows. That is a total of limits — what each device has used is in its own ledger, on that device. (Since 2026-11-09; a device enrolled before then has no window recorded, and status says to re-enrol it to count it.)
 
 ### What a keeper holds, and what it therefore cannot do
 

@@ -19,8 +19,11 @@
 // way the CLI does ($FARCAST_CONFIG_HOME, then the user config directory).
 //
 // go test runs the probe in the package's directory, not the caller's, so a
-// relative path is resolved against FARCAST_WALK_CWD — set it to "$PWD" — and
-// refused without it rather than looked for in the wrong place.
+// relative path is resolved against FARCAST_WALK_CWD, and refused without it
+// rather than looked for in the wrong place. The Session A runbook sets it to
+// a scratch directory outside the checkout: the files a walk passes here are
+// keyring copies, packets and a passphrase, and none of them belongs where a
+// commit could pick it up.
 //
 // Probes (FARCAST_WALK_PROBE):
 //

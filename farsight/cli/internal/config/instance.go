@@ -192,6 +192,11 @@ type Keeper struct {
 	Expires    time.Time `yaml:"expires,omitzero"`
 	Generation uint64    `yaml:"generation,omitempty"`
 	Budget     int       `yaml:"budget,omitempty"`
+	// Window is the period Budget counts over. Budgets add across the fleet
+	// (ADR 0008 finding 6), and a sum is only meaningful within one window,
+	// so the window is recorded beside the budget. Zero on a record written
+	// before 2026-11-09, which status reports as unrecorded.
+	Window time.Duration `yaml:"window,omitempty"`
 	// Revoked marks a device the operator has withdrawn. The row stays, so an
 	// audit of old ledger entries can still attribute them.
 	Revoked   bool      `yaml:"revoked,omitempty"`

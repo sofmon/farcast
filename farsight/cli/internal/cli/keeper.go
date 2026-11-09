@@ -254,7 +254,7 @@ func (c *keeperEnrollCommand) Run(_ context.Context, env *Env, args []string) er
 	if _, err := env.ConfigDir.UpdateInstanceMetadata(name, func(m *config.InstanceMetadata) error {
 		m.Keepers = upsertKeeper(m.Keepers, config.Keeper{
 			Device: device, EnrolledAt: time.Now().UTC(), Expires: expires,
-			Generation: generation, Budget: c.budget,
+			Generation: generation, Budget: c.budget, Window: c.window,
 		})
 		return nil
 	}); err != nil {
@@ -742,7 +742,9 @@ func (*keeperStatusCommand) Run(_ context.Context, env *Env, args []string) erro
 			}
 		}
 	}
-	return env.Printer.Print(keeperStatusResult{Keeping: results, Fleet: fleetRows(fleet)})
+	return env.Printer.Print(keeperStatusResult{
+		Keeping: results, Fleet: fleetRows(fleet), FleetBudget: fleetBudgets(fleet, time.Now()),
+	})
 }
 
 type keeperStatusEntry struct {
@@ -770,18 +772,42 @@ type fleetRow struct {
 	Device   string    `json:"device"`
 	Expires  time.Time `json:"expires,omitzero"`
 	Revoked  bool      `json:"revoked,omitempty"`
+	Budget   int       `json:"budget,omitempty"`
+	Window   string    `json:"window,omitempty"`
+}
+
+// fleetBudget is what an instance's keepers may push between them in one
+// window: the sum of their budgets. Budgets add across a fleet while each
+// device refuses only against its own (ADR 0008 finding 6), so this is the
+// figure the restart count is weighed against — two devices at 8 a month
+// admit 16 re-seeds a month, which no single device's status would show.
+//
+// It is a total of LIMITS. What each device has used is in its own ledger,
+// on that device; the machine that enrolled the fleet holds none of them.
+type fleetBudget struct {
+	Instance string `json:"instance"`
+	// Window is "" for keepers recorded before the window was, whose budget
+	// cannot be added to anyone else's.
+	Window  string `json:"window"`
+	Devices int    `json:"devices"`
+	Reseeds int    `json:"reseeds"`
 }
 
 type keeperStatusResult struct {
-	Keeping []keeperStatusEntry `json:"keeping"`
-	Fleet   []fleetRow          `json:"fleet,omitempty"`
+	Keeping     []keeperStatusEntry `json:"keeping"`
+	Fleet       []fleetRow          `json:"fleet,omitempty"`
+	FleetBudget []fleetBudget       `json:"fleet_budget,omitempty"`
 }
 
 func fleetRows(fleet map[string][]config.Keeper) []fleetRow {
 	rows := make([]fleetRow, 0)
 	for instance, keepers := range fleet {
 		for _, k := range keepers {
-			rows = append(rows, fleetRow{Instance: instance, Device: k.Device, Expires: k.Expires, Revoked: k.Revoked})
+			row := fleetRow{Instance: instance, Device: k.Device, Expires: k.Expires, Revoked: k.Revoked, Budget: k.Budget}
+			if k.Window > 0 {
+				row.Window = keeper.HumanWindow(k.Window)
+			}
+			rows = append(rows, row)
 		}
 	}
 	sort.Slice(rows, func(i, j int) bool {
@@ -791,6 +817,46 @@ func fleetRows(fleet map[string][]config.Keeper) []fleetRow {
 		return rows[i].Device < rows[j].Device
 	})
 	return rows
+}
+
+// fleetBudgets totals each instance's budgets per window, over the keepers
+// that can still push: a revoked device is out of the operator's count, and
+// an expired leaf fails the handshake before any budget is consulted.
+func fleetBudgets(fleet map[string][]config.Keeper, now time.Time) []fleetBudget {
+	type key struct {
+		instance string
+		window   time.Duration
+	}
+	sums := map[key]*fleetBudget{}
+	for instance, keepers := range fleet {
+		for _, k := range keepers {
+			if k.Revoked || (!k.Expires.IsZero() && !now.Before(k.Expires)) {
+				continue
+			}
+			kk := key{instance, k.Window}
+			b := sums[kk]
+			if b == nil {
+				b = &fleetBudget{Instance: instance}
+				if k.Window > 0 {
+					b.Window = keeper.HumanWindow(k.Window)
+				}
+				sums[kk] = b
+			}
+			b.Devices++
+			b.Reseeds += k.Budget
+		}
+	}
+	out := make([]fleetBudget, 0, len(sums))
+	for _, b := range sums {
+		out = append(out, *b)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Instance != out[j].Instance {
+			return out[i].Instance < out[j].Instance
+		}
+		return out[i].Window < out[j].Window
+	})
+	return out
 }
 
 func (r keeperStatusResult) Human(w io.Writer) error {
@@ -842,7 +908,26 @@ func (r keeperStatusResult) Human(w io.Writer) error {
 			case !f.Expires.IsZero():
 				status = "  until " + f.Expires.UTC().Format("2006-01-02")
 			}
-			fprintf(w, "  %-12s %s%s\n", f.Instance, f.Device, status)
+			budget := ""
+			if f.Budget > 0 && !f.Revoked {
+				budget = fmt.Sprintf("  budget %d", f.Budget)
+				if f.Window != "" {
+					budget += " per " + f.Window
+				}
+			}
+			fprintf(w, "  %-12s %s%s%s\n", f.Instance, f.Device, status, budget)
+		}
+		for _, b := range r.FleetBudget {
+			if b.Window == "" {
+				fprintf(w, "  %-12s fleet budget: %d reseed(s) across %d device(s) enrolled before windows were recorded — re-enrol them to total it\n",
+					b.Instance, b.Reseeds, b.Devices)
+				continue
+			}
+			fprintf(w, "  %-12s fleet budget: up to %d reseeds per %s across %d device(s)\n",
+				b.Instance, b.Reseeds, b.Window, b.Devices)
+		}
+		if len(r.FleetBudget) > 0 {
+			fprintln(w, "  The fleet budget is a total of limits, not of use: each device's ledger is on that device.")
 		}
 	}
 	return nil
