@@ -112,7 +112,7 @@ Seen by one FatLine replica, of 2. Each keeps its own picture, so these
 are that replica's share of the instance's traffic, not the total.
 ```
 
-The warning turns on the **replica count**, not on the monitor naming itself, so a sidecar older than the reader still triggers it — verified live against exactly that combination. Shrike also now reports its own pod name; that half is unit-tested only, because deploying it needed a new image tag and the walk was mid-teardown.
+The warning turns on the **replica count**, not on the monitor naming itself, so a sidecar older than the reader still triggers it — verified live against exactly that combination. Shrike also now reports its own pod name; that half is unit-tested only, because deploying it needed a new image tag and the walk was mid-teardown. *(Walked 2026-11-10: see [Session A](#session-a-2026-11-10).)*
 
 **Aggregating across replicas is not solved here.** The route resolves to `127.0.0.1`, which is by construction whichever pod answered; the keyholder addresses replicas through a headless Service with `{ordinal}`, which a Deployment does not have. Saying the count is a share is the honest floor, not the end state.
 
@@ -128,6 +128,8 @@ kubectl -n farcast-system logs deploy/technocore --since=5m | grep "observed usa
 ```
 
 *At a 10-second tick against a ~30-second refresh, about two ticks in three read a reading that has not moved. Expect `observed usage` lines with `unrefreshed=N` above zero, including ticks whose readings were **all** unrefreshed, logged as `sampled=0 unrefreshed=N`. Before 2026-10-08 such a tick logged nothing, so the dedupe could not be seen working. Record those lines as the evidence, then restore the default with `farcast kernel deploy "$INSTANCE" --interval=0`. The deploy warns that 10s is a validation value below the default. Like `--adapt` and `--adapt-cooldown`, the interval is carried forward by later deploys that do not name it.)*
+
+*(Walked 2026-11-10, and the dedupe fired: see [Session A](#session-a-2026-11-10).)*
 
 ### 3. The 5.2 case, in three numbers
 
@@ -149,13 +151,24 @@ What is **not** explained is the rest: after the grant was applied, the Artifact
 
 Two things were checked and ruled out: the project carries **no IAM deny policy**, and the workload identity pool has **no project-level grant** that could have made earlier walks work by another route.
 
-This blocked `farcast run`, so **the walk did not exercise it**. The policy document `run` would have written was constructed by hand instead, through the product's own `fatline/policy` package so the format could not drift, and applied as the same ConfigMap FatLine watches. Everything in section 5 is therefore real traffic through a real boundary under a real per-application credential — but the path that *produces* that policy was not walked here. It was walked on 2026-09-08 for 4.4.
+This blocked `farcast run`, so **the walk did not exercise it**. The policy document `run` would have written was constructed by hand instead, through the product's own `fatline/policy` package so the format could not drift, and applied as the same ConfigMap FatLine watches. Everything in section 5 is therefore real traffic through a real boundary under a real per-application credential — but the path that *produces* that policy was not walked here. It was walked on 2026-09-08 for 4.4, and again on 2026-11-10 for this criterion: see [Session A](#session-a-2026-11-10).
 
 ### 5. A false finding, caught before it was recorded
 
 The first round of probes showed an **undeclared host returning 200**, which would have been a catastrophic enforcement failure. It was not one: `FARCAST_FATLINE_PROXY` is FarCast's variable, not curl's, and the hand-made probe pod carried none of the NetworkPolicy Planck renders — so the requests went straight out to the internet without touching FatLine at all. Re-running with `https_proxy` set produced `CONNECT tunnel failed, response 403` from the boundary, as it should.
 
 Worth recording because the mistake is instructive: the NetworkPolicy is what makes the boundary unavoidable, and a pod built by hand does not have it. Every claim about enforcement in section 5 is from the second round.
+
+---
+
+## Session A, 2026-11-10
+
+Phase 5's consolidated walk, [Session A](phase-5-session-a.md#results--walked-2026-11-10), ran against instance `p5a` at commit `554d4df`. It walked the two criteria this runbook left open and the half of finding 1 it left unit-tested. Its results are the record; this is what they say about 5.1.
+
+- **The reading-dedupe fired (criterion 12; its S8).** After `farcast kernel deploy "$INSTANCE" --interval=10s`, the kernel logged ticks whose readings were all unrefreshed, `sampled=0 unrefreshed=7` and `unrefreshed=9`, between its sampled ones. Over 10.3 minutes the sample counts in `farcast usage -o json` grew about 2.0 a minute per Pod, not the 6 a 10-second tick would add if every tick counted. That is finding 2's two ticks in three, with each reading counted once.
+- **`farcast run` produced the policy the boundary enforced (criterion 13; its S11).** `run` of the egress-demo manifest wrote the egress policy, and 4.4 steps 2–8 passed against it. The policy holds credential hashes only, by a corrected check (Session A's deviation 3). reacher reached its declared host. The undeclared host, and hermit, which declares none, got `403`, logged `not_in_allowlist`. No credential got `407` and `unknown_app`. A grant took effect live in 34 s and a revocation in 58 s. Finding 4's refused push did not recur, because the grant was applied before the first build; the registry delay it records was not reproduced.
+- **Shrike names its replica (finding 1).** `farcast usage` printed "Seen by one FatLine replica of 2," followed by the name of the FatLine Pod whose Shrike answered. The counts are still that replica's share, and aggregating across replicas is still not solved.
+- **Found, and not fixed: `(unidentified)` also counts the operator's own traffic.** In S11's report that row (2 hosts, 30 connections) was the operator's and keepers' mTLS tunnel streams to `datasphered` and `shrike`. FatLine records those with `tenant="" app=""`, the same as an anonymous in-cluster caller, so authenticated operator traffic reads as unidentified application egress. FatLine has the peer's leaf at admission, since it decides the route from the leaf's role, but it does not record it. It is the first of Session A's findings.
 
 ---
 
@@ -171,8 +184,8 @@ Worth recording because the mistake is instructive: the NetworkPolicy is what ma
 | 6 | Shrike is reachable through the tunnel with no new cluster exposure | ✅ |
 | 7 | An allowed connection that cannot be established is recorded | ✅ — `kind=fail`, `dial_ms=30002` |
 | 8 | Bytes and connection latency are attributed per application | ✅ |
-| 9 | An unidentified caller appears, named as such | ✅ |
+| 9 | An unidentified caller appears, named as such | ✅ — and, found 2026-11-10 and not fixed, so do the operator's own tunnel streams; see [Session A](#session-a-2026-11-10) |
 | 10 | The report distinguishes "not measured" from "measured as zero" | ✅ — both states seen |
 | 11 | The network counts are not presented as more than they are | ✅ **after a fix** — see finding 1 |
-| 12 | The reading-dedupe is exercised | ⚠️ **not exercised** — see finding 2, which now gives the `--interval=10s` procedure |
-| 13 | `farcast run` produces the policy the boundary enforces | ⛔ **not walked here** — see finding 4 |
+| 12 | The reading-dedupe is exercised | ✅ **walked 2026-11-10** in [Session A](phase-5-session-a.md#results--walked-2026-11-10) — `sampled=0 unrefreshed=7` at a 10 s tick; about 2 samples a minute per Pod, not 6. Not exercised on 2026-09-09; see finding 2 |
+| 13 | `farcast run` produces the policy the boundary enforces | ✅ **walked 2026-11-10** in [Session A](phase-5-session-a.md#results--walked-2026-11-10) — `run` wrote the policy, and 4.4 steps 2–8 passed against it. Not walked on 2026-09-09; see finding 4 |

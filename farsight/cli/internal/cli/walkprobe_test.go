@@ -14,6 +14,14 @@
 //	FARCAST_WALK=1 FARCAST_WALK_PROBE=<probe> FARCAST_WALK_INSTANCE=<name> … \
 //	  go test -mod=vendor -tags walk -run TestWalkProbe -v ./farsight/cli/internal/cli/
 //
+// A live walk builds it once instead, with go test -mod=vendor -tags walk -c
+// -o <scratch>/walkprobe.test, and runs that binary with -test.run
+// '^TestWalkProbe$' -test.v. A go test run links a fresh binary at a new
+// temporary path every time, and an outbound firewall that rules per binary
+// holds each one's connections until the probe's own deadline: the
+// 2026-11-10 walk lost every probe that dialled the tunnel to that, until it
+// moved to a fixed path.
+//
 // It skips unless FARCAST_WALK=1, takes no default instance, and never prints
 // key material — key IDs only. It reads the operator's config directory the
 // way the CLI does ($FARCAST_CONFIG_HOME, then the user config directory).

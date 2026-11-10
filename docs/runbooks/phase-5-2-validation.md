@@ -8,6 +8,8 @@ Designed by [ADR 0016](../adr/0016-adaptive-resources.md), on the profiles [ADR 
 
 The walk found **two defects that no unit test could have found**, both about the gap between what the kernel asked the cluster for and what the cluster did.
 
+*(2026-11-10: both fixes were walked in [the consolidated Phase 5 walk](phase-5-session-a.md#results--walked-2026-11-10), step S12, against instance `p5a`. Neither symptom came back. The record is [at the end](#walked-2026-11-10--session-a-s12).)*
+
 ---
 
 ## Prerequisites
@@ -117,10 +119,10 @@ Both fixes above independently stop this instance of it. But the deeper problem 
 | 6 | Fields FarCast never set survive the patch | ✅ — Autopilot's `ephemeral-storage` |
 | 7 | The profile survives the restart that applies the resize | ✅ — `usage_restored=true` |
 | 8 | The cooldown holds afterwards | ✅ |
-| 9 | Adjustment converges rather than oscillating | ⚠️ **it did not** — see findings 1 and 2 |
-| 10 | A resize is never made for no cost benefit | ⛔ **failed, now fixed** |
-| 11 | The kernel reports what actually happened | ⛔ **failed, now fixed** |
-| 12 | The fixes are verified live | ❌ **not re-walked** — found near teardown; unit-tested and mutation-tested only |
+| 9 | Adjustment converges rather than oscillating | ⚠️ **it did not** — see findings 1 and 2. ✅ **2026-11-10, after the fixes:** one resize per application, and no second one across four cooldowns and more |
+| 10 | A resize is never made for no cost benefit | ⛔ **failed, now fixed** — fix walked 2026-11-10: no `0.0000` and no step below 50m, as a symptom not seen |
+| 11 | The kernel reports what actually happened | ⛔ **failed, now fixed** — fix walked 2026-11-10: stored requests equal `to=` and no repeated resize, as symptoms not seen |
+| 12 | The fixes are verified live | ✅ **walked 2026-11-10**, in Session A's S12, as symptoms not seen — see [below](#walked-2026-11-10--session-a-s12). *(Until then: not re-walked, found near teardown; unit-tested and mutation-tested only.)* |
 
 ### How a re-walk checks criteria 10 and 11 — added 2026-10-08
 
@@ -130,3 +132,16 @@ Both fixes above independently stop this instance of it. But the deeper problem 
 - **Criterion 11, the kernel reports what happened:** every `resized an application` line's `to=` equals the stored request, read back with `kubectl -n "$APPS" get deploy <app> -o jsonpath='{.spec.template.spec.containers[0].resources.requests}'`. No application is resized twice while its usage is steady, and no `the cluster stored a different reservation than the one asked for` warning appears.
 
 Record them as symptoms not seen, which is weaker than a guard seen working, and say so.
+
+### Walked 2026-11-10 — Session A S12
+
+Both fixes were walked in [the consolidated Phase 5 walk](phase-5-session-a.md#results--walked-2026-11-10), step S12, against instance `p5a` at commit `554d4df`. The subject was beta, at three replicas. `farcast kernel deploy "$INSTANCE" --adapt --adapt-cooldown=2m` turned adapting on at 13:29:26Z, and the Pod's arguments still carried the 10 s interval from an earlier deploy that this one did not name.
+
+- **One resize, and it saved money.** The first tick, at 13:29:45Z, resized beta from 100m/128Mi to 50m/64Mi with `monthly_delta=-5.5434`, three Pods at -1.8478 each.
+- **No second one.** From 13:29:45Z to 13:38:31Z, four cooldowns and more, there was no second `resized an application` line, no `monthly_delta=0.0000`, and no step below 50m.
+- **What it logged is what was stored.** The Deployment's stored requests were 50m/64Mi, equal to `to=`. Beta had two ReplicaSets, the old one at zero and the new one at three Pods, and the new Pods had zero restarts.
+- **One deviation.** A pause earlier in the walk put S12 about 105 minutes after S7, so alpha had reached coverage as well and was resized in the same tick, 100m/128Mi to 50m/64Mi with `monthly_delta=-1.8478`. It too was resized once and never again, and its stored requests equal `to=`.
+
+`--adapt=false` then turned adapting off again.
+
+That is what the section above asks for, and it is recorded the way that section says to: as **symptoms not seen**, which is weaker than a guard seen working. The refusal of a change that does not move the bill, and the override warning, are still unit-tested only, because a walk cannot reach either. The walk's record also does not say whether the override warning's text was looked for. With this, 5.2 is closed.

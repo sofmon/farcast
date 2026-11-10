@@ -95,6 +95,8 @@ This exercises the path [ADR 0008](../adr/0008-in-cluster-key-delivery.md) built
 
 *(Corrected 2026-10-08: this pass does not stand on the evidence given. Until 2026-10-08 Planck rendered `FARCAST_STORAGE_STATUS_ENDPOINT` as `https://` against the status listener, which serves plain HTTP (`planck/translate/workload.go`). The SDK's probe therefore failed its handshake. With every replica sealed and the data Service empty, an application got `ErrStorageUnavailable`, not `ErrStorageSealed`. What the walk saw was most likely the data path's own sealed answer, read in the seconds before readiness took the endpoints away. The endpoint is now rendered `http://`, and a re-walk must check this criterion as follows. Run `farcast storage seal "$INSTANCE"`, which seals both replicas. Wait at least 20 seconds, until `kubectl -n farcast-system get endpoints datasphered` shows none. Only then confirm, on the application's next tick, that it reports `state=sealed` and not `unavailable`. Then run `farcast storage unseal "$INSTANCE"` and confirm it recovers with zero restarts. An application deployed by a CLI from before the fix still carries `https://` until `farcast run` deploys it again.)*
 
+*(Re-walked 2026-11-10 as that correction says, in [Session A](phase-5-session-a.md#results--walked-2026-11-10) S7. After the seal one endpoint lingered for about 10 s. Then `endpoints datasphered` stayed empty for 20 s, and in that window alpha reported `state=sealed`, "storage is sealed (no key material loaded)", on demand and in its log, not `unavailable`. The unseal brought both replicas back. Alpha's first tick after it was not recorded, but the same Pod still had 0 restarts when next checked, in S10.)*
+
 *(Minor: `farcast storage seal` takes no `-y`, while `secret rm`, `run`, `connect` and `release` all do. An inconsistency, recorded rather than fixed here.)*
 
 ## 7. Does `Config()` refuse the platform's namespace in a real pod?
@@ -205,7 +207,7 @@ Confirmed in the key material too: `keys.yaml` gives each application its own **
 
 This asks for an application deployed *before* decision 1 existed, then a keyholder upgraded underneath it. On a fresh install with today's binary every application gets a client leaf, so the state cannot occur. Walking it honestly needs a CLI built at `36db52e` deploying first, then today's binary upgrading the keyholder.
 
-`storage deploy` does print the error path preemptively — *"Applications deployed before this keyholder hold no storage identity and will be refused by it. Run 'farcast run' again for each of them"* — so the CLI knows the condition and names the fix. That is not the same as watching it happen, and this criterion stays open.
+`storage deploy` does print the error path preemptively — *"Applications deployed before this keyholder hold no storage identity and will be refused by it. Run 'farcast run' again for each of them"* — so the CLI knows the condition and names the fix. That is not the same as watching it happen, and this criterion stayed open until the note below retired it.
 
 *(Retired 2026-10-08: the state this criterion asks for can no longer be upgraded into. A CLI from before per-application scopes, the one at `36db52e` included, minted the shared `app` scope, which owns all of `app/`. No per-application scope can be minted beside it, because a scope owns its whole subtree. FarCast has no migration from it, since its objects are named under a name key no per-application scope holds. Since 2026-10-08 `farcast run` refuses such a keyring before it fetches anything, saying to copy the data out with `farcast storage cp` and reinstall (`refuseSharedAppScope` in `farsight/cli/internal/cli/run.go`). So "redeploy and recover" has no path to walk. Every walk instance created with such a CLI was released the same day, so no instance in this state exists to be stranded.)*
 
@@ -216,6 +218,8 @@ This asks for an application deployed *before* decision 1 existed, then a keyhol
 **14b, sealed.** With the instance sealed, deploying a new namespace minted new scopes, reported them **waiting**, named `farcast storage unseal`, deployed the workloads anyway, and wrote **no ledger entry** — byte-for-byte identical ledger before and after. Repeated against a deliberate `--hold`: same result, hold still in force with its reason intact. A deploy did not clear an operator's decision.
 
 The scopes minted while sealed were not stranded: the next unseal came back holding them.
+
+*(Walked with a write in flight 2026-11-10, in [Session A](phase-5-session-a.md#results--walked-2026-11-10) S14. The defect found after this walk, in "Found while fixing findings 4 and 5" below, lay in any push that installs a new generation in a serving keyholder. Session A drove that push with `storage key rotate` rather than with `run`. From alpha, a 16 MiB PUT throttled to 256 s returned `204` across a rotation that finished mid-write. A GET from the Pod and `farcast storage cp` to the operator's machine both matched its sha256. Its header, read from the bucket, named alpha's pre-rotation KEK, so the write was admitted before the push. It read back, so its data key was wrapped under that KEK and not a zeroed one. After S15's rekey the same header named alpha's current KEK. The sealed and held deploys of 14b above were not repeated.)*
 
 ### 15. An instance with no applications unseals — ✅
 
@@ -238,7 +242,7 @@ Both defects the first walk found are still fixed: applications logged `instance
 
 ## What the re-walk found
 
-Seven defects, none of them findable by a unit test. **Two were fixed and re-verified on `p54` before teardown**; five were recorded and deliberately not patched against a billing clock. Of those five, findings 4 and 5 were fixed afterwards (2026-10-06, not re-walked), and fixing them turned up two more — see the end of this section.
+Seven defects, none of them findable by a unit test. **Two were fixed and re-verified on `p54` before teardown**; five were recorded and deliberately not patched against a billing clock. Of those five, findings 4 and 5 were fixed afterwards (2026-10-06; walked 2026-11-10), and fixing them turned up two more — see the end of this section.
 
 ### 1. `storage unseal` wrote ledger entries with no boot label — fixed, re-verified
 
@@ -262,13 +266,15 @@ Delete `datasphered-0`, then immediately `storage seal --hold`. The command repo
 
 So an operator who deliberately held the instance ends up with storage up, through ordinary restart timing rather than an attack. Nothing is hidden — the unreachable replica is named, and `seal --hold` already warns a hold lives only until the pod restarts. What is missing is follow-through: the command reads as instance-level, reports per-replica, and nothing flags that the instance as a whole is **not** held. No non-zero exit, no "re-run when all replicas are reachable".
 
-### 4. `storage key rekey <instance>` is rejected as "a local path" — fixed, not re-walked
+### 4. `storage key rekey <instance>` is rejected as "a local path" — fixed, walked 2026-11-10
 
 Its own usage says `rekey <instance>[:<prefix>]`, prefix optional. `parseLocator` treats an operand with no colon as a local path, so the documented bare form never reaches the instance branch — while `storage ls <instance>` accepts it. The error tells an operator who typed an instance name that they typed a path. Workaround: a trailing colon.
 
 **Fixed:** rekey now resolves its operand through `instanceLocator`, which `ls` and `usage` had used since phase 3.3 — the fix was a helper written in the same commit as the parser, and never wired to this command.
 
-### 5. `storage key rekey` cannot retire what a keeper device holds — fixed, not re-walked
+*(Walked 2026-11-10, [Session A](phase-5-session-a.md#results--walked-2026-11-10) S15 7g: the bare form, `farcast storage key rekey p5a -y`, reached the instance and reported `rewritten: 5, already active: 0`.)*
+
+### 5. `storage key rekey` cannot retire what a keeper device holds — fixed, walked 2026-11-10
 
 **The most serious finding of this walk.** `keeper revoke` tells the operator, verbatim: *"If the device was lost, retire what it HOLDS: `farcast storage rekey p54`. Rekey changes the scope keys, so that device's bundle opens nothing written afterwards."*
 
@@ -287,6 +293,8 @@ While walking the key space it emits, once per object, `datasphere: recover name
 
 **Fixed.** The defect was three layers, not one. Rekey listed the master key space alone, though `Session.KeySpaces` already spanned scopes for `storage ls`. Nothing could rotate a scope's KEK at all — no API existed, and `Keyring.Merge` appends, so a merged key never becomes active. And a rotated key has to reach the keyholder **before** any object moves onto it, or every moved object is unreadable to the applications. Now `rotate` prepends a fresh KEK to every scope and hands the new keys to serving replicas at once; `rekey` rewrites each object through its own scope's store and refuses to move any until every replica is serving and reports that scope's current KEK; `revoke` prints rotate, rekey, re-enrol. A unit test reproduces this finding exactly — the scope keys a keeper enrolled beforehand would carry — and proves they open none of the applications' objects afterwards. The two old behaviours, master-only rotate and master-only rekey, each fail it.
 
+*(Walked 2026-11-10, [Session A](phase-5-session-a.md#results--walked-2026-11-10) S14 and S15. `rotate` moved alpha's active KEK, and reported both replicas holding the new keys and writing under them. `keeper revoke` of device A printed the rotate, rekey and re-enrol sequence. After further rotations, `rekey` reported `rewritten: 5` — all five of the instance's objects — and A's revoked packet, opening alpha's `hello`, got `ErrUnknownKey`. `revoke`'s account of what a revoked device can still do predates the key pin, and Session A records that as a finding of its own.)*
+
 ### 6. `release` reports a cluster "(deleted)" while the delete is still running
 
 `release` printed `cluster: farcast-p54 (deleted)` and removed the local state. The GKE API reported `STOPPING` with `DELETE_CLUSTER` **RUNNING**; the cluster actually disappeared **200 seconds later**.
@@ -295,13 +303,17 @@ It completed, so nothing was stranded. But on the one command whose purpose is t
 
 *(Fixed 2026-10-08: `release` now waits, bounded at 15 minutes, until the cloud reports the cluster gone, and only then deletes the registry, the bucket and the local record. If the wait runs out or is interrupted, it says the cluster "is still being deleted", keeps the instance record, and names `farcast release <instance>` as the way to wait for that same delete. A cluster in `STOPPING` after a successful `release` is now a finding. Independent verification stays mandatory regardless.)*
 
+*(Walked 2026-11-10, [Session A](phase-5-session-a.md#results--walked-2026-11-10) S19: `release` took 6 m 07 s. The cluster read `RUNNING`, then `STOPPING` from about 20 s in until it was gone. The local record stayed until GKE reported the cluster gone, and "(deleted)" printed only after that; nothing printed during the wait. The other branch, a wait that runs out or is interrupted, was not walked.)*
+
 ### 7. Releasing an instance leaves that machine's keeper state behind
 
 After `release`, `instances/p54` was gone and `keepers/p54` remained — bundle, CA, leaf, key and ledger for an instance that no longer exists. Defensible by design: a keeper is a role, usually on a different machine, and the ledger is deliberately kept. But on a machine holding both, `release` knows the directory is there and says nothing.
 
 *(Fixed 2026-10-08: on the releasing machine, `release` now wipes the bundle and leaf key of a keeper for that instance and keeps its ledger. The keeper is proven by its CA, not by its name. `release` also names the keepers enrolled on other devices, which it cannot reach, and says to run `farcast keeper uninstall <instance>` on each.)*
 
-### Found while fixing findings 4 and 5 — both fixed, neither walked
+*(Walked 2026-11-10, [Session A](phase-5-session-a.md#results--walked-2026-11-10) S19: on the releasing machine `release` reported the keeper's bundle and leaf key wiped and its ledger kept, and the files on disk matched. It named device A, enrolled elsewhere, with `farcast keeper uninstall p5a` to run there. Run over SSH, that needed `--yes`, and it wiped A's bundle and leaf key and kept A's ledger. That the keeper is recognised by its CA rather than its name was not tested separately.)*
+
+### Found while fixing findings 4 and 5 — both fixed, walked 2026-11-10 (one branch excepted)
 
 **A push to a serving keyholder could destroy, and expose, an in-flight write.** The vault handed each request its own scope by reference, sharing key bytes, and an unseal at a new generation zeroes the scopes it replaces. A write admitted before such a push and sealed after it — the whole of its upload is the window — wrapped its data key under an all-zero KEK carrying the real key ID: unreadable to its owner, and readable by anyone who tried a key of zeros. Reproduced with a probe before it was fixed. **This was criterion 14a's own path**: every `farcast run` that handed a serving keyholder a new scope pushed a new generation. The walk passed 14a honestly — no write was in flight during its push — and could not have shown this. Fixed: each request gets its own copy of its scope's keys and wipes it when it ends.
 
@@ -310,6 +322,14 @@ After `release`, `instances/p54` was gone and `keepers/p54` remained — bundle,
 The hand-over itself also changed. It used to read each replica's state and then push with `operator-unseal` — an intent the keyholder honours even under a hold — so a replica that restarted or was held between the two round trips was unsealed by a deploy. It now pushes a `hand-over` intent the keyholder refuses on any sealed replica, chooses a generation above every replica's own report rather than this machine's record alone, and counts a replica as holding the keys only if it reports the ones it was sent. The last two close a defect no walk saw: a hand-over that reached one replica of two left the recorded generation behind, the next reused the number, and the replica that had taken it treated the repeat as a retry — installing nothing, and answering success.
 
 **Verifying those fixes found more, and changed them.** A mutation and adversarial-review pass confirmed fourteen defects in the first version of the fix — the worst one introduced by it. Rotation made a new key active one replica at a time, so a replica that did not answer could no longer read what the others wrote. It now stages the key everywhere before activating it. A keeper could still replace a serving replica's keys with a re-seed, and the keyholder now refuses one. `storage unseal`, the remedy every refusal names, had the same generation defect as the hand-over and now has both of its guards. Every fix carries a test shown to fail with the defect restored. See [ADR 0008](../adr/0008-in-cluster-key-delivery.md#what-the-2026-10-06-walk-found-and-what-changed).
+
+*(Walked 2026-11-10 in [Session A](phase-5-session-a.md#results--walked-2026-11-10). The in-flight write is recorded under section 14 above. The keeper's authority was S13: device A's re-seed into an operator hold got `409 operator-hold`; its release of the hold, its seal and a claimed `operator-unseal` each got `403 permission`; and its re-seed of a serving replica got `409 already-serving`. A rotation with one replica absent (S15 7b) moved no scope's active key, though its message was not captured. The hand-over's own refusal of a sealed replica was not a step of that walk.)*
+
+## Walked again in Session A — 2026-11-10
+
+**Walked against instance `p5a` at commit `554d4df`, released the same day**, as part of [the consolidated Session A walk](phase-5-session-a.md#results--walked-2026-11-10) that closed Phase 5. Its cost, teardown check, deviations and new findings are recorded there and not repeated here. For this runbook it walked what had stayed unwalked since the 2026-10-06 re-walk: criterion 14 with a write in flight, findings 4 to 7, both defects found while fixing 4 and 5, and section 6's sealed check as its correction says. Each is noted where it is recorded above.
+
+It re-confirmed criteria 11 and 12 in S7 and 15 in S4, with the same results as on 2026-10-06. It also re-confirmed 14a's hand-over in S7: one `hand-over` ledger entry per replica, with distinct boots, written before the application Pods started. It did not walk criterion 13, which no install can reach and which was retired on 2026-10-08. Nor did it walk 14b's sealed and held deploys under the hand-over as it now is, or finding 3.
 
 ---
 
@@ -322,7 +342,7 @@ The hand-over itself also changed. It used to read each replica's state and then
 | 3 | No Kubernetes Secret or ConfigMap anywhere holds the value | ✅ |
 | 4 | An application's `PUT` and `DELETE` under `secrets/` are refused with `permission` | ✅ |
 | 5 | An application's `GET` of a **neighbour's** secret succeeds, matching ADR 0017 rather than the name | ✅ |
-| 6 | A seal reports as a seal, and clears without a restart | ✅ as recorded. **Reopened 2026-10-08:** the status endpoint was rendered `https://` against a plain-HTTP listener, so a fully sealed instance read as unavailable; re-check as section 6's correction says |
+| 6 | A seal reports as a seal, and clears without a restart | ✅ as recorded. **Reopened 2026-10-08:** the status endpoint was rendered `https://` against a plain-HTTP listener, so a fully sealed instance read as unavailable; re-check as section 6's correction says. **Re-walked 2026-11-10** (Session A S7): with no endpoints for 20 s alpha reported `state=sealed`, not unavailable, and its Pod had 0 restarts afterwards; its first tick after the unseal was not recorded |
 | 7 | `Config()` refuses `FARCAST_*` in a pod that genuinely has those variables set | ✅ |
 | 8 | A `Secret` reaches no log, no error and no marshalled document in the clear | ✅ |
 | 9 | `--force` rotates, `rm` removes, and the application sees both | ✅ (rotation seen with no restart) |
@@ -334,10 +354,10 @@ Criterion 5 was **inverted on purpose** by [ADR 0018](../adr/0018-thin-device-st
 
 | # | Criterion | Result |
 |---|---|---|
-| 11 | An unidentified client is refused at the **handshake**, with no HTTP status | ✅ `tlsv13 alert certificate required`, `http_code=000` |
-| 12 | An application's own objects are served and **every** neighbour object — secret or ordinary — is refused with `permission` | ✅ including a claim of the neighbour's own scope name |
-| 13 | A pre-upgrade application is refused with a message naming the leaf, and recovers on redeploy | ⏸ **not reachable** from a fresh install; needs a CLI built at `36db52e`. **Retired 2026-10-08:** such a CLI mints the shared `app` scope, which `run` now refuses before fetching anything, so there is no recovery to walk (see the note under section 13 above) |
-| 14 | `run` mints a scope per application and hands it to a serving keyholder, while leaving a sealed **and** a held one sealed | ✅ ledger byte-identical across both sealed deploys. The hand-over path carried a write-corrupting defect this walk could not exercise; fixed 2026-10-06, not re-walked. The procedure for re-walking it with a write in flight is in [the consolidated walk runbook](phase-5-session-a.md) |
-| 15 | An instance with no applications unseals and becomes ready | ✅ generation 1, single attempt |
+| 11 | An unidentified client is refused at the **handshake**, with no HTTP status | ✅ `tlsv13 alert certificate required`, `http_code=000`; re-confirmed 2026-11-10 (Session A S7) |
+| 12 | An application's own objects are served and **every** neighbour object — secret or ordinary — is refused with `permission` | ✅ including a claim of the neighbour's own scope name; re-confirmed 2026-11-10 (Session A S7) |
+| 13 | A pre-upgrade application is refused with a message naming the leaf, and recovers on redeploy | ⏸ **not reachable** from a fresh install; needs a CLI built at `36db52e`. **Retired 2026-10-08:** such a CLI mints the shared `app` scope, which `run` now refuses before fetching anything, so there is no recovery to walk (see the note under section 13 above). **Retired, not open.** Session A (2026-11-10) did not walk it either |
+| 14 | `run` mints a scope per application and hands it to a serving keyholder, while leaving a sealed **and** a held one sealed | ✅ ledger byte-identical across both sealed deploys. The hand-over path carried a write-corrupting defect this walk could not exercise; fixed 2026-10-06 (not re-walked until Session A). **Walked 2026-11-10** in [Session A](phase-5-session-a.md#results--walked-2026-11-10) S14: a 16 MiB write throttled to 256 s returned `204` across a rotation that finished mid-write, both read paths match its sha256, and its header names alpha's pre-rotation KEK, then its current one after S15's rekey. 14a re-confirmed in S7; 14b's sealed and held deploys not repeated |
+| 15 | An instance with no applications unseals and becomes ready | ✅ generation 1, single attempt; re-confirmed 2026-11-10 (Session A S4) |
 
 Both defects the first walk found were fixed **and re-verified on the same live instance** before teardown, which is what [the 5.2 walk](phase-5-2-validation.md) could not do. The re-walk held to the same standard: of the [seven defects it found](#what-the-re-walk-found), the two cheapest were fixed and re-verified on `p54` before it was released.

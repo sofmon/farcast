@@ -171,17 +171,19 @@ Expect `http_code=204`. The key is the full logical name. It has to sit under `a
 Now read it back **from the operator's machine, through the ordinary CLI**:
 
 ```bash
-farcast storage ls "$INSTANCE:app/sdk-demo/alpha/"
-farcast storage cp "$INSTANCE:app/sdk-demo/alpha/hello" ./hello.readback
+farcast storage ls "${INSTANCE}:app/sdk-demo/alpha/"
+farcast storage cp "${INSTANCE}:app/sdk-demo/alpha/hello" ./hello.readback
 cat ./hello.readback
 ```
 
 Expect the object to list, and the file to contain `hello from inside the cluster`.
 
+*(Corrected 2026-11-10: these commands used to read `"$INSTANCE:app/…"`. In zsh, the default shell on macOS, `:a` after a parameter is a modifier meaning "make absolute". The argument then becomes a local path, and `storage ls` refuses it: "takes an instance, not a local path". The braces stop that in every shell. Found on [the consolidated walk](phase-5-session-a.md#results--walked-2026-11-10), which passed this step on 2026-11-10.)*
+
 **If the listing is empty, do not guess — ask what it queried:**
 
 ```bash
-farcast storage ls "$INSTANCE:app/sdk-demo/alpha/" --explain
+farcast storage ls "${INSTANCE}:app/sdk-demo/alpha/" --explain
 ```
 
 That reports, per key space, the prefix it owns, the opaque prefix it queried, how many objects the provider holds under it, and how many names were recovered. A key space that queried a prefix with **0 objects under it** does not address the data written there, and its key ids should be compared against the writer's — which is the single fact the 2026-08-31 run could not obtain. That proves the keyring on this laptop and the bundle in the cluster are the same key material, and that the stateless name-recovery promise survives scoping.

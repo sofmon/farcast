@@ -84,16 +84,18 @@ kubectl get rolebindings -A -l app.kubernetes.io/name=technocore
 Expected: **no** ClusterRoleBinding, and one RoleBinding per metered namespace. A ClusterRoleBinding here would hand the kernel every pod in the cluster including the managed ones ADR 0003 puts out of bounds.
 
 ```bash
-kubectl auth can-i list pods --as=system:serviceaccount:$NS:technocore -n kube-system
-kubectl auth can-i delete deployments --as=system:serviceaccount:$NS:technocore -n "$APPS"
-kubectl auth can-i update configmaps --as=system:serviceaccount:$NS:technocore -n "$NS"
+kubectl auth can-i list pods --as=system:serviceaccount:${NS}:technocore -n kube-system
+kubectl auth can-i delete deployments --as=system:serviceaccount:${NS}:technocore -n "$APPS"
+kubectl auth can-i update configmaps --as=system:serviceaccount:${NS}:technocore -n "$NS"
 ```
+
+*(Corrected 2026-11-10: these read `system:serviceaccount:$NS:technocore`. In zsh, the default shell on macOS, `:t` after a bare parameter is the "tail" modifier, so in zsh the name would expand to `farcast-systemechnocore`, an account that does not exist. Every `no` check in this section would then pass whatever the RBAC said, and only the one `yes` could catch it. The recorded walk includes `yes` answers, so its result is not known to have been affected. Found while recording [the consolidated walk](phase-5-session-a.md#results--walked-2026-11-10); the braces are correct in every shell.)*
 
 Expected: `no`, `no`, `no`. The third is the interesting one — the kernel may update its *own* ledger ConfigMap by name, and `can-i` without a resource name asks about all of them.
 
 ```bash
-kubectl auth can-i update configmaps/technocore-ledger --as=system:serviceaccount:$NS:technocore -n "$NS"
-kubectl auth can-i update configmaps/technocore-confirmed --as=system:serviceaccount:$NS:technocore -n "$NS"
+kubectl auth can-i update configmaps/technocore-ledger --as=system:serviceaccount:${NS}:technocore -n "$NS"
+kubectl auth can-i update configmaps/technocore-confirmed --as=system:serviceaccount:${NS}:technocore -n "$NS"
 ```
 
 Expected: `yes`, then **`no`**. The kernel reads the confirmations the operator pushes and can never write one — the asymmetry that stops it fabricating the input that corrects its own estimate.

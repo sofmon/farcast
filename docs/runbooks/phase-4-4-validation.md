@@ -56,11 +56,16 @@ The document must contain no credential in the clear. Confirm by comparing it ag
 
 ```bash
 CRED=$(kubectl -n "$APPS" get secret reacher-egress -o jsonpath='{.data.FARCAST_FATLINE_PROXY}' | base64 -d)
-echo "$CRED"          # http://reacher:<credential>@fatline-egress…
-kubectl -n "$NS" get configmap fatline-egress-policy -o yaml | grep -c "$(echo "$CRED" | sed 's|.*:||; s|@.*||')"
+echo "$CRED" | sed -E 's|^(http://[^:]+:)[^@]+@|\1<credential>@|'    # http://reacher:<credential>@fatline-egress…:3128
+SECRET=$(echo "$CRED" | sed -E 's|^http://[^:]+:([^@]+)@.*|\1|'); echo "length ${#SECRET}"   # 64, not 4
+kubectl -n "$NS" get configmap fatline-egress-policy -o yaml | grep -c -- "$SECRET"
+printf %s "$SECRET" | shasum -a 256    # equals reacher's credential_sha256 in the policy
+unset SECRET CRED
 ```
 
-Expected: `0`. The policy holds hashes; only the application's own Secret holds the credential.
+Expected: a length of `64`, then `0`, then the hash of reacher's own entry. The policy holds hashes, and only the application's own Secret holds the credential.
+
+*(Corrected 2026-11-10, on [the consolidated walk](phase-5-session-a.md#results--walked-2026-11-10). The extraction used to be `sed 's|.*:||; s|@.*||'`. That is greedy, and the proxy URL ends in `:3128`, so it returned the port. The step then counted `3128` in the ConfigMap instead of the credential, so it could never detect one, whatever the policy held. It also echoed the credential in the clear. The length check is there so a wrong extraction shows itself.)*
 
 ## 3. An application reaches what it declared
 
