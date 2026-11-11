@@ -36,7 +36,7 @@ This is the core metaphor for FarCast: your environment exists in the cloud, but
 
 **In the books:** The fatline is a faster-than-light communication system used when farcaster portals are unavailable. It is the fallback — the way to maintain connection across vast distances when the primary network is down. All communication through it is encrypted and private by necessity, as interception across interstellar distances is a serious threat.
 
-**In the OS:** FatLine is the sole networking layer. All traffic — instance-to-instance, instance-to-internet, and client-to-instance — flows through FatLine. It acts as router, proxy, and encryption boundary in one. Like the fatline in the books, it ensures communication remains private regardless of the hostile environment it traverses.
+**In the OS:** FatLine is the networking layer for an instance's applications. Instance-to-instance and instance-to-internet traffic, and the operator's tunnel, flow through it. It acts as router, proxy, and encryption boundary in one. What does not pass through it (control-plane calls, the cluster's own telemetry, image pulls) is listed in the README's FatLine section. Like the fatline in the books, it ensures communication remains private regardless of the hostile environment it traverses.
 
 ### DataSphere
 

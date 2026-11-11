@@ -30,7 +30,20 @@ The two non-negotiable pillars of FarCast are: (1) security/privacy, (2) cost co
 
 **Portal was merged into FarSight.** There were originally separate modules for a browser app (Portal) and monitoring UI (FarSight). These were merged into a single UX layer called FarSight. The downloadable app is branded "farcast".
 
-**CLI was folded into FarSight.** Rather than a separate CLI project, the command line interface lives within FarSight. One app, one download — GUI, CLI, and server are all part of FarSight.
+**CLI was folded into FarSight.** Rather than a separate CLI project, the command line interface lives within FarSight. GUI, CLI and server are all part of FarSight. On macOS one app is to carry the GUI and the CLI, and the other Apple devices a thin client ([ADR 0021](docs/adr/0021-farsight-native-client.md), accepted, not yet built). Even then, on macOS it is not yet one download: the bundled CLI still needs `kubectl`, the GKE auth plugin, Go and a farcast checkout beside it.
+
+**FarSight's client is native, Apple first; Electron was retired.** Accepted 2026-11-11, not yet built.
+- **Why Electron went:**
+  - it reaches desktop only;
+  - its Chromium patch cadence needs an update server FarCast does not have;
+  - its npm toolchain would sit on the machine that holds the cloud credentials.
+- **The shape.** FarSight is one product with one wire contract and a native shell per platform family. First comes one Swift/SwiftUI codebase for macOS, iPadOS, iOS and visionOS, using system frameworks only. Android and Windows are decided when they start.
+- **Two kinds of UI.** Application UIs are web tiles behind an in-app loopback bridge that does the mutual TLS to FatLine, and each tile reaches only its own application. The operator's own surfaces are native.
+- **No unproven traffic claim.** No document says "all traffic goes through FatLine" for a platform until that platform's packet-capture gate passes. On Apple, WebRTC is known to escape a web view's proxy.
+- **Sequencing.** FarSight is sequenced ahead of AllThing.
+- **What it rests on.** [ADR 0020](docs/adr/0020-instance-pki-ecdsa-p256.md) moves the instance PKI from Ed25519 to ECDSA P-256, because Apple's TLS cannot use Ed25519 and the hardware key stores on every target hold P-256.
+
+Full reasoning: [ADR 0021](docs/adr/0021-farsight-native-client.md).
 
 **TimeTomb is deferred.** Snapshot and recovery functionality (TimeTomb) is a future concept documented in the appendix. It is not part of the initial scope.
 
@@ -42,13 +55,17 @@ The two non-negotiable pillars of FarCast are: (1) security/privacy, (2) cost co
 
 ## Module Relationships
 
-- **FatLine** is the network boundary. All traffic flows through it. Nothing else touches the network.
+- **FatLine** is the instance's network boundary. Application egress and the operator's tunnel pass through it, deny-by-default. It is not the only path:
+  - the operator's control-plane calls go to the provider's API server through kubectl ([ADR 0019](docs/adr/0019-what-the-cluster-tells-its-provider.md));
+  - image pulls are node egress it does not see.
+
+  A FarSight client's traffic is claimed to go through it only per platform, once that platform's packet-capture gate passes ([ADR 0021](docs/adr/0021-farsight-native-client.md)).
 - **Shrike** monitors FatLine traffic and enforces policy. It does not control the boundary — it watches it and intervenes on violations. Think policeman, not wall.
 - **TechnoCore** is the kernel. It manages instance lifecycle, adapts application resources (CPU, memory, replicas) based on observed behaviour, and enforces cost limits. It is the last thing to shut down — if cost limits are breached, TechnoCore stops apps but stays alive to report status.
 - **Planck** translates application requirements into cloud-native K8s workloads. It is the compute abstraction.
 - **DataSphere** proxies storage and enforces encryption-at-rest. The cloud provider only sees encrypted blobs — under opaque names, but with their sizes, count and tree shape visible.
 - **AllThing** abstracts cloud AI services (Gemini, Claude, OpenAI). Starts as a chat interface in FarSight, evolves into the AI backbone for the entire system (TechnoCore resource decisions, Shrike traffic analysis, etc.).
-- **FarSight** is the entire UX layer — GUI (tiling browser), CLI, and a server-side component for UX composition.
+- **FarSight** is the entire UX layer: native clients (application UIs in web tiles, the operator's own surfaces native), the CLI, and an in-instance server that keeps the tile registry, sessions and layout state.
 - **SDK** provides syscall-like libraries so applications can interact with the FarCast environment (storage, networking, AI, config, secrets).
 
 ## Branding & Domains
@@ -75,7 +92,14 @@ All component names come from Dan Simmons' *Hyperion Cantos*. The naming is inte
 - Deeper specs, architecture notes, and API docs go in each module's `docs/` subfolder.
 - Tests sit next to the code they cover (`_test.go` files alongside source).
 - Empty directories use `.gitkeep` for Git tracking.
-- FarSight's client is Electron + TypeScript. Everything else is Go (see "Go by default; Rust only on the data plane" above; the sole Rust candidate is a benchmark-gated FatLine data plane).
+- FarSight's clients are native per platform family. Swift/SwiftUI on Apple comes first, under `farsight/client/apple/` ([ADR 0021](docs/adr/0021-farsight-native-client.md)), and Android and Windows are decided when they start. Everything else is Go (see "Go by default; Rust only on the data plane" above; the sole Rust candidate is a benchmark-gated FatLine data plane).
 - **Language guardrails (these make AI-authored code safe without a human reviewer, so they are not optional):**
   - Go modules: `go test -race`, `go vet`, and `golangci-lint` in CI. Go's memory safety is conditional on the absence of data races — `-race` defends that.
+  - Swift (the Apple client, [ADR 0021](docs/adr/0021-farsight-native-client.md) decision 4). These join `./check.sh` with the first client code:
+    - Swift 6 language mode with complete strict concurrency;
+    - `-strict-memory-safety` with its diagnostics as errors;
+    - a source gate refusing `@unchecked Sendable`, `nonisolated(unsafe)` and `unsafe` outside a reviewed allowlist;
+    - full builds, never `-typecheck` alone;
+    - `swift test` and `xcodebuild test`;
+    - no third-party packages without an ADR.
   - Any Rust module (currently only a possible FatLine data plane): `#![forbid(unsafe_code)]`, clippy and `cargo-geiger`, plus cancellation-safety integration tests (the one genuinely silent Rust AI hazard — data loss on a future dropped mid-`select!`, non-atomic state across `.await`) and multithreaded/race-style tests for shared session/allowlist state.

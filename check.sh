@@ -2,7 +2,9 @@
 #
 # The repository check: the guardrails AGENTS.md and ADR 0002 make mandatory,
 # for both Go modules — the root module and sdk/go, which the root's ./...
-# never reaches.
+# never reaches. The Apple client's Swift guardrails (ADR 0021 decision 4)
+# join this gate with the first client code; until then there is no Swift to
+# check.
 #
 #   1  gofmt over every Go file outside vendor/
 #   2  dependencies: go.sum, go.mod and vendor/ agree, byte for byte, and the

@@ -416,6 +416,8 @@ echo "LB=$LB  server-name=$NAME"
 # against LibreSSL, which cannot load FatLine's ed25519 client certificate and
 # fails with "unsupported algorithm" — a client limitation that looks alarmingly
 # like a server problem. A curl linked against OpenSSL 3 works if you have one.)
+# (2026-11-11: ADR 0020 moves the instance PKI to ECDSA P-256. Once that is
+# implemented, LibreSSL curl is expected to load the leaf; the next walk confirms it.)
 ./bin/farcast connect "$INSTANCE" --status
 
 # NEGATIVE — no client certificate → dropped at the handshake:

@@ -1,6 +1,6 @@
 # Execution Plan
 
-A phased build order for FarCast. Each phase builds on the previous one and delivers a testable, usable increment. The principle: at the end of every phase, something real works.
+A phased build order for FarCast. Each phase builds on the ones before it and delivers a testable, usable increment (Phase 7 now runs before Phase 6, per [ADR 0021](docs/adr/0021-farsight-native-client.md)). The principle: at the end of every phase, something real works.
 
 ---
 
@@ -389,6 +389,8 @@ Two things it does not do were already stated rather than implied — the deskto
 
 *Goal: AllThing provides AI capabilities to the system and applications.*
 
+*Sequenced after Phase 7 ([ADR 0021](docs/adr/0021-farsight-native-client.md) decision 9, 2026-11-11), by the operator's choice. 6.1, 6.3, 6.4 and `farcast chat` do not depend on FarSight. Only the chat endpoint on the FarSight server (6.2) and its tile (7.3) do.*
+
 ### 6.1 AllThing — provider adapter
 Abstraction over cloud AI services.
 
@@ -425,47 +427,67 @@ AI as an internal capability for FarCast itself.
 
 ## Phase 7 — FarSight GUI
 
-*Goal: the tiling browser interface — FarCast becomes visual.*
+*Goal: the tiling browser interface — FarCast becomes visual. Native clients, Apple first; application UIs in tiles, the operator's own surfaces native.*
 
-### 7.1 FarSight client — Electron shell
-The desktop app scaffold.
+**Status: ⏳ Accepted, not started (2026-11-11).**
+- [ADR 0021](docs/adr/0021-farsight-native-client.md) retired Electron. The clients are native per platform family, and the first is one Swift/SwiftUI codebase for macOS, iPadOS, iOS and visionOS.
+- [ADR 0020](docs/adr/0020-instance-pki-ecdsa-p256.md) moves the instance PKI to ECDSA P-256 first, because Apple's TLS cannot use Ed25519.
+- This phase is sequenced **ahead of Phase 6**. Nothing here needs AllThing except the chat tile, which arrives with Phase 6.
 
-- Electron app with basic window management
-- FatLine integration (all traffic proxied through the instance)
+The order (ADR 0021 decision 9):
+1. **A SwiftUI prototype against fixtures** from `farcast … -o json`: tiling layout, dashboard and wizard, with no backend change.
+2. **ADR 0020 implemented,** and the Phase 5 Session A runbook walked again.
+3. **The CLI gains a consent protocol and an explicit environment, walked from a terminal.**
+   - The consent protocol is `--plan` and `--confirm <digest>` plus progress events, so a GUI never passes a bare `--yes`.
+   - The explicit environment is the checkout and tool paths the CLI is given.
+4. **7.1.**
+5. **The tile-ingress ADR,** then 7.3.
+6. **The device-leaf and read-route ADR,** then 7.2. Each new surface is first walked from a CLI consumer (principle 3).
+7. **The iPadOS, iOS and visionOS thin clients,** then 7.5.
+
+### 7.1 FarSight client — Apple shell
+The macOS app first, from the one Swift/SwiftUI codebase that also targets iPadOS, iOS and visionOS.
+
+- SwiftUI and system frameworks only, under the Swift guardrails in `./check.sh` (ADR 0021 decisions 2–4)
+- Bundles the Go `farcast` binary and drives it through the consent protocol, with the operator's checkout and tool paths given explicitly
+- The tile bridge: one data store per application behind an in-app loopback CONNECT bridge, each tile bound to its own application, tested against local servers
 - Two modes: Install wizard and Connected view
 
-### 7.2 FarSight server — UX composition
-Server-side component for assembling the interface.
+### 7.2 FarSight server — tile registry and sessions
+Server-side component inside the instance. The operator's dashboard is native in each client, not composed here.
 
 - Application tile registry (which apps are running, their web endpoints)
 - Session management
 - Layout state persistence
+- Its tier and its line in the instance floor are named by the read-route ADR before anything is deployed
 
 ### 7.3 FarSight client — tiling window manager
 The core UX.
 
-- Tiling layout engine (split, resize, rearrange)
-- Each tile renders an application's web interface
+- Tiling layout engine (split, resize, rearrange). A tile can detach into its own window where the platform has several
+- Each tile renders an application's web interface and reaches only its own application, through FatLine (the tile-ingress ADR)
 - Tab management
-- AllThing chat as a built-in tile
+- No "all traffic proxied through FatLine" claim for a platform until its packet-capture gate passes
+- AllThing chat as a built-in tile, once Phase 6 lands
 
 ### 7.4 FarSight client — install wizard (GUI)
-GUI version of `farcast install`.
+GUI version of `farcast install`, on macOS only, because install needs the cloud admin credential and only the operator's Mac holds it.
 
 - Guided cloud provider setup
 - Credential input
-- Progress reporting
-- Instance management dashboard
+- Progress reporting, from the CLI's progress events
+- Instance management dashboard (native; menu bar, widgets and notifications wait for the read route)
 
 ### 7.5 FarSight mobile — the keeper in your pocket
 The first mobile FarSight is deliberately small: it makes a phone a keeper ([ADR 0008](docs/adr/0008-in-cluster-key-delivery.md)) before it grows any GUI ambition.
 
-- Keeper duty within mobile background-execution limits: outbound-only checks, push-woken where the OS allows (the push is a contentless doorbell — in the availability path, never the key path — and a redundant nudge over the jittered poll, never the sole wake path)
-- The bundle held in the no-user-presence protection class, hardware-backed and excluded from iCloud/Google backup by construction — a phone that cannot guarantee the exclusion cannot be a keeper; a presence-gated full keyring copy is a separate, optional decision
+- Keeper duty within mobile background-execution limits: outbound-only checks, push-woken where the OS allows (the push is a contentless doorbell — in the availability path, never the key path — and a redundant nudge over the jittered poll, never the sole wake path). On Apple a push needs the publisher's credential, so it is possible only where the operator builds the app under their own Apple team. A copy of that credential on every instance, or a central relay, is ruled out, and even an empty push shows Apple the device token, bundle ID and timing ([ADR 0021](docs/adr/0021-farsight-native-client.md), *What Apple still sees*)
+- The bundle held in the no-user-presence protection class, hardware-backed and excluded from iCloud/Google backup by construction — a phone that cannot guarantee the exclusion cannot be a keeper; a presence-gated full keyring copy is a separate, optional decision. (On Apple that means a Secure Enclave key plus files marked `isExcludedFromBackup`, with the exclusion read back. A `…ThisDeviceOnly` keychain item alone is backed up, wrapped to the device, and does not qualify: [ADR 0021](docs/adr/0021-farsight-native-client.md).)
 - Reseed notifications and an emergency seal action
 - Stated honestly: a phone improves the odds of a short sealed window, it is not an SLO — a mains-powered desktop keeper anchors the fleet
+- The leaf key is generated in the Secure Enclave and enrolled by request ([ADR 0020](docs/adr/0020-instance-pki-ecdsa-p256.md)). Wrapping the bundle at rest under a separate hardware key is still owed here, as is a probe of a permanent Secure Enclave key signing from a background task with the device locked
 
-**Phase 7 deliverable:** users can download the "farcast" app, install FarCast to a cloud provider via a GUI, and interact with running applications through a tiling browser — all traffic proxied through FatLine. The first mobile FarSight ships alongside it — a keeper before it is a GUI.
+**Phase 7 deliverable:** users can download the "farcast" app, install FarCast to a cloud provider via a GUI on macOS, and interact with running applications through a tiling browser on their Apple devices. Traffic is proxied through FatLine, and that is claimed for each platform only once its packet-capture gate passes. The first mobile FarSight ships alongside it — a keeper before it is a GUI.
 
 ---
 
@@ -521,9 +543,9 @@ Phase 4: TechnoCore → Planck (translator) → farcast run → Shrike (per-app)
               ↓
 Phase 5: TechnoCore (adaptive) → SDK Config/Secrets → farcast keeper (desktop)
               ↓
-Phase 6: AllThing (1st provider) → Chat → SDK AI → System integration
+Phase 7: ADR 0020 (P-256 PKI) → FarSight client (Apple, native) → FarSight server → Tiling UI → Mobile keeper
               ↓
-Phase 7: FarSight client (Electron) → FarSight server → Tiling UI → Mobile keeper
+Phase 6: AllThing (1st provider) → Chat → SDK AI → System integration
               ↓
 Phase 8: 2nd cloud provider → 2nd storage → 2nd AI → Node/Python SDK → Hardening
 ```
@@ -534,7 +556,7 @@ Phase 8: 2nd cloud provider → 2nd storage → 2nd AI → Node/Python SDK → H
 
 1. **Each phase is testable.** Don't move to the next phase until the current one works end-to-end.
 2. **Start with one cloud provider.** Get everything working on one before abstracting to two. The provider interface exists from day one, but only one adapter is needed initially.
-3. **CLI before GUI.** The CLI is faster to build, faster to test, and validates all the backend work before the Electron app adds complexity.
+3. **CLI before GUI.** The CLI is faster to build, faster to test, and validates all the backend work before a GUI adds complexity. Every backend surface a GUI uses is walked from a CLI consumer first.
 4. **Security from Phase 2, not Phase 8.** FatLine and Shrike come online before any application runs. Security is not a feature — it's the foundation.
 5. **SDK drives the API design.** What feels right to an application developer using the SDK should drive how the backend modules expose their capabilities.
 

@@ -17,8 +17,8 @@ Phase 2  Networking & security boundary █████████████�
 Phase 3  Storage                        ████████████████████  3/3 ✅
 Phase 4  Run applications               ████████████████████  4/4 ✅
 Phase 5  Intelligent resources          ████████████████████  4/4 ✅
-Phase 6  AI layer                       ····················  0/4
-Phase 7  FarSight GUI                   ····················  0/5
+Phase 6  AI layer                       ····················  0/4  (after Phase 7)
+Phase 7  FarSight GUI                   ····················  0/5  (next; ADR 0021)
 Phase 8  Multi-provider & hardening     ····················  0/5
 ```
 
@@ -139,15 +139,13 @@ farcast/
 ├── farsight/                       ← The "farcast" app (GUI + CLI + server)
 │   ├── README.md
 │   ├── docs/
-│   ├── server/                     ← Go — UX composition & session management
+│   ├── server/                     ← Go — tile registry, sessions & layout state
 │   │   ├── cmd/
 │   │   │   └── farsight-server/
 │   │   │       └── main.go
 │   │   └── internal/
-│   ├── client/                     ← Electron + TypeScript — GUI
-│   │   ├── src/
-│   │   ├── package.json
-│   │   └── tsconfig.json
+│   ├── client/                     ← Native GUI shells (ADR 0021)
+│   │   └── apple/                  ← Swift/SwiftUI — macOS, iPadOS, iOS, visionOS
 │   └── cli/                        ← Go — command line interface
 │       ├── cmd/
 │       │   └── farcast/
@@ -191,11 +189,11 @@ farcast/
 |---|---|---|
 | **TechnoCore** | Go | Kernel — orchestration, instance lifecycle, adaptive resource management, cost enforcement |
 | **Planck** | Go | Compute abstraction — cloud-agnostic layer over managed Kubernetes (EKS, GKE, AKS) |
-| **FatLine** | Go | Networking layer — routing, proxy, encryption, all traffic in/out |
+| **FatLine** | Go | Networking layer — routing, proxy, encryption, application traffic in/out |
 | **DataSphere** | Go | Storage abstraction layer — cloud-agnostic proxy with encryption-at-rest |
 | **AllThing** | Go | AI abstraction — cloud-agnostic layer over managed AI services (Gemini, Claude, OpenAI) |
 | **Shrike** | Go | Security monitor — validates traffic against manifest declarations and raises attributed alerts; blocking is FatLine's, inline and fail-closed |
-| **FarSight** | Go + Electron + TypeScript | The "farcast" app — GUI (tiling browser), CLI, and server-side composition |
+| **FarSight** | Go + Swift (Apple client) | The "farcast" app — native GUI (tiling browser), CLI, and an in-instance server for tile registry, sessions and layout state |
 
 See each module's `README.md` for language specifics, architecture detail, and implementation notes.
 
@@ -277,7 +275,14 @@ Repositories are first-class executables. `farcast run github.com/user/repo` fet
 DataSphere is the storage abstraction layer. It proxies all file storage and retrieval, hiding the underlying cloud provider (S3, GCS, or any object store) behind a uniform interface. Before any data leaves the instance, DataSphere encrypts it — the cloud provider only ever sees encrypted blobs. Combined with FatLine's encryption in transit, the cloud provider never sees a plaintext byte or a logical name of what is stored or carried. It is blind to *content*, not to everything: object counts, individual object sizes, the shape of your key namespace, and access timing all remain visible. So does what the cluster reports about itself. Its audit log, system logs and events, and metrics carry application names and images, the repository and commit each build came from, Pod states and resource use, and the audit log and the metrics both outlive the instance. Applications' own output is kept on the cluster's nodes, which are the provider's machines. The cluster is configured not to send that output to the provider's logging, and the next walk checks that the provider honours it ([ADR 0019](docs/adr/0019-what-the-cluster-tells-its-provider.md)). [What the cloud still sees](datasphere/README.md#what-the-cloud-still-sees) states exactly what is and is not hidden.
 
 ### FatLine
-FatLine is the sole networking layer for a FarCast instance. All traffic — instance-to-instance, instance-to-internet, and client-to-instance — flows through FatLine. It acts as router, proxy, and encryption boundary in one. By default, all connections are denied. FatLine only permits outbound traffic to external endpoints that are explicitly declared in an application's `./farcast` manifest. A FatLine connection is established the moment a client connects to a FarCast environment, and nothing enters or leaves the instance without passing through it.
+FatLine is the networking layer for a FarCast instance's applications. Instance-to-instance and instance-to-internet traffic, and the operator's tunnel, flow through it. It acts as router, proxy, and encryption boundary in one. By default, all connections are denied. FatLine only permits outbound traffic to external endpoints that are explicitly declared in an application's `./farcast` manifest. Nothing an application sends leaves the instance without passing through it.
+
+Three things do not pass through FatLine ([ADR 0019](docs/adr/0019-what-the-cluster-tells-its-provider.md)):
+- the operator's control-plane calls, which go to the provider's API server through kubectl;
+- what the cluster reports about itself (above);
+- image pulls, which are node egress.
+
+A FarSight client's traffic is claimed to go through FatLine only per platform, once that platform's packet-capture gate passes ([ADR 0021](docs/adr/0021-farsight-native-client.md)).
 
 ### AllThing
 AllThing is the AI abstraction layer. Like Planck abstracts compute and DataSphere abstracts storage, AllThing abstracts cloud AI services — Gemini, Claude, OpenAI, or any provider the operator chooses. Applications interact with AI through AllThing via the SDK, never directly with a provider. Initially, AllThing provides a chat interface accessible through FarSight. Over time, it becomes the AI backbone for the entire system — powering TechnoCore's adaptive resource management, Shrike's traffic analysis, and any application that needs intelligence.
@@ -288,13 +293,25 @@ The farcast SDK is a set of language-level libraries that let applications inter
 ### FarSight
 FarSight is how users see and interact with FarCast — the entire UX layer. It consists of a client and a server.
 
-The user downloads a single app called "farcast". It provides three interfaces: a **GUI** (the tiling browser), a **CLI** (for operators and automation), and a **server** that runs inside the FarCast instance.
+The user installs an app called "farcast".
+- **On macOS** it carries the **GUI** (the tiling browser) and the **CLI** (for operators and automation).
+- **On iPhone, iPad and Vision Pro** it is a thin client that never holds cloud credentials.
+- **A server** runs inside the FarCast instance.
 
-When opened, the app provides two functions: (1) **Install** — a guided process to deploy FarCast to a cloud environment, where the operator provides admin credentials for their chosen cloud provider, and (2) **Connect** — open a FarSight session towards a running FarCast instance. Both functions are accessible from the GUI and the CLI.
+The native clients are accepted and not yet built ([ADR 0021](docs/adr/0021-farsight-native-client.md)), so today the CLI is what exists. Even then, on macOS the app will not yet be one download: the CLI still needs `kubectl`, the GKE auth plugin, Go and a farcast checkout.
 
-Once connected via the GUI, FarSight presents a browser-like interface using a tiling window manager layout. Each tile is an application running inside the FarCast instance. Every request from the FarSight client is proxied through FatLine — all traffic flows through the FarCast instance, meaning the user's local network cannot observe what they are doing. The user's point of presence on the internet is the FarCast instance, not their local machine.
+When opened, the app provides two functions: (1) **Install** — a guided process to deploy FarCast to a cloud environment, where the operator provides admin credentials for their chosen cloud provider, and (2) **Connect** — open a FarSight session towards a running FarCast instance. Install runs on macOS only, from the GUI or the CLI, because it needs the cloud admin credential. Connect is available from every client.
 
-The **FarSight server** runs inside the FarCast instance and handles UX composition — assembling the tiled layout, managing sessions, and serving the interface back to the client through FatLine.
+Once connected via the GUI, FarSight presents a browser-like interface using a tiling window manager layout. Each tile is an application running inside the FarCast instance. The goal is that every request a tile makes is proxied through FatLine. The user's local network would then see an encrypted connection to the instance, with its volume and timing, but not which applications they use, and their point of presence on the internet would be the FarCast instance.
+
+No channel is proven yet. Nothing is claimed for a platform until its packet-capture gate passes ([ADR 0021](docs/adr/0021-farsight-native-client.md)). The 2026-11-11 probe ran on macOS 27 and the iOS 26.0 simulator, with no packet capture and no physical device:
+- it saw `fetch`, images, video and WebSocket reach the in-app proxy;
+- it saw WebRTC's STUN requests leave directly;
+- `dns-prefetch` is believed, from source only, to reach the device resolver.
+
+A channel is listed as proven per platform once that platform's capture gate passes.
+
+The **FarSight server** runs inside the FarCast instance and keeps the tile registry, sessions and layout state. The operator's own surfaces (dashboard, keeper, seal, and on macOS the install wizard) are native views in the client. The clients are native per platform family, with Swift/SwiftUI on Apple first; that is accepted and not yet built.
 
 ---
 

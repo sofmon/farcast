@@ -155,7 +155,7 @@ farcast run "$INSTANCE" github.com/sofmon/farcast --manifest manifest/examples/s
 
 `run` mints a scope for each application, records them in `keys.yaml` before it deploys anything, and hands them to the serving replicas. If you are walking 3.2 on its own, every other step here works without an application. Come back to this one once the instance has a kernel and the fixture.
 
-Now write an object as `alpha`, from inside its own pod and with its own leaf. Planck puts the leaf and its key in the application's Secret, and the CA, endpoint, server name and scope in its ConfigMap. The fixture's image is Alpine, whose curl is built against OpenSSL and can load the Ed25519 leaf that macOS's LibreSSL curl cannot (finding 4 below):
+Now write an object as `alpha`, from inside its own pod and with its own leaf. Planck puts the leaf and its key in the application's Secret, and the CA, endpoint, server name and scope in its ConfigMap. The fixture's image is Alpine, whose curl is built against OpenSSL and can load the Ed25519 leaf that macOS's LibreSSL curl cannot (finding 4 below; *2026-11-11: [ADR 0020](../adr/0020-instance-pki-ecdsa-p256.md) moves the PKI to P-256, which is expected to end this*):
 
 ```bash
 kubectl -n sdk-demo exec deploy/alpha -- sh -c 'umask 077
@@ -296,7 +296,7 @@ Nine of the ten success criteria passed. Criterion 5 — the crux — did not, a
 1. **Workload Identity was never implemented.** Both replicas crash-looped on a 403: no ServiceAccount, no `serviceAccountName`, no binding. ADR 0008 decision 8 named the shape and nothing built it. The keyholder now has its own ServiceAccount and `storage deploy` prints the exact bucket-scoped grant — see step 1a.
 2. **FatLine had no stream route.** Every unseal answered `404`: `Config.StreamRoutes` existed but neither the flag nor the rendered argument did, so the relay was unreachable in any real deployment. Unit tests missed it because they built the config directly. Fixed across the binary, the renderer and `connect`/`redeploy`.
 3. **The SDK could not verify an in-cluster keyholder.** The certificate carries the synthetic SAN `<instance>.datasphered.farcast`, but an application dials a Kubernetes Service name, and the client derived the verified identity from the endpoint host. `FARCAST_STORAGE_SERVER_NAME` now separates the two, as FatLine's tunnel already did.
-4. **This runbook contained two commands that do not exist** (`farcast instance-path`, and `storage cp … -` for stdout — which would have created a file named `-` and "passed" while proving nothing), and a `curl` step that **cannot work on macOS**: the instance CA is Ed25519 and the system curl is LibreSSL. Use the SDK, or a curl built against OpenSSL.
+4. **This runbook contained two commands that do not exist** (`farcast instance-path`, and `storage cp … -` for stdout — which would have created a file named `-` and "passed" while proving nothing), and a `curl` step that **cannot work on macOS**: the instance CA is Ed25519 and the system curl is LibreSSL. Use the SDK, or a curl built against OpenSSL. *(2026-11-11: [ADR 0020](../adr/0020-instance-pki-ecdsa-p256.md) moves the instance PKI to ECDSA P-256. Whether LibreSSL curl then works is for the next walk to record.)*
 
 **Open: criterion 5.** After the SDK wrote `app/sdk-written`, the operator's CLI could not list or read it. The CLI was scope-blind, which is now fixed and tested at every layer — but the fix was *not* confirmed against the cluster, and the live evidence is contradictory:
 

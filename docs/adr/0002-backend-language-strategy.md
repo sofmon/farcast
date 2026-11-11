@@ -10,7 +10,7 @@
 
 ## Context
 
-FarCast's backend was specified in Go across every module, with Electron + TypeScript locked in for the FarSight GUI client. The question was raised: since all FarCast code is written by AI agents — meaning human readability, onboarding, and hiring are non-concerns — would switching the backend to Rust yield a better product?
+FarCast's backend was specified in Go across every module, with Electron + TypeScript locked in for the FarSight GUI client *(superseded for the client on 2026-11-11 by [ADR 0021](0021-farsight-native-client.md): native shells, Swift/SwiftUI on Apple first)*. The question was raised: since all FarCast code is written by AI agents — meaning human readability, onboarding, and hiring are non-concerns — would switching the backend to Rust yield a better product?
 
 This ADR records the decision and the reasoning, because the obvious framing of the question is misleading and the evidence behind it is easy to get stale.
 
@@ -64,7 +64,7 @@ The win is **conditional on actual load.** A sovereign single-tenant instance is
 
 ## Decision
 
-1. **Go is the default backend language for every module** — manifest, Planck, TechnoCore, AllThing, DataSphere, Shrike, FarSight server, FarSight CLI, and the Go SDK. (FarSight's GUI client remains Electron + TypeScript; the Node and Python SDKs proceed as planned.)
+1. **Go is the default backend language for every module** — manifest, Planck, TechnoCore, AllThing, DataSphere, Shrike, FarSight server, FarSight CLI, and the Go SDK. (FarSight's GUI client remains Electron + TypeScript; the Node and Python SDKs proceed as planned.) *(2026-11-11: the client half is superseded by [ADR 0021](0021-farsight-native-client.md). FarSight's clients are native per platform family, with Swift/SwiftUI on Apple first. The backend decision here is unchanged.)*
 
 2. **FatLine is the sole sanctioned Rust candidate, and only its hot data-plane loop.** Its control/config plane stays Go. The choice is **gated on a benchmark** (see below) — default to Go-first, Rust-on-evidence, not speculative Rust.
 
@@ -103,6 +103,13 @@ Build FatLine in Go first (it is needed early in Phase 2 regardless). Then bench
 **Mandated guardrails (make either language safe without a human reviewer)**
 
 - **Go modules:** `go test -race`, `go vet`, and `golangci-lint`, for every Go module, run by `./check.sh`. *(Amended 2026-10-08: this said "in CI" and no CI existed; the guardrails ran from a runbook script that skipped `sdk/go` and skipped lint when the linter was absent. `./check.sh` is the gate, and it fails rather than skips.)*
+- **Swift (the Apple client):** *(added 2026-11-11 by [ADR 0021](0021-farsight-native-client.md) decision 4)*. These join `./check.sh` with the first client code:
+  - Swift 6 language mode with complete strict concurrency;
+  - `-strict-memory-safety` with its diagnostics as errors;
+  - a source gate refusing `@unchecked Sendable`, `nonisolated(unsafe)` and `unsafe` outside a reviewed allowlist;
+  - full builds, never `-typecheck` alone;
+  - `swift test` and `xcodebuild test`;
+  - no third-party packages without an ADR.
 - **Any Rust module:** `#![forbid(unsafe_code)]`, clippy and `cargo-geiger`, plus **cancellation-safety integration tests** — the one genuinely silent, untooled Rust AI hazard identified in review (data loss when a future is dropped mid-`select!`, non-atomic state across `.await`). Multithreaded / race-style integration tests for the shared session and allowlist state.
 
 ---

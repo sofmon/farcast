@@ -2,7 +2,7 @@
 
 > The operator's command line for FarCast — install instances, run repositories, watch costs.
 
-`farcast` is the command line face of [FarSight](../README.md), the FarCast UX layer. The same downloadable "farcast" app provides a GUI (the tiling browser), a server (UX composition inside an instance), and this CLI. The CLI is what operators and automation use to provision instances, deploy repositories, connect through FatLine, and monitor spending.
+`farcast` is the command line face of [FarSight](../README.md), the FarCast UX layer. The same "farcast" product provides a GUI (the tiling browser; on macOS the app is to bundle this CLI), a server (tile registry, sessions and layout state inside an instance), and this CLI. The CLI is what operators and automation use to provision instances, deploy repositories, connect through FatLine, and monitor spending.
 
 This document specifies the CLI phase by phase — the scaffold (1.1) and each command landed since: `install` (1.3), `release` (1.4), and `connect` + `redeploy` (2.3). **Phase 1.1 — the CLI scaffold** (implemented): the command framework, the two commands that work from day one (`version`, `help`), local configuration handling, and the human/JSON output model. **Phase 1.3 — `farcast install`** (implemented): the first command that does real, billable work — interactively provisioning a cloud instance through Planck under a mandatory cost limit. The scaffold is what makes `install` a small, uniform addition.
 
@@ -16,7 +16,7 @@ This document specifies the CLI phase by phase — the scaffold (1.1) and each c
 
 **It is not** the [farcast SDK](../../sdk/go/README.md). The SDK is the syscall surface for applications running *inside* an instance; the CLI is the operator tool *outside* it. They do not share code and the CLI does not import the SDK. The two meet only on the wire — the CLI talks to a running instance through FatLine, in later phases.
 
-**It is not** the GUI or the server. Those are separate FarSight components (Electron client, Phase 7; Go server, later). The CLI is a standalone Go binary now; the packaged "farcast" app will ship it alongside the GUI.
+**It is not** the GUI or the server. Those are separate FarSight components: the native client (Phase 7, [ADR 0021](../../docs/adr/0021-farsight-native-client.md)) and the Go server (later). The CLI is a standalone Go binary now. The macOS app will bundle it and drive it, once the CLI has the consent protocol ADR 0021 decision 6 requires (`--plan` and `--confirm <digest>`, never a bare `--yes`).
 
 ---
 
@@ -77,7 +77,7 @@ farcast [global flags] <command> [command flags] [arguments]
 | `usage` | ✅ works | Compute and network use, against what is reserved and declared, with the kernel's right-sizing advice | 5.1 |
 | `storage` | ✅ works | The instance's encrypted disk: `ls`, `cp`, `rm`, `usage`, `key …` | 3.3 |
 | `secret` | ✅ works | Application secrets, encrypted at rest in the instance's storage: `set`, `ls`, `rm` | 5.3 |
-| `keeper` | ✅ works | Devices that re-seed a restart-sealed instance unattended: `enroll`, `install`, `run`, `status`, `revoke`, `uninstall` | 5.4 |
+| `keeper` | ✅ works | Devices that re-seed a restart-sealed instance unattended: `enroll`, `install`, `run`, `status`, `revoke`, `uninstall`. Enrolment by request is accepted, not yet built ([ADR 0020](../../docs/adr/0020-instance-pki-ecdsa-p256.md)) | 5.4 |
 | `build` | ✅ works | Build an application's image inside the instance | 4.2 |
 | `kernel` | ✅ works | Deploy TechnoCore, meter namespaces, and push the provider's confirmed costs: `deploy`, `meter`, `confirm`. `deploy --adapt` lets it right-size applications; `--adapt-cooldown` and `--interval` tune it, and all three are carried forward | 4.1 |
 | `chat` | ⏳ stub | Terminal AI chat through AllThing | 6.2 |
@@ -830,9 +830,16 @@ farcast keeper revoke  <instance> <device> [-y]
 farcast keeper uninstall <instance>
 ```
 
+**Accepted, not yet built ([ADR 0020](../../docs/adr/0020-instance-pki-ecdsa-p256.md), 2026-11-11): enrolment becomes a request.**
+1. `keeper request` on the device generates a P-256 key where it will live and prints the key's fingerprint.
+2. `keeper enroll --request` on the operator's machine checks the request and issues only after the operator confirms that fingerprint. It writes a passphrase-armored packet carrying the bundle and a certificate, but no private key.
+3. `keeper install` refuses a certificate that is not for its own key.
+
+Until then, the commands above are what exists, and what follows describes them.
+
 `enroll` and `revoke` run on the machine holding the CA key. `install`, `run` and `uninstall` run on the device — `uninstall` wipes its bundle and leaf key and keeps its ledger and record, and `farcast release` does the same to a keeper installed on the releasing machine. `status` runs on either and reads whatever ledgers that machine has. On the machine that enrolled the fleet it also lists each device with its expiry and budget, and totals the budgets of the devices that can still push, per window: two devices at 8 a month admit 16 re-seeds a month, which no one device's status shows. That is a total of limits — what each device has used is in its own ledger, on that device. (Since 2026-11-09; a device enrolled before then has no window recorded, and status says to re-enrol it to count it.)
 
-**The packet in transit.** `enroll` writes a packet that, with its passphrase, *is* that device: anyone holding both can read what is stored under the keys it carries and re-seed a replica that restarts, and `revoke` alone stops neither — rotating does (see *What `revoke` does not do*). Losing it loses nothing; enrol again. So write the packet and the passphrase file outside every directory a desktop indexer or sync client reads — not directly in `~`, nor `~/Documents`, `~/Desktop` or `~/Downloads`, but under a directory such as `~/.config/farcast/` — and delete both once `install` has run. (The 2026-11-10 walk left both directly in `~` on a Linux device, where GNOME's file indexer made their names searchable; the keeper directory under `~/.config` was not indexed.)
+**The packet in transit.** `enroll` writes a packet that, with its passphrase, *is* that device: anyone holding both can read what is stored under the keys it carries and re-seed a replica that restarts, and `revoke` alone stops neither — rotating does (see *What `revoke` does not do*). Losing it loses nothing; enrol again. So write the packet and the passphrase file outside every directory a desktop indexer or sync client reads — not directly in `~`, nor `~/Documents`, `~/Desktop` or `~/Downloads`, but under a directory such as `~/.config/farcast/` — and delete both once `install` has run. (The 2026-11-10 walk left both directly in `~` on a Linux device, where GNOME's file indexer made their names searchable; the keeper directory under `~/.config` was not indexed.) *(Under [ADR 0020](../../docs/adr/0020-instance-pki-ecdsa-p256.md), accepted 2026-11-11 and not yet built, the packet stops carrying the leaf key. With its passphrase it will still yield the bundle, and so still read what is stored under its keys. It will no longer re-seed through the tunnel, provided the operator confirmed the request's fingerprint. The handling above still applies.)*
 
 ### What a pass exits with
 
