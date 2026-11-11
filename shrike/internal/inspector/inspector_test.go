@@ -2,7 +2,10 @@ package inspector
 
 import (
 	"bytes"
+	"encoding/json"
+	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -155,14 +158,20 @@ func TestConcurrentRecord(t *testing.T) {
 			for range iters {
 				ins.Record(event.Event{Kind: event.Allow, Host: "api.example", Port: "443"})
 				ins.Record(event.Event{Kind: event.Deny, Host: "evil.com", Reason: event.ReasonNotInAllowlist})
+				// The tunnel table is shared state of its own.
+				ins.Record(event.Event{Kind: event.Allow, Proto: event.ProtoStream, Host: "keyholder",
+					PeerRole: event.PeerKeeper, PeerToken: "t1", BytesUp: 1})
+				ins.Record(event.Event{Kind: event.Deny, Proto: event.ProtoStream, Host: "shrike",
+					PeerRole: event.PeerKeeper, PeerToken: "t1", Reason: event.ReasonRoleRefused})
 				_ = ins.Allowed()
 				_ = ins.Violations()
+				_ = ins.Tunnel()
 				_ = ins.Events()
 			}
 		})
 	}
 	wg.Wait()
-	if want := int64(goroutines * iters * 2); ins.Events() != want {
+	if want := int64(goroutines * iters * 4); ins.Events() != want {
 		t.Fatalf("Events()=%d, want %d", ins.Events(), want)
 	}
 }
@@ -391,5 +400,300 @@ func TestAnUnidentifiedCallerStillGetsARow(t *testing.T) {
 	apps := i.Apps()
 	if len(apps) != 1 || apps[0].Denies != 1 || apps[0].App != "" {
 		t.Fatalf("apps are %+v, want one unnamed row with a denial", apps)
+	}
+}
+
+func stream(kind event.Kind, role, token, route, reason string) event.Event {
+	return event.Event{Kind: kind, Proto: event.ProtoStream, PeerRole: role, PeerToken: token, Host: route, Reason: reason}
+}
+
+// A tunnel stream is the operator or a keeper reaching an in-instance service.
+// It is not an application's egress and has no application, and folded into
+// the application tables it became the "(unidentified)" row — where walk
+// finding 1 lost which device a refusal was about.
+func TestTunnelStreamsAreNotApplicationEgress(t *testing.T) {
+	ins := New(nopAlerter{}, time.Minute)
+	ins.Record(stream(event.Allow, event.PeerKeeper, "k1", "keyholder", event.ReasonRelayed))
+	ins.Record(stream(event.Deny, event.PeerKeeper, "k1", "shrike", event.ReasonRoleRefused))
+	ins.Record(stream(event.Fail, event.PeerOperator, "op", "keyholder", event.ReasonDialFailed))
+	// An older FatLine's stream line: no peer at all. Separated by Proto, so
+	// it lands here too.
+	ins.Record(event.Event{Kind: event.Deny, Proto: event.ProtoStream, Host: "shrike", Reason: event.ReasonRoleRefused})
+
+	if a := ins.Allowed(); len(a) != 0 {
+		t.Errorf("tunnel streams reached the allowed table: %+v", a)
+	}
+	if v := ins.Violations(); len(v) != 0 {
+		t.Errorf("tunnel streams reached the violation table: %+v", v)
+	}
+	if a := ins.Apps(); len(a) != 0 {
+		t.Errorf("tunnel streams reached the application roll-up: %+v", a)
+	}
+	if n := len(ins.Tunnel()); n != 4 {
+		t.Errorf("the tunnel table has %d rows, want 4: %+v", n, ins.Tunnel())
+	}
+}
+
+// Two keepers on one route are two devices, and two rows.
+func TestTwoKeepersOnOneRouteAreTwoRows(t *testing.T) {
+	ins := New(nopAlerter{}, time.Minute)
+	ins.Record(stream(event.Allow, event.PeerKeeper, "k1", "keyholder", event.ReasonRelayed))
+	ins.Record(stream(event.Allow, event.PeerKeeper, "k2", "keyholder", event.ReasonRelayed))
+	ins.Record(stream(event.Allow, event.PeerKeeper, "k2", "keyholder", event.ReasonRelayed))
+	// The same token in another role is another row: the role is FatLine's
+	// decision and the table must not merge two of them.
+	ins.Record(stream(event.Allow, event.PeerOperator, "k2", "keyholder", event.ReasonRelayed))
+	rows := ins.Tunnel()
+	if len(rows) != 3 {
+		t.Fatalf("rows = %+v, want three", rows)
+	}
+	want := []struct {
+		role, peer string
+		relayed    int64
+	}{{event.PeerKeeper, "k1", 1}, {event.PeerKeeper, "k2", 2}, {event.PeerOperator, "k2", 1}}
+	for i, w := range want {
+		if rows[i].Role != w.role || rows[i].Peer != w.peer || rows[i].Relayed != w.relayed {
+			t.Errorf("row %d = %+v, want %s %s relayed %d", i, rows[i], w.role, w.peer, w.relayed)
+		}
+	}
+}
+
+// A relayed stream's bytes ride its Allow event — a stream has no Close — and
+// were dropped until the tunnel table counted them.
+func TestARelayedStreamCountsItsBytes(t *testing.T) {
+	ins := New(nopAlerter{}, time.Minute)
+	e := stream(event.Allow, event.PeerOperator, "op", "keyholder", event.ReasonRelayed)
+	e.BytesUp, e.BytesDown = 4096, 1<<20
+	ins.Record(e)
+	ins.Record(e)
+	rows := ins.Tunnel()
+	if len(rows) != 1 || rows[0].BytesUp != 8192 || rows[0].BytesDown != 2<<20 || rows[0].Relayed != 2 {
+		t.Errorf("rows = %+v, want 2 relays moving 8 KiB up and 2 MiB down", rows)
+	}
+}
+
+// A keeper asking for the operator's route is raised, with its role and
+// without its token, and repeats within the window are coalesced.
+func TestARoleRefusalAlertsWithTheRoleAndNoToken(t *testing.T) {
+	const token = "d1e2v3i4c5e6t7o8"
+	alerts := &capAlerter{}
+	ins := New(alerts, time.Hour)
+	ins.Record(stream(event.Deny, event.PeerKeeper, token, "shrike", event.ReasonRoleRefused))
+	if alerts.count() != 1 {
+		t.Fatalf("a role refusal raised %d alerts, want 1", alerts.count())
+	}
+	a := alerts.last()
+	if a.PeerRole != event.PeerKeeper || a.Reason != event.ReasonRoleRefused || a.Severity != Warning {
+		t.Errorf("alert = %+v", a)
+	}
+	if !strings.Contains(a.Message, `"shrike"`) || !strings.Contains(a.Message, "keeper") {
+		t.Errorf("the message does not name the route and the role: %q", a.Message)
+	}
+	if strings.Contains(a.Message, token) {
+		t.Errorf("the message carries the token: %q", a.Message)
+	}
+
+	ins.Record(stream(event.Deny, event.PeerKeeper, token, "shrike", event.ReasonRoleRefused))
+	if alerts.count() != 1 {
+		t.Errorf("a repeat within the window raised again: %d alerts", alerts.count())
+	}
+	if rows := ins.Tunnel(); len(rows) != 1 || rows[0].Refused != 2 || rows[0].Reasons[event.ReasonRoleRefused] != 2 {
+		t.Errorf("rows = %+v, want two role refusals counted", rows)
+	}
+
+	// The log line names the role and never the token.
+	var buf bytes.Buffer
+	SlogAlerter{Logger: slog.New(slog.NewTextHandler(&buf, nil))}.Alert(a)
+	if !strings.Contains(buf.String(), "peer_role=keeper") {
+		t.Errorf("the alert line does not name the role:\n  %s", buf.String())
+	}
+	if strings.Contains(buf.String(), token) {
+		t.Errorf("the alert line carries the token:\n  %s", buf.String())
+	}
+}
+
+// A permitted stream whose service did not answer is a network fact. It is
+// counted, and it is not a refusal.
+func TestATunnelDialFailureIsNotARefusal(t *testing.T) {
+	alerts := &capAlerter{}
+	ins := New(alerts, time.Minute)
+	ins.Record(stream(event.Fail, event.PeerOperator, "op", "keyholder", event.ReasonDialFailed))
+	if alerts.count() != 0 {
+		t.Errorf("a dial failure raised %d alerts", alerts.count())
+	}
+	rows := ins.Tunnel()
+	if len(rows) != 1 || rows[0].Failed != 1 || rows[0].Refused != 0 {
+		t.Errorf("rows = %+v, want one failure and no refusal", rows)
+	}
+}
+
+// The reasons map handed out is a copy: a caller must not be given a map the
+// engine keeps writing to.
+func TestTunnelCopiesTheReasons(t *testing.T) {
+	ins := New(nopAlerter{}, time.Minute)
+	ins.Record(stream(event.Deny, event.PeerKeeper, "k1", "shrike", event.ReasonRoleRefused))
+	rows := ins.Tunnel()
+	rows[0].Reasons[event.ReasonRoleRefused] = 99
+	if got := ins.Tunnel()[0].Reasons[event.ReasonRoleRefused]; got != 1 {
+		t.Errorf("a caller's write reached the engine: %d", got)
+	}
+}
+
+// preAttributionDialFailed is the line a FatLine older than attribution wrote
+// to Shrike's socket when a stream's service did not answer: the event struct
+// as it was then, through encoding/json, with the failure riding Deny.
+const preAttributionDialFailed = `{"Kind":"deny","Tenant":"","App":"","Host":"keyholder","Port":"","Proto":"stream","SNI":"","Reason":"dial_failed","BytesUp":0,"BytesDown":0,"DialMillis":0,"DurationMillis":0}`
+
+// A newer Shrike beside an older FatLine reads that line as the failure it
+// is. Raised as a refusal, it sent an operator hunting for a misused
+// credential when a keyholder replica was restarting.
+func TestAnOlderFatLinesStreamDialFailureIsNotARefusal(t *testing.T) {
+	var e event.Event
+	if err := json.Unmarshal([]byte(preAttributionDialFailed), &e); err != nil {
+		t.Fatalf("decode the pre-attribution line: %v", err)
+	}
+	if e.Kind != event.Deny || e.PeerRole != "" {
+		t.Fatalf("the fixture is not the pre-attribution shape: %+v", e)
+	}
+	alerts := &capAlerter{}
+	var buf bytes.Buffer
+	ins := New(alerterPair{alerts, SlogAlerter{Logger: slog.New(slog.NewTextHandler(&buf, nil))}}, time.Minute)
+	ins.Record(e)
+
+	if alerts.count() != 0 || buf.Len() != 0 {
+		t.Errorf("an older FatLine's dial failure raised %d alert(s):\n%s", alerts.count(), buf.String())
+	}
+	rows := ins.Tunnel()
+	if len(rows) != 1 || rows[0].Failed != 1 || rows[0].Refused != 0 || len(rows[0].Reasons) != 0 {
+		t.Errorf("rows = %+v, want one failure and no refusal", rows)
+	}
+}
+
+// alerterPair hands each alert to both: the capture, and a real log line.
+type alerterPair struct {
+	a, b Alerter
+}
+
+func (p alerterPair) Alert(al Alert) {
+	p.a.Alert(al)
+	p.b.Alert(al)
+}
+
+// An older FatLine's stream refusal names no peer. It is still a tunnel
+// stream, and its line must not read as an application's egress violation.
+func TestAnOlderFatLinesStreamRefusalIsLoggedAsATunnelRefusal(t *testing.T) {
+	var buf bytes.Buffer
+	ins := New(SlogAlerter{Logger: slog.New(slog.NewTextHandler(&buf, nil))}, time.Minute)
+	ins.Record(event.Event{Kind: event.Deny, Proto: event.ProtoStream, Host: "shrike", Reason: event.ReasonRoleRefused})
+	out := buf.String()
+	if !strings.Contains(out, `msg="shrike: tunnel stream refused"`) {
+		t.Errorf("a stream refusal without a peer is not logged as a tunnel refusal:\n%s", out)
+	}
+	if strings.Contains(out, "egress policy violation") {
+		t.Errorf("a stream refusal is logged as an egress violation:\n%s", out)
+	}
+	if strings.Contains(out, "peer_role") {
+		t.Errorf("a refusal with no peer carries an empty peer_role:\n%s", out)
+	}
+
+	// The control: application egress keeps its own message.
+	buf.Reset()
+	ins.Record(event.Event{Kind: event.Deny, Tenant: "apps", App: "api", Proto: "connect", Host: "evil.example", Reason: event.ReasonNotInAllowlist})
+	if !strings.Contains(buf.String(), `msg="shrike: egress policy violation"`) {
+		t.Errorf("an egress denial lost its message:\n%s", buf.String())
+	}
+}
+
+// Shrike's alert line is read on provider-owned nodes, so it carries nothing
+// per leaf: not the token, and not a count or a line pattern that depends on
+// one. Two keeper leaves refused the same route in one window are one line,
+// and the count that line and the next carry is the role's. The per-leaf
+// counts stay in the tunnel table.
+func TestTunnelAlertsCarryNothingPerLeaf(t *testing.T) {
+	const tokA, tokB = "aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"
+	var buf bytes.Buffer
+	ins := New(SlogAlerter{Logger: slog.New(slog.NewTextHandler(&buf, nil))}, time.Hour)
+	lines := func() []string { return strings.Split(strings.TrimSpace(buf.String()), "\n") }
+
+	ins.Record(stream(event.Deny, event.PeerKeeper, tokA, "shrike", event.ReasonRoleRefused))
+	ins.Record(stream(event.Deny, event.PeerKeeper, tokB, "shrike", event.ReasonRoleRefused))
+	if got := lines(); len(got) != 1 || !strings.Contains(got[0], "count=1") {
+		t.Fatalf("two leaves refused one route in one window gave %d line(s), want one count=1:\n%s", len(got), buf.String())
+	}
+
+	// Ten refusals from each leaf: neither alone reaches the burst, the role
+	// does, and the escalation says so with the role's count.
+	for range 9 {
+		ins.Record(stream(event.Deny, event.PeerKeeper, tokA, "shrike", event.ReasonRoleRefused))
+		ins.Record(stream(event.Deny, event.PeerKeeper, tokB, "shrike", event.ReasonRoleRefused))
+	}
+	got := lines()
+	if len(got) != 2 {
+		t.Fatalf("the role's burst gave %d line(s), want two:\n%s", len(got), buf.String())
+	}
+	if !strings.Contains(got[1], fmt.Sprintf("count=%d", burstThreshold)) || !strings.Contains(got[1], "severity="+string(Critical)) {
+		t.Errorf("the burst line does not carry the role's count, escalated:\n%s", got[1])
+	}
+	if out := buf.String(); strings.Contains(out, tokA) || strings.Contains(out, tokB) {
+		t.Errorf("a token reached the alert line:\n%s", out)
+	}
+
+	rows := ins.Tunnel()
+	if len(rows) != 2 || rows[0].Peer != tokA || rows[0].Refused != 10 || rows[1].Peer != tokB || rows[1].Refused != 10 {
+		t.Errorf("rows = %+v, want each leaf's ten refusals in its own row", rows)
+	}
+}
+
+// A route name is the peer's own text. Every unknown one is one row per peer
+// and one alert key, so an admitted leaf naming routes cannot grow the
+// picture, and none of that text reaches the alert line.
+func TestUnknownRoutesFoldIntoOneRow(t *testing.T) {
+	alerts := &capAlerter{}
+	ins := New(alerts, time.Hour)
+	for n := range 1000 {
+		ins.Record(stream(event.Deny, event.PeerKeeper, "k1", fmt.Sprintf("\x1b[8mroute-%d", n), event.ReasonUnknownRoute))
+	}
+	ins.Record(stream(event.Deny, event.PeerKeeper, "k2", "another", event.ReasonUnknownRoute))
+
+	rows := ins.Tunnel()
+	if len(rows) != 2 {
+		t.Fatalf("1001 unknown routes from two leaves gave %d rows, want two: %+v", len(rows), rows)
+	}
+	for _, r := range rows {
+		if r.Route != UnknownRoute {
+			t.Errorf("an unknown route kept the peer's name: %q", r.Route)
+		}
+	}
+	if rows[0].Refused != 1000 || rows[0].Reasons[event.ReasonUnknownRoute] != 1000 {
+		t.Errorf("row = %+v, want 1000 unknown_route refusals", rows[0])
+	}
+	ins.mu.Lock()
+	nTunnel, nAlerts := len(ins.tunnel), len(ins.tunnelAlerts)
+	ins.mu.Unlock()
+	if nTunnel != 2 || nAlerts != 1 {
+		t.Errorf("state holds %d tunnel rows and %d alert keys, want 2 and 1", nTunnel, nAlerts)
+	}
+
+	// One key: the first sighting and the burst escalation, and nothing per
+	// name (per name, every one of the 1001 was a first sighting).
+	alerts.mu.Lock()
+	raised := slices.Clone(alerts.alerts)
+	alerts.mu.Unlock()
+	if len(raised) != 2 || raised[0].Count != 1 || raised[1].Count != burstThreshold {
+		t.Fatalf("raised %+v, want the first sighting and the burst", raised)
+	}
+	for _, a := range raised {
+		if a.Host != UnknownRoute || strings.Contains(a.Message, "route-") || strings.Contains(a.Message, "\x1b") {
+			t.Errorf("the alert carries the peer's text: host=%q message=%q", a.Host, a.Message)
+		}
+		if !strings.Contains(a.Message, "does not exist") {
+			t.Errorf("the message does not say the route does not exist: %q", a.Message)
+		}
+	}
+
+	// A configured route is still its own row.
+	ins.Record(stream(event.Allow, event.PeerKeeper, "k1", "keyholder", event.ReasonRelayed))
+	if rows := ins.Tunnel(); len(rows) != 3 || rows[1].Peer != "k1" || rows[1].Route != "keyholder" {
+		t.Errorf("rows = %+v, want keyholder beside the folded row", rows)
 	}
 }

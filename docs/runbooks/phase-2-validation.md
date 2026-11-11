@@ -394,8 +394,10 @@ kubectl -n farcast-system get configmap fatline-egress-policy -o json \
 kubectl -n farcast-system logs -l app.kubernetes.io/name=fatline -c shrike --tail=20 | grep -i reload
 ```
 
-✅ Expect `shrike: declared contract reloaded (…)` on the **already-running**
-pod, with no restart, and the status endpoint serving the new host.
+✅ Expect a timestamped `INFO shrike: declared contract reloaded applications=… hosts=…`
+on the **already-running** pod, with no restart, and the status endpoint serving
+the new host. *(Before 2026-11-10 the line was untimestamped and read
+`shrike: declared contract reloaded (…)`.)*
 
 ## B4. Verify the mTLS boundary — the "locked door"
 

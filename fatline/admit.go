@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/sofmon/farcast/fatline/event"
 	"github.com/sofmon/farcast/fatline/identity"
 )
 
@@ -46,6 +47,30 @@ func (s *Server) isKeeper(cs *tls.ConnectionState) bool {
 		}
 	}
 	return false
+}
+
+// peer attributes a tunnel caller: its role (event.PeerKeeper or
+// event.PeerOperator) and the opaque token of its verified leaf. Both are
+// empty for a caller the tunnel does not admit, which admit has refused
+// before any handler runs.
+//
+// The keeper test is isKeeper itself, so the record of a decision and the
+// decision come from one evaluation and cannot disagree. PeerCertificates[0]
+// is the leaf the handshake verified (RequireAndVerifyClientCert plus the URI
+// rule), so the token names exactly the credential that was admitted.
+func (s *Server) peer(cs *tls.ConnectionState) (role, token string) {
+	if cs == nil || len(cs.PeerCertificates) == 0 {
+		return "", ""
+	}
+	switch {
+	case s.isKeeper(cs):
+		role = event.PeerKeeper
+	case slices.Contains(peerURIs(cs), identity.OperatorURI(s.cfg.Instance)) && s.cfg.Instance != "":
+		role = event.PeerOperator
+	default:
+		return "", ""
+	}
+	return role, identity.LeafToken(cs.PeerCertificates[0].Raw)
 }
 
 // admitted reports whether the peer's leaf carries an identity the tunnel

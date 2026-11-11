@@ -125,6 +125,19 @@ func TestIntegrationClusterLifecycle(t *testing.T) {
 	if strings.Contains(string(c.Kubeconfig), "certificate-authority-data") {
 		t.Error("DNS-endpoint kubeconfig must not embed certificate-authority-data")
 	}
+	// ADR 0019: CreateCluster refuses a cluster that does not read back as
+	// system-only logging, so reaching here means the live cloud accepted and
+	// echoed it. Monitoring is not set by FarCast; record what is on, for the
+	// walk.
+	if !c.SystemLogsOnly {
+		t.Error("cluster not reported as system-only logging (ADR 0019)")
+	}
+	if raw, exists, err := p.(*provider).api.get(ctx, ref); err != nil || !exists {
+		t.Errorf("read back cluster: exists=%t err=%v", exists, err)
+	} else {
+		t.Logf("logging read back: %s", raw.Logging)
+		t.Logf("monitoring read back: %s", raw.Monitoring)
+	}
 
 	st, err := p.ClusterStatus(ctx, ref)
 	if err != nil {

@@ -41,8 +41,12 @@ deployments share a name.
 is the one worth reading after a crash loop.
 
 Logs are the application's own output. FarCast does not collect, forward or
-store them anywhere — this reads them from the cluster on demand and prints
-them here.`)
+store them. The cluster is configured not to send them to the provider's
+logging, which the next walk checks (ADR 0019; an instance installed before it
+is not configured so). They stay on the node that ran the container — about 50 MiB per container, gone when it is rotated or the Pod is
+deleted — and this reads them on demand. The node and its disk are the
+provider's, and the read passes through the provider-run Kubernetes API server,
+so the provider is trusted not to look rather than unable to.`)
 }
 
 func (c *logsCommand) SetFlags(fs *flag.FlagSet) {

@@ -16,6 +16,7 @@ import (
 	"github.com/sofmon/farcast/farsight/cli/internal/keyholder"
 	fldeploy "github.com/sofmon/farcast/fatline/deploy"
 	"github.com/sofmon/farcast/fatline/identity"
+	"github.com/sofmon/farcast/fatline/policy"
 	"github.com/sofmon/farcast/manifest/parser"
 	pbuild "github.com/sofmon/farcast/planck/build"
 	pfetch "github.com/sofmon/farcast/planck/fetch"
@@ -88,7 +89,9 @@ what you approved.
 
 The gate is the external service declarations. Nothing an application can reach
 is implicit — FatLine denies every outbound host that the manifest does not
-name, so what is listed at the prompt is the whole of it.
+name, so what is listed at the prompt is the whole of it. -y answers the
+question and skips nothing else: the review is still printed, to stderr, and
+the result lists every host each application may now reach and why.
 
 An instance with no kernel is refused before anything is read. The read, the
 builds and the applications all bill, and a namespace the kernel does not meter
@@ -106,8 +109,8 @@ func (c *runCommand) SetFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.manifestPath, "manifest", "", "path of the manifest within the repository (default ./farcast)")
 	fs.StringVar(&c.fetcherImage, "fetcher-image", "", "digest-pinned image with git in it")
 	fs.StringVar(&c.builderImage, "builder-image", "", "digest-pinned Kaniko image")
-	fs.BoolVar(&c.assumeYes, "yes", false, "skip the review prompt")
-	fs.BoolVar(&c.assumeYes, "y", false, "skip the review prompt")
+	fs.BoolVar(&c.assumeYes, "yes", false, "show the review but do not ask")
+	fs.BoolVar(&c.assumeYes, "y", false, "show the review but do not ask")
 }
 
 func (c *runCommand) ensureDefaults() {
@@ -290,7 +293,7 @@ func (c *runCommand) Run(ctx context.Context, env *Env, args []string) error {
 		Instance: name, Repo: repo, Namespace: namespace,
 		Deployment: m.Name, Commit: read.Report.Commit,
 		ManifestDigest: read.Report.ManifestDigest,
-		Apps:           appResults(*m, images),
+		Apps:           appResults(*m, images, doc, namespace),
 		Egress:         summarise(doc, namespace),
 		Metered:        metered, MeterError: errString(meterErr),
 		NotReady: slow,
@@ -477,8 +480,13 @@ func (c *runCommand) ensureAppScopes(env *Env, instance, namespace string, m par
 		}
 		return nil, nil, fmt.Errorf("record the new storage scopes: %w — nothing was deployed", err)
 	}
-	fprintf(env.Err, "Minted a storage scope for %s in %q. %s\n",
-		strings.Join(minted, ", "), namespace, datasphere.KeyLossWarning)
+	fprintf(env.Err, "Minted a storage scope for %s in %q.\n", strings.Join(minted, ", "), namespace)
+	warnKeyLoss(env.Err)
+	// The actionable half: the keys just minted exist in this keyring and
+	// nowhere else, so a copy taken earlier cannot restore what is written
+	// under them.
+	fprintf(env.Err, "A backup of keys.yaml made before now does not hold these keys; back it up again: %s\n",
+		env.ConfigDir.InstanceKeyringPath(instance))
 	return out, minted, nil
 }
 
@@ -702,11 +710,22 @@ func (c *runCommand) record(env *Env, meta *config.InstanceMetadata, name, fetch
 	}
 }
 
+// confirm shows the review and asks for it to be approved.
+//
+// The review is printed whether or not -y was passed. AGENTS.md makes the
+// declarations the gate, and -y waives the question, not the reading: an
+// approval given in advance is still an approval of these hosts, and the
+// warnings in the review — FatLine not deployed, a cost limit below what this
+// would bill — are the ones an unattended run most needs on record. It is also
+// the only record if the run fails after the egress policy is written and
+// before a result is printed. Like every prompt it goes to stderr, so stdout
+// carries only the result.
 func (c *runCommand) confirm(env *Env, rev review) (bool, error) {
+	rev.print(env.Err)
 	if c.assumeYes {
+		fprintln(env.Err, "\nApproved with --yes; nothing was asked.")
 		return true, nil
 	}
-	rev.print(env.Err)
 	if !isInteractive(env) {
 		return false, usagef("running a repository builds and deploys code this machine has not read; pass --yes to confirm")
 	}
@@ -741,22 +760,38 @@ func errString(err error) string {
 	return err.Error()
 }
 
-func appResults(m parser.Manifest, images map[string]string) []runApp {
+// appResults is each application the manifest deployed, in manifest order,
+// with what it may now reach.
+//
+// The declarations come from the egress policy that was written — the
+// document FatLine enforces — and not from the manifest again. That is where
+// the summary's count comes from too, so the count and the list cannot
+// disagree, and what the result says an application may reach is what the
+// boundary was told. An application the document has no entry for may reach
+// nothing, and is listed as reaching nothing rather than left out.
+func appResults(m parser.Manifest, images map[string]string, doc *policy.Document, namespace string) []runApp {
 	out := make([]runApp, 0, len(m.Apps))
 	for _, a := range m.Apps {
-		r := runApp{Name: a.Name, Image: images[a.Name]}
-		for _, e := range a.External {
-			r.External = append(r.External, e.Host)
+		r := runApp{Name: a.Name, Image: images[a.Name], External: []parser.External{}}
+		for _, p := range doc.Apps {
+			if p.Namespace == namespace && p.Name == a.Name {
+				r.External = append(r.External, p.External...)
+				break
+			}
 		}
 		out = append(out, r)
 	}
 	return out
 }
 
+// runApp is one deployed application. External is never omitted, and is the
+// same {host, reason} shape as .apps[].external in the policy ConfigMap: an
+// application that may reach nothing says so with [], rather than by a
+// missing key a reader has to know the meaning of.
 type runApp struct {
-	Name     string   `json:"name"`
-	Image    string   `json:"image"`
-	External []string `json:"external,omitempty"`
+	Name     string            `json:"name"`
+	Image    string            `json:"image"`
+	External []parser.External `json:"external"`
 }
 
 type runResult struct {
@@ -778,7 +813,7 @@ func (r runResult) Human(w io.Writer) error {
 	fprintf(w, "  from    %s at %s\n", r.Repo, r.Commit)
 	fprintf(w, "  reading %s\n", r.ManifestDigest)
 	for _, a := range r.Apps {
-		fprintf(w, "  %-16s %s\n", a.Name, a.Image)
+		fprintf(w, "  %-16s %s\n", terminalText(a.Name), a.Image)
 	}
 	// What each application may now reach, and the fact that it is per
 	// application rather than per instance — which is the promise the review
@@ -787,6 +822,15 @@ func (r runResult) Human(w io.Writer) error {
 	fprintf(w, "\nEgress: %s across %s, enforced per application.\n",
 		plural(r.Egress.Hosts, "declared host", "declared hosts"),
 		plural(r.Egress.Applications, "application", "applications"))
+	// And what they are. A count alone is what the Phase 5 Session A walk
+	// found an operator approving with -y was left with: a number, and not
+	// the hosts it stood for. The lines are the review's own (printDeclared).
+	for _, a := range r.Apps {
+		// The manifest's text, like the review's: the parser admits only DNS
+		// labels here, and the printer should not have to know that.
+		fprintf(w, "  %s\n", terminalText(a.Name))
+		printDeclared(w, a.External)
+	}
 	if r.Egress.Others > 0 {
 		fprintf(w, "%s from other deployments on this instance kept their own.\n",
 			plural(r.Egress.Others, "application", "applications"))

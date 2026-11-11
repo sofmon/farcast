@@ -124,6 +124,24 @@ func TestRenderProducesOneNamespaceAndFiveDocumentsPerApp(t *testing.T) {
 	}
 }
 
+// TestRenderEmitsOnlyKnownKinds pins the kinds an application deployment can
+// put in the cluster. One reason is ADR 0019: Autopilot runs the provider's
+// managed Prometheus collectors and they cannot be turned off. They are not
+// idle — GKE's own metric packages already report every Pod's phase,
+// readiness and resource use through them — but they scrape no
+// application's own metrics endpoint unless something asks them to. A
+// PodMonitoring or ClusterPodMonitoring here would hand that endpoint to the
+// provider's monitoring as well.
+func TestRenderEmitsOnlyKnownKinds(t *testing.T) {
+	known := map[string]bool{"Namespace": true, "ConfigMap": true, "Secret": true, "Deployment": true, "Service": true, "NetworkPolicy": true}
+	_, docs := render(t, sampleConfig())
+	for _, d := range docs {
+		if k, _ := d["kind"].(string); !known[k] {
+			t.Errorf("rendered a %q; application deployments render only %v (ADR 0019: FarCast adds no scrape config of its own)", k, known)
+		}
+	}
+}
+
 // The 4.1 walk's lesson, applied before it can bite again: a controller does
 // not copy its own labels onto the pods it creates, and TechnoCore meters
 // PODS. Without managed-by on the pod template the application is invisible to

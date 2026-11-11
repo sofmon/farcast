@@ -121,15 +121,16 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		Log:       logger,
 	}
 
-	if err := cmd.Run(ctx, env, cmdArgs); err != nil {
-		if _, ok := errors.AsType[*usageError](err); ok {
-			fprintf(stderr, "farcast %s: %v\nRun 'farcast help %s' for usage.\n", name, err, name)
-			return 2
-		}
-		printer.PrintError(err.Error(), 1)
-		return 1
+	err = cmd.Run(ctx, env, cmdArgs)
+	code := exitCodeOf(err)
+	if _, usage := errors.AsType[*usageError](err); usage {
+		fprintf(stderr, "farcast %s: %v\nRun 'farcast help %s' for usage.\n", name, err, name)
+	} else if err != nil {
+		// The JSON envelope carries the same code the process exits with, so
+		// a script reading either reads one answer.
+		printer.PrintError(err.Error(), code)
 	}
-	return 0
+	return code
 }
 
 // parseInterspersed parses flags that may appear before, after, or between

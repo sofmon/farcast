@@ -116,26 +116,34 @@ func (s *Server) streamHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Who is asking, decided once. Every record below carries it, and the
+	// role check uses it, so a refusal and its record cannot name two
+	// different callers. The role reaches FatLine's log; the token reaches
+	// only Shrike's picture (event.Event.PeerToken).
+	role, token := s.peer(r.TLS)
 	name := strings.TrimPrefix(r.URL.Path, StreamPathPrefix)
+	emit := func(reason string, up, down int64) { s.emitStream(role, token, name, reason, up, down) }
+
 	route, found := s.route(name)
 	if !found {
 		// The refusal names nothing it was not given: an unknown route is
-		// reported as unknown, never with the list of known ones.
-		s.emitStream(name, "unknown_route", 0, 0)
+		// reported as unknown, never with the list of known ones. The name
+		// is the peer's own text, so it is recorded cut to a bound.
+		s.emitStream(role, token, recordedRoute(name), event.ReasonUnknownRoute, 0, 0)
 		http.Error(w, "unknown route", http.StatusNotFound)
 		return
 	}
 	// A keeper device re-seeds a restarted keyholder replica and does nothing
 	// else (ADR 0008 finding 4): it reaches the routes listed for it, and the
 	// operator reaches all of them.
-	if s.isKeeper(r.TLS) && !slices.Contains(s.cfg.KeeperRoutes, name) {
-		s.emitStream(name, "role_refused", 0, 0)
+	if role == event.PeerKeeper && !slices.Contains(s.cfg.KeeperRoutes, name) {
+		emit(event.ReasonRoleRefused, 0, 0)
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 	addr, err := route.resolve(r.URL.Query().Get("ordinal"))
 	if err != nil {
-		s.emitStream(name, "bad_ordinal", 0, 0)
+		emit(event.ReasonBadOrdinal, 0, 0)
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
@@ -148,7 +156,7 @@ func (s *Server) streamHandler(w http.ResponseWriter, r *http.Request) {
 	var d net.Dialer
 	upstream, err := d.DialContext(dialCtx, "tcp", addr)
 	if err != nil {
-		s.emitStream(name, "dial_failed", 0, 0)
+		emit(event.ReasonDialFailed, 0, 0)
 		http.Error(w, "cannot reach the service", http.StatusBadGateway)
 		return
 	}
@@ -163,7 +171,40 @@ func (s *Server) streamHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Shrike still witnesses that a relay happened, and how much moved — the
 	// route name and byte counts only. No payload byte is ever recorded.
-	s.emitStream(name, "relayed", up, down)
+	emit(event.ReasonRelayed, up, down)
+}
+
+// maxRecordedRoute is how many bytes of an unknown route's name FatLine
+// records. Configured names are a handful of bytes; this is room to read what
+// a confused client asked for, and no more.
+const maxRecordedRoute = 64
+
+// routeCutMarker ends a recorded route name that was cut.
+const routeCutMarker = "...(cut)"
+
+// recordedRoute is an unknown route's name as its event carries it.
+//
+// The name is whatever the peer sent, percent-decoded: an admitted leaf could
+// otherwise write text of any length into every log line that records the
+// refusal, once per request. It is cut to maxRecordedRoute bytes on a rune
+// boundary and marked, so the record says it was cut. Control bytes are kept
+// as sent; the log's text handler quotes them, and a reader that renders the
+// name must do the same.
+func recordedRoute(name string) string {
+	if len(name) <= maxRecordedRoute {
+		return name
+	}
+	// Ranging over a string visits rune starts (each invalid byte its own),
+	// so the last one at or before the bound is the longest cut that splits
+	// no character.
+	cut := 0
+	for i := range name {
+		if i > maxRecordedRoute {
+			break
+		}
+		cut = i
+	}
+	return name[:cut] + routeCutMarker
 }
 
 // route looks up a configured route by name.
@@ -176,14 +217,23 @@ func (s *Server) route(name string) (StreamRoute, bool) {
 	return StreamRoute{}, false
 }
 
-func (s *Server) emitStream(route, reason string, up, down int64) {
-	kind := event.Allow
-	if reason != "relayed" {
-		kind = event.Deny
+// emitStream records one tunnel-stream outcome. A relay is an Allow; a dial
+// failure is a Fail, because the route was permitted and the service did not
+// answer (event.ReasonDialFailed rides Fail, never Deny); everything else is
+// a refusal.
+func (s *Server) emitStream(role, token, route, reason string, up, down int64) {
+	kind := event.Deny
+	switch reason {
+	case event.ReasonRelayed:
+		kind = event.Allow
+	case event.ReasonDialFailed:
+		kind = event.Fail
 	}
 	s.events.Emit(event.Event{
 		Kind:      kind,
-		Proto:     "stream",
+		PeerRole:  role,
+		PeerToken: token,
+		Proto:     event.ProtoStream,
 		Host:      route,
 		Reason:    reason,
 		BytesUp:   up,

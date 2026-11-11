@@ -250,7 +250,8 @@ func (c *keyExportCommand) Run(_ context.Context, env *Env, args []string) error
 	if _, err := file.Write(armored); err != nil {
 		return err
 	}
-	fprintf(env.Err, "The passphrase is the only thing protecting this file. %s\n", datasphere.KeyLossWarning)
+	fprintln(env.Err, "The passphrase is the only thing protecting this file.")
+	warnKeyLoss(env.Err)
 	return env.Printer.Print(keySimpleResult{Instance: instance, Path: c.out, Status: "exported"})
 }
 
@@ -1090,11 +1091,16 @@ func (c *keyRekeyCommand) gate(ctx context.Context, env *Env, instance string, k
 		for i := range replicaCount(meta) {
 			st, err := client.State(ctx, i)
 			switch {
+			// A problem is one bullet of a refusal a dry run prints as it is
+			// and a real run returns as its error, which keeps its newlines:
+			// what a replica said goes in quoted, so it cannot act on the
+			// terminal or start a bullet of its own. The refusal itself is
+			// several lines by design, and is not quoted whole.
 			case err != nil:
-				problems = append(problems, fmt.Sprintf("replica %d did not answer (%v)", i, err))
+				problems = append(problems, fmt.Sprintf("replica %d did not answer (%s)", i, terminalText(err.Error())))
 				remedy(fmt.Sprintf("farcast storage state %s   (to see why it does not answer)", instance))
 			case st.Sealed():
-				problems = append(problems, fmt.Sprintf("replica %d is %s", i, st.Phase))
+				problems = append(problems, fmt.Sprintf("replica %d is %s", i, terminalText(st.Phase)))
 				remedy(fmt.Sprintf("farcast storage unseal %s", instance))
 			case outdatedImage(st):
 				problems = append(problems, fmt.Sprintf("replica %d runs a keyholder image older than this CLI and does not say which keys it holds", i))

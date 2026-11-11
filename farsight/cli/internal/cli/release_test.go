@@ -518,6 +518,136 @@ func TestReleaseJSONOutput(t *testing.T) {
 	}
 }
 
+// TestReleaseNamesWhatTheProviderKeeps: release cannot delete the provider's
+// logs of the instance, so it says so, and the JSON carries it (ADR 0019).
+func TestReleaseNamesWhatTheProviderKeeps(t *testing.T) {
+	f := &fakeProvider{}
+	prov := registerFake(t, f)
+	env, out, _, dir := newInstallEnv(t, output.ModeJSON)
+	recordInstance(t, dir, "p", prov)
+
+	cmd := &releaseCommand{assumeYes: true}
+	if err := cmd.Run(context.Background(), env, []string{"p"}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	var m struct {
+		CloudLogs *releaseCloudLogs `json:"cloud_logs"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &m); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out.String())
+	}
+	if m.CloudLogs == nil {
+		t.Fatalf("JSON result has no cloud_logs:\n%s", out.String())
+	}
+	// recordInstance writes no cloud_logging, as an instance installed
+	// before ADR 0019 has none.
+	if !m.CloudLogs.WorkloadLogs {
+		t.Error("an instance never verified as system-only must report workload logs as possibly kept")
+	}
+}
+
+func TestCloudLogsAfterRelease(t *testing.T) {
+	now := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+
+	got := cloudLogsAfterRelease(&config.InstanceMetadata{Provider: "gke", CloudLogging: config.CloudLoggingSystem}, now)
+	if got.AuditUntil != "2027-12-15" || got.SystemUntil != "2026-12-10" {
+		t.Errorf("dates = audit %q, system %q; want 400 and 30 days on: 2027-12-15, 2026-12-10", got.AuditUntil, got.SystemUntil)
+	}
+	// Metrics about the instance's Pods are kept 24 months, and they are
+	// kept whatever the logging config was: they are not logs.
+	if got.MetricsUntil != "2028-11-10" {
+		t.Errorf("metrics date = %q; want 24 months on: 2028-11-10", got.MetricsUntil)
+	}
+	// The JSON names are what the CLI README documents for scripts.
+	b, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"audit_log_until":"2027-12-15"`, `"system_logs_until":"2026-12-10"`, `"metrics_until":"2028-11-10"`} {
+		if !strings.Contains(string(b), want) {
+			t.Errorf("cloud_logs JSON %s lacks %s", b, want)
+		}
+	}
+	if got.WorkloadLogs {
+		t.Error("a system-only instance must not report workload logs")
+	}
+
+	old := cloudLogsAfterRelease(&config.InstanceMetadata{Provider: "gke"}, now)
+	if !old.WorkloadLogs {
+		t.Error("an instance installed before ADR 0019 must report workload logs")
+	}
+	if old.MetricsUntil != "2028-11-10" {
+		t.Errorf("an unverified instance's metrics date = %q; want 2028-11-10 like any other", old.MetricsUntil)
+	}
+
+	unknown := cloudLogsAfterRelease(&config.InstanceMetadata{Provider: "elsewhere", CloudLogging: config.CloudLoggingSystem}, now)
+	if unknown.AuditUntil != "" || unknown.SystemUntil != "" || unknown.MetricsUntil != "" {
+		t.Errorf("a provider with no known retention got dates %+v; it must not be given GKE's", unknown)
+	}
+
+	// A provider whose metrics retention FarCast does not know is given no
+	// metrics date, rather than GKE's or a zero-month one.
+	t.Cleanup(func() { delete(providerLogRetention, "nometrics") })
+	providerLogRetention["nometrics"] = logRetention{audit: 400 * 24 * time.Hour, system: 30 * 24 * time.Hour}
+	nm := cloudLogsAfterRelease(&config.InstanceMetadata{Provider: "nometrics", CloudLogging: config.CloudLoggingSystem}, now)
+	if nm.AuditUntil == "" || nm.MetricsUntil != "" {
+		t.Errorf("a provider with log but no metrics retention got %+v; want log dates and no metrics date", nm)
+	}
+}
+
+func TestReleaseHumanNamesTheCloudLogs(t *testing.T) {
+	render := func(l *releaseCloudLogs) string {
+		var b bytes.Buffer
+		if err := (releaseResult{Name: "p", CloudLogs: l}).Human(&b); err != nil {
+			t.Fatalf("Human: %v", err)
+		}
+		return b.String()
+	}
+
+	sys := render(&releaseCloudLogs{AuditUntil: "2027-12-15", SystemUntil: "2026-12-10", MetricsUntil: "2028-11-10"})
+	for _, want := range []string{"cloud logs:", "release cannot remove", "2027-12-15", "2026-12-10",
+		"metrics about the instance's Pods (names, states, resource use) until about 2028-11-10"} {
+		if !strings.Contains(sys, want) {
+			t.Errorf("output missing %q:\n%s", want, sys)
+		}
+	}
+	if strings.Contains(sys, "applications' output") {
+		t.Errorf("a system-only instance must not be said to have shipped application output:\n%s", sys)
+	}
+	// Every continuation line keeps the label's value column, so the block
+	// reads as one entry under "cloud logs:".
+	_, block, ok := strings.Cut(sys, "  cloud logs:  ")
+	block, _, _ = strings.Cut(block, "  state:")
+	lines := strings.Split(strings.TrimRight(block, "\n"), "\n")
+	if !ok || len(lines) != 3 {
+		t.Fatalf("want the cloud logs entry on three lines, got %d:\n%s", len(lines), sys)
+	}
+	for _, line := range lines[1:] {
+		if !strings.HasPrefix(line, strings.Repeat(" ", 15)) || line[15] == ' ' {
+			t.Errorf("continuation line not aligned under the label's value column: %q", line)
+		}
+	}
+
+	// No metrics date known: no metrics clause, and no dangling comma.
+	noMetrics := render(&releaseCloudLogs{AuditUntil: "2027-12-15", SystemUntil: "2026-12-10"})
+	if strings.Contains(noMetrics, "metrics") || strings.Contains(noMetrics, "retention),") {
+		t.Errorf("a report with no metrics date must not name one:\n%s", noMetrics)
+	}
+	if !strings.Contains(noMetrics, "(default retention)\n") {
+		t.Errorf("the system-log clause must end its line when no metrics date follows:\n%s", noMetrics)
+	}
+
+	old := render(&releaseCloudLogs{AuditUntil: "2027-12-15", SystemUntil: "2026-12-10", WorkloadLogs: true})
+	if !strings.Contains(old, "applications' output") {
+		t.Errorf("an unverified instance must name its applications' output:\n%s", old)
+	}
+
+	unknown := render(&releaseCloudLogs{})
+	if !strings.Contains(unknown, "release cannot remove") {
+		t.Errorf("a provider with no known retention must still be named:\n%s", unknown)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Phase 3.3: release refuses while the instance bucket still holds data.
 //
@@ -1016,6 +1146,76 @@ func TestReleaseWaitsUnderADeadline(t *testing.T) {
 	}
 }
 
+// slowDelete is a cluster delete that succeeds after a while.
+type slowDelete struct {
+	*fakeProvider
+	takes time.Duration
+}
+
+func (s *slowDelete) DeleteCluster(ctx context.Context, ref planck.ClusterRef) error {
+	select {
+	case <-time.After(s.takes):
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return s.fakeProvider.DeleteCluster(ctx, ref)
+}
+
+// A release under -y, non-interactive, says it is destroying the cluster and
+// keeps saying it is still waiting; the 2026-11-10 walk's printed nothing for
+// six minutes. Run under -race: the notice writes from its own goroutine to
+// the buffer the release then writes its result to.
+func TestReleaseSaysItIsStillWaiting(t *testing.T) {
+	saved := releaseProgressEvery
+	releaseProgressEvery = 5 * time.Millisecond
+	t.Cleanup(func() { releaseProgressEvery = saved })
+
+	for name, mode := range map[string]output.Mode{"human": output.ModeHuman, "json": output.ModeJSON} {
+		t.Run(name, func(t *testing.T) {
+			s := &slowDelete{fakeProvider: &fakeProvider{}, takes: 60 * time.Millisecond}
+			env, _, errb, dir := newInstallEnv(t, mode)
+			recordInstance(t, dir, "prod", registerProvider(t, s))
+			giveStorage(t, dir, "prod")
+			if err := (&releaseCommand{assumeYes: true}).Run(context.Background(), env, []string{"prod"}); err != nil {
+				t.Fatalf("release: %v", err)
+			}
+			got := errb.String()
+			if mode == output.ModeHuman {
+				if !strings.Contains(got, "Destroying ") || !strings.Contains(got, "still waiting for the cloud to report") ||
+					!strings.Contains(got, "of at most 15m\n") {
+					t.Errorf("a -y release did not say it was destroying, and still waiting:\n%s", got)
+				}
+				return
+			}
+			if strings.Contains(got, "Destroying") || strings.Contains(got, "still waiting") {
+				t.Errorf("a JSON release wrote progress to stderr:\n%s", got)
+			}
+		})
+	}
+}
+
+// The notice stops when the delete returns — before the refusal is written —
+// and never after.
+func TestReleaseProgressStopsWithTheWait(t *testing.T) {
+	saved, savedTimeout := releaseProgressEvery, clusterDeleteTimeout
+	releaseProgressEvery, clusterDeleteTimeout = 2*time.Millisecond, 30*time.Millisecond
+	t.Cleanup(func() { releaseProgressEvery, clusterDeleteTimeout = saved, savedTimeout })
+	b := &blockingDelete{fakeProvider: &fakeProvider{}}
+	env, _, errb, dir := newInstallEnv(t, output.ModeHuman)
+	recordInstance(t, dir, "prod", registerProvider(t, b))
+	if err := (&releaseCommand{assumeYes: true}).Run(context.Background(), env, []string{"prod"}); err == nil {
+		t.Fatal("a release whose delete outlived its deadline succeeded")
+	}
+	before := errb.String()
+	if !strings.Contains(before, "still waiting") {
+		t.Fatalf("no progress was printed while waiting:\n%s", before)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if after := errb.String(); after != before {
+		t.Errorf("the progress notice outlived the wait:\n%s", strings.TrimPrefix(after, before))
+	}
+}
+
 // Ctrl-C stops the waiting the same way: the instance stays recorded.
 func TestReleaseInterruptedKeepsState(t *testing.T) {
 	b := &blockingDelete{fakeProvider: &fakeProvider{}}
@@ -1136,8 +1336,20 @@ func TestReleaseNamesKeepersOnOtherDevices(t *testing.T) {
 	}
 	text := out.String()
 	if !strings.Contains(text, "phone (revoked)") || !strings.Contains(text, "laptop") || strings.Contains(text, "study-desktop,") ||
-		!strings.Contains(text, "farcast keeper uninstall prod") {
+		!strings.Contains(text, "farcast keeper uninstall prod") || !strings.Contains(text, "still hold this") ||
+		!strings.Contains(text, "on each") {
 		t.Errorf("release did not name the other devices, or what to run there:\n%s", text)
+	}
+}
+
+// One device elsewhere is spoken of in the singular.
+func TestReleaseNamesOneKeeperElsewhereInTheSingular(t *testing.T) {
+	var b bytes.Buffer
+	if err := (releaseResult{Name: "prod", Elsewhere: []string{"phone (revoked)"}}).Human(&b); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(b.String(), "phone (revoked) still holds this instance's bundle — run 'farcast keeper uninstall prod' on it\n") {
+		t.Errorf("one device elsewhere was not spoken of in the singular:\n%s", b.String())
 	}
 }
 

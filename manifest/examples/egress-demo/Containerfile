@@ -11,6 +11,13 @@
 # and HTTPS_PROXY outright, and when given http_proxy it issues a cleartext
 # proxied GET, which FatLine correctly refuses. An application that cannot
 # speak to the boundary cannot demonstrate anything about it.
+#
+# The trap is what lets it stop. The shell is PID 1, and PID 1 receives only
+# the signals it has a handler for, so `sh -c "… && sleep N"` ignores SIGTERM
+# and the Pod bills through its whole grace period — the 2026-11-10 walk saw it
+# at the old pod count for three ticks after a stop. The trap installs a
+# handler, and `wait` returns the moment a trapped signal arrives; `exec sleep`
+# would not help, since sleep as PID 1 ignores SIGTERM just the same.
 FROM alpine:3.19
 RUN apk add --no-cache ca-certificates curl
-CMD ["sh", "-c", "echo egress-demo ready && sleep 86400"]
+CMD ["sh", "-c", "echo egress-demo ready; trap 'exit 0' TERM INT; sleep 86400 & wait"]

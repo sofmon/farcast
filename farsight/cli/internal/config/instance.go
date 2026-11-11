@@ -73,6 +73,10 @@ const (
 	InstanceError        = "error"
 )
 
+// CloudLoggingSystem is InstanceMetadata.CloudLogging for a cluster that
+// read back as sending the provider's logging its system logs only (ADR 0019).
+const CloudLoggingSystem = "system"
+
 // CostLimit is the mandatory spend ceiling captured at install. For phase 1.3
 // it is a monthly USD amount; enforcement is TechnoCore's job (4.1).
 type CostLimit struct {
@@ -201,6 +205,15 @@ type Keeper struct {
 	// audit of old ledger entries can still attribute them.
 	Revoked   bool      `yaml:"revoked,omitempty"`
 	RevokedAt time.Time `yaml:"revoked_at,omitzero"`
+	// LeafTokens are the opaque tokens (identity.LeafToken) of every leaf
+	// this machine issued to the device, oldest first. Shrike's tunnel table
+	// attributes a stream by token and only this list turns one back into a
+	// device name, on this machine. Every leaf is kept, not just the newest:
+	// an older leaf stays valid in the cluster until its NotAfter, after a
+	// re-enrolment or a revocation, and those are the streams an operator
+	// most needs named. Empty on a device enrolled before 2026-11-10, which
+	// the report shows as not enrolled from this machine until re-enrolled.
+	LeafTokens []string `yaml:"leaf_tokens,omitempty"`
 }
 
 // Kernel records the in-cluster TechnoCore.
@@ -273,6 +286,15 @@ type InstanceMetadata struct {
 	Version   string    `yaml:"farcast_version,omitempty"`
 	CreatedAt time.Time `yaml:"created_at"`
 	UpdatedAt time.Time `yaml:"updated_at"`
+
+	// CloudLogging is the provider's logging configuration for the cluster, as
+	// the provider read it back at install (ADR 0019). CloudLoggingSystem means
+	// configured to collect its mandatory system logs only — not the
+	// applications' stdout and stderr. That is the provider's word about its
+	// configuration, not an observation of what it collects, and on Autopilot
+	// it is unwalked. Empty means not verified: an instance installed before
+	// ADR 0019, whose cluster shipped workload logs.
+	CloudLogging string `yaml:"cloud_logging,omitempty"`
 
 	// FatLineDeployed records that connect has applied FatLine into the cluster
 	// (and, with Carrier set, provisioned its billable point of presence).
@@ -827,6 +849,13 @@ func (d Dir) SaveInstanceMTLS(name string, m MTLSMaterial) error {
 // private key into memory.
 func (d Dir) LoadInstanceCACert(name string) ([]byte, error) {
 	return os.ReadFile(filepath.Join(d.fatlineDir(name), caCertFile))
+}
+
+// LoadOperatorLeaf reads only the operator's client certificate — public, and
+// enough to compute the token the tunnel attributes the operator's streams
+// by, without bringing the CA's private key into memory.
+func (d Dir) LoadOperatorLeaf(name string) ([]byte, error) {
+	return os.ReadFile(filepath.Join(d.fatlineDir(name), clientCertFile))
 }
 
 // LoadInstanceMTLS reads the per-instance mTLS material.

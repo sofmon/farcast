@@ -167,6 +167,9 @@ type pinWrite struct {
 	// Repaired is set when the pin that was there could not be read, and was
 	// rewritten from this keyring.
 	Repaired bool
+	// Created is set when there was no pin — no ConfigMap, or an empty one —
+	// and one was written. That is not a raise, and is not reported as one.
+	Created bool
 }
 
 // writePin raises the instance's pin to this keyring: everything it holds
@@ -218,12 +221,12 @@ func writePin(ctx context.Context, ps pinStore, k datasphere.Keyring, withRetire
 			write = ps.ReplaceConfigMap
 		}
 		if lastErr = write(ctx, manifest); lastErr == nil {
-			return pinWrite{Pin: desired, Changed: true, Repaired: invalid != nil}, nil
+			return pinWrite{Pin: desired, Changed: true, Repaired: invalid != nil, Created: !present && invalid == nil}, nil
 		}
 		// Re-read: a write that landed and lost its answer is success, and a
 		// conflict is another writer to take into account.
 		if again, ok, _, inv, err := readPin(ctx, ps); err == nil && ok && inv == nil && again.Equal(desired) {
-			return pinWrite{Pin: desired, Changed: true, Repaired: invalid != nil}, nil
+			return pinWrite{Pin: desired, Changed: true, Repaired: invalid != nil, Created: !present && invalid == nil}, nil
 		}
 	}
 	return pinWrite{}, fmt.Errorf("the key pin changed while this command wrote it, or could not be written: %w", lastErr)
@@ -267,7 +270,10 @@ func raisePins(ctx context.Context, client sealStateClient, total int, pin dskey
 		case keyholder.Unsupported(err):
 			rows = append(rows, pinRaise{Ordinal: i, Note: fmt.Sprintf("runs a keyholder image that predates the key pin; 'farcast storage deploy %s' updates it", instance)})
 		case err != nil:
-			rows = append(rows, pinRaise{Ordinal: i, Note: fmt.Sprintf("did not take the pin live (%v); it loads it when it next restarts", err)})
+			// The error carries the replica's words, and the Note is printed
+			// as it is — on stdout by 'storage key pin', and in the warnings
+			// of rotate and run — so they go in quoted, as one line.
+			rows = append(rows, pinRaise{Ordinal: i, Note: fmt.Sprintf("did not take the pin live (%s); it loads it when it next restarts", terminalText(err.Error()))})
 		case reported && got.Admits(held) != nil:
 			rows = append(rows, pinRaise{Ordinal: i, Note: fmt.Sprintf("still enforces a pin above this keyring's (%v) — "+
 				"'farcast storage key pin %s --replace' lowers it, if the keys it requires are gone from every machine", got.Admits(held), instance)})
@@ -379,7 +385,7 @@ func (c *keyPinCommand) Run(ctx context.Context, env *Env, args []string) error 
 	case err != nil:
 		return err
 	}
-	res.Written, res.Repaired = w.Changed, w.Repaired
+	res.Written, res.Repaired, res.Created = w.Changed, w.Repaired, w.Created
 	res.Require, res.Retired = len(w.Pin.Require), len(w.Pin.Retired)
 
 	openKH := c.newKeyholder
@@ -440,6 +446,7 @@ type keyPinResult struct {
 	Instance string     `json:"instance"`
 	Written  bool       `json:"written"`
 	Repaired bool       `json:"repaired,omitempty"`
+	Created  bool       `json:"created,omitempty"`
 	Lowered  []string   `json:"lowered,omitempty"`
 	Require  int        `json:"require"`
 	Retired  int        `json:"retired"`
@@ -453,6 +460,8 @@ func (r keyPinResult) Human(w io.Writer) error {
 		fprintf(w, "! lowered the key pin of %q; it no longer requires or retires %s\n", r.Instance, strings.Join(r.Lowered, ", "))
 	case r.Repaired:
 		fprintf(w, "✓ rewrote the key pin of %q from this keyring; the one there could not be read\n", r.Instance)
+	case r.Created:
+		fprintf(w, "✓ wrote the key pin of %q from this keyring; there was none\n", r.Instance)
 	case r.Written:
 		fprintf(w, "✓ raised the key pin of %q\n", r.Instance)
 	default:

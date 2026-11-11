@@ -14,6 +14,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 	"strconv"
@@ -77,6 +78,8 @@ func run(args []string) error {
 		TunnelListen: *tunnelListen,
 		EgressListen: *egressListen,
 		Endpoint:     *endpoint,
+		// Empty from a manifest that predates it; status then omits it.
+		Node: os.Getenv(fatline.EnvNode),
 	}
 
 	if *tunnelListen != "" {
@@ -148,8 +151,7 @@ func run(args []string) error {
 	// an application not require restarting the instance's network boundary
 	// (ADR 0013 decision 5).
 	if *policyPath != "" {
-		go watchPolicy(ctx, *policyPath, policyPollInterval, srv,
-			func(format string, args ...any) { fmt.Fprintf(os.Stderr, format, args...) })
+		go watchPolicy(ctx, *policyPath, policyPollInterval, srv.ReloadPolicy, nil)
 	}
 
 	apps := 0
@@ -195,7 +197,15 @@ func loadPolicy(path string) (*policy.Document, error) {
 // The alternative — dropping to no policy — would turn a typo in a document
 // into an instance-wide egress outage, and the last known-good policy is the
 // operator's own most recent intent.
-func watchPolicy(ctx context.Context, path string, every time.Duration, srv *fatline.Server, log func(string, ...any)) {
+//
+// Both lines go through slog, as the decision lines on the same stream do, so
+// they carry the same timestamp: the 2026-11-10 walk could not time a reload's
+// propagation across replicas from a line that had none. A nil logger is
+// slog.Default().
+func watchPolicy(ctx context.Context, path string, every time.Duration, reload func(*policy.Document), log *slog.Logger) {
+	if log == nil {
+		log = slog.Default()
+	}
 	last, _ := os.ReadFile(path)
 	ticker := time.NewTicker(every)
 	defer ticker.Stop()
@@ -211,15 +221,15 @@ func watchPolicy(ctx context.Context, path string, every time.Duration, srv *fat
 		}
 		doc, err := policy.Parse(data)
 		if err != nil {
-			log("fatline: refusing an unreadable egress policy, keeping the previous one: %v\n", err)
+			log.Warn("fatline: refusing an unreadable egress policy, keeping the previous one", "err", err)
 			// last is deliberately NOT updated: a file that is still broken on
 			// the next tick must be complained about again, or an operator who
 			// looks a minute later sees silence and assumes it took.
 			continue
 		}
 		last = data
-		srv.ReloadPolicy(doc)
-		log("fatline: egress policy reloaded (%d applications)\n", len(doc.Apps))
+		reload(doc)
+		log.Info("fatline: egress policy reloaded", "applications", len(doc.Apps))
 	}
 }
 

@@ -18,6 +18,6 @@ import "fmt"
 // keeper-fleet finding 2, which is where the rule comes from.
 func ExcludeFromBackup(dir string) error {
 	return fmt.Errorf(
-		"keeper: this platform has no backup pipeline FarCast can verifiably exclude %s from, "+
+		"this platform has no backup pipeline FarCast can verifiably exclude %s from, "+
 			"so it cannot promise the bundle stays off a backup", dir)
 }

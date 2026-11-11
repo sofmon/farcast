@@ -18,6 +18,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"strings"
@@ -84,6 +85,47 @@ func KeeperBundleDigest(bundle []byte) string {
 	h.Write([]byte(keeperBundleDomain))
 	h.Write(bundle)
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// leafTokenDomain separates a leaf token from the leaf's ordinary SHA-256
+// fingerprint, so the token cannot be joined against a fingerprint printed
+// anywhere else.
+const leafTokenDomain = "farcast-leaf-token-v1"
+
+// LeafToken is the opaque name a tunnel peer is attributed by: the first 8
+// bytes of SHA-256 over a domain label and the leaf's DER, as 16 hex
+// characters.
+//
+// It names a leaf, not a device, and only the operator's machine can turn it
+// back into a device: it records the token when it issues a keeper's leaf, and
+// nothing else can recompute it. A leaf's key and serial are random, and the
+// tunnel is TLS 1.3 only, so the client certificate travels encrypted and the
+// cloud never holds the bytes the token is a function of.
+//
+// FatLine computes it from the verified leaf and hands it to Shrike's picture,
+// read only over the operator's route. It is never written to a log line: a
+// stable per-device pseudonym in a provider-ingested log would let the
+// provider follow one device across addresses for the leaf's whole life, and
+// count the fleet (ADR 0015).
+func LeafToken(der []byte) string {
+	h := sha256.New()
+	h.Write([]byte(leafTokenDomain))
+	h.Write(der)
+	return hex.EncodeToString(h.Sum(nil)[:8])
+}
+
+// LeafTokenPEM is LeafToken over the first certificate in a PEM block — what
+// the operator's machine holds when it issues a leaf. It hashes the DER, as
+// FatLine does, never the PEM text.
+func LeafTokenPEM(certPEM []byte) (string, error) {
+	block, _ := pem.Decode(certPEM)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return "", errors.New("identity: no certificate in the PEM given")
+	}
+	if _, err := x509.ParseCertificate(block.Bytes); err != nil {
+		return "", fmt.Errorf("identity: parse leaf: %w", err)
+	}
+	return LeafToken(block.Bytes), nil
 }
 
 // AppURI is the identity a deployed application presents to the keyholder's

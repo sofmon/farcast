@@ -229,7 +229,7 @@ func TestWritePinCreatesRaisesAndNeverLowers(t *testing.T) {
 	ps := &fakePinStore{}
 	k := appsKeyring(t, "web")
 	w, err := writePin(ctx, ps, k, true, false)
-	if err != nil || !w.Changed || !ps.exists {
+	if err != nil || !w.Changed || !w.Created || !ps.exists {
 		t.Fatalf("create = %+v, %v", w, err)
 	}
 	before := ps.version
@@ -241,8 +241,8 @@ func TestWritePinCreatesRaisesAndNeverLowers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := writePin(ctx, ps, rotated, true, false); err != nil {
-		t.Fatal(err)
+	if w, err := writePin(ctx, ps, rotated, true, false); err != nil || !w.Changed || w.Created {
+		t.Fatalf("raise = %+v, %v; want changed, and not created", w, err)
 	}
 	if got := ps.pin(t); !got.Equal(pinFor(rotated).Union(pinFor(k))) {
 		t.Errorf("raised to %s", got.Marshal())
@@ -890,10 +890,11 @@ func TestAKeeperRefusedOnThePinAtThePushReportsStale(t *testing.T) {
 	mustRotate(t, env, "prod", fleet)
 	fleet.replica(0).phase, fleet.replica(0).keys, fleet.replica(0).generation = "restart-sealed", nil, 0
 	fleet.replica(1).phase, fleet.replica(1).keys, fleet.replica(1).generation = "restart-sealed", nil, 0
-	decisions, err := keeperCheckWith(context.Background(), env, store, cfg, &pinHiddenAtRead{fleet}, storeBundle(t, store))
+	pass, err := keeperCheckWith(context.Background(), env, store, cfg, &pinHiddenAtRead{fleet}, storeBundle(t, store))
 	if err != nil {
 		t.Fatal(err)
 	}
+	decisions := pass.Decisions
 	for _, d := range decisions {
 		if d.Action != keeper.ActionStale || !strings.Contains(d.Reason, "re-enrol") {
 			t.Errorf("replica %d: %s (%s); want stale, naming re-enrolment", d.Ordinal, d.Action, d.Reason)
@@ -986,5 +987,35 @@ func TestWritePinRefusesAPinNoReplicaCouldRead(t *testing.T) {
 	ps := &fakePinStore{}
 	if _, err := writePin(context.Background(), ps, k, true, false); err == nil || !strings.Contains(err.Error(), "more than") || ps.exists {
 		t.Errorf("an oversize pin = %v, written %v; want it refused and nothing written", err, ps.exists)
+	}
+}
+
+// A pin written where there was none is reported as written, not raised: the
+// 2026-11-10 walk deleted the ConfigMap and was told the pin was "raised".
+func TestKeyPinReportsARecreatedPinAsWritten(t *testing.T) {
+	dir, _, env, _ := handOverInstance(t, "p320")
+	keys := scopedKeyring(t, dir, "p320", "apps", "web", "api")
+	out := &bytes.Buffer{}
+	env.Out, env.Printer.Out = out, out
+	kh := &fakeStateKeyholder{phase: "unsealed"}
+	if err := (&keyPinCommand{newKeyholder: openerFor(kh)}).Run(context.Background(), env, []string{"p320"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), `wrote the key pin of "p320" from this keyring; there was none`) || strings.Contains(out.String(), "raised") {
+		t.Errorf("a pin created over nothing was not reported as written:\n%s", out.String())
+	}
+
+	// A pin that requires less than this keyring holds is raised.
+	full := pinFor(keys)
+	if len(full.Require) < 2 {
+		t.Fatalf("the fixture's pin requires %d key(s); a raise needs a smaller one below it", len(full.Require))
+	}
+	pinStoreOf(dir, "p320").set(dskeyholder.Pin{Require: full.Require[:1]}.Marshal())
+	out.Reset()
+	if err := (&keyPinCommand{newKeyholder: openerFor(kh)}).Run(context.Background(), env, []string{"p320"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), `raised the key pin of "p320"`) || strings.Contains(out.String(), "there was none") {
+		t.Errorf("a raise over an existing pin was not reported as a raise:\n%s", out.String())
 	}
 }

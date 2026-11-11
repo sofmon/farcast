@@ -54,11 +54,14 @@ func (f *fakeProvider) CreateCluster(_ context.Context, spec planck.ClusterSpec)
 	if f.cluster != nil {
 		return f.cluster, nil
 	}
+	// Mirrors the GKE adapter, which returns a cluster only once it has read
+	// it back as system-only logging (ADR 0019).
 	return &planck.Cluster{
-		Ref:        planck.ClusterRef{Name: spec.Name, Location: spec.Location},
-		Status:     planck.StatusRunning,
-		Endpoint:   "uid.us-central1.gke.goog",
-		Kubeconfig: []byte("apiVersion: v1\nkind: Config\n"),
+		Ref:            planck.ClusterRef{Name: spec.Name, Location: spec.Location},
+		Status:         planck.StatusRunning,
+		Endpoint:       "uid.us-central1.gke.goog",
+		Kubeconfig:     []byte("apiVersion: v1\nkind: Config\n"),
+		SystemLogsOnly: true,
 	}, nil
 }
 
@@ -275,6 +278,78 @@ func TestInstallCreateClusterFailureRecordsError(t *testing.T) {
 	if meta.Status != config.InstanceError {
 		t.Errorf("status = %q, want error", meta.Status)
 	}
+	// A cluster that never passed the provider's read-back is never recorded
+	// as keeping its logs from the provider (ADR 0019).
+	if meta.CloudLogging != "" {
+		t.Errorf("cloud_logging = %q after a failed create, want empty", meta.CloudLogging)
+	}
+}
+
+// TestInstallRecordsSystemOnlyLogging: the instance records, and the operator
+// is told, that applications' output stays on the cluster — on the
+// provider's word, and only then (ADR 0019).
+func TestInstallRecordsSystemOnlyLogging(t *testing.T) {
+	f := &fakeProvider{}
+	prov := registerFake(t, f)
+	env, out, _, dir := newInstallEnv(t, output.ModeHuman)
+	cmd := &installCommand{name: "prod", provider: prov, project: "p", costLimit: 10, assumeYes: true}
+	if err := cmd.Run(context.Background(), env, nil); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	meta, err := dir.LoadInstanceMetadata("prod")
+	if err != nil {
+		t.Fatalf("LoadInstanceMetadata: %v", err)
+	}
+	if meta.CloudLogging != config.CloudLoggingSystem {
+		t.Errorf("cloud_logging = %q, want %q", meta.CloudLogging, config.CloudLoggingSystem)
+	}
+	if !strings.Contains(out.String(), "configured not to be sent to the provider's logging") {
+		t.Errorf("result does not say where application logs go:\n%s", out.String())
+	}
+	// The read-back is the provider's word about its configuration; the
+	// result must not present it as observed behaviour (review finding R-3).
+	if strings.Contains(out.String(), "kept on the cluster's nodes, not sent") || !strings.Contains(out.String(), "unwalked") {
+		t.Errorf("result presents the provider's read-back as observed:\n%s", out.String())
+	}
+}
+
+// TestInstallDoesNotClaimUnverifiedLogging: a provider that returns a cluster
+// without having verified its logging gets no "system" record and no claim.
+func TestInstallDoesNotClaimUnverifiedLogging(t *testing.T) {
+	f := &fakeProvider{cluster: &planck.Cluster{
+		Ref:        planck.ClusterRef{Name: "farcast-prod", Location: "us-central1"},
+		Status:     planck.StatusRunning,
+		Endpoint:   "uid.us-central1.gke.goog",
+		Kubeconfig: []byte("apiVersion: v1\nkind: Config\n"),
+	}}
+	prov := registerFake(t, f)
+	env, out, _, dir := newInstallEnv(t, output.ModeJSON)
+	cmd := &installCommand{name: "prod", provider: prov, project: "p", costLimit: 10, assumeYes: true}
+	if err := cmd.Run(context.Background(), env, nil); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	meta, err := dir.LoadInstanceMetadata("prod")
+	if err != nil {
+		t.Fatalf("LoadInstanceMetadata: %v", err)
+	}
+	if meta.CloudLogging != "" {
+		t.Errorf("cloud_logging = %q for an unverified cluster, want empty", meta.CloudLogging)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(out.Bytes(), &m); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out.String())
+	}
+	if m["cloud_logging"] != "unverified" {
+		t.Errorf("cloud_logging = %v, want unverified", m["cloud_logging"])
+	}
+
+	var b bytes.Buffer
+	if err := (installResult{Name: "prod", CloudLogging: cloudLoggingResult(meta.CloudLogging)}).Human(&b); err != nil {
+		t.Fatalf("Human: %v", err)
+	}
+	if strings.Contains(b.String(), "not to be sent to the provider's logging") || !strings.Contains(b.String(), "NOT verified") {
+		t.Errorf("an unverified cluster must be said to be unverified, never kept from the provider:\n%s", b.String())
+	}
 }
 
 func TestInstallUnreachableRecordsStatus(t *testing.T) {
@@ -408,5 +483,8 @@ func TestInstallJSONOutput(t *testing.T) {
 	}
 	if m["cluster"] != "farcast-p" || m["status"] != "running" {
 		t.Errorf("unexpected JSON result: %v", m)
+	}
+	if m["cloud_logging"] != config.CloudLoggingSystem {
+		t.Errorf("cloud_logging = %v, want %q", m["cloud_logging"], config.CloudLoggingSystem)
 	}
 }

@@ -16,6 +16,7 @@ import (
 	dskeyholder "github.com/sofmon/farcast/datasphere/keyholder"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/keyholder"
+	"github.com/sofmon/farcast/fatline/tunnel"
 )
 
 // The application scope's name and prefix now live in datasphere, so the
@@ -30,9 +31,16 @@ const ()
 // dependency the ADR calls a recovery floor becomes visible: an unseal rides
 // FatLine, so an instance whose tunnel is down cannot be unsealed at all.
 func keyholderClient(ctx context.Context, env *Env, name string) (*keyholder.Client, func(), error) {
+	client, _, done, err := keyholderClientOver(ctx, env, name)
+	return client, done, err
+}
+
+// keyholderClientOver is keyholderClient that also hands back the tunnel the
+// client rides.
+func keyholderClientOver(ctx context.Context, env *Env, name string) (*keyholder.Client, *tunnel.Conn, func(), error) {
 	conn, mtls, err := instanceTunnel(ctx, env, name)
 	if err != nil {
-		return nil, nil, fmt.Errorf(
+		return nil, nil, nil, fmt.Errorf(
 			"cannot reach %q through FatLine: %w\n"+
 				"Storage cannot be unsealed while the tunnel is down, and applications keep receiving ErrStorageSealed until it returns.\n"+
 				"Check 'farcast connect %s --status'.", name, err, name)
@@ -40,9 +48,9 @@ func keyholderClient(ctx context.Context, env *Env, name string) (*keyholder.Cli
 	client, err := keyholder.New(keyholder.Conn(conn), name, mtls.CACertPEM, mtls.ClientCertPEM, mtls.ClientKeyPEM)
 	if err != nil {
 		_ = conn.Close()
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return client, func() { _ = conn.Close() }, nil
+	return client, conn, func() { _ = conn.Close() }, nil
 }
 
 // partialFailure turns a fan-out result into an error unless every replica
@@ -99,6 +107,10 @@ machine's keyring: current, behind it ('farcast storage key pin' raises it),
 ahead of it (this keyring is behind the instance), absent, unreadable, or
 serving keys it would refuse.
 
+Each replica also reports the node it runs on. When two share one node, one
+node repair or eviction restarts both and storage stays sealed until someone
+unseals it; this says so, and moves nothing.
+
 This reads through the FatLine tunnel and changes nothing.`)
 }
 
@@ -118,13 +130,20 @@ func (c *storageStateCommand) Run(ctx context.Context, env *Env, args []string) 
 	}
 	open := c.newKeyholder
 	if open == nil {
-		open = openKeyholder
+		open = openKeyholderWithRelay
 	}
 	client, done, err := open(ctx, env, name)
 	if err != nil {
 		return err
 	}
 	defer done()
+	// The node of the FatLine replica that answered, when the opener knows
+	// it. Only that one: the load balancer hands a connection to a single
+	// replica, and nothing here can see where the other runs.
+	var relay string
+	if r, ok := client.(interface{ RelayNode() string }); ok {
+		relay = r.RelayNode()
+	}
 
 	// What a serving replica holds is compared with this machine's keyring,
 	// when this machine has one. The generation cannot say whether a replica
@@ -138,9 +157,12 @@ func (c *storageStateCommand) Run(ctx context.Context, env *Env, args []string) 
 			states = append(states, replicaState{Ordinal: i, Error: err.Error()})
 			continue
 		}
+		// The node is reported for a sealed replica as well: it will be
+		// unsealed where it stands, so where that is matters as much.
 		rs := replicaState{
 			Ordinal: i, Phase: st.Phase, Since: st.Since,
 			Generation: st.Generation, HoldReason: st.HoldReason, Scopes: st.Scopes,
+			Node: st.Node,
 		}
 		switch {
 		case outdatedImage(st):
@@ -158,8 +180,10 @@ func (c *storageStateCommand) Run(ctx context.Context, env *Env, args []string) 
 		rs.PinStatus, rs.PinNote = pinStateOf(st.Pin, mine, name)
 		states = append(states, rs)
 	}
-	return env.Printer.Print(stateResult{Instance: name, Replicas: states,
-		Recorded: meta.Keyholder.Generation})
+	res := stateResult{Instance: name, Replicas: states, Recorded: meta.Keyholder.Generation}
+	res.Colocated, res.PlacementUnknown = sharedNodes(states)
+	res.RelayNode = relay
+	return env.Printer.Print(res)
 }
 
 type replicaState struct {
@@ -184,26 +208,125 @@ type replicaState struct {
 	// keyring; PinNote says what it means when it is not current.
 	PinStatus string `json:"pin_status,omitempty"`
 	PinNote   string `json:"pin_note,omitempty"`
-	Note      string `json:"note,omitempty"`
-	Error     string `json:"error,omitempty"`
+	// Node is the Kubernetes node the replica runs on, as it reported it.
+	// Empty means it did not say.
+	Node  string `json:"node,omitempty"`
+	Note  string `json:"note,omitempty"`
+	Error string `json:"error,omitempty"`
 }
 
 type stateResult struct {
 	Instance string         `json:"instance"`
 	Recorded uint64         `json:"recorded_generation"`
 	Replicas []replicaState `json:"replicas"`
+	// Colocated lists the replicas that share a node, one group per node.
+	// It is a report of now: placement can change at any moment, and
+	// nothing here moves a replica.
+	Colocated []colocation `json:"colocated,omitempty"`
+	// PlacementUnknown are the reachable replicas that did not report a
+	// node. They are never counted as sharing one, nor as spread.
+	PlacementUnknown []int `json:"placement_unknown,omitempty"`
+	// RelayNode is where the FatLine replica that answered this tunnel
+	// runs. It says nothing about the other FatLine replica.
+	RelayNode string `json:"relay_node,omitempty"`
 }
 
+// colocation is replicas sharing one node.
+type colocation struct {
+	Node     string `json:"node"`
+	Replicas []int  `json:"replicas"`
+}
+
+// sharedNodes groups the replicas that reported the same node.
+//
+// An unreachable replica says nothing and is left out. A replica that reported
+// no node is placement unknown: two of those are NOT one node, and one of them
+// beside a named node is not a spread — silence is never read as either. The
+// groups come back ordered by their first ordinal, so the report is stable.
+func sharedNodes(states []replicaState) (groups []colocation, unknown []int) {
+	byNode := map[string][]int{}
+	for _, s := range states {
+		switch {
+		case s.Error != "":
+		case s.Node == "":
+			unknown = append(unknown, s.Ordinal)
+		default:
+			byNode[s.Node] = append(byNode[s.Node], s.Ordinal)
+		}
+	}
+	for node, ordinals := range byNode {
+		if len(ordinals) > 1 {
+			groups = append(groups, colocation{Node: node, Replicas: ordinals})
+		}
+	}
+	slices.SortFunc(groups, func(a, b colocation) int { return cmp.Compare(a.Replicas[0], b.Replicas[0]) })
+	return groups, unknown
+}
+
+// ordinalList renders ordinals as prose: "0", "0 and 1", "0, 1 and 2".
+func ordinalList(ordinals []int) string {
+	parts := make([]string, len(ordinals))
+	for i, o := range ordinals {
+		parts[i] = fmt.Sprint(o)
+	}
+	if len(parts) < 2 {
+		return strings.Join(parts, "")
+	}
+	return strings.Join(parts[:len(parts)-1], ", ") + " and " + parts[len(parts)-1]
+}
+
+// placement says which replicas share a node, and what that costs.
+//
+// Placement is reported, never acted on: nothing in FarCast moves a replica
+// apart, and moving one seals it. "Different nodes" is all a spread could
+// claim — two nodes may still share a zone — so a spread fleet gets no line
+// at all rather than a reassurance.
+//
+// The node name is the replica's own report, read through the tunnel, so it
+// goes through terminalText; --json carries it as it came.
+func (r stateResult) placement(w io.Writer) {
+	for _, g := range r.Colocated {
+		fprintf(w, "\nReplicas %s run on one node (%s). One node repair or eviction restarts them together,\n"+
+			"and storage stays sealed until someone unseals it: while they share a node, the second\n"+
+			"replica guards against a crashed pod but not against losing that node. Nothing moves\n"+
+			"them apart on its own, and moving one seals it (ADR 0008 decision 6).\n",
+			ordinalList(g.Replicas), terminalText(g.Node))
+		if r.RelayNode == g.Node {
+			fprintf(w, "The FatLine replica that answered this tunnel runs on that node too, so the same event\n"+
+				"also drops the tunnel an unseal rides.\n")
+		}
+	}
+	reachable := 0
+	for _, s := range r.Replicas {
+		if s.Error == "" {
+			reachable++
+		}
+	}
+	if len(r.PlacementUnknown) > 0 && reachable > 1 {
+		fprintf(w, "\nReplica(s) %s did not report a node — a keyholder image or manifest older than this\n"+
+			"CLI — so this cannot say whether replicas share one.\n", ordinalList(r.PlacementUnknown))
+	}
+}
+
+// Human renders each replica's row. Every string in a row is the replica's own
+// report, or this machine's prose around one — an error carrying its refusal,
+// its phase and hold reason, a scope it names — so each goes through
+// terminalText; --json carries them as they came.
 func (r stateResult) Human(w io.Writer) error {
 	sealed, differ, behind, outdated, foreign := 0, 0, 0, 0, 0
 	for _, s := range r.Replicas {
 		switch {
 		case s.Error != "":
-			fprintf(w, "  replica %d  unreachable — %s\n", s.Ordinal, s.Error)
+			fprintf(w, "  replica %d  unreachable — %s\n", s.Ordinal, terminalText(s.Error))
 			sealed++
 		case s.Phase == "unsealed":
-			fprintf(w, "  replica %d  unsealed   generation %d, scopes %s\n",
-				s.Ordinal, s.Generation, strings.Join(s.Scopes, ","))
+			if len(s.Scopes) == 0 {
+				fprintf(w, "  replica %d  unsealed   generation %d, holding no application scopes\n", s.Ordinal, s.Generation)
+			} else {
+				// The scope names are the replica's own report.
+				fprintf(w, "  replica %d  unsealed   generation %d, scopes %s\n",
+					s.Ordinal, s.Generation, terminalText(strings.Join(s.Scopes, ",")))
+			}
 			switch {
 			case s.Outdated:
 				outdated++
@@ -216,18 +339,18 @@ func (r stateResult) Human(w io.Writer) error {
 				if strings.Contains(s.KeysDiffer, "minted separately") {
 					foreign++
 				}
-				fprintf(w, "             KEYS DIFFER FROM THIS MACHINE'S KEYRING: it %s\n", s.KeysDiffer)
+				fprintf(w, "             KEYS DIFFER FROM THIS MACHINE'S KEYRING: it %s\n", terminalText(s.KeysDiffer))
 			}
 		default:
-			reason := s.Phase
+			reason := terminalText(s.Phase)
 			if s.HoldReason != "" {
-				reason += " — " + s.HoldReason
+				reason += " — " + terminalText(s.HoldReason)
 			}
 			fprintf(w, "  replica %d  %s\n", s.Ordinal, reason)
 			sealed++
 		}
 		if s.PinNote != "" {
-			fprintf(w, "             key pin: %s\n", s.PinNote)
+			fprintf(w, "             key pin: %s\n", terminalText(s.PinNote))
 		}
 	}
 	if sealed == len(r.Replicas) {
@@ -255,6 +378,7 @@ func (r stateResult) Human(w io.Writer) error {
 			"brings them to it. A replica serving keys from before a rotation was given older material:\n"+
 			"a hand-over that did not finish, or a lost or revoked keeper.\n", differ, r.Instance)
 	}
+	r.placement(w)
 	return nil
 }
 
@@ -357,13 +481,25 @@ type sealResult struct {
 	Replicas []replicaState `json:"replicas"`
 }
 
+// Human renders each replica's row. The phase and the error are the replica's
+// word, so each goes through terminalText; --json carries them as they came.
 func (r sealResult) Human(w io.Writer) error {
+	restartSealed := false
 	for _, s := range r.Replicas {
 		if s.Error != "" {
-			fprintf(w, "  replica %d  NOT SEALED — %s\n", s.Ordinal, s.Error)
+			fprintf(w, "  replica %d  NOT SEALED — %s\n", s.Ordinal, terminalText(s.Error))
 			continue
 		}
-		fprintf(w, "  replica %d  %s\n", s.Ordinal, s.Phase)
+		fprintf(w, "  replica %d  %s\n", s.Ordinal, terminalText(s.Phase))
+		restartSealed = restartSealed || s.Phase == "restart-sealed"
+	}
+	// The phase token is the wire's and stays as it is — keepers in the field
+	// and the runbooks read it — but an operator who sealed to STOP storage
+	// must hear, at the moment they act, that this is the phase a keeper
+	// re-seeds without asking.
+	if !r.Hold && restartSealed {
+		fprintf(w, "\nSealed without --hold, so each replica reports restart-sealed: the state a keeper device\n"+
+			"re-seeds unattended, exactly as after a restart. 'farcast storage seal %s --hold' keeps keepers out.\n", r.Instance)
 	}
 	if r.Hold {
 		fprintf(w, "\nThis hold lives only until the pod restarts. A restarted replica comes back\n"+
@@ -503,7 +639,7 @@ func (c *storageUnsealCommand) Run(ctx context.Context, env *Env, args []string)
 	}
 	if err := env.Printer.Print(unsealResult{
 		Instance: name, Scopes: len(keys.Scopes()), Generation: res.Generation,
-		Loaded: len(res.Loaded), Total: res.Total, Replicas: res.Rows, NotYetActive: notYet,
+		Loaded: len(res.Loaded), HeldOnly: len(res.HeldOnly), Total: res.Total, Replicas: res.Rows, NotYetActive: notYet,
 	}); err != nil {
 		return err
 	}
@@ -538,27 +674,48 @@ func (c *storageUnsealCommand) Run(ctx context.Context, env *Env, args []string)
 }
 
 type unsealResult struct {
-	Instance   string         `json:"instance"`
-	Scopes     int            `json:"scopes"`
-	Generation uint64         `json:"generation"`
-	Loaded     int            `json:"loaded"`
-	Total      int            `json:"total"`
-	Replicas   []replicaState `json:"replicas"`
+	Instance   string `json:"instance"`
+	Scopes     int    `json:"scopes"`
+	Generation uint64 `json:"generation"`
+	Loaded     int    `json:"loaded"`
+	// HeldOnly counts the replicas that took this keyring's keys to hold and
+	// then missed the push that would have had them write under the newest:
+	// serving, and not in Loaded.
+	HeldOnly int            `json:"held_only,omitempty"`
+	Total    int            `json:"total"`
+	Replicas []replicaState `json:"replicas"`
 	// NotYetActive says why the replicas hold this keyring's newest keys
 	// without writing under them.
 	NotYetActive string `json:"not_yet_active,omitempty"`
 }
 
+// Human renders each replica's row and the summary. A row's phase, note and
+// error are the replica's word or carry it — a refusal's text, a scope it
+// named — and so can why the newest keys are not in use yet; each goes
+// through terminalText, and --json carries them as they came.
 func (r unsealResult) Human(w io.Writer) error {
 	for _, s := range r.Replicas {
 		switch {
 		case s.Error != "":
-			fprintf(w, "  replica %d  NOT UNSEALED — %s\n", s.Ordinal, s.Error)
+			fprintf(w, "  replica %d  NOT UNSEALED — %s\n", s.Ordinal, terminalText(s.Error))
 		case s.Note != "":
-			fprintf(w, "  replica %d  %s — %s\n", s.Ordinal, s.Phase, s.Note)
+			fprintf(w, "  replica %d  %s — %s\n", s.Ordinal, terminalText(s.Phase), terminalText(s.Note))
 		default:
-			fprintf(w, "  replica %d  %s   generation %d\n", s.Ordinal, s.Phase, s.Generation)
+			fprintf(w, "  replica %d  %s   generation %d\n", s.Ordinal, terminalText(s.Phase), s.Generation)
 		}
+	}
+	// Nothing writes under the keys: every such run returns an error that
+	// says why, and a summary naming a generation no replica writes under
+	// would only mislead. Replicas that hold them without using them yet are
+	// not "nothing took them" — their rows above say they hold them, and so
+	// must this line.
+	if r.Loaded == 0 {
+		if r.HeldOnly > 0 {
+			fprintf(w, "\nNo replica writes under this machine's newest keys yet; %d hold them. The reason follows.\n", r.HeldOnly)
+		} else {
+			fprintf(w, "\nNo replica took this machine's keys; the reason follows.\n")
+		}
+		return nil
 	}
 	switch r.Scopes {
 	case 0:
@@ -573,7 +730,7 @@ func (r unsealResult) Human(w io.Writer) error {
 			r.Loaded, r.Total, r.Scopes, r.Generation)
 	}
 	if r.NotYetActive != "" {
-		fprintf(w, "They do not write under this keyring's newest keys yet: %s.\n", r.NotYetActive)
+		fprintf(w, "They do not write under this keyring's newest keys yet: %s.\n", terminalText(r.NotYetActive))
 	}
 	fprintf(w, "Key material is held in RAM only: any restart seals that replica again.\n")
 	return nil
@@ -586,6 +743,35 @@ type keyholderOpener func(ctx context.Context, env *Env, instance string) (sealS
 func openKeyholder(ctx context.Context, env *Env, instance string) (sealStateClient, func(), error) {
 	return keyholderClient(ctx, env, instance)
 }
+
+// relayStatusTimeout bounds the one extra status call 'storage state' makes.
+// It is best-effort: a slow answer costs the relay line, never the report.
+const relayStatusTimeout = 5 * time.Second
+
+// openKeyholderWithRelay is openKeyholder that also asks FatLine which node
+// the replica answering this tunnel runs on. The answer is best-effort, and
+// an empty one prints nothing.
+func openKeyholderWithRelay(ctx context.Context, env *Env, instance string) (sealStateClient, func(), error) {
+	client, conn, done, err := keyholderClientOver(ctx, env, instance)
+	if err != nil {
+		return nil, nil, err
+	}
+	sctx, cancel := context.WithTimeout(ctx, relayStatusTimeout)
+	defer cancel()
+	var relay string
+	if st, err := conn.Status(sctx); err == nil {
+		relay = st.Node
+	}
+	return relayedKeyholder{sealStateClient: client, relay: relay}, done, nil
+}
+
+// relayedKeyholder carries the relay's node beside the keyholder client.
+type relayedKeyholder struct {
+	sealStateClient
+	relay string
+}
+
+func (r relayedKeyholder) RelayNode() string { return r.relay }
 
 // reuseKeyholder hands a hand-over a client the caller already opened, and
 // leaves closing it to the caller.
@@ -995,9 +1181,9 @@ func (h *handOver) read() []*keyholder.State {
 		st, err := h.client.State(h.ctx, i)
 		if err != nil {
 			if h.second {
-				h.warn("warning: keyholder replica %d did not answer when asked again: %v\n", i, err)
+				h.warn("warning: keyholder replica %d did not answer when asked again: %s\n", i, terminalText(err.Error()))
 			} else {
-				h.warn("warning: keyholder replica %d did not answer, so it is not handed the keys: %v\n", i, err)
+				h.warn("warning: keyholder replica %d did not answer, so it is not handed the keys: %s\n", i, terminalText(err.Error()))
 			}
 			h.unanswered[i] = err
 			continue
@@ -1149,7 +1335,7 @@ func (h *handOver) push(keys datasphere.Keyring, states []*keyholder.State) (han
 			step.Rows = append(step.Rows, replicaState{Ordinal: i, Error: h.behind})
 		case perr != nil:
 			entry.Result = "refused"
-			h.warn("warning: keyholder replica %d refused the keys: %v\n", i, perr)
+			h.warn("warning: keyholder replica %d refused the keys: %s\n", i, terminalText(perr.Error()))
 			step.Refused = append(step.Refused, i)
 			step.Rows = append(step.Rows, replicaState{Ordinal: i, Error: perr.Error()})
 		case outdatedImage(pushed):
@@ -1356,15 +1542,19 @@ func checkReplica(instance string, keys datasphere.Keyring, i int, st keyholder.
 	for _, name := range slices.Sorted(maps.Keys(st.Keys)) {
 		theirs := st.Keys[name]
 		mine, ok := ours[name]
+		// A scope this keyring does not hold, and a key it does not, are
+		// names only the replica supplied; they reach a hand-over's problem
+		// and an error that keeps its newlines, so they go in quoted. Every
+		// other name here is one this keyring holds.
 		if !ok {
-			return keyringBehind(i, behindScope, "serves scope "+name+", which this machine's keyring does not hold", instance)
+			return keyringBehind(i, behindScope, "serves scope "+terminalText(name)+", which this machine's keyring does not hold", instance)
 		}
 		if len(theirs) > 0 && !slices.ContainsFunc(theirs, func(id string) bool { _, ok := mine[id]; return ok }) {
 			return mintedTwice(i, name)
 		}
 		for _, id := range theirs {
 			if _, ok := mine[id]; !ok {
-				return keyringBehind(i, behindKey, fmt.Sprintf("holds key %s for %s, which this machine's keyring does not", id, name), instance)
+				return keyringBehind(i, behindKey, fmt.Sprintf("holds key %s for %s, which this machine's keyring does not", terminalText(id), name), instance)
 			}
 		}
 		if len(theirs) > 0 {

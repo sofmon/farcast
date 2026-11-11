@@ -709,8 +709,8 @@ func TestStorageCpRoundTrip(t *testing.T) {
 
 	// First storage use is what mints the keyring, and the mint says the one
 	// thing an operator will only ever act on at the moment the file appears.
-	if !strings.Contains(errb.String(), datasphere.KeyLossWarning) {
-		t.Errorf("the mint must print the key-loss warning verbatim:\n%s", errb.String())
+	if !keyLossLine.MatchString(errb.String()) {
+		t.Errorf("the mint must print the key-loss warning verbatim, on a line of its own:\n%s", errb.String())
 	}
 	if !strings.Contains(errb.String(), dir.InstancePath("prod")) {
 		t.Errorf("the mint must name what to back up:\n%s", errb.String())

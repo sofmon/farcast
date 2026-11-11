@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/sofmon/farcast/datasphere"
@@ -15,6 +16,31 @@ import (
 // against an operator hold, which is the in-cluster half of "a keeper never
 // clears a deliberate seal".
 const IntentReseed = "restart-reseed"
+
+// ResultPending is the Result of the entry a keeper writes BEFORE it pushes.
+// The push is recorded on this device's disk first, and is not made when that
+// write fails, so no push can happen that the ledger could not record. The
+// entry written after the push — "ok", ResultRefusedAfterSend or "refused" —
+// settles it; both carry the same Push id, and nothing else settles it. A
+// pending entry that nothing settles is a push whose outcome this device did
+// not record, and both the budget and the audit count it as one that
+// succeeded: the budget so that a ledger that stopped taking writes cannot
+// stop it counting, and the audit because it cannot rule out that key
+// material moved.
+const ResultPending = "pending"
+
+// ResultRefusedAfterSend is a push refused AFTER its sealed bundle was
+// written to whatever answered: already serving, a pin it is below, a bundle
+// the leaf does not bind, any other refusal or error once the request went
+// out. It moved key material as far as the device can tell — the bundle is
+// sealed to the challenge's key, and the challenge comes from whatever
+// answered, which ADR 0008 finding 1's solicitor can be — so the budget and
+// the audit count it as a push. "refused" is left for a push that sent
+// nothing: the replica could not be dialled, did not complete the handshake,
+// or would not issue a challenge. (A "refused" line written before this
+// distinction existed may be either; it is read as the binary that wrote it
+// decided, and not counted.)
+const ResultRefusedAfterSend = "refused-after-send"
 
 // Action is what a keeper should do about one replica.
 type Action string
@@ -32,13 +58,21 @@ const (
 	// ActionBudget: it would re-seed, and the budget is spent. The refusal IS
 	// the alarm; ADR 0008 asks for a human here rather than a wider budget.
 	ActionBudget Action = "budget-exhausted"
-	// ActionStale: this device's bundle does not hold what the fleet holds.
+	// ActionStale: this device's BUNDLE does not hold what the fleet holds.
 	// Either the cluster has held a newer generation, which the keyholder
 	// would refuse anyway, or a serving replica's keys and the bundle's
-	// disagree (see Mismatch) — the instance's keys were rotated, or an
-	// application added, after this keeper was enrolled, or a hand-over has
-	// not reached every replica yet. Degradation, never corruption.
+	// disagree (see Mismatch), or the instance's key pin refuses it (see
+	// Pinned) — the instance's keys were rotated, or an application added,
+	// after this keeper was enrolled, or a hand-over has not reached every
+	// replica yet. Degradation, never corruption. It is about the bundle
+	// only: a re-enrolment is what changes the answer.
 	ActionStale Action = "stale-bundle"
+	// ActionPinUnreadable: the replica cannot read its own key pin, so it
+	// refuses every re-seed whatever the bundle. That is not about this
+	// device: the operator's 'farcast storage key pin' repairs it, and
+	// re-enrolling the device changes nothing. The name is the keyholder's
+	// own refusal code.
+	ActionPinUnreadable Action = "pin-unreadable"
 	// ActionUnknown: the replica did not answer.
 	ActionUnknown Action = "unreachable"
 	// ActionUnchecked: it would re-seed, but ANOTHER replica did not answer,
@@ -46,6 +80,11 @@ const (
 	// A replica that does not answer may well be serving; the next pass
 	// retries.
 	ActionUnchecked Action = "unchecked"
+	// ActionLedgerUnwritable: it would re-seed, and this device's ledger
+	// would not take the entry that records the push before it is made, so
+	// nothing was pushed. It is a fault on this device, and a person's to
+	// repair: an unrecorded push is one the budget never counts.
+	ActionLedgerUnwritable Action = "ledger-unwritable"
 )
 
 // Fleet is what a keeper concluded about every replica together, before
@@ -57,11 +96,23 @@ type Fleet struct {
 	// Unchecked names a replica that did not answer, which leaves the
 	// bundle unchecked against it.
 	Unchecked string
-	// Pinned says why a replica's key pin refuses this device's bundle. It
-	// is read from every replica that answered, sealed ones included: the pin
-	// is the reference that survives a restart, so it is there exactly when
-	// no serving replica is.
+	// Pinned says why the instance's key pin refuses this device's bundle.
+	// It is read from every replica that answered, sealed ones included: the
+	// pin is the reference that survives a restart, so it is there exactly
+	// when no serving replica is.
 	Pinned string
+}
+
+// Refusal is why this device's bundle would be refused by the fleet, or ""
+// when nothing says so — Pinned, else Mismatch, in Decide's precedence. It
+// does not depend on any replica being sealed: a keeper whose bundle the
+// fleet has moved past learns it at the rotation, rather than at the next
+// restart, which is the outage it exists for.
+func (f Fleet) Refusal() string {
+	if f.Pinned != "" {
+		return f.Pinned
+	}
+	return f.Mismatch
 }
 
 // FleetOf reads the whole fleet's answers once. A replica that did not answer
@@ -79,8 +130,8 @@ func FleetOf(mine *datasphere.Bundle, states []keyholder.State, errs []error) Fl
 	return f
 }
 
-// Pinned reports why a replica's key pin refuses this device's bundle, or ""
-// when none does. The keyholder refuses such a bundle itself; deciding it here
+// Pinned reports why the instance's key pin refuses this device's bundle, or
+// "" when no replica's does. The keyholder refuses such a bundle itself; deciding it here
 // keeps the keeper from spending a push, and a ledger line, on a refusal it
 // can see coming — and says why in words.
 //
@@ -88,6 +139,11 @@ func FleetOf(mine *datasphere.Bundle, states []keyholder.State, errs []error) Fl
 // that replica, which refuses every re-seed whatever the bundle, and it is
 // Decide's to say for that replica alone. Here it would stop a re-seed of a
 // different replica whose own pin accepts the bundle.
+//
+// The verdict is the fleet's, not one replica's: a refusing pin on any
+// replica stops the re-seed of a replica whose own pin is absent — the
+// ConfigMap deleted under it — so the words name the instance's pin rather
+// than whichever replica answered first, and a report prints them once.
 func Pinned(mine *datasphere.Bundle, states []keyholder.State, errs []error) string {
 	keys := dskeyholder.KeysOf(mine)
 	for i, st := range states {
@@ -98,11 +154,11 @@ func Pinned(mine *datasphere.Bundle, states []keyholder.State, errs []error) str
 		case dskeyholder.PinValid:
 			p, ok := pinOf(st.Pin)
 			if !ok {
-				return fmt.Sprintf("replica %d reports a key pin this device cannot read", i)
+				return fmt.Sprintf("the instance's key pin, as replica %d reports it, is one this device cannot read", i)
 			}
 			if err := p.Admits(keys); err != nil {
-				return fmt.Sprintf("replica %d's key pin refuses this device's bundle (%v) — the instance's keys were rotated, or an application added, "+
-					"after it was enrolled; re-enrol it", i, err)
+				return fmt.Sprintf("the instance's key pin refuses this device's bundle (%v) — the instance's keys were rotated, or an application added, "+
+					"after it was enrolled; re-enrol it", err)
 			}
 		}
 	}
@@ -111,9 +167,11 @@ func Pinned(mine *datasphere.Bundle, states []keyholder.State, errs []error) str
 
 // PinUnreadableReason is why a keeper leaves alone a replica that cannot read
 // its key pin. Re-enrolling changes nothing: the replica refuses every
-// re-seed until the operator repairs the pin.
-func PinUnreadableReason(ordinal int) string {
-	return fmt.Sprintf("replica %d cannot read its key pin and refuses every re-seed; the operator's 'farcast storage key pin' repairs it", ordinal)
+// re-seed until the operator repairs the pin. It names no replica, because a
+// report already prefixes the one it is about.
+func PinUnreadableReason() string {
+	return "this replica cannot read its key pin, so it refuses every re-seed whatever this device holds; " +
+		"the operator's 'farcast storage key pin' repairs it, and enrolling this device again changes nothing"
 }
 
 func pinOf(r *dskeyholder.PinReport) (dskeyholder.Pin, bool) {
@@ -140,6 +198,53 @@ type Decision struct {
 	Ordinal int
 	Action  Action
 	Reason  string
+	// FleetWide says the Reason is the fleet's verdict on this device's
+	// bundle (Fleet.Refusal), not a fact about this replica. A report prints
+	// it once for the pass rather than under every replica it stops.
+	FleetWide bool
+}
+
+// Outcome is what a pass amounts to for whoever runs a keeper on a timer.
+// The values are ordered: a pass is as bad as its worst replica.
+type Outcome int
+
+const (
+	// OutcomeKept: every replica serves, was just re-seeded, or is held on
+	// purpose by the operator.
+	OutcomeKept Outcome = iota
+	// OutcomeIncomplete: a replica or the tunnel did not answer, or a re-seed
+	// could not be checked. The next pass retries.
+	OutcomeIncomplete
+	// OutcomeCannotKeep: this device cannot keep the instance until a person
+	// acts — a stale bundle, an unreadable pin, a spent budget.
+	OutcomeCannotKeep
+)
+
+// Outcome classes one replica's action. An action added without a mapping
+// is CannotKeep: loud, rather than a silent success.
+func (a Action) Outcome() Outcome {
+	switch a {
+	case ActionNone, ActionReseed, ActionHold:
+		return OutcomeKept
+	case ActionUnknown, ActionUnchecked:
+		return OutcomeIncomplete
+	default:
+		return OutcomeCannotKeep
+	}
+}
+
+// PassOutcome is the worst of a pass's decisions — and CannotKeep whenever the
+// fleet refuses this device's bundle, though every replica is serving and no
+// decision says so.
+func PassOutcome(ds []Decision, f Fleet) Outcome {
+	worst := OutcomeKept
+	if f.Refusal() != "" {
+		worst = OutcomeCannotKeep
+	}
+	for _, d := range ds {
+		worst = max(worst, d.Action.Outcome())
+	}
+	return worst
 }
 
 // Decide chooses what to do about one replica.
@@ -171,11 +276,11 @@ func Decide(st keyholder.State, err error, ordinal int, mine uint64, budget Budg
 		d.Action = ActionStale
 		d.Reason = fmt.Sprintf("the cluster has held generation %d and this device carries %d; re-enrol it", st.Generation, mine)
 	case st.Pin != nil && st.Pin.Status == dskeyholder.PinInvalid:
-		d.Action, d.Reason = ActionStale, PinUnreadableReason(ordinal)
+		d.Action, d.Reason = ActionPinUnreadable, PinUnreadableReason()
 	case fleet.Pinned != "":
-		d.Action, d.Reason = ActionStale, fleet.Pinned
+		d.Action, d.Reason, d.FleetWide = ActionStale, fleet.Pinned, true
 	case fleet.Mismatch != "":
-		d.Action, d.Reason = ActionStale, fleet.Mismatch
+		d.Action, d.Reason, d.FleetWide = ActionStale, fleet.Mismatch, true
 	case fleet.Unchecked != "":
 		d.Action, d.Reason = ActionUnchecked, fleet.Unchecked
 	case !budget.Allowed:
@@ -201,7 +306,7 @@ type BudgetState struct {
 
 func (b BudgetState) String() string {
 	if b.Allowed {
-		return fmt.Sprintf("%d of %d reseeds used in the last %s", b.Used, b.Limit, HumanWindow(b.Window))
+		return fmt.Sprintf("%d of %d %s used in the last %s", b.Used, b.Limit, reseedNoun(b.Limit), HumanWindow(b.Window))
 	}
 	msg := fmt.Sprintf("the reseed budget is spent: %d of %d in the last %s", b.Used, b.Limit, HumanWindow(b.Window))
 	if !b.Oldest.IsZero() {
@@ -212,15 +317,28 @@ func (b BudgetState) String() string {
 
 // Budget counts what this device has pushed inside the window.
 //
-// It counts SUCCESSFUL reseeds only. A refused push moved no key material, and
-// counting it would let anything that can make a keeper fail — an unreachable
-// tunnel, a stale bundle — spend the budget that exists to bound how often key
-// material actually moves.
+// It counts every push whose sealed bundle left this device: a successful
+// reseed, a push refused after the bundle was sent (ResultRefusedAfterSend),
+// and a push recorded before it was made and never settled (ResultPending),
+// whose outcome is unknown. A refusal after sending is not "no key material
+// moved": the bundle went to whatever answered the challenge, and a
+// solicitor holding the keyholder's server leaf can read it and answer every
+// push with a refusal — a budget that skipped refusals would never trip on
+// it. What it does not count is a push that sent nothing ("refused": no
+// dial, no handshake, no challenge), so an unreachable tunnel cannot spend
+// the budget; a stale bundle is refused before any push is made, and does
+// not reach the ledger at all. The price is that a push that loses a race to
+// another pusher — the operator, another device — spends a slot, which is
+// the direction a tripwire should err in.
 func Budget(entries []keyholder.LedgerEntry, limit int, window time.Duration, now time.Time) BudgetState {
 	b := BudgetState{Limit: limit, Window: window}
 	cutoff := now.Add(-window)
-	for _, e := range entries {
-		if e.Intent != IntentReseed || e.Result != "ok" || e.Time.Before(cutoff) {
+	open := Unsettled(entries)
+	for i, e := range entries {
+		if e.Intent != IntentReseed || e.Time.Before(cutoff) {
+			continue
+		}
+		if !Delivered(e, open[i]) {
 			continue
 		}
 		b.Used++
@@ -232,13 +350,35 @@ func Budget(entries []keyholder.LedgerEntry, limit int, window time.Duration, no
 	return b
 }
 
-// HumanWindow names a budget window the way an operator sets it: in days once
-// it is a day or more.
+// HumanWindow names a budget window the way an operator sets it: in days when
+// it is a whole number of them, and otherwise as the duration it is. It never
+// rounds: a 36-hour window read as "1 day" would be a budget that recovers a
+// half-day later than the operator was told.
 func HumanWindow(d time.Duration) string {
-	if d >= 24*time.Hour {
-		return fmt.Sprintf("%d days", int(d.Hours()/24))
+	const day = 24 * time.Hour
+	if d >= day && d%day == 0 {
+		if n := d / day; n != 1 {
+			return fmt.Sprintf("%d days", n)
+		}
+		return "1 day"
 	}
-	return d.String()
+	s := d.String()
+	// "36h0m0s" reads as "36h", "1h30m0s" as "1h30m": the zero units are noise.
+	if strings.HasSuffix(s, "m0s") {
+		s = strings.TrimSuffix(s, "0s")
+	}
+	if strings.HasSuffix(s, "h0m") {
+		s = strings.TrimSuffix(s, "0m")
+	}
+	return s
+}
+
+// reseedNoun agrees with a count: "1 reseed", "8 reseeds".
+func reseedNoun(n int) string {
+	if n == 1 {
+		return "reseed"
+	}
+	return "reseeds"
 }
 
 // Mismatch reports why re-seeding a restarted replica with this device's

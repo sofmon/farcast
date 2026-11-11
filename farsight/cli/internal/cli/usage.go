@@ -1,16 +1,22 @@
 package cli
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
+	"maps"
+	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sofmon/farcast/farsight/cli/internal/cluster"
+	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	fldeploy "github.com/sofmon/farcast/fatline/deploy"
+	"github.com/sofmon/farcast/fatline/identity"
 	"github.com/sofmon/farcast/shrike"
 	"github.com/sofmon/farcast/technocore/deploy"
 	"github.com/sofmon/farcast/technocore/kernel"
@@ -59,6 +65,12 @@ rather than as zero.
 The network latency is CONNECTION latency, not request latency: FatLine
 tunnels CONNECT opaquely and never terminates TLS, so what happens inside a
 connection is ciphertext by construction.
+
+The Tunnel section is the operator's and keepers' own streams into the
+instance, kept apart from application traffic. The monitor knows each peer
+only by an opaque token of its leaf; the device names come from this
+machine's record of the keepers it enrolled. A keeper enrolled elsewhere, or
+before 2026-11-10, shows as not enrolled from this machine until re-enrolled.
 
 Quantiles are bucketed and rounded UP, so a figure here is at or above what
 was observed, never below it. Nothing adjusts anything yet; that is 5.2.
@@ -137,7 +149,7 @@ func (c *usageCommand) Run(ctx context.Context, env *Env, args []string) error {
 		Advice:      doc.Advice,
 		Adapting:    doc.Adapting,
 	}
-	c.addNetwork(ctx, env, name, &res)
+	c.addNetwork(ctx, env, name, meta.Keepers, &res)
 	res.Replicas = fatlineReplicas(ctx, cl)
 	return env.Printer.Print(res)
 }
@@ -149,7 +161,7 @@ func (c *usageCommand) Run(ctx context.Context, env *Env, args []string) error {
 // tunnel — and an operator whose tunnel is down should still be told what
 // their applications are using, with the missing half named rather than shown
 // as zeros.
-func (c *usageCommand) addNetwork(ctx context.Context, env *Env, name string, res *usageResult) {
+func (c *usageCommand) addNetwork(ctx context.Context, env *Env, name string, keepers []config.Keeper, res *usageResult) {
 	if c.noNetwork {
 		res.NetworkSkipped = true
 		return
@@ -169,6 +181,18 @@ func (c *usageCommand) addNetwork(ctx context.Context, env *Env, name string, re
 	res.NetworkSince = snap.Since
 	res.NetworkEvents = snap.Events
 	res.NetworkReplica = snap.Replica
+
+	// The tunnel half is named here, on the operator's machine, and nowhere
+	// else: the monitor holds tokens, and this machine holds the fleet it
+	// enrolled. The operator's own leaf is read alone — never the CA key —
+	// and when it cannot be read, operator rows are still named by the role
+	// FatLine verified.
+	var operatorToken string
+	if leaf, err := env.ConfigDir.LoadOperatorLeaf(name); err == nil {
+		operatorToken, _ = identity.LeafTokenPEM(leaf)
+	}
+	res.Tunnel = attributeTunnel(snap.Tunnel, keepers, operatorToken, time.Now())
+	res.TunnelSeparated = snap.TunnelSeparated
 }
 
 // fatlineReplicas is how many FatLine pods are keeping their own picture.
@@ -229,6 +253,15 @@ type usageResult struct {
 	// NetworkSkipped records that --no-network was given, so an empty section
 	// is never mistaken for an instance that is not talking to anything.
 	NetworkSkipped bool `json:"network_skipped,omitempty"`
+
+	// Tunnel is the operator's and keepers' streams into the instance, each
+	// peer named from this machine's records. Device names appear here — the
+	// operator's own terminal and --json — and nowhere the provider reads.
+	Tunnel []tunnelRow `json:"tunnel,omitempty"`
+	// TunnelSeparated says the monitor kept tunnel streams out of the
+	// application rows. False from a monitor older than that, whose
+	// "(unidentified)" row includes them.
+	TunnelSeparated bool `json:"tunnel_separated,omitempty"`
 }
 
 func (r usageResult) Human(w io.Writer) error {
@@ -347,7 +380,8 @@ func (r usageResult) writeNetwork(w io.Writer) {
 		return
 	case r.NetworkError != "":
 		fprintln(w, "Network not measured — this was not read, which is not the same as zero:")
-		fprintf(w, "  %s\n", r.NetworkError)
+		// It can carry the monitor's own words ("the monitor answered …").
+		fprintf(w, "  %s\n", terminalText(r.NetworkError))
 		fprintln(w, "The monitor is read through the FatLine tunnel; 'farcast connect <instance> --status'")
 		fprintln(w, "says whether that is up. An instance running FatLine alone has no monitor to read.")
 		return
@@ -359,19 +393,28 @@ func (r usageResult) writeNetwork(w io.Writer) {
 	}
 	fprintln(w)
 	r.writeReplicaCaveat(w)
+	r.writeApplicationNetwork(w)
+	r.writeTunnel(w)
+}
+
+// writeApplicationNetwork renders application egress, one row per application.
+func (r usageResult) writeApplicationNetwork(w io.Writer) {
 	if len(r.Network) == 0 {
 		fprintln(w, "  No application has made an outbound connection.")
 		return
 	}
+	unidentified := false
 	fprintf(w, "  %-20s %5s %6s %6s %6s %10s %10s  %s\n",
 		"application", "hosts", "conns", "failed", "denied", "out", "in", "connect")
 	for _, a := range r.Network {
-		name := a.App
+		// The monitor's report, like every string in this section.
+		name := terminalText(a.App)
 		if name == "" {
 			// FatLine could not identify the caller. It is the row an
 			// operator most needs to see, so it is named as what it is
 			// rather than left blank.
 			name = "(unidentified)"
+			unidentified = true
 		}
 		fprintf(w, "  %-20s %5d %6d %6d %6d %10s %10s  %s\n",
 			name, a.Hosts, a.Allows, a.Fails, a.Denies,
@@ -380,6 +423,84 @@ func (r usageResult) writeNetwork(w io.Writer) {
 	fprintln(w)
 	fprintln(w, "  'connect' is how long establishing the connection took, at the 90th")
 	fprintln(w, "  percentile. Not request latency: FatLine never opens the tunnel it carries.")
+	if unidentified && !r.TunnelSeparated {
+		// An older monitor folded the operator's and keepers' streams into
+		// the application tables, under no application. Said, so a keeper's
+		// re-seed is not read as an application nobody can identify.
+		fprintln(w, "  '(unidentified)' includes the operator's and keepers' tunnel streams;")
+		fprintln(w, "  this monitor predates separating them.")
+	}
+}
+
+// writeTunnel renders the operator's and keepers' streams into the instance.
+//
+// Kept apart from the application table because it is a different question:
+// not what an application reached, but who came in through the tunnel and
+// what FatLine let them open.
+//
+// The route is the PEER's word: for a route FatLine does not serve, it is
+// whatever path the peer asked for, percent-decoded — and a keeper leaf is a
+// peer, the one this table exists to catch misbehaving. Printed raw, an escape
+// in it could erase the row that names its own refusal, or write the
+// operator's clipboard. So every string here goes through terminalText, and
+// the columns are measured on what is printed, not on what was sent. --json
+// carries them as they came.
+func (r usageResult) writeTunnel(w io.Writer) {
+	if len(r.Tunnel) == 0 {
+		return
+	}
+	fprintln(w)
+	fprintln(w, "Tunnel — the operator's and keepers' streams into the instance")
+	type shown struct{ who, route string }
+	rows := make([]shown, len(r.Tunnel))
+	whoWidth, routeWidth := len("who"), 10
+	for i, t := range r.Tunnel {
+		rows[i] = shown{who: terminalText(t.Who), route: terminalText(t.Route)}
+		whoWidth = max(whoWidth, utf8.RuneCountInString(rows[i].who))
+		routeWidth = max(routeWidth, utf8.RuneCountInString(rows[i].route))
+	}
+	fprintf(w, "  %-*s %-*s %7s %7s %6s %10s %10s  %-10s %s\n",
+		whoWidth, "who", routeWidth, "route", "relayed", "refused", "failed", "out", "in", "last seen", "refused because")
+	unnamed := false
+	for i, t := range r.Tunnel {
+		if t.Who == unnamedKeeper {
+			unnamed = true
+		}
+		last := "—"
+		if !t.LastSeen.IsZero() {
+			last = since(t.LastSeen) + " ago"
+		}
+		fprintf(w, "  %-*s %-*s %7d %7d %6d %10s %10s  %-10s %s\n",
+			whoWidth, rows[i].who, routeWidth, rows[i].route, t.Relayed, t.Refused, t.Failed,
+			humanBytes(t.BytesUp), humanBytes(t.BytesDown), last, reasons(t.Reasons))
+	}
+	if unnamed {
+		fprintln(w)
+		fprintln(w, "  A keeper this machine cannot name was enrolled elsewhere, or before")
+		fprintln(w, "  enrolment recorded leaf tokens (2026-11-10). Re-enrolling it from here")
+		fprintln(w, "  names it; until then its leaf stays valid to its own expiry.")
+	}
+}
+
+// reasons renders a refusal breakdown, most frequent first. The reasons are
+// FatLine's codes as the monitor reported them, so each goes through
+// terminalText like every other string from the monitor.
+func reasons(m map[string]int64) string {
+	if len(m) == 0 {
+		return ""
+	}
+	keys := slices.Collect(maps.Keys(m))
+	slices.SortFunc(keys, func(a, b string) int {
+		if c := cmp.Compare(m[b], m[a]); c != 0 {
+			return c
+		}
+		return strings.Compare(a, b)
+	})
+	parts := make([]string, len(keys))
+	for i, k := range keys {
+		parts[i] = fmt.Sprintf("%s %d", terminalText(k), m[k])
+	}
+	return strings.Join(parts, ", ")
 }
 
 // writeReplicaCaveat says whose picture this is.
@@ -395,7 +516,8 @@ func (r usageResult) writeReplicaCaveat(w io.Writer) {
 	// are a share — the count comes from the cluster and is enough on its own.
 	who := ""
 	if r.NetworkReplica != "" {
-		who = ", " + r.NetworkReplica
+		// The monitor names its own pod; its word, so terminalText.
+		who = ", " + terminalText(r.NetworkReplica)
 	}
 	switch {
 	case r.Replicas > 1:

@@ -18,7 +18,9 @@ type Provider interface {
 
 	// CreateCluster provisions a cluster from spec and blocks until it is
 	// ready to accept workloads. If a cluster with the same name and location
-	// already exists, it returns that cluster rather than failing.
+	// already exists, it returns that cluster rather than failing. A provider
+	// that cannot hold a cluster to FarCast's isolation — the GKE adapter's
+	// system-only logging (ADR 0019) — returns an error, not the cluster.
 	CreateCluster(ctx context.Context, spec ClusterSpec) (*Cluster, error)
 
 	// ClusterStatus reports the current state of the referenced cluster, or
@@ -55,6 +57,13 @@ type Cluster struct {
 	Status     ClusterStatus
 	Endpoint   string // Kubernetes API server endpoint
 	Kubeconfig []byte // credentials to reach the cluster — sensitive; redacted by String
+	// SystemLogsOnly is set by a provider that has read the cluster back and
+	// found it configured to send the cloud's logging service only the
+	// provider's mandatory system logs — not applications' stdout and stderr.
+	// That is the provider's word about its configuration, not an observation
+	// of what it sends, and on Autopilot it is unwalked (ADR 0019). False
+	// means not verified, not merely "off".
+	SystemLogsOnly bool
 }
 
 // String renders the cluster without leaking the kubeconfig, so accidental

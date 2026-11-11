@@ -191,6 +191,12 @@ func (c *installCommand) Run(ctx context.Context, env *Env, args []string) error
 	// Finalize: persist the kubeconfig + endpoint, then health-check.
 	meta.Region = cluster.Ref.Location
 	meta.Endpoint = cluster.Endpoint
+	// Recorded only on the provider's word that it read the cluster back as
+	// system-only (ADR 0019). The GKE adapter fails CreateCluster otherwise, so
+	// an instance that exports its applications' logs is never installed.
+	if cluster.SystemLogsOnly {
+		meta.CloudLogging = config.CloudLoggingSystem
+	}
 	meta.UpdatedAt = time.Now().UTC()
 	if err := env.ConfigDir.SaveInstanceKubeconfig(c.name, cluster.Kubeconfig); err != nil {
 		return err
@@ -221,15 +227,16 @@ func (c *installCommand) Run(ctx context.Context, env *Env, args []string) error
 	}
 
 	return env.Printer.Print(installResult{
-		Name:       meta.Name,
-		Provider:   meta.Provider,
-		Region:     meta.Region,
-		Cluster:    meta.Cluster,
-		Endpoint:   meta.Endpoint,
-		Registry:   registryPrefix(meta),
-		Status:     meta.Status,
-		CostLimit:  costLimitResult(meta.CostLimit),
-		ConfigPath: env.ConfigDir.InstancePath(c.name),
+		Name:         meta.Name,
+		Provider:     meta.Provider,
+		Region:       meta.Region,
+		Cluster:      meta.Cluster,
+		Endpoint:     meta.Endpoint,
+		Registry:     registryPrefix(meta),
+		Status:       meta.Status,
+		CostLimit:    costLimitResult(meta.CostLimit),
+		CloudLogging: cloudLoggingResult(meta.CloudLogging),
+		ConfigPath:   env.ConfigDir.InstancePath(c.name),
 	})
 }
 
@@ -387,15 +394,29 @@ func validateInstanceName(name string) error {
 }
 
 type installResult struct {
-	Name       string          `json:"name"`
-	Provider   string          `json:"provider"`
-	Region     string          `json:"region"`
-	Cluster    string          `json:"cluster"`
-	Endpoint   string          `json:"endpoint"`
-	Registry   string          `json:"registry,omitempty"`
-	Status     string          `json:"status"`
-	CostLimit  costLimitResult `json:"cost_limit"`
-	ConfigPath string          `json:"config_path"`
+	Name      string          `json:"name"`
+	Provider  string          `json:"provider"`
+	Region    string          `json:"region"`
+	Cluster   string          `json:"cluster"`
+	Endpoint  string          `json:"endpoint"`
+	Registry  string          `json:"registry,omitempty"`
+	Status    string          `json:"status"`
+	CostLimit costLimitResult `json:"cost_limit"`
+	// CloudLogging is the provider's logging configuration as it read the
+	// cluster back: "system" (configured to collect its mandatory system logs
+	// and Events only — the provider's word, unwalked; ADR 0019) or
+	// "unverified".
+	CloudLogging string `json:"cloud_logging"`
+	ConfigPath   string `json:"config_path"`
+}
+
+// cloudLoggingResult reports an instance's recorded CloudLogging, naming the
+// empty value for what it is rather than leaving it blank.
+func cloudLoggingResult(v string) string {
+	if v == config.CloudLoggingSystem {
+		return v
+	}
+	return "unverified"
 }
 
 type costLimitResult struct {
@@ -417,6 +438,18 @@ func (r installResult) Human(w io.Writer) error {
 		fprintf(w, "  registry:    %s (instance images, %s/mo)\n", r.Registry, registryMonthlyCost)
 	}
 	fprintf(w, "  cost limit:  %s %.2f / %s\n", r.CostLimit.Currency, r.CostLimit.Amount, r.CostLimit.Period)
+	if r.CloudLogging == config.CloudLoggingSystem {
+		// Said at install because it is a property of the cluster, fixed at
+		// creation (ADR 0019).
+		// "Configured", and no more: the read-back is the provider's word
+		// about its configuration, and only the next walk's count of the
+		// entries it received shows it is honoured.
+		fprintln(w, "  app logs:    kept on the cluster's nodes, configured not to be sent to the provider's logging")
+		fprintln(w, "               (the provider's read-back; that it is honoured is unwalked, ADR 0019)")
+		fprintln(w, "               (the provider still keeps its system logs, events, audit log and metrics)")
+	} else {
+		fprintln(w, "  app logs:    NOT verified as kept from the provider's logging")
+	}
 	fprintf(w, "  state:       %s\n", r.Status)
 	fprintf(w, "  config:      %s\n", r.ConfigPath)
 	// Said where the region is CHOSEN and the limit is set, which is the one

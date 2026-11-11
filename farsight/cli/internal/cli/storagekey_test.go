@@ -484,8 +484,8 @@ func TestStorageKeyExportImportRoundTrip(t *testing.T) {
 			t.Errorf("key %d's material is in the export in the clear", i)
 		}
 	}
-	if !strings.Contains(errb.String(), datasphere.KeyLossWarning) {
-		t.Errorf("export must carry the key-loss warning:\n%s", errb.String())
+	if !keyLossLine.MatchString(errb.String()) {
+		t.Errorf("export must carry the key-loss warning on a line of its own:\n%s", errb.String())
 	}
 
 	// An export path that already holds something is not a place to write a

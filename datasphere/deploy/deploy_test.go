@@ -894,6 +894,35 @@ func TestRenderReadsTheKeyPinThroughAnOptionalEnvRef(t *testing.T) {
 	}
 }
 
+// The node a replica runs on reaches it as a fieldRef env value. A wrong
+// fieldPath reports something that is not the node (status.hostIP is an
+// address, metadata.name is the Pod), and a name the keyholder does not read
+// reports nothing — both would make shared placement invisible again. A
+// downwardAPI volume would also carry it, and TestRenderHasNoVolumes refuses
+// that.
+func TestRenderNodeArrivesThroughTheDownwardAPIEnv(t *testing.T) {
+	if envNode != keyholder.EnvNode {
+		t.Fatalf("the manifest sets %s and the keyholder reads %s", envNode, keyholder.EnvNode)
+	}
+	_, docs := render(t, sampleConfig())
+	env, ok := dig(docs["StatefulSet/datasphered"], "spec", "template", "spec", "containers", "0", "env").([]any)
+	if !ok {
+		t.Fatal("container has no env")
+	}
+	var found map[string]any
+	for _, e := range env {
+		if m, _ := e.(map[string]any); m["name"] == keyholder.EnvNode {
+			found = m
+		}
+	}
+	if found == nil {
+		t.Fatalf("%s is not in the container env", keyholder.EnvNode)
+	}
+	if got := dig(found, "valueFrom", "fieldRef", "fieldPath"); got != "spec.nodeName" {
+		t.Errorf("%s comes from %v, want fieldRef spec.nodeName", keyholder.EnvNode, got)
+	}
+}
+
 // Every rotation and every run moves the pin. In the pod template it would
 // roll the StatefulSet each time, and a roll seals every replica — so Render
 // takes no pin at all, and nothing about one can reach the template.

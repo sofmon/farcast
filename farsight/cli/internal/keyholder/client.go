@@ -21,9 +21,11 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"time"
 
 	dskeyholder "github.com/sofmon/farcast/datasphere/keyholder"
+	"github.com/sofmon/farcast/farsight/cli/internal/output"
 	"github.com/sofmon/farcast/fatline/identity"
 	"github.com/sofmon/farcast/fatline/tunnel"
 )
@@ -60,6 +62,12 @@ type State struct {
 	// Pin is the key pin this replica enforces — control surface only. Nil
 	// is an image that predates the pin.
 	Pin *dskeyholder.PinReport `json:"pin,omitempty"`
+
+	// Node is the Kubernetes node this replica runs on — control surface
+	// only. Empty is an image or manifest that predates it, and means
+	// "placement unknown", never a node of its own. It is reported, and
+	// nothing decides on it.
+	Node string `json:"node,omitempty"`
 }
 
 // Intents a pusher may claim. The keyholder decides which a caller may use
@@ -83,8 +91,42 @@ type Refusal struct {
 	Status int
 }
 
+// Error is the refusal as prose. The reason is the replica's own words, and
+// they reach an operator inside this machine's errors and rows — and an error
+// keeps its newlines, so a reason carrying one could start a line of its own
+// ("farcast: …") that reads as this machine's. A reason that does not print
+// as it is goes in Go-quoted, the rule every renderer here uses. Code and
+// Reason stay raw on the struct for a caller that decides on them.
 func (r *Refusal) Error() string {
-	return fmt.Sprintf("replica %d refused: %s", r.Ordinal, r.Reason)
+	reason := r.Reason
+	if !output.Printable(reason) {
+		reason = strconv.QuoteToGraphic(reason)
+	}
+	return fmt.Sprintf("replica %d refused: %s", r.Ordinal, reason)
+}
+
+// NothingSentError is a push that failed before any of its sealed bundle was
+// written: the replica could not be dialled, did not complete the handshake,
+// would not issue a challenge, or the bundle could not be sealed. Everything
+// else that fails a push — a refusal above all — came back after the bundle
+// was written to whoever answered the challenge, and a caller counting where
+// key material went must count it.
+type NothingSentError struct{ Err error }
+
+func (e *NothingSentError) Error() string { return e.Err.Error() }
+func (e *NothingSentError) Unwrap() error { return e.Err }
+
+// NothingSent reports whether a failed Unseal failed before any of the sealed
+// bundle left this machine.
+//
+// The default is the other answer, on purpose: a failure this does not
+// recognise counts as one after sending. The bundle is sealed to the key in
+// the challenge, and the challenge comes from whatever answered — which ADR
+// 0008 finding 1's solicitor can be, holding the keyholder's server leaf. A
+// refusal from it arrives after it has read, and can open, the bundle.
+func NothingSent(err error) bool {
+	var n *NothingSentError
+	return errors.As(err, &n)
 }
 
 // NotServing reports a hand-over that a replica refused because it is
@@ -204,11 +246,11 @@ func (c *Client) State(ctx context.Context, ordinal int) (State, error) {
 func (c *Client) Unseal(ctx context.Context, ordinal int, bundle []byte, intent string) (State, error) {
 	var challenge dskeyholder.Challenge
 	if err := c.call(ctx, ordinal, http.MethodGet, dskeyholder.SealChallengePath, "", nil, &challenge); err != nil {
-		return State{}, fmt.Errorf("fetching a challenge from replica %d: %w", ordinal, err)
+		return State{}, &NothingSentError{fmt.Errorf("fetching a challenge from replica %d: %w", ordinal, err)}
 	}
 	sealed, err := dskeyholder.SealBundle(bundle, c.instance, challenge)
 	if err != nil {
-		return State{}, err
+		return State{}, &NothingSentError{err}
 	}
 	var st State
 	path := "/v1/unseal?intent=" + intent
@@ -254,13 +296,19 @@ func (c *Client) ReleaseHold(ctx context.Context, ordinal int) (State, error) {
 // A stream carries exactly one request: these are rare, deliberate operations
 // on the process holding the crown jewels, and a pooled connection that
 // outlived its purpose would be a standing path into it.
+//
+// A replica that could not be dialled, or did not complete the handshake,
+// comes back as a NothingSentError: the body, if there is one, never left
+// this machine. Nothing from the request's write on is marked — a write that
+// failed part-way may have sent part of it — and neither is anything else,
+// which a caller counting where key material went then counts as sent.
 func (c *Client) call(ctx context.Context, ordinal int, method, path, contentType string, body []byte, out any) error {
 	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
 
 	raw, err := c.dialer.DialStream(ctx, StreamRoute, ordinal)
 	if err != nil {
-		return fmt.Errorf("reaching replica %d: %w", ordinal, err)
+		return &NothingSentError{fmt.Errorf("reaching replica %d: %w", ordinal, err)}
 	}
 	defer func() { _ = raw.Close() }()
 
@@ -269,7 +317,7 @@ func (c *Client) call(ctx context.Context, ordinal int, method, path, contentTyp
 		// Named precisely: this is the check that the process on the far end
 		// is the keyholder this instance's CA vouches for, and not something
 		// the cloud stood up in its place.
-		return fmt.Errorf("replica %d did not present a certificate this instance's CA vouches for: %w", ordinal, err)
+		return &NothingSentError{fmt.Errorf("replica %d did not present a certificate this instance's CA vouches for: %w", ordinal, err)}
 	}
 	defer func() { _ = conn.Close() }()
 

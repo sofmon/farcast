@@ -16,7 +16,7 @@ This document is the specification for the Go SDK. It describes the full capabil
 
 **It is not** an infrastructure library. There are no cloud SDKs, no Kubernetes clients, no storage drivers, and no AI provider libraries behind this import. Those live inside the FarCast modules — Planck, DataSphere, FatLine, AllThing — on the other side of the boundary. The application sees only the syscall.
 
-This separation is why `sdk/go/` is its **own Go module** (`github.com/sofmon/farcast/sdk/go`), independent from the repository's root module. An external application pulls the SDK without dragging in the rest of FarCast, and its dependency graph stays small and auditable. See [`../../AGENTS.md`](../../AGENTS.md) ("Conventions") and [`../../README.md`](../../README.md#L114-L125) for the module layout.
+This separation is why `sdk/go/` is its **own Go module** (`github.com/sofmon/farcast/sdk/go`), independent from the repository's root module. An external application pulls the SDK without dragging in the rest of FarCast, and its dependency graph stays small and auditable. See [`../../AGENTS.md`](../../AGENTS.md) ("Conventions") and [`../../README.md`](../../README.md#repository-structure) ("Repository Structure") for the module layout.
 
 ---
 
@@ -91,7 +91,7 @@ Five accessors form the syscall surface. Each returns an interface backed by a F
 
 ### The boundary, and why logging is first
 
-Logging is the only capability that needs **no round-trip to a module**. A FarCast application is a container; its stdout is captured by the node it runs on and shipped by the platform. So "log" means *write one JSON object per line to stdout* — nothing more. That is why logging is the first concrete capability: it has zero dependencies, behaves identically in production and on a laptop, and every later phase can rely on it.
+Logging is the only capability that needs **no round-trip to a module**. A FarCast application is a container; its stdout is captured by the node it runs on, kept there and read on demand by `farcast logs`. The cluster is configured not to ship it to the cloud provider's logging, the node itself is the provider's, and the next walk checks that the provider honours that configuration ([ADR 0019](../../docs/adr/0019-what-the-cluster-tells-its-provider.md)). So "log" means *write one JSON object per line to stdout* — nothing more. That is why logging is the first concrete capability: it has zero dependencies, behaves identically in production and on a laptop, and every later phase can rely on it.
 
 The other capabilities are thin clients to modules running **inside the same instance**. `Storage()` calls DataSphere, which encrypts before writing to object storage. `Net()` hands back an HTTP client whose traffic is forced through FatLine, which permits only declared `external` hosts and lets Shrike watch every connection. `AI()` calls AllThing, which fronts whichever provider the operator chose. In every case the application talks to a local FarCast endpoint — never to the cloud, never holding a credential. The module endpoints are injected into the environment by the platform when the app is deployed (the SDK ships as a sidecar/init container; see [`PLAN.md`](../../PLAN.md) phase 4.2).
 
@@ -234,7 +234,7 @@ if err := store.Write(ctx, key, data); err != nil {
 
 ### Privacy
 
-Logs go to stdout, which the operator's **own** TechnoCore collects inside the operator's **own** instance. They are not shipped to any third party. An application that wants logs to reach an external service must route them through `farcast.Net()` to a host it declared in its manifest — at which point FatLine and Shrike govern that traffic like any other outbound connection. The default keeps log data sovereign.
+Logs go to stdout, and nothing in FarCast collects or forwards them. Each line stays in the container's log file on the node that ran it, and `farcast logs` reads it on demand through the provider-run Kubernetes API server. The node and its disk are the provider's. The cluster is configured not to send stdout to the provider's logging, and the next walk checks that the provider honours that ([ADR 0019](../../docs/adr/0019-what-the-cluster-tells-its-provider.md)). So a log line is protected by the provider not looking, not hidden from it: do not log what you would not show the provider. An application that wants logs to reach an external service must route them through `farcast.Net()` to a host it declared in its manifest — at which point FatLine and Shrike govern that traffic like any other outbound connection.
 
 ### Testing the logger
 

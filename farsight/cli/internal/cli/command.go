@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 )
@@ -72,6 +73,43 @@ func (e *usageError) Error() string { return e.msg }
 
 func usagef(format string, args ...any) error {
 	return &usageError{msg: fmt.Sprintf(format, args...)}
+}
+
+// `keeper run --once`'s own exit codes, beside 0, 1 and 2. A keeper on a timer
+// is read by its exit status, and "kept", "a person must act" and "the next
+// pass retries" are three different answers.
+const (
+	// exitCannotKeep: this device cannot keep the instance until a person
+	// acts — a stale bundle, an unreadable pin, a spent budget, a leaf that
+	// does not bind its bundle or has expired.
+	exitCannotKeep = 3
+	// exitIncomplete: the pass did not finish — a replica or the tunnel did
+	// not answer, or a re-seed could not be checked. The next one retries.
+	exitIncomplete = 4
+)
+
+// exitCodeError carries an exit code other than 1 for a runtime failure. It
+// wraps, so a caller can still match what it wraps.
+type exitCodeError struct {
+	code int
+	err  error
+}
+
+func (e *exitCodeError) Error() string { return e.err.Error() }
+func (e *exitCodeError) Unwrap() error { return e.err }
+
+// exitCodeOf maps a command's error to the process's exit code.
+func exitCodeOf(err error) int {
+	if err == nil {
+		return 0
+	}
+	if _, ok := errors.AsType[*usageError](err); ok {
+		return 2
+	}
+	if e, ok := errors.AsType[*exitCodeError](err); ok {
+		return e.code
+	}
+	return 1
 }
 
 // stubCommand is a registered-but-unimplemented command. It keeps the whole

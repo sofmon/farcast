@@ -271,6 +271,11 @@ func TestInstallRefusesWithoutAVerifiableBackupExclusion(t *testing.T) {
 			t.Errorf("the refusal omits %q: %v", want, err)
 		}
 	}
+	// The refusal names its package once, in front; the reason underneath
+	// carries no prefix of its own, so the record below reads as a reason.
+	if !strings.HasPrefix(err.Error(), "keeper: no exclusion here\n") {
+		t.Errorf("the refusal does not open with the prefixed reason: %q", err)
+	}
 	if _, statErr := os.Stat(filepath.Join(dir, bundleFile)); statErr == nil {
 		t.Error("a refused install left a bundle on disk")
 	}
@@ -288,8 +293,8 @@ func TestInstallRefusesWithoutAVerifiableBackupExclusion(t *testing.T) {
 	if cfg.BackupExcluded {
 		t.Error("a forced install recorded an exclusion it did not get")
 	}
-	if !strings.Contains(cfg.BackupNote, "no exclusion here") {
-		t.Errorf("BackupNote = %q, want the reason it failed", cfg.BackupNote)
+	if cfg.BackupNote != "no exclusion here" {
+		t.Errorf("BackupNote = %q, want exactly the reason it failed", cfg.BackupNote)
 	}
 }
 

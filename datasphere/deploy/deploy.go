@@ -86,6 +86,8 @@ const (
 	// envKeyPin is datasphere/keyholder.EnvKeyPin; a test pins the two
 	// together without this package importing the keyholder.
 	envKeyPin = "DATASPHERED_KEY_PIN"
+	// envNode is datasphere/keyholder.EnvNode, pinned the same way.
+	envNode = "DATASPHERED_NODE"
 	// digestMarker pins the image by content. ADR 0008 decision 1: deployed
 	// pinned by digest.
 	digestMarker = "@sha256:"
@@ -199,6 +201,7 @@ func Render(c Config) ([]byte, error) {
 		PinConfigMap:    PinConfigMapName(c.Name),
 		PinKey:          PinKey,
 		EnvKeyPin:       envKeyPin,
+		EnvNode:         envNode,
 		CACert:          base64.StdEncoding.EncodeToString(c.CACertPEM),
 		ServerCert:      base64.StdEncoding.EncodeToString(c.ServerCertPEM),
 		ServerKey:       base64.StdEncoding.EncodeToString(c.ServerKeyPEM),
@@ -314,6 +317,7 @@ type templateData struct {
 	PinConfigMap  string
 	PinKey        string
 	EnvKeyPin     string
+	EnvNode       string
 	MTLSHash      string
 	CACert        string
 	ServerCert    string
@@ -525,6 +529,16 @@ spec:
                   name: {{.PinConfigMap}}
                   key: {{.PinKey}}
                   optional: true
+            # The node this replica runs on, reported on the control surface
+            # only so "farcast storage state" can say when both replicas share
+            # one node (the spread above is soft). A fieldRef env value, not a
+            # downwardAPI volume: decision 1 permits no volumes. spec.nodeName
+            # never changes for a Pod, and an eviction is a new Pod, so the
+            # value cannot go stale.
+            - name: {{.EnvNode}}
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
           ports:
             - name: data
               containerPort: {{.DataPort}}

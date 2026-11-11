@@ -1141,8 +1141,11 @@ func TestRunSaysWhatMintingAScopeMeans(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := errBuf.String()
-	if !strings.Contains(out, datasphere.KeyLossWarning) {
-		t.Errorf("minting a scope did not carry the mandated key-loss warning:\n%s", out)
+	if !keyLossLine.MatchString(out) {
+		t.Errorf("minting a scope did not carry the mandated key-loss warning on a line of its own:\n%s", out)
+	}
+	if !strings.Contains(out, "A backup of keys.yaml made before now does not hold these keys") {
+		t.Errorf("minting a scope did not say an earlier backup lacks its keys:\n%s", out)
 	}
 	if !strings.Contains(out, "storage unseal") {
 		t.Errorf("nothing said the keyholder must be unsealed to receive the new scopes:\n%s", out)
@@ -1173,6 +1176,8 @@ type fakeReplica struct {
 	// pin is the key pin this replica enforces, as the vault does; nil is
 	// none. It is loaded when the replica starts and raised live.
 	pin *dskeyholder.Pin
+	// node is where the replica runs; empty is an image that does not say.
+	node string
 }
 
 // pinReport is what a replica says of its pin.
@@ -1219,7 +1224,7 @@ func (f *fakeStateKeyholder) replica(i int) *fakeReplica {
 
 func (f *fakeStateKeyholder) State(_ context.Context, i int) (keyholder.State, error) {
 	r := f.replica(i)
-	return keyholder.State{Phase: r.phase, Generation: r.generation, Keys: copyKeys(r.keys), Boot: "b0", Pin: r.pinReport()}, nil
+	return keyholder.State{Phase: r.phase, Generation: r.generation, Keys: copyKeys(r.keys), Boot: "b0", Pin: r.pinReport(), Node: r.node}, nil
 }
 
 func (f *fakeStateKeyholder) Unseal(_ context.Context, i int, payload []byte, intent string) (keyholder.State, error) {

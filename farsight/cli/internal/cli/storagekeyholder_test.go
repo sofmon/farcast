@@ -3,8 +3,11 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -776,4 +779,408 @@ func TestUnsealNeverReportsAnIgnoredPushAsSuccess(t *testing.T) {
 	if meta.Keyholder.Generation != 0 {
 		t.Errorf("recorded generation %d that no replica took", meta.Keyholder.Generation)
 	}
+}
+
+// A replica serving no application scopes says so in words, rather than
+// printing "scopes " and nothing after it.
+func TestStateNamesAReplicaHoldingNoScopes(t *testing.T) {
+	var b bytes.Buffer
+	if err := (stateResult{Instance: "prod", Replicas: []replicaState{
+		{Ordinal: 0, Phase: "unsealed", Generation: 3},
+		{Ordinal: 1, Phase: "unsealed", Generation: 3, Scopes: []string{"app-a", "app-b"}},
+	}}).Human(&b); err != nil {
+		t.Fatal(err)
+	}
+	got := b.String()
+	if !strings.Contains(got, "replica 0  unsealed   generation 3, holding no application scopes\n") {
+		t.Errorf("an empty replica was not named as holding nothing:\n%s", got)
+	}
+	if !strings.Contains(got, "replica 1  unsealed   generation 3, scopes app-a,app-b\n") {
+		t.Errorf("a replica's scopes were not listed:\n%s", got)
+	}
+	if strings.Contains(got, "scopes \n") {
+		t.Errorf("an empty scope list was printed:\n%s", got)
+	}
+}
+
+// A seal without --hold leaves the phase a keeper re-seeds. The token stays —
+// it is the wire's — and the operator is told, once, what it means.
+func TestSealWithoutHoldSaysAKeeperMayReseed(t *testing.T) {
+	rows := []replicaState{{Ordinal: 0, Phase: "restart-sealed"}, {Ordinal: 1, Phase: "restart-sealed"}}
+	var b bytes.Buffer
+	if err := (sealResult{Instance: "prod", Replicas: rows}).Human(&b); err != nil {
+		t.Fatal(err)
+	}
+	got := b.String()
+	if !strings.Contains(got, "replica 0  restart-sealed\n") {
+		t.Errorf("the phase token changed in the rows:\n%s", got)
+	}
+	if strings.Count(got, "Sealed without --hold") != 1 || !strings.Contains(got, "keeper device\nre-seeds unattended") ||
+		!strings.Contains(got, "'farcast storage seal prod --hold'") {
+		t.Errorf("an unheld seal did not say a keeper re-seeds it, once:\n%s", got)
+	}
+
+	b.Reset()
+	held := []replicaState{{Ordinal: 0, Phase: "operator-hold"}}
+	if err := (sealResult{Instance: "prod", Hold: true, Replicas: held}).Human(&b); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(b.String(), "Sealed without --hold") {
+		t.Errorf("a held seal was told it was not held:\n%s", b.String())
+	}
+}
+
+// stateOf runs 'storage state' over a fake fleet whose replicas run on the
+// given nodes, and returns what the operator sees (human) and what a script
+// reads (JSON).
+func stateOf(t *testing.T, kh sealStateClient) (string, stateResult) {
+	t.Helper()
+	dir, _ := keyholderInstance(t, true)
+	var res stateResult
+	var text string
+	for _, mode := range []output.Mode{output.ModeHuman, output.ModeJSON} {
+		env, out, errb := testEnvBoth(dir, mode)
+		if err := (&storageStateCommand{newKeyholder: openerFor(kh)}).Run(context.Background(), env, []string{"prod"}); err != nil {
+			t.Fatalf("state (%v) should exit 0 whatever the placement: %v", mode, err)
+		}
+		if mode == output.ModeJSON {
+			if err := json.Unmarshal(out.Bytes(), &res); err != nil {
+				t.Fatalf("decode %q: %v", out.String(), err)
+			}
+		} else {
+			text = out.String() + errb.String()
+		}
+	}
+	return text, res
+}
+
+// fleetOn is a fleet of two replicas in phase, on these nodes.
+func fleetOn(phase string, nodes ...string) *fakeStateKeyholder {
+	kh := &fakeStateKeyholder{phase: phase}
+	for i, n := range nodes {
+		kh.replica(i).node = n
+	}
+	return kh
+}
+
+// Two replicas on one node are one node repair away from a fully sealed
+// instance. Walk finding 2 found exactly this after an Autopilot eviction, and
+// nothing said so.
+func TestStorageStateFlagsReplicasSharingANode(t *testing.T) {
+	text, res := stateOf(t, fleetOn("unsealed", "n1", "n1"))
+	if !strings.Contains(text, "Replicas 0 and 1 run on one node (n1)") {
+		t.Errorf("the shared node is not named:\n%s", text)
+	}
+	if !strings.Contains(text, "Nothing moves") || !strings.Contains(text, "moving one seals it") {
+		t.Errorf("the report does not say nothing moves them, or what moving costs:\n%s", text)
+	}
+	if len(res.Colocated) != 1 || res.Colocated[0].Node != "n1" || !slices.Equal(res.Colocated[0].Replicas, []int{0, 1}) {
+		t.Errorf("colocated = %+v, want n1:[0 1]", res.Colocated)
+	}
+	if res.Replicas[0].Node != "n1" || res.Replicas[1].Node != "n1" {
+		t.Errorf("the per-replica node is missing from JSON: %+v", res.Replicas)
+	}
+	if len(res.PlacementUnknown) != 0 {
+		t.Errorf("placement_unknown = %v for two replicas that both said", res.PlacementUnknown)
+	}
+}
+
+// A spread fleet gets no line at all: a normal report does not grow, and
+// "different nodes" is not offered as reassurance.
+func TestStorageStateDoesNotWarnWhenSpread(t *testing.T) {
+	text, res := stateOf(t, fleetOn("unsealed", "n1", "n2"))
+	if strings.Contains(text, "node") {
+		t.Errorf("a spread fleet's report talks about nodes:\n%s", text)
+	}
+	if len(res.Colocated) != 0 || len(res.PlacementUnknown) != 0 {
+		t.Errorf("colocated = %+v, unknown = %v, want neither", res.Colocated, res.PlacementUnknown)
+	}
+}
+
+// Silence is never a node. Two replicas that report nothing are not on one
+// node, and one that reports nothing beside one that does is not a spread.
+func TestStorageStateNeverInfersPlacementFromSilence(t *testing.T) {
+	text, res := stateOf(t, fleetOn("unsealed", "", ""))
+	if strings.Contains(text, "run on one node") || len(res.Colocated) != 0 {
+		t.Errorf("two silent replicas were reported as sharing a node:\n%s\n%+v", text, res.Colocated)
+	}
+	if !slices.Equal(res.PlacementUnknown, []int{0, 1}) {
+		t.Errorf("placement_unknown = %v, want [0 1]", res.PlacementUnknown)
+	}
+	if !strings.Contains(text, "cannot say whether replicas share one") {
+		t.Errorf("unknown placement is not said:\n%s", text)
+	}
+
+	text, res = stateOf(t, fleetOn("unsealed", "", "n1"))
+	if len(res.Colocated) != 0 || strings.Contains(text, "run on one node") {
+		t.Errorf("one silent replica was placed: %+v\n%s", res.Colocated, text)
+	}
+	if !slices.Equal(res.PlacementUnknown, []int{0}) || !strings.Contains(text, "cannot say") {
+		t.Errorf("placement_unknown = %v; the report must not read as a spread:\n%s", res.PlacementUnknown, text)
+	}
+}
+
+// A sealed replica will be unsealed where it stands, so its node counts. An
+// unreachable one said nothing, so it is neither placed nor unknown.
+func TestStorageStateCountsASealedReplicasPlacement(t *testing.T) {
+	kh := fleetOn("unsealed", "n1", "n1")
+	kh.replica(1).phase = "restart-sealed"
+	text, res := stateOf(t, kh)
+	if len(res.Colocated) != 1 || !strings.Contains(text, "Replicas 0 and 1 run on one node") {
+		t.Errorf("a sealed replica's placement was dropped: %+v\n%s", res.Colocated, text)
+	}
+
+	_, res = stateOf(t, &unreachableReplica{fakeStateKeyholder: fleetOn("unsealed", "n1", "n1"), down: 1})
+	if len(res.Colocated) != 0 || len(res.PlacementUnknown) != 0 {
+		t.Errorf("an unreachable replica was placed: colocated %+v, unknown %v", res.Colocated, res.PlacementUnknown)
+	}
+}
+
+// unreachableReplica is a fleet in which one replica does not answer.
+type unreachableReplica struct {
+	*fakeStateKeyholder
+	down int
+}
+
+func (u *unreachableReplica) State(ctx context.Context, i int) (keyholder.State, error) {
+	if i == u.down {
+		return keyholder.State{}, errors.New("no route to replica")
+	}
+	return u.fakeStateKeyholder.State(ctx, i)
+}
+
+// relayingFleet is a fleet reached through a FatLine replica on relay.
+type relayingFleet struct {
+	*fakeStateKeyholder
+	relay string
+}
+
+func (r relayingFleet) RelayNode() string { return r.relay }
+
+// The FatLine replica that answered is named only when it shares the
+// keyholders' node, and nothing is said about the other FatLine replica.
+func TestStorageStateNamesTheRelayOnlyWhenItShares(t *testing.T) {
+	const tunnelLine = "The FatLine replica that answered this tunnel runs on that node too"
+	text, res := stateOf(t, relayingFleet{fleetOn("unsealed", "n1", "n1"), "n1"})
+	if !strings.Contains(text, tunnelLine) || res.RelayNode != "n1" {
+		t.Errorf("a relay on the shared node is not said (relay_node %q):\n%s", res.RelayNode, text)
+	}
+	text, _ = stateOf(t, relayingFleet{fleetOn("unsealed", "n1", "n1"), "n2"})
+	if strings.Contains(text, "FatLine") {
+		t.Errorf("a relay elsewhere was talked about:\n%s", text)
+	}
+	text, _ = stateOf(t, relayingFleet{fleetOn("unsealed", "n1", "n2"), "n1"})
+	if strings.Contains(text, "FatLine") {
+		t.Errorf("a spread fleet's report talks about FatLine:\n%s", text)
+	}
+	text, _ = stateOf(t, fleetOn("unsealed", "n1", "n1"))
+	if strings.Contains(text, "FatLine") {
+		t.Errorf("a client that knows no relay printed one:\n%s", text)
+	}
+}
+
+// The node is reported and never decides. An image that predates it reports
+// "", and if that reached a decision it would become an unseal refusal.
+func TestNodeNeverChangesAHandOver(t *testing.T) {
+	var reports []string
+	for _, nodes := range [][]string{{"", ""}, {"n1", "n1"}, {"n1", "n2"}} {
+		dir, meta, env, _ := handOverInstance(t, "p140")
+		k := scopedKeyring(t, dir, "p140", "demo", "alpha")
+		kh := fleetOn("unsealed", nodes...)
+		kh.replica(1).phase = "restart-sealed"
+		res := handOverKeys(context.Background(), env, meta, openerFor(kh), liveKeyring(t, dir, meta.Name), handOverOptions{})
+		var held []string
+		for i := range 2 {
+			held = append(held, fmt.Sprint(kh.replica(i).phase, sameKeys(kh.replica(i).keys, heldKeys(k))))
+		}
+		reports = append(reports, fmt.Sprintf("%+v %v %v", res.Complete(), kh.intents, held))
+	}
+	if reports[0] != reports[1] || reports[1] != reports[2] {
+		t.Errorf("the node changed a hand-over:\n%s", strings.Join(reports, "\n"))
+	}
+	if outdatedImage(keyholder.State{Phase: "unsealed", Scopes: []string{"s"}, Keys: map[string][]string{"s": {"k"}}}) {
+		t.Error("guard: a current image read as outdated")
+	}
+	if outdatedImage(keyholder.State{Phase: "unsealed", Scopes: []string{"s"}, Keys: map[string][]string{"s": {"k"}}, Node: ""}) !=
+		outdatedImage(keyholder.State{Phase: "unsealed", Scopes: []string{"s"}, Keys: map[string][]string{"s": {"k"}}, Node: "n1"}) {
+		t.Error("the node changed whether an image reads as outdated")
+	}
+}
+
+// forgedRow is hostileText that also tries to forge a row of its own on the
+// line below.
+const forgedRow = hostileText + "\n  replica 9  unsealed   generation 9"
+
+// keyholderRowsArePrintable fails unless out shows only printable runes, the
+// forged row never stands on a line of its own, out carries the hostile text
+// quoted rather than dropped, and exactly rows replica rows were printed.
+func keyholderRowsArePrintable(t *testing.T, what, out string, rows int) {
+	t.Helper()
+	t.Log("\n" + out)
+	onlyPrintable(t, what, out)
+	n := 0
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "  replica 9") {
+			t.Errorf("%s: the replica's text forged a row of its own:\n%s", what, out)
+		}
+		if strings.HasPrefix(line, "  replica ") {
+			n++
+		}
+	}
+	if n != rows {
+		t.Errorf("%s: %d replica row(s); want %d — a row was joined or split:\n%s", what, n, rows, out)
+	}
+	if !strings.Contains(out, `\x1b]52`) {
+		t.Errorf("%s: the replica's text is not shown, quoted:\n%s", what, out)
+	}
+}
+
+// The per-replica rows of 'storage state', 'storage seal' and 'storage
+// unseal' print what each replica reported — its phase and hold reason, an
+// error carrying its refusal, a note or key difference naming a scope it
+// sent. Every one of those goes through terminalText, like the rows added
+// beside them; --json carries them as they came.
+func TestKeyholderRowsQuoteWhatTheReplicaSent(t *testing.T) {
+	render := func(r output.Result) string {
+		t.Helper()
+		var b bytes.Buffer
+		if err := r.Human(&b); err != nil {
+			t.Fatal(err)
+		}
+		return b.String()
+	}
+
+	t.Run("storage state", func(t *testing.T) {
+		r := stateResult{Instance: "prod", Replicas: []replicaState{
+			{Ordinal: 0, Error: "keyholder replica 0: " + forgedRow},
+			{Ordinal: 1, Phase: forgedRow, HoldReason: forgedRow, PinNote: forgedRow},
+			{Ordinal: 2, Phase: "unsealed", Generation: 3, Scopes: []string{"app-demo-alpha"},
+				KeysDiffer: "lacks scope " + forgedRow, PinNote: "behind this machine's keyring: " + forgedRow},
+			{Ordinal: 3, Phase: "unsealed", Generation: 3,
+				KeysDiffer: "serves a copy of " + forgedRow + " minted separately from this machine's"},
+		}}
+		out := render(r)
+		keyholderRowsArePrintable(t, "storage state", out, 4)
+		// The count reads the replica's note as it came, not as printed.
+		if !strings.Contains(out, "1 replica(s) serve another machine's copy") {
+			t.Errorf("a separately minted copy was not counted once quoted:\n%s", out)
+		}
+
+		var env bytes.Buffer
+		if err := (&output.Printer{Mode: output.ModeJSON, Out: &env}).Print(r); err != nil {
+			t.Fatal(err)
+		}
+		var back stateResult
+		if err := json.Unmarshal(env.Bytes(), &back); err != nil {
+			t.Fatal(err)
+		}
+		// encoding/json makes the one byte that is not UTF-8 into U+FFFD;
+		// everything else arrives as the replica sent it.
+		if raw := strings.ToValidUTF8(forgedRow, "�"); back.Replicas[1].Phase != raw || back.Replicas[1].HoldReason != raw ||
+			back.Replicas[1].PinNote != raw || back.Replicas[2].KeysDiffer != "lacks scope "+raw {
+			t.Errorf("--json no longer carries the replica's text as it came: %+v", back.Replicas)
+		}
+	})
+	t.Run("storage seal", func(t *testing.T) {
+		out := render(sealResult{Instance: "prod", Replicas: []replicaState{
+			{Ordinal: 0, Error: "keyholder replica 0: " + forgedRow},
+			{Ordinal: 1, Phase: forgedRow},
+		}})
+		keyholderRowsArePrintable(t, "storage seal", out, 2)
+	})
+	t.Run("storage unseal", func(t *testing.T) {
+		out := render(unsealResult{Instance: "prod", Scopes: 1, Generation: 4, Loaded: 1, Total: 3,
+			NotYetActive: forgedRow,
+			Replicas: []replicaState{
+				{Ordinal: 0, Error: "keyholder replica 0: " + forgedRow},
+				{Ordinal: 1, Phase: forgedRow, Note: "holds this machine's keys, still writing under an older one (" + forgedRow + ")"},
+				{Ordinal: 2, Phase: forgedRow, Generation: 4},
+			}})
+		keyholderRowsArePrintable(t, "storage unseal", out, 3)
+		if !strings.Contains(out, "They do not write under this keyring's newest keys yet: \"x") {
+			t.Errorf("why the newest keys are not in use is not shown, quoted:\n%s", out)
+		}
+	})
+}
+
+// forgedWarning is hostileText that also tries to forge a warning of its own
+// on the line below.
+const forgedWarning = hostileText + "\nwarning: keyholder replica 9 took the keys"
+
+// hostileFleet is a fleet whose failures carry text chosen to act on the
+// terminal: State fails for a silent replica, or — silentPushed — for any
+// replica once it has been pushed; and a refused replica's push is refused
+// with that text as the keyholder's reason.
+type hostileFleet struct {
+	*fakeStateKeyholder
+	silent       map[int]bool
+	silentPushed bool
+	refuse       map[int]bool
+	pushed       map[int]bool
+}
+
+func (f *hostileFleet) State(ctx context.Context, i int) (keyholder.State, error) {
+	if f.silent[i] || (f.silentPushed && f.pushed[i]) {
+		return keyholder.State{}, errors.New("tunnel: " + forgedWarning)
+	}
+	return f.fakeStateKeyholder.State(ctx, i)
+}
+
+func (f *hostileFleet) Unseal(ctx context.Context, i int, payload []byte, intent string) (keyholder.State, error) {
+	if f.refuse[i] {
+		return keyholder.State{}, &keyholder.Refusal{Ordinal: i, Reason: forgedWarning, Status: 400}
+	}
+	if f.pushed == nil {
+		f.pushed = map[int]bool{}
+	}
+	f.pushed[i] = true
+	return f.fakeStateKeyholder.Unseal(ctx, i, payload, intent)
+}
+
+// A hand-over's warnings name what a replica said when it did not answer or
+// refused the keys: the tunnel's error, the keyholder's refusal. Each goes
+// through terminalText, so none of it can act on the terminal or forge a
+// warning line of its own.
+func TestHandOverWarningsQuoteWhatTheReplicaSent(t *testing.T) {
+	warned := func(t *testing.T, stderr, want string) {
+		t.Helper()
+		t.Log("\n" + stderr)
+		if !strings.Contains(stderr, want) {
+			t.Fatalf("guard: no %q warning:\n%s", want, stderr)
+		}
+		onlyPrintable(t, "hand-over warnings", stderr)
+		for _, line := range strings.Split(stderr, "\n") {
+			if strings.HasPrefix(line, "warning: keyholder replica 9") {
+				t.Errorf("the replica's text forged a warning of its own:\n%s", stderr)
+			}
+		}
+		if !strings.Contains(stderr, `\x1b]52`) {
+			t.Errorf("the replica's text is not shown, quoted:\n%s", stderr)
+		}
+	}
+
+	t.Run("did not answer", func(t *testing.T) {
+		dir, meta, env, sees := handOverInstance(t, "p140")
+		scopedKeyring(t, dir, "p140", "demo", "alpha")
+		kh := &hostileFleet{fakeStateKeyholder: &fakeStateKeyholder{phase: "unsealed"}, silent: map[int]bool{1: true}}
+		handOverKeys(context.Background(), env, meta, openerFor(kh), liveKeyring(t, dir, meta.Name), handOverOptions{})
+		warned(t, sees.err.String(), "did not answer, so it is not handed the keys: \"tunnel: x")
+	})
+	t.Run("refused the keys", func(t *testing.T) {
+		dir, meta, env, sees := handOverInstance(t, "p141")
+		scopedKeyring(t, dir, "p141", "demo", "alpha")
+		kh := &hostileFleet{fakeStateKeyholder: &fakeStateKeyholder{phase: "unsealed"}, refuse: map[int]bool{1: true}}
+		handOverKeys(context.Background(), env, meta, openerFor(kh), liveKeyring(t, dir, meta.Name), handOverOptions{})
+		// The refusal quotes the replica's reason itself (review finding
+		// R3-3), so the warning carries it quoted inside this machine's words.
+		warned(t, sees.err.String(), "refused the keys: replica 1 refused: \"x")
+	})
+	t.Run("did not answer when asked again", func(t *testing.T) {
+		dir, meta, env, sees := handOverInstance(t, "p142")
+		scopedKeyring(t, dir, "p142", "demo", "alpha")
+		base := servingFleet(t, env, meta, dir)
+		sees.err.Reset()
+		rotateWith(t, env, "p142", &hostileFleet{fakeStateKeyholder: base, silentPushed: true})
+		warned(t, sees.err.String(), "did not answer when asked again: \"tunnel: x")
+	})
 }

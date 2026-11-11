@@ -167,7 +167,7 @@ farcast storage state "$INSTANCE"                                      # replica
 farcast keeper run "$INSTANCE" --once                                  # on the device
 ```
 
-**Expect** `replica 0: stale-bundle`, with a reason naming the key pin: the replica's pin refuses this device's bundle because an application was added. Expect also no push, the device's ledger line count unchanged, and replica 0 still `restart-sealed`. Then recover it from the operator's machine with `farcast storage unseal "$INSTANCE"`. Re-enrol and reinstall the device from the list `run` printed before going on. Its next packet binds the new bundle. `enroll` refuses to overwrite an existing file, so give it a new `--out`, such as `./study-2.packet`, and set `PACKET` to it so `asdevice` presents the device as it now is.
+**Expect** `this device: stale-bundle`, naming the key pin: the instance's pin refuses this device's bundle because an application was added. Then `replica 0: stale-bundle — restart-sealed, and not re-seeded`, pointing to that line, and exit status `3` (`echo $?` on the device). *(Updated 2026-11-10: the pin's verdict is printed once per pass, and `--once` exits by outcome.)* Expect also no push, the device's ledger line count unchanged, and replica 0 still `restart-sealed`. Then recover it from the operator's machine with `farcast storage unseal "$INSTANCE"`. Re-enrol and reinstall the device from the list `run` printed before going on. Its next packet binds the new bundle. `enroll` refuses to overwrite an existing file, so give it a new `--out`, such as `./study-2.packet`, and set `PACKET` to it so `asdevice` presents the device as it now is.
 
 ## 7. Does revocation say what it does not do?
 
@@ -175,7 +175,7 @@ farcast keeper run "$INSTANCE" --once                                  # on the 
 farcast keeper revoke "$INSTANCE" study-desktop -y
 ```
 
-**Expect:** the report says it did not reach the cluster, names the sequence that retires the bundle — `farcast storage key rotate`, `farcast storage key rekey`, then re-enrolling every keeper kept — and says what that does not undo: anything already read, the names, and a restarted replica re-seeded by the device before its certificate expires. Then confirm the uncomfortable half: the revoked device can **still** re-seed, because its certificate is still valid. That is what the ADR says, and the walk should demonstrate it rather than assume the message is enough.
+**Expect:** the report says it did not reach the cluster, names the sequence that retires the bundle — `farcast storage key rotate`, `farcast storage key rekey`, then re-enrolling every keeper kept — and says what that does not undo: anything already read, the names, and a restarted replica re-seeded by the device until the rotation writes the key pin — after which every replica refuses its bundle (`below-pin`), for as long as a replica has the pin loaded (`none loaded` in `storage state`, restored by `storage key pin`). *(Updated 2026-11-10: the text predated the pin.)* Then confirm the uncomfortable half: before the rotation, the revoked device can **still** re-seed, because its certificate is still valid. That is what the ADR says, and the walk should demonstrate it rather than assume the message is enough.
 
 Then retire what the device holds, and prove it from the bundle's side rather than the command's:
 
@@ -223,7 +223,7 @@ farcast keeper run "$INSTANCE" --once                   # on the device
 asdevice FARCAST_WALK_PROBE=push FARCAST_WALK_INTENT=restart-reseed FARCAST_WALK_ORDINAL=0
 ```
 
-**Expect** the keeper to report `stale-bundle`, naming the key pin, and push nothing. That is the device behaving. The probe then pushes anyway, as a device that does not behave would. Expect `replica 0 REFUSED` with code `below-pin`. That is the keyholder refusing on its own, with no serving replica to compare against. Both replicas stay `restart-sealed`.
+**Expect** the keeper to report `this device: stale-bundle`, naming the key pin, once; each replica's `stale-bundle` line to point to it; exit status `3`; and no push. That is the device behaving. The probe then pushes anyway, as a device that does not behave would. Expect `replica 0 REFUSED` with code `below-pin`. That is the keyholder refusing on its own, with no serving replica to compare against. Both replicas stay `restart-sealed`.
 
 Then, still with both sealed, present the device's leaf with a bundle that is current and satisfies the pin but is not the one the leaf was issued for. The operator's own keyring will do:
 
@@ -294,3 +294,5 @@ Nothing failed a criterion. The keeper's own output misleads in three places, an
 - **The fleet-wide pin verdict is printed under each replica**, so replica 1's line reads "replica 0's key pin refuses…" (S16).
 - **`keeper run --once` exits 0 when it refused** (S11.5), so cron or systemd cannot tell a device that kept the instance from one that no longer can.
 - **`keeper revoke`'s text predates the pin** (S15 7a). It says the device can still re-seed a restarted replica with its old keys until its certificate expires. Since the pin, that holds only until a rotation retires those keys, and S16.3 shows the refusal.
+
+*(Fixed 2026-11-10, not yet walked.)* An unreadable pin is reported as `pin-unreadable`, naming `farcast storage key pin`. The pin's verdict is printed once per pass, as `this device: stale-bundle — …`, naming no replica — and also when every replica is still serving. `keeper run --once` exits `0` kept (a hold included), `3` when a person must act, `4` when the pass did not finish; the long-running mode never exits on these. `revoke`'s text says the device can re-seed only until the rotation writes the pin, and that the pin protects only while a replica has it loaded. The next walk re-checks S11.5, S16 and S16.8 against the steps above.

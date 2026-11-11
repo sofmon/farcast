@@ -14,6 +14,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -101,7 +102,7 @@ func run(args []string) error {
 	// what keeps the picture's contract true; FatLine has watched its copy of
 	// the same document since ADR 0013 decision 5.
 	if *policyPath != "" {
-		go watchPolicy(ctx, *policyPath, policyPollInterval, mon)
+		go watchPolicy(ctx, *policyPath, policyPollInterval, mon, nil)
 	}
 
 	fmt.Fprintf(os.Stderr, "shrike: monitoring (socket=%q, %d declared host(s), status=%q)\n",
@@ -127,8 +128,13 @@ const policyPollInterval = 10 * time.Second
 // It mirrors FatLine's watcher deliberately, including its failure behaviour:
 // an unreadable document is complained about and the previous contract kept,
 // and `last` is not updated so a file that is still broken on the next tick is
-// complained about again rather than falling silent.
-func watchPolicy(ctx context.Context, path string, every time.Duration, mon *shrike.Monitor) {
+// complained about again rather than falling silent — and its logging: both
+// lines are timestamped slog records, so a reload can be timed against the
+// FatLine replica's beside it. A nil logger is slog.Default().
+func watchPolicy(ctx context.Context, path string, every time.Duration, mon *shrike.Monitor, log *slog.Logger) {
+	if log == nil {
+		log = slog.Default()
+	}
 	last, _ := os.ReadFile(path)
 	ticker := time.NewTicker(every)
 	defer ticker.Stop()
@@ -144,7 +150,7 @@ func watchPolicy(ctx context.Context, path string, every time.Duration, mon *shr
 		}
 		doc, perr := policy.Parse(data)
 		if perr != nil {
-			fmt.Fprintf(os.Stderr, "shrike: refusing an unreadable egress policy, keeping the previous one: %v\n", perr)
+			log.Warn("shrike: refusing an unreadable egress policy, keeping the previous one", "err", perr)
 			continue
 		}
 		last = data
@@ -153,8 +159,7 @@ func watchPolicy(ctx context.Context, path string, every time.Duration, mon *shr
 			hosts = append(hosts, h...)
 		}
 		mon.ReloadDeclared(hosts)
-		fmt.Fprintf(os.Stderr, "shrike: declared contract reloaded (%d application(s), %d host(s))\n",
-			len(doc.Apps), len(hosts))
+		log.Info("shrike: declared contract reloaded", "applications", len(doc.Apps), "hosts", len(hosts))
 	}
 }
 

@@ -87,6 +87,9 @@ type Config struct {
 
 	// Endpoint is the externally advertised endpoint, reported in status.
 	Endpoint string
+	// Node is the node this replica runs on (EnvNode), reported in status.
+	// Empty means unknown.
+	Node string
 	// Logger for diagnostics. Nil uses slog.Default().
 	Logger *slog.Logger
 }
@@ -233,6 +236,7 @@ func (s *Server) Status() ConnStatus {
 		Since:     since,
 		Active:    s.sessions.Active(),
 		Allowlist: s.allow.Hosts(),
+		Node:      s.cfg.Node,
 	}
 }
 

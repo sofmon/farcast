@@ -1,8 +1,10 @@
 package identity
 
 import (
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/pem"
 	"testing"
 )
@@ -256,5 +258,65 @@ func TestAKeeperLeafBindsItsBundle(t *testing.T) {
 	}
 	if _, _, err := IssueKeeperClient(m.CACertPEM, m.CAKeyPEM, "prod", "laptop", nil); err == nil {
 		t.Error("a keeper leaf was issued binding no bundle")
+	}
+}
+
+// A leaf token is short, stable and domain-separated: the operator's machine
+// records it at issuance and FatLine recomputes it from the verified leaf, so
+// the two must agree on every byte of the recipe. The pinned vector catches a
+// changed label or truncation; the fingerprint comparison catches dropping the
+// label, which would make the token joinable against any SHA-256 fingerprint
+// of the leaf printed anywhere else.
+func TestLeafTokenIsShortStableAndDomainSeparated(t *testing.T) {
+	const want = "3e6e8dd9e42a2e33"
+	if got := LeafToken([]byte("leaf")); got != want {
+		t.Errorf("LeafToken = %s, want %s", got, want)
+	}
+	fingerprint := sha256.Sum256([]byte("leaf"))
+	if LeafToken([]byte("leaf")) == hex.EncodeToString(fingerprint[:])[:16] {
+		t.Error("the token is the leaf's plain fingerprint; it must be domain-separated")
+	}
+
+	m, err := Mint("prod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, _, err := IssueKeeperClient(m.CACertPEM, m.CAKeyPEM, "prod", "laptop", []byte("version: 1\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _, err := IssueKeeperClient(m.CACertPEM, m.CAKeyPEM, "prod", "laptop", []byte("version: 1\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ta, tb := LeafToken(parseLeaf(t, a).Raw), LeafToken(parseLeaf(t, b).Raw)
+	if len(ta) != 16 {
+		t.Errorf("token %q is %d characters, want 16", ta, len(ta))
+	}
+	// The same device re-enrolled is two leaves, and two tokens: a token names
+	// a leaf, and an old leaf stays valid in the cluster until its NotAfter.
+	if ta == tb {
+		t.Error("two leaves for one device share a token")
+	}
+}
+
+// The CLI computes the token from the PEM it issued, FatLine from the DER the
+// handshake verified. They must be the same bytes.
+func TestLeafTokenPEMMatchesLeafToken(t *testing.T) {
+	m, err := Mint("prod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := LeafTokenPEM(m.ClientCertPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := LeafToken(parseLeaf(t, m.ClientCertPEM).Raw); got != want {
+		t.Errorf("LeafTokenPEM = %s, LeafToken over the DER = %s", got, want)
+	}
+	for _, bad := range [][]byte{nil, []byte("not pem"), m.ClientKeyPEM} {
+		if _, err := LeafTokenPEM(bad); err == nil {
+			t.Errorf("LeafTokenPEM accepted %.20q", bad)
+		}
 	}
 }

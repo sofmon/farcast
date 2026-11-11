@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sofmon/farcast/datasphere"
@@ -22,6 +23,8 @@ import (
 type releaseCommand struct {
 	assumeYes  bool
 	deleteData bool
+
+	now func() time.Time // the clock the provider-log dates run from; nil = time.Now
 }
 
 func (*releaseCommand) Name() string     { return "release" }
@@ -63,6 +66,19 @@ its name — has its bundle and leaf key wiped. Its ledger is kept: it is the
 record of what that device did with key material. Keepers on other devices are
 named; release cannot reach them, and 'farcast keeper uninstall' on each does
 the same there.
+
+release cannot remove what the cloud provider has already logged or measured
+about the instance (ADR 0019). Its audit log keeps a record of every create,
+update and delete on the cluster's Kubernetes API — object names, times and
+callers, and the full spec of every workload — for 400 days from each write.
+(Status updates, such as a Pod's readiness, go to its Data Access log, which
+is off unless the project or a parent turned it on.) Its logging keeps the
+cluster's system logs and events for the project's retention, 30 days by
+default. Its monitoring keeps metrics about the instance's Pods — names,
+states such as readiness, and resource use — for 24 months from each sample.
+release names the dates and deletes nothing there: those records belong to
+the project, not to the instance. An instance installed before ADR 0019 also
+sent its applications' output to that logging.
 
 With --output json the command prints one JSON result and never prompts.`)
 }
@@ -135,7 +151,11 @@ func (c *releaseCommand) Run(ctx context.Context, env *Env, args []string) error
 	// Destroy the cloud resource BEFORE local state, so a failure never strands
 	// a billable cluster with no record to find it again. DeleteCluster is
 	// idempotent, so a re-run after a partial failure converges.
-	if interactive || env.Verbose {
+	//
+	// Said in every human session, -y included: the 2026-11-10 walk sat six
+	// minutes in front of a release that printed nothing at all.
+	human := env.Printer.Mode == output.ModeHuman
+	if human || env.Verbose {
 		fprintf(env.Err, "Destroying %s — this can take several minutes…\n", meta.Cluster)
 	}
 	// DeleteCluster returns once the cluster is gone, and a re-run while the
@@ -143,7 +163,15 @@ func (c *releaseCommand) Run(ctx context.Context, env *Env, args []string) error
 	ref := planck.ClusterRef{Name: meta.Cluster, Location: meta.Region}
 	dctx, cancel := context.WithTimeout(ctx, clusterDeleteTimeout)
 	defer cancel()
-	if err := p.DeleteCluster(dctx, ref); err != nil {
+	stopNotice := func() {}
+	if human {
+		stopNotice = waitNotice(dctx, env.Err, meta.Cluster, time.Now(), releaseProgressEvery, clusterDeleteTimeout)
+	}
+	err = p.DeleteCluster(dctx, ref)
+	// Stopped before anything else writes to env.Err: the notice runs on its
+	// own goroutine, and stopNotice returns only once that goroutine has.
+	stopNotice()
+	if err != nil {
 		switch {
 		case errors.Is(err, planck.ErrDeleteInProgress):
 			return fmt.Errorf("cluster %q is still being deleted: %w; the cloud continues the delete without this command, "+
@@ -190,6 +218,10 @@ func (c *releaseCommand) Run(ctx context.Context, env *Env, args []string) error
 		return fmt.Errorf("cloud resources destroyed but removing local state failed: %w", err)
 	}
 
+	now := time.Now
+	if c.now != nil {
+		now = c.now
+	}
 	return env.Printer.Print(releaseResult{
 		Name:        name,
 		Provider:    meta.Provider,
@@ -199,8 +231,68 @@ func (c *releaseCommand) Run(ctx context.Context, env *Env, args []string) error
 		DeletedData: stored.Objects,
 		Keeper:      keeperDone,
 		Elsewhere:   elsewhere,
+		CloudLogs:   cloudLogsAfterRelease(meta, now()),
 		Status:      "released",
 	})
+}
+
+// logRetention is how long a provider keeps what it logged or measured about
+// a cluster.
+type logRetention struct {
+	audit  time.Duration // the audit log of API writes; fixed by the provider
+	system time.Duration // system logs and events; the provider's default
+	// metricsMonths is how long metrics about the cluster's Pods are kept, in
+	// calendar months because that is how the provider states it.
+	metricsMonths int
+}
+
+// providerLogRetention is per Planck provider. GKE: Admin Activity audit logs
+// sit in the _Required bucket for 400 days, which a project cannot change or
+// empty; the _Default bucket keeps everything else 30 days unless the project
+// configured otherwise. Cloud Monitoring keeps Managed Service for Prometheus
+// data — GKE's default kube state and cAdvisor/Kubelet packages ride it — and
+// most GKE system metrics for 24 months, and only deleting the project
+// guarantees they go sooner (ADR 0019). A variable so tests can name their
+// fake.
+var providerLogRetention = map[string]logRetention{
+	"gke": {audit: 400 * 24 * time.Hour, system: 30 * 24 * time.Hour, metricsMonths: 24},
+}
+
+// releaseCloudLogs is what outlives the instance in the provider's logging
+// and monitoring.
+type releaseCloudLogs struct {
+	// AuditUntil, SystemUntil and MetricsUntil are dates (YYYY-MM-DD),
+	// approximate: audit entries expire 400 days after each write, the
+	// system-log date assumes the project's default retention, and metric
+	// points expire 24 months after each sample. Empty when the provider's
+	// retention is not known to FarCast.
+	AuditUntil  string `json:"audit_log_until,omitempty"`
+	SystemUntil string `json:"system_logs_until,omitempty"`
+	// MetricsUntil covers the metrics about the instance's Pods: their names,
+	// states such as readiness, and resource use.
+	MetricsUntil string `json:"metrics_until,omitempty"`
+	// WorkloadLogs is true when the instance was not recorded as configured to
+	// keep its applications' output from the provider's logging (installed
+	// before ADR 0019). False is that configuration, as the provider read it
+	// back at install — its word, unwalked on Autopilot — and not an
+	// observation that no application output reached it.
+	WorkloadLogs bool `json:"workload_logs"`
+}
+
+// cloudLogsAfterRelease reports, and only reports: those logs are the
+// project's, keyed by names every cluster in it shares, and deleting them —
+// or installing a standing exclusion — is not release's to do.
+func cloudLogsAfterRelease(meta *config.InstanceMetadata, now time.Time) *releaseCloudLogs {
+	r := &releaseCloudLogs{WorkloadLogs: meta.CloudLogging != config.CloudLoggingSystem}
+	if ret, ok := providerLogRetention[meta.Provider]; ok {
+		const day = "2006-01-02"
+		r.AuditUntil = now.Add(ret.audit).UTC().Format(day)
+		r.SystemUntil = now.Add(ret.system).UTC().Format(day)
+		if ret.metricsMonths > 0 {
+			r.MetricsUntil = now.UTC().AddDate(0, ret.metricsMonths, 0).Format(day)
+		}
+	}
+	return r
 }
 
 // gateOnStoredData refuses a release that would destroy data, unless the
@@ -375,7 +467,10 @@ type releaseResult struct {
 	Keeper *releaseKeeper `json:"keeper,omitempty"`
 	// Elsewhere are keeper devices still holding the instance's bundle.
 	Elsewhere []string `json:"keepers_elsewhere,omitempty"`
-	Status    string   `json:"status"`
+	// CloudLogs is what the provider keeps about the instance after it is
+	// gone (ADR 0019).
+	CloudLogs *releaseCloudLogs `json:"cloud_logs,omitempty"`
+	Status    string            `json:"status"`
 }
 
 func (r releaseResult) Human(w io.Writer) error {
@@ -403,8 +498,26 @@ func (r releaseResult) Human(w io.Writer) error {
 		}
 	}
 	if len(r.Elsewhere) > 0 {
-		fprintf(w, "  elsewhere:   %s still hold this instance's bundle — run 'farcast keeper uninstall %s' on each\n",
-			strings.Join(r.Elsewhere, ", "), r.Name)
+		n := len(r.Elsewhere)
+		fprintf(w, "  elsewhere:   %s %s this instance's bundle — run 'farcast keeper uninstall %s' %s\n",
+			strings.Join(r.Elsewhere, ", "), noun(n, "still holds", "still hold"), r.Name, noun(n, "on it", "on each"))
+	}
+	if l := r.CloudLogs; l != nil {
+		if l.AuditUntil != "" {
+			fprintf(w, "  cloud logs:  kept by the provider; release cannot remove them — its audit log of this instance's\n"+
+				"               API writes until about %s, its system logs and events until about %s (default retention)",
+				l.AuditUntil, l.SystemUntil)
+			if l.MetricsUntil != "" {
+				fprintf(w, ",\n               its metrics about the instance's Pods (names, states, resource use) until about %s",
+					l.MetricsUntil)
+			}
+			fprintln(w)
+		} else {
+			fprintln(w, "  cloud logs:  whatever the provider logged or measured about this instance is kept by it; release cannot remove it")
+		}
+		if l.WorkloadLogs {
+			fprintln(w, "               this instance was not verified as system-only logging: its applications' output may be among them")
+		}
 	}
 	fprintln(w, "  state:       removed")
 	return nil
@@ -415,6 +528,49 @@ func (r releaseResult) Human(w io.Writer) error {
 // stops the wait, not the delete: the cloud continues it, and a re-run waits
 // on it.
 var clusterDeleteTimeout = 15 * time.Minute
+
+// releaseProgressEvery is how often a human release says it is still waiting
+// on the cluster delete: about six lines over the walk's six-minute wait.
+var releaseProgressEvery = time.Minute
+
+// waitNotice prints, every interval until stop is called or ctx ends, that
+// release is still waiting for the cloud. It reports elapsed time only and
+// claims nothing about the cluster's state, which it does not know.
+//
+// stop is synchronous: it returns once the goroutine has exited, so nothing
+// the caller writes to w afterwards can race it.
+func waitNotice(ctx context.Context, w io.Writer, cluster string, start time.Time, every, limit time.Duration) (stop func()) {
+	quit, done := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(done)
+		tick := time.NewTicker(every)
+		defer tick.Stop()
+		for {
+			select {
+			case <-quit:
+				return
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+			}
+			// A tick that raced stop or the deadline prints nothing.
+			select {
+			case <-quit:
+				return
+			case <-ctx.Done():
+				return
+			default:
+			}
+			fprintf(w, "  still waiting for the cloud to report %s gone — %s so far, of at most %s\n",
+				cluster, keeper.HumanWindow(time.Since(start).Round(time.Second)), keeper.HumanWindow(limit))
+		}
+	}()
+	var once sync.Once
+	return func() {
+		once.Do(func() { close(quit) })
+		<-done
+	}
+}
 
 // releaseKeeper is what release did with a keeper on this machine.
 type releaseKeeper struct {

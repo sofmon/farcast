@@ -617,6 +617,32 @@ func TestConnectStatusDoesNoRegistryWork(t *testing.T) {
 	}
 }
 
+// --status names the node of the FatLine replica that answered, and only that
+// one: it prints nothing about placement when FatLine does not report it.
+func TestConnectStatusNamesTheRelayingReplicasNode(t *testing.T) {
+	for _, node := range []string{"n-7", ""} {
+		dir := config.Dir(t.TempDir())
+		connectedInstance(t, dir, "prod")
+		c := newConnectCommand()
+		c.statusOnly = true
+		c.newCluster = func(string) clusterApplier { return &fakeCluster{} }
+		c.dial = func(context.Context, string, tunnel.ClientIdentity) (tunnelConn, error) {
+			return &fakeConn{st: fatline.ConnStatus{Connected: true, Node: node}}, nil
+		}
+		env, out := testEnv(dir, output.ModeHuman)
+		if err := c.Run(context.Background(), env, []string{"prod"}); err != nil {
+			t.Fatalf("connect --status: %v", err)
+		}
+		text := out.String()
+		if node != "" && !strings.Contains(text, "relayed by:  the FatLine replica on n-7") {
+			t.Errorf("the relaying replica's node is missing:\n%s", text)
+		}
+		if node == "" && strings.Contains(text, "relayed by") {
+			t.Errorf("an unknown node printed a relay line:\n%s", text)
+		}
+	}
+}
+
 func TestConnectRegistryFailureDoesNotBreakReconnect(t *testing.T) {
 	dir := config.Dir(t.TempDir())
 	const name = "prod"

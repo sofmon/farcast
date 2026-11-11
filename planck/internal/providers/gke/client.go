@@ -56,6 +56,15 @@ type createInput struct {
 type clusterState struct {
 	RawStatus string // cloud-native status string, e.g. "RUNNING"
 	Endpoint  string // control-plane DNS endpoint, e.g. uid.us-central1.gke.goog (ADR 0004)
+	// SystemLogsOnly is true only when the cluster, as read back, sends the
+	// provider's logging nothing but GKE's mandatory system logs (ADR 0019).
+	// Its zero value is "not verified", so a snapshot that never looked — or
+	// a config the cloud did not return — reads as workload logs on.
+	SystemLogsOnly bool
+	// Logging and Monitoring are the read-back configs, rendered for an error
+	// message or a walk record. They decide nothing.
+	Logging    string
+	Monitoring string
 }
 
 // gkeClient is the real clusterAPI, backed by the GKE cluster-management API.
@@ -125,16 +134,36 @@ func (c *gkeClient) get(ctx context.Context, ref planck.ClusterRef) (clusterStat
 	// FarCast clusters expose only the DNS endpoint to operators (ADR 0004); the
 	// public IP endpoint is disabled, so cl.GetEndpoint() is not used.
 	return clusterState{
-		RawStatus: cl.GetStatus().String(),
-		Endpoint:  cl.GetControlPlaneEndpointsConfig().GetDnsEndpointConfig().GetEndpoint(),
+		RawStatus:      cl.GetStatus().String(),
+		Endpoint:       cl.GetControlPlaneEndpointsConfig().GetDnsEndpointConfig().GetEndpoint(),
+		SystemLogsOnly: systemLogsOnly(cl.GetLoggingConfig()),
+		Logging:        describeLogging(cl.GetLoggingConfig()),
+		Monitoring:     describeMonitoring(cl.GetMonitoringConfig()),
 	}, true, nil
 }
 
 func (c *gkeClient) create(ctx context.Context, in createInput) error {
+	// CreateCluster returns once the long-running operation is accepted; the
+	// adapter polls get() until the cluster reports Running.
+	_, err := c.svc.CreateCluster(ctx, &containerpb.CreateClusterRequest{
+		Parent:  c.locationPath(in.Location),
+		Cluster: buildCluster(in),
+	})
+	return err
+}
+
+// buildCluster is the cluster FarCast asks GKE for. It is pure so a test can
+// prove every isolation setting reaches the request — a config that exists
+// but is never wired in is the defect ADR 0019 records.
+//
+// Logging is set unconditionally: there is no FarCast cluster that ships its
+// applications' output to the provider, so there is no knob.
+func buildCluster(in createInput) *containerpb.Cluster {
 	cluster := &containerpb.Cluster{
 		Name:           in.Name,
 		ResourceLabels: in.Labels,
 		Autopilot:      &containerpb.Autopilot{Enabled: in.Autopilot},
+		LoggingConfig:  systemOnlyLogging(),
 	}
 	if in.Version != "" {
 		cluster.InitialClusterVersion = in.Version
@@ -142,13 +171,73 @@ func (c *gkeClient) create(ctx context.Context, in createInput) error {
 	if in.PrivateControlPlane {
 		cluster.ControlPlaneEndpointsConfig = privateControlPlaneConfig()
 	}
-	// CreateCluster returns once the long-running operation is accepted; the
-	// adapter polls get() until the cluster reports Running.
-	_, err := c.svc.CreateCluster(ctx, &containerpb.CreateClusterRequest{
-		Parent:  c.locationPath(in.Location),
-		Cluster: cluster,
-	})
-	return err
+	return cluster
+}
+
+// systemOnlyLogging keeps applications' stdout and stderr on the node (ADR
+// 0019). GKE's default is SYSTEM plus WORKLOADS, and FarCast's own namespaces
+// are not GKE "system" namespaces, so the default ships every FarCast and
+// application log line to the provider's logging.
+//
+// SYSTEM_COMPONENTS is the floor: Autopilot requires it, and an empty list
+// means "disable all", which Autopilot rejects.
+func systemOnlyLogging() *containerpb.LoggingConfig {
+	return &containerpb.LoggingConfig{
+		ComponentConfig: &containerpb.LoggingComponentConfig{
+			EnableComponents: []containerpb.LoggingComponentConfig_Component{
+				containerpb.LoggingComponentConfig_SYSTEM_COMPONENTS,
+			},
+		},
+	}
+}
+
+// systemLogsOnly reports whether a read-back logging config sends nothing but
+// system logs. It fails closed: an absent config or component list is the
+// provider default (workloads on), and any component other than
+// SYSTEM_COMPONENTS — WORKLOADS, a control-plane stream we did not ask for, a
+// value this client does not know — is not "system only".
+func systemLogsOnly(cfg *containerpb.LoggingConfig) bool {
+	got := cfg.GetComponentConfig().GetEnableComponents()
+	if len(got) == 0 {
+		return false
+	}
+	for _, c := range got {
+		if c != containerpb.LoggingComponentConfig_SYSTEM_COMPONENTS {
+			return false
+		}
+	}
+	return true
+}
+
+// describeLogging renders a read-back logging config for a message.
+func describeLogging(cfg *containerpb.LoggingConfig) string {
+	if cfg.GetComponentConfig() == nil {
+		return "unset (provider default: system and workloads)"
+	}
+	return fmt.Sprint(cfg.GetComponentConfig().GetEnableComponents())
+}
+
+// describeMonitoring renders a read-back monitoring config. FarCast does not
+// set one (ADR 0019): Autopilot's system metrics and managed Prometheus
+// cannot be turned off. The rendering is carried on clusterState.Monitoring,
+// which only the opt-in integration test (build tag integration) logs, for
+// the walk; nothing in the adapter reads it or acts on it.
+func describeMonitoring(cfg *containerpb.MonitoringConfig) string {
+	if cfg == nil {
+		return "unset"
+	}
+	comps := "unset"
+	if cc := cfg.GetComponentConfig(); cc != nil {
+		comps = fmt.Sprint(cc.GetEnableComponents())
+	}
+	gmp := "unset"
+	if mp := cfg.GetManagedPrometheusConfig(); mp != nil {
+		gmp = fmt.Sprintf("enabled=%t", mp.GetEnabled())
+		if am := mp.GetAutoMonitoringConfig(); am != nil {
+			gmp += " auto-monitoring=" + am.GetScope().String()
+		}
+	}
+	return fmt.Sprintf("components=%s managed-prometheus=%s", comps, gmp)
 }
 
 // privateControlPlaneConfig is FarCast's control-plane network isolation

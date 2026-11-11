@@ -3,6 +3,7 @@ package event
 import (
 	"bytes"
 	"context"
+	"log"
 	"log/slog"
 	"strings"
 	"sync"
@@ -121,3 +122,55 @@ func TestTeeReachesEverySink(t *testing.T) {
 type sinkFunc func(Event)
 
 func (f sinkFunc) Emit(e Event) { f(e) }
+
+// A tunnel stream's log line names the peer's role and never its token. The
+// line lands where the provider reads it, and a token is a stable name for one
+// leaf; the role names a class. Asserted on the rendered bytes, for the reason
+// the test above is.
+func TestSlogSinkLogsTheRoleNeverTheToken(t *testing.T) {
+	const sentinel = "d1e2v3i4c5e6t7o8"
+	var buf bytes.Buffer
+	s := SlogSink{Logger: slog.New(slog.NewTextHandler(&buf, nil))}
+	s.Emit(Event{Kind: Deny, Proto: ProtoStream, Host: "shrike", Reason: ReasonRoleRefused,
+		PeerRole: PeerKeeper, PeerToken: sentinel})
+	line := buf.String()
+	if !strings.Contains(line, "peer_role=keeper") {
+		t.Errorf("a tunnel stream's line does not name the peer's role:\n  %s", line)
+	}
+	if strings.Contains(line, sentinel) {
+		t.Errorf("the peer token reached the log:\n  %s", line)
+	}
+
+	// Application egress has no peer, and its line gains no empty attribute.
+	buf.Reset()
+	s.Emit(Event{Kind: Allow, Tenant: "apps", App: "api", Host: "api.example", Proto: "connect"})
+	if strings.Contains(buf.String(), "peer_role") {
+		t.Errorf("an egress line carries a peer role:\n  %s", buf.String())
+	}
+}
+
+// FatLine's binary logs through slog's default handler: SlogSink with no
+// Logger. A tunnel route name is a peer's own text, so that handler has to
+// quote control and format characters, never write them to the log as sent.
+// Asserted on the production path, with the default logger's output captured.
+func TestSlogSinkQuotesControlBytesOnTheDefaultLogger(t *testing.T) {
+	var buf bytes.Buffer
+	out := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(out) })
+
+	const hostile = "\x1b[8m\r\u009b2J\u202e\x9b"
+	SlogSink{}.Emit(Event{Kind: Deny, Proto: ProtoStream, Host: hostile, Reason: ReasonUnknownRoute, PeerRole: PeerKeeper})
+	line := strings.TrimSuffix(buf.String(), "\n")
+	if !strings.Contains(line, "reason="+ReasonUnknownRoute) {
+		t.Fatalf("the default logger did not receive the line: %q", buf.String())
+	}
+	for _, raw := range []string{"\x1b", "\r", "\n", "\u009b", "\u202e", "\x9b"} {
+		if strings.Contains(line, raw) {
+			t.Errorf("%q reached the log unquoted: %q", raw, line)
+		}
+	}
+	if !strings.Contains(line, `host="\x1b[8m\r`) {
+		t.Errorf("the host is not quoted: %q", line)
+	}
+}

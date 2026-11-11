@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"cloud.google.com/go/container/apiv1/containerpb"
+
 	"github.com/sofmon/farcast/planck"
 )
 
@@ -81,7 +83,7 @@ func TestCreateClusterProvisionsAndWaits(t *testing.T) {
 	api := &fakeClient{states: []stateResult{
 		{exists: false}, // existence check → not found
 		{state: clusterState{RawStatus: "PROVISIONING"}, exists: true},
-		{state: clusterState{RawStatus: "RUNNING", Endpoint: "uid.us-central1.gke.goog"}, exists: true},
+		{state: clusterState{RawStatus: "RUNNING", Endpoint: "uid.us-central1.gke.goog", SystemLogsOnly: true}, exists: true},
 	}}
 	p := newTestProvider(api)
 
@@ -110,11 +112,14 @@ func TestCreateClusterProvisionsAndWaits(t *testing.T) {
 	if len(c.Kubeconfig) == 0 {
 		t.Error("expected a kubeconfig")
 	}
+	if !c.SystemLogsOnly {
+		t.Error("a cluster that read back system-only must be reported as such (ADR 0019)")
+	}
 }
 
 func TestCreateClusterIdempotent(t *testing.T) {
 	api := &fakeClient{states: []stateResult{
-		{state: clusterState{RawStatus: "RUNNING", Endpoint: "uid.us-central1.gke.goog"}, exists: true},
+		{state: clusterState{RawStatus: "RUNNING", Endpoint: "uid.us-central1.gke.goog", SystemLogsOnly: true}, exists: true},
 	}}
 	p := newTestProvider(api)
 
@@ -144,6 +149,105 @@ func TestCreateClusterContextCancelled(t *testing.T) {
 	cancel()
 	if _, err := p.CreateCluster(ctx, planck.ClusterSpec{Name: "demo"}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+}
+
+// TestCreateClusterRefusesWorkloadLogs is ADR 0019's fail-closed read-back: a
+// cluster that comes up Running but does not read back as system-only logging
+// is an error, never an installed instance — whether it was just created or
+// already existed under the name.
+func TestCreateClusterRefusesWorkloadLogs(t *testing.T) {
+	cases := map[string][]stateResult{
+		"fresh create, workloads on": {
+			{exists: false},
+			{state: clusterState{RawStatus: "RUNNING", Endpoint: "e", Logging: "[SYSTEM_COMPONENTS WORKLOADS]"}, exists: true},
+		},
+		"already existing, never verified": {
+			{state: clusterState{RawStatus: "RUNNING", Endpoint: "e"}, exists: true},
+		},
+	}
+	for name, states := range cases {
+		t.Run(name, func(t *testing.T) {
+			p := newTestProvider(&fakeClient{states: states})
+			c, err := p.CreateCluster(context.Background(), planck.ClusterSpec{Name: "demo"})
+			if err == nil {
+				t.Fatalf("CreateCluster returned %v, want an error for a cluster exporting workload logs", c)
+			}
+			if !strings.Contains(err.Error(), "ADR 0019") || !strings.Contains(err.Error(), "logging") {
+				t.Errorf("err = %v, want it to name the logging read-back and ADR 0019", err)
+			}
+		})
+	}
+}
+
+func TestBuildClusterCarriesSystemOnlyLogging(t *testing.T) {
+	c := buildCluster(createInput{Name: "demo", Location: "us-central1", Autopilot: true, PrivateControlPlane: true})
+	if !systemLogsOnly(c.GetLoggingConfig()) {
+		t.Errorf("the create request's logging config is %v, want system components only (ADR 0019)", c.GetLoggingConfig())
+	}
+	// The extraction must not drop the other isolation settings.
+	if !c.GetAutopilot().GetEnabled() {
+		t.Error("Autopilot must stay enabled (ADR 0003)")
+	}
+	if c.GetControlPlaneEndpointsConfig() == nil {
+		t.Error("the private control plane must stay in the request (ADR 0004)")
+	}
+	if c.GetName() != "demo" {
+		t.Errorf("name = %q, want demo", c.GetName())
+	}
+}
+
+func TestSystemOnlyLoggingConfig(t *testing.T) {
+	got := systemOnlyLogging().GetComponentConfig().GetEnableComponents()
+	want := []containerpb.LoggingComponentConfig_Component{containerpb.LoggingComponentConfig_SYSTEM_COMPONENTS}
+	if len(got) != len(want) || got[0] != want[0] {
+		t.Errorf("enabled components = %v, want exactly %v: WORKLOADS ships application output; an empty list is NONE, which Autopilot rejects", got, want)
+	}
+}
+
+func TestSystemLogsOnlyFailsClosed(t *testing.T) {
+	comps := func(cs ...containerpb.LoggingComponentConfig_Component) *containerpb.LoggingConfig {
+		return &containerpb.LoggingConfig{ComponentConfig: &containerpb.LoggingComponentConfig{EnableComponents: cs}}
+	}
+	sys := containerpb.LoggingComponentConfig_SYSTEM_COMPONENTS
+	cases := []struct {
+		name string
+		cfg  *containerpb.LoggingConfig
+		want bool
+	}{
+		{"nil config is the provider default", nil, false},
+		{"nil component config is the provider default", &containerpb.LoggingConfig{}, false},
+		{"empty list", comps(), false},
+		{"system and workloads", comps(sys, containerpb.LoggingComponentConfig_WORKLOADS), false},
+		{"workloads only", comps(containerpb.LoggingComponentConfig_WORKLOADS), false},
+		{"a stream not asked for", comps(sys, containerpb.LoggingComponentConfig_APISERVER), false},
+		{"an unknown value", comps(sys, containerpb.LoggingComponentConfig_Component(99)), false},
+		{"system only", comps(sys), true},
+	}
+	for _, tc := range cases {
+		if got := systemLogsOnly(tc.cfg); got != tc.want {
+			t.Errorf("%s: systemLogsOnly = %t, want %t", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestDescribeMonitoring(t *testing.T) {
+	if got := describeMonitoring(nil); got != "unset" {
+		t.Errorf("nil = %q, want unset", got)
+	}
+	got := describeMonitoring(&containerpb.MonitoringConfig{
+		ComponentConfig: &containerpb.MonitoringComponentConfig{EnableComponents: []containerpb.MonitoringComponentConfig_Component{
+			containerpb.MonitoringComponentConfig_SYSTEM_COMPONENTS,
+		}},
+		ManagedPrometheusConfig: &containerpb.ManagedPrometheusConfig{
+			Enabled:              true,
+			AutoMonitoringConfig: &containerpb.AutoMonitoringConfig{Scope: containerpb.AutoMonitoringConfig_NONE},
+		},
+	})
+	for _, want := range []string{"SYSTEM_COMPONENTS", "enabled=true", "auto-monitoring=NONE"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("describeMonitoring = %q, missing %q", got, want)
+		}
 	}
 }
 
@@ -338,7 +442,7 @@ func TestNewRequiresProject(t *testing.T) {
 func TestLazyClientWiring(t *testing.T) {
 	orig := newClient
 	t.Cleanup(func() { newClient = orig })
-	up := stateResult{state: clusterState{RawStatus: "RUNNING", Endpoint: "uid.us-central1.gke.goog"}, exists: true}
+	up := stateResult{state: clusterState{RawStatus: "RUNNING", Endpoint: "uid.us-central1.gke.goog", SystemLogsOnly: true}, exists: true}
 	fake := &fakeClient{states: []stateResult{up, up, up, up, {exists: false}}}
 	built := 0
 	newClient = func(planck.Config) (clusterAPI, error) {

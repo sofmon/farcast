@@ -52,21 +52,17 @@ func (r review) print(w io.Writer) {
 	var declared int
 	for _, app := range r.Manifest.Apps {
 		fprintf(w, "\n  %s\n", app.Name)
-		fprintf(w, "    build   %s", app.Containerfile)
+		// Paths are the repository's text too, and the parser rules out only
+		// absolute ones and "..", so they go through terminalText as well.
+		fprintf(w, "    build   %s", terminalText(app.Containerfile))
 		// A context of "." is the repository root, which is the default.
 		// Printing it adds a word and no information.
 		if c := strings.Trim(app.Context, "./"); c != "" {
-			fprintf(w, "  (context %s)", app.Context)
+			fprintf(w, "  (context %s)", terminalText(app.Context))
 		}
 		fprintln(w)
-		if len(app.External) == 0 {
-			fprintf(w, "    reaches nothing outside the instance\n")
-			continue
-		}
 		declared += len(app.External)
-		for _, e := range app.External {
-			fprintf(w, "    → %-34s %s\n", e.Host, e.Reason)
-		}
+		printDeclared(w, app.External)
 	}
 
 	fprintf(w, "\nThose hosts are the whole of what these applications may reach. FatLine denies\n")
@@ -78,6 +74,27 @@ func (r review) print(w io.Writer) {
 	}
 
 	r.printCost(w)
+}
+
+// printDeclared prints what one application may reach, one host per line with
+// the reason the manifest gives for it, in the order the manifest declares them.
+//
+// The review and the run's result both print through this, so what the
+// operator approved and what the result says was allowed are the same lines,
+// byte for byte. Both are the operator's record; two formats would be two
+// things to compare.
+//
+// The reason is the repository's free text and goes through terminalText; the
+// host is validated by the parser and goes through it anyway, because the
+// printer should not have to know that.
+func printDeclared(w io.Writer, ext []parser.External) {
+	if len(ext) == 0 {
+		fprintf(w, "    reaches nothing outside the instance\n")
+		return
+	}
+	for _, e := range ext {
+		fprintf(w, "    → %-34s %s\n", terminalText(e.Host), terminalText(e.Reason))
+	}
 }
 
 // printCost says what approving this will cost, in the two ways it costs:

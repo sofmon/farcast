@@ -18,7 +18,16 @@ type ConnStatus struct {
 	Since     time.Time `json:"since,omitzero"`
 	Active    int       `json:"active"`
 	Allowlist []string  `json:"allowlist,omitempty"`
+	// Node is the Kubernetes node of the replica that answered — the one
+	// relaying this session. It says nothing about any other replica: the
+	// load balancer hands a session to one of them. Empty from a manifest
+	// that predates it. Served on the mTLS tunnel only.
+	Node string `json:"node,omitempty"`
 }
+
+// EnvNode is the environment variable the deploy fills from the Pod's
+// spec.nodeName.
+const EnvNode = "FATLINE_NODE"
 
 // Egress is the deny-by-default outbound proxy seam: an http.Handler that
 // speaks CONNECT for HTTPS and absolute-URI for plain HTTP. The hot path sits

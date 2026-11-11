@@ -225,6 +225,14 @@ func openSession(ctx context.Context, env *Env, instance string, mint bool) (*st
 	return session, nil
 }
 
+// warnKeyLoss prints the mandated key-loss sentence on a line of its own. The
+// constant starts lowercase and is pinned verbatim by the spec, so it is never
+// appended to another sentence: the walk found it run on mid-line at three
+// sites, where it read as part of whatever came before.
+func warnKeyLoss(w io.Writer) {
+	fprintf(w, "WARNING: %s\n", datasphere.KeyLossWarning)
+}
+
 // reportSession says, exactly once, what an Open brought into existence. The
 // key-loss warning is emitted verbatim and in every output mode, because the
 // one moment an operator will act on it is the moment the file appears.
@@ -232,7 +240,7 @@ func reportSession(env *Env, session *storage.Session) {
 	if session.KeyringMinted {
 		fprintf(env.Err, "Created the storage keyring for %q at %s (mode 0600).\n",
 			session.Instance, env.ConfigDir.InstanceKeyringPath(session.Instance))
-		fprintf(env.Err, "WARNING: %s\n", datasphere.KeyLossWarning)
+		warnKeyLoss(env.Err)
 		fprintf(env.Err, "Back it up the way you back up the instance's CA key: copy %s offline.\n",
 			env.ConfigDir.InstancePath(session.Instance))
 	}

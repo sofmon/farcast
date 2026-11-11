@@ -42,7 +42,14 @@ farcast run "$INSTANCE" github.com/sofmon/farcast \
   --manifest manifest/examples/egress-demo/farcast --namespace "$APPS" -y
 ```
 
-Expected: the review names **two** applications with different declarations, and the result ends with a line reading `Egress: 1 declared host across 2 applications, enforced per application.`
+Expected: the review names **two** applications with different declarations — `-y` skips the question, not the review, which is printed to stderr and ends `Approved with --yes; nothing was asked.` The result carries a line reading `Egress: 1 declared host across 2 applications, enforced per application.`, and under it each application with what it may now reach, in the review's own words:
+
+```text
+  reacher
+    → example.com                        proving an application reaches what it declared
+  hermit
+    reaches nothing outside the instance
+```
 
 ## 2. The policy arrived, and carries no credentials
 

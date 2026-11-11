@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -172,5 +174,52 @@ func TestInvalidOutputMode(t *testing.T) {
 	}
 	if !strings.Contains(errOut, "xml") {
 		t.Errorf("expected invalid-mode error:\n%s", errOut)
+	}
+}
+
+// The exit code a command's error maps to. A code other than 1 survives
+// wrapping, since that is how a command's errors travel.
+func TestExitCodeOf(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"success", nil, 0},
+		{"misuse", usagef("bad"), 2},
+		{"a runtime failure", errors.New("x"), 1},
+		{"cannot keep, wrapped", fmt.Errorf("x: %w", &exitCodeError{code: exitCannotKeep, err: errors.New("y")}), exitCannotKeep},
+		{"incomplete", &exitCodeError{code: exitIncomplete, err: errors.New("y")}, exitIncomplete},
+	} {
+		if got := exitCodeOf(tc.err); got != tc.want {
+			t.Errorf("%s: exitCodeOf = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}
+
+// Through the router: the process exits with the command's code, and JSON
+// mode's error envelope carries the same one. A cancelled context makes the
+// keeper's dial fail before it reaches for any network.
+func TestTheRouterExitsWithTheCommandsCode(t *testing.T) {
+	_, dir, _, _ := installedKeeper(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var out, errb bytes.Buffer
+	code := run(ctx, []string{"farcast", "--config", dir.Path(), "-o", "json", "keeper", "run", "prod", "--once"},
+		strings.NewReader(""), &out, &errb)
+	if code != exitIncomplete {
+		t.Fatalf("exit = %d, want %d\nstdout: %s\nstderr: %s", code, exitIncomplete, out.String(), errb.String())
+	}
+	var env struct {
+		Error struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &env); err != nil {
+		t.Fatalf("stdout is not the JSON error envelope: %v\n%s", err, out.String())
+	}
+	if env.Error.Code != exitIncomplete || !strings.Contains(env.Error.Message, "cannot reach") {
+		t.Errorf("envelope = %+v; want code %d, saying it cannot reach the instance", env.Error, exitIncomplete)
 	}
 }

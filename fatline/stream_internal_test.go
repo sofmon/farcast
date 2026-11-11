@@ -1,6 +1,10 @@
 package fatline
 
-import "testing"
+import (
+	"strings"
+	"testing"
+	"unicode/utf8"
+)
 
 // resolve is where a caller-supplied ordinal becomes an address, so the range
 // check is pinned here rather than end-to-end.
@@ -45,4 +49,42 @@ func TestStreamRouteResolve(t *testing.T) {
 			}
 		}
 	})
+}
+
+// An unknown route's name is the peer's own text, and the record of it is
+// bounded: cut to maxRecordedRoute bytes, never inside a character, and
+// marked so a reader knows it was cut.
+func TestRecordedRouteIsBounded(t *testing.T) {
+	for _, name := range []string{"", "keyholder", "\x1b[8m", strings.Repeat("a", maxRecordedRoute)} {
+		if got := recordedRoute(name); got != name {
+			t.Errorf("recordedRoute(%q) = %q; a name within the bound is recorded as sent", name, got)
+		}
+	}
+
+	for _, tc := range []struct {
+		what, name string
+		keep       int // bytes of the name kept
+	}{
+		{"one byte over", strings.Repeat("a", maxRecordedRoute+1), maxRecordedRoute},
+		{"a megabyte of control text", strings.Repeat("\x1b[2J", 1<<18), maxRecordedRoute},
+		// 3-byte characters: the bound falls inside the 22nd, which is dropped.
+		{"multibyte", strings.Repeat("€", 30), 63},
+		// 2-byte characters ending exactly on the bound.
+		{"on the bound", strings.Repeat("é", 40), maxRecordedRoute},
+		// Invalid bytes are each their own rune; cutting between them is fine.
+		{"invalid UTF-8", strings.Repeat("\xff", 100), maxRecordedRoute},
+	} {
+		got := recordedRoute(tc.name)
+		kept, marked := strings.CutSuffix(got, routeCutMarker)
+		if !marked {
+			t.Errorf("%s: %q is not marked as cut", tc.what, got)
+			continue
+		}
+		if len(kept) != tc.keep || !strings.HasPrefix(tc.name, kept) {
+			t.Errorf("%s: kept %d bytes %q, want the first %d", tc.what, len(kept), kept, tc.keep)
+		}
+		if utf8.ValidString(tc.name) && !utf8.ValidString(kept) {
+			t.Errorf("%s: the cut split a character: %q", tc.what, kept)
+		}
+	}
 }

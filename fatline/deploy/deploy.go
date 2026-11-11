@@ -51,6 +51,9 @@ const (
 	PolicyConfigMap = "fatline-egress-policy"
 	PolicyKey       = "policy.json"
 	policyMountPath = "/etc/fatline/policy"
+	// envNode is fatline.EnvNode; a test pins the two together without the
+	// manifest renderer importing the data plane.
+	envNode = "FATLINE_NODE"
 
 	// EgressService is the in-cluster name applications send outbound traffic
 	// to. It is a SEPARATE ClusterIP Service from the tunnel's, and that
@@ -224,6 +227,7 @@ func Render(c Config) ([]byte, error) {
 		PolicyMountPath: policyMountPath,
 		PolicyConfigMap: PolicyConfigMap,
 		PolicyKey:       PolicyKey,
+		EnvNode:         envNode,
 		CACert:          base64.StdEncoding.EncodeToString(c.CACertPEM),
 		ServerCert:      base64.StdEncoding.EncodeToString(c.ServerCertPEM),
 		ServerKey:       base64.StdEncoding.EncodeToString(c.ServerKeyPEM),
@@ -280,6 +284,7 @@ type templateData struct {
 	PolicyMountPath string
 	PolicyConfigMap string
 	PolicyKey       string
+	EnvNode         string
 	MTLSHash        string
 	CACert          string
 	ServerCert      string
@@ -418,6 +423,15 @@ spec:
 {{- range .KeeperRoutes}}
             - --keeper-route={{.}}
 {{- end}}
+          env:
+            # The node this replica runs on, reported in the tunnel's status
+            # so the operator can see which node relayed a session (the spread
+            # above is soft). A fieldRef env value; spec.nodeName never changes
+            # for a Pod.
+            - name: {{.EnvNode}}
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
           ports:
             - name: tunnel
               containerPort: {{.TunnelPort}}

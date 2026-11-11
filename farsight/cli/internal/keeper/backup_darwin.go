@@ -33,15 +33,15 @@ const (
 // The attribute binds Time Machine; it does not bind everything.
 func ExcludeFromBackup(dir string) error {
 	if err := unix.Setxattr(dir, backupExcludeAttr, []byte(backupExcludeValue), 0); err != nil {
-		return fmt.Errorf("keeper: this device could not mark %s as excluded from backup: %w", dir, err)
+		return fmt.Errorf("this device could not mark %s as excluded from backup: %w", dir, err)
 	}
 	buf := make([]byte, 256)
 	n, err := unix.Getxattr(dir, backupExcludeAttr, buf)
 	if err != nil {
-		return fmt.Errorf("keeper: this device could not confirm %s is excluded from backup: %w", dir, err)
+		return fmt.Errorf("this device could not confirm %s is excluded from backup: %w", dir, err)
 	}
 	if !bytes.Equal(buf[:n], []byte(backupExcludeValue)) {
-		return fmt.Errorf("keeper: %s reports a backup-exclusion attribute this build did not set", dir)
+		return fmt.Errorf("%s reports a backup-exclusion attribute this build did not set", dir)
 	}
 	return nil
 }

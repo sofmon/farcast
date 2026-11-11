@@ -83,7 +83,7 @@ In **2.1 there is no public carrier.** The server listens on a ClusterIP Service
 
 An in-instance app's outbound traffic is a standard forward-proxy flow. FatLine is what the SDK's `farcast.Net().HTTPClient()` points at; the proxy URL is discovered from a Pod env var (`FARCAST_FATLINE_PROXY`) that **Planck injects in 4.2** — 2.1 fixes the contract, not the injection.
 
-- **HTTPS (the normal case): `CONNECT host:443`.** FatLine checks the authority host against the app's allowlist, dials the upstream, returns `200`, then does an **opaque** bidirectional `io.Copy`. It **never terminates TLS to the upstream** — end-to-end encryption to e.g. `api.stripe.com` is preserved and FatLine (and the cloud) see ciphertext only. This is what keeps *"the cloud is blind"* true on the egress path.
+- **HTTPS (the normal case): `CONNECT host:443`.** FatLine checks the authority host against the app's allowlist, dials the upstream, returns `200`, then does an **opaque** bidirectional `io.Copy`. It **never terminates TLS to the upstream** — end-to-end encryption to e.g. `api.stripe.com` is preserved and FatLine (and the cloud) see ciphertext only. This is what keeps the cloud *blind to content* on the egress path.
 - **Plain `http://` is denied by default** (reason `cleartext_not_allowed`). FatLine refuses to silently proxy cleartext it would itself see and that would cross cloud-carried network in the clear — confidentiality is part of deny-by-default, not just the hostname. The manifest declares a bare hostname with no scheme, so FarCast cannot infer `https` intent; cleartext is therefore a documented, opt-in-only exception, never the default.
 - **SNI defense-in-depth.** On an allowed `CONNECT`, FatLine peeks the TLS ClientHello to read `server_name` *without* terminating, and asserts `SNI == CONNECT authority` (case-folded); a mismatch tears the connection down (`sni_mismatch`). The peek is precise: read and **buffer** the leading record bytes, parse the ClientHello from the buffer, then `io.MultiReader(buffer, conn)` into the upstream copy so consumed bytes are replayed unchanged. The only degraded mode is authority-only matching — it **never fails open** to no check. (This is defense-in-depth, not a cryptographic guarantee — see [Known limitations](#known-limitations).)
 
@@ -102,6 +102,10 @@ Three properties make it safe to carry the crown jewels over a process whose day
 - **It is HTTP/2, not `CONNECT` with a hijack.** This listener negotiates h2, and Go's HTTP/2 server does not implement `http.Hijacker` — so a hijacking design would fail at run time as a *hang* rather than an error. The client refuses a relay that fell back to HTTP/1.1 for the same reason.
 
 Shrike still witnesses that a relay happened: the event carries the route name and byte counts, and never a payload byte.
+
+**Every stream decision names its peer — by role in the log, by token only in Shrike's picture.** *(Since 2026-11-10, [ADR 0015](../docs/adr/0015-what-the-boundary-can-measure.md) decision 7.)* A stream event (`Proto` `stream`) carries `PeerRole` — `operator` or `keeper`, from the same check that makes the `role_refused` decision — and `PeerToken`, an opaque 16-hex token of the verified leaf (`identity.LeafToken`: SHA-256 over a domain label and the leaf's DER, truncated). FatLine's log line gains `peer_role` and **never the token**: the log is provider-readable, and a token is a stable name for one device's leaf for 90 days. The token goes only to Shrike over the in-Pod socket; the operator's machine, which recorded it at `keeper enroll`, is the only place that maps it to a device. Outcomes: `relayed` is an `Allow` carrying the byte counts, `dial_failed` is a `Fail` (it was a `Deny`, against `event.ReasonDialFailed`'s own rule), and `unknown_route`, `role_refused` and `bad_ordinal` are `Deny`s.
+
+**An unknown route's name is recorded cut to a bound.** It is the peer's own text, percent-decoded, so an admitted leaf could otherwise write text of any length, control bytes included, into every log line that records the refusal. The `unknown_route` event carries at most its first 64 bytes, cut on a character boundary and marked `...(cut)` when longer; the log line quotes control and format characters, as slog's text form does for any value (`TestSlogSinkQuotesControlBytesOnTheDefaultLogger` pins it on the default logger the binary uses). The 404 answers `unknown route` and echoes nothing. Shrike keeps none of the name: it folds every unknown route into one `(unknown route)` row per peer ([Shrike](../shrike/README.md#the-tunnel-picture-2026-11-10)).
 
 ## The interfaces
 
@@ -125,6 +129,7 @@ type Config struct {
 	Allowlist           []parser.External   // egress policy, deny-by-default
 	Events              event.Sink          // egress decisions; Shrike implements this in 2.2
 	Endpoint            string              // advertised endpoint, reported in status
+	Node                string              // this replica's node (FATLINE_NODE), reported in status
 }
 
 func New(cfg Config) (*Server, error)
@@ -140,8 +145,11 @@ type ConnStatus struct {
 	Since     time.Time
 	Active    int      // live tunnel streams
 	Allowlist []string // declared hosts, for `farcast connect` status (2.3)
+	Node      string   // the node of the replica that answered; "" when unknown
 }
 ```
+
+`Node` comes from the Pod's `spec.nodeName`, which the deploy hands the process as a Downward API `fieldRef` env value (`FATLINE_NODE`). It names only the replica that answered — the load balancer hands a connection to one of them — and is served on the mTLS tunnel only.
 
 The public client tunnel (`fatline/tunnel`) — the 2.3 `connect` import surface:
 
@@ -200,9 +208,11 @@ type Egress interface {
 type Sink interface{ Emit(Event) }
 
 type Event struct {
-	Kind               Kind   // allow | deny | close
-	Tenant, App        string // app identity — empty in 2.1; 4.4 fills it
-	Host, Port, Proto  string // proto: "connect" | "http"
+	Kind               Kind   // allow | deny | close | fail
+	Tenant, App        string // app identity — filled since 4.4; empty on a tunnel stream
+	PeerRole           string // tunnel stream only: "operator" | "keeper" (logged)
+	PeerToken          string // tunnel stream only: opaque leaf token (to Shrike only; never logged)
+	Host, Port, Proto  string // proto: "connect" | "http" | "stream"
 	SNI                string
 	Reason             string // deny reason: not_in_allowlist | cleartext_not_allowed | sni_mismatch
 	BytesUp, BytesDown int64
@@ -224,7 +234,7 @@ FatLine's tunnel is mutually authenticated against **one per-instance Root CA** 
 - **The CA is the crown jewel and is operator-held — it never enters the cluster.** FatLine is shipped the CA *certificate* (to verify clients) plus its own *server leaf + key*; it is never given the CA private key. So a cloud compromise of the in-cluster Secret can read only the rotatable server leaf (which authenticates *this listener*), never mint new identities.
 - **Leg 1 — client verifies server.** The client trusts **only** the instance CA (`RootCAs`, no system-root fallback) and pins the server's `ServerName`/SAN.
 - **Leg 2 — server verifies client.** `tls.RequireAndVerifyClientCert` against the instance CA, plus a `VerifyConnection` SAN-identity check, so *"a valid cert from our CA"* is necessary but not sufficient. That SAN hook is the seam the 4.4 per-app identity and multi-operator models build on.
-- **Who the public tunnel admits — a fixed rule, not configuration.** *(Since 2026-10-08.)* This instance's operator leaf (`farcast://<instance>/operator`) and named keeper leaves (`farcast://<instance>/keeper/<device>`), and nothing else the CA issues. An application's leaf rests in a Kubernetes Secret, readable by whatever reads that namespace and by the cloud; before this rule any instance-CA leaf opened the public carrier, so one application's leaf could reach every stream route from anywhere. Thin-device leaves join only with the data route [ADR 0018](../docs/adr/0018-thin-device-storage.md) decision 7 specifies. The instance is read from FatLine's own server leaf (`<instance>.fatline.farcast`), the rule is applied at the handshake and re-checked on every request, and a keeper may open only `KeeperRoutes` — the keyholder's route; any other route answers `403` and is logged as `role_refused`.
+- **Who the public tunnel admits — a fixed rule, not configuration.** *(Since 2026-10-08.)* This instance's operator leaf (`farcast://<instance>/operator`) and named keeper leaves (`farcast://<instance>/keeper/<device>`), and nothing else the CA issues. An application's leaf rests in a Kubernetes Secret, readable by whatever reads that namespace and by the cloud; before this rule any instance-CA leaf opened the public carrier, so one application's leaf could reach every stream route from anywhere. Thin-device leaves join only with the data route [ADR 0018](../docs/adr/0018-thin-device-storage.md) decision 7 specifies. The instance is read from FatLine's own server leaf (`<instance>.fatline.farcast`), the rule is applied at the handshake and re-checked on every request, and a keeper may open only `KeeperRoutes` — the keyholder's route; any other route answers `403` and is logged as `role_refused` with `peer_role=keeper` (never the device: see [the inward stream relay](#the-inward-stream-relay-32)).
 - **Choices.** TLS 1.3 only (a closed FarCast-to-FarCast channel — no 1.2 fallback to misconfigure), **ed25519** leaves/CA (ECDSA P-256 fallback only if a peer rejects ed25519), `crypto/rand` serials, CA validity 1–2 y, leaves 90 d. All stdlib: `crypto/tls`, `crypto/x509`, `crypto/ed25519`, `encoding/pem`.
 - **Identity SAN.** Operator identity is a SPIFFE-style URI SAN — `farcast://<instance>/operator` — so it composes with the per-app identities (`farcast://<instance>/app/<name>`) that 4.4 will pin. The server-leaf SAN is a single `serverIdentity` input, so the *same* issuance code serves whichever carrier 2.3 binds (a public DNS/IP, an in-cluster service name, or a URI identity).
 - **Storage.** Operator side: `ca.crt`, `ca.key`, `client.crt`, `client.key` (plus the rotatable `server.crt`/`server.key`) at `0600` under the instance's `fatline/` subdirectory in the [CLI instance store](../farsight/cli/README.md#configuration--credential-storage). Server side: the `fatline-mtls` Kubernetes `Secret` (`ca.crt`/`server.crt`/`server.key` — never `ca.key`).
@@ -310,7 +320,7 @@ Per [AGENTS.md](../AGENTS.md) and [ADR 0002](../docs/adr/0002-backend-language-s
 These are deliberately accepted-and-documented in 2.1, not oversights:
 
 - **SNI allowlisting is defense-in-depth, not a cryptographic guarantee.** It is bypassable under Encrypted ClientHello (ECH hides `server_name`), no-SNI connections, and domain-fronting (the `CONNECT` host and SNI match an allowed name while the HTTP `Host` header *inside* the TLS targets a different origin on a shared frontend — invisible because FatLine never decrypts). IP-literal `CONNECT` authority is hard-denied (the manifest forbids IPs, so no IP can ever be a member).
-- **The server leaf key is readable by the GKE managed control plane** (a K8s Secret, Google-managed KMS by default). *"The cloud is blind"* holds for client↔instance traffic confidentiality and for the operator-held CA signing key (never in-cluster), but **not** for the live leaf key on the host that terminates TLS — the cloud already runs that compute. Hardening (CMEK / memory-only delivery) is deferred, and sharpens if the threat model formally adopts process-memory-disclosure / co-tenant attacks (an open [ADR 0002](../docs/adr/0002-backend-language-strategy.md) input).
+- **The server leaf key is readable by the GKE managed control plane** (a K8s Secret, Google-managed KMS by default). The cloud being *blind to content* holds for client↔instance traffic confidentiality and for the operator-held CA signing key (never in-cluster), but **not** for the live leaf key on the host that terminates TLS — the cloud already runs that compute. Hardening (CMEK / memory-only delivery) is deferred, and sharpens if the threat model formally adopts process-memory-disclosure / co-tenant attacks (an open [ADR 0002](../docs/adr/0002-backend-language-strategy.md) input).
 - **Port is not matched.** The manifest declares host only (ports reserved as not-yet-specified), so any port on an allowed host is permitted; the port is recorded on the event but not enforced.
 - **No CRL/OCSP.** Revocation is short leaf lifetimes + a FatLine-side allowed-SAN/serial set + CA rotation; a leaked operator client cert stays valid until its TTL expires or the operator removes its SAN/serial.
 - **Plain-HTTP egress cannot be made confidential** — the host-only manifest carries no scheme, so cleartext is a deny-by-default exception (`cleartext_not_allowed`), a limitation of the host-only model rather than a feature.

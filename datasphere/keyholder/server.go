@@ -80,7 +80,19 @@ type Config struct {
 	// Log receives structured events. Key material never reaches it, and
 	// neither do logical keys.
 	Log *slog.Logger
+	// Node is the name of the Kubernetes node this process runs on, as the
+	// Downward API gave it in EnvNode. Empty when the manifest predates it.
+	//
+	// It is reported on the control surface only, so the operator can see
+	// two replicas sharing a node: one node repair restarts both, and both
+	// come back sealed. It never takes part in a decision.
+	Node string
 }
+
+// EnvNode is the environment variable the deploy fills from the Pod's
+// spec.nodeName. A Pod never changes node, and an eviction is a new Pod and a
+// new process, so a value read once at start cannot go stale.
+const EnvNode = "DATASPHERED_NODE"
 
 // Server is the keyholder's HTTP surface. It exposes three muxes rather than
 // one, because the three audiences are different and must not share a port:
@@ -182,7 +194,7 @@ func (s *Server) ControlHandler() http.Handler {
 			s.fail(w, r, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, controlStateBody(s.cfg.Instance, s.cfg.Vault.State()))
+		writeJSON(w, http.StatusOK, s.controlStateBody(s.cfg.Vault.State()))
 	})
 
 	mux.HandleFunc("GET "+SealChallengePath, func(w http.ResponseWriter, r *http.Request) {
@@ -271,7 +283,10 @@ func (s *Server) ControlHandler() http.Handler {
 		// or nothing.
 		if err := id.bindsBundle(payload); err != nil {
 			clear(payload)
-			s.log.Warn("keeper bundle refused", "keeper", id.Name, "error", err)
+			// The role, never the device name: this line reaches the
+			// provider's side, and a keeper's name is the operator's fact
+			// to hold. Every other refusal here logs the role alone.
+			s.log.Warn("keeper bundle refused", "role", id.Role, "error", err)
 			s.fail(w, r, err)
 			return
 		}
@@ -300,7 +315,7 @@ func (s *Server) ControlHandler() http.Handler {
 				"serving_below", st.Pin.ServingBelow)
 		}
 		s.log.Info("unsealed", "intent", intent, "generation", st.Generation, "scopes", len(st.Scopes))
-		writeJSON(w, http.StatusOK, controlStateBody(s.cfg.Instance, st))
+		writeJSON(w, http.StatusOK, s.controlStateBody(st))
 	})
 
 	// The operator raising a running replica's key pin. The environment is
@@ -330,7 +345,7 @@ func (s *Server) ControlHandler() http.Handler {
 		st := s.cfg.Vault.RaisePin(pin, replace)
 		s.log.Info("key pin raised", "replace", replace,
 			"require", len(st.Pin.Require), "retired", len(st.Pin.Retired), "serving_below", st.Pin.ServingBelow)
-		writeJSON(w, http.StatusOK, controlStateBody(s.cfg.Instance, st))
+		writeJSON(w, http.StatusOK, s.controlStateBody(st))
 	})
 
 	mux.HandleFunc("POST /v1/seal", func(w http.ResponseWriter, r *http.Request) {
@@ -342,7 +357,7 @@ func (s *Server) ControlHandler() http.Handler {
 		reason := r.URL.Query().Get("reason")
 		st := s.cfg.Vault.Seal(hold, reason)
 		s.log.Info("sealed", "hold", hold, "phase", st.Phase)
-		writeJSON(w, http.StatusOK, controlStateBody(s.cfg.Instance, st))
+		writeJSON(w, http.StatusOK, s.controlStateBody(st))
 	})
 
 	mux.HandleFunc("POST /v1/release-hold", func(w http.ResponseWriter, r *http.Request) {
@@ -352,7 +367,7 @@ func (s *Server) ControlHandler() http.Handler {
 		}
 		st := s.cfg.Vault.ReleaseHold()
 		s.log.Info("hold released", "phase", st.Phase)
-		writeJSON(w, http.StatusOK, controlStateBody(s.cfg.Instance, st))
+		writeJSON(w, http.StatusOK, s.controlStateBody(st))
 	})
 
 	return mux
@@ -614,6 +629,10 @@ type stateResponse struct {
 	// Pin is set on the control surface only: the key pin this replica
 	// enforces. Nil from an image that predates the pin.
 	Pin *PinReport `json:"pin,omitempty"`
+	// Node is set on the control surface only: the node this replica runs
+	// on. Empty when the manifest predates it, which a reader must take as
+	// "placement unknown", never as a node of its own.
+	Node string `json:"node,omitempty"`
 }
 
 // stateBody is what the UNAUTHENTICATED status endpoint answers.
@@ -636,9 +655,13 @@ func stateBody(instance string, st State) stateResponse {
 
 // controlStateBody is what the mutually-authenticated control surface answers:
 // the same state, plus the boot label a keeper needs in order to record WHICH
-// process it seeded (ADR 0008 finding 1).
-func controlStateBody(instance string, st State) stateResponse {
-	body := stateBody(instance, st)
+// process it seeded (ADR 0008 finding 1), and the node this replica runs on.
+//
+// The node is topology, and topology stays off the unauthenticated status
+// port for the same reason the boot label does.
+func (s *Server) controlStateBody(st State) stateResponse {
+	body := stateBody(s.cfg.Instance, st)
+	body.Node = s.cfg.Node
 	body.Boot = st.Boot
 	body.Keys = st.Keys
 	if st.Pin.Status != "" {

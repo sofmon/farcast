@@ -99,4 +99,6 @@ All three are mutable after creation (`gcloud … clusters update`, or `ClusterU
 
 ---
 
+**See also [ADR 0019](0019-what-the-cluster-tells-its-provider.md):** a private control plane is still the provider's. Its Admin Activity audit log keeps every create, update and delete on the cluster's API for 400 days, with full bodies for workloads, metadata only for ConfigMaps and Secrets, and outlives the instance. Status updates, such as a Pod's readiness, go to the Data Access log instead, which is off unless the project or a parent turned it on.
+
 *This ADR is a living record. Revisit it when private nodes / FatLine egress land, when the second cloud provider arrives (8.1), or whenever GKE's control-plane access model materially changes.*

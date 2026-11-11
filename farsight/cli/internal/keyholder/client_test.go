@@ -29,6 +29,14 @@ type liveKeyholder struct {
 
 func startKeyholder(t *testing.T, instance string, m *identity.Material) *liveKeyholder {
 	t.Helper()
+	return startKeyholderOn(t, instance, m, "", nil)
+}
+
+// startKeyholderOn is startKeyholder on a named node, with its control
+// surface optionally wrapped — so a test can make the real server answer as a
+// newer one would.
+func startKeyholderOn(t *testing.T, instance string, m *identity.Material, node string, wrap func(http.Handler) http.Handler) *liveKeyholder {
+	t.Helper()
 	certPEM, keyPEM, err := identity.IssueKeyholderServer(m.CACertPEM, m.CAKeyPEM, instance)
 	if err != nil {
 		t.Fatalf("IssueKeyholderServer: %v", err)
@@ -49,6 +57,7 @@ func startKeyholder(t *testing.T, instance string, m *identity.Material) *liveKe
 		Stores: func(s datasphere.Scope) (*datasphere.Store, error) {
 			return nil, errors.New("no provider in this test")
 		},
+		Node: node,
 	})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
@@ -61,8 +70,12 @@ func startKeyholder(t *testing.T, instance string, m *identity.Material) *liveKe
 	}
 	t.Cleanup(func() { _ = l.Close() })
 
+	handler := srv.ControlHandler()
+	if wrap != nil {
+		handler = wrap(handler)
+	}
 	go func() {
-		_ = (&http.Server{Handler: srv.ControlHandler()}).Serve(l)
+		_ = (&http.Server{Handler: handler}).Serve(l)
 	}()
 	return &liveKeyholder{addr: l.Addr().String(), vault: vault}
 }
@@ -496,5 +509,49 @@ func TestThePinCrossesTheRealWire(t *testing.T) {
 func TestUnsupportedIsA404WithNoCode(t *testing.T) {
 	if !Unsupported(&Refusal{Status: 404}) || Unsupported(&Refusal{Status: 404, Code: "permission"}) || Unsupported(&Refusal{Status: 409}) {
 		t.Error("Unsupported misclassifies")
+	}
+}
+
+// The node a replica runs on crosses the real control surface, and an image
+// that does not report one arrives as "" rather than as a node.
+func TestTheNodeCrossesTheRealWire(t *testing.T) {
+	m, err := identity.Mint("prod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, node := range []string{"gk3-pool-1-abc", ""} {
+		kh := startKeyholderOn(t, "prod", m, node, nil)
+		st, err := newClient(t, "prod", m, kh.addr).State(context.Background(), 0)
+		if err != nil {
+			t.Fatalf("State: %v", err)
+		}
+		if st.Node != node {
+			t.Errorf("node = %q, want %q", st.Node, node)
+		}
+	}
+}
+
+// A keyholder newer than this CLI may answer with fields it does not know.
+// They must be ignored, not refused: an operator whose CLI lags the image
+// still has to be able to read the state and unseal. (This is how an older
+// CLI reads the node today.)
+func TestStateDecodingToleratesUnknownFields(t *testing.T) {
+	m, err := identity.Mint("prod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	newer := func(http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"instance":"prod","phase":"unsealed","generation":3,"from_the_future":{"x":1}}`))
+		})
+	}
+	kh := startKeyholderOn(t, "prod", m, "", newer)
+	st, err := newClient(t, "prod", m, kh.addr).State(context.Background(), 0)
+	if err != nil {
+		t.Fatalf("a newer keyholder's state was refused: %v", err)
+	}
+	if st.Phase != "unsealed" || st.Generation != 3 {
+		t.Errorf("state = %+v", st)
 	}
 }

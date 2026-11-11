@@ -21,6 +21,9 @@ const (
 	leafKey    = "leaf.key"
 	bundleFile = "bundle.yaml"
 	ledgerFile = "ledger.jsonl"
+	// passLockFile is held, by flock, for the length of one pass. It holds
+	// nothing.
+	passLockFile = "pass.lock"
 
 	// dirMode and fileMode are the only modes anything here rests under.
 	dirMode  = 0o700
@@ -52,6 +55,9 @@ type Config struct {
 	WipedAt     time.Time `yaml:"wiped_at,omitzero"`
 	WipedReason string    `yaml:"wiped_reason,omitempty"`
 }
+
+// ErrPassRunning is another keeper process on this device mid-pass.
+var ErrPassRunning = errors.New("another keeper pass on this device is running")
 
 // ErrWiped is a keeper whose material was wiped: it holds a record and a
 // ledger, and nothing it could push.
@@ -100,7 +106,7 @@ func Install(dir string, p *Packet, force bool) (*Store, error) {
 		excluded, note = false, err.Error()
 		if !force {
 			return nil, fmt.Errorf(
-				"%w\n\nThe bundle, this device's private key and the ledger would rest somewhere the platform "+
+				"keeper: %w\n\nThe bundle, this device's private key and the ledger would rest somewhere the platform "+
 					"may copy off the device. ADR 0008 says a platform that cannot guarantee the exclusion cannot "+
 					"be a keeper.\n\nIf you have arranged the exclusion yourself, re-run with --accept-backup-risk "+
 					"and the record will say that you did.", err)

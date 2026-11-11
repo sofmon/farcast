@@ -11,6 +11,7 @@ import (
 	"io"
 	"math/rand/v2"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -31,20 +32,29 @@ import (
 // holds neither. Everything this needs came in the enrolment packet, which is
 // what lets a keeper be a machine that has never installed anything.
 func keeperTunnel(ctx context.Context, cfg keeper.Config, caPEM, leafCert, leafKey []byte) (*tunnel.Conn, error) {
+	id, err := keeperIdentity(cfg, caPEM, leafCert, leafKey)
+	if err != nil {
+		return nil, err
+	}
+	return tunnel.Connect(ctx, "https://"+cfg.Carrier, id)
+}
+
+// keeperIdentity is the local half of keeperTunnel: what this device presents,
+// and the CA it checks FatLine against. Its failures are this device's own,
+// which no retry mends; the dial's are not.
+func keeperIdentity(cfg keeper.Config, caPEM, leafCert, leafKey []byte) (tunnel.ClientIdentity, error) {
 	cert, err := tls.X509KeyPair(leafCert, leafKey)
 	if err != nil {
-		return nil, fmt.Errorf("keeper: this device's certificate and key do not form a pair: %w", err)
+		return tunnel.ClientIdentity{}, fmt.Errorf("keeper: this device's certificate and key do not form a pair: %w", err)
 	}
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(caPEM) {
 		// Without the instance CA there is no way to tell FatLine from
 		// anything else answering on that address, and the system roots would
 		// accept exactly that.
-		return nil, fmt.Errorf("keeper: this device holds no usable CA certificate for %q", cfg.Instance)
+		return tunnel.ClientIdentity{}, fmt.Errorf("keeper: this device holds no usable CA certificate for %q", cfg.Instance)
 	}
-	return tunnel.Connect(ctx, "https://"+cfg.Carrier, tunnel.ClientIdentity{
-		Cert: cert, CA: pool, ServerName: cfg.ServerName,
-	})
+	return tunnel.ClientIdentity{Cert: cert, CA: pool, ServerName: cfg.ServerName}, nil
 }
 
 // `farcast keeper` — the devices that re-seed a restart-sealed instance
@@ -221,6 +231,16 @@ func (c *keeperEnrollCommand) Run(_ context.Context, env *Env, args []string) er
 	}
 	defer clear(leafKey)
 	expires := leafExpiry(leafCert)
+	// The token Shrike's tunnel table will attribute this leaf's streams by.
+	// Computed and recorded here because this is the only moment this
+	// machine holds the leaf: it goes to the device, and without the token
+	// the operator could never say which device a stream was. Before the
+	// packet is written, so a failure leaves no device holding a leaf this
+	// machine cannot name.
+	leafToken, err := identity.LeafTokenPEM(leafCert)
+	if err != nil {
+		return err
+	}
 
 	packet := &keeper.Packet{
 		Version: 1, Instance: name, Device: device,
@@ -255,18 +275,33 @@ func (c *keeperEnrollCommand) Run(_ context.Context, env *Env, args []string) er
 		m.Keepers = upsertKeeper(m.Keepers, config.Keeper{
 			Device: device, EnrolledAt: time.Now().UTC(), Expires: expires,
 			Generation: generation, Budget: c.budget, Window: c.window,
+			LeafTokens: []string{leafToken},
 		})
 		return nil
 	}); err != nil {
 		return fmt.Errorf("the packet was written but recording the enrolment failed: %w", err)
 	}
 
-	fprintf(env.Err, "The passphrase is the only thing protecting %s. %s\n", c.out, datasphere.KeyLossWarning)
+	warnPacketDisclosure(env.Err, c.out, name, device)
 	return env.Printer.Print(keeperEnrollResult{
 		Instance: name, Device: device, Path: c.out,
-		Generation: generation, Budget: c.budget, Window: c.window.String(), Expires: expires,
+		Generation: generation, Budget: c.budget, Window: c.window.String(), window: c.window, Expires: expires,
 		Fleet: activeKeepers(meta.Keepers, device),
 	})
+}
+
+// warnPacketDisclosure is what enroll says about the packet it wrote. The
+// hazard is disclosure, not loss: the packet holds a derived bundle and a leaf,
+// never keys.yaml, so losing it loses nothing — and whoever holds it with the
+// passphrase holds the device. What retires that is the same as for a lost
+// device, so it is said in the words 'keeper revoke' uses: revoking alone does
+// not, rotating does, and nothing undoes what was read before.
+func warnPacketDisclosure(w io.Writer, path, instance, device string) {
+	fprintf(w, "WARNING: the passphrase is the only thing protecting %s. Anyone holding the packet and the\n", path)
+	fprintf(w, "passphrase holds keeper %q: they can read what is stored under the keys it carries, and\n", device)
+	fprintf(w, "re-seed a keyholder replica that restarts. 'farcast keeper revoke' alone stops neither; rotating\n")
+	fprintf(w, "the keys does ('farcast storage key rotate %s', then 'farcast storage key rekey %s'),\n", instance, instance)
+	fprintf(w, "and nothing undoes what was read before. Losing the packet loses nothing: enrol the device again.\n")
 }
 
 type keeperEnrollResult struct {
@@ -278,13 +313,17 @@ type keeperEnrollResult struct {
 	Window     string    `json:"window"`
 	Expires    time.Time `json:"expires,omitzero"`
 	Fleet      int       `json:"fleet"`
+
+	// window is Window as a duration, for the human line. JSON keeps the
+	// flag's own syntax ("720h0m0s"), which a script can parse back.
+	window time.Duration
 }
 
 func (r keeperEnrollResult) Human(w io.Writer) error {
 	fprintf(w, "✓ enrolled %q as a keeper of %q\n", r.Device, r.Instance)
 	fprintf(w, "  packet      %s (mode 0600)\n", r.Path)
 	fprintf(w, "  bundle      generation %d\n", r.Generation)
-	fprintf(w, "  budget      %d reseeds per %s\n", r.Budget, r.Window)
+	fprintf(w, "  budget      %s per %s\n", plural(r.Budget, "reseed", "reseeds"), humanWindowOr(r.window, r.Window))
 	if !r.Expires.IsZero() {
 		fprintf(w, "  expires     %s — re-enrol before then or this device stops keeping\n",
 			r.Expires.UTC().Format(time.RFC3339))
@@ -362,7 +401,7 @@ func (c *keeperInstallCommand) Run(_ context.Context, env *Env, args []string) e
 	}
 	return env.Printer.Print(keeperInstallResult{
 		Instance: cfg.Instance, Device: cfg.Device, Dir: store.Dir(),
-		Generation: cfg.Generation, Budget: cfg.Budget, Window: cfg.Window.String(),
+		Generation: cfg.Generation, Budget: cfg.Budget, Window: cfg.Window.String(), window: cfg.Window,
 		BackupExcluded: cfg.BackupExcluded, BackupNote: cfg.BackupNote,
 	})
 }
@@ -376,17 +415,34 @@ type keeperInstallResult struct {
 	Window         string `json:"window"`
 	BackupExcluded bool   `json:"backup_excluded"`
 	BackupNote     string `json:"backup_note,omitempty"`
+
+	// window is Window as a duration, for the human line (see keeperEnrollResult).
+	window time.Duration
 }
+
+// humanWindowOr names a budget window in days for a person, falling back to
+// the recorded string when the duration was not carried.
+func humanWindowOr(d time.Duration, recorded string) string {
+	if d > 0 {
+		return keeper.HumanWindow(d)
+	}
+	return recorded
+}
+
+// backupNote prints a keeper's recorded backup reason. Records written before
+// the reason lost its package prefix still carry "keeper: ", which reads as a
+// log line in the middle of a sentence.
+func backupNote(s string) string { return strings.TrimPrefix(s, "keeper: ") }
 
 func (r keeperInstallResult) Human(w io.Writer) error {
 	fprintf(w, "✓ this device is now keeper %q of %q\n", r.Device, r.Instance)
 	fprintf(w, "  state       %s (mode 0700)\n", r.Dir)
 	fprintf(w, "  bundle      generation %d\n", r.Generation)
-	fprintf(w, "  budget      %d reseeds per %s\n", r.Budget, r.Window)
+	fprintf(w, "  budget      %s per %s\n", plural(r.Budget, "reseed", "reseeds"), humanWindowOr(r.window, r.Window))
 	if r.BackupExcluded {
 		fprintf(w, "  backup      excluded, and the exclusion was read back\n")
 	} else {
-		fprintf(w, "  backup      NOT verifiably excluded — %s\n", r.BackupNote)
+		fprintf(w, "  backup      NOT verifiably excluded — %s\n", backupNote(r.BackupNote))
 		fprintf(w, "              You accepted this. Keep the directory off every backup and sync path yourself.\n")
 	}
 	fprintf(w, "\nStart keeping:  farcast keeper run %s\n", r.Instance)
@@ -398,6 +454,9 @@ func (r keeperInstallResult) Human(w io.Writer) error {
 type keeperRunCommand struct {
 	interval time.Duration
 	once     bool
+	// check is one pass; nil is keeperCheck. A seam, so the exit status of
+	// --once and the loop's refusal to exit are tested without a tunnel.
+	check func(ctx context.Context, env *Env, store *keeper.Store, cfg keeper.Config) (keeperPassResult, error)
 }
 
 func (*keeperRunCommand) Name() string     { return "run" }
@@ -413,6 +472,21 @@ back sealed from a restart.
 Flags:
       --interval <duration>   How often to check (default 15m)
       --once                  Check once and exit, for a timer or a test
+
+With --once, the exit status says what the pass found:
+  0   kept: every replica serves, was re-seeded, or is held by the operator
+  3   cannot keep until a person acts: a stale bundle, an unreadable pin, a
+      spent budget, or a leaf that does not bind its bundle or has expired
+  4   incomplete: a replica or the tunnel did not answer, or another keeper
+      pass on this device was running; the next pass retries
+  1   a fault on this device: its store, ledger or bundle could not be read,
+      or its ledger would not take a write
+A re-seed is recorded in the ledger before it is pushed, and is not pushed
+when that write fails. A ledger that would not take a write outranks 3 and 4:
+that pass still reports every replica, exits 1, and its error names what else
+it found. A push refused after its bundle was sent counts against the budget
+as one that landed: whatever answered had the bundle.
+Without --once it never exits on any of these: it reports, and checks again.
 
 The check is OUTBOUND-ONLY: this device dials FatLine and nothing listens here.
 Every flow of key material starts on your hardware, and leaves a ledger entry
@@ -449,13 +523,34 @@ func (c *keeperRunCommand) Run(ctx context.Context, env *Env, args []string) err
 		return fmt.Errorf("%w on %s (%s); its ledger remains, and 'farcast keeper status %s' still reads it",
 			keeper.ErrWiped, cfg.WipedAt.Format("2006-01-02"), cfg.WipedReason, name)
 	}
+	check := c.check
+	if check == nil {
+		check = keeperCheck
+	}
+	// One pass at a time on this device (keeper.Store.LockPass): a pass that
+	// finds another running is incomplete, and the next one retries.
+	check = lockedPass(check)
 	if c.once {
-		_, err := keeperCheck(ctx, env, store, cfg)
-		return err
+		pass, err := check(ctx, env, store, cfg)
+		if err != nil {
+			// A fault on this device outranks what the pass found: a timer
+			// that read 3 or 4 here would never learn that the ledger — the
+			// control — stopped counting. What the pass found is kept in the
+			// one line a timer's log keeps, as text only (%v), so it cannot
+			// carry its own exit code over the fault's.
+			if perr := keeperPassError(cfg.Instance, pass); perr != nil {
+				return fmt.Errorf("%w (the pass also found: %v)", err, perr)
+			}
+			return err
+		}
+		return keeperPassError(cfg.Instance, pass)
 	}
 	fprintf(env.Err, "Keeping %q as %q — checking about every %s, outbound only.\n", cfg.Instance, cfg.Device, c.interval)
 	for {
-		if _, err := keeperCheck(ctx, env, store, cfg); err != nil {
+		// The pass's outcome is not consulted here, on purpose: it has been
+		// reported, and a keeper that exited on a refusal or an unreachable
+		// tunnel would be absent for the next restart, which is what it is for.
+		if _, err := check(ctx, env, store, cfg); err != nil {
 			if errors.Is(err, keeper.ErrWiped) {
 				// Wiped while running — an uninstall, or a release on this
 				// machine. Nothing is left to keep.
@@ -475,6 +570,24 @@ func (c *keeperRunCommand) Run(ctx context.Context, env *Env, args []string) err
 	}
 }
 
+// lockedPass is check run under this device's pass lock. A pass that finds
+// another running makes no call to any replica and writes nothing: it comes
+// back as incomplete (exit 4 with --once), and the loop reports it and checks
+// again.
+func lockedPass(check func(context.Context, *Env, *keeper.Store, keeper.Config) (keeperPassResult, error)) func(context.Context, *Env, *keeper.Store, keeper.Config) (keeperPassResult, error) {
+	return func(ctx context.Context, env *Env, store *keeper.Store, cfg keeper.Config) (keeperPassResult, error) {
+		release, err := store.LockPass()
+		if errors.Is(err, keeper.ErrPassRunning) {
+			return keeperPassResult{}, &exitCodeError{code: exitIncomplete, err: fmt.Errorf("%w, so this one made no push; the next one retries", err)}
+		}
+		if err != nil {
+			return keeperPassResult{}, err
+		}
+		defer release()
+		return check(ctx, env, store, cfg)
+	}
+}
+
 // jitter spreads a poll by up to a quarter of the interval, in both
 // directions. See the usage text: a fleet's cadence is metadata.
 func jitter(d time.Duration) time.Duration {
@@ -488,32 +601,94 @@ func jitter(d time.Duration) time.Duration {
 	return d + time.Duration(rand.Int64N(2*spread)-spread)
 }
 
+// keeperPassResult is what one pass found: each replica's decision, and the
+// fleet's verdict on this device's bundle, which can refuse it while every
+// replica serves and no decision says so.
+type keeperPassResult struct {
+	Decisions []keeper.Decision
+	Fleet     keeper.Fleet
+}
+
+// keeperPassError is --once's answer: nil when the pass kept the instance,
+// and otherwise an error carrying the exit code that says whether a person
+// must act (3) or the next pass retries (4). What each replica got has already
+// been reported; this is the one line a timer's log keeps.
+func keeperPassError(instance string, pass keeperPassResult) error {
+	switch keeper.PassOutcome(pass.Decisions, pass.Fleet) {
+	case keeper.OutcomeKept:
+		return nil
+	case keeper.OutcomeIncomplete:
+		why := "a replica did not answer"
+		for _, d := range pass.Decisions {
+			if d.Action.Outcome() == keeper.OutcomeIncomplete {
+				// A reason can carry a replica's words — a State or push
+				// error, a refusal — and this error keeps its newlines when
+				// printed: quoted, it stays one line. The same below, and for
+				// the fleet's verdict, which can name a scope a replica serves.
+				why = fmt.Sprintf("replica %d: %s — %s", d.Ordinal, d.Action, terminalText(d.Reason))
+				break
+			}
+		}
+		return &exitCodeError{code: exitIncomplete, err: fmt.Errorf("the pass over %q did not finish (%s); the next one retries", instance, why)}
+	default:
+		why := terminalText(pass.Fleet.Refusal())
+		if why == "" {
+			for _, d := range pass.Decisions {
+				if d.Action.Outcome() == keeper.OutcomeCannotKeep {
+					why = fmt.Sprintf("replica %d: %s — %s", d.Ordinal, d.Action, terminalText(d.Reason))
+					break
+				}
+			}
+		}
+		return &exitCodeError{code: exitCannotKeep, err: fmt.Errorf("this device cannot keep %q: %s", instance, why)}
+	}
+}
+
 // keeperCheck is one pass over the instance's replicas.
-func keeperCheck(ctx context.Context, env *Env, store *keeper.Store, cfg keeper.Config) ([]keeper.Decision, error) {
+func keeperCheck(ctx context.Context, env *Env, store *keeper.Store, cfg keeper.Config) (keeperPassResult, error) {
 	caPEM, leafCert, leafKey, bundle, err := store.Material()
 	if err != nil {
-		return nil, err
+		return keeperPassResult{}, err
 	}
 	defer clear(bundle)
 	defer clear(leafKey)
-	// Before dialling: a leaf that does not bind this bundle is refused by
-	// every keyholder, and saying so here is cheaper and clearer than a
-	// refusal per replica per pass.
-	if err := leafBindsBundle(leafCert, bundle); err != nil {
-		return nil, err
+	if err := keeperLeafUsable(leafCert, bundle, time.Now()); err != nil {
+		return keeperPassResult{}, err
 	}
 
-	conn, err := keeperTunnel(ctx, cfg, caPEM, leafCert, leafKey)
+	id, err := keeperIdentity(cfg, caPEM, leafCert, leafKey)
 	if err != nil {
-		return nil, fmt.Errorf("cannot reach %q: %w", cfg.Instance, err)
+		return keeperPassResult{}, err
+	}
+	conn, err := tunnel.Connect(ctx, "https://"+cfg.Carrier, id)
+	if err != nil {
+		return keeperPassResult{}, &exitCodeError{code: exitIncomplete, err: fmt.Errorf("cannot reach %q: %w", cfg.Instance, err)}
 	}
 	defer func() { _ = conn.Close() }()
 
 	client, err := keyholder.New(keyholder.Conn(conn), cfg.Instance, caPEM, leafCert, leafKey)
 	if err != nil {
-		return nil, err
+		return keeperPassResult{}, err
 	}
 	return keeperCheckWith(ctx, env, store, cfg, client, bundle)
+}
+
+// keeperLeafUsable is what a keeper checks of its own leaf before dialling.
+// Each failure is one every keyholder would answer the same way on every
+// pass, so it is a person's to act on (exit 3) and not a retry's. Saying so
+// here is cheaper and clearer than a refusal per replica per pass — and an
+// expired leaf would otherwise fail at the TLS handshake, which looks exactly
+// like a tunnel that did not answer, forever.
+func keeperLeafUsable(leafPEM, bundle []byte, now time.Time) error {
+	if err := leafBindsBundle(leafPEM, bundle); err != nil {
+		return &exitCodeError{code: exitCannotKeep, err: err}
+	}
+	if exp := leafExpiry(leafPEM); !exp.IsZero() && now.After(exp) {
+		return &exitCodeError{code: exitCannotKeep, err: fmt.Errorf(
+			"this device's certificate expired on %s, and every keyholder refuses it; re-enrol it with 'farcast keeper enroll' on the operator's machine",
+			exp.Format(time.RFC3339))}
+	}
+	return nil
 }
 
 // keeperCheckWith is everything a keeper decides and does once it can reach
@@ -522,10 +697,15 @@ func keeperCheck(ctx context.Context, env *Env, store *keeper.Store, cfg keeper.
 // that wiring is what stops a keeper enrolled before a rotation putting the
 // retired keys back into a replica that restarted, and nothing could reach it
 // while it lived behind a real tunnel.
-func keeperCheckWith(ctx context.Context, env *Env, store *keeper.Store, cfg keeper.Config, client sealStateClient, bundle []byte) ([]keeper.Decision, error) {
+//
+// Its one error that comes back WITH a pass is a ledger write that failed —
+// before a push, which is then not made, or after one, whose outcome is then
+// unknown to the ledger: the pass finished, and what it found is still worth
+// saying.
+func keeperCheckWith(ctx context.Context, env *Env, store *keeper.Store, cfg keeper.Config, client sealStateClient, bundle []byte) (keeperPassResult, error) {
 	entries, err := keyholder.ReadLedger(store.LedgerPath())
 	if err != nil {
-		return nil, err
+		return keeperPassResult{}, err
 	}
 	// Every replica first. Whether this device's bundle is out of date is a
 	// question about the whole fleet: a replica that restarted holds nothing
@@ -537,12 +717,21 @@ func keeperCheckWith(ctx context.Context, env *Env, store *keeper.Store, cfg kee
 	}
 	parsed, err := datasphere.ParseBundle(bundle)
 	if err != nil {
-		return nil, fmt.Errorf("this device's bundle could not be read: %w", err)
+		return keeperPassResult{}, fmt.Errorf("this device's bundle could not be read: %w", err)
 	}
 	fleet := keeper.FleetOf(parsed, states, stErrs)
 	parsed.Zero()
+	// The fleet's verdict on this bundle, once per pass and whether or not
+	// any replica is sealed: a keeper learns it is stale at the rotation,
+	// not at the next restart. Each replica it stops then points here.
+	if why := fleet.Refusal(); why != "" {
+		fprintf(env.Err, "this device: %s — %s\n", keeper.ActionStale, terminalText(why))
+	}
 
 	decisions := make([]keeper.Decision, 0, keeperReplicas)
+	// unrecorded is the first ledger write that failed. The pass goes on —
+	// every replica is still decided and reported — and ends in that error.
+	var unrecorded error
 	for i := range keeperReplicas {
 		budget := keeper.Budget(entries, cfg.Budget, cfg.Window, time.Now().UTC())
 		st, stErr := states[i], stErrs[i]
@@ -552,32 +741,72 @@ func keeperCheckWith(ctx context.Context, env *Env, store *keeper.Store, cfg kee
 			keeperReport(env, cfg, d, st)
 			continue
 		}
+		// The push is recorded before it is made, and not made when that
+		// fails. Recorded afterwards, a ledger that reads but no longer
+		// writes — mode 0400 after a restore, a read-only remount, a full
+		// disk — would let every pass push and never count it, since the
+		// budget is read back from the ledger; a cluster that restarts its
+		// replicas between passes would then be re-seeded without limit.
+		//
+		// Both entries carry one random push id, and only this push's outcome
+		// settles this pending entry: another keeper process on this device
+		// can announce a push to the same replica in between, and pairing by
+		// replica would let its outcome settle this one.
+		push := keeper.NewPushID()
+		intent := keyholder.LedgerEntry{
+			Time: time.Now().UTC(), Instance: cfg.Instance, Ordinal: i,
+			Intent: keeper.IntentReseed, Generation: cfg.Generation,
+			Device: cfg.Device, Boot: st.Boot, Result: keeper.ResultPending, Push: push,
+		}
+		if lerr := keyholder.AppendLedger(store.LedgerPath(), intent); lerr != nil {
+			if unrecorded == nil {
+				unrecorded = fmt.Errorf("this device's ledger did not take the entry a re-seed is recorded in before it is pushed, so none was: %w", lerr)
+			}
+			d.Action, d.Reason = keeper.ActionLedgerUnwritable, "restart-sealed, and not re-seeded: this device's ledger cannot record the push"
+			decisions[len(decisions)-1] = d
+			keeperReport(env, cfg, d, st)
+			continue
+		}
+		entries = append(entries, intent)
 		pushed, pushErr := client.Unseal(ctx, i, bundle, keeper.IntentReseed)
 		entry := keyholder.LedgerEntry{
 			Time: time.Now().UTC(), Instance: cfg.Instance, Ordinal: i,
 			Intent: keeper.IntentReseed, Generation: cfg.Generation,
-			Device: cfg.Device, Boot: st.Boot, Result: "ok",
+			Device: cfg.Device, Boot: st.Boot, Result: "ok", Push: push,
 		}
+		// A refusal is recorded by whether the bundle had been sent when it
+		// came: a refusal after sending counts against the budget and in the
+		// audit like a push, because whatever answered the challenge had the
+		// bundle (keeper.ResultRefusedAfterSend). Only a push that sent
+		// nothing is a plain "refused".
+		refused := keeper.ResultRefusedAfterSend
+		if keyholder.NothingSent(pushErr) {
+			refused = "refused"
+		}
+		// The reasons below that carry pushErr carry a replica's words. They
+		// leave this function only through keeperReport and keeperPassError,
+		// and each quotes a reason as one line.
 		switch {
 		case keyholder.AlreadyServing(pushErr):
 			// Unsealed between the read and the push — by the operator, or by
-			// another keeper. Nothing to do, and nothing went wrong.
-			entry.Result = "refused"
+			// another keeper. Nothing to do, and the pass kept the instance;
+			// the bundle was still sent, so the push counts (above).
+			entry.Result = refused
 			d.Action, d.Reason = keeper.ActionNone, "already serving: another pusher reached it first"
 		case keyholder.PinUnreadable(pushErr):
 			// It restarted between the read and the push and cannot read its
 			// pin: it refuses every re-seed whatever the bundle, so a
 			// re-enrolment would change nothing.
-			entry.Result = "refused"
-			d.Action, d.Reason = keeper.ActionStale, keeper.PinUnreadableReason(i)
+			entry.Result = refused
+			d.Action, d.Reason = keeper.ActionPinUnreadable, keeper.PinUnreadableReason()
 		case keyholder.BelowPin(pushErr), keyholder.KeeperBundle(pushErr):
 			// The keyholder's own refusal of this device's bundle: the pin
 			// moved past it since the read, or the leaf does not bind it.
 			// Either way only a re-enrolment changes the answer.
-			entry.Result = "refused"
+			entry.Result = refused
 			d.Action, d.Reason = keeper.ActionStale, pushErr.Error()+"; re-enrol this device"
 		case pushErr != nil:
-			entry.Result = "refused"
+			entry.Result = refused
 			d.Action, d.Reason = keeper.ActionUnknown, pushErr.Error()
 		default:
 			entry.Phase = pushed.Phase
@@ -591,14 +820,31 @@ func keeperCheckWith(ctx context.Context, env *Env, store *keeper.Store, cfg kee
 		}
 		decisions[len(decisions)-1] = d
 		if lerr := keyholder.AppendLedger(store.LedgerPath(), entry); lerr != nil {
-			// Loud, because the ledger is the control. A push nobody recorded
-			// is the one an audit cannot account for later.
-			fprintf(env.Err, "WARNING: a reseed was not recorded in the ledger: %v\n", lerr)
+			// Loud, because the ledger is the control. The pending entry
+			// above stands for this push, so the budget still counts it — as
+			// a success, whatever it was — and the audit reads it as
+			// unconfirmed.
+			fprintf(env.Err, "WARNING: the outcome of a reseed was not recorded in the ledger; it counts against the budget as done: %v\n", lerr)
+			if unrecorded == nil {
+				unrecorded = fmt.Errorf("the outcome of a re-seed was not recorded in this device's ledger, so the budget counts it as done and an audit reads it as unconfirmed: %w", lerr)
+			}
+		} else {
+			// The rest of this pass budgets from what the ledger holds, as the
+			// next pass will: a lost outcome leaves its pending entry standing.
+			entries = append(entries, entry)
 		}
-		entries = append(entries, entry)
 		keeperReport(env, cfg, d, st)
 	}
-	return decisions, nil
+	pass := keeperPassResult{Decisions: decisions, Fleet: fleet}
+	if unrecorded != nil {
+		// A fault on this device, and not a warning: the ledger is the
+		// control, and a keeper on a timer that exited 0 here would leave a
+		// ledger that no longer takes writes with nobody told. Every replica
+		// was still decided and reported above; the pass comes back beside
+		// the error so --once can name what else it found.
+		return pass, unrecorded
+	}
+	return pass, nil
 }
 
 // leafBindsBundle checks that this device's leaf names the bundle it holds.
@@ -632,17 +878,27 @@ func leafBindsBundle(leafPEM, bundle []byte) error {
 // there answers with a dial error, which the pass reports and moves past.
 const keeperReplicas = 2
 
+// keeperReport says what one replica got. Its words are partly the
+// keyholder's — a phase, a boot label, a refusal's message, an operator's hold
+// reason — read back through the tunnel, so each goes through terminalText:
+// this lands in the device's terminal or its journal.
 func keeperReport(env *Env, cfg keeper.Config, d keeper.Decision, st keyholder.State) {
 	switch d.Action {
 	case keeper.ActionNone:
 		if env.Verbose {
-			fprintf(env.Err, "replica %d: %s\n", d.Ordinal, d.Reason)
+			fprintf(env.Err, "replica %d: %s\n", d.Ordinal, terminalText(d.Reason))
 		}
 	case keeper.ActionReseed:
 		fprintf(env.Err, "replica %d: re-seeded %s at generation %d (process %s)\n",
-			d.Ordinal, cfg.Instance, cfg.Generation, shortBoot(st.Boot))
+			d.Ordinal, cfg.Instance, cfg.Generation, terminalText(shortBoot(st.Boot)))
 	default:
-		fprintf(env.Err, "replica %d: %s — %s\n", d.Ordinal, d.Action, d.Reason)
+		if d.FleetWide {
+			// The why is the fleet's, printed once above this pass's replicas.
+			fprintf(env.Err, "replica %d: %s — %s, and not re-seeded: this device's bundle is refused (above)\n",
+				d.Ordinal, d.Action, terminalText(st.Phase))
+			return
+		}
+		fprintf(env.Err, "replica %d: %s — %s\n", d.Ordinal, d.Action, terminalText(d.Reason))
 	}
 }
 
@@ -723,11 +979,14 @@ func (*keeperStatusCommand) Run(_ context.Context, env *Env, args []string) erro
 		entry.Wiped, entry.WipedReason = cfg.WipedAt, cfg.WipedReason
 		entry.BackupExcluded, entry.BackupNote = cfg.BackupExcluded, cfg.BackupNote
 		entry.Reseeds, entry.Boots, entry.Refused = audit.Reseeds, audit.Boots, audit.Refused
-		entry.Unlabelled = audit.Unlabelled
+		entry.Unlabelled, entry.Unconfirmed = audit.Unlabelled, audit.Unconfirmed
+		entry.RefusedAfterSend = audit.RefusedAfterSend
 		entry.BudgetUsed, entry.BudgetLimit = budget.Used, budget.Limit
 		for _, d := range audit.Divergent {
-			entry.Divergent = append(entry.Divergent, fmt.Sprintf(
-				"process %s re-seeded %d times (last %s)", shortBoot(d.Boot), d.Count, d.Last.UTC().Format(time.RFC3339)))
+			entry.Divergent = append(entry.Divergent, divergentRow(d))
+			if d.Unconfirmed > 0 || d.RefusedAfterSend > 0 {
+				entry.DivergentQualified = true
+			}
 		}
 		results = append(results, entry)
 	}
@@ -747,19 +1006,46 @@ func (*keeperStatusCommand) Run(_ context.Context, env *Env, args []string) erro
 	})
 }
 
+// divergentRow is one process the audit found re-seeded more than once, and
+// which of those pushes were not plain successes: an unconfirmed one may never
+// have landed (a keeper stopped between recording it and making it), and one
+// refused after sending may have lost a race to another pusher. Neither rules
+// a solicitation out, so the row stays and says so.
+func divergentRow(d keeper.BootCount) string {
+	row := fmt.Sprintf("process %s re-seeded %d times (last %s)", terminalText(shortBoot(d.Boot)), d.Count, d.Last.UTC().Format(time.RFC3339))
+	var of []string
+	if d.Unconfirmed > 0 {
+		of = append(of, fmt.Sprintf("%d unconfirmed", d.Unconfirmed))
+	}
+	if d.RefusedAfterSend > 0 {
+		of = append(of, fmt.Sprintf("%d refused after the bundle was sent", d.RefusedAfterSend))
+	}
+	if len(of) > 0 {
+		row += ": " + strings.Join(of, ", ")
+	}
+	return row
+}
+
 type keeperStatusEntry struct {
-	Instance       string   `json:"instance"`
-	Device         string   `json:"device,omitempty"`
-	Generation     uint64   `json:"generation,omitempty"`
-	Reseeds        int      `json:"reseeds"`
-	Boots          int      `json:"boots"`
-	Refused        int      `json:"refused"`
-	Unlabelled     int      `json:"unlabelled,omitempty"`
-	BudgetUsed     int      `json:"budget_used"`
-	BudgetLimit    int      `json:"budget_limit"`
-	BackupExcluded bool     `json:"backup_excluded"`
-	BackupNote     string   `json:"backup_note,omitempty"`
-	Divergent      []string `json:"divergent,omitempty"`
+	Instance    string `json:"instance"`
+	Device      string `json:"device,omitempty"`
+	Generation  uint64 `json:"generation,omitempty"`
+	Reseeds     int    `json:"reseeds"`
+	Boots       int    `json:"boots"`
+	Refused     int    `json:"refused"`
+	Unlabelled  int    `json:"unlabelled,omitempty"`
+	Unconfirmed int    `json:"unconfirmed,omitempty"`
+	// RefusedAfterSend counts pushes refused after their bundle was sent;
+	// each is in Reseeds too. Refused is the pushes that sent nothing.
+	RefusedAfterSend int      `json:"refused_after_send,omitempty"`
+	BudgetUsed       int      `json:"budget_used"`
+	BudgetLimit      int      `json:"budget_limit"`
+	BackupExcluded   bool     `json:"backup_excluded"`
+	BackupNote       string   `json:"backup_note,omitempty"`
+	Divergent        []string `json:"divergent,omitempty"`
+	// DivergentQualified is set when a Divergent row counts a push that was
+	// unconfirmed or refused after sending, which the human view explains.
+	DivergentQualified bool `json:"-"`
 	// Wiped is when this device's bundle and key were wiped; its ledger and
 	// record remain, which is what this entry reads.
 	Wiped       time.Time `json:"wiped,omitzero"`
@@ -873,17 +1159,23 @@ func (r keeperStatusResult) Human(w io.Writer) error {
 		if !e.Wiped.IsZero() {
 			fprintf(w, "  material    wiped %s (%s) — this device no longer keeps it\n", e.Wiped.Format("2006-01-02"), e.WipedReason)
 		}
-		fprintf(w, "  reseeds     %d into %d distinct keyholder processes", e.Reseeds, e.Boots)
+		fprintf(w, "  reseeds     %d into %s", e.Reseeds, plural(e.Boots, "distinct keyholder process", "distinct keyholder processes"))
 		if e.Refused > 0 {
 			fprintf(w, ", %d refused", e.Refused)
 		}
 		fprintln(w, "")
 		fprintf(w, "  budget      %d of %d used\n", e.BudgetUsed, e.BudgetLimit)
 		if !e.BackupExcluded {
-			fprintf(w, "  backup      NOT verifiably excluded — %s\n", e.BackupNote)
+			fprintf(w, "  backup      NOT verifiably excluded — %s\n", backupNote(e.BackupNote))
 		}
 		if e.Unlabelled > 0 {
 			fprintf(w, "  unlabelled  %d reseed(s) name no process, so they cannot be reconciled\n", e.Unlabelled)
+		}
+		if e.Unconfirmed > 0 {
+			fprintf(w, "  unconfirmed %d push(es) recorded before they were made and never after, counted above as re-seeds\n", e.Unconfirmed)
+		}
+		if e.RefusedAfterSend > 0 {
+			fprintf(w, "  after send  %d push(es) refused after the bundle was sent, counted above as re-seeds\n", e.RefusedAfterSend)
 		}
 		if len(e.Divergent) == 0 {
 			fprintf(w, "  audit       nothing to explain — no process was re-seeded twice\n")
@@ -894,6 +1186,11 @@ func (r keeperStatusResult) Human(w io.Writer) error {
 			}
 			fprintf(w, "              A process is sealed once per restart. A second push into a live one\n")
 			fprintf(w, "              means something asked for key material it already held.\n")
+			if e.DivergentQualified {
+				fprintf(w, "              An unconfirmed push may never have landed — a keeper stopped between\n")
+				fprintf(w, "              recording a push and making it reads the same — and one refused after\n")
+				fprintf(w, "              sending may have lost a race to another pusher. Neither rules it out.\n")
+			}
 		}
 	}
 	if len(r.Fleet) > 0 {
@@ -923,8 +1220,8 @@ func (r keeperStatusResult) Human(w io.Writer) error {
 					b.Instance, b.Reseeds, b.Devices)
 				continue
 			}
-			fprintf(w, "  %-12s fleet budget: up to %d reseeds per %s across %d device(s)\n",
-				b.Instance, b.Reseeds, b.Window, b.Devices)
+			fprintf(w, "  %-12s fleet budget: up to %s per %s across %d device(s)\n",
+				b.Instance, plural(b.Reseeds, "reseed", "reseeds"), b.Window, b.Devices)
 		}
 		if len(r.FleetBudget) > 0 {
 			fprintln(w, "  The fleet budget is a total of limits, not of use: each device's ledger is on that device.")
@@ -962,11 +1259,19 @@ command prints how rather than implying it already happened:
                                           predate the rotation
 
 What that does not undo is printed too. Names stay computable, because a
-scope's name key cannot rotate. And until the device's certificate expires it
-can still re-seed a keyholder replica that restarts, with its old keys. A
-replica already serving refuses a re-seed, and an honest keeper never tries;
-a device in someone else's hands may, and 'farcast storage state' flags a
-replica serving keys other than this machine's keyring.`)
+scope's name key cannot rotate. Rekey covers only what is already stored.
+
+Until 'farcast storage key rotate' writes the instance's key pin, the device
+can re-seed a keyholder replica that restarts, with the keys it holds — which
+are today's keys. A replica already serving refuses a re-seed. Once the pin is
+written, every replica refuses the device's bundle (below-pin), serving, sealed
+or restarted, and its leaf binds that one bundle, so it has no other to push.
+
+The pin protects only while a replica has loaded it: one that starts without it
+checks nothing. 'farcast storage state' reports that as "none loaded", and
+'farcast storage key pin' restores it. Until its certificate expires the device
+can still reach the keyholder and read each replica's state; it cannot release
+an operator's hold.`)
 }
 
 func (c *keeperRevokeCommand) SetFlags(fs *flag.FlagSet) {
@@ -1070,11 +1375,20 @@ func (r keeperRevokeResult) Human(w io.Writer) error {
 	fprintln(w, "    anyone captured before the rekey, stays exposed")
 	fprintln(w, "  - names: a scope's name key cannot rotate, so the bundle can still compute")
 	fprintln(w, "    where each application's objects are stored")
-	fprintln(w, "  - until its certificate expires, the device can still re-seed a keyholder")
-	fprintln(w, "    replica that restarts, with its old keys. A replica already serving refuses")
-	fprintln(w, "    it, and an honest keeper never tries; a device in someone else's hands may.")
-	fprintf(w, "    'farcast storage state %s' flags a replica serving keys other than this\n", r.Instance)
-	fprintln(w, "    machine's keyring — the generation is no sign, since a bundle carries any.")
+	fprintln(w, "  - until the rotation writes the instance's key pin, the device can re-seed a")
+	fprintln(w, "    keyholder replica that restarts, with the keys it holds, which are today's.")
+	fprintln(w, "    A replica already serving refuses a re-seed.")
+	fprintln(w, "  - once the pin is written, every replica refuses the device's bundle")
+	fprintln(w, "    (below-pin), and its leaf binds that one bundle, so it has no other to push.")
+	fprintln(w, "  - the pin protects only while a replica has loaded it; one that starts without")
+	fprintf(w, "    it checks nothing. 'farcast storage state %s' reports that as \"none loaded\",\n", r.Instance)
+	fprintf(w, "    and 'farcast storage key pin %s' restores it.\n", r.Instance)
+	if !r.Expires.IsZero() {
+		fprintf(w, "  - until its certificate expires (%s), the device can still reach the\n", r.Expires.UTC().Format("2006-01-02"))
+	} else {
+		fprintln(w, "  - until its certificate expires, the device can still reach the")
+	}
+	fprintln(w, "    keyholder and read each replica's state; it cannot release an operator's hold.")
 	if r.Remaining < 2 {
 		fprintf(w, "\n%q now has %d active keeper(s). Enrol another before you rely on unattended recovery.\n",
 			r.Instance, r.Remaining)
@@ -1090,6 +1404,11 @@ func upsertKeeper(list []config.Keeper, k config.Keeper) []config.Keeper {
 			// Re-enrolment replaces the row and clears a revocation: the
 			// operator has just issued this device a fresh leaf, which is a
 			// deliberate readmission rather than an accident.
+			//
+			// Except the leaf tokens, which accumulate. The earlier leaf is
+			// still valid in the cluster until its own NotAfter, and a stream
+			// it opens must still be named as this device's.
+			k.LeafTokens = append(slices.Clone(list[i].LeafTokens), k.LeafTokens...)
 			list[i] = k
 			return list
 		}

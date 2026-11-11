@@ -87,9 +87,13 @@ func TestDecide(t *testing.T) {
 	})
 }
 
-// The budget counts key material that actually MOVED. Counting refusals would
-// let anything that can make a keeper fail — an unreachable tunnel, a stale
-// bundle — spend the budget that bounds how often material moves.
+// The budget counts pushes whose bundle LEFT the device inside the window. A
+// push refused before anything was sent ("refused": no dial, no handshake, no
+// challenge) moved nothing, and counting it would let an unreachable tunnel
+// spend the budget that bounds how often material moves. One refused AFTER
+// sending did go out — to whatever answered the challenge — and counts
+// (review finding V3-3): a solicitor that reads the bundle and answers with a
+// refusal must still trip the budget.
 func TestBudgetCountsSuccessfulReseedsInsideTheWindow(t *testing.T) {
 	now := time.Now().UTC()
 	entries := []keyholder.LedgerEntry{
@@ -98,10 +102,12 @@ func TestBudgetCountsSuccessfulReseedsInsideTheWindow(t *testing.T) {
 		{Time: now.Add(-3 * time.Hour), Intent: IntentReseed, Result: "refused"},
 		{Time: now.Add(-4 * time.Hour), Intent: "operator-unseal", Result: "ok"},
 		{Time: now.Add(-40 * 24 * time.Hour), Intent: IntentReseed, Result: "ok"},
+		{Time: now.Add(-5 * time.Hour), Intent: IntentReseed, Result: ResultRefusedAfterSend},
+		{Time: now.Add(-41 * 24 * time.Hour), Intent: IntentReseed, Result: ResultRefusedAfterSend},
 	}
 	b := Budget(entries, 8, DefaultWindow, now)
-	if b.Used != 2 {
-		t.Errorf("Used = %d, want 2 (refusals, operator unseals and expired entries do not count)", b.Used)
+	if b.Used != 3 {
+		t.Errorf("Used = %d, want 3 (two successes and a refusal after sending; refusals that sent nothing, operator unseals and expired entries do not count)", b.Used)
 	}
 	if !b.Allowed {
 		t.Error("Allowed = false with 2 of 8 used")
@@ -116,6 +122,49 @@ func TestBudgetCountsSuccessfulReseedsInsideTheWindow(t *testing.T) {
 	}
 	if Budget(full, 8, DefaultWindow, now).Allowed {
 		t.Error("Allowed = true at the limit")
+	}
+}
+
+// Review finding RV2-1. A push is recorded as pending before it is made. A
+// pending entry its outcome settled is not a second push; one nothing settled
+// counts as a success, so a ledger that lost the outcome cannot stop the
+// budget counting.
+func TestBudgetCountsAnUnsettledPushAsDone(t *testing.T) {
+	now := time.Now().UTC()
+	at := func(h int, ordinal int, result string, push ...string) keyholder.LedgerEntry {
+		e := keyholder.LedgerEntry{Time: now.Add(-time.Duration(h) * time.Hour), Instance: "prod", Device: "d",
+			Ordinal: ordinal, Intent: IntentReseed, Result: result}
+		if len(push) > 0 {
+			e.Push = push[0]
+		}
+		return e
+	}
+	for _, tc := range []struct {
+		name    string
+		entries []keyholder.LedgerEntry
+		used    int
+	}{
+		{"settled ok", []keyholder.LedgerEntry{at(5, 0, ResultPending, "p"), at(5, 0, "ok", "p")}, 1},
+		{"settled refused", []keyholder.LedgerEntry{at(5, 0, ResultPending, "p"), at(5, 0, "refused", "p")}, 0},
+		{"settled refused after sending", []keyholder.LedgerEntry{at(5, 0, ResultPending, "p"), at(5, 0, ResultRefusedAfterSend, "p")}, 1},
+		{"unsettled", []keyholder.LedgerEntry{at(5, 0, ResultPending, "p")}, 1},
+		{"unsettled, then another replica's push", []keyholder.LedgerEntry{
+			at(5, 0, ResultPending, "p"), at(5, 1, ResultPending, "q"), at(5, 1, "ok", "q")}, 2},
+		{"another push's outcome settles nothing", []keyholder.LedgerEntry{
+			at(5, 0, ResultPending, "p"), at(5, 0, ResultPending, "q"), at(5, 0, "ok", "q")}, 2},
+		{"no id, nothing settles it", []keyholder.LedgerEntry{at(5, 0, ResultPending), at(5, 0, "refused")}, 1},
+		{"unsettled, outside the window", []keyholder.LedgerEntry{at(40*24, 0, ResultPending, "p")}, 0},
+	} {
+		if b := Budget(tc.entries, 8, DefaultWindow, now); b.Used != tc.used {
+			t.Errorf("%s: Used = %d, want %d", tc.name, b.Used, tc.used)
+		}
+	}
+	spent := make([]keyholder.LedgerEntry, 8)
+	for i := range spent {
+		spent[i] = at(i, 0, ResultPending)
+	}
+	if Budget(spent, 8, DefaultWindow, now).Allowed {
+		t.Error("eight pushes whose outcomes were lost left the budget open")
 	}
 }
 
@@ -363,10 +412,143 @@ func TestAnUnreadablePinStopsOnlyThatReplica(t *testing.T) {
 	}
 	fleet := FleetOf(mine, states, []error{nil, nil})
 	budget := BudgetState{Allowed: true}
-	if d := Decide(states[0], nil, 0, 1, budget, fleet); d.Action != ActionStale || !strings.Contains(d.Reason, "storage key pin") {
-		t.Errorf("replica 0 = %s (%s); want stale, naming the repair", d.Action, d.Reason)
+	// Its own label, not stale-bundle: the bundle is not what is wrong, and
+	// a re-enrolment — what stale-bundle asks for — changes nothing.
+	if d := Decide(states[0], nil, 0, 1, budget, fleet); d.Action != ActionPinUnreadable || !strings.Contains(d.Reason, "storage key pin") ||
+		strings.Contains(d.Reason, "re-enrol") || d.FleetWide {
+		t.Errorf("replica 0 = %s (%s, fleet-wide %v); want pin-unreadable, naming the repair and not re-enrolment", d.Action, d.Reason, d.FleetWide)
 	}
 	if d := Decide(states[1], nil, 1, 1, budget, fleet); d.Action != ActionReseed {
 		t.Errorf("replica 1 = %s (%s); want a re-seed: its own pin does not refuse", d.Action, d.Reason)
+	}
+}
+
+// Walk finding 4. The pin's verdict is the instance's: a refusing pin on
+// replica 0 stops the re-seed of replica 1, whose own pin is absent. It used
+// to read "replica 0's key pin refuses …" under replica 1, which looked like a
+// fault in the wrong replica; it names the instance's pin now, and says it is
+// the fleet's so a report can print it once.
+func TestPinnedReadsTheSameUnderEveryReplica(t *testing.T) {
+	before := instanceKeys(t, "alpha")
+	after := rotated(t, before)
+	var require []string
+	for _, sc := range after.Scopes() {
+		require = append(require, sc.Keyring().KEKs()[0].ID.String())
+	}
+	states := []keyholder.State{
+		{Phase: "restart-sealed", Pin: &dskeyholder.PinReport{Status: dskeyholder.PinValid, Require: require}},
+		{Phase: "restart-sealed", Pin: &dskeyholder.PinReport{Status: dskeyholder.PinAbsent}},
+	}
+	fleet := FleetOf(bundleFrom(t, before), states, []error{nil, nil})
+	ordinal := regexp.MustCompile(`replica \d's key pin`)
+	for i := range states {
+		d := Decide(states[i], nil, i, 1, allowed(), fleet)
+		if d.Action != ActionStale || !d.FleetWide || !strings.Contains(d.Reason, "key pin refuses") || ordinal.MatchString(d.Reason) {
+			t.Errorf("replica %d = %s (%s, fleet-wide %v); want stale and fleet-wide, naming the instance's pin and no replica's", i, d.Action, d.Reason, d.FleetWide)
+		}
+	}
+	if fleet.Refusal() != fleet.Pinned {
+		t.Errorf("Refusal = %q; want the pin's verdict %q", fleet.Refusal(), fleet.Pinned)
+	}
+	// A replica's own staleness is its own: a generation the cluster has
+	// held past this device's is not the fleet's verdict.
+	if d := Decide(keyholder.State{Phase: "restart-sealed", Generation: 9}, nil, 0, 1, allowed(), Fleet{}); d.Action != ActionStale || d.FleetWide {
+		t.Errorf("a generation-stale replica = %s (fleet-wide %v); want stale, and not fleet-wide", d.Action, d.FleetWide)
+	}
+	// Nor is a mismatch something one replica owns.
+	mis := Fleet{Mismatch: "replica 1 holds a key for x that this device's bundle does not carry"}
+	if d := Decide(keyholder.State{Phase: "restart-sealed"}, nil, 0, 1, allowed(), mis); d.Action != ActionStale || !d.FleetWide {
+		t.Errorf("a mismatched fleet = %s (fleet-wide %v); want stale and fleet-wide", d.Action, d.FleetWide)
+	}
+	if mis.Refusal() != mis.Mismatch || (Fleet{Unchecked: "x"}).Refusal() != "" {
+		t.Error("Refusal must be Pinned, else Mismatch, and nothing else")
+	}
+}
+
+// What a keeper on a timer reads: each action's class. A new Action without a
+// mapping must fail loudly, never pass for kept.
+func TestActionOutcome(t *testing.T) {
+	for a, want := range map[Action]Outcome{
+		ActionNone:          OutcomeKept,
+		ActionReseed:        OutcomeKept,
+		ActionHold:          OutcomeKept,
+		ActionUnknown:       OutcomeIncomplete,
+		ActionUnchecked:     OutcomeIncomplete,
+		ActionStale:         OutcomeCannotKeep,
+		ActionPinUnreadable: OutcomeCannotKeep,
+		ActionBudget:        OutcomeCannotKeep,
+		// A ledger that will not record a push is a person's to repair.
+		ActionLedgerUnwritable: OutcomeCannotKeep,
+		Action("invented"):     OutcomeCannotKeep,
+	} {
+		if got := a.Outcome(); got != want {
+			t.Errorf("%s.Outcome() = %d, want %d", a, got, want)
+		}
+	}
+}
+
+// A pass is as bad as its worst replica — and cannot keep whenever the fleet
+// refuses the bundle, though every replica serves and no decision says so.
+func TestPassOutcome(t *testing.T) {
+	dec := func(as ...Action) []Decision {
+		out := make([]Decision, len(as))
+		for i, a := range as {
+			out[i] = Decision{Ordinal: i, Action: a}
+		}
+		return out
+	}
+	for _, tc := range []struct {
+		name  string
+		ds    []Decision
+		fleet Fleet
+		want  Outcome
+	}{
+		{"every replica serving", dec(ActionNone, ActionNone), Fleet{}, OutcomeKept},
+		{"stale while every replica serves", dec(ActionNone, ActionNone), Fleet{Mismatch: "x"}, OutcomeCannotKeep},
+		{"a pin refusing while every replica serves", dec(ActionNone, ActionNone), Fleet{Pinned: "x"}, OutcomeCannotKeep},
+		{"unreachable then stale", dec(ActionUnknown, ActionStale), Fleet{}, OutcomeCannotKeep},
+		{"stale then unreachable", dec(ActionStale, ActionUnknown), Fleet{}, OutcomeCannotKeep},
+		{"unreachable beside serving", dec(ActionUnknown, ActionNone), Fleet{}, OutcomeIncomplete},
+		{"serving beside unreachable", dec(ActionNone, ActionUnknown), Fleet{}, OutcomeIncomplete},
+		{"a hold beside serving", dec(ActionHold, ActionNone), Fleet{}, OutcomeKept},
+		{"re-seeded", dec(ActionReseed, ActionNone), Fleet{}, OutcomeKept},
+		{"an unchecked fleet", dec(ActionUnchecked, ActionUnknown), Fleet{Unchecked: "x"}, OutcomeIncomplete},
+	} {
+		if got := PassOutcome(tc.ds, tc.fleet); got != tc.want {
+			t.Errorf("%s: PassOutcome = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}
+
+// A window is named in days only when it is whole days, and a count agrees
+// with its noun. "1 days" and a 36-hour window read as "1 days" were both
+// printed by the 2026-11-10 walk's build.
+func TestHumanWindowNamesDaysAndNeverTruncates(t *testing.T) {
+	for d, want := range map[time.Duration]string{
+		24 * time.Hour:      "1 day",
+		DefaultWindow:       "30 days",
+		7 * 24 * time.Hour:  "7 days",
+		36 * time.Hour:      "36h",
+		90 * time.Minute:    "1h30m",
+		time.Hour:           "1h",
+		30 * time.Minute:    "30m",
+		48*time.Hour + 1e9:  "48h0m1s",
+		12 * time.Hour:      "12h",
+		720*time.Hour + 1e9: "720h0m1s",
+	} {
+		if got := HumanWindow(d); got != want {
+			t.Errorf("HumanWindow(%v) = %q, want %q", d, got, want)
+		}
+	}
+}
+
+func TestBudgetStateAgreesWithItsLimit(t *testing.T) {
+	one := BudgetState{Used: 0, Limit: 1, Window: DefaultWindow, Allowed: true}.String()
+	if one != "0 of 1 reseed used in the last 30 days" {
+		t.Errorf("budget of one = %q", one)
+	}
+	many := BudgetState{Used: 1, Limit: 8, Window: DefaultWindow, Allowed: true}.String()
+	if many != "1 of 8 reseeds used in the last 30 days" {
+		t.Errorf("budget of eight = %q", many)
 	}
 }

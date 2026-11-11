@@ -41,6 +41,8 @@ type (
 	Latency = inspector.Latency
 	// Violation is a denied egress class with its running count and severity.
 	Violation = inspector.Violation
+	// TunnelStat is one tunnel peer's use of one stream route.
+	TunnelStat = inspector.TunnelStat
 	// SlogAlerter is the default Alerter: it logs alerts via slog.
 	SlogAlerter = inspector.SlogAlerter
 )
@@ -51,6 +53,11 @@ const (
 	SeverityWarning  = inspector.Warning
 	SeverityCritical = inspector.Critical
 )
+
+// UnknownRoute is the Route of the one tunnel row, per peer, that every
+// unknown_route refusal is folded into: the name a peer asked for is its own
+// text and is not kept here, so naming routes cannot grow the picture.
+const UnknownRoute = inspector.UnknownRoute
 
 // Config configures a Monitor.
 type Config struct {
@@ -144,6 +151,19 @@ type Snapshot struct {
 	// it is computed here rather than by the reader so that the picture and
 	// the report can never disagree about what an application did.
 	Apps []AppStat `json:"apps,omitempty"`
+
+	// Tunnel is the operator's and keepers' streams into the instance, one
+	// row per peer and route (every unknown route one UnknownRoute row), kept
+	// apart from the application tables above.
+	// A row's Peer is an opaque leaf token: this picture is served on
+	// loopback and read over the operator's route, and the operator's machine
+	// is the only place that can name the device behind it.
+	Tunnel []TunnelStat `json:"tunnel,omitempty"`
+	// TunnelSeparated is true from every monitor that keeps Tunnel apart. A
+	// reader uses it to tell an older monitor — whose "(unidentified)"
+	// application row still absorbs tunnel streams — from one that simply
+	// saw no tunnel traffic.
+	TunnelSeparated bool `json:"tunnel_separated"`
 }
 
 // Snapshot returns the current security picture. Each allowed host is annotated
@@ -166,5 +186,8 @@ func (m *Monitor) Snapshot() Snapshot {
 		Allowed:    allowed,
 		Violations: m.inspector.Violations(),
 		Apps:       m.inspector.Apps(),
+
+		Tunnel:          m.inspector.Tunnel(),
+		TunnelSeparated: true,
 	}
 }

@@ -63,20 +63,65 @@ const (
 	ReasonUnknownApp = "unknown_app"
 )
 
+// Tunnel-stream reasons. A stream event (Proto "stream") is the operator or a
+// keeper reaching an in-instance service through the public tunnel, not an
+// application's egress, and these are its outcomes. Stable strings, for the
+// reason the deny reasons above are.
+const (
+	// ReasonRelayed: the stream was opened and copied to its end. Rides Allow.
+	ReasonRelayed = "relayed"
+	// ReasonUnknownRoute: the peer named a route that is not in the table.
+	ReasonUnknownRoute = "unknown_route"
+	// ReasonRoleRefused: a keeper asked for a route that is the operator's
+	// alone.
+	ReasonRoleRefused = "role_refused"
+	// ReasonBadOrdinal: the replica index named is outside the route's range.
+	ReasonBadOrdinal = "bad_ordinal"
+)
+
+// ProtoStream marks a tunnel-stream event. It has been set on every stream
+// event since the relay existed, so a consumer that separates tunnel streams
+// from application egress by it does so for an older FatLine too.
+const ProtoStream = "stream"
+
+// Peer roles: which class of tunnel peer a stream event is about. A role names
+// a class, never a device, and it is the only peer attribution FatLine's own
+// log carries.
+const (
+	PeerOperator = "operator"
+	PeerKeeper   = "keeper"
+)
+
 // Event is one structured egress decision. FatLine emits exactly one decision
 // Event (Allow or Deny) per egress request, before the caller is answered, so
 // Shrike's block-and-alert is satisfiable; a successful connection also emits a
 // Close event with byte counts when it finishes.
 //
-// Tenant and App are the per-app attribution hooks: empty in phase 2.1 (there
-// are no running apps yet) and filled by phase 4.4.
+// Tenant and App attribute application egress (filled since phase 4.4); they
+// are empty on a tunnel-stream event, which PeerRole and PeerToken attribute
+// instead.
+//
+// The fields carry no JSON tags, and must not gain any: the Shrike wire is
+// this struct through encoding/json, so the Go field names ARE the wire keys,
+// and a tag would rename a key an older sidecar still reads.
 type Event struct {
-	Kind      Kind
-	Tenant    string
-	App       string
+	Kind   Kind
+	Tenant string
+	App    string
+
+	// PeerRole is which class of tunnel peer a stream event is about
+	// (PeerOperator or PeerKeeper). Empty for application egress.
+	PeerRole string
+	// PeerToken is the opaque per-leaf token of that peer (identity.LeafToken).
+	// It goes to Shrike's in-memory picture, read over the operator's route,
+	// and the operator's machine maps it to a device. It is NEVER logged: a
+	// stable per-device pseudonym in a provider-visible log would let the
+	// provider follow one device for the leaf's life and count the fleet.
+	PeerToken string
+
 	Host      string
 	Port      string
-	Proto     string // "connect" | "http"
+	Proto     string // "connect" | "http" | "stream"
 	SNI       string
 	Reason    string
 	BytesUp   int64
@@ -118,13 +163,23 @@ func (s SlogSink) Emit(e Event) {
 	if e.Kind == Deny || e.Kind == Fail {
 		lvl = slog.LevelWarn
 	}
-	l.LogAttrs(context.Background(), lvl, "egress",
+	attrs := []slog.Attr{
 		slog.String("kind", string(e.Kind)),
 		// Who, before what. A denial nobody can attribute is telemetry rather
 		// than enforcement (ADR 0013), and that is decided here: the proxy
 		// fills these in and this is the only place an operator reads them.
 		slog.String("tenant", e.Tenant),
 		slog.String("app", e.App),
+	}
+	// A tunnel stream is attributed by its peer's ROLE here and nowhere more
+	// finely. PeerToken is deliberately absent: this line lands where the
+	// provider can read it, and a token names one leaf for 90 days. The
+	// device behind a token is answered from Shrike's picture, on the
+	// operator's own machine (ADR 0015).
+	if e.PeerRole != "" {
+		attrs = append(attrs, slog.String("peer_role", e.PeerRole))
+	}
+	attrs = append(attrs,
 		slog.String("host", e.Host),
 		slog.String("port", e.Port),
 		slog.String("proto", e.Proto),
@@ -135,6 +190,7 @@ func (s SlogSink) Emit(e Event) {
 		slog.Int64("dial_ms", e.DialMillis),
 		slog.Int64("duration_ms", e.DurationMillis),
 	)
+	l.LogAttrs(context.Background(), lvl, "egress", attrs...)
 }
 
 // Tee fans one event out to several sinks, in order. A nil member is skipped.

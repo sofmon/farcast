@@ -249,16 +249,25 @@ Per step: the command, what was expected, what was seen, and pass or fail. A fai
 
 ### What the walk found
 
-Nothing here failed a criterion, and nothing here is fixed yet. In rough order of weight:
+Nothing here failed a criterion. They are listed in rough order of weight. Each carries a dated note on what changed after the walk, and **none of those changes has been walked**: they are built and unit-tested only, and the next paid session walks them.
 
 1. **FatLine's tunnel-stream decisions carry no peer identity.** In `farcast usage`, the operator's and keepers' mTLS streams to `datasphered` and `shrike` are counted as `(unidentified)`, the same bucket the report uses for anonymous in-cluster callers. S17's `role_refused` line for a keeper on the operator's route reads `tenant="" app=""`, so the log cannot say which device tried. FatLine has the leaf at that point, since a role refusal is decided from the role on it, but it does not record it. Until it does, Shrike cannot attribute a tunnel violation to a device.
+   *Fixed 2026-11-10, not yet walked:* every stream event now carries the peer's role and an opaque per-leaf token. Logs name only the role. The token stays in Shrike's in-memory picture, which is read over the operator's route, and `farcast usage` maps it to a device in a new *Tunnel* section. The keyholder's refusal line no longer names the device. See [ADR 0015](../adr/0015-what-the-boundary-can-measure.md) decision 7. Keepers enrolled before the change read as "leaf not enrolled from this machine" until they are enrolled again.
 2. **An Autopilot eviction put both keyholder replicas on the node that also held both FatLine replicas, and nothing moves them apart again.** FatLine's two replicas had shared a node since their first deploy, when the cluster had only one. About a minute after S7's hand-over, Autopilot evicted alpha and `datasphered-1` together and recreated both on the node that already ran `datasphered-0`. Replica 1 came back restart-sealed, and for the 55 s before the walk's own seal in S7 nothing reported that. Afterwards it shows only as a new boot label in the next unseal's ledger entry. The spread is `ScheduleAnyway` on purpose: a hard constraint can leave a replica Pending forever on Autopilot (the reasoning is in `datasphere/deploy`). But a soft constraint never rebalances. When placement was checked, at about 11:56Z, one node repair would have sealed storage and dropped the tunnel together. Placement was not checked again after the keyholder Pods were recreated in later steps. This is a gap against [ADR 0008](../adr/0008-in-cluster-key-delivery.md)'s case for a second replica, not a defect in the code as written.
+   *Reported 2026-11-10, not yet walked, and not fixed:* each replica now reports its node on the mutual-TLS surface only. `farcast storage state` names replicas that share a node, and `connect --status` names the node of the FatLine replica that answered. Nothing moves replicas apart. That decision is left to a later ADR, which also holds the deferred hard spread for FatLine.
 3. **The keeper's report misleads in three places.**
    - An unreadable pin is filed under `stale-bundle`, which sends the operator to re-enrol, the one remedy that changes nothing.
    - The fleet-wide pin verdict (`keeper.Pinned` in `farsight/cli/internal/keeper/decide.go`) is printed under each replica, so replica 1's line reads "replica 0's key pin refuses…".
    - `keeper run --once` exits 0 when it refused, so cron or systemd cannot tell "kept" from "can no longer keep".
+
+   *Fixed 2026-11-10, not yet walked:*
+   - An unreadable pin has its own label, `pin-unreadable`, which names `farcast storage key pin`.
+   - The pin's verdict prints once per pass, as `this device: stale-bundle — …`. It prints even while every replica serves, so a keeper learns it is stale at the rotation rather than at the next restart.
+   - `keeper run --once` exits 0 when it kept, 3 when a person must act, 4 when the pass did not finish and the next one retries (including when another keeper pass on the same device was running), and 1 on a fault on the device itself, including a ledger that will not take the entry a re-seed is recorded in before it is pushed (the re-seed is then not made). The running mode never exits on any of these. The exit codes are in the [CLI README](../../farsight/cli/README.md#what-a-pass-exits-with).
 4. **`keeper revoke` overstates what remains.** It says the device can still re-seed a restarted replica with its old keys until its certificate expires. Since the pin, a rotation retires those keys, and S16.3 shows the refusal.
+   *Fixed 2026-11-10, not yet walked:* `revoke` now says the device can re-seed only until `rotate` writes the instance's key pin. After that every replica refuses its bundle (`below-pin`), and a replica that starts without the pin checks nothing, which `storage state` reports as "none loaded".
 5. **`farcast run -y` prints no declared host.** Its result reads "1 declared host across 2 applications", so an operator approving with `-y` never sees `example.com` in this output.
+   *Fixed 2026-11-10, not yet walked:* `-y` now skips the question, not the review. The review goes to stderr with every host and its reason, and the result lists each application's hosts under the summary line. In `-o json`, `apps[].external` is now `[{host, reason}]` and is always present. Reasons and paths that carry terminal-control or bidirectional characters print quoted.
 6. **Smaller, recorded:**
    - Durations print as `720h0m0s` beside `30 days`, and counts as "1 reseeds".
    - The key-loss warning is appended mid-paragraph, starting with a lowercase word.
@@ -270,6 +279,39 @@ Nothing here failed a criterion, and nothing here is fixed yet. In rough order o
    - An operator seal without a hold reports `restart-sealed`, although nothing restarted.
    - The egress fixture's `sh -c "… && sleep 86400"` ignores SIGTERM, so a stopped Pod bills through its 30-second grace period. That shows as three ticks at `pods=7` after S18's stop.
    - On a desktop Linux device, GNOME's file indexer indexes `~` without descending into it. So the packet's and passphrase's *file names* were indexable for as long as S9 left them there. The keeper directory, under `~/.config`, is not indexed.
+
+   *Fixed 2026-11-10, not yet walked*, all ten:
+   - Budgets read "1 reseed per 30 days". The JSON window stays a Go duration.
+   - Counts agree with their nouns.
+   - The key-loss warning always prints on its own `WARNING:` line.
+   - `storage state` says "holding no application scopes".
+   - A re-created pin reports that there was none.
+   - A refused unseal prints no generation summary.
+   - `release` reads "still holds" and prints a line about once a minute while it waits.
+   - FatLine's and Shrike's reload lines are timestamped log records.
+   - An operator seal without a hold says a keeper re-seeds that state.
+   - Both idling fixtures stop on SIGTERM.
+   - The GNOME indexer is answered with advice, not code: the keeper documentation says to write the packet and passphrase outside indexed directories.
+
+### Found after the walk
+
+7. **Every container's output reached the provider's logging, the applications' included.** After release, the project's Cloud Logging still held `k8s_container` entries from the walk, counted read-only and by number alone:
+   - in `farcast-system`: FatLine 375, the kernel 493, `datasphered` 122 and Shrike 10;
+   - in the application namespaces: alpha 250, beta 750, and the egress fixture 2.
+
+   Planck created clusters with no logging configuration, so GKE's default applied, and that default sends every container's stdout and stderr to the provider. There the entries outlive the instance, for 30 days under the default retention. They included:
+   - FatLine's per-application egress decisions;
+   - the keyholder's refusals, which then named the keeper device;
+   - anything an application writes with `farcast.Log()`.
+
+   No criterion asked about this, which is why every row above still passes. It contradicts "blind to content" all the same, and it is the heaviest thing this walk turned up.
+
+   *Fixed 2026-11-10, not yet walked:* [ADR 0019](../adr/0019-what-the-cluster-tells-its-provider.md).
+   - Every cluster is created with system-only logging.
+   - `install` fails unless the cluster reads back that way.
+   - `release` names what the provider keeps after the instance is gone.
+
+   Google's documentation disagrees with itself on whether Autopilot accepts system-only logging, so the next install is the test. If Autopilot refuses, install fails rather than running with workload logs on. The ADR also names what no setting turns off: system logs, Events, system metrics, and the Admin Activity audit log, kept 400 days. GKE's default metric packages are on too; turning them off is documented but untried, and an open decision (ADR 0019 decision 3). The audit log carries each workload's spec, and with it the repository and commit every build came from. And for 24 months by the metrics, and very likely 400 days by the audit log's endpoint updates, the provider can date when each keyholder replica was sealed and brought back to serving. The walk's own entries were not deleted. Under the default retention they expire around 2026-12-10.
 
 ### Not walked
 
@@ -299,3 +341,39 @@ These were built and unit-tested, and this walk did not exercise them. They are 
 **Still open, and not inferred:** 4.1 c12, invoice reconciliation, because `confirmed` never arrived before release.
 
 **Retired rather than walked:** 5.3 c13, a pre-upgrade application. Since 2026-10-08, `run` refuses the keyring that state needs, so no install can reach it.
+
+### What the next walk owes this record
+
+Each fix above carries "not yet walked" until a paid session walks it. Most of the fixes change the FatLine, Shrike and `datasphered` images, so they go out as one rollout with the operator present. Rolling the keyholder restarts both replicas sealed, and the operator has to unseal them. Before that session spends anything, it should check:
+- **Logging (finding 7):**
+  - `install` succeeds, and the cluster reads back system-only logging. If it fails instead, Autopilot has refused, and that is a decision for the operator before anything else runs.
+  - Counted from install onwards, `farcast-system` and the application namespaces have no `k8s_container` entries.
+  - `farcast logs` still works.
+  - Work through all eight steps of [ADR 0019's Verification](../adr/0019-what-the-cluster-tells-its-provider.md#verification) and record each result. Steps 2 and 3 are the two bullets above. The rest:
+    - Step 1: the logging and monitoring read-back, and that a kube state series (container readiness) exists for a `datasphered` replica;
+    - Step 4: `farcast-system` and the application namespaces hold no `PodMonitoring`, and every `ClusterPodMonitoring` is recorded;
+    - Step 5: an audit entry naming a FatLine or keyholder ConfigMap carries no request or response body;
+    - Step 6: a `pods/status` entry for a `datasphered` replica and one for a fetch Pod, looked for in Admin Activity and, if it is on, Data Access;
+    - Step 7: one build Job's create entry carries `--context=git://…#<commit>`;
+    - Step 8: after a seal and the unseal that brings the replica back to serving, an Admin Activity `update` on the `datasphered` data Service's Endpoints and one on its EndpointSlice in `farcast-system`, with the level of each and what its body carries.
+  - Before install, read-only: confirm that the project has no GKE Enterprise enablement or fleet registration (either could turn control-plane logs on and fail the strict read-back), and record its effective Data Access audit configuration, inherited settings included.
+- **Peer identity (finding 1):**
+  - Enrol the keeper devices again, so their tokens are recorded.
+  - `farcast usage` names each keeper in its *Tunnel* section, including on the `role_refused` row.
+  - FatLine's and `datasphered`'s logs hold no device name and no token, and the refusal line carries `peer_role=keeper`.
+- **The keeper (findings 3 and 4):**
+  - A replica the keeper cannot reach exits 4.
+  - S11.5's stale bundle prints `this device: stale-bundle` once and exits 3.
+  - S13's hold still exits 0.
+  - S16.8's unreadable pin reads `pin-unreadable` and exits 3.
+  - `revoke` shows the new text.
+  - Any step run under `set -e` that expects a refusal must now tolerate exit 3.
+  - After S10's re-seed, A's ledger gains two lines for that push: a `pending` line and an `ok` line carrying the same `push` id. `keeper status` on A, whose ledger mixes the walk's old single-line entries with the new two-line ones, shows no `unconfirmed` and no `after send` line.
+  - A keeper push into a replica that is already serving (for example `keeper run --once` started just after `storage unseal` reached the restarted replica) is recorded as `refused-after-send`, spends one budget slot, and appears in `keeper status` as `after send 1`.
+  - A second `keeper run --once` started while another pass on the same device runs exits 4 with `another keeper pass on this device is running` and adds no ledger line. Check this only if it can be timed; the unit tests cover it.
+- **Placement (finding 2):** `storage state` shows a `node` on each replica and says whether replicas share one, and `connect --status` shows `relayed by`. Check the names once against the Pods' nodes.
+- **`run -y` (finding 5):** 4.4 step 1 with `-y` shows the review and its hosts on stderr, and the result lists `reacher → example.com` and hermit reaching nothing.
+- **The smaller items (finding 6):**
+  - The reload lines carry timestamps.
+  - Both fixtures leave at once on stop, with no ticks at the old Pod count.
+  - `release -y` prints a line about once a minute.

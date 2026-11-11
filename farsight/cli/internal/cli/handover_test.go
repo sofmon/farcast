@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"maps"
 	"os"
@@ -1403,6 +1404,12 @@ func TestUnsealNeverPushesAReplicaThatDidNotAnswer(t *testing.T) {
 	if kh.replica(0).phase != "restart-sealed" {
 		t.Errorf("replica 0 was unsealed beside a replica nothing could check it against")
 	}
+	// No replica took the keys, so no summary claims a generation they hold:
+	// the 2026-11-10 walk printed "0 of 2 replicas hold … at generation N"
+	// above the refusal.
+	if strings.Contains(out.String(), "0 of 2 replicas") || !strings.Contains(out.String(), "No replica took this machine's keys") {
+		t.Errorf("a refused unseal summarised what nothing holds:\n%s", out.String())
+	}
 	// The operator may say otherwise; the silent replica is still not pushed.
 	if err := (&storageUnsealCommand{newKeyholder: openerFor(silent), unchecked: true}).Run(context.Background(), env, []string{"p112"}); err == nil {
 		t.Error("an unseal that could not reach every replica was reported as success")
@@ -1601,6 +1608,58 @@ func TestUnsealReportsAReplicaItUnsealedAsUnsealed(t *testing.T) {
 		t.Errorf("unseal says it did not unseal a replica it unsealed:\n%s", out.String())
 	}
 	noSplit(t, base)
+}
+
+// Review finding E-unseal-heldonly-summary. The same unseal with EVERY
+// replica missing the activating push: both took the keys to hold, neither
+// writes under the newest. The rows say they hold them and so does the error;
+// the summary said "No replica took this machine's keys". It must say what the
+// rows say.
+func TestUnsealSummaryAgreesWhenEveryReplicaHoldsWithoutUsing(t *testing.T) {
+	dir, meta, env, out := handOverInstance(t, "p917")
+	before := scopedKeyring(t, dir, "p917", "demo", "alpha")
+	base := servingFleet(t, env, meta, dir)
+	mustRotate(t, env, "p917", base)
+	base.replica(0).keys = heldKeys(before)
+	unpin(t, dir, "p917", base)
+	base.replica(1).phase, base.replica(1).keys, base.replica(1).generation = "restart-sealed", nil, 0
+
+	err := (&storageUnsealCommand{newKeyholder: openerFor(&flakyKeyholder{fakeStateKeyholder: base, refuseNth: map[int]int{0: 2, 1: 2}})}).
+		Run(context.Background(), env, []string{"p917"})
+	if err == nil || !strings.Contains(err.Error(), "0 of 2 replicas write under") || !strings.Contains(err.Error(), "the other 2 hold them") {
+		t.Fatalf("guard: unseal = %v; want every replica holding the keys and none writing under them", err)
+	}
+	shown := out.String()
+	if n := strings.Count(shown, "holds this machine's keys, still writing under an older one"); n != 2 {
+		t.Fatalf("guard: %d row(s) say a replica holds the keys; want 2:\n%s", n, shown)
+	}
+	if strings.Contains(shown, "No replica took this machine's keys") {
+		t.Errorf("the summary says no replica took the keys, while the rows and the error say both hold them:\n%s", shown)
+	}
+	if !strings.Contains(shown, "No replica writes under this machine's newest keys yet; 2 hold them. The reason follows.") {
+		t.Errorf("the summary does not say both replicas hold the keys:\n%s", shown)
+	}
+	noSplit(t, base)
+}
+
+// --json counts them too, and leaves the field out when there are none.
+func TestUnsealResultCountsHeldOnly(t *testing.T) {
+	for _, tc := range []struct {
+		r    unsealResult
+		want string
+		has  bool
+	}{
+		{unsealResult{Total: 2, HeldOnly: 2}, `"held_only":2`, true},
+		{unsealResult{Total: 2, Loaded: 2}, `"held_only"`, false},
+	} {
+		b, err := json.Marshal(tc.r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(b), tc.want) != tc.has {
+			t.Errorf("%+v marshals to %s; want %q present=%v", tc.r, b, tc.want, tc.has)
+		}
+	}
 }
 
 // Review finding 17. The gate said rekeyed objects would be unreadable through

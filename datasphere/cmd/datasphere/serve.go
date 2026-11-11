@@ -91,6 +91,8 @@ func serve(ctx context.Context, opt options, sopt serveOptions, out, errw io.Wri
 		},
 		MaxObjectBytes: sopt.maxObject,
 		Log:            log,
+		// Empty from a manifest that predates it; the field is then omitted.
+		Node: os.Getenv(keyholder.EnvNode),
 	})
 	if err != nil {
 		return fail(errw, "datasphere: %v\n", err)

@@ -276,6 +276,7 @@ func (c *connectCommand) Run(ctx context.Context, env *Env, args []string) error
 		Identity:  identity.OperatorURI(name),
 		Active:    st.Active,
 		Allowlist: st.Allowlist,
+		Node:      st.Node,
 		Registry:  registryPrefix(meta),
 		Image:     deployedImage(meta),
 		costLimit: meta.CostLimit,
@@ -530,13 +531,17 @@ func isInteractive(env *Env) bool {
 }
 
 type connectResult struct {
-	Name      string           `json:"name"`
-	Connected bool             `json:"connected"`
-	Carrier   string           `json:"carrier"`
-	Endpoint  string           `json:"endpoint"`
-	Identity  string           `json:"identity"`
-	Active    int              `json:"active"`
-	Allowlist []string         `json:"allowlist,omitempty"`
+	Name      string   `json:"name"`
+	Connected bool     `json:"connected"`
+	Carrier   string   `json:"carrier"`
+	Endpoint  string   `json:"endpoint"`
+	Identity  string   `json:"identity"`
+	Active    int      `json:"active"`
+	Allowlist []string `json:"allowlist,omitempty"`
+	// Node is where the FatLine replica that answered runs. The load
+	// balancer hands a connection to one replica, so it says nothing about
+	// the other. Empty from a FatLine that does not report it.
+	Node      string           `json:"node,omitempty"`
 	Registry  string           `json:"registry,omitempty"`
 	Image     string           `json:"image,omitempty"`
 	costLimit config.CostLimit // unexported: not serialized; used for the human cost line
@@ -551,10 +556,15 @@ func (r connectResult) Human(w io.Writer) error {
 	fprintf(w, "  carrier:     public mTLS NLB  %s\n", r.Endpoint)
 	fprintf(w, "  identity:    %s\n", r.Identity)
 	fprintf(w, "  active:      %d streams\n", r.Active)
+	// The allowlist and the node are FatLine's own report, read through the
+	// tunnel, so they go through terminalText; --json carries them as they came.
 	if len(r.Allowlist) > 0 {
-		fprintf(w, "  allowlist:   %d hosts (%s)\n", len(r.Allowlist), strings.Join(r.Allowlist, ", "))
+		fprintf(w, "  allowlist:   %d hosts (%s)\n", len(r.Allowlist), terminalText(strings.Join(r.Allowlist, ", ")))
 	} else {
 		fprintln(w, "  allowlist:   0 hosts (deny-by-default)")
+	}
+	if r.Node != "" {
+		fprintf(w, "  relayed by:  the FatLine replica on %s\n", terminalText(r.Node))
 	}
 	if r.Registry != "" {
 		fprintf(w, "  registry:    %s\n", r.Registry)

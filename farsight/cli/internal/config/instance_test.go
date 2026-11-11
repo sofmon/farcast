@@ -536,3 +536,31 @@ func TestCreateInstanceKeyringIsWholeOrAbsent(t *testing.T) {
 		t.Errorf("a failed create left a keys.yaml behind: %v", err)
 	}
 }
+
+// The usage report reads the operator's leaf to name the operator's tunnel
+// streams. It must not need the CA key to do it: a report has no business
+// bringing the instance's crown jewel into memory.
+func TestLoadOperatorLeafNeedsNoCAKey(t *testing.T) {
+	d := testDir(t)
+	if err := d.SaveInstanceMTLS("prod", MTLSMaterial{
+		CACertPEM: []byte("ca"), CAKeyPEM: []byte("cakey"), ClientCertPEM: []byte("operator-leaf"),
+		ClientKeyPEM: []byte("k"), ServerCertPEM: []byte("s"), ServerKeyPEM: []byte("sk"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(d.fatlineDir("prod"), caKeyFile)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := d.LoadOperatorLeaf("prod")
+	if err != nil {
+		t.Fatalf("LoadOperatorLeaf without a CA key: %v", err)
+	}
+	if string(got) != "operator-leaf" {
+		t.Errorf("LoadOperatorLeaf = %q, want the operator's client certificate", got)
+	}
+	// The control: the loader that does read the CA key fails here, so the
+	// assertion above is about the key's absence and not a vacuous pass.
+	if _, err := d.LoadInstanceMTLS("prod"); err == nil {
+		t.Error("LoadInstanceMTLS succeeded without a CA key; the test proves nothing")
+	}
+}

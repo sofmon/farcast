@@ -5,14 +5,16 @@
 //
 // It is the "policeman" half of FarCast's deny-by-default boundary: it never
 // blocks (FatLine enforces inline, fail-closed) and it is fail-open — a crash
-// here must never affect egress. The violation table is the one shared mutable
-// state, so it is mutex-guarded and exercised under -race.
+// here must never affect egress. Its tables — allowed traffic, violations, and
+// the operator's and keepers' tunnel streams — are shared mutable state, so
+// they are mutex-guarded and exercised under -race.
 package inspector
 
 import (
 	"context"
 	"fmt"
 	"log/slog"
+	"maps"
 	"slices"
 	"strings"
 	"sync"
@@ -80,12 +82,17 @@ type Alert struct {
 	// App and Namespace are which application did this. Empty only
 	// when FatLine could not identify the caller at all, which is its
 	// own reason (ADR 0013 decision 6).
-	App       string    `json:"app,omitempty"`
-	Namespace string    `json:"namespace,omitempty"`
-	Host      string    `json:"host"`
-	Port      string    `json:"port,omitempty"`
-	Proto     string    `json:"proto,omitempty"`
-	SNI       string    `json:"sni,omitempty"`
+	App       string `json:"app,omitempty"`
+	Namespace string `json:"namespace,omitempty"`
+	Host      string `json:"host"`
+	Port      string `json:"port,omitempty"`
+	Proto     string `json:"proto,omitempty"`
+	SNI       string `json:"sni,omitempty"`
+	// PeerRole is set on a tunnel-stream alert: which class of peer — the
+	// operator or a keeper — was refused. Never a token or a device: an alert
+	// is logged, and the log is where the provider can read it. For the same
+	// reason a tunnel alert's Count is the role's, never one leaf's.
+	PeerRole  string    `json:"peer_role,omitempty"`
 	Reason    string    `json:"reason"`
 	Count     int64     `json:"count"`
 	FirstSeen time.Time `json:"first_seen"`
@@ -114,13 +121,27 @@ func (a SlogAlerter) Alert(al Alert) {
 	case Warning:
 		lvl = slog.LevelWarn
 	}
-	l.LogAttrs(context.Background(), lvl, "shrike: egress policy violation",
+	// By Proto, not by PeerRole: an older FatLine's stream refusal names no
+	// peer, and it is still a tunnel stream, not an application's egress.
+	msg := "shrike: egress policy violation"
+	if al.Proto == event.ProtoStream {
+		msg = "shrike: tunnel stream refused"
+	}
+	attrs := []slog.Attr{
 		slog.String("severity", string(al.Severity)),
 		// Who, before what. The status JSON has carried these since 4.4 while
 		// this line did not, so an operator watching the alert stream saw two
 		// applications denied the same host as one indistinguishable problem.
 		slog.String("namespace", al.Namespace),
 		slog.String("app", al.App),
+	}
+	// A tunnel peer is named by its role here, never more finely. Shrike's
+	// stdout is read on provider-owned nodes; the token that names one leaf
+	// stays in the picture served over the operator's route (ADR 0015).
+	if al.PeerRole != "" {
+		attrs = append(attrs, slog.String("peer_role", al.PeerRole))
+	}
+	attrs = append(attrs,
 		slog.String("host", al.Host),
 		slog.String("port", al.Port),
 		slog.String("proto", al.Proto),
@@ -128,6 +149,7 @@ func (a SlogAlerter) Alert(al Alert) {
 		slog.String("reason", al.Reason),
 		slog.Int64("count", al.Count),
 	)
+	l.LogAttrs(context.Background(), lvl, msg, attrs...)
 }
 
 var _ Alerter = SlogAlerter{}
@@ -276,6 +298,37 @@ type AppStat struct {
 	LastSeen  time.Time `json:"last_seen,omitzero"`
 }
 
+// TunnelStat is one tunnel peer's use of one stream route: the operator or a
+// keeper reaching an in-instance service through the public tunnel.
+//
+// It is kept apart from the application tables on purpose. A tunnel stream is
+// not egress and it has no application; folded into them it became the
+// "(unidentified)" row, which is where walk finding 1 lost which device a
+// refusal was about.
+//
+// Peer is the opaque leaf token FatLine computed from the verified leaf. Only
+// the operator's machine can map it to a device. It lives in this in-memory
+// picture, served on loopback and reached over the operator's route alone, and
+// is never logged. Empty Role and Peer are a FatLine older than attribution.
+type TunnelStat struct {
+	Role string `json:"role,omitempty"`
+	Peer string `json:"peer,omitempty"`
+	// Route is the configured route the stream named, or UnknownRoute for
+	// every name that is not one: those are folded into one row per peer.
+	Route string `json:"route"`
+	// Relayed counts streams opened and copied to their end.
+	Relayed int64 `json:"relayed"`
+	// Refused counts streams FatLine would not open, by reason in Reasons.
+	Refused int64            `json:"refused"`
+	Reasons map[string]int64 `json:"reasons,omitempty"`
+	// Failed counts permitted streams whose service did not answer. Not a
+	// refusal, and never an alert.
+	Failed    int64     `json:"failed"`
+	BytesUp   int64     `json:"bytes_up"`
+	BytesDown int64     `json:"bytes_down"`
+	LastSeen  time.Time `json:"last_seen,omitzero"`
+}
+
 // Violation is a denied egress class (reason+host) with its running count,
 // effective severity, and timing.
 type Violation struct {
@@ -305,6 +358,14 @@ type Inspector struct {
 	events     int64
 	allowed    map[string]*HostStat
 	violations map[string]*vrec
+
+	// tunnel is the per-peer, per-route stream table, and tunnelAlerts the
+	// dedupe state for its refusals, per role, reason and route and never per
+	// peer. Neither is ever read into the application tables above. Both are
+	// bounded: peers are the leaves this instance admits, routes the closed
+	// list plus UnknownRoute, and reasons FatLine's fixed set.
+	tunnel       map[string]*TunnelStat
+	tunnelAlerts map[string]*vrec
 }
 
 // vrec is the internal violation record: the public Violation plus the last
@@ -323,10 +384,12 @@ func New(alerter Alerter, window time.Duration) *Inspector {
 		window = time.Minute
 	}
 	return &Inspector{
-		alerter:    alerter,
-		window:     window,
-		allowed:    make(map[string]*HostStat),
-		violations: make(map[string]*vrec),
+		alerter:      alerter,
+		window:       window,
+		allowed:      make(map[string]*HostStat),
+		violations:   make(map[string]*vrec),
+		tunnel:       make(map[string]*TunnelStat),
+		tunnelAlerts: make(map[string]*vrec),
 	}
 }
 
@@ -337,14 +400,19 @@ func (i *Inspector) Record(e event.Event) {
 	i.mu.Lock()
 	i.events++
 	var alert *Alert
-	switch e.Kind {
-	case event.Allow:
+	// A tunnel stream first, and by Proto rather than by PeerRole: an older
+	// FatLine sends stream events with no peer, and they still belong here
+	// and not in an application's row.
+	switch {
+	case e.Proto == event.ProtoStream:
+		alert = i.recordTunnel(e, now)
+	case e.Kind == event.Allow:
 		i.recordAllow(e, now)
-	case event.Close:
+	case e.Kind == event.Close:
 		i.recordClose(e, now)
-	case event.Fail:
+	case e.Kind == event.Fail:
 		i.recordFail(e, now)
-	case event.Deny:
+	case e.Kind == event.Deny:
 		alert = i.recordDeny(e, now)
 	}
 	i.mu.Unlock()
@@ -461,6 +529,135 @@ func (i *Inspector) recordDeny(e event.Event, now time.Time) *Alert {
 	return &a
 }
 
+// severityForTunnel maps a tunnel-stream refusal to its base severity. A
+// keeper asking for the operator's route, or anyone naming a route that does
+// not exist, is a credential being used for something it was not issued for;
+// an ordinal out of range is a client out of step with the instance.
+func severityForTunnel(reason string) Severity {
+	if reason == event.ReasonBadOrdinal {
+		return Info
+	}
+	return Warning
+}
+
+// UnknownRoute is the one route every unknown_route refusal is recorded under,
+// in the tunnel table and in its alerts.
+//
+// The name a peer asks for is the peer's own text. Kept per name, every new
+// one became a new row and a new alert key that nothing evicts, so a single
+// admitted leaf could grow this picture without bound by naming routes. That
+// a route did not exist is the finding; which text was tried is in FatLine's
+// own log line, cut to a bound there.
+const UnknownRoute = "(unknown route)"
+
+// recordTunnel folds one tunnel-stream event into the tunnel table, and
+// returns an alert for a refusal that warrants one. Caller holds the lock.
+func (i *Inspector) recordTunnel(e event.Event, now time.Time) *Alert {
+	// A FatLine older than attribution emitted a stream dial failure as a
+	// Deny. The route was permitted and the service did not answer, which is
+	// what Fail means (event.ReasonDialFailed rides Fail, never Deny), so it
+	// is read as one here: counted, and never raised as a refusal.
+	if e.Kind == event.Deny && e.Reason == event.ReasonDialFailed {
+		e.Kind = event.Fail
+	}
+	route := e.Host
+	if e.Reason == event.ReasonUnknownRoute {
+		route = UnknownRoute
+	}
+
+	key := e.PeerRole + "\x00" + e.PeerToken + "\x00" + route
+	t := i.tunnel[key]
+	if t == nil {
+		t = &TunnelStat{Role: e.PeerRole, Peer: e.PeerToken, Route: route}
+		i.tunnel[key] = t
+	}
+	t.LastSeen = now
+	switch e.Kind {
+	case event.Allow:
+		// The bytes ride the Allow: a stream has no Close of its own.
+		t.Relayed++
+		t.BytesUp += e.BytesUp
+		t.BytesDown += e.BytesDown
+		return nil
+	case event.Fail:
+		t.Failed++
+		return nil
+	case event.Deny:
+	default:
+		return nil
+	}
+	t.Refused++
+	if t.Reasons == nil {
+		t.Reasons = map[string]int64{}
+	}
+	t.Reasons[e.Reason]++
+
+	// Deduplicated by role, reason and route, with the window and burst rules
+	// application violations use: one stray refusal is raised, a repeat is
+	// coalesced into the count, and a burst escalates.
+	//
+	// Never by peer. The alert is logged where the provider reads it, and
+	// keyed per leaf token it would say how many distinct leaves were refused
+	// (each one's first refusal is a new count=1 line) and link later lines to
+	// the same leaf by its running count: a weaker form of the token the line
+	// leaves out (ADR 0015 decision 7). The per-leaf counts stay in the
+	// tunnel table above, read over the operator's route alone.
+	akey := e.PeerRole + "\x00" + e.Reason + "\x00" + route
+	v := i.tunnelAlerts[akey]
+	if v == nil {
+		v = &vrec{Violation: Violation{Host: route, Proto: e.Proto, Reason: e.Reason, FirstSeen: now}}
+		i.tunnelAlerts[akey] = v
+	}
+	v.Count++
+	v.LastSeen = now
+	prev := v.Severity
+	base := severityForTunnel(e.Reason)
+	v.Severity = base
+	if v.Count >= burstThreshold {
+		v.Severity = escalate(base)
+	}
+	if v.Count != 1 && v.Severity.rank() <= prev.rank() && now.Sub(v.lastAlertAt) < i.window {
+		return nil
+	}
+	v.lastAlertAt = now
+	return &Alert{
+		Severity:  v.Severity,
+		PeerRole:  e.PeerRole,
+		Host:      v.Host,
+		Proto:     v.Proto,
+		Reason:    v.Reason,
+		Count:     v.Count,
+		FirstSeen: v.FirstSeen,
+		LastSeen:  v.LastSeen,
+		Message:   tunnelMessage(e.PeerRole, v.Reason, v.Host, v.Count),
+	}
+}
+
+// tunnelMessage renders a tunnel refusal. It names the role and the route and
+// nothing that identifies a device: the token stays in the picture, and the
+// count is the role's.
+func tunnelMessage(role, reason, route string, count int64) string {
+	who := "a tunnel peer"
+	switch role {
+	case event.PeerKeeper:
+		who = "a keeper leaf"
+	case event.PeerOperator:
+		who = "the operator's leaf"
+	}
+	switch reason {
+	case event.ReasonRoleRefused:
+		return fmt.Sprintf("%s asked for route %q, which is the operator's alone; %d attempt(s)", who, route, count)
+	case event.ReasonUnknownRoute:
+		// No name: every unknown route is UnknownRoute here, and the name the
+		// peer chose is its own text.
+		return fmt.Sprintf("%s asked for a route that does not exist; %d attempt(s)", who, count)
+	case event.ReasonBadOrdinal:
+		return fmt.Sprintf("%s named a replica of %q outside its range; %d attempt(s)", who, route, count)
+	default:
+		return fmt.Sprintf("%s was refused route %q (%s); %d attempt(s)", who, route, reason, count)
+	}
+}
+
 // message renders the operator-facing alert text for a violation class.
 func message(reason, host, app string, count int64) string {
 	// Named where it is known. An alert that says "application" when it could
@@ -557,6 +754,30 @@ func (i *Inspector) Apps() []AppStat {
 			return c
 		}
 		return strings.Compare(a.Namespace, b.Namespace)
+	})
+	return out
+}
+
+// Tunnel returns the tunnel-stream table, one row per peer and route (every
+// unknown route one UnknownRoute row), sorted by role, then peer, then route.
+// The returned slice is a copy, and so is each row's reasons map.
+func (i *Inspector) Tunnel() []TunnelStat {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	out := make([]TunnelStat, 0, len(i.tunnel))
+	for _, t := range i.tunnel {
+		row := *t
+		row.Reasons = maps.Clone(t.Reasons)
+		out = append(out, row)
+	}
+	slices.SortFunc(out, func(a, b TunnelStat) int {
+		if c := strings.Compare(a.Role, b.Role); c != 0 {
+			return c
+		}
+		if c := strings.Compare(a.Peer, b.Peer); c != 0 {
+			return c
+		}
+		return strings.Compare(a.Route, b.Route)
 	})
 	return out
 }

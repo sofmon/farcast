@@ -232,6 +232,14 @@ func (p *provider) planCreate(spec planck.ClusterSpec) (createInput, error) {
 
 // waitReady polls until the cluster reports Running (returning it with a
 // kubeconfig), enters an error state, or ctx expires.
+//
+// Running is not enough: the cluster must also read back as sending the
+// provider's logging nothing but system logs (ADR 0019). That holds for the
+// cluster just created and for one that already existed under this name —
+// install refuses an instance it already records, so an existing cluster here
+// is one FarCast lost track of, and it is not adopted as private on trust. A
+// cluster that fails the check is reported as an error and left for
+// 'farcast release'; FarCast does not reconfigure it.
 func (p *provider) waitReady(ctx context.Context, api clusterAPI, ref planck.ClusterRef) (*planck.Cluster, error) {
 	for {
 		st, exists, err := api.get(ctx, ref)
@@ -241,11 +249,17 @@ func (p *provider) waitReady(ctx context.Context, api clusterAPI, ref planck.Clu
 		if exists {
 			switch mapStatus(st.RawStatus) {
 			case planck.StatusRunning:
+				if !st.SystemLogsOnly {
+					return nil, fmt.Errorf("gke: cluster %q is running but its logging config reads back as %s, not system logs only: "+
+						"its applications' output would be sent to the provider's logging, which FarCast refuses (ADR 0019)",
+						ref.Name, st.Logging)
+				}
 				return &planck.Cluster{
-					Ref:        ref,
-					Status:     planck.StatusRunning,
-					Endpoint:   st.Endpoint,
-					Kubeconfig: buildKubeconfig(ref.Name, st.Endpoint),
+					Ref:            ref,
+					Status:         planck.StatusRunning,
+					Endpoint:       st.Endpoint,
+					Kubeconfig:     buildKubeconfig(ref.Name, st.Endpoint),
+					SystemLogsOnly: true,
 				}, nil
 			case planck.StatusError:
 				return nil, fmt.Errorf("gke: cluster %q entered an error state", ref.Name)

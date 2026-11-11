@@ -86,6 +86,40 @@ func TestIngressStatusHandler(t *testing.T) {
 	}
 }
 
+// The node of the replica that answered rides the tunnel's status, and only
+// when it is known: an empty node must be omitted, never sent as a name.
+func TestStatusReportsThisReplicasNode(t *testing.T) {
+	s, err := New(Config{TunnelListen: "127.0.0.1:0", Instance: "inst", Node: "n-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := s.Status().Node; got != "n-1" {
+		t.Errorf("status node = %q, want n-1", got)
+	}
+	ts := httptest.NewServer(s.ingressHandler())
+	defer ts.Close()
+	resp, err := http.Get(ts.URL + StatusPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var st ConnStatus
+	if err := json.NewDecoder(resp.Body).Decode(&st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Node != "n-1" {
+		t.Errorf("wire node = %q, want n-1", st.Node)
+	}
+
+	raw, err := json.Marshal(ConnStatus{Connected: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), `"node"`) {
+		t.Errorf("an unknown node was sent: %s", raw)
+	}
+}
+
 func TestServeEgressLifecycle(t *testing.T) {
 	addr := freeAddr(t)
 	s, _ := New(Config{EgressListen: addr, Allowlist: []parser.External{{Host: "allowed.test"}}})

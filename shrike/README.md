@@ -120,6 +120,9 @@ type Snapshot struct {
     Allowed    []HostStat   // hosts actually reached, with counts + bytes
     Violations []Violation  // deny classes, with severity + counts + timing
     Events     int64        // events processed
+    Apps       []AppStat    // per-application rollup (5.1b)
+    Tunnel     []TunnelStat // operator/keeper streams, per peer token and route
+    TunnelSeparated bool    // true from every monitor that keeps Tunnel apart
 }
 
 const StatusPath = "/_shrike/status"
@@ -215,7 +218,7 @@ Per [AGENTS.md](../AGENTS.md) and [ADR 0002](../docs/adr/0002-backend-language-s
 
 Accepted-and-documented for 2.2, not oversights:
 
-- **Shrike sees metadata, never payload.** By design (no MITM, the cloud stays blind) it knows host/port/proto/SNI/reason/byte-counts, not content. Exfiltration *to a declared host* is invisible to Shrike — that is a manifest-review problem (the operator vetting declarations), not a monitoring one.
+- **Shrike sees metadata, never payload.** By design (no MITM, the cloud stays blind to content) it knows host/port/proto/SNI/reason/byte-counts, not content. Exfiltration *to a declared host* is invisible to Shrike — that is a manifest-review problem (the operator vetting declarations), not a monitoring one.
 - **Inherits FatLine's SNI/ECH blind spots.** Shrike can only alert on what FatLine can distinguish; Encrypted ClientHello, no-SNI, and domain-fronting limits ([FatLine known limitations](../fatline/README.md#known-limitations)) carry through.
 - **Single-tenant in 2.2.** All violations attribute to the instance, not an app, until 4.4 — adequate while no apps run yet (Phase 4).
 - **Alerts are local.** 2.2 raises alerts to logs and the status surface; routing them to an operator out-of-band (push, the FarSight GUI) is a later UX concern, consistent with zero-central-dependency (no phone-home).
@@ -251,3 +254,17 @@ The status endpoint now carries a per-application rollup — hosts reached, conn
 **The picture is reached over the tunnel, and the listener has not moved.** It still binds `127.0.0.1` inside the Pod, with no Service and nothing the cluster can dial. FatLine's stream relay runs in that same Pod and shares its loopback, so one entry in the closed route list reaches it — an operator names a route, never an address, and the mTLS tunnel has already authenticated them. The original note on that port said publishing it would be attack surface *until something reached for it*; something now does, and it turned out to need no publishing.
 
 **The counts are a floor, not a total, for two separate reasons.** Shrike is fail-open and FatLine's `BufferedSink` drops events rather than block the data plane, so under a flood the byte totals under-report — the correct trade, stated rather than hidden, and FatLine logs every drop. And **each FatLine replica keeps its own picture**: a read through the tunnel lands on whichever replica answered, so on a two-replica instance the counts are that replica's share. The 5.1b walk found consecutive reports alternating between two partial pictures with identical timestamps, and the snapshot now carries the replica's own name while `farcast usage` reads the replica count and says the counts are a share. Aggregating across replicas is unsolved: the route resolves to `127.0.0.1` by construction, and a Deployment has no ordinals to address replicas with the way the keyholder's headless Service does.
+
+## The tunnel picture (2026-11-10)
+
+The operator's and keepers' streams into the instance — the keyholder re-seeds, the operator reading this very picture — are kept in their own table, `Snapshot.Tunnel`, one row per peer and route: streams relayed (with their bytes), refused (by reason) and failed ([ADR 0015](../docs/adr/0015-what-the-boundary-can-measure.md) decision 7).
+
+**They are not application egress, and they no longer pose as it.** Folded into the application tables, a tunnel stream had no application and became the `(unidentified)` row — which is where walk finding 1 (a keeper refused the operator's `shrike` route) lost which device it was. They are separated by `Proto == "stream"`, which FatLine has always set, so an older FatLine's stream lines land here too, with an empty peer. A relayed stream's bytes ride its `Allow` and used to be dropped; they are counted here.
+
+**A row's peer is an opaque leaf token, and it stays in this picture.** FatLine computes it from the verified leaf and sends it over the in-Pod socket; this picture is served on `127.0.0.1` and read over the operator's route alone. The token is never logged — not by FatLine, and not by the alert line here, which names `peer_role` (`operator` or `keeper`) and nothing finer, because Shrike's stdout is read on provider-owned nodes. Nothing finer includes the line's shape: alerts are de-duplicated per role, so how many lines there are and the `count` each carries depend on the role alone, not on which leaf, or how many leaves, were refused. Keyed per leaf, each leaf's first refusal was a new `count=1` line and its running count linked its later lines, which told a reader of the node log how many leaves were refused and which line was which. Only the operator's machine names the device behind a token, from the tokens `keeper enroll` recorded; `farcast usage` renders the table that way.
+
+**A refusal alerts like a violation.** `role_refused` and `unknown_route` are warnings, `bad_ordinal` informational, de-duplicated per role, reason and route with the same window and burst rules. Never per peer: a burst is the role's, and the per-leaf counts are in the table. A failed tunnel dial is counted and never alerts.
+
+**Every route that does not exist is one row.** A peer's `unknown_route` refusals are folded into a single `(unknown route)` row (`shrike.UnknownRoute`), and into one alert key per role. The name a peer asks for is its own text: kept per name, each new one was a new row and a new alert key that nothing evicts, so one admitted leaf could grow this picture without bound by naming routes. That the route did not exist is the finding. Which name was tried is on FatLine's own log line, quoted, and cut at 64 bytes and marked `...(cut)` when longer.
+
+**Mixed versions.** The wire is untagged `encoding/json` without `DisallowUnknownFields`, so an older sidecar ignores the two new event fields. A FatLine older than attribution sent a stream `dial_failed` as a `Deny`; this monitor reads it as the failure it is, so it is counted and raises nothing. That FatLine's stream refusals carry no peer, and their alert line still reads `tunnel stream refused`, chosen by `Proto`, not `egress policy violation`. `TunnelSeparated` is `true` from every monitor that keeps the table apart; a reader seeing it absent knows the `(unidentified)` row still includes tunnel streams. The table is per replica, like everything else here.

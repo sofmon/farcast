@@ -78,4 +78,6 @@ For most projects this is an ops-versus-control trade-off. For FarCast it is mor
 
 ---
 
+**Amended by [ADR 0019](0019-what-the-cluster-tells-its-provider.md):** the cluster is created with system-only logging and fails install unless it reads back that way. What Autopilot still reports to the provider (system logs and Events, the Admin Activity audit log, system metrics and GKE's default metric packages) is listed there.
+
 *This ADR is a living record. Revisit it after the FatLine benchmark (ADR 0002), when the second cloud provider lands (8.1), or whenever the GKE Autopilot pricing/restriction landscape materially changes.*

@@ -637,6 +637,64 @@ func TestBootLabelIsControlSurfaceOnly(t *testing.T) {
 	}
 }
 
+// The node a replica runs on is topology, and it is disclosed only where the
+// peer is authenticated, for the same reason the boot label is.
+func TestNodeIsControlSurfaceOnly(t *testing.T) {
+	h := newHarness(t)
+	h.srv.cfg.Node = "n-test"
+	h.status, h.control = h.srv.StatusHandler(), h.srv.ControlHandler()
+
+	var public map[string]any
+	mustJSON(t, do(h.status, "GET", "/v1/state", nil, nil), &public)
+	if v, present := public["node"]; present {
+		t.Errorf("the unauthenticated status endpoint disclosed the node: %v", v)
+	}
+
+	var control struct {
+		Node string `json:"node"`
+	}
+	mustJSON(t, doAs(h.control, asOperator, "GET", "/v1/state", nil, nil), &control)
+	if control.Node != "n-test" {
+		t.Errorf("control node = %q, want n-test", control.Node)
+	}
+}
+
+// The node rides every control response, not only GET /v1/state: a caller of
+// unseal or seal has that body in hand and nothing else.
+func TestNodeRidesEveryControlResponse(t *testing.T) {
+	h := newHarness(t)
+	h.srv.cfg.Node = "n-test"
+	h.control = h.srv.ControlHandler()
+
+	type body struct {
+		Node string `json:"node"`
+	}
+	check := func(what string, w *httptest.ResponseRecorder) {
+		t.Helper()
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s = %d: %s", what, w.Code, w.Body.String())
+		}
+		var b body
+		mustJSON(t, w, &b)
+		if b.Node != "n-test" {
+			t.Errorf("%s answered node %q, want n-test", what, b.Node)
+		}
+	}
+	check("unseal", h.push(t, "prod", 1, IntentOperator))
+	check("pin", doAs(h.control, asOperator, "POST", PinPath, map[string]string{"Content-Type": ContentTypePin},
+		[]byte(`{"version":1,"require":["00000000000000aa"],"retired":[]}`)))
+	check("seal", doAs(h.control, asOperator, "POST", "/v1/seal", nil, nil))
+	check("release-hold", doAs(h.control, asOperator, "POST", "/v1/release-hold", nil, nil))
+
+	// An absent node is omitted, not sent as "".
+	h.srv.cfg.Node = ""
+	var raw map[string]any
+	mustJSON(t, doAs(h.control, asOperator, "GET", "/v1/state", nil, nil), &raw)
+	if _, present := raw["node"]; present {
+		t.Errorf("an empty node was sent: %v", raw["node"])
+	}
+}
+
 // Two processes are two labels. Without that, "reseeded twice" and "restarted
 // twice" are indistinguishable in a ledger, and the audit ADR 0008 relies on
 // cannot be performed.
@@ -1433,5 +1491,30 @@ func TestThePinIsReportedOnTheControlSurfaceOnly(t *testing.T) {
 	}
 	if sealed.Pin == nil || sealed.Pin.Status != PinValid {
 		t.Errorf("seal answered without the pin: %+v", sealed.Pin)
+	}
+}
+
+// A refused keeper push is logged by role, never by device name. datasphered's
+// log is read on the provider's side, and which devices keep an instance is
+// the operator's fact to hold (walk finding 1).
+func TestAKeeperBundleRefusalLogsNoDeviceName(t *testing.T) {
+	const device = "distinctive-device-name"
+	var logs bytes.Buffer
+	h := newHarness(t)
+	h.srv.log = slog.New(slog.NewTextHandler(&logs, nil))
+	keeperURI := "farcast://prod/keeper/" + device
+	raw := marshalBundle(t, "prod", 1)
+	other := marshalBundle(t, "prod", 1)
+	w := h.pushWithLeaf(t, []string{keeperURI, KeeperBundleURIPrefix + KeeperBundleDigest(other)},
+		h.sealFor(t, keeperURI, raw), "/v1/unseal?intent="+string(IntentReseed))
+	if codeOf(w) != CodeKeeperBundle {
+		t.Fatalf("push = %d/%q, want the keeper-bundle refusal", w.Code, codeOf(w))
+	}
+	out := logs.String()
+	if !strings.Contains(out, "keeper bundle refused") || !strings.Contains(out, "role=keeper") {
+		t.Errorf("the refusal was not logged by role:\n%s", out)
+	}
+	if strings.Contains(out, device) {
+		t.Errorf("a keeper's device name reached datasphered's log:\n%s", out)
 	}
 }

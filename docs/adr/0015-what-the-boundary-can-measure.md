@@ -40,6 +40,19 @@ This is the condition the original comment on that port set — *"until somethin
 
 **6. Either half may be missing, and the report says which.** The two come from two places over two paths. A tunnel that is down must not cost the operator the compute half, an unreadable metrics API must not cost them the network half, and neither absence may render as a zero — the same distinction [ADR 0014](0014-observed-usage.md) decision 2 drew between "not measured" and "measured as nothing".
 
+**7. A tunnel stream is attributed by its peer's role in the log, and by an opaque leaf token only in the monitor's picture.** *(Amended 2026-11-10, from walk finding 1 of the Phase 5 Session A walk: a keeper was refused the operator's `shrike` route and nothing could say which device.)* FatLine already holds the verified leaf where it decides on a stream, so every stream event now carries two fields:
+
+- **`PeerRole`** — `operator` or `keeper`, from the same check that makes the `role_refused` decision, so the record and the decision cannot disagree.
+- **`PeerToken`** — 16 hex characters: the first 8 bytes of SHA-256 over the label `farcast-leaf-token-v1` and the leaf's DER (`identity.LeafToken`). The label keeps it from equalling the leaf's ordinary fingerprint.
+
+Where each goes is the decision. FatLine's own log line — and Shrike's alert line — gain **`peer_role` only**: it names a class, never a device. The token travels in process memory and over the in-Pod socket to Shrike, which keeps it in a per-peer, per-route **tunnel table** (`Snapshot.Tunnel`), served on `127.0.0.1` and read over the operator's route alone (decision 4). It is **never logged**: a stable per-device pseudonym in a provider-readable log would let the provider follow one device across its network addresses for the leaf's 90-day life, and count the fleet. The provider cannot invert the token either — the tunnel is TLS 1.3 only, so the client certificate crosses the wire encrypted, and a keeper's leaf never rests in the cloud. Only the operator's machine can name the device behind a token: `keeper enroll` records the token of every leaf it issues (`Keeper.LeafTokens`, oldest first, kept across re-enrolment and revocation because an older leaf stays valid in the cluster until its own NotAfter), and `farcast usage` maps tokens to `operator`, `keeper <device>` (marked revoked, expired, or an earlier leaf), or "leaf not enrolled from this machine".
+
+The alert line carries nothing per leaf, its shape included. Shrike de-duplicates tunnel alerts per **role, reason and route**, never per token, so how many lines it writes and the `count` each carries depend on the role alone, not on which leaf, or how many leaves, were refused. Keyed per token, each leaf's first refusal was a new `count=1` line and its running count linked its later ones: no token on the line, and still a weaker form of the same "follow one device, count the fleet" leak. The per-leaf counts stay in the tunnel table. The table also keeps no route name a peer chose: every `unknown_route` refusal is one `(unknown route)` row per peer and one alert key per role, because that name is the peer's own text and, kept per name, let one admitted leaf grow the picture without bound. FatLine's own line records the name quoted, and cut at 64 bytes when longer.
+
+Tunnel streams leave the application tables. They are not egress and have no application; folded in, they became the `(unidentified)` row, which is where the finding lost its device. The monitor separates them by `Proto == "stream"`, which FatLine has always set, so an older FatLine's stream lines land in the tunnel table too, with no peer. Two defects went with them: a relayed stream's bytes ride its `Allow` and were dropped (they are counted now), and a stream `dial_failed` was emitted as `Deny` against decision 2 (it is a `Fail` now).
+
+Rejected: putting the token in the log as well, so FatLine's own record names the device when Shrike is down. That buys a convenience for the operator at the price of a provider-visible device pseudonym, and the question it answers — which device tried — is answered from the picture.
+
 ---
 
 ## Consequences
@@ -49,6 +62,12 @@ This is the condition the original comment on that port set — *"until somethin
 **Counts are as lossy as the monitor's wire.** Shrike is fail-open and FatLine's `BufferedSink` drops events rather than block the data plane, so under a flood the byte totals under-report. That is the correct trade — security is never sacrificed for observability — and it means these numbers are a floor, not a total. FatLine logs every drop, which is where an operator sees that the floor is lower than the truth.
 
 **A failed dial now appears in the alert stream's neighbourhood without being an alert.** It is counted per host and per application and it raises nothing. An operator looking for why an application is not working finds it in the same table as everything else, which is the point.
+
+**A keeper enrolled before 2026-11-10 is unnamed from the operator's machine until it is re-enrolled.** The machine never kept the leaf it issued, so its token cannot be backfilled; `farcast usage` shows such a device as "keeper (leaf not enrolled from this machine)" and says that re-enrolling names it. Re-enrolment is the remedy every rotation already requires.
+
+**Mixed versions degrade, and say so.** The event struct carries no JSON tags and the wire decodes without `DisallowUnknownFields`, so an older Shrike sidecar ignores the two new fields and keeps working. A newer Shrike beside an older FatLine still separates tunnel streams, with an empty peer the report names as "FatLine predates attribution", and reads that FatLine's stream `dial_failed`, which rode `Deny`, as the failure it is: counted, never alerted. A picture from a monitor that predates the separation lacks `tunnel_separated`, and the report annotates its `(unidentified)` row as including the operator's and keepers' streams.
+
+**The token is in memory on provider-owned nodes.** It is held the way all of FatLine's and Shrike's in-process state is — FatLine holds the whole leaf already. The claim is that it is never written to a provider-ingested log or disk, not that it is hidden from a provider that reads node memory.
 
 **`farcast usage` needs a tunnel for half its output.** An instance that has never been connected reports compute alone, and says so. `--no-network` skips the tunnel deliberately, so a scripted caller need not pay for it.
 

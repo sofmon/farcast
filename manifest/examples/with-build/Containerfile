@@ -9,4 +9,5 @@
 # started from the result proves the step actually ran.
 FROM alpine:3.19
 RUN mkdir -p /opt && echo "built by farcast, inside the instance" > /opt/built.txt
-CMD ["sh", "-c", "cat /opt/built.txt && sleep 3600"]
+# Trapped so it stops on SIGTERM: see egress-demo/Containerfile for why.
+CMD ["sh", "-c", "cat /opt/built.txt || exit 1; trap 'exit 0' TERM INT; sleep 3600 & wait"]

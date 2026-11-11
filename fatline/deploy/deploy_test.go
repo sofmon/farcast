@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	"github.com/goccy/go-yaml"
+
+	"github.com/sofmon/farcast/fatline"
 )
 
 func sampleConfig() Config {
@@ -467,6 +469,36 @@ func argsOf(t *testing.T, container map[string]any) []string {
 		out = append(out, s)
 	}
 	return out
+}
+
+// The node a FatLine replica runs on reaches it as a fieldRef env value under
+// the name the binary reads. A wrong fieldPath or a diverging name reports
+// nothing, and the tunnel status would go back to saying nothing about
+// placement.
+func TestRenderNodeArrivesThroughTheDownwardAPIEnv(t *testing.T) {
+	if envNode != fatline.EnvNode {
+		t.Fatalf("the manifest sets %s and fatline reads %s", envNode, fatline.EnvNode)
+	}
+	out, err := Render(sampleConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, ok := containersOf(t, out)["fatline"]["env"].([]any)
+	if !ok {
+		t.Fatal("the fatline container has no env")
+	}
+	var found map[string]any
+	for _, e := range env {
+		if m, _ := e.(map[string]any); m["name"] == fatline.EnvNode {
+			found = m
+		}
+	}
+	if found == nil {
+		t.Fatalf("%s is not in the fatline container env", fatline.EnvNode)
+	}
+	if got := nested(t, found, "valueFrom", "fieldRef", "fieldPath"); got != "spec.nodeName" {
+		t.Errorf("%s comes from %v, want fieldRef spec.nodeName", fatline.EnvNode, got)
+	}
 }
 
 // Shrike is co-scheduled with FatLine, not deployed as its own workload.
