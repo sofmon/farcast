@@ -98,7 +98,13 @@ private struct MapContent: View {
                 if let territory = geometry.territories[instance.id] {
                     let rect = camera.screen(territory.header, in: viewport)
                     if rect.intersects(screen) {
-                        TerritoryLabel(instance: instance, rect: rect, scale: camera.scale) {
+                        TerritoryLabel(
+                            instance: instance,
+                            rect: rect,
+                            scale: camera.scale,
+                            alert: model.alertByInstance[instance.id],
+                            showsReadState: model.world.source == .live
+                        ) {
                             model.fly(to: .instance(instance.id))
                         }
                     }

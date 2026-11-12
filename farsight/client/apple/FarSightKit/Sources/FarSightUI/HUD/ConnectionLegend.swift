@@ -87,7 +87,7 @@ private struct LineSwatch: View {
             context.stroke(
                 path,
                 with: .color(style.color),
-                style: StrokeStyle(lineWidth: style.width, lineCap: .round, dash: style.dash)
+                style: StrokeStyle(lineWidth: style.width, lineCap: style.cap, dash: style.dash)
             )
             if refused {
                 var cross = Path()

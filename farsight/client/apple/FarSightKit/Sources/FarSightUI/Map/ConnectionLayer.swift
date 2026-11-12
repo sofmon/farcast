@@ -34,8 +34,8 @@ struct ConnectionLayer: View {
                 // panels; the rest dim and sink under them, so none crosses
                 // the app the operator is looking at.
                 let over = emphasis == .lifted || (emphasis == .normal && connection.crossesWall)
-                let healthy: Bool = if case .device(let id) = connection.from { devices[id]?.isHealthy ?? true } else { true }
-                let style = EdgeStyle(connection, healthy: healthy)
+                let health: Device.Health = if case .device(let id) = connection.from { devices[id]?.health ?? .healthy } else { .healthy }
+                let style = EdgeStyle(connection, health: health)
 
                 if over == (tier == .over) {
                     var path = Path()
@@ -56,7 +56,7 @@ struct ConnectionLayer: View {
                     line.stroke(
                         path,
                         with: .color(style.color),
-                        style: StrokeStyle(lineWidth: width, lineCap: .round, lineJoin: .round, dash: style.dash)
+                        style: StrokeStyle(lineWidth: width, lineCap: style.cap, lineJoin: .round, dash: style.dash)
                     )
                     if let last = route.segments.last {
                         Self.drawEnd(
@@ -94,7 +94,7 @@ struct ConnectionLayer: View {
                 for (position, i) in ordered.enumerated() {
                     var (route, connection, style) = labels[i]
                     route.labelStack = (position, ordered.count)
-                    Self.drawLabel(connection.label, route, context, camera: camera, viewport: viewport, color: style.color, stale: connection.isStale)
+                    Self.drawLabel(Display.name(connection.label), route, context, camera: camera, viewport: viewport, color: style.color, stale: connection.isStale)
                 }
             }
         }
@@ -160,17 +160,25 @@ struct ConnectionLayer: View {
 }
 
 /// How a connection looks, from what kind it is and what is known about it.
-/// Solid means FatLine counted it; dots mean only declared; red means refused;
-/// violet dashes mean decided but not built.
+/// Solid means FatLine counted it; dots mean only declared; red with short
+/// dashes means refused, so a refusal reads without its colour too; violet
+/// dashes mean decided but not built. No two grades share a dash.
 struct EdgeStyle {
     let color: Color
     let width: CGFloat
     let dash: [CGFloat]
+    /// Round, except on the refused line: round caps would close its short
+    /// gaps.
+    var cap: CGLineCap { dash == Self.deniedDash ? .butt : .round }
 
-    init(_ connection: Connection, healthy: Bool = true) {
+    /// The refused line's dash, which no other line uses.
+    static let deniedDash: [CGFloat] = [2, 3]
+
+    /// `health` is the health of the device a line starts at, if it does.
+    init(_ connection: Connection, health: Device.Health = .healthy) {
         switch (connection.kind, connection.evidence) {
         case (_, .denied):
-            (color, width, dash) = (Theme.denied, 2, [])
+            (color, width, dash) = (Theme.denied, 2, Self.deniedDash)
         case (_, .planned):
             (color, width, dash) = (Theme.planned, 2, [8, 6])
         case (_, .declared):
@@ -180,7 +188,12 @@ struct EdgeStyle {
         case (.tunnel, .observed):
             (color, width, dash) = (Theme.observed, 2.6, [])
         case (.keeper, .observed):
-            (color, width, dash) = (healthy ? Theme.keeper : Theme.warning, 2, [7, 6])
+            let color: Color = switch health {
+            case .healthy: Theme.keeper
+            case .expired, .revoked, .unseen: Theme.warning
+            case .unknown: Theme.secondaryText
+            }
+            (self.color, width, dash) = (color, 2, [7, 6])
         case (.storage, .observed):
             (color, width, dash) = (Theme.storage, 2, [6, 5])
         case (.appToApp, .observed):

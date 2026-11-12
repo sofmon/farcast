@@ -4,6 +4,7 @@ import Foundation
 import SwiftUI
 import Testing
 @testable import FarSightUI
+import FarSightCore
 
 /// The backdrop and what it asks of everything drawn over it.
 ///
@@ -13,8 +14,10 @@ import Testing
 /// 4.5:1 for text, 3:1 for lines — for what `readable()` lists: connection
 /// lines at full strength on the open backdrop and inside walls, their labels
 /// and the gates' and instances' on chips over the backdrop, a group's text,
-/// the app strip's repo names on chips over anything the map shows, and a
-/// host's or device's card border against its card. So the contract is checked against every colour
+/// the app strip's repo names on chips over anything the map shows, each
+/// spending level's colour on an instance's chip, a host's or device's card
+/// border against its card — by health and by alert — and an app's state
+/// colour on its card. So the contract is checked against every colour
 /// under the cap, not only the colours of today's backdrop, and the backdrop
 /// is checked against the cap on its own.
 ///
@@ -28,6 +31,8 @@ import Testing
 ///   below these ratios on the plain ground too;
 /// - the dot grid, which is decorative and kept outside the walls;
 /// - the map's lines and label chips where they cross a panel's light page;
+/// - the expected part of the spending bar, lighter than the confirmed part
+///   on purpose (`Theme.expectedShare`), whose figure is also written out;
 /// - the HUD's Liquid Glass, which adapts to what is under it and was
 ///   checked by eye on the iPad simulator, not here.
 @Suite("The backdrop")
@@ -227,24 +232,35 @@ struct BackdropTests {
         }
         let card = Light.luminance(Paint(Theme.panel).rgb)
 
+        let keeper = Connection(id: "k", from: .device("k"), to: .app("s"), kind: .keeper, evidence: .observed, label: "")
         let lines: [(String, Color)] = [
             ("observed", Theme.observed), ("declared", Theme.declared), ("denied", Theme.denied),
             ("planned", Theme.planned), ("keeper", Theme.keeper), ("unhealthy keeper", Theme.warning),
-        ]
+        ] + Device.Health.allCases.map { ("keeper line, \($0.rawValue)", EdgeStyle(keeper, health: $0).color) }
         let insideLines = lines + [("storage", Theme.storage), ("watch", Theme.watch)]
+        // An instance's chip: its spending in its level's colour, and when it
+        // was read or what failed.
         let labels = insideLines + [
             ("text", Theme.text), ("secondary text", Theme.secondaryText),
             ("running", Theme.running), ("warning", Theme.warning), ("critical", Theme.critical),
-        ]
+        ] + Spending.Level.allCases.map { ("spending, \($0.rawValue)", Theme.level($0)) }
         let groupText: [(String, Color)] = [
             ("text", Theme.text), ("secondary text", Theme.secondaryText), ("illustrative", Theme.illustrative),
         ]
 
+        // A device's border by its health, an alert's colour on it, and an
+        // app's state on its card: the dot, the pill and the marker.
+        let devices = Device.Health.allCases.flatMap { health in
+            DeviceRole.allCases.map { role in
+                ("\(role.rawValue) device, \(health.rawValue)", Theme.device(Device(id: "d", name: "d", role: role, note: "", health: health)))
+            }
+        }
         let cardBorders: [(String, Color)] = [
             ("used", Theme.observed), ("refused", Theme.denied), ("planned", Theme.planned),
             ("declared", Theme.declared), ("unconnected", Theme.tertiaryText),
             ("operator device", Theme.focus), ("keeper device", Theme.keeper), ("unhealthy device", Theme.warning),
-        ]
+            ("warning alert", Theme.severity(.warning)), ("critical alert", Theme.severity(.critical)),
+        ] + devices + AppState.allCases.map { ("app \($0.label)", Theme.state($0)) }
 
         // Lines crossing the open backdrop: egress to hosts, tunnels and
         // keepers from devices. Lines inside a wall: all kinds. Labels on

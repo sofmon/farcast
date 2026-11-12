@@ -86,17 +86,9 @@ func (c *costsCommand) Run(ctx context.Context, env *Env, args []string) error {
 	if !found {
 		return fmt.Errorf("the kernel in %q has not checkpointed yet; it writes one within a few minutes of starting", name)
 	}
-	var cp kernel.Checkpoint
-	if err := json.Unmarshal([]byte(raw), &cp); err != nil {
-		return fmt.Errorf("decode the kernel's ledger: %w", err)
-	}
-	if cp.Version != kernel.CheckpointVersion {
-		return fmt.Errorf("the kernel wrote ledger version %d and this build reads %d; one of them is older than the other",
-			cp.Version, kernel.CheckpointVersion)
-	}
-	ledger, err := cost.Restore(cp.Ledger)
+	cp, ledger, err := decodeCheckpoint(raw)
 	if err != nil {
-		return fmt.Errorf("restore the kernel's ledger: %w", err)
+		return err
 	}
 
 	accrual := ledger.Accrued()
@@ -128,6 +120,30 @@ func (c *costsCommand) Run(ctx context.Context, env *Env, args []string) error {
 		res.Discrepancies = append(res.Discrepancies, d.String())
 	}
 	return env.Printer.Print(res)
+}
+
+// decodeCheckpoint reads the kernel's checkpoint the one way 'costs' and
+// 'world' both read it: decoded, its version checked against this build's,
+// and its ledger restored through the validating path.
+//
+// A version this build does not read is marked version_skew, and a value that
+// is not a checkpoint at all kubectl_failed — the read returned something, and
+// it was not what the kernel writes.
+func decodeCheckpoint(raw string) (kernel.Checkpoint, *cost.Ledger, error) {
+	var cp kernel.Checkpoint
+	if err := json.Unmarshal([]byte(raw), &cp); err != nil {
+		return cp, nil, withKind(kindKubectlFailed, fmt.Errorf("decode the kernel's ledger: %w", err))
+	}
+	if cp.Version != kernel.CheckpointVersion {
+		return cp, nil, withKind(kindVersionSkew, fmt.Errorf(
+			"the kernel wrote ledger version %d and this build reads %d; one of them is older than the other",
+			cp.Version, kernel.CheckpointVersion))
+	}
+	ledger, err := cost.Restore(cp.Ledger)
+	if err != nil {
+		return cp, nil, fmt.Errorf("restore the kernel's ledger: %w", err)
+	}
+	return cp, ledger, nil
 }
 
 func appSpend(byApp map[string]float64) []appCost {
@@ -259,11 +275,9 @@ func (r costsResult) Human(w io.Writer) error {
 	// Always printed. A figure that looks complete is the failure this guards
 	// against: these charges reach the bill and never reach 'expected'.
 	fprintf(w, "\nNot metered — the kernel cannot see these from inside the cluster:\n")
-	fprintf(w, "  data through the carrier (egress and load-balancer processing)\n")
-	fprintf(w, "  bucket storage and operations\n")
-	fprintf(w, "  registry storage\n")
-	fprintf(w, "  the cluster's own managed workloads (modelled at about $%d/month in the floor, unverified)\n", emptyClusterMonthlyUSD)
-	fprintf(w, "  the GKE cluster fee, if the free credit is spent on another cluster\n")
+	for _, fact := range notMeteredFacts() {
+		fprintf(w, "  %s\n", fact)
+	}
 	fprintf(w, "'confirmed' is what catches them.\n")
 
 	if r.Observed.Unclassified > 0 {

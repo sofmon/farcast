@@ -3,6 +3,8 @@ package output
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -56,7 +58,7 @@ func TestPrinterJSON(t *testing.T) {
 func TestPrintErrorHuman(t *testing.T) {
 	var out, errb bytes.Buffer
 	p := &Printer{Mode: ModeHuman, Out: &out, Err: &errb}
-	p.PrintError("boom", 1)
+	p.PrintError(errors.New("boom"), 1)
 	if errb.String() != "farcast: boom\n" {
 		t.Errorf("err = %q", errb.String())
 	}
@@ -68,7 +70,7 @@ func TestPrintErrorHuman(t *testing.T) {
 func TestPrintErrorJSON(t *testing.T) {
 	var out, errb bytes.Buffer
 	p := &Printer{Mode: ModeJSON, Out: &out, Err: &errb}
-	p.PrintError("boom", 2)
+	p.PrintError(errors.New("boom"), 2)
 
 	var env struct {
 		Error struct {
@@ -130,7 +132,7 @@ const hostileError = "keyholder replica 1 refused the keys: x\x1b]52;c;ZXZpbA==\
 func TestPrintErrorHumanEscapesWhatWouldActOnTheTerminal(t *testing.T) {
 	var out, errb bytes.Buffer
 	p := &Printer{Mode: ModeHuman, Out: &out, Err: &errb}
-	p.PrintError(hostileError, 1)
+	p.PrintError(errors.New(hostileError), 1)
 	got := errb.String()
 	t.Log("\n" + got)
 
@@ -164,7 +166,7 @@ func TestPrintErrorHumanLeavesPrintableTextAlone(t *testing.T) {
 		"\tpaiement à l'étranger — ça marche, 支払い処理, \ufffd\n" +
 		"Storage keys live only here."
 	var out, errb bytes.Buffer
-	(&Printer{Mode: ModeHuman, Out: &out, Err: &errb}).PrintError(msg, 1)
+	(&Printer{Mode: ModeHuman, Out: &out, Err: &errb}).PrintError(errors.New(msg), 1)
 	if want := "farcast: " + msg + "\n"; errb.String() != want {
 		t.Errorf("printed %q, want %q", errb.String(), want)
 	}
@@ -174,7 +176,7 @@ func TestPrintErrorHumanLeavesPrintableTextAlone(t *testing.T) {
 // makes of the raw message, byte for byte, and nothing is escaped on the way.
 func TestPrintErrorJSONCarriesTheMessageAsItCame(t *testing.T) {
 	var out, errb bytes.Buffer
-	(&Printer{Mode: ModeJSON, Out: &out, Err: &errb}).PrintError(hostileError, 1)
+	(&Printer{Mode: ModeJSON, Out: &out, Err: &errb}).PrintError(errors.New(hostileError), 1)
 
 	var want bytes.Buffer
 	enc := json.NewEncoder(&want)
@@ -182,10 +184,11 @@ func TestPrintErrorJSONCarriesTheMessageAsItCame(t *testing.T) {
 	type body struct {
 		Message string `json:"message"`
 		Code    int    `json:"code"`
+		Kind    string `json:"kind"`
 	}
 	if err := enc.Encode(struct {
 		Error body `json:"error"`
-	}{body{Message: hostileError, Code: 1}}); err != nil {
+	}{body{Message: hostileError, Code: 1, Kind: KindInternal}}); err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(out.Bytes(), want.Bytes()) {
@@ -204,5 +207,51 @@ func TestPrintErrorJSONCarriesTheMessageAsItCame(t *testing.T) {
 	}
 	if errb.Len() != 0 {
 		t.Errorf("stderr should be empty, got %q", errb.String())
+	}
+}
+
+// kinded is a test error that names its kind, as the CLI's kindError does.
+type kinded struct{ kind, msg string }
+
+func (k *kinded) Error() string     { return k.msg }
+func (k *kinded) ErrorKind() string { return k.kind }
+
+// The envelope carries the kind an error names anywhere in its chain, and
+// "internal" for an error that names none. The message and the code are the
+// two fields a reader that predates the kind already read, unchanged.
+func TestPrintErrorJSONCarriesTheKind(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want string
+	}{
+		{errors.New("plain"), KindInternal},
+		{&kinded{kind: "not_found", msg: "no instance named atlas"}, "not_found"},
+		{fmt.Errorf("wrapped: %w", &kinded{kind: "gcloud_mismatch", msg: "x"}), "gcloud_mismatch"},
+		{&kinded{kind: "", msg: "a kind left empty"}, KindInternal},
+	} {
+		var out, errb bytes.Buffer
+		(&Printer{Mode: ModeJSON, Out: &out, Err: &errb}).PrintError(tc.err, 1)
+		var env struct {
+			Error struct {
+				Message string `json:"message"`
+				Code    int    `json:"code"`
+				Kind    string `json:"kind"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(out.Bytes(), &env); err != nil {
+			t.Fatalf("not JSON: %v", err)
+		}
+		if env.Error.Kind != tc.want || env.Error.Message != tc.err.Error() || env.Error.Code != 1 {
+			t.Errorf("PrintError(%q) envelope = %+v, want kind %q", tc.err, env.Error, tc.want)
+		}
+	}
+}
+
+// Human mode prints no kind: the line an operator reads is unchanged.
+func TestPrintErrorHumanPrintsNoKind(t *testing.T) {
+	var out, errb bytes.Buffer
+	(&Printer{Mode: ModeHuman, Out: &out, Err: &errb}).PrintError(&kinded{kind: "timeout", msg: "boom"}, 1)
+	if errb.String() != "farcast: boom\n" {
+		t.Errorf("err = %q", errb.String())
 	}
 }

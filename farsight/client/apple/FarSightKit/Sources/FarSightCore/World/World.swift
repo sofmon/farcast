@@ -4,28 +4,77 @@ import Foundation
 /// them, the operator's own devices, the hosts outside, and the connections
 /// between them.
 ///
-/// It is a snapshot. Fixtures provide it today; the read route ADR 0021 names
-/// is to deliver it later, through FatLine. Nothing in it is hidden by the
-/// map: every app has a place, a stopped one included.
+/// It is a snapshot, and it says where it came from (`source`). A fixture
+/// world is illustrative. A live world arrives from the Connected view's
+/// reader, one instance at a time, when the operator asks for a read (ADR
+/// 0021 decision 9, amended 2026-11-12); the read route is to deliver it
+/// later, through FatLine. Nothing in it is hidden by the map: every app has
+/// a place, a stopped one included.
 public struct World: Codable, Sendable, Equatable {
     public var instances: [Instance]
     public var devices: [Device]
     public var hosts: [Host]
     public var connections: [Connection]
     public var alerts: [WorldAlert]
+    /// Illustrative, or read from instances. A live world never holds the
+    /// fixture's illustrative groups, apps or planned lines (`validate()`).
+    public var source: Source
 
     public init(
         instances: [Instance],
         devices: [Device] = [],
         hosts: [Host] = [],
         connections: [Connection] = [],
-        alerts: [WorldAlert] = []
+        alerts: [WorldAlert] = [],
+        source: Source = .live
     ) {
         self.instances = instances
         self.devices = devices
         self.hosts = hosts
         self.connections = connections
         self.alerts = alerts
+        self.source = source
+    }
+
+    /// A snapshot that does not say where it came from is held to the live
+    /// rules, the stricter ones.
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        instances = try container.decode([Instance].self, forKey: .instances)
+        devices = try container.decode([Device].self, forKey: .devices)
+        hosts = try container.decode([Host].self, forKey: .hosts)
+        connections = try container.decode([Connection].self, forKey: .connections)
+        alerts = try container.decode([WorldAlert].self, forKey: .alerts)
+        source = try container.decodeIfPresent(Source.self, forKey: .source) ?? .live
+    }
+
+    public enum Source: String, Codable, Sendable, Equatable, CaseIterable {
+        /// Illustrative: drawn from `world.json`, read from nothing.
+        case fixture
+        /// Read from the operator's instances.
+        case live
+
+        /// A source this build does not know is held to the live rules.
+        public init(from decoder: any Decoder) throws {
+            let raw = try decoder.singleValueContainer().decode(String.self)
+            self = Source(rawValue: raw) ?? .live
+        }
+    }
+
+    /// A decoder for a world as `world.json` writes it: times are RFC 3339,
+    /// to the second.
+    public static func decoder() -> JSONDecoder {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return decoder
+    }
+
+    /// An encoder that writes what `decoder()` reads.
+    public static func encoder() -> JSONEncoder {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.sortedKeys]
+        return encoder
     }
 }
 
@@ -35,45 +84,317 @@ public struct Instance: Codable, Sendable, Equatable, Identifiable {
     public var id: String
     public var spending: Spending
     public var groups: [AppGroup]
+    /// What the local record says, verbatim.
+    public var status: Status
+    /// When the instance was read; nil for the fixture and for an instance
+    /// listed but not read yet.
+    public var readAt: Date?
+    /// Every part of the read that failed. A section that could not be read
+    /// says so here instead of disappearing.
+    public var problems: [SectionProblem]
+    public var cloudLogging: CloudLogging
+    /// Which FatLine replica counted the instance's lines, and since when;
+    /// nil when the network was not read.
+    public var network: NetworkReading?
+    /// What the read saw and could not draw, in the CLI's words: rows that
+    /// name no app on the map, an app the monitor names that is not
+    /// running. Shown through `Display.message`.
+    public var caveats: [String]
 
-    public init(id: String, spending: Spending, groups: [AppGroup]) {
+    public init(
+        id: String,
+        spending: Spending,
+        groups: [AppGroup],
+        status: Status = .unknown,
+        readAt: Date? = nil,
+        problems: [SectionProblem] = [],
+        cloudLogging: CloudLogging = .unknown,
+        network: NetworkReading? = nil,
+        caveats: [String] = []
+    ) {
         self.id = id
         self.spending = spending
         self.groups = groups
+        self.status = status
+        self.readAt = readAt
+        self.problems = problems
+        self.cloudLogging = cloudLogging
+        self.network = network
+        self.caveats = caveats
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        spending = try container.decode(Spending.self, forKey: .spending)
+        groups = try container.decode([AppGroup].self, forKey: .groups)
+        status = try container.decodeIfPresent(Status.self, forKey: .status) ?? .unknown
+        readAt = try container.decodeIfPresent(Date.self, forKey: .readAt)
+        problems = try container.decodeIfPresent([SectionProblem].self, forKey: .problems) ?? []
+        cloudLogging = try container.decodeIfPresent(CloudLogging.self, forKey: .cloudLogging) ?? .unknown
+        network = try container.decodeIfPresent(NetworkReading.self, forKey: .network)
+        caveats = try container.decodeIfPresent([String].self, forKey: .caveats) ?? []
+    }
+
+    /// The instance's status as its local record holds it.
+    public enum Status: String, Codable, Sendable, Equatable, CaseIterable, UnknownDecodable {
+        case provisioning
+        case running
+        case unreachable
+        /// A release that did not finish: the instance may still be billing.
+        case deleting
+        case error
+        case unknown
+
+        public var label: String {
+            switch self {
+            case .provisioning: "provisioning"
+            case .running: "running"
+            case .unreachable: "unreachable"
+            case .deleting: "release incomplete, may still be billing"
+            case .error: "error"
+            case .unknown: "status unknown"
+            }
+        }
+    }
+
+    /// Whether the cluster sends only system logs to the provider's logging.
+    public enum CloudLogging: String, Codable, Sendable, Equatable, CaseIterable, UnknownDecodable {
+        case systemOnly
+        /// The record says nothing: the setting was never confirmed.
+        case unverified
+        case unknown
+    }
+
+    /// The problem the read had with `section`, if any.
+    public func problem(in section: SectionProblem.Section) -> SectionProblem? {
+        problems.first { $0.section == section }
     }
 }
 
-/// TechnoCore's figure that protective action fires on, `expected`, against
-/// the limit set at creation (AGENTS.md, cost control). The provider's
-/// `confirmed` figure arrives a day later and is not drawn yet.
+/// What counted every line of an instance: one FatLine replica's monitor,
+/// since it started (ADR 0022 decision 9). Counts are floors.
+public struct NetworkReading: Codable, Sendable, Equatable {
+    /// The Pod; nil when the monitor did not say.
+    public var replica: String?
+    public var since: Date?
+    /// How many FatLine replicas run; nil when not read.
+    public var fatlineReplicas: Int?
+
+    public init(replica: String? = nil, since: Date? = nil, fatlineReplicas: Int? = nil) {
+        self.replica = replica
+        self.since = since
+        self.fatlineReplicas = fatlineReplicas
+    }
+}
+
+/// One part of an instance's read that failed, and why.
+public struct SectionProblem: Codable, Sendable, Equatable, Hashable {
+    public var section: Section
+    public var kind: Kind
+    /// Written by the CLI; shown through `Display.message`.
+    public var message: String
+
+    public init(section: Section, kind: Kind, message: String) {
+        self.section = section
+        self.kind = kind
+        self.message = message
+    }
+
+    /// Which part failed: one of the world document's sections, the local
+    /// record, or the read as a whole (a timeout, a refused identity).
+    public enum Section: String, Codable, Sendable, Equatable, Hashable, CaseIterable, UnknownDecodable {
+        case record
+        case read
+        case spend
+        case apps
+        case policy
+        case network
+        case seal
+        case unknown
+    }
+
+    /// The CLI's stable error kinds, so the map tells "no tunnel", "no
+    /// kernel", "version skew" and "signed out of gcloud" apart without
+    /// reading prose.
+    public enum Kind: String, Codable, Sendable, Equatable, Hashable, CaseIterable, UnknownDecodable {
+        case recordUnreadable
+        case notFound
+        /// No FatLine recorded, so no tunnel.
+        case notConnected
+        case tunnelUnreachable
+        case kernelAbsent
+        case notCheckpointed
+        case versionSkew
+        case kubectlMissing
+        case kubectlFailed
+        case gcloudMismatch
+        case gcloudSignedOut
+        case authToolMissing
+        case timeout
+        case `internal`
+        case unknown
+
+        public var label: String {
+            switch self {
+            case .recordUnreadable: "record unreadable"
+            case .notFound: "not found"
+            case .notConnected: "no tunnel"
+            case .tunnelUnreachable: "tunnel unreachable"
+            case .kernelAbsent: "no kernel"
+            case .notCheckpointed: "not checkpointed yet"
+            case .versionSkew: "version skew"
+            case .kubectlMissing: "kubectl missing"
+            case .kubectlFailed: "kubectl failed"
+            case .gcloudMismatch: "gcloud identity does not match"
+            case .gcloudSignedOut: "signed out of gcloud"
+            case .authToolMissing: "auth plugin missing"
+            case .timeout: "timed out"
+            case .internal: "internal error"
+            case .unknown: "unknown error"
+            }
+        }
+    }
+}
+
+/// Spending as TechnoCore reports it, never recomputed here (ADR 0009).
+///
+/// Two figures, not one: `confirmed` is the provider's own number for each
+/// window that has closed, through `confirmedThrough`; `expected` is metered
+/// locally for the open window, and is what protective action fires on. They
+/// are never shown as one undifferentiated total (ADR 0009 decision 4):
+/// `totalCents` is their sum as the kernel compares it, and only sets the
+/// length of the bar.
 public struct Spending: Codable, Sendable, Equatable {
-    public var expectedCents: Int
-    public var limitCents: Int
+    public var expectedCents: Int?
+    public var confirmedCents: Int?
+    /// What enforcement compares against the kernel's limit. Drawn as the
+    /// bar's length, never printed as one figure.
+    public var totalCents: Int?
+    /// The kernel's own limit; nil unless spending was read, or when the
+    /// kernel published none.
+    public var limitCents: Int?
+    /// The local record's limit; nil when the record could not be read.
+    public var recordedLimitCents: Int?
+    public var hasConfirmation: Bool
+    public var confirmedThrough: Date?
+    /// The kernel's level, as it last reconciled.
+    public var level: Level
+    public var currency: String
+    /// Discrepancies and gaps the kernel or the CLI reported.
+    public var caveats: [String]
+    /// What the meter cannot see from inside the cluster.
+    public var notMetered: [String]
+    /// The kernel's checkpoint is older than three checkpoint intervals.
+    public var isCheckpointStale: Bool
 
-    public init(expectedCents: Int, limitCents: Int) {
+    public init(
+        expectedCents: Int? = nil,
+        confirmedCents: Int? = nil,
+        totalCents: Int? = nil,
+        limitCents: Int? = nil,
+        recordedLimitCents: Int? = nil,
+        hasConfirmation: Bool = false,
+        confirmedThrough: Date? = nil,
+        level: Level = .unknown,
+        currency: String = "USD",
+        caveats: [String] = [],
+        notMetered: [String] = [],
+        isCheckpointStale: Bool = false
+    ) {
         self.expectedCents = expectedCents
+        self.confirmedCents = confirmedCents
+        self.totalCents = totalCents
         self.limitCents = limitCents
+        self.recordedLimitCents = recordedLimitCents
+        self.hasConfirmation = hasConfirmation
+        self.confirmedThrough = confirmedThrough
+        self.level = level
+        self.currency = currency
+        self.caveats = caveats
+        self.notMetered = notMetered
+        self.isCheckpointStale = isCheckpointStale
     }
 
-    /// Expected spending as a share of the limit; 0 when there is no limit to
-    /// share, which an instance never has but a malformed snapshot could.
-    public var fraction: Double {
-        limitCents > 0 ? Double(expectedCents) / Double(limitCents) : 0
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        expectedCents = try container.decodeIfPresent(Int.self, forKey: .expectedCents)
+        confirmedCents = try container.decodeIfPresent(Int.self, forKey: .confirmedCents)
+        totalCents = try container.decodeIfPresent(Int.self, forKey: .totalCents)
+        limitCents = try container.decodeIfPresent(Int.self, forKey: .limitCents)
+        recordedLimitCents = try container.decodeIfPresent(Int.self, forKey: .recordedLimitCents)
+        hasConfirmation = try container.decodeIfPresent(Bool.self, forKey: .hasConfirmation) ?? false
+        confirmedThrough = try container.decodeIfPresent(Date.self, forKey: .confirmedThrough)
+        level = try container.decodeIfPresent(Level.self, forKey: .level) ?? .unknown
+        currency = try container.decodeIfPresent(String.self, forKey: .currency) ?? "USD"
+        caveats = try container.decodeIfPresent([String].self, forKey: .caveats) ?? []
+        notMetered = try container.decodeIfPresent([String].self, forKey: .notMetered) ?? []
+        isCheckpointStale = try container.decodeIfPresent(Bool.self, forKey: .isCheckpointStale) ?? false
+    }
+
+    /// The kernel's level: where spending stands against its limit, as the
+    /// kernel last judged it. Never recomputed from the figures.
+    public enum Level: String, Codable, Sendable, Equatable, CaseIterable, UnknownDecodable {
+        case ok
+        case warn50
+        case warn75
+        case warn90
+        case reached
+        case unknown
+
+        /// As the kernel says it.
+        public var label: String {
+            switch self {
+            case .ok: "ok"
+            case .warn50: "50%"
+            case .warn75: "75%"
+            case .warn90: "90%"
+            case .reached: "limit reached"
+            case .unknown: "not read"
+            }
+        }
+    }
+
+    /// Whether any figure was read: an instance listed but not read, or
+    /// whose spending section failed, has none.
+    public var isRead: Bool {
+        expectedCents != nil || confirmedCents != nil || totalCents != nil
+    }
+
+    /// The total as a share of the kernel's limit: what enforcement compares.
+    /// Nil when either was not read.
+    public var fraction: Double? {
+        guard let total = totalCents, let limit = limitCents, limit > 0 else { return nil }
+        return Double(total) / Double(limit)
+    }
+
+    /// The bar's two parts as shares of the kernel's limit, each clamped to
+    /// the bar: confirmed first, then expected up to the total. Nil when the
+    /// total or the limit was not read.
+    public var bar: (confirmed: Double, expected: Double)? {
+        guard let total = totalCents, let limit = limitCents, limit > 0 else { return nil }
+        let length = min(max(Double(total) / Double(limit), 0), 1)
+        let confirmed = hasConfirmation ? min(max(Double(confirmedCents ?? 0) / Double(limit), 0), length) : 0
+        return (confirmed, length - confirmed)
     }
 }
 
-/// One Git repository's apps: one deployment, one Kubernetes namespace, one
-/// group that moves on the map as a unit. The system group is FarCast itself —
-/// TechnoCore, Shrike, FatLine and DataSphere, shown as apps like any other.
+/// One namespace's apps, labelled with the repository `run` recorded for it
+/// on this Mac: one Kubernetes namespace, one group that moves on the map as
+/// a unit. A repository with several manifests deploys several namespaces,
+/// so several groups (ADR 0021 decision 2, amended 2026-11-12). The system
+/// group is FarCast itself — TechnoCore, Shrike, FatLine and DataSphere,
+/// shown as apps like any other.
 public struct AppGroup: Codable, Sendable, Equatable, Identifiable {
     /// `<instance>/<namespace>`.
     public var id: String
     public var namespace: String
-    /// Where the apps come from: a repository, or "FarCast" for the system group.
+    /// The repository `run` recorded for the namespace on this Mac, or a
+    /// note that none is recorded here, or "FarCast" for the system group.
     public var source: String
     public var isSystem: Bool
     /// Drawn to show behaviour that is decided but not built. Never a real
-    /// deployment; the map marks it so.
+    /// deployment; the map marks it so, and a live world never has one.
     public var isIllustrative: Bool
     public var apps: [Application]
 
@@ -106,22 +427,30 @@ public struct Application: Codable, Sendable, Equatable, Identifiable {
     public var stopReason: String?
     /// The part of FarCast this app is, for apps in the system group.
     public var system: SystemRole?
-    /// Expected spending this month; nil when it is counted elsewhere.
+    /// Expected spending this month; nil when it is counted elsewhere or
+    /// could not be told apart.
     public var monthCents: Int?
     /// Where the spending is counted when `monthCents` is nil.
     public var costNote: String?
     public var isIllustrative: Bool
+    /// Ready replicas, and the replicas wanted, when the apps were read.
+    public var ready: Int?
+    public var desired: Int?
 
+    /// `state` defaults to `unknown`: an app built without one has nothing
+    /// behind it saying it runs, and is never drawn as running.
     public init(
         id: String,
         name: String,
         role: String,
-        state: AppState = .running,
+        state: AppState = .unknown,
         stopReason: String? = nil,
         system: SystemRole? = nil,
         monthCents: Int? = nil,
         costNote: String? = nil,
-        isIllustrative: Bool = false
+        isIllustrative: Bool = false,
+        ready: Int? = nil,
+        desired: Int? = nil
     ) {
         self.id = id
         self.name = name
@@ -132,12 +461,40 @@ public struct Application: Codable, Sendable, Equatable, Identifiable {
         self.monthCents = monthCents
         self.costNote = costNote
         self.isIllustrative = isIllustrative
+        self.ready = ready
+        self.desired = desired
     }
 }
 
-public enum AppState: String, Codable, Sendable, Equatable {
+/// What an app, or one of FarCast's own components, is doing.
+public enum AppState: String, Codable, Sendable, Equatable, CaseIterable, UnknownDecodable {
     case running
     case stopped
+    /// Fewer replicas ready than wanted.
+    case starting
+    /// Never deployed, or the cluster has no workload for it.
+    case notDeployed
+    /// Not read: the section that would say failed, or was never read.
+    case unknown
+
+    /// What the map says, and VoiceOver reads.
+    public var label: String {
+        switch self {
+        case .running: "running"
+        case .stopped: "stopped"
+        case .starting: "starting"
+        case .notDeployed: "not deployed"
+        case .unknown: "unknown"
+        }
+    }
+
+    /// Nothing runs: drawn faded, as a stopped app always was.
+    public var isDormant: Bool {
+        switch self {
+        case .stopped, .notDeployed: true
+        case .running, .starting, .unknown: false
+        }
+    }
 }
 
 /// The FarCast component a system app is. The map anchors the instance's
@@ -171,18 +528,60 @@ public struct Device: Codable, Sendable, Equatable, Identifiable {
     public var name: String
     public var role: DeviceRole
     public var note: String
-    public var isHealthy: Bool
+    public var health: Health
 
-    public init(id: String, name: String, role: DeviceRole, note: String, isHealthy: Bool = true) {
+    /// A device given no `health` has the one its role implies
+    /// (`unstatedHealth(_:)`), never one read from nothing.
+    public init(id: String, name: String, role: DeviceRole, note: String, health: Health? = nil) {
         self.id = id
         self.name = name
         self.role = role
         self.note = note
-        self.isHealthy = isHealthy
+        self.health = health ?? Self.unstatedHealth(role)
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        role = try container.decode(DeviceRole.self, forKey: .role)
+        note = try container.decode(String.self, forKey: .note)
+        health = try container.decodeIfPresent(Health.self, forKey: .health) ?? Self.unstatedHealth(role)
+    }
+
+    /// The health of a device that states none. The operator's own Mac is
+    /// not graded — it is the one reading — so it is healthy, as a world
+    /// read from an instance names it (`{"id": "operator", "role":
+    /// "operator"}`). A keeper's health is graded from what was read, so
+    /// without one it was not read.
+    public static func unstatedHealth(_ role: DeviceRole) -> Health {
+        switch role {
+        case .operator: .healthy
+        case .keeper: .unknown
+        }
+    }
+
+    /// Whether the device is drawn as needing nothing. Kept for the callers
+    /// that only ask that; a device not read (`unknown`) is not claimed to be
+    /// unhealthy, so it counts here, and the map says "not read" for it by
+    /// switching on `health`.
+    public var isHealthy: Bool {
+        health == .healthy || health == .unknown
+    }
+
+    public enum Health: String, Codable, Sendable, Equatable, CaseIterable, UnknownDecodable {
+        case healthy
+        /// Its leaf is past its expiry.
+        case expired
+        case revoked
+        /// No tunnel from it within a day, where the read can tell.
+        case unseen
+        /// Not read: the network section failed or could not tell.
+        case unknown
     }
 }
 
-public enum DeviceRole: String, Codable, Sendable, Equatable {
+public enum DeviceRole: String, Codable, Sendable, Equatable, CaseIterable {
     case `operator`
     case keeper
 }
@@ -197,8 +596,13 @@ public struct Connection: Codable, Sendable, Equatable, Identifiable {
     public var kind: Kind
     public var evidence: Evidence
     public var label: String
-    /// The last observation is old: the line is drawn faded.
+    /// The last observation is old, or the read that gave it failed since:
+    /// the line is drawn faded.
     public var isStale: Bool
+    /// A floor, counted by one FatLine replica since `since`; never a total.
+    public var count: Int?
+    public var since: Date?
+    public var lastSeen: Date?
 
     public init(
         id: String,
@@ -207,7 +611,10 @@ public struct Connection: Codable, Sendable, Equatable, Identifiable {
         kind: Kind,
         evidence: Evidence,
         label: String,
-        isStale: Bool = false
+        isStale: Bool = false,
+        count: Int? = nil,
+        since: Date? = nil,
+        lastSeen: Date? = nil
     ) {
         self.id = id
         self.from = from
@@ -216,6 +623,9 @@ public struct Connection: Codable, Sendable, Equatable, Identifiable {
         self.evidence = evidence
         self.label = label
         self.isStale = isStale
+        self.count = count
+        self.since = since
+        self.lastSeen = lastSeen
     }
 
     public enum Kind: String, Codable, Sendable, Equatable, CaseIterable {
@@ -233,7 +643,7 @@ public struct Connection: Codable, Sendable, Equatable, Identifiable {
         case watch
     }
 
-    public enum Evidence: String, Codable, Sendable, Equatable {
+    public enum Evidence: String, Codable, Sendable, Equatable, CaseIterable {
         /// FatLine counted it.
         case observed
         /// A manifest declares it; nothing has used it.
@@ -301,31 +711,94 @@ extension Endpoint: Codable {
     }
 }
 
-/// Something the operator should look at, pinned to the app it is about.
+/// What an alert is about. Encoded as `app:<id>`, `instance:<id>` or
+/// `device:<id>`, as an `Endpoint` is. A FarCast component is its system
+/// app: the reader maps a component subject to `.app` of the app in that
+/// role.
+public enum AlertSubject: Hashable, Sendable, CustomStringConvertible {
+    case app(String)
+    case instance(String)
+    case device(String)
+
+    public var description: String {
+        switch self {
+        case .app(let id): "app:\(id)"
+        case .instance(let id): "instance:\(id)"
+        case .device(let id): "device:\(id)"
+        }
+    }
+
+    public var appID: String? {
+        if case .app(let id) = self { id } else { nil }
+    }
+}
+
+extension AlertSubject: Codable {
+    public init(from decoder: any Decoder) throws {
+        let text = try decoder.singleValueContainer().decode(String.self)
+        let refused = DecodingError.dataCorrupted(.init(
+            codingPath: decoder.codingPath,
+            debugDescription: "alert subject \(text.debugDescription) is not app:, instance: or device:"
+        ))
+        guard let colon = text.firstIndex(of: ":") else { throw refused }
+        let id = String(text[text.index(after: colon)...])
+        switch text[..<colon] {
+        case "app" where !id.isEmpty: self = .app(id)
+        case "instance" where !id.isEmpty: self = .instance(id)
+        case "device" where !id.isEmpty: self = .device(id)
+        default: throw refused
+        }
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(description)
+    }
+}
+
+/// Something the operator should look at, pinned to what it is about.
 public struct WorldAlert: Codable, Sendable, Equatable, Identifiable {
     public var id: String
     public var kind: Kind
     public var severity: Severity
+    /// Short plain English, written by the CLI; shown through
+    /// `Display.message`.
     public var title: String
-    public var appID: String
+    public var subject: AlertSubject
 
-    public init(id: String, kind: Kind, severity: Severity, title: String, appID: String) {
+    public init(id: String, kind: Kind, severity: Severity, title: String, subject: AlertSubject) {
         self.id = id
         self.kind = kind
         self.severity = severity
         self.title = title
-        self.appID = appID
+        self.subject = subject
     }
 
-    public enum Kind: String, Codable, Sendable, Equatable {
+    public enum Kind: String, Codable, Sendable, Equatable, CaseIterable, UnknownDecodable {
         case cost
+        case checkpointStale
         case sealed
         case denied
+        case unattributedDenials
+        case notReady
+        case keeper
+        case unmeteredNamespace
+        case loggingUnverified
+        case releaseIncomplete
+        case hostsOmitted
+        case drift
+        case unknown
     }
 
-    public enum Severity: String, Codable, Sendable, Equatable, Comparable {
+    public enum Severity: String, Codable, Sendable, Equatable, Comparable, CaseIterable {
         case warning
         case critical
+
+        /// A severity this build does not know sorts and draws as a warning.
+        public init(from decoder: any Decoder) throws {
+            let raw = try decoder.singleValueContainer().decode(String.self)
+            self = Severity(rawValue: raw) ?? .warning
+        }
 
         public static func < (a: Severity, b: Severity) -> Bool {
             a == .warning && b == .critical

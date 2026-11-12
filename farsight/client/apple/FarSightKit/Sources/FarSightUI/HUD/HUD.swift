@@ -103,7 +103,7 @@ private struct TopBar: View {
                             }
                             .buttonStyle(.plain)
                             .hudGlass(tint: Theme.severity(alert.severity).opacity(0.4), interactive: true)
-                            .accessibilityLabel(alert.title)
+                            .accessibilityLabel(Display.message(alert.title))
                         }
                     }
                     .hudRegion(model, "alerts")
@@ -140,34 +140,60 @@ private struct TopBar: View {
     }
 }
 
+/// An instance's name and its spending in brief: the bar, confirmed solid
+/// and expected lighter against the kernel's limit, coloured by the kernel's
+/// level, and the total's share of that limit, labelled "total" on the chip
+/// itself — the figure enforcement compares. The full split is on the
+/// instance's label and in TechnoCore's panel, and VoiceOver says it here.
 private struct InstanceChip: View {
     let instance: Instance
     let compact: Bool
 
     var body: some View {
-        let fraction = instance.spending.fraction
+        let spending = instance.spending
         HStack(spacing: 7) {
-            Text(instance.id).fontWeight(.semibold)
+            Text(Display.name(instance.id)).fontWeight(.semibold)
             if !compact {
-                Capsule()
-                    .fill(.white.opacity(0.18))
+                SpendingBar(spending: spending)
                     .frame(width: 36, height: 5)
-                    .overlay(alignment: .leading) {
-                        Capsule()
-                            .fill(Theme.spending(fraction))
-                            .frame(width: 36 * min(max(fraction, 0), 1), height: 5)
-                    }
             }
-            Text(Format.percent(fraction))
+            Text(Format.share(spending))
                 .monospacedDigit()
-                .foregroundStyle(Theme.spending(fraction))
+                .foregroundStyle(Theme.level(spending.level))
         }
+        .help(spending.isRead ? "\(Format.spending(spending)): the total's share is what enforcement compares" : Format.spending(spending))
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(instance.id), expected spending at \(Format.percent(fraction)) of its cost limit")
+        .accessibilityLabel("\(Display.name(instance.id)), \(Format.spendingSpoken(spending))")
     }
 }
 
-/// What needs looking at, most urgent first. Each flies to the app it is about.
+/// Spending as a bar against the kernel's limit: the confirmed part solid,
+/// the expected part lighter, never one undifferentiated length (ADR 0009
+/// decision 4). Empty when nothing was read.
+struct SpendingBar: View {
+    let spending: Spending
+
+    var body: some View {
+        let color = Theme.level(spending.level)
+        Canvas { context, size in
+            let track = Capsule().path(in: CGRect(origin: .zero, size: size))
+            context.fill(track, with: .color(.white.opacity(0.18)))
+            guard let bar = spending.bar else { return }
+            var inside = context
+            inside.clip(to: track)
+            let confirmed = size.width * bar.confirmed, expected = size.width * bar.expected
+            inside.fill(Path(CGRect(x: 0, y: 0, width: confirmed, height: size.height)), with: .color(color))
+            inside.fill(
+                Path(CGRect(x: confirmed, y: 0, width: expected, height: size.height)),
+                with: .color(color.opacity(Theme.expectedShare))
+            )
+        }
+        .accessibilityHidden(true)
+    }
+}
+
+/// What needs looking at, most urgent first. Each opens what it is about: an
+/// app is focused, an instance or a device framed.
 struct AlertBar: View {
     let model: WorldModel
     let compact: Bool
@@ -190,7 +216,7 @@ struct AlertBar: View {
                     Button {
                         model.open(alert)
                     } label: {
-                        Label(alert.title, systemImage: Self.symbol(alert.kind))
+                        Label(Display.message(alert.title), systemImage: Self.symbol(alert.kind))
                             .labelStyle(AlertLabelStyle(showsTitle: titles))
                             .font(.callout.weight(.medium))
                             .padding(.horizontal, 12)
@@ -198,7 +224,7 @@ struct AlertBar: View {
                     }
                     .buttonStyle(.plain)
                     .hudGlass(tint: Theme.severity(alert.severity).opacity(0.4), interactive: true)
-                    .help(alert.title)
+                    .help(Display.message(alert.title))
                 }
             }
             .fixedSize()
@@ -209,8 +235,18 @@ struct AlertBar: View {
     static func symbol(_ kind: WorldAlert.Kind) -> String {
         switch kind {
         case .cost: "dollarsign.circle.fill"
+        case .checkpointStale: "clock.badge.exclamationmark"
         case .sealed: "lock.fill"
         case .denied: "xmark.octagon.fill"
+        case .unattributedDenials: "xmark.shield.fill"
+        case .notReady: "hourglass"
+        case .keeper: "key.fill"
+        case .unmeteredNamespace: "eye.slash.fill"
+        case .loggingUnverified: "doc.text.magnifyingglass"
+        case .releaseIncomplete: "trash.slash.fill"
+        case .hostsOmitted: "ellipsis.circle.fill"
+        case .drift: "arrow.triangle.branch"
+        case .unknown: "exclamationmark.triangle.fill"
         }
     }
 }

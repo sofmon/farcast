@@ -80,6 +80,8 @@ farcast [global flags] <command> [command flags] [arguments]
 | `keeper` | ✅ works | Devices that re-seed a restart-sealed instance unattended: `enroll`, `install`, `run`, `status`, `revoke`, `uninstall`. Enrolment by request is accepted, not yet built ([ADR 0020](../../docs/adr/0020-instance-pki-ecdsa-p256.md)) | 5.4 |
 | `build` | ✅ works | Build an application's image inside the instance | 4.2 |
 | `kernel` | ✅ works | Deploy TechnoCore, meter namespaces, and push the provider's confirmed costs: `deploy`, `meter`, `confirm`. `deploy --adapt` lets it right-size applications; `--adapt-cooldown` and `--interval` tune it, and all three are carried forward | 4.1 |
+| `instances` | ✅ works | List the instances this machine holds, from local records alone; `pin-gcloud` pins the gcloud account each is read as ([below](#farcast-instances-and-farcast-world--the-connected-views-reads-adr-0021-decision-9-amended-2026-11-12)) | 7 (Connected view) |
+| `world` | ✅ works | Read one instance as the app's map draws it: one JSON document, five independently read sections, under the pinned gcloud identity | 7 (Connected view) |
 | `chat` | ⏳ stub | Terminal AI chat through AllThing | 6.2 |
 
 *Legend: ✅ works · 📋 specified, not yet implemented · ⏳ stub.* Stubbed commands route correctly and print a clear "not yet implemented (phase N)" message to stderr, exiting non-zero. This mirrors the SDK's `ErrNotImplemented` pattern: the whole surface is visible and navigable before the features land. `install` is the canonical verb for creating an instance — the CLI, the root README, and the [instance lifecycle](../../README.md#instance-lifecycle) (`install → bind → run → release`) all use it.
@@ -111,11 +113,11 @@ farcast [global flags] <command> [command flags] [arguments]
 |---|---|
 | `0` | Success |
 | `1` | Runtime error (the command ran but failed) |
-| `2` | Usage error (unknown command, bad flag, missing argument) |
+| `2` | Usage error (unknown command, bad flag, missing argument) — no JSON envelope, in either mode |
 | `3` | `keeper run --once` only: this device cannot keep the instance until a person acts (see [what a pass exits with](#what-a-pass-exits-with)) |
 | `4` | `keeper run --once` only: the pass did not finish — a replica or the tunnel did not answer; the next pass retries |
 
-**Errors** are formatted to match the mode: in human mode a `farcast: <message>` line on stderr; in JSON mode a `{"error":{"message":…,"code":…}}` object on stdout, so automation parses failures the same way it parses results.
+**Errors** are formatted to match the mode: in human mode a `farcast: <message>` line on stderr; in JSON mode a `{"error":{"message":…,"code":…,"kind":…}}` object on stdout, so automation parses failures the same way it parses results. `kind` (since 2026-11-12) is one of a closed set — [Error kinds](#error-kinds) — and is additive: `message` and `code` are what they were. Exit `2` is the exception: a usage error, a flag that does not parse and an unknown command print prose on stderr and no envelope, in either mode.
 
 **Text from the cluster is quoted when it could rewrite the terminal.** *(Since 2026-11-10.)* Some human output prints text that a cluster component, a tunnel peer or a repository's manifest chose: a route name, a refusal reason, a node or application name. Where it does, the CLI prints that text Go-quoted (`strconv.QuoteToGraphic`) whenever it holds a non-printing character or is not valid UTF-8. That catches an escape sequence, a carriage return or a bidi override. Otherwise the text prints as it is. This covers:
 - `usage`: the tunnel table's peer, route and refusal reasons, application names, the monitor replica's name and the network error;
@@ -992,6 +994,174 @@ Both figures, the distance to the limit the kernel is enforcing, and spending by
 
 ---
 
+## `farcast instances` and `farcast world` — the Connected view's reads ([ADR 0021](../../docs/adr/0021-farsight-native-client.md) decision 9, amended 2026-11-12)
+
+The FarCast app on macOS draws a live instance by running the operator's own `farcast` and nothing else: `farcast version`, `farcast instances` and `farcast world <instance>`, with fixed flags, the instance name being one `instances` returned. The listing, `farcast instances`, and `farcast world` are reads, and change nothing; `farcast instances pin-gcloud` (below) is the one write here, run from a terminal and never by the app. Neither read opens `ca.key` or `keys.yaml` — a test runs them against a config directory where both are mode 000, with the config package's read observer showing neither was opened.
+
+### `farcast instances`
+
+Every instance this machine holds, from each one's `metadata.yaml` alone. It opens no credential, kubeconfig, CA key or keyring, and touches no network, so the app runs it at launch.
+
+```json
+{"schema":1,"generated_at":"2026-11-12T10:00:00Z","farcast":{"version":"v0.1.0","commit":"0e54eb1"},
+ "instances":[
+  {"name":"atlas","provider":"gke","region":"europe-west4","status":"running",
+   "cost_limit":{"cents":5000,"currency":"USD","period":"monthly"},"cloud_logging":"system_only",
+   "components":{"fatline":true,"kernel":true,"keyholder":true},"keepers":1,"gcloud_pinned":true},
+  {"name":"broken","error":{"kind":"record_unreadable","message":"instances/broken/metadata.yaml could not be parsed: a YAML syntax error at line 1, column 7"}}]}
+```
+
+- `status` is the record's, verbatim: `provisioning`, `running`, `unreachable`, `deleting` or `error`.
+- `cloud_logging` is `system_only` when install read the provider's logging back as system logs only, `unverified` when the record has none (an instance from before ADR 0019), and `unknown` for anything else.
+- `components` is what the record says was deployed, not what is running — `world` reads that.
+- `keepers` counts enrolled keepers that are not revoked.
+- `gcloud_pinned` says whether a gcloud account is pinned (below); the account itself is never printed.
+- Project ids, cluster names, endpoints and addresses are never emitted. A record that cannot be read is its name and an error, nothing more; its path is relative to the config directory. A record that does not parse is described by the kind of fault and its line and column, never quoted: the YAML parser's own message prints the lines around the fault, and some of its messages quote a value, and a record holds the project, the endpoints and the pinned account. `world` and `pin-gcloud` say the same of a record they cannot parse; the file itself shows the rest.
+
+`farcast instances pin-gcloud <instance> --account <email>` records the gcloud account an instance's cluster is read as, through a narrow read-modify-write of the record. It is refused unless a configuration in gcloud's directory has that account together with the instance's project, and sets no `[auth]` override (below), so a pin can never name an identity that cannot read. It is run from a terminal; the app shows the pin for the operator to confirm and never writes it.
+
+### `farcast world <instance>`
+
+One instance, map-ready. The CLI does the grading, the staleness, the alerts and the spending arithmetic; the map draws what it is given and recomputes none of it. The document is built by a pure function of what was read plus the clock and the build stamp, so the in-instance read route can later serve the same document.
+
+It reads in five **sections**, each on its own, each with its own deadline, under a ceiling of 60 seconds for the whole command:
+
+| Section | Read | Through |
+|---|---|---|
+| `apps` | FarCast's own workloads in `farcast-system`, the namespaces labelled `app.kubernetes.io/managed-by=farcast`, each namespace's Deployments and StatefulSets, and the kernel's `technocore-namespaces` list | kubectl (`ps`'s workload read) |
+| `spend` | the kernel's checkpoint | kubectl (`costs`' checkpoint read) |
+| `policy` | the egress policy FatLine enforces | kubectl (`run`'s `readEgressPolicy`) |
+| `network` | Shrike's whole picture: allowed rows, refusals, the tunnel table | the FatLine tunnel (`usage`'s `fetchNetwork`) |
+| `seal` | each keyholder replica's phase, generation and hold — never its key ids, so no keyring is needed | the same tunnel |
+
+`sections.<name>` is `{"read": true}`, `{"read": false, "error": {"kind", "message"}}`, or — the seal of an instance whose record has no keyholder — `{"read": false, "skipped": "not_deployed"}`. A failed section never fails the command: what it would have supplied is marked unknown (`null`, or the state `unknown`), never omitted as if absent. When `apps` fails, a group's `apps` list holds only the applications the policy or the monitor named, each `unknown` — not the namespace's whole content. When only the `technocore-namespaces` read fails, the section carries that error, the workloads it read stand, and `metered` is `null` wherever this machine's record does not say otherwise. The deadlines are 20 seconds for each kubectl read, 15 for opening the tunnel and 15 for the monitor's picture, and 10 for each keyholder replica. The cluster reads and the tunnel reads run side by side, so a control plane that does not answer cannot spend the tunnel's share of the ceiling, nor a carrier that does not answer the cluster's. A failure every later kubectl read would meet the same way — no kubectl, no auth tool, gcloud signed out, a control plane that let one read run out its deadline, the ceiling reached — is reported for each cluster section without asking again, and a section that was not asked says "not asked". A tunnel the ceiling left no room to try says it was not attempted, which is not a carrier that did not answer. The network and seal reads ride **one** tunnel: two would double what the provider sees of a Refresh.
+
+**Wire rules.** JSON, snake_case. Times are RFC 3339 UTC to the second (`2026-11-12T10:00:00Z`), never ages, never fractional. Money is integer cents, `math.Round(usd*100)`. Every array is sorted by a stable key and is `[]` when empty, never `null`. `farcast.version` and `farcast.commit` come from `buildinfo`. The document never carries a credential hash, the carrier's endpoint or address, the project, the cluster or the bucket; a section message that would name one says `<carrier>`, `<control plane>`, `<project>`, `<cluster>` or `<bucket>` instead. Nor does it carry an account: an API server's refusal names the caller and gcloud's credential errors name the account they tried, so the pinned account (in any case) and anything else shaped like an email address — a work identity whose token was cached for this instance's context, a service account — reads `<account>`. Nor a path on this machine: the config directory reads `<config>`, gcloud's directory `$CLOUDSDK_CONFIG` or `~/.config/gcloud`, as the guard found it, and the home directory `~`.
+
+**`instance`** — `name`, `status` (verbatim), `cloud_logging`, `spend`, `network`, `components`, `hosts_omitted`, and `caveats` (what this document could not say: applications named by the policy or the monitor but not running, policy or monitor rows naming an application in `farcast-system` — which a manifest named `farcast-system` could put there before `run` refused such a manifest (2026-11-12), and which is never drawn as a group — tunnel peers not enrolled from this machine, namespaces whose storage wiring is unknown).
+
+- **`spend`** is `{"read": false}` or: `currency`, `period` (the record's, verbatim), `period_start`, `period_end`, `total_cents` (what enforcement compares), `expected_cents`, `confirmed_cents` (`null` until the provider has confirmed anything — never a confirmed zero), `has_confirmation`, `confirmed_through`, `limit_cents` (the **kernel's**; `null`, with the caveat "the kernel published no limit", when it published none — the recorded limit is never substituted), `recorded_limit_cents` (this machine's), `level` (the kernel's own, never recomputed: `ok`, `warn50`, `warn75`, `warn90`, `reached`, or `unknown`), `observed_at`, `checkpoint_stale` (more than 15 minutes before `generated_at`), `not_metered` (the facts `costs` prints, as data) and `caveats` (discrepancies, unreadable namespaces, unclassified pods, an unobserved carrier, a kernel limit that differs from the recorded one, application names the ledger cannot tell apart).
+- **`network`** is `{"read": false}` or `{"read": true, "replica", "since", "fatline_replicas"}`: every count is a floor, counted by that one FatLine replica since `since`.
+- **`components`** — one each for `boundary` (FatLine), `kernel` (TechnoCore), `monitor` (Shrike, a container in FatLine's Pod) and `storage` (the keyholder, `datasphered`), sorted by role: `{"role", "name", "state", "ready", "desired", "version"}`. `state` is `running`, `starting` (ready < desired), `stopped` (desired 0), `not_deployed` or `unknown`. `version` is `sha256:` and the first 12 hex characters of the image digest the cluster runs, when it is exactly the image the record says was deployed, and `null` otherwise; the monitor's is its container's digest, for which no image is recorded. The monitor is `not_deployed` when FatLine's Pod has no second container, `running` when it answered through the tunnel, and `unknown` when the network section failed.
+
+**`groups`** — one per FarCast-managed namespace, never `farcast-system`, discovered from the cluster's labelled namespaces, the kernel's metered list and this machine's record: `{"namespace", "metered", "provenance", "apps"}`. `metered` is `true` when the kernel's list or the record names it, `false` when the list was read and neither does, and `null` when the list could not be read — by the same rule for a namespace only the policy or the monitor names. `provenance` is the record `run` wrote — `{"repository", "ref", "commit", "manifest_digest", "deployed_at", "storage_wired"}`, the repository never with a user name or credential in it — or `null`, which the map draws as "repository not recorded on this Mac". Each app is `{"name", "state", "ready", "desired", "stopped_by", "month_cents"}`. `stopped_by` is `null` until the kernel names its stops. `month_cents` is the app's accrual this period, or `null` when its namespace is not known to be metered, when spending was not read, or when the same name runs in two namespaces — the ledger keys spending by bare name, so neither share can be told apart, and a caveat says so.
+
+**`hosts`** — `{"name", "seen_as"}`. Two spellings are one host when they are equal lower-cased, trimmed and without a trailing dot — the rule Shrike and FatLine compare by; `name` is that key and `seen_as` the raw spellings that differ from it. At most 200, the strongest evidence first and then by name; the rest are counted in `instance.hosts_omitted`, raise an alert, and their lines are not drawn.
+
+**`lines`** — one per (kind, from, to). Never app-to-app, and never `planned`: neither exists in a live world.
+
+- `egress`: from `{"app": "<namespace>/<app>"}` to `{"host"}`, with `evidence` the strongest of its `ports` (observed > denied > declared), `stale`, `drift`, `last_seen` and `since`. A port entry is `{"port", "evidence", "count", "fails", "reason", "last_seen", "no_longer_declared"}`: **observed**, one per allowed row (`count` the allows, a floor); **denied**, one per refusal reason — Shrike keys refusals by reason and host and keeps only the last port, so `port` is that last port and `count` spans every port; **declared**, one per policy entry, `port` `null` and `reason` the manifest's. `stale` is true when the line was last observed more than an hour before `generated_at`, or never, for a counted line. `drift` is an allowed host the application's current policy does not declare, seen within the hour and after the namespace was last deployed from here; an older one is a host a redeploy removed — Shrike's tables live as long as its Pod — and is marked `no_longer_declared` with no alert. `drift` is `null` when the policy was not read.
+- `tunnel`: the operator to the boundary, `label_hint: "read_now"`, present when the tunnel opened — that read is its evidence.
+- `keeper`: a keeper device to storage, from that device's own tunnel rows, with `last_seen` and `stale`. A keeper line is stale when last seen more than 24 hours before `generated_at` — the window the keeper's health is judged by, not the egress hour: a keeper streams only when it re-seeds, and a healthy keeper drawn with a stale line would contradict itself.
+- `watch`: the monitor to the boundary, present when Shrike answered.
+- `storage`: each application to storage, `evidence: "declared"`, `label_hint: "wired_not_counted"`, for namespaces whose provenance says `run` wired storage, while the keyholder is deployed. The keyholder keeps no per-application counters, so these are never observed; a namespace with no provenance gets a caveat instead of a line.
+
+**`devices`** — the operator, `{"id": "operator", "role": "operator"}`, and each keeper this machine enrolled, `{"id": "<instance>/<device>", "role": "keeper", "name", "health"}`. `health` is `revoked` or `expired` from the record first; `healthy` when one of the device's own tunnel rows was seen within 24 hours; `unseen` only when that absence means something — the picture covers a whole day, the device has a leaf token this machine recorded, and there is one FatLine replica, so the row cannot be in another replica's picture; `unknown` otherwise.
+
+**`alerts`** — `{"id", "kind", "severity", "subject", "title"}`, critical first, then by id. `subject` is `{"app": "<namespace>/<app>"}`, `{"component": "<role>"}`, `{"device": "<id>"}` or `{"instance": true}`; `id` is the kind, the subject and, where one subject has several, a discriminator.
+
+| Kind | Severity | Subject | When |
+|---|---|---|---|
+| `cost` | warning at `warn75`/`warn90`, critical at `reached` | instance | the kernel's level |
+| `checkpoint_stale` | critical | `kernel` | the checkpoint is more than 15 minutes old |
+| `sealed` | critical | `storage` | a replica that answered is sealed or under an operator hold |
+| `denied` | warning | the app | refusals seen within the hour, for an application on this map |
+| `unattributed_denials` | warning | `boundary` | refusals within the hour that name no application on this map — none at all, or one in `farcast-system` |
+| `not_ready` | warning | the app | ready < desired, desired > 0 |
+| `keeper` | warning | the device | expired, revoked or unseen |
+| `unmetered_namespace` | warning | `kernel` | a group whose `metered` is `false` |
+| `logging_unverified` | warning | instance | `cloud_logging` is `unverified` |
+| `release_incomplete` | critical | instance | status `deleting` — it may still be billing |
+| `hosts_omitted` | warning | `boundary` | more than 200 hosts |
+| `drift` | warning | the app | a drift line |
+
+Every application, host, device and component a line or an alert names is in the document: an application the policy or the monitor names that the cluster does not run is added to its group as `not_deployed` (or `unknown`, when the workloads were not read), with a caveat.
+
+The human rendering is brief — spending split into confirmed and expected, the components, the groups with their repositories, the counts of lines, what needs attention, and what was not read — with every name the instance chose quoted under [the rule above](#output-model). `-o json` is the whole document.
+
+### Error kinds
+
+Every JSON error envelope carries `kind` beside `message` and `code` — additive, so a reader of the two old fields reads them as before — and so does every section error. The set is closed and stable; a reader decodes a kind it does not know as unknown.
+
+| Kind | Means |
+|---|---|
+| `record_unreadable` | this machine's record of the instance (or its operator identity) is there and cannot be read |
+| `not_found` | no instance by that name on this machine — also for every command that loads an instance record that is not there |
+| `not_connected` | no FatLine recorded, so no tunnel |
+| `tunnel_unreachable` | the tunnel did not open, or what answered through it could not be read |
+| `kernel_absent` | no kernel is recorded, so nothing meters the instance |
+| `not_checkpointed` | the kernel's ledger is absent or empty: it has not written yet |
+| `version_skew` | the checkpoint, the egress policy or the metered-namespace list is another version; the message names both |
+| `kubectl_missing` | kubectl is not on the PATH the read runs with |
+| `kubectl_failed` | kubectl ran and failed, or returned a document that does not decode |
+| `gcloud_mismatch` | the gcloud identity guard refused: no pinned account, no recorded project, or no configuration with both that sets no `[auth]` override |
+| `gcloud_signed_out` | gcloud asks the operator to sign in: its session expired ("Reauthentication failed"), the account has no valid credentials on this machine, or no account is selected |
+| `auth_tool_missing` | the gke-gcloud-auth-plugin, or the gcloud it runs, is not installed where kubectl looks |
+| `timeout` | a read, or the whole command, ran out of time |
+| `internal` | anything else |
+
+There is no `usage` kind. A usage error, a flag that does not parse and an unknown command exit `2` with prose on stderr and no envelope, as they always have.
+
+### The gcloud identity guard
+
+kubectl reaches a GKE cluster through the gke-gcloud-auth-plugin, which authenticates as whichever gcloud configuration is active — on an operator's Mac, often a work identity. So before `world` runs any kubectl:
+
+1. The instance must pin an account (`instances pin-gcloud`) and record a project; otherwise `gcloud_mismatch`.
+2. The CLI reads gcloud's configuration files in-process — `CLOUDSDK_CONFIG`, or `~/.config/gcloud` — and never runs gcloud. It considers every `configurations/config_*` and chooses those whose `[core] account` is the pinned one (compared case-insensitively) and whose `[core] project` is the instance's; several are told apart by name, the lexicographically first winning. A configuration that matches but sets `[auth] impersonate_service_account`, `access_token_file` or `credential_file_override` is passed over: gcloud would hand out another identity's token for it, whatever its account says, and the refusal names the property, never its value. `active_config` and `CLOUDSDK_ACTIVE_CONFIG_NAME` are never consulted. None matching is `gcloud_mismatch`, and the message names the instance's project and each configuration considered with its project, saying only "the account differs from the one recorded", never an account.
+3. kubectl runs with an environment built for it (`cluster.NewWithEnv`): this process's own, minus `KUBECONFIG`, every `CLOUDSDK_*` variable — `CLOUDSDK_AUTH_ACCESS_TOKEN` and `CLOUDSDK_CORE_ACCOUNT` among them, which gcloud honours over its files — and `GOOGLE_APPLICATION_CREDENTIALS`; plus `KUBECONFIG` naming the instance's own kubeconfig, `CLOUDSDK_CONFIG` naming the directory the guard read, and `CLOUDSDK_ACTIVE_CONFIG_NAME` naming the configuration it chose. kubectl itself is found on that environment's PATH, never in the working directory. `KUBECONFIG` matters because the plugin keys its token cache by the current context of `$KUBECONFIG` (or `~/.kube/config`), not by the `--kubeconfig` kubectl is given.
+4. kubectl's failures map to kinds by `errors.Is`, not by matching prose: `cluster.ErrKubectlMissing`, `cluster.ErrAuthToolMissing`, `cluster.ErrSignedOut`, and a wrapped `context.DeadlineExceeded`.
+
+**What remains.** A token the plugin cached for *this instance's own context*, within its lifetime (about an hour), is reused whichever account minted it — that needs kubectl to have run against this instance's kubeconfig under another account in the last hour. And gcloud also reads installation-wide properties from its own install directory, which the guard does not: an `[auth]` override set there applies under every configuration. A test stands a fake kubectl and plugin in front of a local fake API server, plants a token in the plugin's cache under a work context and `CLOUDSDK_AUTH_ACCESS_TOKEN` in the parent, and shows the server receives neither.
+
+**What other commands do not yet get.** In this milestone the guard and the built environment apply to `world` alone. Every other command still runs kubectl with the CLI's whole environment, as the active gcloud configuration, and `storage state` and the other tunnel reads still load the CA key (`storage state` also the keyring). With 7.1 — through decision 6's explicit environment (amended 2026-11-12), which comes ahead of it in decision 9's order, walked from a terminal — the pinned identity and the built environment extend to every command, writes included: a work identity does more harm in a write than in a read.
+
+### What each read tells the provider and the network
+
+- **Before kubectl runs**, gcloud may refresh the pinned account's access token at Google's OAuth endpoint: that tells Google the account, the time and the source address. gcloud may also run its own daily update check.
+- **The kubectl reads** go to the provider's API server, which terminates TLS. Data Access audit logging is off by default, but any parent folder or organisation can force it on; where it is on, it records each get and list — caller, object, namespace, source address, user agent and time ([ADR 0019](../../docs/adr/0019-what-the-cluster-tells-its-provider.md)). The objects read are in the provider's etcd already. The Mac's resolver sees the control plane's `*.gke.goog` name ([ADR 0004](../../docs/adr/0004-private-control-plane.md)).
+- **The tunnel reads** show the provider and the network the source address, the timing, the sizes and the SNI that names the instance — and are blind to content.
+- `instances` and `version` read files on the Mac and tell nobody anything. That is why `world` runs only when the operator asks, and never on a timer.
+
+### `run` records what it deployed, and keeps one repository per namespace
+
+On success, after the workloads are applied and before the rollout wait, `run` records on this machine — never in the cluster — `deployments.<namespace>: {repository, ref, commit, manifest_digest, deployed_at, storage_wired}`, from what its in-instance read reported: the ref is `--ref`, or `refs/heads/main` when none is given (what the fetch resolves), `deployed_at` is UTC to the second, and `storage_wired` says whether this run gave its applications a storage identity. The write is a narrow read-modify-write of the record; a failure warns and does not fail the deploy.
+
+A manifest's name is held to the same namespace rules as `--namespace` (2026-11-12): a DNS label, never a provider-managed `kube-` namespace, and never `farcast-system`, which holds the instance's own components. One named otherwise is refused after the read, before anything is built or deployed. A namespace this machine recorded under a different repository is refused, naming both, unless `--replace-repository` is given: two repositories in one namespace is the second replacing the first's egress entries and reusing its applications' storage scopes. Repositories are compared ignoring only a trailing `/` and `.git` (and a credential, should an older record hold one). A repository URL with a user name or credential in it is refused before anything is read — it would be written into the fetch Job and into this record, which every `world` prints — and the refusal names the URL without it; a private repository's read-only credential goes through `--git-secret`. With `--namespace` the refusal comes before anything is read; without it the namespace is the manifest's name, known only after the in-instance read — which has run and billed — so the refusal comes then, before anything is built, written to the egress policy, minted or applied, and says so. The record belongs to this machine: a deploy from another machine is not caught, and a namespace with no record here — every namespace deployed before this — is accepted by the first run from any repository.
+
+### Golden vectors
+
+Every JSON shape the app decodes has a vector under `internal/cli/testdata/`: `world/` (one per case — healthy, never connected, no kernel, tunnel down, a sealed replica, cost reached with stopped apps, a stale checkpoint, an unmetered namespace, checkpoint version skew, two namespaces sharing an app name, one host with mixed evidence, drift, an unattributed denial, a host name carrying a bidi override and a C1 control, the host cap exceeded, keepers healthy/expired/unseen, release incomplete, nothing read, a violation from a removed app, rows from `farcast-system`, section messages that name accounts, and the `gcloud_mismatch` and `not_found` error envelopes), `instances/` (an empty list, and a listing with unreadable records), `version/` (`{version, commit}`, the two fields the app reads), `kinds/` (the closed set of error kinds, in order) and `app/` (`argv.json`, the app's three command lines, which a test runs against the CLI). World vectors come only from the pure builder fed literal inputs; the others from running the command against a written config directory. A test rebuilds each one and fails on any byte difference; `FARCAST_UPDATE_VECTORS=1 go test ./farsight/cli/internal/cli/ -run Vector` rewrites them, and the diff is then reviewed like code.
+
+### The no-cost rehearsal
+
+`farcast-rehearsal` is the instance the app reads from Finder before it reads a live one ([ADR 0021](../../docs/adr/0021-farsight-native-client.md) decision 9, "Walked before it is relied on", and Verification 5). It is `cmd/farcast-rehearsal`, built as `./bin/farcast-rehearsal`, and never part of `farcast`: a fake `kubectl` must never be in the product binary. It costs nothing, touches no cloud, and listens only on 127.0.0.1.
+
+- **What it runs.** A real FatLine tunnel and a real Shrike behind it, and two keyholder replicas that answer `GET /v1/state` and refuse everything else, all under the instance's own mutual TLS.
+  - A state directory holds the instance's record (every name a `.invalid` placeholder, with `ca.key` and `keys.yaml` mode 000), a gcloud configuration directory whose *active* configuration is a decoy of another account, and three fake tools — `kubectl`, `gke-gcloud-auth-plugin` and `gcloud` — each a link to the harness binary.
+  - The operator's own `farcast` reads it exactly as it reads a cluster: `kubectl` by bare name, through the plugin and gcloud, and the network and seal through the tunnel.
+  - Its traffic: the shop's `api` reaching its payments host every minute, and the enrolled keeper reading storage's state through the tunnel every ten.
+- **It never touches the real gcloud, kube or farcast directories.**
+  - Before it writes anything, it refuses a directory that is, holds or sits inside `~/.config/gcloud`, `~/.kube`, this machine's default farcast configuration directory (protected whether or not `$FARCAST_CONFIG_HOME` is set), or a directory `$FARCAST_CONFIG_HOME`, `$CLOUDSDK_CONFIG` or `$KUBECONFIG` names.
+  - Directories are compared by what they are on disk, not by how they are spelled. Both sides are resolved through their symlinks, and the parts that exist are matched by file identity, so `/var` and `/private/var`, a symlinked alias, and a macOS firmlink spelling (`/System/Volumes/Data/Users/…` for `/Users/…`) are each one directory. The parts not made yet are compared by name, ignoring case.
+  - The one exception is a directory `$FARCAST_CONFIG_HOME`, `$CLOUDSDK_CONFIG` or `$KUBECONFIG` names *inside* a rehearsal that already exists, which is the rehearsal's own. The default farcast directory, `~/.kube` and `~/.config/gcloud` are never excepted.
+  - The fake plugin and gcloud refuse to run unless `CLOUDSDK_CONFIG` names the rehearsal's own directory. Neither falls back to a default.
+  - Tests prove both: the guard against a fake home under `$TMPDIR`, through `/var`, a symlinked alias and, on macOS, the data volume's firmlink spelling, with the default farcast directory refused while `$FARCAST_CONFIG_HOME` points elsewhere; and the tools with `CLOUDSDK_CONFIG` unset or naming another directory.
+- **The fake `kubectl` refuses what must not reach it,** naming the variable and never its value: any `CLOUDSDK_*` but `CLOUDSDK_CONFIG` and `CLOUDSDK_ACTIVE_CONFIG_NAME`, `GOOGLE_APPLICATION_CREDENTIALS`, `FARCAST_CONFIG_HOME`, a proxy variable in either case, a `KUBECONFIG` that is not the instance's own, a relative `PATH` entry, and a credential that is not the pinned account's.
+  - It answers only the reads `world` sends: no write, no secret, no `-A`.
+  - Every call the fake tools answer is one line of `calls.log` in the state directory: its arguments, then `| ok` or `| refused: <reason>`, and never a variable's value or a token.
+- **Scenarios.** `farcast-rehearsal scenario --dir <dir> <name>` switches what the next read shows, with no restart:
+  - `healthy`, `sealed`, `stale-checkpoint`, `cost-reached` and `denied`;
+  - `signed-out`, where gcloud's session has expired;
+  - `identity-mismatch`, which `world` refuses before any `kubectl` runs;
+  - `slow-cluster`, where `kubectl` sleeps past `world`'s 20-second read deadline.
+  The kernel's ledger is anchored to the rehearsal's start, never the calendar, so spending reads split, confirmed and expected, on any day of a month. A rehearsal lives 25 days.
+- **Restart.** Stopped with Ctrl-C, it starts again with `--dir <dir>` on the same tunnel port, with its own leaves, so nothing in the app's Settings changes.
+- **`summarize`.** `farcast-rehearsal summarize < world.json` prints only a document's shape: each section's outcome and kind, counts, and the alert kinds. Every word it prints is a number or a value from a closed set, so it never prints a name, host, repository, commit, replica, message, title or time of day. It is the walk's scrub tool for a live read.
+
+The walk is [the Phase 7 Connected-view runbook](../../docs/runbooks/phase-7-connected-view.md).
+
+---
+
 ## Diagnostics
 
 Diagnostic logging is for the operator debugging the CLI, not for command output. It is plain text on **stderr**, gated by `--verbose`, built on the standard library's `log/slog` with a text handler. It is intentionally **not** the farcast SDK logger: the SDK is for in-instance applications and emitting JSON to stdout, which is the opposite of what an operator CLI wants. Keeping them separate also keeps the root module free of a dependency on the `sdk/go` module.
@@ -1004,8 +1174,10 @@ Diagnostic logging is for the operator debugging the CLI, not for command output
 farsight/cli/
 ├── README.md                  ← this file
 ├── cmd/
-│   └── farcast/
-│       └── main.go            ← thin entry point: os.Exit(cli.Main(os.Args, …))
+│   ├── farcast/
+│   │   └── main.go            ← thin entry point: os.Exit(cli.Main(os.Args, …))
+│   └── farcast-rehearsal/
+│       └── main.go            ← the no-cost rehearsal; never part of farcast  (Connected view)
 └── internal/
     ├── cli/                   ← router, root command, global flags, signal handling
     │   ├── cli.go             ← Main/Run, global-flag parsing, dispatch
@@ -1022,7 +1194,15 @@ farsight/cli/
     │   │                        registry ensure, workload render  (2.3)
     │   ├── redeploy.go        ← farcast redeploy: re-render and re-apply FatLine's workload  (2.3)
     │   ├── storage.go         ← farcast storage: ls, cp, rm, usage; the <instance>:<key> locator  (3.3)
-    │   └── storagekey.go      ← farcast storage key: export, import, rotate, rekey  (3.3)
+    │   ├── storagekey.go      ← farcast storage key: export, import, rotate, rekey  (3.3)
+    │   ├── instances.go       ← farcast instances, and pin-gcloud  (Connected view)
+    │   ├── world.go           ← farcast world: the gather layer — five sections, one tunnel  (Connected view)
+    │   ├── worlddoc.go        ← the world document's wire types and its pure builder
+    │   ├── worldbuild.go      ←   hosts, lines, devices, alerts and the document's order
+    │   ├── worldhuman.go      ←   the brief human reading
+    │   ├── gcloud.go          ← the gcloud identity guard and kubectl's built environment
+    │   ├── kinds.go           ← the closed set of error kinds, and kindError
+    │   └── testdata/          ← golden vectors: world/, instances/, version/, kinds/, app/
     ├── output/                ← human/JSON printer, error formatting, exit codes
     │   └── output.go
     ├── cluster/               ← kubectl-subprocess wrapper: apply, await rollout, read LB IP  (2.3)
@@ -1040,6 +1220,8 @@ farsight/cli/
     ├── config/                ← local config + credential store, permission enforcement
     │   ├── config.go          ← config dir resolution, perms, config.yaml load/save
     │   └── instance.go        ← per-instance metadata / credentials / kubeconfig / mTLS store  (1.3, +2.3)
+    ├── rehearsal/             ← the no-cost rehearsal: FatLine, Shrike and the keyholders on 127.0.0.1,
+    │                            the fake kubectl, plugin and gcloud, the guard, summarize  (Connected view)
     └── buildinfo/             ← Version/Commit/Date (ldflags), ReadBuildInfo fallback
         └── buildinfo.go
 ```
@@ -1091,7 +1273,10 @@ Per [AGENTS.md](../../AGENTS.md) and [ADR 0002](../../docs/adr/0002-backend-lang
 - **`install`** — flag/prompt precedence; a missing or non-positive `--cost-limit` is rejected (the headline guarantee); unattended mode with a missing required flag exits `2`; the record-before-create ordering and `running`/`unreachable`/`error` state transitions are exercised against a **fake `planck.Provider`** (registered via `planck.Register`), with `t.TempDir()` for state and asserted `0700`/`0600` perms — no real cloud calls.
 - **`release`** — loads the recorded instance and tears it down via the fake `planck.Provider`, then removes local state; covers the delete-before-cleanup ordering (a `DeleteCluster` failure keeps the record), idempotent re-release of an already-gone cluster, the destructive confirmation (and `--yes`), and the unknown-instance error.
 - **`redeploy`** — shares connect's fakes, and covers what is specific to it: the refusal for an instance that was never connected or is being released, an explicit image deployed as given, the preflight-hit and preflight-miss (build) paths, `--source` forcing a rebuild over a resolvable reference (and preflighting nothing), the two image flags together as a usage error, an unchanged digest that still re-renders and re-applies, the recorded digest being updated on success — and *not* updated when the rollout fails, so the record keeps naming the image still serving — the consent gate as a usage error when non-interactive without `--yes`, one JSON result with no prompt, and, guarding the decision that matters most, that it never mints an mTLS identity and never waits for an external IP, so the trust root and the carrier are provably untouched.
-- Commands are tested by calling `Run` with buffers for `Out`/`Err` — no process spawning.
+- **`instances` and `world`** — golden vectors rebuilt byte for byte (above); the gather layer against this package's fakes, asserting each section's outcome and kind (kubectl missing and not asked again, signed out, timeouts, tunnel down, never connected, no kernel, version skew), a control plane that never answers costing one read's deadline while the tunnel is still read, and no path on this machine in a section message; the gcloud guard's refusals and its choice, which no active configuration and no `[auth]` override moves; kubectl's built environment; a fake kubectl and auth plugin that never present a planted token to a fake API server; both commands run with `ca.key` and `keys.yaml` mode 000 and the read observer showing neither opened; a record broken beside its account and project, quoted by none of `instances`, `world` or `pin-gcloud`; and every vector closed — no line or alert naming what the document does not hold — carrying no account, and drawing no healthy keeper with a stale line.
+- **The rehearsal** — its end-to-end test runs the real `world` against it: `farcast version`, `instances` and `world` in process, with the app's own command lines (`testdata/app/argv.json`) and the app's environment, against a rig on 127.0.0.1, with `CLOUDSDK_AUTH_ACCESS_TOKEN`, `CLOUDSDK_CORE_ACCOUNT`, `CLOUDSDK_ACTIVE_CONFIG_NAME`, `KUBECONFIG` and `GOOGLE_APPLICATION_CREDENTIALS` planted for farcast to drop. Every section reads, and every `calls.log` line is an `ok` `get` or credential call. Beside it: each scenario on the very next read; the fake tools' refusals, run in process with an explicit environment; the guard against the real directories; `ca.key` and `keys.yaml` never opened; a restart on the same directory; the ledger on the first of a month; and `summarize` over every world vector, printing none of what each names.
+- **`run`'s provenance** — what a first deploy records, the refusal of a namespace recorded under another repository (before the read with `--namespace`, after it otherwise, with nothing built or deployed), `--replace-repository`, and the `/` and `.git` normalisation.
+- Commands are tested by calling `Run` with buffers for `Out`/`Err` — process spawning only where a subprocess is what is tested: the fake kubectl.
 
 ---
 

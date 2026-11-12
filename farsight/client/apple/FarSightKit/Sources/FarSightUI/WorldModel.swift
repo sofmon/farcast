@@ -5,6 +5,9 @@ import FarSightCore
 
 /// One world on screen: the snapshot, where the operator has put things, and
 /// where the camera looks. Views read it; gestures and the HUD change it.
+///
+/// Each window owns one. A live world changes under it as reads land
+/// (`update(world:)`); the model's identity never changes for one screen.
 @Observable
 public final class WorldModel {
     public private(set) var world: World
@@ -22,6 +25,10 @@ public final class WorldModel {
     private(set) var alerts: [WorldAlert] = []
     /// The alert each app shows: its most urgent.
     private(set) var alertByApp: [String: WorldAlert] = [:]
+    /// The alert each instance's label shows: its most urgent.
+    private(set) var alertByInstance: [String: WorldAlert] = [:]
+    /// The alert each device's card shows: its most urgent.
+    private(set) var alertByDevice: [String: WorldAlert] = [:]
     /// Instances the operator has a tunnel into.
     private(set) var tunnelled: Set<String> = []
 
@@ -49,7 +56,10 @@ public final class WorldModel {
     /// Where the map's viewport is, in global coordinates.
     @ObservationIgnored var viewportFrame: CGRect = .zero
 
-    @ObservationIgnored private let store: ArrangementStore?
+    /// Where this world's source keeps its arrangement: one store per
+    /// source, so a live instance named like a fixture instance never
+    /// inherits the fixture's places.
+    @ObservationIgnored private var store: ArrangementStore?
     /// Counts every change to the camera. A gesture's anchor records the
     /// count after its own change; finding it moved on means something else
     /// moved the camera meanwhile — a flight, a scroll, the minimap — and the
@@ -70,7 +80,9 @@ public final class WorldModel {
     @ObservationIgnored private var activeMove: (item: Movable, start: CGPoint, grab: CGSize, hadConflicts: Bool)?
     @ObservationIgnored private var flights = 0
     @ObservationIgnored private var hasFramed = false
-    @ObservationIgnored private var alertCursor = -1
+    /// The alert last opened, by id, so a reordering does not move Space
+    /// on to the wrong one.
+    @ObservationIgnored private var alertCursor: String?
 
     static let regularInsets = ViewportInsets(top: 84, leading: 24, bottom: 150, trailing: 24)
     static let compactInsets = ViewportInsets(top: 64, leading: 8, bottom: 190, trailing: 8)
@@ -86,6 +98,7 @@ public final class WorldModel {
         case instance(String)
         case group(String)
         case app(String)
+        case device(String)
     }
 
     /// What the operator can drag on the map.
@@ -94,7 +107,10 @@ public final class WorldModel {
         case app(String)
     }
 
+    /// `store` gives the defaults the arrangement is kept in; the key is
+    /// the world's source's, whatever source the store was made for.
     public init(world: World, store: ArrangementStore? = nil) {
+        let store = store?.for(world.source)
         let index = WorldIndex(world)
         let standard = Arrangement.standard(for: world)
         let arrangement = store?.load()?.completed(for: world, from: standard) ?? standard
@@ -108,6 +124,50 @@ public final class WorldModel {
         derive()
     }
 
+    /// A new snapshot of the world, validated by whoever read it: a live
+    /// world changes as each instance's read lands.
+    ///
+    /// What the operator arranged stays where it is, and what is new is
+    /// placed around it. When the source changes, the arrangement is the new
+    /// source's own, never the old one's completed into it. Focus on an app
+    /// that is gone is dropped, and a drag on something that is gone is put
+    /// back. The camera stays, except that the first world with anything in
+    /// it is framed, and a change of source flies to the whole world.
+    public func update(world new: World) {
+        let sourceChanged = new.source != world.source
+        let newIndex = WorldIndex(new)
+        if let active = activeMove {
+            let gone = switch active.item {
+            case .group(let id): newIndex.groups[id] == nil
+            case .app(let id): newIndex.apps[id] == nil
+            }
+            // Back where it started, unsaved: on a change of source its
+            // start belongs to the other source's layout.
+            if gone || sourceChanged {
+                activeMove = nil
+                if !sourceChanged { set(active.item, active.start) }
+            }
+        }
+        let standard = Arrangement.standard(for: new)
+        if sourceChanged {
+            store = store?.for(new.source)
+            arrangement = store?.load()?.completed(for: new, from: standard) ?? standard
+        } else {
+            arrangement = arrangement.completed(for: new, from: standard)
+        }
+        world = new
+        index = newIndex
+        if let focus, index.apps[focus] == nil { self.focus = nil }
+        rebuild()
+        derive()
+        if !hasFramed, fitted(.world) != nil {
+            hasFramed = true
+            show(.world)
+        } else if sourceChanged {
+            fly(to: .world)
+        }
+    }
+
     private func derive() {
         appOrder = index.apps.values.sorted { $0.id < $1.id }
         groupOrder = index.groups.values.sorted { $0.id < $1.id }
@@ -115,8 +175,14 @@ public final class WorldModel {
             .sorted { ($1.element.severity, $0.offset) < ($0.element.severity, $1.offset) }
             .map(\.element)
         alertByApp = [:]
-        for alert in alerts where alertByApp[alert.appID] == nil {
-            alertByApp[alert.appID] = alert
+        alertByInstance = [:]
+        alertByDevice = [:]
+        for alert in alerts {
+            switch alert.subject {
+            case .app(let id): if alertByApp[id] == nil { alertByApp[id] = alert }
+            case .instance(let id): if alertByInstance[id] == nil { alertByInstance[id] = alert }
+            case .device(let id): if alertByDevice[id] == nil { alertByDevice[id] = alert }
+            }
         }
         tunnelled = Set(world.connections.filter { line in
             guard line.kind == .tunnel, line.evidence == .observed, !line.isStale,
@@ -187,6 +253,7 @@ public final class WorldModel {
         case .instance(let id): geometry.territories[id]?.frame
         case .group(let id): geometry.groups[id]?.frame
         case .app(let id): geometry.apps[id]
+        case .device(let id): geometry.devices[id]
         }
     }
 
@@ -389,15 +456,28 @@ public final class WorldModel {
         fly(to: instance.map(Target.instance) ?? .world)
     }
 
+    /// Opens what an alert is about: an app is focused; an instance or a
+    /// device is framed, and nothing stays focused.
     func open(_ alert: WorldAlert) {
-        if let i = alerts.firstIndex(of: alert) { alertCursor = i }
-        focus(on: alert.appID)
+        alertCursor = alert.id
+        switch alert.subject {
+        case .app(let id):
+            focus(on: id)
+        case .instance(let id):
+            focus = nil
+            fly(to: .instance(id))
+        case .device(let id):
+            focus = nil
+            fly(to: .device(id))
+        }
     }
 
-    /// Space: the alert after the one last opened, round and round.
+    /// Space: the alert after the one last opened, round and round. If that
+    /// one is gone, the most urgent.
     func openNextAlert() {
         guard !alerts.isEmpty else { return }
-        open(alerts[(alertCursor + 1) % alerts.count])
+        let last = alertCursor.flatMap { id in alerts.firstIndex { $0.id == id } }
+        open(alerts[last.map { ($0 + 1) % alerts.count } ?? 0])
     }
 
     func alert(for appID: String) -> WorldAlert? {
@@ -532,20 +612,24 @@ public final class WorldModel {
     func search(_ query: String) -> [SearchResult] {
         var results: [SearchResult] = []
         for instance in world.instances {
+            let name = Display.name(instance.id)
             results.append(SearchResult(
-                id: "instance:\(instance.id)", title: instance.id,
-                detail: "instance · \(Format.percent(instance.spending.fraction)) of its limit",
+                id: "instance:\(instance.id)", title: name,
+                // The same words as the instance's label: both parts, or
+                // what was not read, never a share made into a whole.
+                detail: "instance · \(Format.spending(instance.spending))",
                 symbol: "square.dashed", target: .instance(instance.id)
             ))
             for group in instance.groups {
+                let groupName = group.isSystem ? "FarCast" : Display.name(group.namespace)
                 results.append(SearchResult(
-                    id: "group:\(group.id)", title: group.isSystem ? "FarCast" : group.namespace,
-                    detail: "\(instance.id) · \(group.source)", symbol: "folder", target: .group(group.id)
+                    id: "group:\(group.id)", title: groupName,
+                    detail: "\(name) · \(Display.name(group.source))", symbol: "folder", target: .group(group.id)
                 ))
                 for app in group.apps {
                     results.append(SearchResult(
-                        id: "app:\(app.id)", title: app.name,
-                        detail: "\(instance.id) · \(group.isSystem ? "FarCast" : group.namespace) · \(app.role)",
+                        id: "app:\(app.id)", title: Display.name(app.name),
+                        detail: "\(name) · \(groupName) · \(Display.name(app.role))",
                         symbol: app.system == nil ? "app" : "gearshape", target: .app(app.id)
                     ))
                 }
@@ -593,25 +677,44 @@ private extension CGSize {
 
 /// Keeps the operator's arrangement on this device. ADR 0021 gives layout
 /// state to the FarSight server; this is the stand-in until that server
-/// exists. One arrangement for every instance: it keeps the places of groups
-/// the world no longer shows, so an instance that comes back finds its layout.
+/// exists. One arrangement for every instance of a source: it keeps the
+/// places of groups the world no longer shows, so an instance that comes
+/// back finds its layout.
+///
+/// Each source has its own key, and the fixture keeps the key it always
+/// had, so a real instance named like a fixture instance never inherits the
+/// fixture's places.
 public struct ArrangementStore {
     private let defaults: UserDefaults
-    private static let key = "farsight.arrangement.v2"
+    public let source: World.Source
 
-    public init(defaults: UserDefaults = .standard) {
+    public init(defaults: UserDefaults = .standard, source: World.Source = .fixture) {
         self.defaults = defaults
+        self.source = source
+    }
+
+    /// The key each source's arrangement is kept under.
+    public static func key(for source: World.Source) -> String {
+        switch source {
+        case .fixture: "farsight.arrangement.v2"
+        case .live: "farsight.arrangement.live.v1"
+        }
+    }
+
+    /// The store for `source`, in the same defaults.
+    func `for`(_ source: World.Source) -> ArrangementStore {
+        ArrangementStore(defaults: defaults, source: source)
     }
 
     func load() -> Arrangement? {
-        defaults.data(forKey: Self.key).flatMap { try? JSONDecoder().decode(Arrangement.self, from: $0) }
+        defaults.data(forKey: Self.key(for: source)).flatMap { try? JSONDecoder().decode(Arrangement.self, from: $0) }
     }
 
     func save(_ arrangement: Arrangement) {
-        if let data = try? JSONEncoder().encode(arrangement) { defaults.set(data, forKey: Self.key) }
+        if let data = try? JSONEncoder().encode(arrangement) { defaults.set(data, forKey: Self.key(for: source)) }
     }
 
     func clear() {
-        defaults.removeObject(forKey: Self.key)
+        defaults.removeObject(forKey: Self.key(for: source))
     }
 }

@@ -4,6 +4,7 @@ package output
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strconv"
@@ -55,14 +56,43 @@ func (p *Printer) Print(r Result) error {
 	return r.Human(p.Out)
 }
 
+// KindInternal is the kind of an error nothing classified: the default, and
+// never a promise that the failure was FarCast's own fault.
+const KindInternal = "internal"
+
+// Kinded is an error that names its own kind, one of the CLI's closed set
+// (farsight/cli/README.md, "Error kinds"). The output package does not own
+// that set; it only carries whatever the error says.
+type Kinded interface {
+	error
+	ErrorKind() string
+}
+
+// KindOf is the kind err carries anywhere in its chain, or KindInternal.
+func KindOf(err error) string {
+	var k Kinded
+	if errors.As(err, &k) {
+		if kind := k.ErrorKind(); kind != "" {
+			return kind
+		}
+	}
+	return KindInternal
+}
+
 // PrintError reports an error. In JSON mode it writes a structured envelope
-// to Out (carrying the intended exit code) with msg exactly as it is; in human
-// mode it writes a "farcast: …" line to Err, through errorText.
-func (p *Printer) PrintError(msg string, code int) {
+// to Out (carrying the intended exit code and the error's kind) with the
+// message exactly as it is; in human mode it writes a "farcast: …" line to
+// Err, through errorText. The kind is additive: a reader that knew only the
+// message and the code reads the same two fields it always did.
+func (p *Printer) PrintError(err error, code int) {
+	msg := ""
+	if err != nil {
+		msg = err.Error()
+	}
 	if p.Mode == ModeJSON {
 		enc := json.NewEncoder(p.Out)
 		enc.SetEscapeHTML(false)
-		_ = enc.Encode(errorEnvelope{Error: errorBody{Message: msg, Code: code}})
+		_ = enc.Encode(errorEnvelope{Error: errorBody{Message: msg, Code: code, Kind: KindOf(err)}})
 		return
 	}
 	// Best-effort: a failed write to the user's stderr is not recoverable.
@@ -133,4 +163,9 @@ type errorEnvelope struct {
 type errorBody struct {
 	Message string `json:"message"`
 	Code    int    `json:"code"`
+	Kind    string `json:"kind"`
 }
+
+// ErrorText is errorText for a caller outside this package: an error message
+// made safe to print line by line, keeping its newlines and tabs.
+func ErrorText(msg string) string { return errorText(msg) }

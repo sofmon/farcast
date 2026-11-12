@@ -10,7 +10,11 @@ import (
 	"github.com/sofmon/farcast/farsight/cli/internal/buildinfo"
 )
 
-type versionCommand struct{}
+type versionCommand struct {
+	// info is the build stamp; nil reads the binary's own. A seam so the
+	// version vector does not change with the build that checks it.
+	info func() buildinfo.Info
+}
 
 func (versionCommand) Name() string     { return "version" }
 func (versionCommand) Synopsis() string { return "Print version information" }
@@ -21,8 +25,12 @@ func (versionCommand) Usage() string {
 
 func (versionCommand) SetFlags(*flag.FlagSet) {}
 
-func (versionCommand) Run(_ context.Context, env *Env, _ []string) error {
-	info := buildinfo.Get()
+func (c versionCommand) Run(_ context.Context, env *Env, _ []string) error {
+	get := c.info
+	if get == nil {
+		get = buildinfo.Get
+	}
+	info := get()
 	return env.Printer.Print(versionResult{
 		Version: info.Version,
 		Commit:  info.Commit,

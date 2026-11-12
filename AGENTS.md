@@ -30,7 +30,7 @@ The two non-negotiable pillars of FarCast are: (1) security/privacy, (2) cost co
 
 **Portal was merged into FarSight.** There were originally separate modules for a browser app (Portal) and monitoring UI (FarSight). These were merged into a single UX layer called FarSight. The downloadable app is branded "farcast".
 
-**CLI was folded into FarSight.** Rather than a separate CLI project, the command line interface lives within FarSight. GUI, CLI and server are all part of FarSight. On macOS one app is to carry the GUI and the CLI, and the other Apple devices a thin client ([ADR 0021](docs/adr/0021-farsight-native-client.md), accepted, not yet built). Even then, on macOS it is not yet one download: the bundled CLI still needs `kubectl`, the GKE auth plugin, Go and a farcast checkout beside it.
+**CLI was folded into FarSight.** Rather than a separate CLI project, the command line interface lives within FarSight. GUI, CLI and server are all part of FarSight. On macOS one app is to carry the GUI and the CLI, and the other Apple devices a thin client ([ADR 0021](docs/adr/0021-farsight-native-client.md), accepted, not yet built). Even then, on macOS it is not yet one download: the bundled CLI still needs `kubectl`, the GKE auth plugin, `gcloud`, Go and a farcast checkout beside it.
 
 **FarSight's client is native, Apple first; Electron was retired.** Accepted 2026-11-11, not yet built.
 - **Why Electron went:**

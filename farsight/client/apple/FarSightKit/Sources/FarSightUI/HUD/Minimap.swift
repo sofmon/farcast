@@ -23,9 +23,16 @@ struct Minimap: View {
                     let color: Color =
                         if model.focus == id { Theme.focus }
                         else if let alert = model.alert(for: id) { Theme.severity(alert.severity) }
-                        else if app?.state == .stopped { Theme.stopped }
                         else if app?.isIllustrative ?? false { Theme.illustrative }
-                        else { Theme.secondaryText }
+                        else {
+                            // Small, a running app is drawn quietly; any other
+                            // state in its own colour, an unread one fainter.
+                            switch app?.state ?? .unknown {
+                            case .running: Theme.secondaryText
+                            case .unknown: Theme.tertiaryText
+                            case .starting, .stopped, .notDeployed: Theme.state(app?.state ?? .unknown)
+                            }
+                        }
                     context.fill(Path(fit.map(rect)), with: .color(color.opacity(0.85)))
                 }
                 for rect in model.geometry.hosts.values {

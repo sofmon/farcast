@@ -49,13 +49,13 @@ struct WorldModelTests {
     @Test("alerts come critical first, and Space walks through them")
     func alerts() throws {
         let model = try model()
-        #expect(model.alerts.map(\.severity) == [.critical, .critical, .warning])
+        #expect(model.alerts.map(\.severity) == [.critical, .warning, .warning])
         model.openNextAlert()
-        #expect(model.focus == model.alerts[0].appID)
+        #expect(model.focus == model.alerts[0].subject.appID)
         model.openNextAlert()
         model.openNextAlert()
         model.openNextAlert()
-        #expect(model.focus == model.alerts[0].appID)
+        #expect(model.focus == model.alerts[0].subject.appID)
     }
 
     @Test("dragging a group moves its apps, and the arrangement is kept")
@@ -250,7 +250,7 @@ struct WorldModelTests {
         let model = try model()
         model.open(model.alerts[1])
         model.openNextAlert()
-        #expect(model.focus == model.alerts[2].appID)
+        #expect(model.focus == model.alerts[2].subject.appID)
     }
 
     @Test("on a phone, a focused app is drawn full and can be live")

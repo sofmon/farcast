@@ -73,17 +73,25 @@ extension World {
     /// Checks the snapshot is drawable and says nothing the map would draw
     /// as more than it is:
     /// - ids are unique and nest the way the map nests them;
-    /// - each instance has a cost limit, one system group, and in it at most
-    ///   one app per FarCast role, FatLine among them;
+    /// - each instance has one system group, and in it at most one app per
+    ///   FarCast role, FatLine among them; an instance whose record and
+    ///   spending were read has a cost limit, and nothing requires a figure
+    ///   that was not read;
     /// - every connection's ends exist and suit its kind, and a refusal is
     ///   only ever recorded where a wall can refuse it;
     /// - app-to-app lines are only drawn where they are illustrative,
     ///   because app-to-app through FatLine is decided but not built, and an
     ///   illustrative app has nothing observed, declared or refused, and no
     ///   spending — it is not a deployment;
+    /// - a live world has no illustrative group or app, no planned line and
+    ///   no app-to-app line (ADR 0021 decision 9, amended 2026-11-12);
     /// - the tunnel comes from the operator's device, a keeper's line from a
     ///   keeper;
-    /// - every alert points at an app, and every sum of money is in range.
+    /// - every alert points at an app, instance or device the world holds,
+    ///   and every sum of money is in range.
+    ///
+    /// Unknown states, levels, statuses and healths are accepted: they are
+    /// what an instance that could not be read is drawn with.
     public func validate() throws(WorldError) {
         var problems: [String] = []
         var seen = Set<String>()
@@ -98,12 +106,37 @@ extension World {
 
         for instance in instances {
             unique("instance", instance.id)
-            if instance.spending.limitCents <= 0 {
-                problems.append("instance \(instance.id) has no cost limit")
-            } else {
-                money(instance.spending.limitCents, "instance \(instance.id)'s cost limit", allowZero: false)
+            let spending = instance.spending
+            // A limit is checked where it was read. An instance whose record
+            // and spending were read must have one: every instance has a cost
+            // limit set at creation (AGENTS.md). One whose record failed, or
+            // whose status is unknown, is drawn without; so is one whose
+            // spending section failed, because a world read from an instance
+            // carries both limits only inside that section.
+            if let limit = spending.limitCents {
+                if limit <= 0 {
+                    problems.append("instance \(instance.id) has no cost limit")
+                } else {
+                    money(limit, "instance \(instance.id)'s cost limit", allowZero: false)
+                }
             }
-            money(instance.spending.expectedCents, "instance \(instance.id)'s expected spending")
+            if let recorded = spending.recordedLimitCents {
+                if recorded <= 0 {
+                    problems.append("instance \(instance.id) has no recorded cost limit")
+                } else {
+                    money(recorded, "instance \(instance.id)'s recorded cost limit", allowZero: false)
+                }
+            }
+            if instance.status != .unknown, instance.problem(in: .record) == nil, instance.problem(in: .spend) == nil,
+               spending.limitCents == nil, spending.recordedLimitCents == nil {
+                problems.append("instance \(instance.id) has no cost limit")
+            }
+            if let cents = spending.expectedCents { money(cents, "instance \(instance.id)'s expected spending") }
+            if let cents = spending.confirmedCents { money(cents, "instance \(instance.id)'s confirmed spending") }
+            if let cents = spending.totalCents { money(cents, "instance \(instance.id)'s total spending") }
+            if spending.hasConfirmation, spending.confirmedCents == nil {
+                problems.append("instance \(instance.id) says spending is confirmed, with no confirmed figure")
+            }
             let systemGroups = instance.groups.filter(\.isSystem)
             if systemGroups.count != 1 {
                 problems.append("instance \(instance.id) has \(systemGroups.count) system groups, not one")
@@ -113,6 +146,9 @@ extension World {
             }
             for group in instance.groups {
                 unique("group", group.id)
+                if source == .live, group.isIllustrative {
+                    problems.append("live world has illustrative group \(group.id); a live map never shows the fixture's sketches")
+                }
                 if group.id != "\(instance.id)/\(group.namespace)" {
                     problems.append("group \(group.id) is not \(instance.id)/\(group.namespace)")
                 }
@@ -138,6 +174,11 @@ extension World {
                     if app.isIllustrative, app.state != .running || app.stopReason != nil {
                         problems.append("illustrative app \(app.id) is stopped; only a deployment can be")
                     }
+                    if source == .live, app.isIllustrative {
+                        problems.append("live world has illustrative app \(app.id)")
+                    }
+                    if let ready = app.ready, ready < 0 { problems.append("app \(app.id) has a negative ready count") }
+                    if let desired = app.desired, desired < 0 { problems.append("app \(app.id) has a negative desired count") }
                 }
             }
         }
@@ -155,12 +196,32 @@ extension World {
         }
         for connection in connections {
             problems += Self.problems(with: connection, index)
+            if source == .live, connection.evidence == .planned {
+                problems.append("live world has planned line \(connection.id); nothing decided-but-not-built is read")
+            }
+            if source == .live, connection.kind == .appToApp {
+                problems.append("live world has app-to-app line \(connection.id); app to app is not built")
+            }
+            if let count = connection.count, count < 0 {
+                problems.append("connection \(connection.id) has a negative count")
+            }
         }
         for alert in alerts {
-            if index.apps[alert.appID] == nil {
-                problems.append("alert \(alert.id) points at unknown app \(alert.appID)")
-            } else if index.apps[alert.appID]?.isIllustrative == true {
-                problems.append("alert \(alert.id) is about illustrative app \(alert.appID); nothing happens to a sketch")
+            switch alert.subject {
+            case .app(let app):
+                if index.apps[app] == nil {
+                    problems.append("alert \(alert.id) points at unknown app \(app)")
+                } else if index.apps[app]?.isIllustrative == true {
+                    problems.append("alert \(alert.id) is about illustrative app \(app); nothing happens to a sketch")
+                }
+            case .instance(let instance):
+                if index.instances[instance] == nil {
+                    problems.append("alert \(alert.id) points at unknown instance \(instance)")
+                }
+            case .device(let device):
+                if index.devices[device] == nil {
+                    problems.append("alert \(alert.id) points at unknown device \(device)")
+                }
             }
         }
 

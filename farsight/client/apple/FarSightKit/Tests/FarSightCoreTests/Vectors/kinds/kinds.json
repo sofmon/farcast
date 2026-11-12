@@ -1,0 +1,1 @@
+{"kinds":["record_unreadable","not_found","not_connected","tunnel_unreachable","kernel_absent","not_checkpointed","version_skew","kubectl_missing","kubectl_failed","gcloud_mismatch","gcloud_signed_out","auth_tool_missing","timeout","internal"]}

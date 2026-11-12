@@ -148,7 +148,7 @@ func TestAnUnsealErrorCannotForgeALineFromARefusal(t *testing.T) {
 	if err == nil {
 		t.Fatal("guard: the unseal succeeded")
 	}
-	env.Printer.PrintError(err.Error(), 1)
+	env.Printer.PrintError(err, 1)
 	if !strings.Contains(stderr.String(), `pin\nfarcast: forged`) {
 		t.Errorf("guard: the refusal is not in the error, quoted:\n%s", stderr.String())
 	}

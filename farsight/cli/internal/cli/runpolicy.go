@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	fldeploy "github.com/sofmon/farcast/fatline/deploy"
@@ -82,8 +83,18 @@ func readEgressPolicy(ctx context.Context, cl policyReader) (*policy.Document, e
 	}
 	doc, err := policy.Parse([]byte(raw))
 	if err != nil {
-		return nil, fmt.Errorf("the instance's existing egress policy could not be read (%w); refusing to replace "+
+		err = fmt.Errorf("the instance's existing egress policy could not be read (%w); refusing to replace "+
 			"it, because rewriting it from scratch would revoke every application already running", err)
+		// A document of another version is version skew — one side is older
+		// than the other — and is marked so a reader can tell it from one that
+		// is broken. The words are the same either way.
+		var head struct {
+			Version *int `json:"version"`
+		}
+		if json.Unmarshal([]byte(raw), &head) == nil && head.Version != nil && *head.Version != policy.Version {
+			return nil, withKind(kindVersionSkew, err)
+		}
+		return nil, withKind(kindKubectlFailed, err)
 	}
 	return doc, nil
 }

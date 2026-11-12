@@ -95,12 +95,12 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 
 	dir, err := config.Resolve(opts.config)
 	if err != nil {
-		printer.PrintError(err.Error(), 1)
+		printer.PrintError(err, 1)
 		return 1
 	}
 	cfg, err := config.Load(dir)
 	if err != nil {
-		printer.PrintError(err.Error(), 1)
+		printer.PrintError(err, 1)
 		return 1
 	}
 
@@ -127,8 +127,9 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		fprintf(stderr, "farcast %s: %v\nRun 'farcast help %s' for usage.\n", name, err, name)
 	} else if err != nil {
 		// The JSON envelope carries the same code the process exits with, so
-		// a script reading either reads one answer.
-		printer.PrintError(err.Error(), code)
+		// a script reading either reads one answer — and the error's kind,
+		// so a reader can tell failures apart without parsing prose.
+		printer.PrintError(classified(err), code)
 	}
 	return code
 }
@@ -161,6 +162,7 @@ func defaultRegistry() *Registry {
 	help := &helpCommand{}
 	reg.Register(help)
 	help.reg = reg
+	reg.Register(newInstancesCommand())
 
 	reg.Register(&installCommand{})
 	reg.Register(&releaseCommand{})
@@ -171,6 +173,7 @@ func defaultRegistry() *Registry {
 	reg.Register(&logsCommand{})
 	reg.Register(&costsCommand{})
 	reg.Register(&usageCommand{})
+	reg.Register(newWorldCommand())
 	reg.Register(&buildCommand{})
 	reg.Register(&toolchainCommand{})
 	reg.Register(newStorageCommand())

@@ -75,7 +75,7 @@ type Config struct {
 // configuration without error.
 func Load(d Dir) (*Config, error) {
 	path := filepath.Join(string(d), fileName)
-	data, err := os.ReadFile(path)
+	data, err := readFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return &Config{}, nil
 	}

@@ -42,7 +42,7 @@ struct WorldTests {
             id: "x3", from: .device("mac"), to: .app("atlas/home/notes"),
             kind: .tunnel, evidence: .observed, label: "?"
         ))
-        world.alerts.append(WorldAlert(id: "x4", kind: .cost, severity: .warning, title: "?", appID: "atlas/ghost"))
+        world.alerts.append(WorldAlert(id: "x4", kind: .cost, severity: .warning, title: "?", subject: .app("atlas/ghost")))
         world.instances[0].spending.limitCents = 0
 
         #expect {
@@ -172,7 +172,7 @@ struct WorldTests {
     @Test("nothing happens to a sketch: no alert, no stop, and FarCast itself is never one")
     func sketchesAreQuiet() throws {
         let alert = try problems { world in
-            world.alerts.append(WorldAlert(id: "x", kind: .denied, severity: .warning, title: "api: 3 denied", appID: "atlas/shop/api"))
+            world.alerts.append(WorldAlert(id: "x", kind: .denied, severity: .warning, title: "api: 3 denied", subject: .app("atlas/shop/api")))
         }
         #expect(alert.contains("alert x is about illustrative app atlas/shop/api"))
         let stopped = try problems { world in

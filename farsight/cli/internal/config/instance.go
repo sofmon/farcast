@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"sync/atomic"
 	"time"
 
 	"github.com/goccy/go-yaml"
@@ -32,6 +33,37 @@ import (
 // Refusing is the point. The command that would have overwritten stops and
 // says so, rather than reporting success over a loss nobody can see.
 var ErrMetadataConflict = errors.New("instance metadata changed on disk since it was read")
+
+// ErrNoInstanceRecord marks a metadata read that found no record at all: no
+// instance by that name on this machine. The error that carries it reads
+// exactly as the underlying file error did, and still matches fs.ErrNotExist.
+var ErrNoInstanceRecord = errors.New("no instance record on this machine")
+
+// recordMissing is a missing metadata.yaml, marked as ErrNoInstanceRecord.
+type recordMissing struct{ err error }
+
+func (e *recordMissing) Error() string   { return e.err.Error() }
+func (e *recordMissing) Unwrap() []error { return []error{e.err, ErrNoInstanceRecord} }
+
+// readObserver, when set, is told the path of every file this package reads.
+var readObserver atomic.Pointer[func(path string)]
+
+// ObserveReads tells f the path of every file this package reads from now on,
+// until stop is called. It exists so a test can show what a command never
+// opened — the CA key and the storage keyring above all — rather than infer
+// it from the command succeeding.
+func ObserveReads(f func(path string)) (stop func()) {
+	readObserver.Store(&f)
+	return func() { readObserver.Store(nil) }
+}
+
+// readFile is os.ReadFile, told to the observer first.
+func readFile(path string) ([]byte, error) {
+	if f := readObserver.Load(); f != nil {
+		(*f)(path)
+	}
+	return os.ReadFile(path)
+}
 
 const (
 	instancesSubdir = "instances"
@@ -273,6 +305,28 @@ type KernelConfirmation struct {
 	AsOf  time.Time `yaml:"as_of,omitempty"`
 }
 
+// Deployment is what this machine recorded about the last successful 'farcast
+// run' into one namespace: the repository it came from and the exact tree that
+// was read (ADR 0021 decision 2, amended 2026-11-12).
+//
+// It lives here, on the operator's machine, and never in the cluster: the
+// provider already keeps the repository and commit through the fetch and build
+// Job bodies, and a Namespace annotation would add a standing copy. The record
+// belongs to the machine that made it — a deploy from another machine is not
+// in it.
+type Deployment struct {
+	Repository     string    `yaml:"repository"`
+	Ref            string    `yaml:"ref,omitempty"`
+	Commit         string    `yaml:"commit,omitempty"`
+	ManifestDigest string    `yaml:"manifest_digest,omitempty"`
+	DeployedAt     time.Time `yaml:"deployed_at,omitzero"`
+	// StorageWired records that this run gave its applications a storage
+	// identity — that the keyholder was deployed when it ran. An application
+	// deployed before 'storage deploy' has none, whatever the record says
+	// about the keyholder today.
+	StorageWired bool `yaml:"storage_wired,omitempty"`
+}
+
 // InstanceMetadata is the non-secret record for an installed instance.
 type InstanceMetadata struct {
 	Name      string    `yaml:"name"`
@@ -286,6 +340,13 @@ type InstanceMetadata struct {
 	Version   string    `yaml:"farcast_version,omitempty"`
 	CreatedAt time.Time `yaml:"created_at"`
 	UpdatedAt time.Time `yaml:"updated_at"`
+
+	// GCloudAccount is the gcloud account this instance's cluster is read as
+	// (ADR 0021 decision 9, amended 2026-11-12). The operator pins it from a
+	// terminal ('farcast instances pin-gcloud'); it is never taken from
+	// whatever configuration happens to be active. Empty means unpinned, and
+	// 'farcast world' refuses to read until it is set.
+	GCloudAccount string `yaml:"gcloud_account,omitempty"`
 
 	// CloudLogging is the provider's logging configuration for the cluster, as
 	// the provider read it back at install (ADR 0019). CloudLoggingSystem means
@@ -324,6 +385,11 @@ type InstanceMetadata struct {
 	// Toolchain records the third-party images this instance runs to turn a
 	// repository into a deployable image, pointer-typed like the rest.
 	Toolchain *Toolchain `yaml:"toolchain,omitempty"`
+
+	// Deployments is, per namespace, the repository and tree this machine's
+	// last successful 'farcast run' deployed there. 'run' refuses a namespace
+	// recorded under another repository unless told to replace it.
+	Deployments map[string]Deployment `yaml:"deployments,omitempty"`
 
 	// loaded and loadedSum are how a write knows it is replacing the record it
 	// read rather than one somebody else has since written. Unexported, so
@@ -446,7 +512,7 @@ func (d Dir) SaveInstanceMetadata(name string, m *InstanceMetadata) error {
 	}
 	path := filepath.Join(d.instanceDir(name), metadataFile)
 
-	switch current, readErr := os.ReadFile(path); {
+	switch current, readErr := readFile(path); {
 	case readErr == nil:
 		if !m.loaded {
 			return fmt.Errorf("%w: %s already exists and this command never read it", ErrMetadataConflict, path)
@@ -539,9 +605,15 @@ func mergeOntoNewer(baseRaw []byte, mine *InstanceMetadata, newerRaw []byte) (*I
 }
 
 // LoadInstanceMetadata reads metadata.yaml for an instance.
+//
+// No record at all is an error marked ErrNoInstanceRecord, with the file
+// error's own text.
 func (d Dir) LoadInstanceMetadata(name string) (*InstanceMetadata, error) {
 	path := filepath.Join(d.instanceDir(name), metadataFile)
-	data, err := os.ReadFile(path)
+	data, err := readFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, &recordMissing{err: err}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -553,6 +625,49 @@ func (d Dir) LoadInstanceMetadata(name string) (*InstanceMetadata, error) {
 	m.loadedSum = sha256.Sum256(data)
 	m.loadedRaw = data
 	return &m, nil
+}
+
+// ParseFault says why a record did not parse — the kind of fault and where it
+// is — without a word of the record itself. ok is false when err is not a
+// parse failure of a record.
+//
+// It exists for a reader whose output travels further than the operator's
+// terminal ('instances' and 'world', which the FarCast app runs). The YAML
+// parser's own text quotes the lines around the fault, and some of its
+// messages quote a value; a record holds the project, the endpoints and the
+// pinned gcloud account. The error LoadInstanceMetadata returns still reads
+// as it always has: the operator at a terminal gets the whole of it.
+func ParseFault(err error) (fault string, ok bool) {
+	var ye yaml.Error
+	if !errors.As(err, &ye) {
+		return "", false
+	}
+	var (
+		syntax   *yaml.SyntaxError
+		typ      *yaml.TypeError
+		overflow *yaml.OverflowError
+		dup      *yaml.DuplicateKeyError
+		unknown  *yaml.UnknownFieldError
+		node     *yaml.UnexpectedNodeTypeError
+	)
+	switch {
+	case errors.As(err, &syntax):
+		fault = "a YAML syntax error"
+	case errors.As(err, &typ), errors.As(err, &node):
+		fault = "a value of the wrong type"
+	case errors.As(err, &overflow):
+		fault = "a number out of range"
+	case errors.As(err, &dup):
+		fault = "a key given twice"
+	case errors.As(err, &unknown):
+		fault = "a field this build does not know"
+	default:
+		fault = "a YAML error"
+	}
+	if tk := ye.GetToken(); tk != nil && tk.Position != nil {
+		fault += fmt.Sprintf(" at line %d, column %d", tk.Position.Line, tk.Position.Column)
+	}
+	return fault, true
 }
 
 // UpdateInstanceMetadata reads the current metadata, applies mutate and writes
@@ -596,7 +711,7 @@ func (d Dir) SaveInstanceCredentials(name string, c *InstanceCredentials) error 
 // LoadInstanceCredentials reads credentials.yaml for an instance.
 func (d Dir) LoadInstanceCredentials(name string) (*InstanceCredentials, error) {
 	path := filepath.Join(d.instanceDir(name), credentialsFile)
-	data, err := os.ReadFile(path)
+	data, err := readFile(path)
 	if err != nil {
 		return nil, err
 	}
@@ -699,7 +814,7 @@ func (d Dir) LoadInstanceKeyring(name string) ([]byte, error) {
 	if perm := info.Mode().Perm(); perm&0o077 != 0 {
 		return nil, fmt.Errorf("keyring %s is mode %04o; it must not be readable by other accounts on this machine", path, perm)
 	}
-	return os.ReadFile(path)
+	return readFile(path)
 }
 
 // CreateInstanceKeyring writes a new keyring, refusing to overwrite an
@@ -790,7 +905,7 @@ func (d Dir) SaveInstanceKeyring(name string, expected, data []byte) error {
 		return fmt.Errorf("%s is a link, not a file of its own: replacing it would leave the link's other end behind, "+
 			"silently missing every key added from now on. Keep the keyring itself at this path, and back the directory up instead", path)
 	}
-	current, err := os.ReadFile(path)
+	current, err := readFile(path)
 	if err != nil {
 		return fmt.Errorf("read %s before replacing it: %w", path, err)
 	}
@@ -848,21 +963,54 @@ func (d Dir) SaveInstanceMTLS(name string, m MTLSMaterial) error {
 // enough to prove what was enrolled under it, without bringing the CA's
 // private key into memory.
 func (d Dir) LoadInstanceCACert(name string) ([]byte, error) {
-	return os.ReadFile(filepath.Join(d.fatlineDir(name), caCertFile))
+	return readFile(filepath.Join(d.fatlineDir(name), caCertFile))
 }
 
 // LoadOperatorLeaf reads only the operator's client certificate — public, and
 // enough to compute the token the tunnel attributes the operator's streams
 // by, without bringing the CA's private key into memory.
 func (d Dir) LoadOperatorLeaf(name string) ([]byte, error) {
-	return os.ReadFile(filepath.Join(d.fatlineDir(name), clientCertFile))
+	return readFile(filepath.Join(d.fatlineDir(name), clientCertFile))
+}
+
+// DialIdentity is what dialling an instance's tunnel needs, and nothing more:
+// the CA certificate the server is verified against, and the operator's leaf
+// and its key. The CA's private key is not a field, so no reader built on this
+// can be handed it by mistake.
+type DialIdentity struct {
+	CACertPEM     []byte
+	ClientCertPEM []byte
+	ClientKeyPEM  []byte
+}
+
+// LoadDialIdentity reads the three files a tunnel dial uses. It never opens
+// ca.key — the reads 'farcast instances' and 'farcast world' make must
+// succeed with it unreadable (ADR 0021 decision 9, amended 2026-11-12).
+func (d Dir) LoadDialIdentity(name string) (DialIdentity, error) {
+	dir := d.fatlineDir(name)
+	var id DialIdentity
+	for _, f := range []struct {
+		file string
+		into *[]byte
+	}{
+		{caCertFile, &id.CACertPEM},
+		{clientCertFile, &id.ClientCertPEM},
+		{clientKeyFile, &id.ClientKeyPEM},
+	} {
+		b, err := readFile(filepath.Join(dir, f.file))
+		if err != nil {
+			return DialIdentity{}, fmt.Errorf("read %s: %w", f.file, err)
+		}
+		*f.into = b
+	}
+	return id, nil
 }
 
 // LoadInstanceMTLS reads the per-instance mTLS material.
 func (d Dir) LoadInstanceMTLS(name string) (MTLSMaterial, error) {
 	dir := d.fatlineDir(name)
 	read := func(file string) ([]byte, error) {
-		b, err := os.ReadFile(filepath.Join(dir, file))
+		b, err := readFile(filepath.Join(dir, file))
 		if err != nil {
 			return nil, fmt.Errorf("read %s: %w", file, err)
 		}

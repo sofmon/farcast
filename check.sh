@@ -14,14 +14,15 @@
 #   5  golangci-lint, mandatory — a missing linter fails the check
 #   6  go test -race
 #   7  the Apple client: the source gate (only allowed file types and the
-#      one backdrop image, no links; no unsafe, unsafeFlags or attribute outside an allowed set,
-#      outside the reviewed allowlist; a static manifest with no third-party
-#      package and each target's settings from an allowlist; the project held
-#      to an exact shape, reviewed setting keys and one action-free scheme;
-#      the guardrails in effect for every configuration and SDK), swift build
-#      and swift test, the app built for macOS, the iOS simulator and the
-#      visionOS simulator, and xcodebuild test on macOS and an iOS simulator
-#      (minutes, the first time)
+#      one backdrop image, no links; the CLI's vectors copied byte for byte;
+#      no unsafe, unsafeFlags or attribute outside an allowed set, outside the
+#      reviewed allowlist; a static manifest with no third-party package and
+#      each target's settings and resources from an allowlist; the project held
+#      to an exact shape, reviewed setting keys, one Info.plist holding only
+#      the build's commit, and one action-free scheme; the guardrails in effect
+#      for every configuration and SDK), swift build and swift test, the app
+#      built for macOS, the iOS simulator and the visionOS simulator, and
+#      xcodebuild test on macOS and an iOS simulator (minutes, the first time)
 #   8  the randomized hand-over model, with --model (minutes)
 #
 # There is no hosted CI. Run this before every commit and before every live
@@ -66,7 +67,7 @@ MODEL=''
 for arg in "$@"; do
   case "$arg" in
     --model) MODEL=1 ;;
-    -h|--help) sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) printf 'unknown argument: %s\nusage: ./check.sh [--model]\n' "$arg" >&2; exit 2 ;;
   esac
 done
@@ -241,6 +242,27 @@ strays=$(apple_files -type f ! -name .DS_Store | tr '\0' '\n' | awk -F/ -v backd
 [ -z "$strays" ] || { printf '%s\n' "$strays" >&2; die "files of a type the Apple client does not allow (above); a new type is a reviewed change to this step"; }
 ok "only Swift sources and their manifests, project, data and the backdrop; no links"
 
+# The CLI's golden vectors (ADR 0021 decision 7, Verification 4): Go's tests
+# hold them to what the CLI prints, and FarSightKit's tests decode copies of
+# them. So each copy must be Go's own, byte for byte, and hold nothing Go's
+# does not: a copy edited to make a Swift test pass would hide a broken
+# contract. Finder's .DS_Store is ignored on both sides, as the file-type
+# step above ignores it.
+GOVECTORS=farsight/cli/internal/cli/testdata
+KITVECTORS=$KIT/Tests/FarSightCoreTests/Vectors
+VECTOR_DIRS="app instances kinds version world"
+[ -d "$KITVECTORS" ] || die "FarSightKit has no copy of the CLI's vectors at $KITVECTORS"
+have=$(find "$KITVECTORS" -mindepth 1 -maxdepth 1 ! -name .DS_Store -print | sed "s|^$KITVECTORS/||" | sort | paste -sd' ' -)
+[ "$have" = "$VECTOR_DIRS" ] || die "FarSightKit's vectors hold '$have', not the CLI's '$VECTOR_DIRS'"
+for d in $VECTOR_DIRS; do
+  [ -d "$GOVECTORS/$d" ] || die "the CLI has no $d vectors at $GOVECTORS/$d"
+  if ! diff -r -x .DS_Store "$GOVECTORS/$d" "$KITVECTORS/$d" >"$TMP/vectors.diff" 2>&1; then
+    head -n 20 "$TMP/vectors.diff" >&2
+    die "FarSightKit's copy of the CLI's $d vectors is not Go's (above). Copy them again: rm -rf '$KITVECTORS/$d' && cp -R '$GOVECTORS/$d' '$KITVECTORS/'"
+  fi
+done
+ok "FarSightKit decodes the CLI's own vectors ($VECTOR_DIRS), byte for byte"
+
 # Strict memory safety flags unsafe constructs but not every way around it:
 # @unchecked Sendable (ADR 0021 decision 4), an 'unsafe' marker, unsafeFlags,
 # and attributes such as @_silgen_name (binds any C symbol), @diagnose (turns
@@ -294,6 +316,11 @@ GUARDRAILS='{"kind":{"swiftLanguageMode":{"_0":"6"}},"tool":"swift"}
 {"kind":{"treatAllWarnings":{"_0":"error"}},"tool":"swift"}'
 ALLOWED_SETTINGS="$GUARDRAILS
 {\"kind\":{\"defaultIsolation\":{\"_0\":\"MainActor\"}},\"tool\":\"swift\"}"
+# Resources, by target, exact path and rule: data a target ships or a test
+# reads. A 'process' rule runs a build tool over the file.
+RESOURCES='FarSightUI|Backdrop/backdrop.heic|{"copy":{}}
+FarSightFixtures|world.json|{"copy":{}}
+FarSightCoreTests|Vectors|{"copy":{}}'
 for ((t = 0; t < targets; t++)); do
   name=$(pj "targets.$t.name" raw); type=$(pj "targets.$t.type" raw)
   case "$type" in regular|test) ;; *) die "FarSightKit target $name is a $type target; only regular and test targets are allowed without an ADR" ;; esac
@@ -312,8 +339,16 @@ for ((t = 0; t < targets; t++)); do
   while IFS= read -r want; do
     printf '%s' "$entries" | grep -qxF "$want" || die "FarSightKit target $name lacks the guardrail setting $want (ADR 0021 decision 4)"
   done <<<"$GUARDRAILS"
+  rcount=$(pj "targets.$t.resources" raw || echo 0)
+  rgot=''
+  for ((i = 0; i < rcount; i++)); do
+    rgot="$rgot$name|$(pj "targets.$t.resources.$i.path" raw)|$(pj "targets.$t.resources.$i.rule" json)"$'\n'
+  done
+  rgot=$(printf '%s' "$rgot" | sed '/^$/d')
+  rwant=$(printf '%s\n' "$RESOURCES" | awk -F'|' -v n="$name" '$1 == n')
+  [ "$rgot" = "$rwant" ] || die "FarSightKit target $name declares the resources '$rgot', not the reviewed '$rwant'"
 done
-ok "FarSightKit: a static manifest, no dependencies; $targets targets, each with exactly the allowed settings"
+ok "FarSightKit: a static manifest, no dependencies; $targets targets, each with exactly the allowed settings and resources"
 
 # The app, as Xcode builds it, held to an exact shape rather than a
 # denylist: these objects in these numbers (no build-script phase, no second
@@ -389,8 +424,9 @@ for id in $ids; do
   esac
 done
 [ -z "$(apple_files -name Package.resolved | tr '\0' '\n')" ] || die "the Apple client has resolved a package"
-SETTING_KEYS="ALWAYS_SEARCH_USER_PATHS CLANG_ENABLE_MODULES CLANG_ENABLE_OBJC_ARC CODE_SIGN_IDENTITY[sdk=macosx*] CODE_SIGN_STYLE COPY_PHASE_STRIP CURRENT_PROJECT_VERSION DEBUG_INFORMATION_FORMAT ENABLE_HARDENED_RUNTIME ENABLE_NS_ASSERTIONS ENABLE_PREVIEWS ENABLE_STRICT_OBJC_MSGSEND ENABLE_TESTABILITY ENABLE_USER_SCRIPT_SANDBOXING GCC_OPTIMIZATION_LEVEL GCC_PREPROCESSOR_DEFINITIONS GENERATE_INFOPLIST_FILE INFOPLIST_KEY_CFBundleDisplayName INFOPLIST_KEY_LSApplicationCategoryType INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*] INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*] INFOPLIST_KEY_UILaunchScreen_Generation[sdk=iphoneos*] INFOPLIST_KEY_UILaunchScreen_Generation[sdk=iphonesimulator*] INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone IPHONEOS_DEPLOYMENT_TARGET LD_RUNPATH_SEARCH_PATHS LD_RUNPATH_SEARCH_PATHS[sdk=macosx*] MACOSX_DEPLOYMENT_TARGET MARKETING_VERSION ONLY_ACTIVE_ARCH PRODUCT_BUNDLE_IDENTIFIER PRODUCT_NAME SDKROOT SUPPORTED_PLATFORMS SUPPORTS_MACCATALYST SWIFT_ACTIVE_COMPILATION_CONDITIONS SWIFT_COMPILATION_MODE SWIFT_DEFAULT_ACTOR_ISOLATION SWIFT_OPTIMIZATION_LEVEL SWIFT_STRICT_CONCURRENCY SWIFT_STRICT_MEMORY_SAFETY SWIFT_TREAT_WARNINGS_AS_ERRORS SWIFT_VERSION TARGETED_DEVICE_FAMILY XROS_DEPLOYMENT_TARGET"
+SETTING_KEYS="ALWAYS_SEARCH_USER_PATHS CLANG_ENABLE_MODULES CLANG_ENABLE_OBJC_ARC CODE_SIGN_IDENTITY[sdk=macosx*] CODE_SIGN_STYLE COPY_PHASE_STRIP CURRENT_PROJECT_VERSION DEBUG_INFORMATION_FORMAT ENABLE_HARDENED_RUNTIME ENABLE_NS_ASSERTIONS ENABLE_PREVIEWS ENABLE_STRICT_OBJC_MSGSEND ENABLE_TESTABILITY ENABLE_USER_SCRIPT_SANDBOXING GCC_OPTIMIZATION_LEVEL GCC_PREPROCESSOR_DEFINITIONS GENERATE_INFOPLIST_FILE INFOPLIST_FILE INFOPLIST_KEY_CFBundleDisplayName INFOPLIST_KEY_LSApplicationCategoryType INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*] INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*] INFOPLIST_KEY_UILaunchScreen_Generation[sdk=iphoneos*] INFOPLIST_KEY_UILaunchScreen_Generation[sdk=iphonesimulator*] INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone IPHONEOS_DEPLOYMENT_TARGET LD_RUNPATH_SEARCH_PATHS LD_RUNPATH_SEARCH_PATHS[sdk=macosx*] MACOSX_DEPLOYMENT_TARGET MARKETING_VERSION ONLY_ACTIVE_ARCH PRODUCT_BUNDLE_IDENTIFIER PRODUCT_NAME SDKROOT SUPPORTED_PLATFORMS SUPPORTS_MACCATALYST SWIFT_ACTIVE_COMPILATION_CONDITIONS SWIFT_COMPILATION_MODE SWIFT_DEFAULT_ACTOR_ISOLATION SWIFT_OPTIMIZATION_LEVEL SWIFT_STRICT_CONCURRENCY SWIFT_STRICT_MEMORY_SAFETY SWIFT_TREAT_WARNINGS_AS_ERRORS SWIFT_VERSION TARGETED_DEVICE_FAMILY XROS_DEPLOYMENT_TARGET"
 literals=0
+infoplists=0
 for id in $configs; do
   keys=$(plutil -extract "objects.$id.buildSettings" raw -o - "$PROJECT/project.pbxproj" 2>/dev/null || true)
   # One key per line, compared whole: never word-split.
@@ -410,6 +446,11 @@ for id in $configs; do
       wholemodule|singlefile) ;; *) die "FarSight.xcodeproj sets SWIFT_COMPILATION_MODE to an unreviewed value" ;;
     esac ;;
   esac
+  case " $(printf '%s ' $keys)" in *" INFOPLIST_FILE "*)
+    [ "$(plutil -extract "objects.$id.buildSettings.INFOPLIST_FILE" raw -o - "$PROJECT/project.pbxproj")" = FarCast-Info.plist ] \
+      || die "FarSight.xcodeproj's INFOPLIST_FILE is not FarCast-Info.plist, the one file this step reads"
+    infoplists=$((infoplists + 1)) ;;
+  esac
   for pair in SWIFT_VERSION=6.0 SWIFT_STRICT_CONCURRENCY=complete SWIFT_STRICT_MEMORY_SAFETY=YES SWIFT_TREAT_WARNINGS_AS_ERRORS=YES; do
     key=${pair%%=*}
     case " $(printf '%s ' $keys)" in *" $key "*)
@@ -420,6 +461,13 @@ for id in $configs; do
   done
 done
 [ "$literals" -eq 8 ] || die "FarSight.xcodeproj writes the four guardrails literally in $literals places, not in both of the target's configurations"
+[ "$infoplists" -eq 2 ] || die "FarSight.xcodeproj names FarCast-Info.plist in $infoplists configurations, not in both of the target's"
+# The one Info.plist file holds the build's commit and nothing else; every
+# other key comes from a build setting reviewed above. The commit is passed
+# at build time (FARCAST_COMMIT=…): without it the key is empty and the app
+# reads nothing (ADR 0021 decision 9, amended 2026-11-12).
+[ "$(plutil -convert json -o - "$APPLE/FarCast-Info.plist" 2>/dev/null)" = '{"FarCastCommit":"$(FARCAST_COMMIT)"}' ] \
+  || die "farsight/client/apple/FarCast-Info.plist holds more or other than FarCastCommit = \$(FARCAST_COMMIT)"
 # Every scheme anywhere — the pruned per-user folders and SwiftPM's .swiftpm
 # included, since xcodebuild prefers a scheme it finds there to the one it
 # would generate.
@@ -443,12 +491,13 @@ for config in Debug Release; do
     [ "$(setting SWIFT_TREAT_WARNINGS_AS_ERRORS)" = YES ] || die "FarCast ($config, $sdk): SWIFT_TREAT_WARNINGS_AS_ERRORS is not YES"
     [ "$(setting SWIFT_SUPPRESS_WARNINGS)" != YES ] || die "FarCast ($config, $sdk): SWIFT_SUPPRESS_WARNINGS is YES"
     [ -z "$(setting OTHER_SWIFT_FLAGS)" ] || die "FarCast ($config, $sdk): OTHER_SWIFT_FLAGS is '$(setting OTHER_SWIFT_FLAGS)', which could switch a guardrail off"
+    [ "$(setting INFOPLIST_FILE)" = FarCast-Info.plist ] || die "FarCast ($config, $sdk): INFOPLIST_FILE is '$(setting INFOPLIST_FILE)'"
     # Unset is the toolchain's default for the configuration.
     case "$(setting SWIFT_OPTIMIZATION_LEVEL)" in ''|-Onone|-O|-Osize) ;; *) die "FarCast ($config, $sdk): SWIFT_OPTIMIZATION_LEVEL is '$(setting SWIFT_OPTIMIZATION_LEVEL)'" ;; esac
     checked=$((checked + 1))
   done
 done
-ok "FarCast: the project has its reviewed shape, keys and scheme, and the guardrails are in effect in all $checked configuration and SDK pairs"
+ok "FarCast: the project has its reviewed shape, keys and scheme, and the guardrails are in effect in all $checked configuration and SDK pairs, and the one Info.plist holds only the build's commit"
 
 xcode() {
   local log=$1; shift

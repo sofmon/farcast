@@ -20,7 +20,7 @@ struct AppStrip: View {
                         // over whatever the map shows under the strip — the
                         // backdrop, or an app's light page — so it carries a
                         // chip, as the map's labels do.
-                        Text(group.isSystem ? "FarCast" : group.namespace)
+                        Text(group.isSystem ? "FarCast" : Display.name(group.namespace))
                             .font(.caption2.weight(.semibold))
                             .foregroundStyle(Theme.text)
                             .padding(.horizontal, 7)
@@ -45,13 +45,13 @@ struct AppStrip: View {
         let focused = model.focus == app.id
         let alert = model.alert(for: app.id)
         let dot: Color = alert.map { Theme.severity($0.severity) }
-            ?? (app.state == .stopped ? Theme.stopped : app.isIllustrative ? Theme.illustrative : Theme.running)
+            ?? (app.isIllustrative ? Theme.illustrative : Theme.state(app.state))
         return Button {
             model.focus(on: app.id)
         } label: {
             HStack(spacing: 6) {
                 Circle().fill(dot).frame(width: 6, height: 6)
-                Text(app.name)
+                Text(Display.name(app.name))
             }
             .font(.callout.weight(focused ? .semibold : .regular))
             .padding(.horizontal, 11)
@@ -60,6 +60,6 @@ struct AppStrip: View {
         .buttonStyle(.plain)
         .hudGlass(tint: focused ? Theme.focus.opacity(0.55) : nil, interactive: true)
         .hudGlassID(app.id, in: glass)
-        .accessibilityLabel("\(app.name), \(app.isIllustrative ? "illustrative" : app.state.rawValue)\(alert.map { ", \($0.title)" } ?? "")")
+        .accessibilityLabel("\(Display.name(app.name)), \(app.isIllustrative ? "illustrative" : app.state.label)\(alert.map { ", \(Display.message($0.title))" } ?? "")")
     }
 }

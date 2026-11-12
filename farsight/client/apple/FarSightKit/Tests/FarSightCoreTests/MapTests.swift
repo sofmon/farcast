@@ -327,7 +327,7 @@ struct RouteTests {
             spending: Spending(expectedCents: 0, limitCents: 1000),
             groups: [AppGroup(
                 id: "andromeda/farcast-system", namespace: "farcast-system", source: "FarCast", isSystem: true,
-                apps: [Application(id: "andromeda/farcast-system/fatline", name: "FatLine", role: "network boundary", system: .boundary)]
+                apps: [Application(id: "andromeda/farcast-system/fatline", name: "FatLine", role: "network boundary", state: .running, system: .boundary)]
             )]
         ), at: 0)
         let saved = Arrangement.standard(for: self.world)

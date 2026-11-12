@@ -1,9 +1,20 @@
 {
   "_about": "Illustrative only. Two instances, the way the FarSight prototype canvas drew them. No name, figure or connection here is read from a live instance.",
+  "source": "fixture",
   "instances": [
     {
       "id": "atlas",
-      "spending": { "expectedCents": 4180, "limitCents": 15000 },
+      "status": "running",
+      "cloudLogging": "systemOnly",
+      "problems": [],
+      "spending": {
+        "confirmedCents": 2900, "confirmedThrough": "2026-11-10T00:00:00Z", "hasConfirmation": true,
+        "expectedCents": 1280, "totalCents": 4180,
+        "limitCents": 15000, "recordedLimitCents": 15000, "level": "ok", "currency": "USD",
+        "caveats": [],
+        "notMetered": ["data through the carrier", "bucket storage and operations", "registry storage", "the cluster's own managed workloads", "the GKE cluster fee"],
+        "isCheckpointStale": false
+      },
       "groups": [
         {
           "id": "atlas/farcast-system", "namespace": "farcast-system", "source": "FarCast",
@@ -43,7 +54,17 @@
     },
     {
       "id": "borealis",
-      "spending": { "expectedCents": 5520, "limitCents": 6000 },
+      "status": "running",
+      "cloudLogging": "systemOnly",
+      "problems": [],
+      "spending": {
+        "confirmedCents": 4800, "confirmedThrough": "2026-11-10T00:00:00Z", "hasConfirmation": true,
+        "expectedCents": 720, "totalCents": 5520,
+        "limitCents": 6000, "recordedLimitCents": 6000, "level": "warn90", "currency": "USD",
+        "caveats": [],
+        "notMetered": ["data through the carrier", "bucket storage and operations", "registry storage", "the cluster's own managed workloads", "the GKE cluster fee"],
+        "isCheckpointStale": false
+      },
       "groups": [
         {
           "id": "borealis/farcast-system", "namespace": "farcast-system", "source": "FarCast",
@@ -67,9 +88,9 @@
     }
   ],
   "devices": [
-    { "id": "mac", "name": "This Mac", "role": "operator", "note": "operator · holds the keys", "isHealthy": true },
-    { "id": "ubuntu-vm", "name": "ubuntu-vm", "role": "keeper", "note": "keeper for atlas", "isHealthy": true },
-    { "id": "pixel-phone", "name": "pixel-phone", "role": "keeper", "note": "keeper for borealis · budget spent", "isHealthy": false }
+    { "id": "mac", "name": "This Mac", "role": "operator", "note": "operator · holds the keys", "health": "healthy" },
+    { "id": "ubuntu-vm", "name": "ubuntu-vm", "role": "keeper", "note": "keeper for atlas", "health": "healthy" },
+    { "id": "pixel-phone", "name": "pixel-phone", "role": "keeper", "note": "keeper for borealis · leaf expired", "health": "expired" }
   ],
   "hosts": [
     { "id": "maps", "name": "maps.example.test", "instanceID": "atlas", "note": "used by photos" },
@@ -100,13 +121,13 @@
     { "id": "b2", "from": "app:borealis/lab/renderer", "to": "host:assets", "kind": "egress", "evidence": "observed", "label": "31 ok · until 03:41", "isStale": true },
     { "id": "b3", "from": "app:borealis/farcast-system/shrike", "to": "app:borealis/farcast-system/fatline", "kind": "watch", "evidence": "observed", "label": "watches", "isStale": false },
     { "id": "b4", "from": "device:mac", "to": "app:borealis/farcast-system/fatline", "kind": "tunnel", "evidence": "observed", "label": "you · mTLS tunnel", "isStale": false },
-    { "id": "b5", "from": "device:pixel-phone", "to": "app:borealis/farcast-system/datasphere", "kind": "keeper", "evidence": "observed", "label": "keeper · budget spent", "isStale": false },
+    { "id": "b5", "from": "device:pixel-phone", "to": "app:borealis/farcast-system/datasphere", "kind": "keeper", "evidence": "observed", "label": "keeper · leaf expired", "isStale": false },
     { "id": "b6", "from": "app:borealis/lab/wiki", "to": "app:borealis/farcast-system/datasphere", "kind": "storage", "evidence": "observed", "label": "storage", "isStale": false },
     { "id": "b7", "from": "app:borealis/lab/renderer", "to": "app:borealis/farcast-system/datasphere", "kind": "storage", "evidence": "observed", "label": "storage", "isStale": false }
   ],
   "alerts": [
-    { "id": "cost-borealis", "kind": "cost", "severity": "critical", "title": "borealis is past 90% of its limit", "appID": "borealis/farcast-system/technocore" },
-    { "id": "sealed-borealis", "kind": "sealed", "severity": "critical", "title": "borealis storage: K1 sealed", "appID": "borealis/farcast-system/datasphere" },
-    { "id": "denied-forge", "kind": "denied", "severity": "warning", "title": "forge: 2 connections denied", "appID": "atlas/dev/forge" }
+    { "id": "cost-borealis", "kind": "cost", "severity": "warning", "title": "borealis is past 90% of its limit", "subject": "instance:borealis" },
+    { "id": "sealed-borealis", "kind": "sealed", "severity": "critical", "title": "borealis storage: K1 sealed", "subject": "app:borealis/farcast-system/datasphere" },
+    { "id": "denied-forge", "kind": "denied", "severity": "warning", "title": "forge: 2 connections denied", "subject": "app:atlas/dev/forge" }
   ]
 }

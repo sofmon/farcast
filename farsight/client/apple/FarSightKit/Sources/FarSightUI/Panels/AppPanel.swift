@@ -49,14 +49,14 @@ struct AppPanel: View {
 
     private var marker: some View {
         RoundedRectangle(cornerRadius: 3, style: .continuous)
-            .fill(stateColor.opacity(app.state == .stopped ? 0.35 : 0.8))
+            .fill(stateColor.opacity(app.state.isDormant ? 0.35 : 0.8))
             .overlay(
                 RoundedRectangle(cornerRadius: 3, style: .continuous)
                     .strokeBorder(borderColor, style: StrokeStyle(lineWidth: isFocused || alert != nil ? 2 : 0.5, dash: dash))
             )
             .overlay(alignment: .bottom) {
                 if rect.width >= 30 {
-                    Text(app.name)
+                    Text(Display.name(app.name))
                         .font(.system(size: 10, weight: .medium))
                         .foregroundStyle(Theme.text)
                         .fixedSize()
@@ -73,7 +73,7 @@ struct AppPanel: View {
             // card pans the map like empty space does.
             HStack(spacing: 6) {
                 Circle().fill(stateColor).frame(width: 7, height: 7)
-                Text(app.name)
+                Text(Display.name(app.name))
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(Theme.text)
                 Spacer(minLength: 0)
@@ -95,7 +95,7 @@ struct AppPanel: View {
         .frame(width: rect.width, height: rect.height, alignment: .topLeading)
         .background(Theme.panel, in: shape)
         .overlay(shape.strokeBorder(borderColor, style: StrokeStyle(lineWidth: borderWidth, dash: dash)))
-        .opacity(app.state == .stopped ? 0.75 : 1)
+        .opacity(app.state.isDormant ? 0.75 : 1)
         .contentShape(shape)
         .onTapGesture { model.focus(on: app.id) }
     }
@@ -116,10 +116,10 @@ struct AppPanel: View {
     private var titleBar: some View {
         HStack(spacing: 8) {
             Circle().fill(stateColor).frame(width: 8, height: 8)
-            Text(app.name)
+            Text(Display.name(app.name))
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(Theme.text)
-            Text(group.isSystem ? "FarCast" : group.namespace)
+            Text(group.isSystem ? "FarCast" : Display.name(group.namespace))
                 .font(.system(size: 11))
                 .foregroundStyle(Theme.secondaryText)
             Spacer(minLength: 4)
@@ -137,13 +137,14 @@ struct AppPanel: View {
         .onTapGesture { model.focus(on: app.id) }
     }
 
-    /// What the live budget would do with this panel. Tiles are not built, so
-    /// nothing is live yet and there is no last frame: the pill says "would".
+    /// The app's state, when it is anything but running; otherwise what the
+    /// live budget would do with this panel. Tiles are not built, so nothing
+    /// is live yet and there is no last frame: the pill says "would".
     /// FarCast's own surfaces are native and not budgeted, so they have none.
     @ViewBuilder
     private var badge: some View {
-        if app.state == .stopped {
-            Pill(text: "stopped", color: Theme.stopped)
+        if app.state != .running {
+            Pill(text: app.state.label, color: Theme.state(app.state))
         } else if group.isSystem {
             EmptyView()
         } else if app.isIllustrative {
@@ -167,11 +168,14 @@ struct AppPanel: View {
             } else {
                 PageSketch(seed: app.id, illustrative: app.isIllustrative)
             }
-            if app.state == .stopped {
+            switch app.state {
+            case .stopped, .notDeployed:
                 Theme.ground.opacity(0.55)
-                Label(app.stopReason ?? "stopped", systemImage: "pause.circle")
+                Label(statusLine, systemImage: app.state == .stopped ? "pause.circle" : "circle.dashed")
                     .font(.system(size: min(max(30 * scale, 12), 20), weight: .semibold))
                     .foregroundStyle(Theme.text)
+            case .running, .starting, .unknown:
+                EmptyView()
             }
         }
         .frame(width: size.width, height: size.height)
@@ -180,7 +184,7 @@ struct AppPanel: View {
             if !group.isSystem, size.height > 120 {
                 Text(app.isIllustrative
                     ? "illustrative · not a deployment, and it has no UI"
-                    : "placeholder · \(app.name)'s own web UI is drawn here once tiles exist")
+                    : "placeholder · \(Display.name(app.name))'s own web UI is drawn here once tiles exist")
                     .font(.system(size: 10))
                     .foregroundStyle(Theme.tertiaryText)
                     .padding(8)
@@ -198,7 +202,7 @@ struct AppPanel: View {
     }
 
     private var stateColor: Color {
-        app.state == .stopped ? Theme.stopped : app.isIllustrative ? Theme.illustrative : Theme.running
+        app.isIllustrative ? Theme.illustrative : Theme.state(app.state)
     }
 
     private var borderColor: Color {
@@ -213,25 +217,45 @@ struct AppPanel: View {
     }
 
     private var dash: [CGFloat] {
-        app.isIllustrative && !isFocused ? [7, 5] : []
+        if isFocused { return [] }
+        return app.isIllustrative ? [7, 5] : Theme.stateDash(app.state)
     }
 
+    /// What the glance says under the name: the state when it is not
+    /// running, else the alert, else what the app is.
     private var statusLine: String {
-        if app.state == .stopped { return app.stopReason ?? "stopped" }
-        if let alert { return alert.title }
-        return app.role
+        switch app.state {
+        case .stopped: return Display.name(app.stopReason ?? "stopped")
+        case .notDeployed: return "not deployed"
+        case .starting:
+            if let ready = app.ready, let desired = app.desired { return "starting · \(ready) of \(desired) ready" }
+            return "starting"
+        case .unknown: return "state not read"
+        case .running: break
+        }
+        if let alert { return Display.message(alert.title) }
+        return Display.name(app.role)
     }
 
     private var statusColor: Color {
         if let alert { return Theme.severity(alert.severity).opacity(0.9) }
-        if app.state == .stopped { return Theme.critical.opacity(0.9) }
+        switch app.state {
+        case .stopped: return Theme.critical.opacity(0.9)
+        case .starting: return Theme.warning
+        case .notDeployed, .unknown: return Theme.secondaryText
+        case .running: break
+        }
         if app.isIllustrative { return Theme.illustrative }
         return Theme.secondaryText
     }
 
     private var accessibilityText: String {
-        var parts = [app.name, group.isSystem ? "FarCast" : group.namespace, app.isIllustrative ? "illustrative" : app.state.rawValue]
-        if let alert { parts.append(alert.title) }
+        var parts = [
+            Display.name(app.name),
+            group.isSystem ? "FarCast" : Display.name(group.namespace),
+            app.isIllustrative ? "illustrative" : app.state.label,
+        ]
+        if let alert { parts.append(Display.message(alert.title)) }
         if app.isIllustrative { parts.append("not a deployment") }
         return parts.joined(separator: ", ")
     }

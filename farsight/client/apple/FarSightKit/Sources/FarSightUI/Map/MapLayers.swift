@@ -93,14 +93,20 @@ struct OutsideLayer: View {
                 case .declared: (Theme.declared, [2, 4])
                 case .unconnected: (Theme.tertiaryText, [1, 5])
                 }
-                Self.card(context, rect, title: host.name, note: host.note, color: color, dash: dash, scale: camera.scale)
+                Self.card(context, rect, title: Display.name(host.name), note: Display.name(host.note), color: color, dash: dash, scale: camera.scale)
             }
             for device in model.world.devices {
                 guard let world = model.geometry.devices[device.id] else { continue }
                 let rect = camera.screen(world, in: viewport)
                 guard rect.intersects(screen) else { continue }
-                let color = !device.isHealthy ? Theme.warning : device.role == .operator ? Theme.focus : Theme.keeper
-                Self.card(context, rect, title: device.name, note: device.note, color: color, dash: [], scale: camera.scale)
+                // A device an alert is about takes the alert's colour, as a
+                // panel does; otherwise its health's. One whose health was not
+                // read says so rather than passing for healthy or not.
+                let alert = model.alertByDevice[device.id]
+                let color = alert.map { Theme.severity($0.severity) } ?? Theme.device(device)
+                let note = device.health == .unknown && device.role == .keeper
+                    ? "\(Display.name(device.note)) · not read" : Display.name(device.note)
+                Self.card(context, rect, title: Display.name(device.name), note: note, color: color, dash: [], scale: camera.scale)
             }
         }
     }
@@ -137,11 +143,17 @@ struct OutsideLayer: View {
     }
 }
 
-/// An instance's name and spending, above its wall. Tap to frame it.
+/// An instance's name and spending, above its wall, and — for an instance
+/// read from a live world — when it was read and what of the read failed.
+/// Tap to frame it.
 struct TerritoryLabel: View {
     let instance: Instance
     let rect: CGRect
     let scale: CGFloat
+    /// The instance's most urgent alert: the chip takes its colour.
+    var alert: WorldAlert? = nil
+    /// Whether to say when the instance was read: only a live world is read.
+    var showsReadState = false
     let action: () -> Void
 
     var body: some View {
@@ -149,14 +161,24 @@ struct TerritoryLabel: View {
         let inset = min(max(160 * scale, 10), 40)
         let height = max(rect.height, size + 12)
         let spending = instance.spending
+        let readState = showsReadState ? Format.readState(instance) : nil
+        // What failed in the read, then what it saw and could not draw.
+        let problems: [String] = instance.problems.map { Display.message("\($0.section.rawValue): \($0.message)") }
+        let caveats: [String] = instance.caveats.map(Display.message)
+        let help = (problems + caveats).joined(separator: "\n")
         Button(action: action) {
             HStack(alignment: .firstTextBaseline, spacing: size * 0.5) {
-                Text(instance.id)
+                Text(Display.name(instance.id))
                     .font(.system(size: size, weight: .bold))
                     .foregroundStyle(Theme.text)
-                Text("\(Format.dollars(spending.expectedCents)) expected of \(Format.dollars(spending.limitCents)) · \(Format.percent(spending.fraction))")
+                Text(Format.spending(spending))
                     .font(.system(size: size * 0.62, weight: .medium, design: .monospaced))
-                    .foregroundStyle(Theme.spending(spending.fraction))
+                    .foregroundStyle(Theme.level(spending.level))
+                if let readState {
+                    Text(readState)
+                        .font(.system(size: size * 0.55, weight: .medium))
+                        .foregroundStyle(instance.problems.isEmpty && instance.status != .deleting ? Theme.secondaryText : Theme.warning)
+                }
             }
             .lineLimit(1)
             .fixedSize()
@@ -165,9 +187,16 @@ struct TerritoryLabel: View {
             .padding(.horizontal, size * 0.45)
             .padding(.vertical, size * 0.16)
             .background(Theme.chip, in: Capsule())
+            .overlay {
+                if let alert {
+                    Capsule().strokeBorder(Theme.severity(alert.severity), lineWidth: 2)
+                }
+            }
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("\(instance.id), expected spending at \(Format.percent(spending.fraction)) of its cost limit")
+        .help(help)
+        .accessibilityLabel(([Display.name(instance.id), Format.spendingSpoken(spending)] + (readState.map { [$0] } ?? [])
+            + (alert.map { [Display.message($0.title)] } ?? [])).joined(separator: ", "))
         .frame(width: max(rect.width - 2 * inset, 1), height: height, alignment: .leading)
         .position(x: rect.midX, y: rect.maxY - height / 2)
     }
@@ -191,11 +220,11 @@ struct GroupHeader: View {
             Image(systemName: group.isSystem ? "gearshape.2.fill" : "shippingbox")
                 .font(.system(size: size * 0.8))
                 .foregroundStyle(Theme.secondaryText)
-            Text(group.isSystem ? "FarCast" : group.namespace)
+            Text(group.isSystem ? "FarCast" : Display.name(group.namespace))
                 .font(.system(size: size, weight: .semibold))
                 .foregroundStyle(Theme.text)
             if rect.width > 300 {
-                Text(group.isSystem ? "the OS itself, shown as apps" : group.source)
+                Text(group.isSystem ? "the OS itself, shown as apps" : Display.name(group.source))
                     .font(.system(size: size * 0.72))
                     .foregroundStyle(Theme.secondaryText)
             }

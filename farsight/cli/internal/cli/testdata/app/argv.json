@@ -1,0 +1,1 @@
+{"instances":["--config","<config>","-o","json","instances"],"version":["--config","<config>","-o","json","version"],"world":["--config","<config>","-o","json","world","--","<instance>"]}

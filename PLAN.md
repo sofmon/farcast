@@ -429,20 +429,25 @@ AI as an internal capability for FarCast itself.
 
 *Goal: the app world map — FarCast becomes visual. Native clients, Apple first; application UIs in tiles, the operator's own surfaces native.*
 
-**Status: ⏳ Accepted, not started (2026-11-11).**
+**Status: 🟡 Step 1 begun (2026-11-11); the read-only Connected view on macOS built (2026-11-12), awaiting its no-cost rehearsal and first live read ([runbook](docs/runbooks/phase-7-connected-view.md)).**
 - [ADR 0021](docs/adr/0021-farsight-native-client.md) retired Electron. The clients are native per platform family, and the first is one Swift/SwiftUI codebase for macOS, iPadOS, iOS and visionOS.
 - [ADR 0020](docs/adr/0020-instance-pki-ecdsa-p256.md) moves the instance PKI to ECDSA P-256 first, because Apple's TLS cannot use Ed25519.
 - This phase is sequenced **ahead of Phase 6**. Nothing here needs AllThing except the chat tile, which arrives with Phase 6.
 
 The order (ADR 0021 decision 9):
-1. **A SwiftUI prototype against fixtures** from `farcast … -o json`: the app world map, dashboard and wizard, with no backend change. *Begun 2026-11-11 (`farsight/client/apple/`): the map and its Liquid Glass HUD, against an illustrative fixture until the CLI reports apps by repository and graded connections.*
+1. **A SwiftUI prototype against fixtures** from `farcast … -o json`: the app world map, dashboard and wizard, with no backend change. *Begun 2026-11-11 (`farsight/client/apple/`): the map and its Liquid Glass HUD, against an illustrative fixture until the CLI reports apps by namespace, with the repository `run` recorded, and graded connections.*
+   - **A read-only Connected view on macOS** comes next, before 7.1 (ADR 0021 decision 9, amended 2026-11-12). *Built 2026-11-12; awaiting its no-cost rehearsal and first live read ([runbook](docs/runbooks/phase-7-connected-view.md)).*
+     - At launch the app runs the operator's installed `farcast version` and `farcast instances`, which read only files on the Mac. When the operator presses Refresh, it runs `farcast world <instance>` and draws what comes back.
+     - `instances` and `world` are new read-only CLI commands, walked from a terminal first (principle 3). They are the one CLI change ahead of step 3.
+     - It shows no tiles, does no background reads, adds no standing cost, and nothing in it changes an instance.
+     - Its conditions are in the amendment: a pinned gcloud account, an explicit environment, no CA key or keyring opened, golden vectors, and a no-cost rehearsal before the first read of a live instance.
 2. **ADR 0020 implemented,** and the Phase 5 Session A runbook walked again.
 3. **The CLI gains a consent protocol and an explicit environment, walked from a terminal.**
    - The consent protocol is `--plan` and `--confirm <digest>` plus progress events, so a GUI never passes a bare `--yes`.
-   - The explicit environment is the checkout and tool paths the CLI is given.
+   - The explicit environment is the checkout, the tool paths and the pinned gcloud account the CLI is given.
 4. **7.1.**
-5. **The tile-ingress ADR,** then 7.3.
-6. **The device-leaf and read-route ADR,** then 7.2. Each new surface is first walked from a CLI consumer (principle 3).
+5. **The tile-ingress ADR, with the device-leaf ADR or after it** (amended 2026-11-12, because the tile bridge presents the tile-only leaf that ADR defines), then 7.3. Device-leaf enrolment is first walked from a CLI consumer (principle 3).
+6. **The read-route ADR,** then 7.2. Each new surface is first walked from a CLI consumer (principle 3).
 7. **The iPadOS, iOS and visionOS thin clients,** then 7.5.
 
 ### 7.1 FarSight client — Apple shell
@@ -451,7 +456,7 @@ The macOS app first, from the one Swift/SwiftUI codebase that also targets iPadO
 - SwiftUI and system frameworks only, under the Swift guardrails in `./check.sh` (ADR 0021 decisions 2–4)
 - Bundles the Go `farcast` binary and drives it through the consent protocol, with the operator's checkout and tool paths given explicitly
 - The tile bridge: one data store per application behind an in-app loopback CONNECT bridge, each tile bound to its own application, tested against local servers
-- Two modes: Install wizard and Connected view
+- Two modes: Install wizard and Connected view. The Connected view's read-only half arrives earlier, after step 1. 7.1 adds what changes an instance and the bundled CLI.
 
 ### 7.2 FarSight server — tile registry and sessions
 Server-side component inside the instance. The operator's dashboard is native in each client, not composed here.
@@ -464,7 +469,7 @@ Server-side component inside the instance. The operator's dashboard is native in
 ### 7.3 FarSight client — the app world map
 The core UX.
 
-- The map: every app a panel in its place, repos as movable groups, instances as walled territories, connections drawn and graded by evidence; a camera that flies rather than switches, a minimap, an app strip and a jump palette. A tile can detach into its own window where the platform has several (ADR 0021 decision 2, amended)
+- The map: every app a panel in its place, namespaces as movable groups labelled with their repositories, instances as walled territories, connections drawn and graded by evidence; a camera that flies rather than switches, a minimap, an app strip and a jump palette. A tile can detach into its own window where the platform has several (ADR 0021 decision 2, amended)
 - Each tile renders an application's web interface and reaches only its own application, through FatLine (the tile-ingress ADR)
 - Tab management
 - No "all traffic proxied through FatLine" claim for a platform until its packet-capture gate passes

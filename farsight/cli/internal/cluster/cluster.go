@@ -16,7 +16,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -27,27 +30,171 @@ type Runner interface {
 	Run(ctx context.Context, stdin []byte, args ...string) (stdout []byte, err error)
 }
 
-// execRunner runs the real kubectl binary found on PATH, against a kubeconfig.
-type execRunner struct{ kubeconfig string }
+// ErrKubectlMissing marks a kubectl that could not be found. Every error a
+// missing kubectl produces wraps it, so a caller tells it from a kubectl that
+// ran and failed with errors.Is, never by its words.
+var ErrKubectlMissing = errors.New("kubectl not found")
+
+// ErrAuthToolMissing marks a kubectl that ran but could not authenticate
+// because the tool its kubeconfig names — the gke-gcloud-auth-plugin, or the
+// gcloud it runs — is not installed where it looks.
+var ErrAuthToolMissing = errors.New("the cluster's auth plugin or gcloud is missing")
+
+// ErrSignedOut marks a kubectl that ran but whose credential plugin could not
+// get a token because gcloud's user session has expired. Signing in again is
+// the operator's act; nothing here can do it for them.
+var ErrSignedOut = errors.New("gcloud is signed out")
+
+// subprocessError is a kubectl failure as it always read, marked with what it
+// means. The text is the same text it carried before it was marked: the mark
+// is for a caller deciding what to do, not for the operator reading it.
+type subprocessError struct {
+	msg  string
+	mark error
+	err  error
+}
+
+func (e *subprocessError) Error() string { return e.msg }
+
+func (e *subprocessError) Unwrap() []error {
+	out := make([]error, 0, 2)
+	if e.mark != nil {
+		out = append(out, e.mark)
+	}
+	if e.err != nil {
+		out = append(out, e.err)
+	}
+	return out
+}
+
+// markOf reads what kubectl's stderr says about authentication. The phrases
+// are the ones the auth plugin and gcloud print; a kubectl failure that says
+// none of them is an ordinary failure, and unmarked.
+//
+// Signed out covers a session that expired, an account that sits in a
+// configuration but was never logged in on this machine or had its grant
+// revoked, and a configuration with no account at all: every one of them is
+// fixed by the operator signing in, and gcloud ends each with the command
+// that does it.
+func markOf(stderr string) error {
+	switch {
+	// A missing tool first: it is the more exact diagnosis, and gcloud's own
+	// advice in the same text may name a sign-in that would not help.
+	case strings.Contains(stderr, "executable gke-gcloud-auth-plugin not found"),
+		strings.Contains(stderr, "gke-gcloud-auth-plugin: executable file not found"),
+		strings.Contains(stderr, `"gke-gcloud-auth-plugin": executable file not found`),
+		strings.Contains(stderr, `"gcloud": executable file not found`),
+		strings.Contains(stderr, "gcloud: executable file not found"):
+		return ErrAuthToolMissing
+	case strings.Contains(stderr, "Reauthentication failed"),
+		strings.Contains(stderr, "problem refreshing your current auth tokens"),
+		strings.Contains(stderr, "does not have any valid credentials"),
+		strings.Contains(stderr, "You do not currently have an active account selected"),
+		strings.Contains(stderr, "gcloud auth login"):
+		return ErrSignedOut
+	}
+	return nil
+}
+
+// execRunner runs the real kubectl binary, against a kubeconfig.
+//
+// With env nil it runs the kubectl found on this process's PATH and inherits
+// this process's whole environment, which is what every command but 'world'
+// still does. With env set (NewWithEnv) the subprocess gets exactly env and
+// nothing else, and kubectl is looked up on env's own PATH: the binary that
+// runs is the one the environment it runs in would find.
+type execRunner struct {
+	kubeconfig string
+	env        []string
+	// missing is what a missing kubectl means to the command that wanted it.
+	missing string
+}
+
+func (r execRunner) command(ctx context.Context, args []string) (*exec.Cmd, error) {
+	full := append([]string{"--kubeconfig", r.kubeconfig}, args...)
+	if r.env == nil {
+		return exec.CommandContext(ctx, "kubectl", full...), nil
+	}
+	path, ok := lookPathIn("kubectl", envValue(r.env, "PATH"))
+	if !ok {
+		return nil, &subprocessError{msg: r.missingText(), mark: ErrKubectlMissing}
+	}
+	cmd := exec.CommandContext(ctx, path, full...)
+	cmd.Env = append([]string{}, r.env...)
+	return cmd, nil
+}
+
+func (r execRunner) missingText() string {
+	if r.missing != "" {
+		return r.missing
+	}
+	return "kubectl not found on PATH — deploying into an instance needs kubectl and the gke-gcloud-auth-plugin"
+}
+
+// failure turns a kubectl that did not succeed into an error.
+//
+// A context that ended is wrapped as itself, so a caller can tell a timeout
+// from a refusal: kubectl killed by its deadline says only "signal: killed",
+// which reads like a crash.
+func (r execRunner) failure(ctx context.Context, args []string, stderr string, err error) error {
+	if errors.Is(err, exec.ErrNotFound) {
+		return &subprocessError{msg: r.missingText(), mark: ErrKubectlMissing, err: err}
+	}
+	if cerr := ctx.Err(); cerr != nil {
+		return fmt.Errorf("kubectl %s: %w", strings.Join(args, " "), cerr)
+	}
+	if msg := strings.TrimSpace(stderr); msg != "" {
+		return &subprocessError{msg: fmt.Sprintf("kubectl %s: %s", strings.Join(args, " "), msg), mark: markOf(msg)}
+	}
+	return fmt.Errorf("kubectl %s: %w", strings.Join(args, " "), err)
+}
 
 func (r execRunner) Run(ctx context.Context, stdin []byte, args ...string) ([]byte, error) {
-	full := append([]string{"--kubeconfig", r.kubeconfig}, args...)
-	cmd := exec.CommandContext(ctx, "kubectl", full...)
+	cmd, err := r.command(ctx, args)
+	if err != nil {
+		return nil, err
+	}
 	if stdin != nil {
 		cmd.Stdin = bytes.NewReader(stdin)
 	}
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	if err := cmd.Run(); err != nil {
-		if errors.Is(err, exec.ErrNotFound) {
-			return nil, errors.New("kubectl not found on PATH — deploying into an instance needs kubectl and the gke-gcloud-auth-plugin")
-		}
-		if msg := strings.TrimSpace(errb.String()); msg != "" {
-			return nil, fmt.Errorf("kubectl %s: %s", strings.Join(args, " "), msg)
-		}
-		return nil, fmt.Errorf("kubectl %s: %w", strings.Join(args, " "), err)
+		return nil, r.failure(ctx, args, errb.String(), err)
 	}
 	return out.Bytes(), nil
+}
+
+// envValue is the last value env gives key, the one a process reading its
+// environment sees.
+func envValue(env []string, key string) string {
+	v := ""
+	for _, kv := range env {
+		if k, val, ok := strings.Cut(kv, "="); ok && k == key {
+			v = val
+		}
+	}
+	return v
+}
+
+// lookPathIn finds an executable named name on a PATH value, as a shell
+// would: the first directory that holds an executable regular file by that
+// name. An empty entry is not the current directory here — a binary planted
+// in whatever directory the CLI happens to run from must never be the kubectl
+// that holds the operator's cluster credential.
+func lookPathIn(name, pathValue string) (string, bool) {
+	for _, dir := range filepath.SplitList(pathValue) {
+		if dir == "" || !filepath.IsAbs(dir) {
+			continue
+		}
+		p := filepath.Join(dir, name)
+		info, err := os.Stat(p)
+		if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+			continue
+		}
+		return p, true
+	}
+	return "", false
 }
 
 // Client applies workloads to a cluster over a kubeconfig.
@@ -59,6 +206,24 @@ type Client struct {
 // path (the per-instance kubeconfig.yaml the CLI stored at install time).
 func New(kubeconfigPath string) *Client {
 	return &Client{runner: execRunner{kubeconfig: kubeconfigPath}}
+}
+
+// NewWithEnv is New with kubectl's whole environment given rather than
+// inherited: the subprocess sees env and nothing else, and kubectl is found on
+// env's PATH. env must not be nil; an empty one is an environment with
+// nothing in it, which finds no kubectl.
+//
+// It exists for 'farcast world', which pins the identity kubectl's auth plugin
+// acts as (ADR 0021 decision 9, amended 2026-11-12): what reaches the plugin
+// is decided by the caller, not by whatever the operator's shell exported.
+func NewWithEnv(kubeconfigPath string, env []string) *Client {
+	if env == nil {
+		env = []string{}
+	}
+	return &Client{runner: execRunner{
+		kubeconfig: kubeconfigPath, env: env,
+		missing: "kubectl not found on the PATH this read runs with — reading an instance needs kubectl, the gke-gcloud-auth-plugin and gcloud",
+	}}
 }
 
 // NewWithRunner returns a Client backed by a custom Runner (for tests).
@@ -204,23 +369,23 @@ type Streamer interface {
 }
 
 func (r execRunner) Stream(ctx context.Context, out io.Writer, args ...string) error {
-	full := append([]string{"--kubeconfig", r.kubeconfig}, args...)
-	cmd := exec.CommandContext(ctx, "kubectl", full...)
+	r.missing = "kubectl not found on PATH — reading an instance's logs needs kubectl and the gke-gcloud-auth-plugin"
+	cmd, err := r.command(ctx, args)
+	if err != nil {
+		return err
+	}
 	var errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = out, &errb
 	if err := cmd.Run(); err != nil {
 		if errors.Is(err, exec.ErrNotFound) {
-			return errors.New("kubectl not found on PATH — reading an instance's logs needs kubectl and the gke-gcloud-auth-plugin")
+			return &subprocessError{msg: r.missingText(), mark: ErrKubectlMissing, err: err}
 		}
 		// A follow the operator interrupted is not a failure, and reporting it
 		// as one would end every 'farcast logs --follow' with an error.
 		if ctx.Err() != nil {
 			return nil
 		}
-		if msg := strings.TrimSpace(errb.String()); msg != "" {
-			return fmt.Errorf("kubectl %s: %s", strings.Join(args, " "), msg)
-		}
-		return fmt.Errorf("kubectl %s: %w", strings.Join(args, " "), err)
+		return r.failure(ctx, args, errb.String(), err)
 	}
 	return nil
 }
@@ -408,6 +573,39 @@ func (c *Client) Namespaces(ctx context.Context) ([]string, error) {
 		}
 		names = append(names, strings.TrimPrefix(line, "namespace/"))
 	}
+	return names, nil
+}
+
+// NamespacesLabelled lists the namespaces that carry a label selector, by name,
+// sorted.
+//
+// JSON, for the reason Workloads reads JSON: a namespace listing parsed by
+// position is one column move away from silently wrong data.
+func (c *Client) NamespacesLabelled(ctx context.Context, selector string) ([]string, error) {
+	out, err := c.runner.Run(ctx, nil, "get", "namespace", "-l", selector, "-o", "json")
+	if err != nil {
+		return nil, err
+	}
+	if len(bytes.TrimSpace(out)) == 0 {
+		return []string{}, nil
+	}
+	var list struct {
+		Items []struct {
+			Metadata struct {
+				Name string `json:"name"`
+			} `json:"metadata"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(out, &list); err != nil {
+		return nil, fmt.Errorf("cluster: read the namespaces labelled %s: %w", selector, err)
+	}
+	names := make([]string, 0, len(list.Items))
+	for _, it := range list.Items {
+		if it.Metadata.Name != "" {
+			names = append(names, it.Metadata.Name)
+		}
+	}
+	sort.Strings(names)
 	return names, nil
 }
 

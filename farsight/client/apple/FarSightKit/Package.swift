@@ -28,9 +28,10 @@ let package = Package(
         .library(name: "FarSightFixtures", targets: ["FarSightFixtures"]),
     ],
     targets: [
-        // Values only: the world the map draws, where everything sits on it,
-        // and the camera that looks at it. Nothing here touches the network,
-        // a key, or a view.
+        // Values, and the Connected view's contract: the world the map draws, where
+        // everything sits on it, the camera, and the logic that turns the operator's
+        // `farcast` output into a world. It runs no process itself (the macOS app
+        // hands it one), and touches no network, key or view.
         .target(
             name: "FarSightCore",
             swiftSettings: guardrails
@@ -53,6 +54,7 @@ let package = Package(
         .testTarget(
             name: "FarSightCoreTests",
             dependencies: ["FarSightCore", "FarSightFixtures"],
+            resources: [.copy("Vectors")],
             swiftSettings: guardrails
         ),
         .testTarget(

@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
@@ -86,6 +87,17 @@ func readManifest(ctx context.Context, env *Env, cl jobWaiter, cfg pfetch.Config
 	return fetched{Manifest: raw, Report: report, Job: job}, nil
 }
 
+// withoutUserinfo is a repository URL without a user name or credential in it,
+// or s unchanged when it has none or is not a URL.
+func withoutUserinfo(s string) string {
+	u, err := url.Parse(s)
+	if err != nil || u.User == nil {
+		return s
+	}
+	u.User = nil
+	return u.String()
+}
+
 // repoURL normalises what an operator types.
 //
 // `farcast run github.com/user/repo` is the shape PLAN 4.3 promises, and it is
@@ -98,6 +110,14 @@ func repoURL(s string) (string, error) {
 	case s == "":
 		return "", usagef("run takes a repository, e.g. 'farcast run <instance> github.com/user/repo'")
 	case strings.HasPrefix(s, "https://"):
+		// A credential in the URL would be written into the fetch Job, which
+		// the provider stores, and into this machine's record, which every
+		// 'farcast world' prints. The message names the URL without it.
+		if u, err := url.Parse(s); err == nil && u.User != nil {
+			return "", usagef("refusing %q with a user name or credential in it; it would be written into the instance's fetch Job "+
+				"and this machine's record. Name the repository without it, and pass a read-only credential with --git-secret",
+				withoutUserinfo(s))
+		}
 		return s, nil
 	case strings.HasPrefix(s, "http://"):
 		return "", usagef("refusing http:// for %q; the source of what an instance is about to run is not carried in clear", s)

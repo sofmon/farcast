@@ -1,6 +1,6 @@
 # ADR 0021 — FarSight's Client: Native Shells, Apple First
 
-**Status:** Accepted (2026-11-11). Decision 2 amended the same day: the app world map replaces tiling as the base layout. Decision 9's first step has begun — `farsight/client/apple/` holds FarSightKit and the FarCast app target, drawing the map against an illustrative fixture. Nothing else below is built. This ADR depends on [ADR 0020](0020-instance-pki-ecdsa-p256.md): without it, no Apple client can reach FatLine on stock APIs. The tile-path evidence below comes from a probe on macOS 27 and the iOS 26.0 simulator, with no packet capture and no physical device. visionOS was not probed.
+**Status:** Accepted (2026-11-11). Decision 2 amended the same day: the app world map replaces tiling as the base layout. Decision 9's first step has begun — `farsight/client/apple/` holds FarSightKit and the FarCast app target, drawing the map against an illustrative fixture. Decision 9's Connected view is built on macOS (2026-11-12) and awaits its no-cost rehearsal and first live read; nothing else below is built. Decisions 2 and 9 amended, and decision 6 corrected, 2026-11-12: a group is a namespace labelled with its repository; a read-only Connected view on macOS comes before 7.1; tile ingress and device leaves are decided together; cluster calls also need `gcloud`, and every one runs under a pinned gcloud account. This ADR depends on [ADR 0020](0020-instance-pki-ecdsa-p256.md): without it, no Apple client can reach FatLine on stock APIs. The tile-path evidence below comes from a probe on macOS 27 and the iOS 26.0 simulator, with no packet capture and no physical device. visionOS was not probed.
 
 **Date:** 2026-11-11
 
@@ -129,12 +129,27 @@ The only Phase 7 line that names AllThing is 7.3's *"AllThing chat as a built-in
 
 *Amended 2026-11-11: the app world map.* The operator chose the base layout from the prototype canvas, over tiling:
 - **Nothing is hidden.** Every app, FarCast's own components included, is a panel on one freeform two-dimensional map. The operator never switches apps; the camera flies to where an app is, and a stopped app keeps its place.
-- **Repos are places.** One Git repository is one namespace and one group, which the operator moves as a unit. Each instance is its own walled territory, with nothing drawn between instances because nothing runs between them.
+- **Repos are places.** One Git repository is one namespace and one group, which the operator moves as a unit (amended 2026-11-12, below: a group is a namespace, labelled with its repository). Each instance is its own walled territory, with nothing drawn between instances because nothing runs between them.
 - **Connections are drawn and graded by evidence:** counted by FatLine, declared only, refused at the wall, or decided but not built. Lines that cross a wall pass through its gate, so no line suggests a path FatLine does not see.
 - **A few panels are live.** Only panels drawn large enough to use are live, a handful at a time; the rest show a last frame, marked as such.
 - **FarCast's own components are panels like any app.** Their surfaces are decision 6's native operator surfaces, not web tiles.
 - **The HUD is Liquid Glass, the map is not.** Instances, alerts, the connection legend, the minimap, the app strip and the jump palette float over the map in glass; the map is content. visionOS has no `glassEffect`, so the HUD falls back to `glassBackgroundEffect` there.
 - **App-to-app traffic goes through FatLine** (operator decision, 2026-11-11, to be recorded in its own ADR). Until it is built, the map draws such lines only on an illustrative group, labelled "decided, not built".
+
+*Amended 2026-11-12: a group is a namespace, labelled with its repository.* "One Git repository is one namespace and one group" is not what `run` does.
+- **Why the old sentence fails.**
+  - A namespace is the manifest's name, or `--namespace` ([`run.go:202-205`](../../farsight/cli/internal/cli/run.go)). A repository with several manifests is therefore several namespaces.
+  - Two repositories whose manifests share a name land in one namespace. The second run then replaces the first one's egress entries ([`runpolicy.go:35-43`](../../farsight/cli/internal/cli/runpolicy.go)). An application of the same name also reuses the first one's storage scope, and so reads that application's data ([`run.go:449-456`](../../farsight/cli/internal/cli/run.go)).
+- **One group per namespace.** The map draws a group for each namespace and labels it with the repository `run` recorded for it.
+  - This departs from "repos are places": a repository with several manifests becomes several groups, which the map does not yet move as one unit.
+  - Whether groups that share a repository move together is the operator's call.
+- **The record stays on the operator's machine.** `run` records the repository, ref, commit and manifest digest on the operator's machine, never in the cluster.
+  - The provider already keeps the repository and commit for 400 days, through the fetch and build Job bodies (ADR 0019). A Namespace annotation would add a standing copy, plus another full-body entry in that log.
+- **`run` refuses a namespace recorded under another repository.** It refuses unless the operator explicitly says to replace it, and it names both repositories.
+- **What this does not catch.** The record belongs to the machine that made it.
+  - A deploy from another machine is not caught, and this Mac's map may then label the group with a repository that no longer runs there.
+  - A namespace with no record here is accepted by the first `run` from any repository. That covers every namespace deployed before this change, and any whose record was lost with the config directory. Such a group is drawn with its namespace and "repository not recorded on this Mac".
+  - The iPhone, iPad and Vision Pro clients never hold the record, so they label groups by namespace only.
 
 **3. System frameworks only.**
 - *Allowed:* SwiftUI, WebKit, Network, Security, CryptoKit, BackgroundTasks, UserNotifications, and WidgetKit or App Intents where used. ADR 0020's enrolment request is a template built with these.
@@ -201,8 +216,8 @@ The dashboard, the install wizard, connect and release, keeper custody, and seal
   - *Progress:* long-running commands emit progress as newline-delimited JSON events on a separate stream.
   - *Vectors:* plan, progress and error shapes get golden vectors (Verification).
 - **The CLI's environment is explicit.**
-  - *What the flows need:* image builds need a farcast checkout and the Go toolchain (Context, item 4), and cluster calls need `kubectl` and `gke-gcloud-auth-plugin`. A Finder- or Dock-launched app inherits launchd's minimal PATH.
-  - *How the shell provides it:* it records the operator's checkout and each tool's absolute path once, confirmed in Settings, and passes `--source` and an explicit PATH to every invocation. Any PATH it guessed would be a binary-planting surface in a credential-holding process.
+  - *What the flows need:* image builds need a farcast checkout and the Go toolchain (Context, item 4), and cluster calls need `kubectl` and `gke-gcloud-auth-plugin`, which authenticates through `gcloud`'s user session as whichever gcloud configuration is active (corrected 2026-11-12). A Finder- or Dock-launched app inherits launchd's minimal PATH.
+  - *How the shell provides it:* it records the operator's checkout and each tool's absolute path once, confirmed in Settings, and passes `--source` and an explicit PATH to every invocation. Any PATH it guessed would be a binary-planting surface in a credential-holding process. *(Amended 2026-11-12:* every invocation, writes included, runs `kubectl` as the instance's pinned gcloud account, under the identity rules of the Connected-view amendment in decision 9. A work identity does more harm in a write than in a read.)
   - *What remains untrue:* "one app, one download" (AGENTS.md:33) is not yet true on macOS. Shipping prebuilt, signed system images instead would amend ADR 0007 and needs its own ADR.
 - **One CLI, one state.**
   - *Sandbox and distribution:* the app is not App Sandboxed. It is distributed with Developer ID, outside the Mac App Store.
@@ -211,7 +226,7 @@ The dashboard, the install wizard, connect and release, keeper custody, and seal
     - System images are tagged with the deploying CLI's version ([`fatline.go:155`](../../farsight/cli/internal/cli/fatline.go)), so a bundled CLI and a terminal CLI would redeploy each other's components.
     - A system-component deploy therefore records the deploying CLI version in instance metadata.
     - The CLI refuses to redeploy over a different version without an explicit flag, and names both versions.
-- **Background surfaces wait for the read route.** The menu bar, widgets and notifications read only the read route through FatLine, and do not exist until it does. They never poll through the bundled CLI. CLI-backed reads happen on operator action only, because each one is a provider-loggable API-server request (Context, item 1).
+- **Background surfaces wait for the read route.** The menu bar, widgets and notifications read only the read route through FatLine, and do not exist until it does. They never poll through the bundled CLI. CLI-backed reads happen on operator action only, because each one is a provider-loggable API-server request (Context, item 1). (`farcast instances`, which reads only files on the Mac, also runs at launch: decision 9, amended 2026-11-12.)
 
 **iPhone, iPad and Vision Pro are thin clients.**
 - They never hold cloud credentials, the CA key or the keyring (ADR 0018's thin device), so the install wizard is macOS-only.
@@ -244,14 +259,80 @@ The dashboard, the install wizard, connect and release, keeper custody, and seal
 - **Either way,** whatever is chosen implements the same contract and passes the same vectors.
 
 **9. FarSight moves ahead of AllThing.** The order:
-1. **The Apple shell prototype, against fixtures.** Fixtures come from `farcast … -o json`. It covers the app world map, the dashboard and the wizard, with no backend change. *Begun 2026-11-11:* the map, its HUD and the core apps' first surfaces run on macOS and the iPad simulator. Their fixture is the prototype canvas's illustrative world, because no CLI command yet reports apps by repository or graded connections; fixtures move to CLI output as commands gain those fields. The wizard is not started.
+1. **The Apple shell prototype, against fixtures.** Fixtures come from `farcast … -o json`. It covers the app world map, the dashboard and the wizard, with no backend change. *Begun 2026-11-11:* the map, its HUD and the core apps' first surfaces run on macOS and the iPad simulator. Their fixture is the prototype canvas's illustrative world, because no CLI command yet reports apps by namespace with the repository `run` recorded, or graded connections; fixtures move to CLI output as commands gain those fields. The wizard is not started. A read-only Connected view on macOS follows it (amended below).
 2. **ADR 0020 implemented,** and Phase 5 Session A walked again.
 3. **The CLI's consent protocol and explicit environment** (decision 6), walked from a terminal.
 4. **7.1, the macOS shell** driving the bundled CLI, with the tile bridge tested against local servers.
-5. **The tile-ingress ADR,** then 7.3: tiles reach real applications, behind the packet-capture gate.
-6. **The device-leaf and read-route ADR,** then 7.2. Each new backend surface, device-leaf enrolment and the read route, first gains a CLI consumer that is walked end to end before a GUI depends on it, per PLAN principle 3. The FarSight server keeps the tile registry, sessions and layout state.
+5. **The tile-ingress ADR, with the device-leaf ADR or after it** (amended below), then 7.3: tiles reach real applications, behind the packet-capture gate. Device-leaf enrolment first gains a CLI consumer that is walked end to end before a GUI depends on it, per PLAN principle 3.
+6. **The read-route ADR** (amended below), then 7.2. The read route first gains a CLI consumer that is walked end to end before a GUI depends on it, per PLAN principle 3. The FarSight server keeps the tile registry, sessions and layout state.
 7. **The iPadOS, iOS and visionOS thin clients,** then the 7.5 keeper.
 8. **Phase 6, AllThing.** Its chat endpoint lands on the 7.2 server, and its chat is an ordinary web tile.
+
+*Amended 2026-11-12: a read-only Connected view on macOS comes before 7.1.* The operator brought it forward, after a review of what the map needs against what an instance holds.
+- **What it is.** When the operator presses Refresh, the macOS app runs the operator's own `farcast` and draws what comes back. Anything that changes an instance still waits for step 3 and 7.1. On iPhone, iPad and Vision Pro the app keeps the fixture until those devices have a device leaf and the read route (decision 6).
+- **Two new read-only commands.** `farcast instances` and `farcast world <instance>` were added on 2026-11-12, with their golden vectors, before the app used them. They are the one CLI change ahead of step 3.
+- **Reads only. Nothing the provider can see happens except on the operator's action.**
+  - The app runs exactly three commands: `farcast version`, `farcast instances` and `farcast world <instance>`.
+  - Their flags are fixed in code. The one argument, an instance name, must be a name `instances` returned, and a test proves nothing else can be run.
+  - `version` and `instances` read only files on the Mac and run at launch. `world` runs only when the operator asks.
+  - Nothing runs on a timer. The menu bar, widgets and notifications still wait for the read route (decision 6).
+- **The installed CLI, until 7.1.** This is a temporary departure from decision 6's bundled `farcast`, and it ends with 7.1.
+  - Until the app bundles `farcast`, it runs the copy at an absolute path the operator confirms in Settings.
+  - It refuses to read when `farcast version` names a different commit from the app's own build.
+  - The app's own commit is written into its Info.plist at build time (`FARCAST_COMMIT`). A build without it, such as one from Xcode's Run button, reads nothing.
+  - *What it gives up.* The bundled binary is covered by the app's signature. The installed one is whatever sits at that path, and a binary reports its own commit, so the check catches version skew, not a replaced binary. The installed copy is trusted exactly as a terminal `farcast` is: that adds no exposure the terminal does not already have, and removes none.
+- **An explicit environment.**
+  - The app records the absolute paths of `farcast`, `kubectl`, `gke-gcloud-auth-plugin` and `gcloud`, and the farcast and gcloud configuration directories, confirmed once in Settings.
+  - The child process gets an environment built from an allowlist:
+    - `HOME`, `TMPDIR` and the locale (`LANG`, `LC_*`) from the app;
+    - `PATH`, made of the recorded tools' directories followed by the system's own read-only directories (`/usr/bin:/bin:/usr/sbin:/sbin`, on the sealed system volume). The CLI runs `kubectl` by bare name; the instance kubeconfig names the plugin by bare name; the plugin runs `gcloud` by bare name; and `gcloud` is a shell script that needs the system's utilities and finds its Python on `PATH`;
+    - `CLOUDSDK_CONFIG`, set to the confirmed gcloud directory: the directory the CLI's identity guard reads and hands to `kubectl`.
+
+    `--config` names the config directory, and stdin is closed.
+  - It inherits nothing else from the app: not its `PATH`, and none of its `CLOUDSDK_*` variables, `KUBECONFIG`, `FARCAST_CONFIG_HOME`, proxy settings or `GOOGLE_APPLICATION_CREDENTIALS`.
+- **The cloud identity is pinned.**
+  - *How the plugin chooses an identity.* The auth plugin authenticates as whichever gcloud configuration is active (*Sentences corrected*, below). Before it asks gcloud, it returns `CLOUDSDK_AUTH_ACCESS_TOKEN` if that is set, or an unexpired token from its cache. That cache is keyed by the current context of the kubeconfig in `KUBECONFIG` (or `~/.kube/config`), not by account. It is not keyed by the `--kubeconfig` that kubectl was given either.
+  - *What the instance records.* Each instance records the gcloud account it is read as.
+    - The operator pins it once from a terminal, with `farcast instances pin-gcloud`, which refuses an account that no gcloud configuration pairs with the instance's project. The app shows only whether an account is pinned. The account itself stays in the instance's record and the terminal, so it never reaches the app's output or a captured listing.
+    - It is never taken from whatever happens to be active.
+  - *How every read runs.*
+    - The CLI chooses a gcloud configuration whose account is the recorded one and whose project is the instance's. It never consults the active configuration. It reads gcloud's configuration files to choose, without running gcloud (ADR 0007).
+    - `kubectl` runs with `KUBECONFIG` naming the instance's own kubeconfig, so the plugin's cache is keyed by the instance's own context.
+    - It runs with `CLOUDSDK_ACTIVE_CONFIG_NAME` naming the chosen configuration, and with `CLOUDSDK_CONFIG` naming the directory the CLI read.
+  - *Variables that never reach it:* `CLOUDSDK_AUTH_ACCESS_TOKEN`, `CLOUDSDK_CORE_ACCOUNT`, every other `CLOUDSDK_*` variable except the two the CLI sets, and `GOOGLE_APPLICATION_CREDENTIALS`.
+  - *Refusal.* A read is refused before `kubectl` runs in three cases: the instance has no recorded account, no configuration matches, or the project is unrecorded. A Refresh never reads as a work identity that happens to be active.
+  - *What remains.* A token the plugin cached within the hour for this instance's own context is reused, whichever account minted it. That needs `kubectl` to have run against this instance's kubeconfig under another account.
+- **Reads never open the CA key or the storage keyring.** `instances` and `world` open neither. A test runs them against a config directory where both are unreadable.
+  - Today `storage state` and the tunnel reads open the CA key, and `storage state` also opens the keyring. Those commands keep their behaviour.
+  - `world` therefore cannot use today's tunnel opener (`usagenet.go:36-45`), which loads every mTLS file, `ca.key` included, through `LoadInstanceMTLS` (`config/instance.go:862-880`).
+  - It gets an opener that reads only the CA certificate and the operator's client certificate and key, which is all `clientIdentity` uses (`connect.go:514-526`).
+- **The contract has vectors.**
+  - Every JSON shape the app decodes has a golden vector, errors included (decision 7, Verification 4). `go test` checks the vector against the CLI, and FarSightKit's tests decode it.
+  - Errors carry a stable kind, so the map can tell "no tunnel", "no kernel", "version skew" and "signed out of gcloud" apart without parsing prose.
+- **Walked before it is relied on.**
+  - `farcast world` is walked end to end from a terminal before the app depends on it (PLAN principle 3).
+  - The app's first read of a live instance follows a rehearsal that costs nothing, against a local FatLine and Shrike and a fake `kubectl`.
+- **No standing cost.** A Refresh adds no standing cost and never runs `connect`. Its tunnel reads ride the carrier the instance already pays for. Without one, the counted lines are drawn as "no tunnel".
+- **Honest drawing.**
+  - A live map never shows the fixture's illustrative groups, apps or planned lines.
+  - Spending is drawn as the kernel reports it, and is never recomputed in the app.
+    - The accrued figure that enforcement compares against the kernel's own limit, at the kernel's level, is shown split. `confirmed` covers each closed window, with its date, or says "no confirmation yet". `expected` covers the open window.
+    - The two are never shown as one undifferentiated total (ADR 0009 decision 4).
+    - Beside them is what the meter does not see.
+  - A counted line is labelled as a floor (ADR 0015), counted by one FatLine replica since it started, and the map names that replica (ADR 0022 decision 9).
+  - Each instance shows when it was read. A section that could not be read says so instead of disappearing.
+- **What a Refresh tells the provider and the network.**
+  - Before `kubectl` runs, gcloud may refresh the account's access token at Google's OAuth endpoint. That tells Google the account, the time and the source address. gcloud may also run its own daily update check.
+  - The `kubectl` reads go to the provider's API server, which terminates TLS. Data Access audit is off by default, but any parent folder or organisation can force it on. Where it is on, it records each get and list: caller, object, namespace, source address, user agent and time (ADR 0019). The objects read are in the provider's etcd already.
+  - The Mac's resolver sees the control plane's `*.gke.goog` name (ADR 0004).
+  - The tunnel reads show the provider the source address, the timing, the sizes and the SNI that names the instance, and nothing of their content.
+  - That is why a read happens only when the operator asks for one.
+
+*Amended 2026-11-12: tile ingress and device leaves are decided together.*
+- **The conflict.** Decision 5's bridge presents "a leaf that FatLine admits to tile routes only, which the device-leaf ADR defines", and takes its authorities from the tile registry that 7.2 keeps. Step 5 put tiles before both.
+- **Leaves move to step 5.** The device-leaf half of step 6 moves into step 5. It is written with the tile-ingress ADR, or before it, ahead of 7.3.
+- **The registry, until 7.2.** The tile-ingress ADR decides where the macOS shell's tile registry comes from until 7.2's server exists. One candidate is the instance's `world` read, which takes nothing from page input.
+- **What stays in step 6.** The read route and 7.2.
 
 ## What Apple still sees
 
@@ -308,7 +389,7 @@ Stated because *"blind to content"* is FarCast's standard, and installing a clie
 **Negative**
 - **Separate codebases.** Each platform family is its own codebase, so Android and Windows are new code when they come. The cost is verification more than typing, which is what the conformance vectors are for.
 - **The CLI must change before the macOS shell can drive it:** the consent protocol, the explicit environment and the version record (decision 6). Until then the shell drives only read commands and fixtures.
-- **"One app, one download" is not yet true on macOS.** The operator still installs `kubectl`, `gke-gcloud-auth-plugin` and Go, and keeps a checkout.
+- **"One app, one download" is not yet true on macOS.** The operator still installs `kubectl`, `gke-gcloud-auth-plugin`, `gcloud` and Go, and keeps a checkout.
 - **The gate needs a Mac.** Since the first Swift code landed (2026-11-11), `./check.sh` requires a Mac with Xcode.
 - **A Chromium-only web app can misbehave in a tile.** Tiles inherit Safari's web platform, not Chromium's.
 - **The dev Mac is missing runtimes.** It has no visionOS simulator runtime and no iOS 27 runtime (installed: iOS 17.5, 18.1 and 26.0). visionOS work needs the runtime installed first, which is the operator's download to make.
@@ -352,6 +433,18 @@ Stated because *"blind to content"* is FarCast's standard, and installing a clie
   - the Phase 6 and Phase 7 order, per decision 9.
 - `farsight/client/package.json` and `tsconfig.json` are removed.
 
+**Sentences corrected by the 2026-11-12 amendments.**
+- **gcloud.** Decision 6's list of what cluster calls need, the "one download" consequence, `AGENTS.md:33` and `README.md:301` gain `gcloud`.
+  - The auth plugin runs through gcloud's user session ([`phase-4-1-validation.md`](../runbooks/phase-4-1-validation.md), *The walk stalled on an expired gcloud user credential*; ADR 0006 already named gcloud beside it). So gcloud is a third tool, and the account it acts as is part of the environment.
+  - Decision 6's environment now records that account for every invocation.
+- **Repositories as groups.** Decision 2's "Repos are places" and the sentences that group the map by repository: `README.md:305`, PLAN 7.3, `farsight/client/apple/README.md:3`, and step 1 here and in PLAN. A group is a namespace labelled with its repository. `AppGroup`'s doc comment (`World.swift:65`) changes with the Connected view's code.
+- **PLAN Phase 7:**
+  - the status line said "not started" while step 1 had begun;
+  - the order gains the Connected view and the moved device-leaf ADR;
+  - the Connected view's read-only half comes before 7.1;
+  - step 3's environment gains the pinned gcloud account.
+- **The "no network" sentences** change when the Connected view's code lands, not before. These are the sentences that say the client reaches no network (`farsight/client/apple/README.md:5`), or that the map draws fixtures until the read route exists (`World.swift:7-8`, `FarCastApp.swift:6-7`) (changed 2026-11-12, with the Connected view's code).
+
 **Sentences the decision 2 amendment corrected (2026-11-11).** "Tiling browser" and "tiling window manager" become the app world map in `README.md:196,297,305`, `PLAN.md:430,438,464-468,490,546`, `docs/hyperion-reference.md:63`, `farsight/README.md:3,7` and `farsight/cli/README.md:5`, and the `check.sh` header describes the Swift steps it now runs.
 
 ## Verification
@@ -370,6 +463,16 @@ Stated because *"blind to content"* is FarCast's standard, and installing a clie
    - Each JSON shape the macOS shell parses has a golden vector: result, plan, progress and error. A CLI change that breaks the GUI then fails `go test`.
    - A plan whose facts change before `--confirm` is refused.
    - A run with no checkout and launchd's PATH fails with the CLI's named error, and never hangs or misreports.
+5. **The Connected view** (decision 9, amended 2026-11-12). Each of these is a test that needs no cloud:
+   - nothing but `version`, `instances` and `world` can be run, and `world` takes only a name `instances` returned;
+   - the child environment drops what the parent set: `PATH`, `FARCAST_CONFIG_HOME`, `KUBECONFIG`, proxy variables, every `CLOUDSDK_*` variable and `GOOGLE_APPLICATION_CREDENTIALS` among it; the one `CLOUDSDK_*` variable the child has, `CLOUDSDK_CONFIG`, is the gcloud directory confirmed in Settings, never the parent's;
+   - the `kubectl` that `world` runs gets `KUBECONFIG` naming the instance's own kubeconfig;
+   - `instances` and `world` succeed with the CA key and the keyring unreadable;
+   - a read under a gcloud account or project other than the instance's record is refused before `kubectl` runs;
+   - with a token planted in the auth plugin's cache under another context, and `CLOUDSDK_AUTH_ACCESS_TOKEN` set in the parent, the bearer token a local fake API server receives is never either of them;
+   - a live map refuses illustrative groups and planned lines.
+
+   Then a rehearsal, from Finder, against a local FatLine and Shrike and a fake `kubectl`, before the first read of a live instance.
 
 ## Revisit triggers
 

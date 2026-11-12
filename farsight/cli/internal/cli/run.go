@@ -46,6 +46,9 @@ type runCommand struct {
 	manifestPath string
 	namespace    string
 	assumeYes    bool
+	// replaceRepository lets a run replace a namespace this machine recorded
+	// under another repository.
+	replaceRepository bool
 
 	// Seams, overridable in tests.
 	newCluster func(kubeconfigPath string) runCluster
@@ -74,7 +77,7 @@ func (*runCommand) Synopsis() string {
 func (*runCommand) Usage() string {
 	return strings.TrimSpace(`
 Usage: farcast run <instance> <repository> [--ref <git-ref>] [--git-secret <name>]
-                   [--namespace <name>] [--manifest <path>]
+                   [--namespace <name>] [--manifest <path>] [--replace-repository]
                    [--fetcher-image <ref@sha256:…>] [--builder-image <ref@sha256:…>] [-y]
 
 Read a repository's ./farcast manifest, show you what it declares, and — once
@@ -99,7 +102,17 @@ is neither counted against the cost limit nor stoppable by it — run
 'farcast kernel deploy <instance>' first.
 
 Both images this runs inside the instance are third-party and must be
-digest-pinned. Pass each once and the instance remembers it.`)
+digest-pinned. Pass each once and the instance remembers it.
+
+One namespace holds one repository. A successful run records, on this machine
+and never in the cluster, the repository, ref, commit and manifest digest it
+deployed into the namespace. A later run into that namespace from another
+repository is refused — it would replace the first one's egress entries and
+reuse its applications' storage scopes — unless --replace-repository says to
+replace it. With --namespace the refusal comes before anything is read; without
+it the namespace is the manifest's name, so it comes after the manifest read
+and before anything is built or deployed. The record belongs to this machine: a
+deploy from another machine is not in it.`)
 }
 
 func (c *runCommand) SetFlags(fs *flag.FlagSet) {
@@ -111,6 +124,8 @@ func (c *runCommand) SetFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.builderImage, "builder-image", "", "digest-pinned Kaniko image")
 	fs.BoolVar(&c.assumeYes, "yes", false, "show the review but do not ask")
 	fs.BoolVar(&c.assumeYes, "y", false, "show the review but do not ask")
+	fs.BoolVar(&c.replaceRepository, "replace-repository", false,
+		"deploy into a namespace this machine recorded under another repository, replacing it")
 }
 
 func (c *runCommand) ensureDefaults() {
@@ -160,13 +175,11 @@ func (c *runCommand) Run(ctx context.Context, env *Env, args []string) error {
 	// Checked before anything is fetched. An unusable namespace found after
 	// the read and the builds would have cost real money to discover.
 	if c.namespace != "" {
-		if err := validNamespace(c.namespace); err != nil {
-			return usagef("namespace %q: %v", c.namespace, err)
+		if err := deployableNamespace(c.namespace); err != nil {
+			return err
 		}
-		if c.namespace == tcdeploy.DefaultNamespace {
-			return usagef("refusing to deploy applications into %q; it holds the instance's own components, "+
-				"and mixing them makes the tier labels a cost shutdown reads harder to trust than they should be",
-				tcdeploy.DefaultNamespace)
+		if err := c.refuseOtherRepository(meta, name, c.namespace, repo, false); err != nil {
+			return err
 		}
 	}
 
@@ -202,6 +215,17 @@ func (c *runCommand) Run(ctx context.Context, env *Env, args []string) error {
 	namespace := c.namespace
 	if namespace == "" {
 		namespace = m.Name
+		// Known only now. The read has run and billed; nothing has been
+		// built or deployed, and nothing will be if this refuses. A manifest
+		// is held to the same namespace rules as --namespace: one named
+		// farcast-system, or kube-anything, would otherwise put applications
+		// beside the instance's own components or into the managed ones.
+		if err := deployableNamespace(namespace); err != nil {
+			return fmt.Errorf("the manifest's name: %w; the manifest was read, and nothing was built or deployed", err)
+		}
+		if err := c.refuseOtherRepository(meta, name, namespace, repo, true); err != nil {
+			return err
+		}
 	}
 
 	// 2. The operator sees what it declares, and decides.
@@ -255,6 +279,10 @@ func (c *runCommand) Run(ctx context.Context, env *Env, args []string) error {
 	// outage an operator has to notice first.
 	var scopes map[string]datasphere.Scope
 	var minted []string
+	// Whether this run wires storage, which is decided now and by nothing
+	// later: an application deployed before 'storage deploy' has no storage
+	// identity, whatever the record says about the keyholder afterwards.
+	storageWired := meta.Keyholder != nil && meta.Keyholder.Deployed
 	if meta.Keyholder != nil && meta.Keyholder.Deployed {
 		if scopes, minted, err = c.ensureAppScopes(env, meta.Name, namespace, *m); err != nil {
 			return err
@@ -280,6 +308,7 @@ func (c *runCommand) Run(ctx context.Context, env *Env, args []string) error {
 	// up, and an instance whose local state has not heard of them is one
 	// nobody will think to tear down.
 	c.record(env, meta, name, fetcher, builder)
+	c.recordProvenance(env, name, namespace, repo, read.Report, storageWired)
 
 	var slow []string
 	for _, app := range m.Apps {
@@ -710,6 +739,65 @@ func (c *runCommand) record(env *Env, meta *config.InstanceMetadata, name, fetch
 	}
 }
 
+// normalisedRepository is a repository URL compared by what it names: a
+// trailing slash and a trailing .git are the only differences ignored — and a
+// credential, which no record should hold but one written before it was
+// refused might.
+func normalisedRepository(s string) string {
+	return strings.TrimSuffix(strings.TrimRight(strings.TrimSpace(withoutUserinfo(s)), "/"), ".git")
+}
+
+// refuseOtherRepository refuses a namespace this machine recorded under a
+// different repository, unless --replace-repository was given (ADR 0021
+// decision 2, amended 2026-11-12). Two repositories in one namespace is the
+// second replacing the first's egress entries and reusing its applications'
+// storage scopes — reading their data.
+//
+// A namespace with no record here is accepted: every namespace deployed
+// before records existed, and any deployed from another machine.
+func (c *runCommand) refuseOtherRepository(meta *config.InstanceMetadata, instance, namespace, repo string, afterRead bool) error {
+	dep, ok := meta.Deployments[namespace]
+	if !ok || c.replaceRepository || normalisedRepository(dep.Repository) == normalisedRepository(repo) {
+		return nil
+	}
+	what := "Nothing was read, built or deployed."
+	if afterRead {
+		what = "The manifest was read inside the instance; nothing was built or deployed."
+	}
+	return fmt.Errorf("namespace %q in %q was deployed from %s, and this run is %s. One namespace holds one repository: "+
+		"deploying this one there would replace the other's egress entries and reuse its applications' storage scopes. %s "+
+		"Pass --replace-repository to replace it, or --namespace to deploy beside it",
+		namespace, instance, withoutUserinfo(dep.Repository), withoutUserinfo(repo), what)
+}
+
+// recordProvenance writes down, on this machine, what this run deployed into
+// the namespace: the map labels the namespace's group with it, and the next
+// run checks against it. Nothing new reaches the cluster.
+//
+// It warns rather than fails, as record does: the workloads exist by now, and
+// a record that did not land is a label missing from the map, not a failed
+// deployment.
+func (c *runCommand) recordProvenance(env *Env, instance, namespace, repo string, report pfetch.Report, storageWired bool) {
+	ref := c.ref
+	if ref == "" {
+		ref = "refs/heads/main" // what the fetch resolves when no ref is given
+	}
+	dep := config.Deployment{
+		// repoURL refuses a credential in the URL; this is the second lock.
+		Repository: withoutUserinfo(repo), Ref: ref, Commit: report.Commit, ManifestDigest: report.ManifestDigest,
+		DeployedAt: time.Now().UTC().Truncate(time.Second), StorageWired: storageWired,
+	}
+	if _, err := env.ConfigDir.UpdateInstanceMetadata(instance, func(m *config.InstanceMetadata) error {
+		if m.Deployments == nil {
+			m.Deployments = map[string]config.Deployment{}
+		}
+		m.Deployments[namespace] = dep
+		return nil
+	}); err != nil {
+		fprintf(env.Err, "warning: could not record which repository %q was deployed from: %v\n", namespace, err)
+	}
+}
+
 // confirm shows the review and asks for it to be approved.
 //
 // The review is printed whether or not -y was passed. AGENTS.md makes the
@@ -856,4 +944,20 @@ func (r runResult) Human(w io.Writer) error {
 // applicationsMonthlyUSD is what a translated manifest costs standing still.
 func applicationsMonthlyUSD(apps int) float64 {
 	return float64(apps) * pricing.WorkloadMonthlyUSD(1, translate.RequestCPUMilli, translate.RequestMemMiB)
+}
+
+// deployableNamespace is the one rule for where run may put applications,
+// whether the namespace came from --namespace or from the manifest's name: a
+// DNS label, outside the provider's managed kube- namespaces, and never the
+// namespace that holds the instance's own components.
+func deployableNamespace(ns string) error {
+	if err := validNamespace(ns); err != nil {
+		return usagef("namespace %q: %v", ns, err)
+	}
+	if ns == tcdeploy.DefaultNamespace {
+		return usagef("refusing to deploy applications into %q; it holds the instance's own components, "+
+			"and mixing them makes the tier labels a cost shutdown reads harder to trust than they should be",
+			tcdeploy.DefaultNamespace)
+	}
+	return nil
 }
