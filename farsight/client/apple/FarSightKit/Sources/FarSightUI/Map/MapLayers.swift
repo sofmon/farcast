@@ -19,8 +19,8 @@ struct TerritoryLayer: View {
             for (instanceID, territory) in geometry.territories {
                 let rect = camera.screen(territory.frame, in: viewport)
                 guard rect.intersects(screen) else { continue }
-                let wall = RoundedRectangle(cornerRadius: max(4, 90 * scale), style: .continuous).path(in: rect)
-                context.fill(wall, with: .color(Theme.territory))
+                let wall = Self.wall(rect, at: scale)
+                context.fill(wall, with: .color(Theme.territorySurface))
                 context.stroke(wall, with: .color(Theme.wall), lineWidth: min(max(10 * scale, 1.5), 4))
 
                 for (gate, label, anchor) in [
@@ -33,11 +33,20 @@ struct TerritoryLayer: View {
                     context.fill(notch, with: .color(Theme.ground))
                     context.stroke(notch, with: .color(Theme.observed), lineWidth: 1.5)
                     if scale > 0.025 {
-                        let text = Text(label)
-                            .font(.system(size: 11, weight: .semibold))
-                            .foregroundStyle(Theme.observed)
+                        let text = context.resolve(
+                            Text(label)
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(Theme.observed)
+                        )
                         let offset: CGFloat = anchor == .trailing ? -(width + 6) : width + 6
-                        context.draw(text, at: CGPoint(x: p.x + offset, y: p.y - height / 2 - 8), anchor: anchor)
+                        let at = CGPoint(x: p.x + offset, y: p.y - height / 2 - 8)
+                        // The label stands outside the wall, on the open
+                        // backdrop, so it gets a chip of its own.
+                        let size = text.measure(in: CGSize(width: 400, height: 40))
+                        let left = anchor == .trailing ? at.x - size.width : at.x
+                        let chip = CGRect(x: left - 7, y: at.y - size.height / 2 - 3, width: size.width + 14, height: size.height + 6)
+                        context.fill(Capsule().path(in: chip), with: .color(Theme.chip))
+                        context.draw(text, at: at, anchor: anchor)
                     }
                 }
             }
@@ -47,13 +56,19 @@ struct TerritoryLayer: View {
                 guard rect.intersects(screen) else { continue }
                 let info = index.groups[id]
                 let frame = RoundedRectangle(cornerRadius: max(3, 44 * scale), style: .continuous).path(in: rect)
-                context.fill(frame, with: .color(Theme.groupFill))
+                context.fill(frame, with: .color(Theme.groupSurface))
                 let illustrative = info?.isIllustrative ?? false
                 let stroke = illustrative ? Theme.illustrative.opacity(0.7)
                     : (info?.isSystem ?? false) ? Theme.systemGroupStroke : Theme.groupStroke
                 context.stroke(frame, with: .color(stroke), style: StrokeStyle(lineWidth: 1.5, dash: illustrative ? [7, 5] : []))
             }
         }
+    }
+
+    /// An instance's wall drawn at `rect`. The backdrop's frosted form is cut
+    /// to the same shape, and the ground's dots kept out of it.
+    nonisolated static func wall(_ rect: CGRect, at scale: CGFloat) -> Path {
+        RoundedRectangle(cornerRadius: max(4, 90 * scale), style: .continuous).path(in: rect)
     }
 }
 
@@ -145,6 +160,11 @@ struct TerritoryLabel: View {
             }
             .lineLimit(1)
             .fixedSize()
+            // Drawn small, the label outgrows its band and stands partly on
+            // the open backdrop, so it carries its own chip.
+            .padding(.horizontal, size * 0.45)
+            .padding(.vertical, size * 0.16)
+            .background(Theme.chip, in: Capsule())
         }
         .buttonStyle(.plain)
         .accessibilityLabel("\(instance.id), expected spending at \(Format.percent(spending.fraction)) of its cost limit")

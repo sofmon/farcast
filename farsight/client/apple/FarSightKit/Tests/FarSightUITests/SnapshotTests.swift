@@ -7,9 +7,10 @@ import UniformTypeIdentifiers
 import FarSightCore
 import FarSightFixtures
 
-/// Renders the screen at a few camera positions. Always a smoke test: the
-/// whole view tree builds and draws. With FARSIGHT_SNAPSHOTS set to a
-/// directory, the frames are also written there as PNGs to look at.
+/// Renders the screen at a few camera positions, over the bundled backdrop.
+/// Always a smoke test: the whole view tree builds and draws. With
+/// FARSIGHT_SNAPSHOTS set to a directory, the frames are also written there as
+/// PNGs to look at.
 ///
 /// ImageRenderer draws offscreen, so Liquid Glass is not composited the way a
 /// window shows it; these frames are for layout, not for the glass.
@@ -22,7 +23,8 @@ struct SnapshotTests {
     }
 
     @Test("the screen draws", arguments: Shot.allCases)
-    func draws(_ shot: Shot) throws {
+    func draws(_ shot: Shot) async throws {
+        let backdrop = try #require(await Backdrop.bundled())
         let model = WorldModel(world: try Fixtures.world())
         model.viewportChanged(to: Self.viewport)
         switch shot {
@@ -36,7 +38,7 @@ struct SnapshotTests {
             model.show(.group("borealis/farcast-system"))
         }
 
-        let renderer = ImageRenderer(content: WorldScreen(model: model).frame(width: Self.viewport.width, height: Self.viewport.height))
+        let renderer = ImageRenderer(content: WorldScreen(model: model, backdrop: backdrop).frame(width: Self.viewport.width, height: Self.viewport.height))
         renderer.proposedSize = ProposedViewSize(Self.viewport)
         renderer.scale = 2
         let image = try #require(renderer.cgImage)

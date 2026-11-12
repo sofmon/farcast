@@ -6,11 +6,13 @@ import FarSightCore
 /// any zoom, and a panel always knows how large it is drawn.
 struct WorldViewport: View {
     let model: WorldModel
+    /// Drawn under everything once it is ready; until then, the plain ground.
+    let backdrop: Backdrop?
 
     var body: some View {
         GeometryReader { proxy in
             TimelineView(.animation(minimumInterval: nil, paused: model.flight == nil)) { timeline in
-                MapContent(model: model, camera: model.camera(at: timeline.date), viewport: proxy.size)
+                MapContent(model: model, backdrop: backdrop, camera: model.camera(at: timeline.date), viewport: proxy.size)
             }
             .onAppear { model.viewportChanged(to: proxy.size) }
             .onChange(of: proxy.size) { _, size in model.viewportChanged(to: size) }
@@ -30,6 +32,7 @@ struct WorldViewport: View {
 
 private struct MapContent: View {
     let model: WorldModel
+    let backdrop: Backdrop?
     let camera: Camera
     let viewport: CGSize
 
@@ -39,8 +42,15 @@ private struct MapContent: View {
         let screen = CGRect(origin: .zero, size: viewport).insetBy(dx: -60, dy: -60)
         let live = model.liveApps(at: camera)
 
+        let walls = geometry.territories.values.map { camera.screen($0.frame, in: viewport) }
+
         ZStack(alignment: .topLeading) {
-            Ground(camera: camera, viewport: viewport)
+            if let backdrop {
+                BackdropLayers(backdrop: backdrop, camera: camera, viewport: viewport, walls: walls)
+                    .transition(OpacityTransition())
+            }
+
+            Ground(camera: camera, viewport: viewport, walls: walls)
                 .onTapGesture(count: 2) { point in model.zoomStep(2, at: point) }
                 .onTapGesture { model.clearFocus() }
 
@@ -103,16 +113,23 @@ private struct MapContent: View {
     }
 }
 
-/// The ground under everything: a dot grid that pans and zooms with the map,
-/// so motion reads even over empty space. It is also what a drag on empty
-/// space grabs.
+/// The ground over the backdrop: a dot grid that pans and zooms with the map,
+/// so motion reads even over empty space, at the map's own pace where the
+/// backdrop lags it. The dots stay outside the walls, as they did when the
+/// walls were opaque. It is also what a drag on empty space grabs.
 private struct Ground: View {
     let camera: Camera
     let viewport: CGSize
+    /// The instances' walls, in viewport points.
+    let walls: [CGRect]
 
     var body: some View {
         Canvas { context, size in
-            context.fill(Path(CGRect(origin: .zero, size: size)), with: .color(Theme.ground))
+            // Everything outside every wall, overlapping walls included: the
+            // same nonzero inside that the frosted form is cut to, inverted.
+            var inside = Path()
+            for wall in walls { inside.addPath(TerritoryLayer.wall(wall, at: camera.scale)) }
+            context.clip(to: inside, options: .inverse)
             var spacing: CGFloat = 200
             while spacing * camera.scale < 24 { spacing *= 5 }
             let visible = camera.visibleWorld(in: viewport)

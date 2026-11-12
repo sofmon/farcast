@@ -153,7 +153,7 @@ struct ConnectionLayer: View {
         let lift = (CGFloat(route.labelStack.index) - CGFloat(route.labelStack.count - 1) / 2) * (box.height + 4)
         let rect = CGRect(origin: CGPoint(x: origin.x, y: origin.y + lift), size: box)
         let chip = Capsule().path(in: rect)
-        context.fill(chip, with: .color(Theme.ground.opacity(0.88)))
+        context.fill(chip, with: .color(Theme.chip))
         context.stroke(chip, with: .color(color.opacity(0.35)), lineWidth: 1)
         context.draw(text, at: CGPoint(x: rect.midX, y: rect.midY), anchor: .center)
     }

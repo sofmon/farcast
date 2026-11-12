@@ -12,6 +12,20 @@ enum Theme {
     static let groupStroke = Color(rgb: 0x2A3949)
     static let systemGroupStroke = Color(rgb: 0x3B5068)
 
+    // Surfaces over the backdrop. Each lets some of the backdrop through and
+    // covers the rest with its own colour, enough that the connection lines,
+    // labels and text BackdropTests lists keep WCAG contrast on it over any
+    // backdrop no brighter than Backdrop.luminanceCap. Outlines and faded
+    // lines are not held to that; BackdropTests names them.
+    /// The inside of an instance's wall, over the backdrop's frosted form.
+    static let territorySurface = territory.opacity(0.55)
+    /// A group's frame, over its instance's surface.
+    static let groupSurface = groupFill.opacity(0.6)
+    /// Behind a label: a connection's, a gate's, an instance's, and a repo's
+    /// name in the app strip. Nearly opaque, because a label may stand on the
+    /// open backdrop or, in the strip, on an app's light page.
+    static let chip = ground.opacity(0.94)
+
     // Panels.
     static let panel = Color(rgb: 0x141B23)
     static let panelStroke = Color(rgb: 0x2F4052)

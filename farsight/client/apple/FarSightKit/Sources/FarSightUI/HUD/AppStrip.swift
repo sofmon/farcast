@@ -16,10 +16,17 @@ struct AppStrip: View {
             HUDGlassGroup(spacing: 6) {
                 HStack(spacing: 6) {
                     ForEach(groups) { group in
+                        // The repo's name has no glass of its own and floats
+                        // over whatever the map shows under the strip — the
+                        // backdrop, or an app's light page — so it carries a
+                        // chip, as the map's labels do.
                         Text(group.isSystem ? "FarCast" : group.namespace)
                             .font(.caption2.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                            .padding(.leading, group.id == groups.first?.id ? 4 : 10)
+                            .foregroundStyle(Theme.text)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3)
+                            .background(Theme.chip, in: Capsule())
+                            .padding(.leading, group.id == groups.first?.id ? 0 : 4)
                         ForEach(group.apps) { app in
                             chip(app)
                         }

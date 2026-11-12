@@ -35,10 +35,11 @@ let package = Package(
             name: "FarSightCore",
             swiftSettings: guardrails
         ),
-        // The app world map and its Liquid Glass HUD.
+        // The app world map and its Liquid Glass HUD, over the backdrop.
         .target(
             name: "FarSightUI",
             dependencies: ["FarSightCore"],
+            resources: [.copy("Backdrop/backdrop.heic")],
             swiftSettings: onMain
         ),
         // A world to draw until the read route exists (ADR 0021 decision 9,

@@ -13,8 +13,8 @@
 #      never run)
 #   5  golangci-lint, mandatory — a missing linter fails the check
 #   6  go test -race
-#   7  the Apple client: the source gate (only allowed file types, no
-#      links; no unsafe, unsafeFlags or attribute outside an allowed set,
+#   7  the Apple client: the source gate (only allowed file types and the
+#      one backdrop image, no links; no unsafe, unsafeFlags or attribute outside an allowed set,
 #      outside the reviewed allowlist; a static manifest with no third-party
 #      package and each target's settings from an allowlist; the project held
 #      to an exact shape, reviewed setting keys and one action-free scheme;
@@ -229,13 +229,17 @@ step "7a — Swift source gate"
 # anywhere, and only the file types the client is made of. C, C++,
 # Objective-C, assembly, an .xcconfig or a build script would each compile or
 # configure something outside the Swift guardrails; a new type is added here
-# in a reviewed commit.
+# in a reviewed commit. One image is allowed by its path, not its type: the
+# backdrop, which the app decodes and never runs, painted by the test
+# target's BackdropPainter and checked by BackdropTests against it and
+# against the readability cap.
+BACKDROP=$KIT/Sources/FarSightUI/Backdrop/backdrop.heic
 links=$(apple_files -type l | tr '\0' '\n')
 [ -z "$links" ] || { printf '%s\n' "$links" >&2; die "symbolic links in the Apple client (above) could bring in sources no check sees"; }
-strays=$(apple_files -type f ! -name .DS_Store | tr '\0' '\n' | awk -F/ '{ n = split($NF, part, "."); ext = (n > 1 ? part[n] : "") }
-  ext !~ /^(swift|json|md|txt|pbxproj|xcscheme|xcworkspacedata|plist)$/ { print }')
+strays=$(apple_files -type f ! -name .DS_Store | tr '\0' '\n' | awk -F/ -v backdrop="$BACKDROP" '{ n = split($NF, part, "."); ext = (n > 1 ? part[n] : "") }
+  $0 != backdrop && ext !~ /^(swift|json|md|txt|pbxproj|xcscheme|xcworkspacedata|plist)$/ { print }')
 [ -z "$strays" ] || { printf '%s\n' "$strays" >&2; die "files of a type the Apple client does not allow (above); a new type is a reviewed change to this step"; }
-ok "only Swift sources and their manifests, project and data; no links"
+ok "only Swift sources and their manifests, project, data and the backdrop; no links"
 
 # Strict memory safety flags unsafe constructs but not every way around it:
 # @unchecked Sendable (ADR 0021 decision 4), an 'unsafe' marker, unsafeFlags,

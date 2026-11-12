@@ -5,6 +5,7 @@ import FarSightCore
 /// There is no other place an app can be; to use one, the camera goes there.
 public struct WorldScreen: View {
     @State private var model: WorldModel
+    @State private var backdrop: Backdrop?
     #if os(iOS)
     @Environment(\.horizontalSizeClass) private var sizeClass
     @Environment(\.verticalSizeClass) private var verticalSizeClass
@@ -14,21 +15,33 @@ public struct WorldScreen: View {
         _model = State(initialValue: model)
     }
 
+    /// With the backdrop already read, as the snapshot tests draw it.
+    init(model: WorldModel, backdrop: Backdrop?) {
+        _model = State(initialValue: model)
+        _backdrop = State(initialValue: backdrop)
+    }
+
     public init(world: World, store: ArrangementStore? = nil) {
         self.init(model: WorldModel(world: world, store: store))
     }
 
     public var body: some View {
         ZStack {
-            WorldViewport(model: model)
+            WorldViewport(model: model, backdrop: backdrop)
                 .ignoresSafeArea()
             HUD(model: model)
+        }
+        .task {
+            guard backdrop == nil else { return }
+            let loaded = await Backdrop.bundled()
+            withAnimation(.easeOut(duration: 0.6)) { backdrop = loaded }
         }
         #if os(iOS)
         .onChange(of: [sizeClass, verticalSizeClass], initial: true) {
             model.layoutChanged(compact: sizeClass == .compact, short: verticalSizeClass == .compact)
         }
         #endif
+        // Until the backdrop is read, and wherever it is not drawn.
         .background(Theme.ground)
         .preferredColorScheme(.dark)
     }
