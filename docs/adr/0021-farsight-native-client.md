@@ -1,6 +1,6 @@
 # ADR 0021 — FarSight's Client: Native Shells, Apple First
 
-**Status:** Accepted (2026-11-11). Nothing below is built. This ADR depends on [ADR 0020](0020-instance-pki-ecdsa-p256.md): without it, no Apple client can reach FatLine on stock APIs. The tile-path evidence below comes from a probe on macOS 27 and the iOS 26.0 simulator, with no packet capture and no physical device. visionOS was not probed.
+**Status:** Accepted (2026-11-11). Decision 2 amended the same day: the app world map replaces tiling as the base layout. Decision 9's first step has begun — `farsight/client/apple/` holds FarSightKit and the FarCast app target, drawing the map against an illustrative fixture. Nothing else below is built. This ADR depends on [ADR 0020](0020-instance-pki-ecdsa-p256.md): without it, no Apple client can reach FatLine on stock APIs. The tile-path evidence below comes from a probe on macOS 27 and the iOS 26.0 simulator, with no packet capture and no physical device. visionOS was not probed.
 
 **Date:** 2026-11-11
 
@@ -122,10 +122,19 @@ The only Phase 7 line that names AllThing is 7.3's *"AllThing chat as a built-in
 - *Package:* logic sits in a local SwiftPM package that builds and tests headlessly.
 - *Project:* app targets live in an Xcode project that uses folder-synchronized groups (Xcode 16 and later), so adding a file does not churn the project file. No project generator such as XcodeGen or Tuist is used; a generator would be a tool dependency.
 - *Platform-specific code stays in scenes and windows:*
-  - The tiling layout inside one window is the common base.
+  - The app world map inside one window is the common base (amended below).
   - Where a platform supports several windows (macOS, iPadOS, visionOS), detaching a tile into its own window uses `WindowGroup` and `openWindow`.
-  - The iPhone shows one tile at a time.
+  - The iPhone shows one app at a time, and swipes to the neighbour the map places beside it.
   - macOS adds `MenuBarExtra` and `Settings`, and visionOS adds ornaments. Those are confined to their platforms because their availability is (`Window` is macOS 13 and visionOS 26, not iOS; `defaultWindowPlacement` is not available on iPadOS).
+
+*Amended 2026-11-11: the app world map.* The operator chose the base layout from the prototype canvas, over tiling:
+- **Nothing is hidden.** Every app, FarCast's own components included, is a panel on one freeform two-dimensional map. The operator never switches apps; the camera flies to where an app is, and a stopped app keeps its place.
+- **Repos are places.** One Git repository is one namespace and one group, which the operator moves as a unit. Each instance is its own walled territory, with nothing drawn between instances because nothing runs between them.
+- **Connections are drawn and graded by evidence:** counted by FatLine, declared only, refused at the wall, or decided but not built. Lines that cross a wall pass through its gate, so no line suggests a path FatLine does not see.
+- **A few panels are live.** Only panels drawn large enough to use are live, a handful at a time; the rest show a last frame, marked as such.
+- **FarCast's own components are panels like any app.** Their surfaces are decision 6's native operator surfaces, not web tiles.
+- **The HUD is Liquid Glass, the map is not.** Instances, alerts, the connection legend, the minimap, the app strip and the jump palette float over the map in glass; the map is content. visionOS has no `glassEffect`, so the HUD falls back to `glassBackgroundEffect` there.
+- **App-to-app traffic goes through FatLine** (operator decision, 2026-11-11, to be recorded in its own ADR). Until it is built, the map draws such lines only on an illustrative group, labelled "decided, not built".
 
 **3. System frameworks only.**
 - *Allowed:* SwiftUI, WebKit, Network, Security, CryptoKit, BackgroundTasks, UserNotifications, and WidgetKit or App Intents where used. ADR 0020's enrolment request is a template built with these.
@@ -235,7 +244,7 @@ The dashboard, the install wizard, connect and release, keeper custody, and seal
 - **Either way,** whatever is chosen implements the same contract and passes the same vectors.
 
 **9. FarSight moves ahead of AllThing.** The order:
-1. **The Apple shell prototype, against fixtures.** Fixtures come from `farcast … -o json`. It covers the tiling layout, the dashboard and the wizard, with no backend change.
+1. **The Apple shell prototype, against fixtures.** Fixtures come from `farcast … -o json`. It covers the app world map, the dashboard and the wizard, with no backend change. *Begun 2026-11-11:* the map, its HUD and the core apps' first surfaces run on macOS and the iPad simulator. Their fixture is the prototype canvas's illustrative world, because no CLI command yet reports apps by repository or graded connections; fixtures move to CLI output as commands gain those fields. The wizard is not started.
 2. **ADR 0020 implemented,** and Phase 5 Session A walked again.
 3. **The CLI's consent protocol and explicit environment** (decision 6), walked from a terminal.
 4. **7.1, the macOS shell** driving the bundled CLI, with the tile bridge tested against local servers.
@@ -300,7 +309,7 @@ Stated because *"blind to content"* is FarCast's standard, and installing a clie
 - **Separate codebases.** Each platform family is its own codebase, so Android and Windows are new code when they come. The cost is verification more than typing, which is what the conformance vectors are for.
 - **The CLI must change before the macOS shell can drive it:** the consent protocol, the explicit environment and the version record (decision 6). Until then the shell drives only read commands and fixtures.
 - **"One app, one download" is not yet true on macOS.** The operator still installs `kubectl`, `gke-gcloud-auth-plugin` and Go, and keeps a checkout.
-- **The gate will need a Mac.** Once the first Swift code lands, `./check.sh` requires a Mac with Xcode.
+- **The gate needs a Mac.** Since the first Swift code landed (2026-11-11), `./check.sh` requires a Mac with Xcode.
 - **A Chromium-only web app can misbehave in a tile.** Tiles inherit Safari's web platform, not Chromium's.
 - **The dev Mac is missing runtimes.** It has no visionOS simulator runtime and no iOS 27 runtime (installed: iOS 17.5, 18.1 and 26.0). visionOS work needs the runtime installed first, which is the operator's download to make.
 - **Who signs and publishes the app is open, on every Apple platform.**
@@ -342,6 +351,8 @@ Stated because *"blind to content"* is FarCast's standard, and installing a clie
   - principle 3's *"before the Electron app adds complexity"* (`:537`);
   - the Phase 6 and Phase 7 order, per decision 9.
 - `farsight/client/package.json` and `tsconfig.json` are removed.
+
+**Sentences the decision 2 amendment corrected (2026-11-11).** "Tiling browser" and "tiling window manager" become the app world map in `README.md:196,297,305`, `PLAN.md:430,438,464-468,490,546`, `docs/hyperion-reference.md:63`, `farsight/README.md:3,7` and `farsight/cli/README.md:5`, and the `check.sh` header describes the Swift steps it now runs.
 
 ## Verification
 

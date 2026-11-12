@@ -427,7 +427,7 @@ AI as an internal capability for FarCast itself.
 
 ## Phase 7 — FarSight GUI
 
-*Goal: the tiling browser interface — FarCast becomes visual. Native clients, Apple first; application UIs in tiles, the operator's own surfaces native.*
+*Goal: the app world map — FarCast becomes visual. Native clients, Apple first; application UIs in tiles, the operator's own surfaces native.*
 
 **Status: ⏳ Accepted, not started (2026-11-11).**
 - [ADR 0021](docs/adr/0021-farsight-native-client.md) retired Electron. The clients are native per platform family, and the first is one Swift/SwiftUI codebase for macOS, iPadOS, iOS and visionOS.
@@ -435,7 +435,7 @@ AI as an internal capability for FarCast itself.
 - This phase is sequenced **ahead of Phase 6**. Nothing here needs AllThing except the chat tile, which arrives with Phase 6.
 
 The order (ADR 0021 decision 9):
-1. **A SwiftUI prototype against fixtures** from `farcast … -o json`: tiling layout, dashboard and wizard, with no backend change.
+1. **A SwiftUI prototype against fixtures** from `farcast … -o json`: the app world map, dashboard and wizard, with no backend change. *Begun 2026-11-11 (`farsight/client/apple/`): the map and its Liquid Glass HUD, against an illustrative fixture until the CLI reports apps by repository and graded connections.*
 2. **ADR 0020 implemented,** and the Phase 5 Session A runbook walked again.
 3. **The CLI gains a consent protocol and an explicit environment, walked from a terminal.**
    - The consent protocol is `--plan` and `--confirm <digest>` plus progress events, so a GUI never passes a bare `--yes`.
@@ -461,10 +461,10 @@ Server-side component inside the instance. The operator's dashboard is native in
 - Layout state persistence
 - Its tier and its line in the instance floor are named by the read-route ADR before anything is deployed
 
-### 7.3 FarSight client — tiling window manager
+### 7.3 FarSight client — the app world map
 The core UX.
 
-- Tiling layout engine (split, resize, rearrange). A tile can detach into its own window where the platform has several
+- The map: every app a panel in its place, repos as movable groups, instances as walled territories, connections drawn and graded by evidence; a camera that flies rather than switches, a minimap, an app strip and a jump palette. A tile can detach into its own window where the platform has several (ADR 0021 decision 2, amended)
 - Each tile renders an application's web interface and reaches only its own application, through FatLine (the tile-ingress ADR)
 - Tab management
 - No "all traffic proxied through FatLine" claim for a platform until its packet-capture gate passes
@@ -487,7 +487,7 @@ The first mobile FarSight is deliberately small: it makes a phone a keeper ([ADR
 - Stated honestly: a phone improves the odds of a short sealed window, it is not an SLO — a mains-powered desktop keeper anchors the fleet
 - The leaf key is generated in the Secure Enclave and enrolled by request ([ADR 0020](docs/adr/0020-instance-pki-ecdsa-p256.md)). Wrapping the bundle at rest under a separate hardware key is still owed here, as is a probe of a permanent Secure Enclave key signing from a background task with the device locked
 
-**Phase 7 deliverable:** users can download the "farcast" app, install FarCast to a cloud provider via a GUI on macOS, and interact with running applications through a tiling browser on their Apple devices. Traffic is proxied through FatLine, and that is claimed for each platform only once its packet-capture gate passes. The first mobile FarSight ships alongside it — a keeper before it is a GUI.
+**Phase 7 deliverable:** users can download the "farcast" app, install FarCast to a cloud provider via a GUI on macOS, and interact with running applications on the app world map on their Apple devices. Traffic is proxied through FatLine, and that is claimed for each platform only once its packet-capture gate passes. The first mobile FarSight ships alongside it — a keeper before it is a GUI.
 
 ---
 
@@ -543,7 +543,7 @@ Phase 4: TechnoCore → Planck (translator) → farcast run → Shrike (per-app)
               ↓
 Phase 5: TechnoCore (adaptive) → SDK Config/Secrets → farcast keeper (desktop)
               ↓
-Phase 7: ADR 0020 (P-256 PKI) → FarSight client (Apple, native) → FarSight server → Tiling UI → Mobile keeper
+Phase 7: ADR 0020 (P-256 PKI) → FarSight client (Apple, native) → FarSight server → App world map → Mobile keeper
               ↓
 Phase 6: AllThing (1st provider) → Chat → SDK AI → System integration
               ↓

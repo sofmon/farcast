@@ -60,7 +60,7 @@ This is the core metaphor for FarCast: your environment exists in the cloud, but
 
 **In the books:** While not a named technology in the original novels, the concept of "seeing through" a farcaster — observing what lies on the other side before stepping through — is woven throughout the Cantos. The farcaster portals are not blind doorways; operators and the TechnoCore can observe and monitor what passes through them.
 
-**In the OS:** FarSight is the UX layer — how users see into and interact with their FarCast instance. The downloadable "farcast" app is FarSight, providing a tiling browser interface where each tile is an application running inside the instance. True to the metaphor, FarSight lets you look through the portal and interact with the world on the other side.
+**In the OS:** FarSight is the UX layer — how users see into and interact with their FarCast instance. The downloadable "farcast" app is FarSight, showing the instance as a map on which every application running inside it has its place. True to the metaphor, FarSight lets you look through the portal and interact with the world on the other side.
 
 ---
 

@@ -22,3 +22,10 @@
 # and neither has ever been tracked — this makes that survive a `git add -A`.
 /HANDOVER.md
 /.claude/
+
+# The Apple client's build output: SwiftPM's .build/ and .swiftpm/, the
+# DerivedData ./check.sh points xcodebuild at, and Xcode's per-user state.
+/farsight/client/apple/.build/
+/farsight/client/apple/FarSightKit/.build/
+/farsight/client/apple/FarSightKit/.swiftpm/
+xcuserdata/

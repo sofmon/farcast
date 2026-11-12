@@ -193,7 +193,7 @@ farcast/
 | **DataSphere** | Go | Storage abstraction layer — cloud-agnostic proxy with encryption-at-rest |
 | **AllThing** | Go | AI abstraction — cloud-agnostic layer over managed AI services (Gemini, Claude, OpenAI) |
 | **Shrike** | Go | Security monitor — validates traffic against manifest declarations and raises attributed alerts; blocking is FatLine's, inline and fail-closed |
-| **FarSight** | Go + Swift (Apple client) | The "farcast" app — native GUI (tiling browser), CLI, and an in-instance server for tile registry, sessions and layout state |
+| **FarSight** | Go + Swift (Apple client) | The "farcast" app — native GUI (the app world map), CLI, and an in-instance server for tile registry, sessions and layout state |
 
 See each module's `README.md` for language specifics, architecture detail, and implementation notes.
 
@@ -294,7 +294,7 @@ The farcast SDK is a set of language-level libraries that let applications inter
 FarSight is how users see and interact with FarCast — the entire UX layer. It consists of a client and a server.
 
 The user installs an app called "farcast".
-- **On macOS** it carries the **GUI** (the tiling browser) and the **CLI** (for operators and automation).
+- **On macOS** it carries the **GUI** (the app world map) and the **CLI** (for operators and automation).
 - **On iPhone, iPad and Vision Pro** it is a thin client that never holds cloud credentials.
 - **A server** runs inside the FarCast instance.
 
@@ -302,7 +302,7 @@ The native clients are accepted and not yet built ([ADR 0021](docs/adr/0021-fars
 
 When opened, the app provides two functions: (1) **Install** — a guided process to deploy FarCast to a cloud environment, where the operator provides admin credentials for their chosen cloud provider, and (2) **Connect** — open a FarSight session towards a running FarCast instance. Install runs on macOS only, from the GUI or the CLI, because it needs the cloud admin credential. Connect is available from every client.
 
-Once connected via the GUI, FarSight presents a browser-like interface using a tiling window manager layout. Each tile is an application running inside the FarCast instance. The goal is that every request a tile makes is proxied through FatLine. The user's local network would then see an encrypted connection to the instance, with its volume and timing, but not which applications they use, and their point of presence on the internet would be the FarCast instance.
+Once connected via the GUI, FarSight presents the instance as a map. Every running application — FarCast's own components included — is a panel in its place, grouped by the repository it came from, with its connections drawn and graded by what FatLine has seen. Nothing is hidden: to use an application, the camera flies to it. Each panel shows the application's own web interface. The goal is that every request a tile makes is proxied through FatLine. The user's local network would then see an encrypted connection to the instance, with its volume and timing, but not which applications they use, and their point of presence on the internet would be the FarCast instance.
 
 No channel is proven yet. Nothing is claimed for a platform until its packet-capture gate passes ([ADR 0021](docs/adr/0021-farsight-native-client.md)). The 2026-11-11 probe ran on macOS 27 and the iOS 26.0 simulator, with no packet capture and no physical device:
 - it saw `fetch`, images, video and WebSocket reach the in-app proxy;

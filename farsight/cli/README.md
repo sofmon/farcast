@@ -2,7 +2,7 @@
 
 > The operator's command line for FarCast — install instances, run repositories, watch costs.
 
-`farcast` is the command line face of [FarSight](../README.md), the FarCast UX layer. The same "farcast" product provides a GUI (the tiling browser; on macOS the app is to bundle this CLI), a server (tile registry, sessions and layout state inside an instance), and this CLI. The CLI is what operators and automation use to provision instances, deploy repositories, connect through FatLine, and monitor spending.
+`farcast` is the command line face of [FarSight](../README.md), the FarCast UX layer. The same "farcast" product provides a GUI (the app world map; on macOS the app is to bundle this CLI), a server (tile registry, sessions and layout state inside an instance), and this CLI. The CLI is what operators and automation use to provision instances, deploy repositories, connect through FatLine, and monitor spending.
 
 This document specifies the CLI phase by phase — the scaffold (1.1) and each command landed since: `install` (1.3), `release` (1.4), and `connect` + `redeploy` (2.3). **Phase 1.1 — the CLI scaffold** (implemented): the command framework, the two commands that work from day one (`version`, `help`), local configuration handling, and the human/JSON output model. **Phase 1.3 — `farcast install`** (implemented): the first command that does real, billable work — interactively provisioning a cloud instance through Planck under a mandatory cost limit. The scaffold is what makes `install` a small, uniform addition.
 

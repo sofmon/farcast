@@ -1,0 +1,112 @@
+{
+  "_about": "Illustrative only. Two instances, the way the FarSight prototype canvas drew them. No name, figure or connection here is read from a live instance.",
+  "instances": [
+    {
+      "id": "atlas",
+      "spending": { "expectedCents": 4180, "limitCents": 15000 },
+      "groups": [
+        {
+          "id": "atlas/farcast-system", "namespace": "farcast-system", "source": "FarCast",
+          "isSystem": true, "isIllustrative": false,
+          "apps": [
+            { "id": "atlas/farcast-system/technocore", "name": "TechnoCore", "role": "kernel · cost and resources", "state": "running", "system": "kernel", "monthCents": 126, "isIllustrative": false },
+            { "id": "atlas/farcast-system/shrike", "name": "Shrike", "role": "traffic monitor", "state": "running", "system": "monitor", "costNote": "counted with FatLine", "isIllustrative": false },
+            { "id": "atlas/farcast-system/fatline", "name": "FatLine", "role": "network boundary", "state": "running", "system": "boundary", "monthCents": 379, "isIllustrative": false },
+            { "id": "atlas/farcast-system/datasphere", "name": "DataSphere", "role": "storage and keys", "state": "running", "system": "storage", "monthCents": 253, "isIllustrative": false }
+          ]
+        },
+        {
+          "id": "atlas/home", "namespace": "home", "source": "github.com/example/home",
+          "isSystem": false, "isIllustrative": false,
+          "apps": [
+            { "id": "atlas/home/notes", "name": "notes", "role": "notes and lists", "state": "running", "monthCents": 606, "isIllustrative": false },
+            { "id": "atlas/home/photos", "name": "photos", "role": "photo library", "state": "running", "monthCents": 1113, "isIllustrative": false }
+          ]
+        },
+        {
+          "id": "atlas/dev", "namespace": "dev", "source": "github.com/example/forge",
+          "isSystem": false, "isIllustrative": false,
+          "apps": [
+            { "id": "atlas/dev/forge", "name": "forge", "role": "code forge", "state": "running", "monthCents": 957, "isIllustrative": false }
+          ]
+        },
+        {
+          "id": "atlas/shop", "namespace": "shop", "source": "github.com/example/shop",
+          "isSystem": false, "isIllustrative": true,
+          "apps": [
+            { "id": "atlas/shop/web", "name": "web", "role": "storefront · illustrative", "state": "running", "costNote": "illustrative", "isIllustrative": true },
+            { "id": "atlas/shop/api", "name": "api", "role": "orders · illustrative", "state": "running", "costNote": "illustrative", "isIllustrative": true },
+            { "id": "atlas/shop/worker", "name": "worker", "role": "fulfilment · illustrative", "state": "running", "costNote": "illustrative", "isIllustrative": true }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "borealis",
+      "spending": { "expectedCents": 5520, "limitCents": 6000 },
+      "groups": [
+        {
+          "id": "borealis/farcast-system", "namespace": "farcast-system", "source": "FarCast",
+          "isSystem": true, "isIllustrative": false,
+          "apps": [
+            { "id": "borealis/farcast-system/technocore", "name": "TechnoCore", "role": "kernel · cost and resources", "state": "running", "system": "kernel", "monthCents": 126, "isIllustrative": false },
+            { "id": "borealis/farcast-system/shrike", "name": "Shrike", "role": "traffic monitor", "state": "running", "system": "monitor", "costNote": "counted with FatLine", "isIllustrative": false },
+            { "id": "borealis/farcast-system/fatline", "name": "FatLine", "role": "network boundary", "state": "running", "system": "boundary", "monthCents": 379, "isIllustrative": false },
+            { "id": "borealis/farcast-system/datasphere", "name": "DataSphere", "role": "storage and keys", "state": "running", "system": "storage", "monthCents": 253, "isIllustrative": false }
+          ]
+        },
+        {
+          "id": "borealis/lab", "namespace": "lab", "source": "github.com/example/lab",
+          "isSystem": false, "isIllustrative": false,
+          "apps": [
+            { "id": "borealis/lab/wiki", "name": "wiki", "role": "team wiki", "state": "running", "monthCents": 125, "isIllustrative": false },
+            { "id": "borealis/lab/renderer", "name": "renderer", "role": "batch renderer", "state": "stopped", "stopReason": "stopped by the cost guard", "monthCents": 4515, "isIllustrative": false }
+          ]
+        }
+      ]
+    }
+  ],
+  "devices": [
+    { "id": "mac", "name": "This Mac", "role": "operator", "note": "operator · holds the keys", "isHealthy": true },
+    { "id": "ubuntu-vm", "name": "ubuntu-vm", "role": "keeper", "note": "keeper for atlas", "isHealthy": true },
+    { "id": "pixel-phone", "name": "pixel-phone", "role": "keeper", "note": "keeper for borealis · budget spent", "isHealthy": false }
+  ],
+  "hosts": [
+    { "id": "maps", "name": "maps.example.test", "instanceID": "atlas", "note": "used by photos" },
+    { "id": "cdn", "name": "cdn.example.test", "instanceID": "atlas", "note": "declared by photos · never used" },
+    { "id": "sync", "name": "sync.example.test", "instanceID": "atlas", "note": "used by notes" },
+    { "id": "git", "name": "git.example.test", "instanceID": "atlas", "note": "used by forge" },
+    { "id": "tracker", "name": "tracker.example.test", "instanceID": "atlas", "note": "refused · never crossed" },
+    { "id": "pay", "name": "pay.example.test", "instanceID": "atlas", "note": "illustrative" },
+    { "id": "assets", "name": "assets.example.test", "instanceID": "borealis", "note": "last used 03:41" },
+    { "id": "wiki-sync", "name": "wiki-sync.example.test", "instanceID": "borealis", "note": "used by wiki · 1 failed dial" }
+  ],
+  "connections": [
+    { "id": "e1", "from": "app:atlas/home/notes", "to": "host:sync", "kind": "egress", "evidence": "observed", "label": "5 ok", "isStale": false },
+    { "id": "e2", "from": "app:atlas/home/photos", "to": "host:maps", "kind": "egress", "evidence": "observed", "label": "9 ok", "isStale": false },
+    { "id": "e3", "from": "app:atlas/home/photos", "to": "host:cdn", "kind": "egress", "evidence": "declared", "label": "declared · unused", "isStale": false },
+    { "id": "e4", "from": "app:atlas/dev/forge", "to": "host:git", "kind": "egress", "evidence": "observed", "label": "7 ok", "isStale": false },
+    { "id": "e5", "from": "app:atlas/dev/forge", "to": "host:tracker", "kind": "egress", "evidence": "denied", "label": "2 denied", "isStale": false },
+    { "id": "e6", "from": "app:atlas/shop/web", "to": "app:atlas/shop/api", "kind": "appToApp", "evidence": "planned", "label": "via FatLine · decided, not built", "isStale": false },
+    { "id": "e7", "from": "app:atlas/shop/api", "to": "app:atlas/shop/worker", "kind": "appToApp", "evidence": "planned", "label": "via FatLine · decided, not built", "isStale": false },
+    { "id": "e8", "from": "app:atlas/shop/api", "to": "host:pay", "kind": "egress", "evidence": "planned", "label": "illustrative", "isStale": false },
+    { "id": "e9", "from": "app:atlas/farcast-system/shrike", "to": "app:atlas/farcast-system/fatline", "kind": "watch", "evidence": "observed", "label": "watches", "isStale": false },
+    { "id": "e10", "from": "device:mac", "to": "app:atlas/farcast-system/fatline", "kind": "tunnel", "evidence": "observed", "label": "you · mTLS tunnel", "isStale": false },
+    { "id": "e11", "from": "device:ubuntu-vm", "to": "app:atlas/farcast-system/datasphere", "kind": "keeper", "evidence": "observed", "label": "keeper · keyholder only", "isStale": false },
+    { "id": "e12", "from": "app:atlas/home/notes", "to": "app:atlas/farcast-system/datasphere", "kind": "storage", "evidence": "observed", "label": "storage", "isStale": false },
+    { "id": "e13", "from": "app:atlas/home/photos", "to": "app:atlas/farcast-system/datasphere", "kind": "storage", "evidence": "observed", "label": "storage", "isStale": false },
+    { "id": "e14", "from": "app:atlas/dev/forge", "to": "app:atlas/farcast-system/datasphere", "kind": "storage", "evidence": "observed", "label": "storage", "isStale": false },
+    { "id": "b1", "from": "app:borealis/lab/wiki", "to": "host:wiki-sync", "kind": "egress", "evidence": "observed", "label": "12 ok · 1 failed", "isStale": false },
+    { "id": "b2", "from": "app:borealis/lab/renderer", "to": "host:assets", "kind": "egress", "evidence": "observed", "label": "31 ok · until 03:41", "isStale": true },
+    { "id": "b3", "from": "app:borealis/farcast-system/shrike", "to": "app:borealis/farcast-system/fatline", "kind": "watch", "evidence": "observed", "label": "watches", "isStale": false },
+    { "id": "b4", "from": "device:mac", "to": "app:borealis/farcast-system/fatline", "kind": "tunnel", "evidence": "observed", "label": "you · mTLS tunnel", "isStale": false },
+    { "id": "b5", "from": "device:pixel-phone", "to": "app:borealis/farcast-system/datasphere", "kind": "keeper", "evidence": "observed", "label": "keeper · budget spent", "isStale": false },
+    { "id": "b6", "from": "app:borealis/lab/wiki", "to": "app:borealis/farcast-system/datasphere", "kind": "storage", "evidence": "observed", "label": "storage", "isStale": false },
+    { "id": "b7", "from": "app:borealis/lab/renderer", "to": "app:borealis/farcast-system/datasphere", "kind": "storage", "evidence": "observed", "label": "storage", "isStale": false }
+  ],
+  "alerts": [
+    { "id": "cost-borealis", "kind": "cost", "severity": "critical", "title": "borealis is past 90% of its limit", "appID": "borealis/farcast-system/technocore" },
+    { "id": "sealed-borealis", "kind": "sealed", "severity": "critical", "title": "borealis storage: K1 sealed", "appID": "borealis/farcast-system/datasphere" },
+    { "id": "denied-forge", "kind": "denied", "severity": "warning", "title": "forge: 2 connections denied", "appID": "atlas/dev/forge" }
+  ]
+}

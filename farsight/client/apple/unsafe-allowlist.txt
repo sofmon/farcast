@@ -1,0 +1,10 @@
+# Swift that ./check.sh's source gate lets through (ADR 0021 decision 4).
+#
+# The gate refuses @unchecked Sendable, nonisolated(unsafe), the unsafe
+# marker and unsafeFlags anywhere in the Apple client. An entry here lets one
+# exact line through:
+#
+#   <path from the repository root> | <the line, leading whitespace trimmed>
+#
+# Every entry is added in a reviewed commit that says why the line cannot be
+# written safely. There are none.
