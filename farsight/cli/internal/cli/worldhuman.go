@@ -34,12 +34,15 @@ func (d worldDoc) Human(w io.Writer) error {
 	}
 	fprintf(w, "  system     %s\n", strings.Join(parts, " · "))
 
-	apps, notReady := 0, 0
+	apps, notReady, guarded := 0, 0, 0
 	for _, g := range d.Groups {
 		apps += len(g.Apps)
 		for _, a := range g.Apps {
 			if a.State == stateStarting {
 				notReady++
+			}
+			if a.StoppedBy != nil {
+				guarded++
 			}
 		}
 	}
@@ -50,6 +53,9 @@ func (d worldDoc) Human(w io.Writer) error {
 		fprintf(w, "  apps       %s in %s", plural(apps, "application", "applications"), plural(len(d.Groups), "namespace", "namespaces"))
 		if notReady > 0 {
 			fprintf(w, ", %d not ready", notReady)
+		}
+		if guarded > 0 {
+			fprintf(w, ", %d stopped by the cost guard", guarded)
 		}
 		fprintln(w)
 	}
@@ -140,16 +146,24 @@ func spendLine(s worldSpend) string {
 		b.WriteString(", the kernel published no limit")
 	}
 	fmt.Fprintf(&b, " (level %s)", s.Level)
+	if s.Floor != nil {
+		b.WriteString(", at the instance floor")
+	}
 	if s.CheckpointStale {
 		b.WriteString(", checkpoint stale")
 	}
 	return b.String()
 }
 
-// hasWorkloads reports whether any component's workload was read.
+// hasWorkloads reports whether FarCast's own workloads were read: whether any
+// component whose state is its workload's has a state. The monitor's is not
+// its workload's — it is running whenever Shrike answered through the tunnel,
+// whatever else was read — so it never stands for the workloads. The apps
+// section's own status does not say it either: the section also fails when
+// only the kernel's metered list could not be read, with every workload read.
 func hasWorkloads(cs []worldComponent) bool {
 	for _, c := range cs {
-		if c.State != stateUnknown {
+		if c.Role != roleMonitor && c.State != stateUnknown {
 			return true
 		}
 	}

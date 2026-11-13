@@ -340,19 +340,19 @@ struct WorldFeedTests {
             try PanelFacts.of(model, "a/farcast-system/\(app)")
         }
         #expect(try facts("datasphere")["keepers needing attention"] == "0")
-        #expect(try facts("datasphere")["keepers"] == "1")
+        #expect(try facts("datasphere")["keeper"] == "1")
         #expect(try facts("fatline")["devices coming in"] == "2")
 
         reader.set("a", .failure(ReadFailure(kind: .tunnelUnreachable, message: "dial tcp: i/o timeout")))
         await feed.refresh()?.value
         model.update(world: feed.world)
         #expect(try facts("datasphere")["keepers needing attention"] == "0")
-        #expect(try facts("datasphere")["keepers"] == "1")
+        #expect(try facts("datasphere")["keeper"] == "1")
         #expect(try facts("datasphere")["seal not read"] == "unknown")
         #expect(try facts("fatline")["devices coming in"] == "not read")
         #expect(try facts("shrike")["Shrike's watch on FatLine"] == "not read")
         // What the kept snapshot counted stays, as of its read.
-        #expect(try facts("fatline")["lines out, counted"] == "1")
+        #expect(try facts("fatline")["line out, counted"] == "1")
     }
 
     @Test("over the fixture reader, the feed composes the fixture's instances, with their ids")

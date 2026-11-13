@@ -23,6 +23,7 @@ import (
 	"github.com/sofmon/farcast/technocore/cost"
 	tcdeploy "github.com/sofmon/farcast/technocore/deploy"
 	"github.com/sofmon/farcast/technocore/kernel"
+	"github.com/sofmon/farcast/technocore/pricing"
 )
 
 // The world document, schema 1: one instance, map-ready (farsight/cli/README.md,
@@ -217,8 +218,25 @@ type worldSpend struct {
 	Level              string    `json:"level"`
 	ObservedAt         *wireTime `json:"observed_at"`
 	CheckpointStale    bool      `json:"checkpoint_stale"`
-	NotMetered         []string  `json:"not_metered"`
-	Caveats            []string  `json:"caveats"`
+	// AtFloor is whether the kernel recorded the instance floor, and null
+	// when the kernel that wrote the checkpoint records no such thing.
+	AtFloor    *bool       `json:"at_floor"`
+	Floor      *worldFloor `json:"floor"`
+	NotMetered []string    `json:"not_metered"`
+	Caveats    []string    `json:"caveats"`
+}
+
+// worldFloor is the kernel's floor record (ADR 0009 decision 8): since when,
+// what still burns, and the levers it names and takes neither of.
+type worldFloor struct {
+	Since *wireTime `json:"since"`
+	// StillBurningMonthCents is the kernel's hourly figure for what still
+	// burns, at the billing convention's 730 hours a month — the unit every
+	// floor in this project is stated in.
+	StillBurningMonthCents int64 `json:"still_burning_month_cents"`
+	// Levers are the kernel's ids, in its order: "drop_carrier",
+	// "release_instance".
+	Levers []string `json:"levers"`
 }
 
 type worldNetwork struct {
@@ -452,6 +470,9 @@ type worldBuilder struct {
 	spendRead bool
 	spendBody *worldSpend
 	byApp     map[string]float64
+	// costStops is every namespace/deployment the checkpoint records the
+	// cost guard as having stopped.
+	costStops map[string]bool
 
 	groups map[string]*worldGroup
 	// The kernel's metered list, whether it was read, and the namespaces
@@ -683,28 +704,32 @@ func (b *worldBuilder) components() {
 	}
 
 	// The monitor is a container in FatLine's Pod, not a workload of its
-	// own: its counts are FatLine's, and whether it is running is what the
-	// tunnel read says.
+	// own: its counts are FatLine's, when the workloads were read. Whether it
+	// is running is what the tunnel read says first: a monitor that answered
+	// through the tunnel is running, whatever else failed to read. Only
+	// when it did not answer does FatLine's workload say what it can — no
+	// second container, or none desired — and anything else is unknown.
 	monitor := worldComponent{Role: roleMonitor, Name: "shrike", State: stateUnknown}
+	var fatline *cluster.Workload
 	if b.appsRead() {
-		w := b.systemWorkload(fldeploy.DefaultName)
-		switch {
-		case w == nil || len(w.Images) < 2:
-			monitor.State = stateNotDeployed
-		default:
-			monitor.Ready, monitor.Desired = ptr(w.Ready), ptr(w.Desired)
-			if v := digestVersion(w.Images[1]); v != "" {
-				monitor.Version = &v
-			}
-			switch {
-			case w.Desired == 0:
-				monitor.State = stateStopped
-			case b.networkRead():
-				monitor.State = stateRunning
-			default:
-				monitor.State = stateUnknown
-			}
+		fatline = b.systemWorkload(fldeploy.DefaultName)
+	}
+	deployed := fatline != nil && len(fatline.Images) >= 2
+	if deployed {
+		monitor.Ready, monitor.Desired = ptr(fatline.Ready), ptr(fatline.Desired)
+		if v := digestVersion(fatline.Images[1]); v != "" {
+			monitor.Version = &v
 		}
+	}
+	switch {
+	case b.networkRead():
+		monitor.State = stateRunning
+	case !b.appsRead():
+		monitor.State = stateUnknown
+	case !deployed:
+		monitor.State = stateNotDeployed
+	case fatline.Desired == 0:
+		monitor.State = stateStopped
 	}
 	kernelC := component(roleKernel, tcdeploy.DefaultName, kernelImage)
 	storage := component(roleStorage, dsdeploy.DefaultName, keyholderImage)
@@ -782,6 +807,12 @@ func (b *worldBuilder) spend() {
 	b.doc.Sections.Spend = sectionStatus{Read: true}
 	b.spendRead = true
 	b.byApp = ledger.ByApp()
+	b.costStops = map[string]bool{}
+	for _, st := range cp.Stops {
+		if st.Reason == kernel.StopReasonCostGuard {
+			b.costStops[tenantOf(st.Namespace, st.Deployment)] = true
+		}
+	}
 
 	accrual := ledger.Accrued()
 	start, end := ledger.Period()
@@ -839,6 +870,18 @@ func (b *worldBuilder) spend() {
 	}
 	if obs.Carrier == string(kernel.CarrierUnobserved) {
 		caveats = append(caveats, "the kernel could not read the carrier's Service, so it is billing it as present")
+	}
+	if cp.RecordsStops() {
+		s.AtFloor = ptr(cp.Floor != nil)
+		if f := cp.Floor; f != nil {
+			s.Floor = &worldFloor{
+				Since:                  optTime(f.Since),
+				StillBurningMonthCents: cents(f.HourlyUSD * pricing.HoursPerMonth),
+				Levers:                 append([]string{}, f.Levers...),
+			}
+		}
+	} else {
+		caveats = append(caveats, "the kernel keeps no record of what it stops, so why an application is stopped, and whether the instance is at its floor, are not known")
 	}
 	b.spendCaveats = caveats
 	b.spendBody = &s
@@ -958,22 +1001,42 @@ func (b *worldBuilder) groupsAndApps() {
 				continue
 			}
 			for _, w := range ws {
-				g.Apps = append(g.Apps, worldApp{
+				a := worldApp{
 					Name: w.Name, State: workloadState(w.Ready, w.Desired),
 					Ready: ptr(w.Ready), Desired: ptr(w.Desired),
-				})
+				}
+				// The record says what the kernel did; the cluster says it
+				// still holds. A record for an application running again is
+				// stale, and never labels it.
+				if w.Kind == "Deployment" && w.Desired == 0 && b.costStops[tenantOf(ns, w.Name)] {
+					a.StoppedBy = ptr(kernel.StopReasonCostGuard)
+				}
+				g.Apps = append(g.Apps, a)
 			}
 		}
 	}
 }
 
 // monthCents gives each application its accrual this period, where the
-// kernel's ledger can tell it apart. The ledger keys spending by application
-// name alone, so a name that runs in two namespaces — the system one included
-// — is two applications the ledger has added together.
+// kernel's ledger can tell it apart.
+//
+// The ledger keys spending by namespace and name (kernel.AppKey), so each
+// application has its own figure. A key with no namespace was accrued before
+// the kernel recorded namespaces, and is carried until the period ends; it
+// is added to an application's figure only where one namespace — the system
+// one included — runs that name. Where two do, it belongs to one or the other
+// or both, so neither has a figure, and a caveat says why.
 func (b *worldBuilder) monthCents() {
 	if !b.spendRead {
 		return
+	}
+	qualified, legacy := map[string]float64{}, map[string]float64{}
+	for key, usd := range b.byApp {
+		if ns, name, ok := kernel.SplitAppKey(key); ok {
+			qualified[tenantOf(ns, name)] += usd
+		} else {
+			legacy[name] += usd
+		}
 	}
 	where := map[string][]string{}
 	if b.appsRead() {
@@ -986,16 +1049,20 @@ func (b *worldBuilder) monthCents() {
 			where[a.Name] = append(where[a.Name], ns)
 		}
 	}
+	if len(legacy) > 0 {
+		b.spendCaveats = append(b.spendCaveats,
+			"part of this period's spending was accrued before the kernel recorded namespaces; an application's figure includes it only where one namespace runs that name")
+	}
 	for name, nss := range where {
-		if len(nss) < 2 {
+		if _, old := legacy[name]; !old || len(nss) < 2 {
 			continue
 		}
 		sort.Strings(nss)
 		b.spendCaveats = append(b.spendCaveats, fmt.Sprintf(
-			"%s runs in more than one namespace (%s); the kernel's ledger keys spending by application name alone, so their shares cannot be told apart",
+			"%s runs in more than one namespace (%s); what the kernel accrued for it before it recorded namespaces cannot be told apart, so neither has a figure",
 			name, strings.Join(nss, ", ")))
 	}
-	for _, g := range b.groups {
+	for ns, g := range b.groups {
 		if g.Metered == nil || !*g.Metered {
 			// Not metered, or not known to be: the ledger holds nothing
 			// for it, and nothing is not a zero.
@@ -1003,10 +1070,14 @@ func (b *worldBuilder) monthCents() {
 		}
 		for i := range g.Apps {
 			a := &g.Apps[i]
-			if len(where[a.Name]) > 1 {
-				continue
+			usd := qualified[tenantOf(ns, a.Name)]
+			if old, ok := legacy[a.Name]; ok {
+				if len(where[a.Name]) > 1 {
+					continue
+				}
+				usd += old
 			}
-			a.MonthCents = ptr(cents(b.byApp[a.Name]))
+			a.MonthCents = ptr(cents(usd))
 		}
 	}
 }

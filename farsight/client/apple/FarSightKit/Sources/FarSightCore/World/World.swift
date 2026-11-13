@@ -202,7 +202,10 @@ public struct SectionProblem: Codable, Sendable, Equatable, Hashable {
     }
 
     /// Which part failed: one of the world document's sections, the local
-    /// record, or the read as a whole (a timeout, a refused identity).
+    /// record, or the read as a whole (a timeout, a refused identity) — or,
+    /// as `figures`, a spending figure a section that was read gave and the
+    /// map cannot draw. That one is the map's own, never the CLI's: its
+    /// section was read, and says so.
     public enum Section: String, Codable, Sendable, Equatable, Hashable, CaseIterable, UnknownDecodable {
         case record
         case read
@@ -211,6 +214,7 @@ public struct SectionProblem: Codable, Sendable, Equatable, Hashable {
         case policy
         case network
         case seal
+        case figures
         case unknown
     }
 
@@ -287,6 +291,13 @@ public struct Spending: Codable, Sendable, Equatable {
     public var notMetered: [String]
     /// The kernel's checkpoint is older than three checkpoint intervals.
     public var isCheckpointStale: Bool
+    /// Whether the kernel records that it is at the instance floor: every
+    /// application stopped, and spending still over its limit (ADR 0009
+    /// decision 8). Nil when not read, or when the kernel that wrote the
+    /// checkpoint records no such thing — never read as "not at the floor".
+    public var atFloor: Bool?
+    /// The kernel's floor record, while it is at the floor.
+    public var floor: SpendingFloor?
 
     public init(
         expectedCents: Int? = nil,
@@ -300,7 +311,9 @@ public struct Spending: Codable, Sendable, Equatable {
         currency: String = "USD",
         caveats: [String] = [],
         notMetered: [String] = [],
-        isCheckpointStale: Bool = false
+        isCheckpointStale: Bool = false,
+        atFloor: Bool? = nil,
+        floor: SpendingFloor? = nil
     ) {
         self.expectedCents = expectedCents
         self.confirmedCents = confirmedCents
@@ -314,6 +327,8 @@ public struct Spending: Codable, Sendable, Equatable {
         self.caveats = caveats
         self.notMetered = notMetered
         self.isCheckpointStale = isCheckpointStale
+        self.atFloor = atFloor
+        self.floor = floor
     }
 
     public init(from decoder: any Decoder) throws {
@@ -330,6 +345,8 @@ public struct Spending: Codable, Sendable, Equatable {
         caveats = try container.decodeIfPresent([String].self, forKey: .caveats) ?? []
         notMetered = try container.decodeIfPresent([String].self, forKey: .notMetered) ?? []
         isCheckpointStale = try container.decodeIfPresent(Bool.self, forKey: .isCheckpointStale) ?? false
+        atFloor = try container.decodeIfPresent(Bool.self, forKey: .atFloor)
+        floor = try container.decodeIfPresent(SpendingFloor.self, forKey: .floor)
     }
 
     /// The kernel's level: where spending stands against its limit, as the
@@ -376,6 +393,35 @@ public struct Spending: Codable, Sendable, Equatable {
         let length = min(max(Double(total) / Double(limit), 0), 1)
         let confirmed = hasConfirmation ? min(max(Double(confirmedCents ?? 0) / Double(limit), 0), length) : 0
         return (confirmed, length - confirmed)
+    }
+}
+
+/// The instance floor as TechnoCore records it (ADR 0009 decision 8): every
+/// application stopped and spending still over. What remains is the
+/// instance's own standing cost, and the levers that would reduce it destroy
+/// operator-visible capability or data, so the kernel names them and takes
+/// neither.
+public struct SpendingFloor: Codable, Sendable, Equatable {
+    /// When the kernel first found nothing left to stop.
+    public var since: Date?
+    /// What still burns, a month at that rate; nil when the figure could
+    /// not be drawn.
+    public var stillBurningMonthCents: Int?
+    /// The levers left, as the map says them: "drop the load-balancer
+    /// carrier", "release the instance". Shown through `Display.message`.
+    public var levers: [String]
+
+    public init(since: Date? = nil, stillBurningMonthCents: Int? = nil, levers: [String] = []) {
+        self.since = since
+        self.stillBurningMonthCents = stillBurningMonthCents
+        self.levers = levers
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        since = try container.decodeIfPresent(Date.self, forKey: .since)
+        stillBurningMonthCents = try container.decodeIfPresent(Int.self, forKey: .stillBurningMonthCents)
+        levers = try container.decodeIfPresent([String].self, forKey: .levers) ?? []
     }
 }
 
@@ -777,6 +823,9 @@ public struct WorldAlert: Codable, Sendable, Equatable, Identifiable {
     public enum Kind: String, Codable, Sendable, Equatable, CaseIterable, UnknownDecodable {
         case cost
         case checkpointStale
+        /// Every application stopped and spending still over: the kernel
+        /// has reached the instance floor, and names what is left.
+        case atFloor
         case sealed
         case denied
         case unattributedDenials

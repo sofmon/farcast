@@ -244,8 +244,17 @@ public final class WorldModel {
     }
 
     /// Narrower than this on screen, a panel shows a glance, not its app. A
-    /// focused app is always drawn at least this wide, on any screen.
-    var fullPanelWidth: CGFloat { min(320, focusedPanelWidth * 0.95) }
+    /// focused app is drawn at least this wide on any screen that has room
+    /// for `leastFullPanelWidth` — every phone, and a Mac window no smaller
+    /// than `WorldScreen.minimumWindow`. On a smaller one, a focused app is a
+    /// glance: a panel is never drawn whole where its figures would be cut.
+    var fullPanelWidth: CGFloat { max(min(320, focusedPanelWidth * 0.95), Self.leastFullPanelWidth) }
+
+    /// The narrowest a panel is drawn whole, anywhere: a phone on its side.
+    /// At this width the tightest arrangement of FarCast's own surfaces
+    /// keeps every figure whole and leaves the notes their least
+    /// (`PanelWordingTests.figuresFit`).
+    static let leastFullPanelWidth: CGFloat = 280
 
     func frame(of target: Target) -> CGRect? {
         switch target {
@@ -662,7 +671,8 @@ public final class WorldModel {
         case refused
         /// Only decided-but-not-built lines reach it.
         case planned
-        /// Declared, never used.
+        /// Declared, and no use counted: never used where the network was
+        /// read, its use not read where it was not.
         case declared
         /// No line reaches it at all.
         case unconnected

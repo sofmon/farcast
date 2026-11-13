@@ -7,9 +7,10 @@
 // nothing happening in it, and the cost guard would go quiet at precisely the
 // moment it mattered.
 //
-// It holds no state of its own beyond the ledger it accrues into: declared
-// intent lives on the workloads as labels, observed state is read fresh every
-// tick, and nothing is cached between them.
+// It holds no state of its own beyond the ledger it accrues into and the
+// record of what it stopped: declared intent lives on the workloads as
+// labels, observed state is read fresh every tick, and nothing is cached
+// between them.
 //
 // [ADR 0009]: ../../docs/adr/0009-technocore-kernel-and-cost-metering.md
 package kernel
@@ -180,6 +181,14 @@ type Reconciler struct {
 	// kernel's own figures rather than a second model of them.
 	Observed Observation
 
+	// Stops are the workloads a cost shutdown scaled to zero and nobody has
+	// brought back, and Floor is set while the kernel is at the instance
+	// floor. Both are exported for the same reason Last is: the checkpoint
+	// carries them across a restart, so a report can still say why an
+	// application is stopped after the kernel that stopped it has gone.
+	Stops []Stop
+	Floor *Floor
+
 	// Usage accumulates what workloads actually consume, as opposed to what
 	// they reserve. Nil turns collection off entirely, and everything else
 	// here behaves identically — nothing in the cost path reads it.
@@ -332,6 +341,7 @@ type Report struct {
 	//
 	// RateHourlyUSD includes the instance's overhead; RateByTier and
 	// RateByApp never do — overhead belongs to no workload and no application.
+	// RateByApp is keyed by AppKey, as the ledger is.
 	RateHourlyUSD float64
 	RateByTier    map[tier.Tier]float64
 	RateByApp     map[string]float64
@@ -341,6 +351,10 @@ type Report struct {
 	// Targets are the deployments this tick saw, with the cost of the pods
 	// each one claims.
 	Targets []Target
+
+	// listed is every namespace whose Deployments this tick listed: where a
+	// Deployment that is not among the Targets is gone, rather than unseen.
+	listed map[string]bool
 
 	// UsageSampled counts pod readings folded into the profiles this tick.
 	// UsageRepeated counts readings the metrics server had not refreshed
@@ -472,7 +486,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, now time.Time) (Report, erro
 			rep.Workloads = append(rep.Workloads, w)
 			rep.RateHourlyUSD += w.HourlyUSD
 			rep.RateByTier[w.Tier] += w.HourlyUSD
-			rep.RateByApp[w.App] += w.HourlyUSD
+			rep.RateByApp[AppKey(w.Namespace, w.App)] += w.HourlyUSD
 		}
 	}
 
@@ -489,6 +503,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, now time.Time) (Report, erro
 	if err := r.collectTargets(ctx, &rep); err != nil {
 		return Report{}, err
 	}
+	// A stop is over once the cluster shows it — running again, or gone —
+	// or once its namespace is no longer the kernel's to watch.
+	r.pruneStops(rep)
 	r.observeCarrier(ctx, &rep)
 
 	// After the workloads are known and before anything is accrued: a
@@ -502,8 +519,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, now time.Time) (Report, erro
 	rep.Reconstructed = r.Interval > 0 && billed > 2*r.Interval
 
 	if billed > 0 {
+		// By namespace and name. The name alone would add two namespaces'
+		// "web" together, and neither share could be told apart.
 		for _, w := range rep.Workloads {
-			r.Ledger.Accrue(now, w.App, w.HourlyUSD, billed)
+			r.Ledger.Accrue(now, AppKey(w.Namespace, w.App), w.HourlyUSD, billed)
 		}
 		// A reconstructed gap assumes the carrier stood throughout, as it
 		// assumes the observed Pods did.
@@ -516,6 +535,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, now time.Time) (Report, erro
 	rep.Accrual = r.Ledger.Accrued()
 	_, periodEnd := r.Ledger.Period()
 	rep.Assessment = cost.Assess(rep.Accrual.Total, r.Limit, rep.RateHourlyUSD, now, periodEnd)
+	r.observeFloor(rep)
 	r.Observed = Observation{
 		At:            now,
 		Pods:          len(rep.Workloads),
@@ -580,12 +600,14 @@ func safeNamespaceError(err error) string {
 }
 
 func (r *Reconciler) collectTargets(ctx context.Context, rep *Report) error {
+	rep.listed = map[string]bool{}
 	for _, ns := range rep.Metered {
 		deps, err := r.Cluster.ListDeployments(ctx, ns, r.Selector)
 		if err != nil {
 			rep.Unreachable = append(rep.Unreachable, fmt.Sprintf("%s (deployments): %v", ns, safeNamespaceError(err)))
 			continue
 		}
+		rep.listed[ns] = true
 		for _, d := range deps {
 			t := Target{
 				Namespace:   ns,

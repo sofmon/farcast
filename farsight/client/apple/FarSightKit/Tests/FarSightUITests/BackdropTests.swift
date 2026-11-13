@@ -16,8 +16,9 @@ import FarSightCore
 /// and the gates' and instances' on chips over the backdrop, a group's text,
 /// the app strip's repo names on chips over anything the map shows, each
 /// spending level's colour on an instance's chip, a host's or device's card
-/// border against its card — by health and by alert — and an app's state
-/// colour on its card. So the contract is checked against every colour
+/// border against its card — by health and by alert — an app's state
+/// colour on its card, and the text on a FarCast component's opaque panel
+/// and its disclosures. So the contract is checked against every colour
 /// under the cap, not only the colours of today's backdrop, and the backdrop
 /// is checked against the cap on its own.
 ///
@@ -261,6 +262,15 @@ struct BackdropTests {
             ("operator device", Theme.focus), ("keeper device", Theme.keeper), ("unhealthy device", Theme.warning),
             ("warning alert", Theme.severity(.warning)), ("critical alert", Theme.severity(.critical)),
         ] + devices + AppState.allCases.map { ("app \($0.label)", Theme.state($0)) }
+        // A FarCast component's surface, opaque on its panel: its figures in
+        // their tones, its labels and notes, what the read could not say,
+        // and the "more" that opens the rest — and the same in what "more"
+        // and the instance chip's disclosure open.
+        let panelText: [(String, Color)] = [
+            ("text", Theme.text), ("secondary text", Theme.secondaryText), ("problem", Theme.warning),
+            ("more", Theme.focus), ("critical", Theme.critical), ("observed", Theme.observed), ("declared", Theme.declared),
+            ("refused", Theme.denied), ("storage", Theme.storage),
+        ] + Spending.Level.allCases.map { ("spending, \($0.rawValue)", Theme.level($0)) }
 
         // Lines crossing the open backdrop: egress to hosts, tunnels and
         // keepers from devices. Lines inside a wall: all kinds. Labels on
@@ -274,6 +284,7 @@ struct BackdropTests {
             ("a chip in the app strip", stripChip, [("repo name", Theme.text)], 4.5),
             ("a group's surface", groups, groupText, 4.5),
             ("a card", card, cardBorders, 3.0),
+            ("a panel", card, panelText, 4.5),
         ] as [(String, Double, [(String, Color)], Double)] {
             for (name, color) in foreground {
                 let y = Light.luminance(Paint(color).rgb)

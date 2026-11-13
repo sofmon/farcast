@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/fatline/event"
 	tcdeploy "github.com/sofmon/farcast/technocore/deploy"
+	"github.com/sofmon/farcast/technocore/kernel"
 )
 
 // The second half of the world builder: hosts and the lines to them, the
@@ -262,6 +264,12 @@ func (b *worldBuilder) raiseAlerts() {
 			b.alert("checkpoint_stale", severityCritical, alertSubject{Component: roleKernel}, "",
 				"The kernel has not checkpointed for more than 15 minutes")
 		}
+		// ADR 0009 decision 8. The cost alert says where spending stands;
+		// this one says the kernel has run out of things it may stop, and
+		// names what is left, which it never takes.
+		if f := s.Floor; f != nil {
+			b.alert("at_floor", severityCritical, alertSubject{Component: roleKernel}, "", floorTitle(f.Levers))
+		}
 	}
 
 	b.sealedAlert()
@@ -302,7 +310,7 @@ func (b *worldBuilder) raiseAlerts() {
 		for _, a := range g.Apps {
 			if a.State == stateStarting {
 				b.alert("not_ready", severityWarning, alertSubject{App: tenantOf(ns, a.Name)}, "",
-					fmt.Sprintf("%s has %d of %d replicas ready", tenantOf(ns, a.Name), *a.Ready, *a.Desired))
+					fmt.Sprintf("%s has %d of %s ready", tenantOf(ns, a.Name), *a.Ready, plural(*a.Desired, "replica", "replicas")))
 			}
 		}
 		if g.Metered != nil && !*g.Metered {
@@ -350,6 +358,20 @@ func (b *worldBuilder) raiseAlerts() {
 	}
 }
 
+// floorTitle is the at_floor alert's title, naming the levers the kernel
+// recorded.
+func floorTitle(levers []string) string {
+	said := make([]string, 0, len(levers))
+	for _, l := range levers {
+		said = append(said, kernel.LeverText(l))
+	}
+	title := "Every application is stopped and spending is still over the limit"
+	if len(said) == 0 {
+		return title
+	}
+	return title + "; what is left is to " + strings.Join(said, ", or ") + ", which the kernel leaves to you"
+}
+
 // sealedAlert is raised when any replica that answered holds no key material.
 func (b *worldBuilder) sealedAlert() {
 	if b.in.Seal.Skipped || b.in.Seal.Problem != nil {
@@ -369,7 +391,7 @@ func (b *worldBuilder) sealedAlert() {
 		return
 	}
 	total := len(b.in.Seal.Replicas)
-	title := fmt.Sprintf("Storage is sealed on %d of %d replicas", sealed, total)
+	title := fmt.Sprintf("Storage is sealed on %d of %s", sealed, plural(total, "replica", "replicas"))
 	if held > 0 {
 		title += fmt.Sprintf(", %d under an operator hold", held)
 	}

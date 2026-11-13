@@ -97,6 +97,12 @@ func runStart(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		return 2
 	}
 	if fs.NArg() > 0 {
+		if name := fs.Arg(0); rehearsal.ValidScenario(name) {
+			// A scenario name where a command goes: say the command that
+			// switches to it, with the directory filled in when it was given.
+			_, _ = io.WriteString(stderr, scenarioHint(name, *dir))
+			return 2
+		}
 		_, _ = fmt.Fprintf(stderr, "farcast-rehearsal: unknown command %q\n", fs.Arg(0))
 		printUsage(stderr)
 		return 2
@@ -149,6 +155,23 @@ func runStart(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	}
 	_, _ = fmt.Fprintf(stdout, "stopped; remove %s when done\n", rehearsal.ShellQuote(rig.Dir))
 	return 0
+}
+
+// scenarioHint is what a scenario name given as a command gets: the scenario
+// command that switches a running rehearsal to it, and the flag that starts a
+// new one showing it. dir is the --dir given, if any, which fills the command
+// in.
+func scenarioHint(name, dir string) string {
+	where := "<dir>"
+	if dir != "" {
+		where = rehearsal.ShellQuote(dir)
+	}
+	hint := fmt.Sprintf("farcast-rehearsal: %q is a scenario, not a command. To switch a running rehearsal to it:\n"+
+		"  farcast-rehearsal scenario --dir %s %s\n", name, where, name)
+	if dir == "" {
+		hint += "<dir> is the state directory the harness printed when it started.\n"
+	}
+	return hint + fmt.Sprintf("To start a new rehearsal showing it: farcast-rehearsal --scenario %s\n", name)
 }
 
 // farcastVersionArgs is the app's own version argv (testdata/app/argv.json)

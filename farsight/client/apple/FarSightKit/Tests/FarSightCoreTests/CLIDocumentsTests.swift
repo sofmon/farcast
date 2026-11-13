@@ -199,7 +199,7 @@ struct CLIDocumentsTests {
         default: doc.recorded = value
         }
         let instance = try #require(try doc.world().instances.first)
-        #expect(instance.problems == [SectionProblem(section: .spend, kind: .internal, message: message)])
+        #expect(instance.problems == [SectionProblem(section: .figures, kind: .internal, message: message)])
         let spending = instance.spending
         switch field {
         case "expected": #expect(spending.expectedCents == nil)
@@ -209,18 +209,61 @@ struct CLIDocumentsTests {
         }
     }
 
+    @Test("with both cost limits figures the map cannot draw, the read still lands: the figures are said, the section was read")
+    func bothLimitsNotDrawn() throws {
+        var doc = Doc()
+        doc.limit = "0"
+        doc.recorded = "-1"
+        let instance = try #require(try doc.world().instances.first)
+        #expect(instance.problems.map(\.section) == [.figures, .figures])
+        #expect(instance.problem(in: .spend) == nil)
+        #expect(instance.problems.map(\.sentence) == ["spending figure not drawn · out of range", "spending figure not drawn · out of range"])
+    }
+
     @Test("an app's figure the map cannot draw becomes a problem, and the app says it has none")
     func appFigure() throws {
         var doc = Doc()
         doc.groups = #"[{"namespace":"shop","metered":true,"provenance":null,"apps":[{"name":"api","state":"running","ready":-1,"desired":2,"stopped_by":"cost_guard","month_cents":-3},{"name":"web","state":"stopped","stopped_by":"operator","month_cents":null}]}]"#
         let instance = try #require(try doc.world().instances.first)
-        #expect(instance.problems == [SectionProblem(section: .spend, kind: .internal, message: "shop/api's spending this month is not one: -3 cents")])
+        #expect(instance.problems == [SectionProblem(section: .figures, kind: .internal, message: "shop/api's spending this month is not one: -3 cents")])
         let api = try #require(instance.groups.last?.apps.first)
         #expect(api.monthCents == nil && api.costNote == "not a figure the map can draw")
         #expect(api.ready == nil && api.desired == 2 && api.role == "running")
         #expect(api.stopReason == "stopped by the cost guard")
-        #expect(instance.groups.last?.apps.last?.stopReason == "stopped by operator")
+        // The kernel's one reason is the only one said; any other word on
+        // the wire leaves the app plainly "stopped".
+        #expect(instance.groups.last?.apps.last?.stopReason == nil)
         #expect(instance.groups.last?.apps.last?.costNote == "not told apart from an app of the same name")
+    }
+
+    @Test("the floor: levers in the map's words, an unknown one as written, and a figure it cannot draw a problem")
+    func floor() throws {
+        var doc = Doc()
+        doc.spend = #"{"read":true,"currency":"USD","period":"monthly","total_cents":2269,"expected_cents":1805,"confirmed_cents":464,"has_confirmation":true,"confirmed_through":"2026-11-08T00:00:00Z","limit_cents":5000,"recorded_limit_cents":5000,"level":"reached","checkpoint_stale":false,"at_floor":true,"floor":{"since":"2026-11-12T08:30:00Z","still_burning_month_cents":-1,"levers":["drop_carrier","sell_the_house","release_instance"]},"not_metered":null,"caveats":null}"#
+        doc.alerts = #"[{"id":"at_floor:component:kernel","kind":"at_floor","severity":"critical","subject":{"component":"kernel"},"title":"t"},{"id":"x:instance","kind":"something_new","severity":"loud","subject":{"instance":true},"title":"t"}]"#
+        let world = try doc.world()
+        let instance = try #require(world.instances.first)
+        let floor = try #require(instance.spending.floor)
+        #expect(floor.levers == ["drop the load-balancer carrier", "sell_the_house", "release the instance"])
+        #expect(floor.stillBurningMonthCents == nil)
+        #expect(instance.problems == [SectionProblem(section: .figures, kind: .internal, message: "what still burns at the floor is not one: -1 cents")])
+        #expect(instance.spending.atFloor == true)
+        #expect(world.alerts.map(\.kind) == [.atFloor, .unknown])
+        #expect(world.alerts.map(\.severity) == [.critical, .warning])
+    }
+
+    @Test("at_floor: null from a kernel that records no floor, false from one that does, absent from an older CLI")
+    func atFloorStates() throws {
+        func spend(_ atFloor: String) -> String {
+            #"{"read":true,"currency":"USD","period":"monthly","total_cents":10,"expected_cents":10,"confirmed_cents":null,"has_confirmation":false,"confirmed_through":null,"limit_cents":5000,"recorded_limit_cents":5000,"level":"ok","checkpoint_stale":false,\#(atFloor)"not_metered":null,"caveats":null}"#
+        }
+        for (field, want) in [(#""at_floor":null,"floor":null,"#, Bool?.none), (#""at_floor":false,"floor":null,"#, false), ("", nil)] {
+            var doc = Doc()
+            doc.spend = spend(field)
+            let spending = try #require(try doc.world().instances.first).spending
+            #expect(spending.atFloor == want, "\(field)")
+            #expect(spending.floor == nil)
+        }
     }
 
     @Test("spending read with no recorded limit is a problem with the record, and the world validates")

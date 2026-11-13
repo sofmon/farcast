@@ -171,8 +171,14 @@ type worldDoc struct {
 			HasConfirmation bool   `json:"has_confirmation"`
 			ConfirmedCents  *int64 `json:"confirmed_cents"`
 			ExpectedCents   int64  `json:"expected_cents"`
+			TotalCents      int64  `json:"total_cents"`
+			LimitCents      *int64 `json:"limit_cents"`
 			CheckpointStale bool   `json:"checkpoint_stale"`
 			Level           string `json:"level"`
+			AtFloor         *bool  `json:"at_floor"`
+			Floor           *struct {
+				Levers []string `json:"levers"`
+			} `json:"floor"`
 		} `json:"spend"`
 		Network struct {
 			Read            bool    `json:"read"`
@@ -208,6 +214,7 @@ type alert struct {
 	Kind     string         `json:"kind"`
 	Severity string         `json:"severity"`
 	Subject  map[string]any `json:"subject"`
+	Title    string         `json:"title"`
 }
 
 type section struct {
@@ -468,6 +475,10 @@ func TestScenariosShowInWorld(t *testing.T) {
 	if !critical || !stopped || doc.Instance.Spend.Level != "reached" {
 		t.Errorf("cost-reached: alerts %+v, groups %+v", doc.Alerts, doc.Groups)
 	}
+	// A kernel at its limit is one whose spending is over it (phase 7, F6).
+	if s := doc.Instance.Spend; s.LimitCents == nil || s.TotalCents < *s.LimitCents {
+		t.Errorf("cost-reached: total %d cents against a limit of %v; a kernel at its limit is over it", s.TotalCents, s.LimitCents)
+	}
 
 	set(rehearsal.ScenarioSignedOut)
 	doc = world(t, rig, argv)
@@ -510,6 +521,57 @@ func TestScenariosShowInWorld(t *testing.T) {
 	for _, s := range []string{"spend", "apps", "policy", "network", "seal"} {
 		if got := doc.sectionKind(s); got != "read" {
 			t.Errorf("denied: section %s is %s, want read", s, got)
+		}
+	}
+}
+
+// TestTheAtFloorScenarioShowsWhatTheKernelRecorded reads the scenario the
+// map's cost-guard label, floor alert and levers are walked with: both
+// applications stopped by the kernel and recorded, and the floor reached.
+// cost-reached stays the kernel that recorded nothing, so the two read apart.
+func TestTheAtFloorScenarioShowsWhatTheKernelRecorded(t *testing.T) {
+	rig := startRig(t, rehearsal.Options{})
+	argv := loadArgv(t)
+	asTheApp(t, rig)
+	if err := rehearsal.SetScenario(rig.Dir, rehearsal.ScenarioAtFloor); err != nil {
+		t.Fatal(err)
+	}
+	doc := world(t, rig, argv)
+
+	for _, g := range doc.Groups {
+		if g.Namespace != "shop" {
+			continue
+		}
+		for _, a := range g.Apps {
+			if a.State != "stopped" || a.StoppedBy == nil || *a.StoppedBy != "cost_guard" {
+				t.Errorf("shop/%s: state %s, stopped_by %v; want stopped by the cost guard", a.Name, a.State, a.StoppedBy)
+			}
+		}
+	}
+	s := doc.Instance.Spend
+	if s.Level != "reached" || s.AtFloor == nil || !*s.AtFloor || s.Floor == nil ||
+		!slices.Equal(s.Floor.Levers, []string{"drop_carrier", "release_instance"}) {
+		t.Errorf("spend: level %s, at_floor %v, floor %+v", s.Level, s.AtFloor, s.Floor)
+	}
+	if s.LimitCents == nil || s.TotalCents < *s.LimitCents {
+		t.Errorf("spend: total %d cents against a limit of %v; at the floor, spending is still over the limit", s.TotalCents, s.LimitCents)
+	}
+	floor, costAlert := false, false
+	for _, a := range doc.Alerts {
+		switch a.Kind {
+		case "at_floor":
+			floor = a.Severity == "critical" && a.Subject["component"] == "kernel" &&
+				strings.Contains(a.Title, "release the instance")
+		case "cost":
+			costAlert = a.Severity == "critical"
+		}
+	}
+	if !floor || !costAlert {
+		t.Errorf("alerts %+v; want the critical at_floor alert on the kernel naming its levers, beside the cost alert", doc.Alerts)
+	}
+	for _, sec := range []string{"spend", "apps", "policy", "network", "seal"} {
+		if got := doc.sectionKind(sec); got != "read" {
+			t.Errorf("section %s is %s, want read", sec, got)
 		}
 	}
 }
@@ -1224,6 +1286,59 @@ func TestLedgerIgnoresTheCalendar(t *testing.T) {
 	if _, err := rehearsal.Start(t.Context(), rehearsal.Options{Dir: rig.Dir, Home: home, Tools: testBinary(t)}); err == nil ||
 		!strings.Contains(err.Error(), "older than its 30-day period") {
 		t.Errorf("a restart of an expired rehearsal: %v", err)
+	}
+}
+
+// TestTheLevelIsTheLedgersOwn: on every read of a rehearsal's life, every
+// scenario's level is what the kernel's own assessment makes of its ledger —
+// never a level set beside a total that contradicts it (phase 7, F6). The
+// scenarios at the limit are over it from their first read to their last,
+// with the calibration still exactly one; every other scenario is well under.
+func TestTheLevelIsTheLedgersOwn(t *testing.T) {
+	s := spec(t)
+	args := []string{"get", "configmap", kernel.DefaultCheckpointName, "-n", fldeploy.DefaultNamespace, "--ignore-not-found", "-o", "json"}
+	for _, name := range rehearsal.Scenarios() {
+		s.Scenario = name
+		// A rehearsal lives between 24 and 25 days: its period starts at the
+		// midnight five days before it did.
+		for _, after := range []time.Duration{0, time.Hour, 12 * 24 * time.Hour, 24 * 24 * time.Hour} {
+			now := s.Started.Add(after)
+			out, ok := rehearsal.ClusterAnswer(s, args, now)
+			if !ok {
+				t.Fatalf("%s, %s in: no checkpoint", name, after)
+			}
+			var cm struct {
+				Data map[string]string `json:"data"`
+			}
+			var cp kernel.Checkpoint
+			if err := json.Unmarshal(out, &cm); err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal([]byte(cm.Data[kernel.CheckpointKey()]), &cp); err != nil {
+				t.Fatal(err)
+			}
+			ledger, err := cost.Restore(cp.Ledger)
+			if err != nil {
+				t.Fatal(err)
+			}
+			a := ledger.Accrued()
+			if a.Calibration != 1 || len(a.Discrepancies) != 0 {
+				t.Errorf("%s, %s in: calibration %v, discrepancies %v", name, after, a.Calibration, a.Discrepancies)
+			}
+			_, end := ledger.Period()
+			if want := cost.Assess(a.Total, cp.Observed.Limit, cp.Observed.RateHourlyUSD, now, end).Level.String(); cp.Observed.Level != want {
+				t.Errorf("%s, %s in: level %q, and the ledger assesses %q", name, after, cp.Observed.Level, want)
+			}
+			atLimit := name == rehearsal.ScenarioCostReached || name == rehearsal.ScenarioAtFloor
+			switch {
+			case cp.Observed.Limit != 50:
+				t.Errorf("%s, %s in: limit %v, want the record's 50", name, after, cp.Observed.Limit)
+			case atLimit && (a.Total < cp.Observed.Limit || cp.Observed.Level != cost.LevelReached.String()):
+				t.Errorf("%s, %s in: total %.2f of %v, level %q; a kernel at its limit is over it", name, after, a.Total, cp.Observed.Limit, cp.Observed.Level)
+			case !atLimit && cp.Observed.Level != cost.LevelOK.String():
+				t.Errorf("%s, %s in: level %q, total %.2f; only the scenarios at the limit approach it", name, after, cp.Observed.Level, a.Total)
+			}
+		}
 	}
 }
 

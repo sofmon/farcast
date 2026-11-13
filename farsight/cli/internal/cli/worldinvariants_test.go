@@ -18,6 +18,7 @@ import (
 var arrayKeys = map[string]bool{
 	"groups": true, "hosts": true, "lines": true, "devices": true, "alerts": true, "apps": true,
 	"ports": true, "components": true, "seen_as": true, "not_metered": true, "caveats": true, "instances": true,
+	"levers": true,
 }
 
 func walkJSON(t *testing.T, path string, v any, visit func(path, key string, v any)) {

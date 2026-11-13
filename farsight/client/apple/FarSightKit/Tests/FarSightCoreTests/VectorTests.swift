@@ -10,12 +10,13 @@ struct VectorTests {
     /// Every world vector present today. A new one in Go fails here until it
     /// gains an expectation.
     static let worldVectors = [
-        "account_in_message.json", "checkpoint_version_skew.json", "cost_reached_stopped_apps.json", "drift.json",
+        "account_in_message.json", "at_floor.json", "checkpoint_version_skew.json", "cost_guard_stop.json",
+        "cost_reached_stopped_apps.json", "drift.json",
         "error_gcloud_mismatch.json", "error_not_found.json", "healthy.json", "host_cap_exceeded.json",
-        "hostile_host_name.json", "keepers.json", "mixed_evidence.json", "never_connected.json", "no_kernel.json",
-        "nothing_read.json", "release_incomplete.json", "removed_app_violation.json", "sealed_replica.json",
-        "shared_app_name.json", "stale_checkpoint.json", "system_namespace_rows.json", "tunnel_down.json",
-        "unattributed_denial.json", "unmetered_namespace.json",
+        "hostile_host_name.json", "keepers.json", "legacy_bare_keys.json", "mixed_evidence.json", "never_connected.json",
+        "no_kernel.json", "nothing_read.json", "release_incomplete.json", "removed_app_violation.json", "sealed_replica.json",
+        "shared_app_name.json", "shared_app_name_namespaced.json", "stale_checkpoint.json", "stale_stop_record.json",
+        "system_namespace_rows.json", "tunnel_down.json", "unattributed_denial.json", "unmetered_namespace.json",
     ]
 
     /// A world vector, read as the app reads `atlas`, and checked as the
@@ -301,6 +302,20 @@ struct VectorTests {
         #expect(!world.connections.contains { $0.kind == .tunnel })
     }
 
+    @Test("tunnel_down: a line only declared says its use was not read, and its host likewise, never unused")
+    func tunnelDownDeclaredUse() throws {
+        let world = try Self.world("tunnel_down")
+        for host in ["api.stripe.com", "sentry.io"] {
+            #expect(try Self.line(world, to: host).label == "declared · use not read", "\(host)")
+            #expect(world.hosts.first { $0.name == host }?.note == "declared by shop/api, use not read", "\(host)")
+        }
+        #expect(!world.connections.contains { $0.label.contains("unused") })
+        #expect(!world.hosts.contains { $0.note.contains("never used") })
+        // Read, and nothing counted: unused, as before.
+        let healthy = try Self.world("healthy")
+        #expect(try Self.line(healthy, to: "sentry.io").label == "declared · unused")
+    }
+
     @Test("cost_reached_stopped_apps: a critical cost alert, and the stopped apps as the vector has them")
     func costReachedStoppedApps() throws {
         let world = try Self.world("cost_reached_stopped_apps")
@@ -311,6 +326,70 @@ struct VectorTests {
         #expect(shop.apps.allSatisfy { $0.state == .stopped && $0.stopReason == nil })
         #expect(try Self.instance(world).spending.level == .reached)
         #expect(try Self.instance(world).spending.caveats.count == 1)
+    }
+
+    @Test("cost_guard_stop: the app the kernel recorded stopping says the cost guard; one it did not, no reason")
+    func costGuardStop() throws {
+        let instance = try Self.instance(Self.world("cost_guard_stop"))
+        let shop = try #require(instance.groups.first { $0.namespace == "shop" })
+        let api = try #require(shop.apps.first { $0.name == "api" })
+        let web = try #require(shop.apps.first { $0.name == "web" })
+        #expect(api.state == .stopped && api.stopReason == "stopped by the cost guard")
+        #expect(web.state == .stopped && web.stopReason == nil)
+        #expect(instance.spending.atFloor == false && instance.spending.floor == nil)
+        #expect(instance.spending.level == .reached)
+    }
+
+    @Test("stale_stop_record: a record for an app running again labels nothing")
+    func staleStopRecord() throws {
+        let world = try Self.world("stale_stop_record")
+        let apps = try Self.instance(world).groups.flatMap(\.apps).filter { $0.system == nil }
+        #expect(!apps.isEmpty)
+        #expect(apps.allSatisfy { $0.state == .running && $0.stopReason == nil })
+        #expect(world.alerts.isEmpty)
+    }
+
+    @Test("at_floor: the floor on TechnoCore, critical, with what still burns and the levers")
+    func atFloor() throws {
+        let world = try Self.world("at_floor")
+        let instance = try Self.instance(world)
+        let spending = instance.spending
+        #expect(spending.atFloor == true)
+        let floor = try #require(spending.floor)
+        #expect(floor.since == Date(timeIntervalSince1970: 1_794_472_200))
+        #expect(floor.stillBurningMonthCents == 5703)
+        #expect(floor.levers == ["drop the load-balancer carrier", "release the instance"])
+        let alert = try #require(world.alerts.first { $0.kind == .atFloor })
+        #expect(alert.severity == .critical)
+        #expect(alert.subject == .app(Self.technocore))
+        #expect(alert.id == "atlas/at_floor:component:kernel")
+        #expect(alert.title.contains("drop the load-balancer carrier, or release the instance"))
+        // The cost alert keeps its own rule beside it.
+        #expect(world.alerts.contains { $0.kind == .cost && $0.severity == .critical })
+        let shop = try #require(instance.groups.first { $0.namespace == "shop" })
+        #expect(shop.apps.allSatisfy { $0.state == .stopped && $0.stopReason == "stopped by the cost guard" })
+    }
+
+    @Test("legacy_bare_keys: an older kernel's checkpoint reads, each figure its app's, and its silence is said")
+    func legacyBareKeys() throws {
+        let instance = try Self.instance(Self.world("legacy_bare_keys"))
+        #expect(instance.problem(in: .spend) == nil)
+        #expect(instance.spending.atFloor == nil && instance.spending.floor == nil)
+        let api = try #require(instance.groups.flatMap(\.apps).first { $0.id == "atlas/shop/api" })
+        #expect(api.monthCents == 825 && api.costNote == nil)
+        #expect(instance.spending.caveats.count == 2)
+        #expect(instance.spending.caveats.contains { $0.contains("before the kernel recorded namespaces") })
+        #expect(instance.spending.caveats.contains { $0.contains("keeps no record of what it stops") })
+    }
+
+    @Test("shared_app_name_namespaced: two namespaces' web, each with its own figure")
+    func sharedAppNameNamespaced() throws {
+        let instance = try Self.instance(Self.world("shared_app_name_namespaced"))
+        let webs = instance.groups.flatMap(\.apps).filter { $0.name == "web" }
+        #expect(webs.map(\.id) == ["atlas/blog/web", "atlas/shop/web"])
+        #expect(webs.map(\.monthCents) == [309, 206])
+        #expect(webs.allSatisfy { $0.costNote == nil })
+        #expect(instance.spending.caveats.isEmpty)
     }
 
     @Test("no_kernel: spending not read, so no app has a figure, and says why")

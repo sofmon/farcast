@@ -686,3 +686,97 @@ func TestTheRenderedWorkloadLimitsKeepersToTheKeyholder(t *testing.T) {
 		t.Errorf("want exactly %q among the keeper routes:\n%s", want, rendered)
 	}
 }
+
+// The kernel keys profiles by namespace and name, as it keys spending. The
+// report names each application the same way in both tables — the profile
+// and the advice beside it — and splits the key in JSON, so one report never
+// names one application two ways.
+func TestUsageNamesEachProfileByNamespaceAsTheAdviceDoes(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	meteringInstance(t, dir, "p51")
+	at := time.Date(2026, 9, 9, 12, 30, 0, 0, time.UTC)
+	store := usage.New(24)
+	for _, ns := range []string{"shop", "blog"} {
+		store.Record(at, kernel.AppKey(ns, "web"), []usage.PodUsage{
+			{Pod: "web-1", CPUMilli: 40, MemMiB: 100, RequestCPUMilli: 500, RequestMemMiB: 512},
+		})
+	}
+	raw, err := json.Marshal(kernel.Profiles{
+		Version: kernel.ProfilesVersion, At: at, Store: store.Snapshot(),
+		Advice: []kernel.Adaptation{{
+			Namespace: "blog", Deployment: "web", Replicas: 1,
+			Advice: adapt.Advice{App: "web", CurrentCPUMilli: 500, CurrentMemMiB: 512, CPUMilli: 500, MemMiB: 512,
+				Hold: "only 1 readings so far"},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	shown := runUsage(t, dir, string(raw), output.ModeHuman)
+	profiles, advice, ok := strings.Cut(shown, "Right-sizing")
+	if !ok {
+		t.Fatalf("no advice section:\n%s", shown)
+	}
+	if !strings.Contains(profiles, "shop/web") || !strings.Contains(profiles, "blog/web") || !strings.Contains(advice, "blog/web") {
+		t.Errorf("an application is not named by namespace in both tables:\n%s", shown)
+	}
+	if strings.Contains(shown, profileNote) {
+		t.Errorf("namespaced profiles carry the legacy note:\n%s", shown)
+	}
+
+	var res struct {
+		Apps []struct {
+			Namespace string `json:"namespace"`
+			App       string `json:"app"`
+			Note      string `json:"note"`
+			Pods      int    `json:"pods"`
+		} `json:"apps"`
+	}
+	js := runUsage(t, dir, string(raw), output.ModeJSON)
+	if err := json.Unmarshal([]byte(js), &res); err != nil {
+		t.Fatalf("%v:\n%s", err, js)
+	}
+	got := map[string]string{}
+	for _, a := range res.Apps {
+		if a.App != "web" || a.Note != "" || a.Pods != 1 {
+			t.Errorf("app %+v: want the bare name web, one pod, no note", a)
+		}
+		got[a.Namespace] = a.App
+	}
+	if len(got) != 2 || got["shop"] != "web" || got["blog"] != "web" {
+		t.Errorf("apps = %+v, want web in shop and in blog", res.Apps)
+	}
+}
+
+// A kernel not yet updated writes version 1, with each profile under the
+// bare name. This report reads it — it only shows it, and the kernel that
+// acts on profiles discards it — naming each as written, and saying so.
+func TestUsageReadsAnOlderKernelsProfilesByTheirBareNames(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	meteringInstance(t, dir, "p51")
+	at := time.Date(2026, 9, 9, 12, 30, 0, 0, time.UTC)
+	store := usage.New(24)
+	store.Record(at, "api", []usage.PodUsage{{Pod: "api-1", CPUMilli: 40, MemMiB: 100, RequestCPUMilli: 500, RequestMemMiB: 512}})
+	raw, err := json.Marshal(kernel.Profiles{Version: 1, At: at, Store: store.Snapshot()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	shown := runUsage(t, dir, string(raw), output.ModeHuman)
+	if !strings.Contains(shown, "api *") || !strings.Contains(shown, profileNote) {
+		t.Errorf("a version 1 profile is not shown by its bare name with the note:\n%s", shown)
+	}
+	var res struct {
+		Apps []struct {
+			Namespace *string `json:"namespace"`
+			App       string  `json:"app"`
+			Note      string  `json:"note"`
+		} `json:"apps"`
+	}
+	if err := json.Unmarshal([]byte(runUsage(t, dir, string(raw), output.ModeJSON)), &res); err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Apps) != 1 || res.Apps[0].Namespace == nil || *res.Apps[0].Namespace != "" || res.Apps[0].App != "api" || res.Apps[0].Note != profileNote {
+		t.Errorf("apps = %+v", res.Apps)
+	}
+}

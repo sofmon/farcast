@@ -209,6 +209,46 @@ func TestScenarioCommandLine(t *testing.T) {
 	}
 }
 
+// A scenario name where a command goes is not just "unknown command": it
+// says the scenario command that switches to it (phase 7, F7), with the
+// directory filled in when --dir was given, and starts nothing.
+func TestAScenarioNameAsACommandSaysHowToSwitch(t *testing.T) {
+	ctx := t.Context()
+	for _, name := range rehearsal.Scenarios() {
+		var out, errb bytes.Buffer
+		if code := run(ctx, []string{name}, nil, &out, &errb); code != 2 {
+			t.Errorf("%s: exit %d, want 2", name, code)
+		}
+		want := "farcast-rehearsal scenario --dir <dir> " + name + "\n"
+		if !strings.Contains(errb.String(), want) || strings.Contains(errb.String(), "unknown command") {
+			t.Errorf("%s: stderr %q, want it to hold %q", name, errb.String(), want)
+		}
+		if out.Len() != 0 {
+			t.Errorf("%s: stdout %q", name, out.String())
+		}
+	}
+
+	dir := filepath.Join(t.TempDir(), "a rehearsal")
+	var out, errb bytes.Buffer
+	if code := run(ctx, []string{"--dir", dir, rehearsal.ScenarioSealed}, nil, &out, &errb); code != 2 {
+		t.Errorf("with --dir: exit %d, want 2", code)
+	}
+	want := "farcast-rehearsal scenario --dir " + rehearsal.ShellQuote(dir) + " sealed\n"
+	if !strings.Contains(errb.String(), want) || strings.Contains(errb.String(), "<dir>") {
+		t.Errorf("with --dir: stderr %q, want it to hold %q", errb.String(), want)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Errorf("a scenario name as a command made its directory: %v", err)
+	}
+
+	// Any other word is still an unknown command.
+	errb.Reset()
+	if code := run(ctx, []string{"no-such-command"}, nil, &out, &errb); code != 2 ||
+		!strings.Contains(errb.String(), `unknown command "no-such-command"`) {
+		t.Errorf("an unknown word: exit %d, %q", code, errb.String())
+	}
+}
+
 func TestSummarizeCommand(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join("..", "..", "internal", "cli", "testdata", "world", "healthy.json"))
 	if err != nil {

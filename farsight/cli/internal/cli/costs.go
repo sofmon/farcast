@@ -2,7 +2,7 @@ package cli
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -52,7 +52,14 @@ the limit and is shown on its own, never inside an application's share,
 because no application can be stopped to remove it. Some charges the kernel
 cannot see from inside the cluster at all — carrier data, bucket storage and
 operations, registry storage — and the report names them every time; only
-'confirmed' catches those.`)
+'confirmed' catches those.
+
+Applications are named by namespace and name, as the kernel keys them. A
+figure with no namespace was accrued before the kernel recorded namespaces,
+and is shown as it was kept. It also lists the applications the kernel has
+stopped to contain cost, as it last recorded them, and says when it has
+reached the instance floor: every application stopped and spending still
+over, with the levers that remain — which the kernel names and never takes.`)
 }
 
 func (c *costsCommand) SetFlags(*flag.FlagSet) {}
@@ -114,7 +121,10 @@ func (c *costsCommand) Run(ctx context.Context, env *Env, args []string) error {
 		ObservedAgo:   since(cp.Observed.At),
 		RecordedLimit: meta.CostLimit.Amount,
 		Apps:          appSpend(ledger.ByApp()),
-		Overhead:      appSpend(ledger.ByOverhead()),
+		Overhead:      overheadSpend(ledger.ByOverhead()),
+		RecordsStops:  cp.RecordsStops(),
+		Stops:         cp.Stops,
+		Floor:         cp.Floor,
 	}
 	for _, d := range accrual.Discrepancies {
 		res.Discrepancies = append(res.Discrepancies, d.String())
@@ -123,21 +133,23 @@ func (c *costsCommand) Run(ctx context.Context, env *Env, args []string) error {
 }
 
 // decodeCheckpoint reads the kernel's checkpoint the one way 'costs' and
-// 'world' both read it: decoded, its version checked against this build's,
-// and its ledger restored through the validating path.
+// 'world' both read it: decoded by the kernel's own decoder, its version
+// checked against the range this build reads, and its ledger restored
+// through the validating path.
 //
 // A version this build does not read is marked version_skew, and a value that
 // is not a checkpoint at all kubectl_failed — the read returned something, and
-// it was not what the kernel writes.
+// it was not what the kernel writes. An older kernel's checkpoint is read:
+// its spending is keyed by bare name, and it records no stops.
 func decodeCheckpoint(raw string) (kernel.Checkpoint, *cost.Ledger, error) {
-	var cp kernel.Checkpoint
-	if err := json.Unmarshal([]byte(raw), &cp); err != nil {
-		return cp, nil, withKind(kindKubectlFailed, fmt.Errorf("decode the kernel's ledger: %w", err))
-	}
-	if cp.Version != kernel.CheckpointVersion {
+	cp, err := kernel.DecodeCheckpoint([]byte(raw))
+	if errors.Is(err, kernel.ErrCheckpointVersion) {
 		return cp, nil, withKind(kindVersionSkew, fmt.Errorf(
-			"the kernel wrote ledger version %d and this build reads %d; one of them is older than the other",
-			cp.Version, kernel.CheckpointVersion))
+			"the kernel wrote ledger version %d and this build reads versions %d to %d; one of them is older than the other",
+			cp.Version, kernel.OldestCheckpointVersion, kernel.CheckpointVersion))
+	}
+	if err != nil {
+		return cp, nil, withKind(kindKubectlFailed, fmt.Errorf("decode the kernel's ledger: %w", err))
 	}
 	ledger, err := cost.Restore(cp.Ledger)
 	if err != nil {
@@ -146,13 +158,61 @@ func decodeCheckpoint(raw string) (kernel.Checkpoint, *cost.Ledger, error) {
 	return cp, ledger, nil
 }
 
+// legacyNote is what a figure the kernel keyed by bare name says: it was
+// accrued before the kernel recorded namespaces, and which namespace ran it
+// was never written down.
+const legacyNote = "accrued before the kernel recorded namespaces"
+
+// appSpend splits the ledger's keys into namespace and name. A bare key —
+// from a kernel older than namespaced spending, carried into this period —
+// keeps an empty namespace and says why, rather than being given one.
 func appSpend(byApp map[string]float64) []appCost {
 	out := make([]appCost, 0, len(byApp))
-	for name, usd := range byApp {
+	for key, usd := range byApp {
+		ns, name, qualified := kernel.SplitAppKey(key)
 		if name == "" {
 			name = "(unattributed)"
 		}
-		out = append(out, appCost{Name: name, USD: usd})
+		c := appCost{Namespace: ns, Name: name, USD: usd}
+		if !qualified {
+			c.Note = legacyNote
+		}
+		out = append(out, c)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].USD != out[j].USD {
+			return out[i].USD > out[j].USD
+		}
+		if out[i].Namespace != out[j].Namespace {
+			return out[i].Namespace < out[j].Namespace
+		}
+		return out[i].Name < out[j].Name
+	})
+	return out
+}
+
+// appCost is one application's accrual: by namespace and name, or by name
+// alone with a note when the kernel accrued it before recording namespaces.
+type appCost struct {
+	Namespace string  `json:"namespace"`
+	Name      string  `json:"name"`
+	USD       float64 `json:"usd"`
+	Note      string  `json:"note,omitempty"`
+}
+
+// label is the application as the report names it.
+func (c appCost) label() string {
+	if c.Namespace == "" {
+		return c.Name
+	}
+	return kernel.AppKey(c.Namespace, c.Name)
+}
+
+// overheadSpend is the instance-level charges, which no namespace owns.
+func overheadSpend(byItem map[string]float64) []overheadCost {
+	out := make([]overheadCost, 0, len(byItem))
+	for name, usd := range byItem {
+		out = append(out, overheadCost{Name: name, USD: usd})
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].USD != out[j].USD {
@@ -163,7 +223,7 @@ func appSpend(byApp map[string]float64) []appCost {
 	return out
 }
 
-type appCost struct {
+type overheadCost struct {
 	Name string  `json:"name"`
 	USD  float64 `json:"usd"`
 }
@@ -193,8 +253,20 @@ type costsResult struct {
 	Apps []appCost `json:"apps,omitempty"`
 	// Overhead is the instance-level spending no application owns — today the
 	// load-balancer carrier.
-	Overhead      []appCost `json:"overhead,omitempty"`
-	Discrepancies []string  `json:"discrepancies,omitempty"`
+	Overhead      []overheadCost `json:"overhead,omitempty"`
+	Discrepancies []string       `json:"discrepancies,omitempty"`
+
+	// RecordsStops is false for a checkpoint from a kernel that kept no
+	// record of its stops: there, no stops listed is not "none were made".
+	RecordsStops bool `json:"records_stops"`
+	// Stops are the applications the kernel scaled to zero, as it last
+	// recorded them, each with its reason — today always "cost_guard", the
+	// only reason the kernel has. A record ends when the kernel next sees the
+	// workload running again or gone, so one brought back since the
+	// checkpoint can still be listed.
+	Stops []kernel.Stop `json:"stops,omitempty"`
+	// Floor is set when the kernel has reached the instance floor.
+	Floor *kernel.Floor `json:"floor,omitempty"`
 }
 
 func (r costsResult) Human(w io.Writer) error {
@@ -252,8 +324,16 @@ func (r costsResult) Human(w io.Writer) error {
 
 	if len(r.Apps) > 0 {
 		fprintf(w, "\nBy application:\n")
+		legacy := false
 		for _, app := range r.Apps {
-			fprintf(w, "  %-24s %s %8.2f\n", app.Name, cur, app.USD)
+			mark := ""
+			if app.Namespace == "" {
+				mark, legacy = "  *", true
+			}
+			fprintf(w, "  %-32s %s %8.2f%s\n", app.label(), cur, app.USD, mark)
+		}
+		if legacy {
+			fprintf(w, "  * %s; which namespace ran it was not recorded.\n", legacyNote)
 		}
 		// Attribution is always local. The provider bills an instance, not an
 		// application, so `confirmed` cannot be broken down and saying which
@@ -261,6 +341,7 @@ func (r costsResult) Human(w io.Writer) error {
 		fprintf(w, "\nAttribution is from 'expected' only — the provider bills the instance, not\n")
 		fprintf(w, "the applications in it, so a confirmed total can never be split this way.\n")
 	}
+	r.writeStops(w)
 
 	if len(r.Overhead) > 0 {
 		fprintf(w, "\nInstance overhead (never attributed to an application):\n")
@@ -298,4 +379,51 @@ func (r costsResult) Human(w io.Writer) error {
 		fprintf(w, "\nThe local model is calibrated by %.3f against confirmed figures.\n", r.Calibration)
 	}
 	return nil
+}
+
+// writeStops says what the kernel stopped and whether it is at the floor.
+func (r costsResult) writeStops(w io.Writer) {
+	cur := r.Currency
+	if !r.RecordsStops {
+		fprintf(w, "\nThis kernel keeps no record of what it stops: an application it stopped\n")
+		fprintf(w, "shows as stopped with no reason. 'farcast kernel deploy %s' updates it.\n", r.Instance)
+		return
+	}
+	// Only a record whose reason is the cost guard is listed as the cost
+	// guard's, as 'world' labels only those. The kernel writes no other
+	// reason today; one a later kernel writes is shown with its reason, not
+	// put under a heading that would misattribute it.
+	var guard, other []kernel.Stop
+	for _, s := range r.Stops {
+		if s.Reason == kernel.StopReasonCostGuard {
+			guard = append(guard, s)
+		} else {
+			other = append(other, s)
+		}
+	}
+	if len(guard) > 0 {
+		fprintf(w, "\nStopped by the cost guard, as the kernel last recorded it:\n")
+		for _, s := range guard {
+			fprintf(w, "  %-32s since %s, saving %s %.4f/hour\n",
+				kernel.AppKey(s.Namespace, s.Deployment), s.At.UTC().Format("2006-01-02 15:04"), cur, s.HourlyUSD)
+		}
+		fprintf(w, "The kernel never starts them again; bringing one back is yours to decide.\n")
+	}
+	if len(other) > 0 {
+		fprintf(w, "\nStopped by the kernel for a reason this build does not know:\n")
+		for _, s := range other {
+			fprintf(w, "  %-32s since %s, reason %q\n",
+				kernel.AppKey(s.Namespace, s.Deployment), s.At.UTC().Format("2006-01-02 15:04"), terminalText(s.Reason))
+		}
+	}
+	if f := r.Floor; f != nil {
+		levers := make([]string, 0, len(f.Levers))
+		for _, l := range f.Levers {
+			levers = append(levers, kernel.LeverText(l))
+		}
+		fprintf(w, "\nAt the instance floor since %s: every application is\n", f.Since.UTC().Format("2006-01-02 15:04"))
+		fprintf(w, "stopped and spending is still over the limit. Still burning %s %.4f/hour.\n", cur, f.HourlyUSD)
+		fprintf(w, "What is left is to %s.\n", strings.Join(levers, ", or "))
+		fprintf(w, "The kernel names what is left and leaves it to you.\n")
+	}
 }

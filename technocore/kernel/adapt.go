@@ -72,6 +72,8 @@ func (r *Reconciler) Advise(rep Report, now time.Time) []Adaptation {
 	if r.Usage == nil {
 		return nil
 	}
+	// Keyed by AppKey, as sampleUsage records them: a profile is found for
+	// the workload in its own namespace and nowhere else.
 	profiles := map[string]int{}
 	summaries := r.Usage.Summarize(now)
 	for i, s := range summaries {
@@ -93,7 +95,7 @@ func (r *Reconciler) Advise(rep Report, now time.Time) []Adaptation {
 			Advice: adapt.Advice{App: t.App, CurrentCPUMilli: t.CPUMilli, CurrentMemMiB: t.MemMiB,
 				CPUMilli: t.CPUMilli, MemMiB: t.MemMiB},
 		}
-		i, ok := profiles[t.App]
+		i, ok := profiles[AppKey(t.Namespace, t.App)]
 		if !ok {
 			a.Hold = "no usage profile for this workload yet"
 			out = append(out, a)
@@ -126,7 +128,12 @@ func (r *Reconciler) Advise(rep Report, now time.Time) []Adaptation {
 		}
 		out = append(out, a)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].App < out[j].App })
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].App != out[j].App {
+			return out[i].App < out[j].App
+		}
+		return out[i].Namespace < out[j].Namespace
+	})
 	r.lastAdvice = out
 	return out
 }

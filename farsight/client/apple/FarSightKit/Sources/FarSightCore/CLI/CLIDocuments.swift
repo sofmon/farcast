@@ -272,6 +272,7 @@ public enum CLIDocuments {
         switch wire {
         case "cost": .cost
         case "checkpoint_stale": .checkpointStale
+        case "at_floor": .atFloor
         case "sealed": .sealed
         case "denied": .denied
         case "unattributed_denials": .unattributedDenials
@@ -284,6 +285,23 @@ public enum CLIDocuments {
         case "drift": .drift
         default: .unknown
         }
+    }
+
+    /// A lever the kernel names at the floor, as the map says it. One this
+    /// build does not know is kept as written, and drawn escaped like any
+    /// text the CLI sends.
+    static func lever(_ wire: String) -> String {
+        switch wire {
+        case "drop_carrier": "drop the load-balancer carrier"
+        case "release_instance": "release the instance"
+        default: wire
+        }
+    }
+
+    /// The one reason the kernel stops an application, as the map says it.
+    /// Any other word on the wire gives no reason: the app is "stopped".
+    static func stopReason(_ wire: String?) -> String? {
+        wire == "cost_guard" ? "stopped by the cost guard" : nil
     }
 
     static func severity(_ wire: String) -> WorldAlert.Severity {
@@ -355,8 +373,9 @@ public enum InstanceName {
 private struct WorldMapping {
     let name: String
     let wire: WireWorld
-    /// The figures the map cannot draw, said as problems with the spend
-    /// section: one bad figure never blanks an instance.
+    /// The figures the map cannot draw, each said as a problem of its own
+    /// (`figures`), never as the spend section not read: that section was
+    /// read, and one bad figure never blanks an instance.
     var figureProblems: [SectionProblem] = []
 
     init(name: String, wire: WireWorld) {
@@ -428,7 +447,7 @@ private struct WorldMapping {
     private mutating func money(_ cents: Int?, _ what: String) -> Int? {
         guard let cents else { return nil }
         guard (0...World.maxCents).contains(cents) else {
-            figureProblems.append(SectionProblem(section: .spend, kind: .internal, message: "\(what) is not one: \(cents) cents"))
+            figureProblems.append(SectionProblem(section: .figures, kind: .internal, message: "\(what) is not one: \(cents) cents"))
             return nil
         }
         return cents
@@ -438,7 +457,7 @@ private struct WorldMapping {
     private mutating func limit(_ cents: Int?, _ what: String) -> Int? {
         guard let cents else { return nil }
         guard (1...World.maxCents).contains(cents) else {
-            figureProblems.append(SectionProblem(section: .spend, kind: .internal, message: "\(what) is not one: \(cents) cents"))
+            figureProblems.append(SectionProblem(section: .figures, kind: .internal, message: "\(what) is not one: \(cents) cents"))
             return nil
         }
         return cents
@@ -463,6 +482,18 @@ private struct WorldMapping {
 
     private mutating func mapSpending(_ spend: WireSpend?) -> Spending {
         guard let spend else { return Spending() }
+        // The floor as the kernel recorded it: the levers in the map's
+        // words, and what still burns only where it is a figure the map can
+        // draw. A record with no `at_floor` beside it (a CLI older than the
+        // field never sends one) still says the kernel is at the floor.
+        var floor: SpendingFloor?
+        if let wire = spend.floor {
+            floor = SpendingFloor(
+                since: wire.since,
+                stillBurningMonthCents: money(wire.stillBurningMonthCents, "what still burns at the floor"),
+                levers: wire.levers.map(CLIDocuments.lever)
+            )
+        }
         let confirmed = money(spend.confirmedCents, "confirmed spending")
         return Spending(
             expectedCents: money(spend.expectedCents, "expected spending"),
@@ -476,7 +507,9 @@ private struct WorldMapping {
             currency: spend.currency,
             caveats: spend.caveats,
             notMetered: spend.notMetered,
-            isCheckpointStale: spend.checkpointStale
+            isCheckpointStale: spend.checkpointStale,
+            atFloor: floor != nil ? true : spend.atFloor,
+            floor: floor
         )
     }
 
@@ -547,7 +580,7 @@ private struct WorldMapping {
                 name: app.name,
                 role: role,
                 state: CLIDocuments.appState(app.state),
-                stopReason: app.stoppedBy.map { $0 == "cost_guard" ? "stopped by the cost guard" : "stopped by \($0)" },
+                stopReason: CLIDocuments.stopReason(app.stoppedBy),
                 monthCents: month,
                 costNote: costNote,
                 isIllustrative: false,
@@ -585,6 +618,13 @@ private struct WorldMapping {
 
     // MARK: Hosts and lines
 
+    /// Whether the network section was read: only then does a line with
+    /// nothing counted say that nothing used it. Unread, nobody saw either
+    /// way, and the map says so.
+    private var networkRead: Bool {
+        wire.sections.network.read && wire.sections.network.error == nil
+    }
+
     private func mapHosts() -> [Host] {
         var linesTo: [String: [WireLine]] = [:]
         for line in wire.lines where line.kind == "egress" {
@@ -602,7 +642,9 @@ private struct WorldMapping {
             var parts: [String] = []
             if !reached.isEmpty { parts.append("reached by \(reached.joined(separator: ", "))") }
             if !refused.isEmpty { parts.append("refused for \(refused.joined(separator: ", "))") }
-            if !unused.isEmpty { parts.append("declared by \(unused.joined(separator: ", ")), never used") }
+            if !unused.isEmpty {
+                parts.append("declared by \(unused.joined(separator: ", ")), \(networkRead ? "never used" : "use not read")")
+            }
             if !host.seenAs.isEmpty { parts.append("also written \(host.seenAs.joined(separator: ", "))") }
             return Host(id: "\(name)/\(host.name)", name: host.name, instanceID: name, note: parts.joined(separator: " · "))
         }
@@ -621,7 +663,7 @@ private struct WorldMapping {
         let label: String
         switch kind {
         case .egress:
-            (label, count) = Self.egress(line)
+            (label, count) = Self.egress(line, networkRead: networkRead)
         case .tunnel:
             label = line.labelHint == "read_now" ? "you · this read" : "you · mTLS tunnel"
         case .keeper:
@@ -649,8 +691,10 @@ private struct WorldMapping {
 
     /// An egress line's label and count, from its ports. Every count is a
     /// floor (ADR 0015), so it is written with ≥, and integers plainly, the
-    /// same on every platform.
-    static func egress(_ line: WireLine) -> (label: String, count: Int?) {
+    /// same on every platform. A line only declared is "unused" only where
+    /// the network section was read and counted nothing on it; unread, its
+    /// use was not read.
+    static func egress(_ line: WireLine, networkRead: Bool) -> (label: String, count: Int?) {
         let observed = line.ports.filter { $0.evidence == "observed" }
         let denied = line.ports.filter { $0.evidence == "denied" }
         let allows = sum(observed.map { count($0.count) ?? 0 })
@@ -660,7 +704,9 @@ private struct WorldMapping {
         if !observed.isEmpty { parts.append("≥\(allows) ok") }
         if fails > 0 { parts.append("≥\(fails) failed") }
         if !denied.isEmpty { parts.append("≥\(refused) refused") }
-        if !line.ports.isEmpty, line.ports.allSatisfy({ $0.evidence == "declared" }) { parts.append("declared · unused") }
+        if !line.ports.isEmpty, line.ports.allSatisfy({ $0.evidence == "declared" }) {
+            parts.append(networkRead ? "declared · unused" : "declared · use not read")
+        }
         if line.drift == true { parts.append("not declared") }
         if observed.contains(where: \.noLongerDeclared) { parts.append("no longer declared") }
         let counted: Int? = if !observed.isEmpty { allows } else if !denied.isEmpty { refused } else { nil }

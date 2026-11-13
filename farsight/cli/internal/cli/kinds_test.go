@@ -93,7 +93,7 @@ func TestKindsAreFoundThroughWrapping(t *testing.T) {
 // refusal now carries the kind world reports.
 func TestCostsAndWorldShareTheCheckpointReader(t *testing.T) {
 	_, _, err := decodeCheckpoint(`{"version":99}`)
-	if kindOf(err) != kindVersionSkew || !strings.Contains(err.Error(), "ledger version 99 and this build reads 1") {
+	if kindOf(err) != kindVersionSkew || !strings.Contains(err.Error(), "ledger version 99 and this build reads versions 1 to 2") {
 		t.Errorf("version: %v (%s)", err, kindOf(err))
 	}
 	if _, _, err := decodeCheckpoint(`not json`); kindOf(err) != kindKubectlFailed || !strings.HasPrefix(err.Error(), "decode the kernel's ledger") {

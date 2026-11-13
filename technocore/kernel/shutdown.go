@@ -45,6 +45,12 @@ type ShutdownResult struct {
 	// shutdown was less effective than the operator may expect, and saying
 	// so is the point.
 	Unclassified int
+
+	// Recorded says this shutdown changed what the checkpoint must carry: it
+	// stopped something, or it found the floor for the first time. A caller
+	// saves the checkpoint at once when it is set, so a restart straight
+	// after a stop cannot forget why the application is stopped.
+	Recorded bool
 }
 
 // StoppedUSDPerHour is the burn rate this shutdown removed.
@@ -91,6 +97,12 @@ func (r *Reconciler) Shutdown(ctx context.Context, rep Report, now time.Time) (S
 			continue
 		}
 		out.Stopped = append(out.Stopped, t)
+		// Recorded in the kernel's own state, never on the Deployment: an
+		// annotation would be a second write to the workload — a full-body
+		// audit entry the provider keeps for 400 days (ADR 0019) — outside
+		// the verb set ADR 0009 decision 3 grants.
+		r.recordStop(t, now)
+		out.Recorded = true
 	}
 
 	// The floor is reached when nothing was available to stop, not when
@@ -101,6 +113,14 @@ func (r *Reconciler) Shutdown(ctx context.Context, rep Report, now time.Time) (S
 	// may hold the very workloads it would be claiming to have run out of
 	// ways to stop.
 	out.AtFloor = rep.Complete() && len(rep.Stoppable()) == 0
+	if out.AtFloor {
+		if r.Floor == nil {
+			r.Floor = &Floor{Since: now}
+			out.Recorded = true
+		}
+		r.Floor.HourlyUSD = rep.FloorHourlyUSD()
+		r.Floor.Levers = floorLevers(rep)
+	}
 	return out, nil
 }
 

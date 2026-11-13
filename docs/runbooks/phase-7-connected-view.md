@@ -8,7 +8,7 @@ The macOS FarCast app reads the operator's instances by running the operator's o
 
 **Gate G1 (2026-11-12): Q1 and Q2 accepted.** The app's child `PATH` ends with the system's own directories, and its `CLOUDSDK_CONFIG` is the gcloud directory confirmed in Settings. Without the second, a `farcast` started from Finder would read the operator's real `~/.config/gcloud`. So R4 to R9 are not blocked.
 
-**Commit walked:** — *(fill in at R0)*. **Status:** not yet walked.
+**Commit walked:** `5bb19ac` (2026-11-12). **Status:** Part R walked 2026-11-12. R2, R5 and R8.3–R8.5 were not reported, and Part L is not walked. Eight findings, listed under Results.
 
 Throughout:
 - Run every command from the checkout root, and keep that checkout outside `~/Documents`, `~/Desktop` and `~/Downloads`, which TCC prompts for.
@@ -92,7 +92,8 @@ Open Settings (⌘,), enter the six paths R1 printed, press Check, then Confirm.
 Every fact in the `healthy` row of the table in R7, and also:
 - the spending is split, confirmed and expected, and never shown as one total;
 - the boundary's panel says `counted by fatline-rehearsal-0 since … · 1 of 1 FatLine replica · every count is a floor`;
-- nothing illustrative appears: no fixture group, app or planned line.
+- nothing illustrative appears: no fixture group, app or planned line;
+- every figure on TechnoCore's panel is whole, none cut at the top or the side, and "more" under its notes opens every word of them, the not-metered list whole among them (F2). At a smaller zoom the figures take a tighter arrangement; they are never cut.
 
 Then the log:
 
@@ -116,9 +117,10 @@ Switch with `./bin/farcast-rehearsal scenario --dir "$DIR" <name>`, then Refresh
 | `healthy` | Every section read. Spending split, confirmed and expected. `≥n ok` on `api → api.payments.invalid`, and `telemetry.invalid` declared and unused. The keeper healthy, with its line into storage. The tunnel and watch lines. Storage lines "wired, not counted". Replica `fatline-rehearsal-0`, 1 of 1. |
 | `sealed` | The `sealed` alert on DataSphere. |
 | `stale-checkpoint` | The `checkpoint_stale` alert, and "checkpoint stale" on the chip. |
-| `cost-reached` | The critical `cost` alert. `web` stopped, with no reason given. |
-| `signed-out` | Spend, apps and policy each `gcloud_signed_out`. Network and seal still read. |
-| `identity-mismatch` | The read is refused with `gcloud_mismatch` before any `kubectl` runs: `grep -c ' kubectl ' "$DIR/calls.log"` is the same before and after the Refresh. |
+| `cost-reached` | The critical `cost` alert, and spending over the $50 limit: the total reads more than 100% beside "limit reached", never a few percent (F6). `web` stopped, with no reason given: this kernel recorded no stop. |
+| `at-floor` *(added 2026-11-12, after this walk)* | The critical `cost` alert, and beside it the critical `at_floor` alert on TechnoCore, its title naming the levers: drop the load-balancer carrier, or release the instance. Spending over the limit, as in `cost-reached`. `api` and `web` each "stopped by the cost guard". TechnoCore's panel says what still burns a month and names the same levers; the spending line says "at the floor". |
+| `signed-out` | Spend, apps and policy each `gcloud_signed_out`. Network and seal still read. Shrike's panel shows what it watched, "1 line watched" and "0 refusals seen", never "not watching" or "not read" (F1). Each panel says each of its own failed sections in one sentence, and no kubectl or gcloud text: TechnoCore "spending not read · signed out of gcloud — run gcloud auth login" and "apps not read · …", FatLine "egress policy not read · …", DataSphere "apps not read · …" (F3). Its figures stay whole. The chip reads "3 sections not read · signed out of gcloud" and stays on screen; narrowed, it drops the spending before that, then says "3 sections not read" (F4). gcloud's own message appears once, behind the chip's info button. |
+| `identity-mismatch` | The read is refused with `gcloud_mismatch` before any `kubectl` runs: `grep -c ' kubectl ' "$DIR/calls.log"` is the same before and after the Refresh. Every panel says "the read was refused · gcloud identity does not match — farcast instances pin-gcloud", and the chip "read refused · gcloud identity does not match", never "read not read" (F5). |
 | `denied` | The `denied` alert on `shop/web`, and a refused line to `tracker.invalid`, on the first read after the switch. |
 | `slow-cluster` | R9's. |
 
@@ -128,7 +130,7 @@ Switch with `./bin/farcast-rehearsal scenario --dir "$DIR" <name>`, then Refresh
 
 ### R8. Failure paths
 
-1. **The tunnel goes away.** Ctrl-C the harness, then Refresh. Network and seal read `tunnel_unreachable`. Apps, spend and policy still read, because the fake tools are files.
+1. **The tunnel goes away.** Ctrl-C the harness, then Refresh. Network and seal read `tunnel_unreachable`. Apps, spend and policy still read, because the fake tools are files. The declared line to `telemetry.invalid` reads "declared · use not read", and its card "declared by shop/api, use not read", never "unused" (F8). TechnoCore still counts "0 apps stopped": Shrike's state not read is no application's. DataSphere's keepers needing attention read "not read", never 0.
 2. **The harness comes back.** Restart it on **the same directory**: `./bin/farcast-rehearsal --dir "$DIR" --farcast "$PWD/bin/farcast"`. It rebinds the same tunnel port and reuses its own leaves, so Settings stay as they are. Refresh: healthy again, the keeper included, and no `denied` alert. If it says the port is in use, stop whatever holds it, or start a new rehearsal in a new directory and enter Settings again.
 3. **farcast goes missing.** `mv ./bin/farcast ./bin/farcast.away`, then Refresh. Refresh lists first, and the listing's preflight finds nothing at the path before it runs anything: "Settings need attention: farcast: nothing is at this path". Restore it with `mv ./bin/farcast.away ./bin/farcast`.
 4. *Optionally,* `chmod -x ./bin/farcast`, then Refresh: "Settings need attention: farcast: is not executable by you". Restore it with `chmod 755 ./bin/farcast`. ("could not be started" comes only from a file that passes these checks and still will not exec.)
@@ -136,7 +138,7 @@ Switch with `./bin/farcast-rehearsal scenario --dir "$DIR" <name>`, then Refresh
 
 ### R9. Quit mid-read
 
-Switch to `slow-cluster`, Refresh, then ⌘Q within 5 seconds. Two seconds later, `pgrep -fl 'json (version|instances|world)|/kube/bin/kubectl '` prints nothing: quitting stopped the read and every process it started. Switch back to `healthy`.
+Switch to `slow-cluster`, Refresh, then ⌘Q within 5 seconds. Two seconds later, `pgrep -fl 'json (version|instances|world)|/kube/bin/kubectl '` prints nothing and exits 1, which is `pgrep`'s "no match". That means quitting stopped the read and every process it started. Exit 0 with lines printed would be a finding. Switch back to `healthy`.
 
 ### R10. Teardown
 
@@ -221,29 +223,37 @@ Deny gcloud's update check, and anything else, and record it.
 
 ## Results
 
-*Not yet walked.*
+### Part R: walked 2026-11-12 at `5bb19ac`, by the operator
 
 | Step | Result | Notes |
 |---|---|---|
-| Commit | — | |
-| R0 build, `./check.sh` | — | |
-| R1 harness | — | |
-| R2 Finder, nothing planted | — | |
-| R3 Finder, planted | — | |
-| R4 Settings | — | |
-| R5 launch listing | — | |
-| R6 Refresh | — | |
-| R7 scenarios | — | |
-| R8 failure paths | — | |
-| R9 quit mid-read | — | |
-| R10 teardown | — | |
-| L0 spend approved | — | |
-| L1 identity | — | |
-| L1b real paths | — | |
-| L2 terminal walk | — | |
-| L3 the app | — | |
-| L4 record | — | |
+| Commit | `5bb19ac` | The Connected view's own commit. |
+| R0 build, `./check.sh` | pass | `./check.sh` passed on this exact tree immediately before it was committed. It was not re-run at the commit itself. `./bin/farcast version` and the app's `FarCastCommit` both read `5bb19ac`. |
+| R1 harness | pass | Started on a temporary directory under `$TMPDIR`. |
+| R2 Finder, nothing planted | not reported | |
+| R3 Finder, planted | pass | Opened with R3's `open -n --env …` command, all seven variables planted. Every read that followed reached the fake tools, which refuse the moment a planted variable reaches them, so none did. Before the commit, `farcast` run from a terminal under the app's exact child environment showed the same. |
+| R4 Settings | pass | Inferred from the reads that followed. |
+| R5 launch listing | not reported | |
+| R6 Refresh | pass, one finding | Spending split as `$1.45 confirmed through Nov 10 + $2.77 expected of $50.00`. `counted by fatline-rehearsal-0 … 1 of 1 FatLine replica · every count is a floor` appears on FatLine and Shrike. Nothing illustrative. The group is labelled `git.rehearsal.invalid/shop · main at ef4c4ac`. TechnoCore's notes are clipped (F2). The `calls.log` checks were not reported. |
+| R7 scenarios | pass, five findings | `sealed`: the alert, and DataSphere red. `stale-checkpoint`: "checkpoint stale" on the chip and the panel. `cost-reached`: the alert and `web` stopped, but "total 8%" beside "limit reached" (F6). `signed-out`: spend, apps and policy read "signed out of gcloud" while network and seal read, but Shrike says "not watching" (F1), raw errors fill the panels (F3), and the chip runs off screen (F4). `identity-mismatch`: refused, the last snapshot kept and faded, the tunnel no longer claimed, but "read not read" (F5). `denied`: ✕ at the OUT gate, `tracker.invalid` "≥1 refused", the alert on `shop/web`. |
+| R8 failure paths | pass, one finding | R8.1: network and seal read `tunnel_unreachable`, Shrike "state not read", the IN gate no longer "your tunnel", the keeper "not read". But declared lines read "declared · unused" (F8). R8.2: a restart on the same directory came back healthy with Settings untouched, the keeper healthy and the `denied` alert gone. R8.3–R8.5 were not reported. |
+| R9 quit mid-read | pass | `pgrep` printed nothing (exit 1). |
+| R10 teardown | pass | Settings forgotten, the app quit, the harness stopped and its temporary directory removed. |
+| L0–L4 | not walked | |
 
 ### Findings
 
-*None yet.*
+- **F1. Shrike says "not watching" after a read whose `apps` section failed, though Shrike answered.**
+  - The CLI marks the monitor `unknown` when the workloads read fails. The design says it is `running` whenever Shrike answered through the tunnel.
+  - The panel then requires `running` before it trusts the observed watch line.
+- **F2. Long notes are clipped.** TechnoCore's not-metered list ends mid-sentence, so what the meter does not see is not fully readable (ADR 0009).
+- **F3. Raw errors fill the panels.** A failed section's whole kubectl and gcloud message is repeated in several panels. It overflows them, clipping their first row and running under lines.
+- **F4. The chip runs off screen** with one entry per failed section.
+- **F5. "read not read (gcloud identity does not match)"** should say the read was refused. **"1 apps stopped"** should be singular.
+- **F6. The harness's `cost-reached` scenario contradicts itself.** It shows "limit reached" beside "total 8%", because it flips the kernel's level without putting spending over the limit.
+- **F7. A scenario name passed to the start form gets only "unknown command".** It should point to `farcast-rehearsal scenario --dir <dir> <name>`.
+- **F8. A declared line reads "declared · unused" when the network section was not read.** That claims an absence of traffic nobody read.
+
+**Seen, and not counted as findings:**
+- Lines cross panel content: the keeper line over FatLine's figures, and an egress line through `web`.
+- The Connections legend covers part of a device card.

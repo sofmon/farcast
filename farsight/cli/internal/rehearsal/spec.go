@@ -19,6 +19,7 @@ const (
 	ScenarioSealed           = "sealed"
 	ScenarioStaleCheckpoint  = "stale-checkpoint"
 	ScenarioCostReached      = "cost-reached"
+	ScenarioAtFloor          = "at-floor"
 	ScenarioDenied           = "denied"
 	ScenarioSignedOut        = "signed-out"
 	ScenarioIdentityMismatch = "identity-mismatch"
@@ -26,7 +27,7 @@ const (
 )
 
 var scenarios = []string{
-	ScenarioHealthy, ScenarioSealed, ScenarioStaleCheckpoint, ScenarioCostReached,
+	ScenarioHealthy, ScenarioSealed, ScenarioStaleCheckpoint, ScenarioCostReached, ScenarioAtFloor,
 	ScenarioDenied, ScenarioSignedOut, ScenarioIdentityMismatch, ScenarioSlowCluster,
 }
 

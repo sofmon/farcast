@@ -118,7 +118,7 @@ If the figure is a multiple of that, Autopilot is raising the pods to a higher f
 kubectl -n "$NS" get configmap technocore-ledger -o jsonpath='{.data.checkpoint\.json}' | head -c 400; echo
 ```
 
-Expected: a JSON document with `"version":1`, a period covering the current month, and non-zero `hourly` buckets. The checkpoint is written every five minutes, so allow that long after step 2.
+Expected: a JSON document with `"version":2` (`1` from a kernel built before 2026-11-12), a period covering the current month, and non-zero `hourly` buckets. The checkpoint is written every five minutes, so allow that long after step 2.
 
 ## 7. A restart resumes the accounting rather than resetting it
 

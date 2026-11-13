@@ -15,10 +15,11 @@ enum PanelFacts {
         )
     }
 
-    /// The panel's note, the lines under its facts.
+    /// The panel's note, the lines under its facts: what the read could
+    /// not say, then the component's own notes.
     static func note(_ model: WorldModel, _ appID: String) throws -> String {
         let app = try #require(model.index.apps[appID])
-        return SystemSummary(app: app, model: model).note ?? ""
+        return SystemSummary(app: app, model: model).text
     }
 }
 

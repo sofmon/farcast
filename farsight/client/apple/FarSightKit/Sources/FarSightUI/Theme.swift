@@ -180,16 +180,22 @@ enum Format {
         // The share is of the total, the sum enforcement compares; it is
         // labelled so, and never printed as a figure of its own.
         if let fraction = spending.fraction { text += " · total \(percent(fraction))" }
+        if spending.floor != nil { text += " · at the floor" }
         if spending.isCheckpointStale { text += " · checkpoint stale" }
         return text
     }
 
     /// Spending at its briefest, for the HUD's chip: the total's share of the
     /// kernel's limit, labelled as the total — the sum enforcement compares
-    /// — and never a bare percent; or why there is no share.
+    /// — and never a bare percent; or why there is no share. A share at the
+    /// floor, or from a stale checkpoint, says so: brief, it never passes for
+    /// current.
     static func share(_ spending: Spending) -> String {
         guard spending.isRead else { return "not read" }
-        return spending.fraction.map { "total \(percent($0))" } ?? "no kernel limit"
+        var text = spending.fraction.map { "total \(percent($0))" } ?? "no kernel limit"
+        if spending.floor != nil { text += " · at the floor" }
+        if spending.isCheckpointStale { text += " · stale" }
+        return text
     }
 
     /// What VoiceOver says for an instance's spending: both parts, and the
@@ -213,6 +219,7 @@ enum Format {
             parts.append("total not compared, no kernel limit read")
         }
         parts.append("level \(spending.level.label)")
+        if spending.floor != nil { parts.append("at the instance floor, every application stopped") }
         if spending.isCheckpointStale { parts.append("checkpoint stale") }
         return parts.joined(separator: ", ")
     }
@@ -227,21 +234,33 @@ enum Format {
             + " · every count is a floor"
     }
 
-    /// When an instance was read, and what in the read failed: what its
-    /// territory's chip says under its name. Nil for an instance the map has
-    /// nothing to say about (the fixture's).
-    static func readState(_ instance: Instance) -> String? {
+    /// When an instance was read, and what in the read failed, in brief:
+    /// what its territory's chip says beside its name. Failed sections are
+    /// counted, never listed one by one (`ProblemText.summary`); each one's
+    /// sentence is in the panels it touches, and the CLI's own message
+    /// behind the chip's disclosure.
+    /// `brief` leaves out when it was read, for a chip with no room for
+    /// it, and is nil when there is nothing else to say.
+    static func readState(_ instance: Instance, brief: Bool = false) -> String? {
         var parts: [String] = []
         switch instance.status {
         case .running, .unknown: break
         case .provisioning, .unreachable, .deleting, .error: parts.append(instance.status.label)
         }
-        parts.append(instance.readAt.map { "read \(time($0))" } ?? "not read yet")
-        for problem in instance.problems {
-            parts.append(problem.section == .read || problem.section == .record
-                ? problem.kind.label
-                : "\(problem.section.rawValue) not read: \(problem.kind.label)")
+        if !brief { parts.append(instance.readAt.map { "read \(time($0))" } ?? "not read yet") }
+        parts += ProblemText.summary(instance.problems)
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    /// What failed at its shortest, for a chip with room for nothing more
+    /// than its name and a few words: the instance's status where it is
+    /// one to say, else the first thing that failed without why — "read
+    /// refused", "3 sections not read". Nil when nothing failed.
+    static func readHeadline(_ instance: Instance) -> String? {
+        switch instance.status {
+        case .running, .unknown: break
+        case .provisioning, .unreachable, .deleting, .error: return instance.status.label
         }
-        return parts.joined(separator: " · ")
+        return ProblemText.summary(instance.problems).first.map { $0.components(separatedBy: " · ")[0] }
     }
 }

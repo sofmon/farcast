@@ -180,6 +180,10 @@ struct WireSpend: Decodable {
     let recordedLimitCents: Int?
     let level: String
     let checkpointStale: Bool
+    /// Null from a kernel that records no floor; absent from a CLI older
+    /// than the field.
+    let atFloor: Bool?
+    let floor: WireFloor?
     let notMetered: [String]
     let caveats: [String]
 
@@ -194,6 +198,8 @@ struct WireSpend: Decodable {
         case recordedLimitCents = "recorded_limit_cents"
         case level
         case checkpointStale = "checkpoint_stale"
+        case atFloor = "at_floor"
+        case floor
         case notMetered = "not_metered"
         case caveats
     }
@@ -211,8 +217,31 @@ struct WireSpend: Decodable {
         recordedLimitCents = try c.decodeIfPresent(Int.self, forKey: .recordedLimitCents)
         level = try c.decode(String.self, forKey: .level)
         checkpointStale = try c.decode(Bool.self, forKey: .checkpointStale)
+        atFloor = try c.decodeIfPresent(Bool.self, forKey: .atFloor)
+        floor = try c.decodeIfPresent(WireFloor.self, forKey: .floor)
         notMetered = try c.decodeIfPresent([String].self, forKey: .notMetered) ?? []
         caveats = try c.decodeIfPresent([String].self, forKey: .caveats) ?? []
+    }
+}
+
+/// `worldFloor`: the kernel's floor record. `since` is a pointer; the levers
+/// are the kernel's ids.
+struct WireFloor: Decodable {
+    let since: Date?
+    let stillBurningMonthCents: Int
+    let levers: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case since
+        case stillBurningMonthCents = "still_burning_month_cents"
+        case levers
+    }
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        since = try c.decodeIfPresent(Date.self, forKey: .since)
+        stillBurningMonthCents = try c.decode(Int.self, forKey: .stillBurningMonthCents)
+        levers = try c.decodeIfPresent([String].self, forKey: .levers) ?? []
     }
 }
 

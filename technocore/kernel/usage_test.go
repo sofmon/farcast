@@ -74,8 +74,8 @@ func TestReadingsAreProfiledPerApplication(t *testing.T) {
 	}
 
 	sums := r.Usage.Summarize(now)
-	if len(sums) != 1 || sums[0].App != "web" {
-		t.Fatalf("profiled %+v, want one application called web", sums)
+	if len(sums) != 1 || sums[0].App != AppKey("farcast-apps", "web") {
+		t.Fatalf("profiled %+v, want one application called farcast-apps/web", sums)
 	}
 	got := sums[0]
 	if got.Pods != 2 {

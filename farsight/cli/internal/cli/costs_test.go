@@ -261,3 +261,222 @@ func TestCostsNamesWhatTheMeterCannotSee(t *testing.T) {
 		}
 	}
 }
+
+// stopsCheckpoint is a version 2 checkpoint as a kernel at its floor writes
+// it: namespaced spending beside one figure a version 1 kernel accrued, two
+// recorded stops, and the floor with its levers.
+func stopsCheckpoint(t *testing.T, version int) string {
+	t.Helper()
+	start := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	ledger, err := cost.NewLedger(start, start.AddDate(0, 1, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := start.Add(48 * time.Hour)
+	ledger.Accrue(at, kernel.AppKey("shop", "web"), 20, time.Hour)
+	ledger.Accrue(at, kernel.AppKey("blog", "web"), 10, time.Hour)
+	ledger.Accrue(at, "worker", 5, time.Hour)
+	cp := kernel.Checkpoint{
+		Version: version, Ledger: ledger.Snapshot(), Last: at,
+		Observed: kernel.Observation{At: at, Pods: 2, RateHourlyUSD: 0.1, Level: "reached", Limit: 30},
+		Stops: []kernel.Stop{
+			{Namespace: "blog", Deployment: "web", At: at.Add(-time.Hour), Reason: kernel.StopReasonCostGuard, HourlyUSD: 0.25},
+			{Namespace: "shop", Deployment: "web", At: at.Add(-time.Hour), Reason: kernel.StopReasonCostGuard, HourlyUSD: 0.5},
+		},
+		Floor: &kernel.Floor{Since: at, HourlyUSD: 0.105, Levers: []string{kernel.LeverCarrier, kernel.LeverRelease}},
+	}
+	raw, err := json.Marshal(cp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw)
+}
+
+// Two namespaces' web are two applications, each with its own figure; a
+// figure from before namespaces were recorded is shown as it was kept, with
+// no namespace and a note, never given one.
+func TestCostsNamesEachApplicationByNamespace(t *testing.T) {
+	shown := runCosts(t, stopsCheckpoint(t, kernel.CheckpointVersion), output.ModeHuman)
+	for _, want := range []string{"shop/web", "blog/web", "20.00", "10.00", "worker", "*", "accrued before the kernel recorded namespaces"} {
+		if !strings.Contains(shown, want) {
+			t.Errorf("costs does not show %q:\n%s", want, shown)
+		}
+	}
+
+	var res struct {
+		Apps []appCost `json:"apps"`
+	}
+	js := runCosts(t, stopsCheckpoint(t, kernel.CheckpointVersion), output.ModeJSON)
+	if err := json.Unmarshal([]byte(js), &res); err != nil {
+		t.Fatalf("%v:\n%s", err, js)
+	}
+	want := []appCost{
+		{Namespace: "shop", Name: "web", USD: 20},
+		{Namespace: "blog", Name: "web", USD: 10},
+		{Namespace: "", Name: "worker", USD: 5, Note: legacyNote},
+	}
+	if len(res.Apps) != len(want) {
+		t.Fatalf("apps = %+v, want %+v", res.Apps, want)
+	}
+	for i := range want {
+		if res.Apps[i] != want[i] {
+			t.Errorf("apps[%d] = %+v, want %+v", i, res.Apps[i], want[i])
+		}
+	}
+	if !strings.Contains(js, `"namespace":""`) {
+		t.Errorf("a legacy entry does not carry its empty namespace:\n%s", js)
+	}
+}
+
+// What the kernel stopped, and the floor with the levers it leaves to the
+// operator: in the report a person reads, and in the one a program reads.
+func TestCostsShowsTheStopsAndTheFloor(t *testing.T) {
+	shown := runCosts(t, stopsCheckpoint(t, kernel.CheckpointVersion), output.ModeHuman)
+	for _, want := range []string{
+		"Stopped by the cost guard", "shop/web", "saving USD 0.5000/hour", "blog/web", "never starts them again",
+		"At the instance floor since 2026-09-03 00:00", "Still burning USD 0.1050/hour",
+		"drop the load-balancer carrier, or release the instance",
+	} {
+		if !strings.Contains(shown, want) {
+			t.Errorf("costs does not say %q:\n%s", want, shown)
+		}
+	}
+
+	var res struct {
+		RecordsStops bool          `json:"records_stops"`
+		Stops        []kernel.Stop `json:"stops"`
+		Floor        *kernel.Floor `json:"floor"`
+	}
+	js := runCosts(t, stopsCheckpoint(t, kernel.CheckpointVersion), output.ModeJSON)
+	if err := json.Unmarshal([]byte(js), &res); err != nil {
+		t.Fatalf("%v:\n%s", err, js)
+	}
+	if !res.RecordsStops || len(res.Stops) != 2 || res.Stops[1].Deployment != "web" || res.Stops[1].Namespace != "shop" ||
+		res.Stops[1].Reason != kernel.StopReasonCostGuard || res.Stops[1].HourlyUSD != 0.5 {
+		t.Errorf("stops = %+v (records %v)", res.Stops, res.RecordsStops)
+	}
+	if res.Floor == nil || res.Floor.HourlyUSD != 0.105 || len(res.Floor.Levers) != 2 || res.Floor.Levers[1] != kernel.LeverRelease {
+		t.Errorf("floor = %+v", res.Floor)
+	}
+	for _, key := range []string{`"saving_per_hour"`, `"still_burning_per_hour"`, `"levers"`} {
+		if !strings.Contains(js, key) {
+			t.Errorf("the JSON does not carry %s:\n%s", key, js)
+		}
+	}
+}
+
+// An older kernel's checkpoint is read rather than refused: its spending is
+// all bare-keyed, and its silence about stops is said, not shown as none.
+func TestCostsReadsAnOlderKernelAndSaysWhatItDoesNotRecord(t *testing.T) {
+	shown := runCosts(t, stopsCheckpoint(t, 1), output.ModeHuman)
+	if !strings.Contains(shown, "keeps no record of what it stops") {
+		t.Errorf("a version 1 kernel's silence about stops is not said:\n%s", shown)
+	}
+	for _, never := range []string{"Stopped by the cost guard", "At the instance floor"} {
+		if strings.Contains(shown, never) {
+			t.Errorf("a version 1 checkpoint showed %q, which that kernel never wrote:\n%s", never, shown)
+		}
+	}
+	var res struct {
+		RecordsStops bool `json:"records_stops"`
+	}
+	if err := json.Unmarshal([]byte(runCosts(t, stopsCheckpoint(t, 1), output.ModeJSON)), &res); err != nil || res.RecordsStops {
+		t.Errorf("records_stops = %v, %v", res.RecordsStops, err)
+	}
+}
+
+// A version this build does not read is still refused, as before, with the
+// kind the app tells apart.
+func TestCostsRefusesACheckpointFromANewerKernel(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	meteringInstance(t, dir, "p43")
+	env, _ := testEnv(dir, output.ModeHuman)
+	f := costsReader(t, stopsCheckpoint(t, kernel.CheckpointVersion+1))
+	c := &costsCommand{}
+	c.newCluster = func(string) configMapReader { return f }
+	err := c.Run(context.Background(), env, []string{"p43"})
+	if kindOf(err) != kindVersionSkew || !strings.Contains(err.Error(), "older than the other") {
+		t.Fatalf("a newer kernel's checkpoint: %v (%s)", err, kindOf(err))
+	}
+}
+
+// After the upgrade one application can hold two figures in one period:
+// what a version 1 kernel accrued under its bare name, and what has been
+// accrued since under its namespace. Both are shown, each as it was kept —
+// the old one with no namespace and the note — and nothing is lost between
+// them: the rows add up to what the ledger holds.
+func TestCostsShowsAnApplicationsFiguresFromBeforeAndAfterNamespaces(t *testing.T) {
+	start := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	ledger, err := cost.NewLedger(start, start.AddDate(0, 1, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := start.Add(48 * time.Hour)
+	ledger.Accrue(at, "web", 2, time.Hour)
+	ledger.Accrue(at, kernel.AppKey("shop", "web"), 3, time.Hour)
+	raw, err := json.Marshal(kernel.Checkpoint{
+		Version: kernel.CheckpointVersion, Ledger: ledger.Snapshot(), Last: at,
+		Observed: kernel.Observation{At: at, Pods: 1, RateHourlyUSD: 3, Level: "ok", Limit: 100},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var res struct {
+		Total float64   `json:"total"`
+		Apps  []appCost `json:"apps"`
+	}
+	js := runCosts(t, string(raw), output.ModeJSON)
+	if err := json.Unmarshal([]byte(js), &res); err != nil {
+		t.Fatalf("%v:\n%s", err, js)
+	}
+	want := []appCost{
+		{Namespace: "shop", Name: "web", USD: 3},
+		{Namespace: "", Name: "web", USD: 2, Note: legacyNote},
+	}
+	if len(res.Apps) != len(want) || res.Apps[0] != want[0] || res.Apps[1] != want[1] {
+		t.Fatalf("apps = %+v, want %+v", res.Apps, want)
+	}
+	if sum := res.Apps[0].USD + res.Apps[1].USD; sum != 5 || res.Total != sum {
+		t.Errorf("the rows add to %v and the total is %v; want both 5", sum, res.Total)
+	}
+
+	shown := runCosts(t, string(raw), output.ModeHuman)
+	if !strings.Contains(shown, "shop/web") || !strings.Contains(shown, "*") || !strings.Contains(shown, legacyNote) {
+		t.Errorf("both figures are not shown, each as kept:\n%s", shown)
+	}
+}
+
+// A record with a reason this build does not know is not listed as the cost
+// guard's — 'world' would not label it so either — but it is not hidden.
+func TestCostsListsOnlyTheCostGuardsStopsAsTheCostGuards(t *testing.T) {
+	start := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	ledger, err := cost.NewLedger(start, start.AddDate(0, 1, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := start.Add(48 * time.Hour)
+	raw, err := json.Marshal(kernel.Checkpoint{
+		Version: kernel.CheckpointVersion, Ledger: ledger.Snapshot(), Last: at,
+		Observed: kernel.Observation{At: at, Level: "reached", Limit: 1},
+		Stops: []kernel.Stop{
+			{Namespace: "shop", Deployment: "api", At: at, Reason: kernel.StopReasonCostGuard, HourlyUSD: 0.5},
+			{Namespace: "shop", Deployment: "batch", At: at, Reason: "maintenance", HourlyUSD: 0.25},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	shown := runCosts(t, string(raw), output.ModeHuman)
+	guard, rest, ok := strings.Cut(shown, "Stopped by the cost guard")
+	if !ok {
+		t.Fatalf("no cost guard section:\n%s", shown)
+	}
+	section, after, _ := strings.Cut(rest, "never starts them again")
+	if !strings.Contains(section, "shop/api") || strings.Contains(section, "shop/batch") {
+		t.Errorf("the cost guard's section is wrong:\n%s", section)
+	}
+	if strings.Contains(guard, "shop/batch") || !strings.Contains(after, "shop/batch") || !strings.Contains(after, `"maintenance"`) {
+		t.Errorf("the other stop is not shown apart, with its reason:\n%s", shown)
+	}
+}

@@ -210,7 +210,7 @@ struct LiveModelTests {
         let model = model(world)
         #expect(model.geometry.territories.keys.sorted() == ["atlas", "broken"])
         #expect(Format.readState(broken) == "not read yet · record unreadable")
-        #expect(Format.readState(deleting) == "release incomplete, may still be billing · not read yet · timed out")
+        #expect(Format.readState(deleting) == "release incomplete, may still be billing · not read yet · read timed out")
         #expect(Format.spending(deleting.spending) == "spending not read · recorded limit $50.00")
 
         let renderer = ImageRenderer(content: WorldScreen(model: model, backdrop: nil).frame(width: viewport.width, height: viewport.height))
@@ -301,12 +301,12 @@ struct LiveModelTests {
         ]
         model.update(world: world)
         let boundary = try PanelFacts.of(model, "a/farcast-system/fatline")
-        #expect(["lines out, counted", "refused at the wall", "declared, never used", "devices coming in"].map { boundary[$0] }
+        #expect(["lines out, counted", "refused at the wall", "declared, use not read", "devices coming in"].map { boundary[$0] }
             == Array(repeating: "not read", count: 4))
         #expect(try PanelFacts.of(model, "a/farcast-system/shrike") == ["Shrike's watch on FatLine": "not read"])
         #expect(try PanelFacts.of(model, "a/farcast-system/datasphere")["apps storing here"] == "not read")
         #expect(try PanelFacts.of(model, "a/farcast-system/technocore")["apps stopped"] == "not read")
-        #expect(try PanelFacts.note(model, "a/farcast-system/fatline").contains("network not read (tunnel unreachable)"))
+        #expect(try PanelFacts.note(model, "a/farcast-system/fatline").contains("network not read · tunnel unreachable"))
 
         // All read: figures, the confirmed one with its day.
         world.instances[0].problems = []
@@ -314,8 +314,8 @@ struct LiveModelTests {
         let read = try PanelFacts.of(model, "a/farcast-system/technocore")
         #expect(read["apps stopped"] == "0")
         #expect(read["confirmed through \(Format.day(Date(timeIntervalSince1970: 1_794_355_200)))"] == "$5.00")
-        #expect(try PanelFacts.of(model, "a/farcast-system/fatline")["lines out, counted"] == "1")
-        #expect(try PanelFacts.of(model, "a/farcast-system/shrike")["lines watched"] == "1")
+        #expect(try PanelFacts.of(model, "a/farcast-system/fatline")["line out, counted"] == "1")
+        #expect(try PanelFacts.of(model, "a/farcast-system/shrike")["line watched"] == "1")
         #expect(try PanelFacts.of(model, "a/farcast-system/datasphere")["storage"] == "not sealed")
     }
 
@@ -327,13 +327,13 @@ struct LiveModelTests {
         try world.validate()
         let model = model(world)
         var storage = try PanelFacts.of(model, "a/farcast-system/datasphere")
-        #expect(storage["keepers"] == "1" && storage["keepers needing attention"] == "1")
+        #expect(storage["keeper"] == "1" && storage["keeper needing attention"] == "1")
         #expect(storage["keeper not read"] == nil)
 
         world.devices[1].health = .unknown
         model.update(world: world)
         storage = try PanelFacts.of(model, "a/farcast-system/datasphere")
-        #expect(storage["keepers"] == "1" && storage["keepers needing attention"] == "0")
+        #expect(storage["keeper"] == "1" && storage["keepers needing attention"] == "not read")
         #expect(storage["keeper not read"] == "1")
     }
 
@@ -344,15 +344,15 @@ struct LiveModelTests {
             world.connections[i].isStale = true
         }
         let storage = try PanelFacts.of(model(world), "a/farcast-system/datasphere")
-        #expect(storage["keepers"] == "1" && storage["keepers needing attention"] == "0")
+        #expect(storage["keeper"] == "1" && storage["keepers needing attention"] == "0")
     }
 
     @Test("the fixture's panels draw its figures whole: it is illustrative, not unread")
     func fixturePanels() throws {
         let model = model(try Fixtures.world())
-        #expect(try PanelFacts.of(model, "borealis/farcast-system/technocore")["apps stopped"] == "1")
+        #expect(try PanelFacts.of(model, "borealis/farcast-system/technocore")["app stopped"] == "1")
         #expect(try PanelFacts.of(model, "borealis/farcast-system/datasphere")["storage"] == "sealed")
-        #expect(try PanelFacts.of(model, "borealis/farcast-system/datasphere")["keepers needing attention"] == "1")
+        #expect(try PanelFacts.of(model, "borealis/farcast-system/datasphere")["keeper needing attention"] == "1")
         #expect(try PanelFacts.of(model, "atlas/farcast-system/datasphere")["apps storing here"] == "3")
         #expect(try PanelFacts.of(model, "atlas/farcast-system/fatline")["lines out, counted"] == "3")
         #expect(try !PanelFacts.note(model, "atlas/farcast-system/technocore").contains("Not read yet."))

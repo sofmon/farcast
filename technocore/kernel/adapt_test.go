@@ -13,14 +13,15 @@ import (
 )
 
 // profiled seeds a reconciler with a settled profile for one application:
-// well-covered, and using far less than it reserves.
+// well-covered, and using far less than it reserves. It is keyed as the
+// kernel keys it, by AppKey; every test here meters farcast-apps.
 func profiled(t *testing.T, r *Reconciler, at time.Time, app string, cpu, mem, reqCPU, reqMem int) {
 	t.Helper()
 	if r.Usage == nil {
 		r.Usage = usage.New(24)
 	}
 	for i := 0; i < usage.MinSamples; i++ {
-		r.Usage.Record(at, app, []usage.PodUsage{
+		r.Usage.Record(at, AppKey("farcast-apps", app), []usage.PodUsage{
 			{Pod: app + "-1", CPUMilli: cpu, MemMiB: mem, RequestCPUMilli: reqCPU, RequestMemMiB: reqMem},
 		})
 	}

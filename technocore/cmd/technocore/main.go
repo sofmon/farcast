@@ -205,6 +205,14 @@ type supervisor struct {
 	lastCheckpoint time.Time
 	warnedProject  bool
 	lastCarrier    kernel.CarrierState
+
+	// unsaved is set when a shutdown changed what the checkpoint must carry
+	// — a stop, or the floor newly reached — and cleared only once a
+	// checkpoint holding it has been written. Until then every tick writes
+	// the ledger again, whatever the schedule: a failed write must not leave
+	// the record of why an application is stopped waiting for the next
+	// scheduled one, which a crash in between would lose.
+	unsaved bool
 }
 
 func (s *supervisor) observe(rep kernel.Report, err error) {
@@ -275,6 +283,13 @@ func (s *supervisor) observe(rep kernel.Report, err error) {
 
 	if a.Level.Acts() {
 		s.act(ctx, rep)
+	}
+	// A stop, or the floor newly reached, is written now rather than on the
+	// schedule, and again on every tick until a write succeeds: a kernel that
+	// crashed in the minutes after stopping an application would otherwise
+	// come back with no record of why it is stopped.
+	if s.unsaved {
+		s.saveLedger(ctx)
 	}
 	s.adapt(ctx, rep)
 	s.checkpoint(ctx, rep.At)
@@ -354,22 +369,34 @@ func (s *supervisor) act(ctx context.Context, rep kernel.Report) {
 		// Decision 8: what remains is the instance's own standing cost, and
 		// the levers that would reduce it destroy operator-visible capability
 		// or data. The kernel names them and takes neither.
+		var levers []string
+		if f := s.reconciler.Floor; f != nil {
+			for _, l := range f.Levers {
+				levers = append(levers, kernel.LeverText(l))
+			}
+		}
 		s.log.Error("at the instance floor: every application is stopped and spending is still over",
 			"still_burning_per_hour", round(rep.FloorHourlyUSD()),
 			"carrier_per_hour", round(rep.RateOverheadUSD),
-			"remaining_levers", "release the load-balancer carrier, or release the instance")
+			"remaining_levers", strings.Join(levers, ", or "))
+	}
+	if res.Recorded {
+		s.unsaved = true
 	}
 }
 
+// checkpoint writes the ledger, and then the usage profiles, on the
+// checkpoint schedule.
 func (s *supervisor) checkpoint(ctx context.Context, now time.Time) {
 	if !s.lastCheckpoint.IsZero() && now.Sub(s.lastCheckpoint) < s.checkpointEvery {
 		return
 	}
-	if err := s.reconciler.Save(ctx, s.store); err != nil {
-		// Not fatal, and deliberately loud: the kernel keeps metering in
-		// memory, but a restart from here would lose whatever the last good
-		// checkpoint does not cover.
-		s.log.Error("checkpoint failed; a restart would lose accounting since the last good one", "err", err)
+	s.save(ctx, now)
+}
+
+// save writes the ledger, and then the usage profiles, whatever the schedule.
+func (s *supervisor) save(ctx context.Context, now time.Time) {
+	if !s.saveLedger(ctx) {
 		return
 	}
 	s.lastCheckpoint = now
@@ -380,6 +407,25 @@ func (s *supervisor) checkpoint(ctx context.Context, now time.Time) {
 	if err := s.reconciler.SaveUsage(ctx, s.profiles, now); err != nil {
 		s.log.Warn("the usage profiles could not be written; metering is unaffected", "err", err)
 	}
+}
+
+// saveLedger writes the checkpoint alone and reports whether it was written.
+//
+// Alone, it is the whole of the off-schedule write after a stop. The usage
+// profiles carry no record of a stop, so they wait for the schedule rather
+// than add a second off-schedule write the provider's audit log would date;
+// and the schedule is left as it was, so a stop adds one write and moves
+// none.
+func (s *supervisor) saveLedger(ctx context.Context) bool {
+	if err := s.reconciler.Save(ctx, s.store); err != nil {
+		// Not fatal, and deliberately loud: the kernel keeps metering in
+		// memory, but a restart from here would lose whatever the last good
+		// checkpoint does not cover.
+		s.log.Error("checkpoint failed; a restart would lose accounting since the last good one", "err", err)
+		return false
+	}
+	s.unsaved = false
+	return true
 }
 
 func round(v float64) string { return fmt.Sprintf("%.4f", v) }

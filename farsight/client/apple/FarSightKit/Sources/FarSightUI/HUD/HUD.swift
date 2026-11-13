@@ -236,6 +236,7 @@ struct AlertBar: View {
         switch kind {
         case .cost: "dollarsign.circle.fill"
         case .checkpointStale: "clock.badge.exclamationmark"
+        case .atFloor: "arrow.down.to.line"
         case .sealed: "lock.fill"
         case .denied: "xmark.octagon.fill"
         case .unattributedDenials: "xmark.shield.fill"

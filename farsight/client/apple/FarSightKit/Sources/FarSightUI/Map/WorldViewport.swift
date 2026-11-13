@@ -103,7 +103,8 @@ private struct MapContent: View {
                             rect: rect,
                             scale: camera.scale,
                             alert: model.alertByInstance[instance.id],
-                            showsReadState: model.world.source == .live
+                            showsReadState: model.world.source == .live,
+                            visible: CGRect(x: 8, y: 0, width: max(viewport.width - 16, 1), height: viewport.height)
                         ) {
                             model.fly(to: .instance(instance.id))
                         }

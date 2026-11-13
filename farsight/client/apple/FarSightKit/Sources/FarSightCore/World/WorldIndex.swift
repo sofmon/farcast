@@ -128,12 +128,14 @@ extension World {
                 }
             }
             if instance.status != .unknown, instance.problem(in: .record) == nil, instance.problem(in: .spend) == nil,
+               instance.problem(in: .figures) == nil,
                spending.limitCents == nil, spending.recordedLimitCents == nil {
                 problems.append("instance \(instance.id) has no cost limit")
             }
             if let cents = spending.expectedCents { money(cents, "instance \(instance.id)'s expected spending") }
             if let cents = spending.confirmedCents { money(cents, "instance \(instance.id)'s confirmed spending") }
             if let cents = spending.totalCents { money(cents, "instance \(instance.id)'s total spending") }
+            if let cents = spending.floor?.stillBurningMonthCents { money(cents, "what still burns at instance \(instance.id)'s floor") }
             if spending.hasConfirmation, spending.confirmedCents == nil {
                 problems.append("instance \(instance.id) says spending is confirmed, with no confirmed figure")
             }

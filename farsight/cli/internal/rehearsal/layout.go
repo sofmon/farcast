@@ -173,14 +173,14 @@ func makeLayout(root string, s Spec, tools, tunnelAddr string, now time.Time) (m
 	meta := &config.InstanceMetadata{
 		Name: inst, Provider: "gke", Project: s.Project, Region: "rehearsal-local", Cluster: "farcast-" + inst,
 		Endpoint: "control-plane.rehearsal.invalid", Status: config.InstanceRunning,
-		CostLimit: config.CostLimit{Amount: 50, Currency: "USD", Period: "monthly"},
+		CostLimit: config.CostLimit{Amount: limitUSD, Currency: "USD", Period: "monthly"},
 		CreatedAt: now, UpdatedAt: now,
 		CloudLogging: config.CloudLoggingSystem, GCloudAccount: s.Account, FatLineDeployed: true,
 		Carrier:  &config.Carrier{Type: "rehearsal", Endpoint: tunnelAddr, ServerName: identity.ServerName(inst)},
 		Registry: &config.Registry{Prefix: "registry.rehearsal.invalid/farcast", FatLineDigest: s.Images[nameFatLine]},
 		Kernel: &config.Kernel{
 			Deployed: true, Applied: true, Image: s.Images[nameKernel], Namespaces: []string{"farcast-system", shopNamespace},
-			Limit: 50, Currency: "USD", Period: "monthly",
+			Limit: limitUSD, Currency: "USD", Period: "monthly",
 		},
 		Keyholder: &config.Keyholder{Deployed: true, Image: s.Images[nameKeyholder], Replicas: 2},
 		Keepers:   []config.Keeper{{Device: keeperDevice, EnrolledAt: now, Expires: expires, LeafTokens: []string{token}}},

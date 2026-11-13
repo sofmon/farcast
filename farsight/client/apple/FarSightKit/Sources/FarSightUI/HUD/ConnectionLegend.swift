@@ -16,7 +16,9 @@ struct ConnectionLegend: View {
 
     private static let entries: [(String, Connection.Kind, Connection.Evidence)] = [
         ("counted by FatLine", .egress, .observed),
-        ("declared, never used", .egress, .declared),
+        // True whether or not the network was read: a line only declared
+        // has had no use counted, which is not the same as none.
+        ("declared, no use counted", .egress, .declared),
         ("refused at the wall", .egress, .denied),
         ("your tunnel, mutual TLS", .tunnel, .observed),
         ("keeper, keyholder route only", .keeper, .observed),

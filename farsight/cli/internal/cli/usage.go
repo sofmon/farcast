@@ -124,9 +124,9 @@ func (c *usageCommand) Run(ctx context.Context, env *Env, args []string) error {
 	if err := json.Unmarshal([]byte(raw), &doc); err != nil {
 		return fmt.Errorf("decode the kernel's usage profiles: %w", err)
 	}
-	if doc.Version != kernel.ProfilesVersion {
-		return fmt.Errorf("the kernel wrote usage profiles version %d and this build reads %d; one of them is older than the other",
-			doc.Version, kernel.ProfilesVersion)
+	if doc.Version < oldestProfilesVersion || doc.Version > kernel.ProfilesVersion {
+		return fmt.Errorf("the kernel wrote usage profiles version %d and this build reads versions %d to %d; one of them is older than the other",
+			doc.Version, oldestProfilesVersion, kernel.ProfilesVersion)
 	}
 	store, err := usage.Restore(doc.Store)
 	if err != nil {
@@ -145,7 +145,7 @@ func (c *usageCommand) Run(ctx context.Context, env *Env, args []string) error {
 		Unavailable: doc.Unavailable,
 		TrimmedTo:   doc.TrimmedTo,
 		Dropped:     doc.Dropped,
-		Apps:        store.Summarize(doc.At),
+		Apps:        appUsages(store.Summarize(doc.At)),
 		Advice:      doc.Advice,
 		Adapting:    doc.Adapting,
 	}
@@ -226,7 +226,7 @@ type usageResult struct {
 	TrimmedTo   int      `json:"trimmed_to,omitempty"`
 	Dropped     []string `json:"dropped,omitempty"`
 
-	Apps []usage.Summary `json:"apps,omitempty"`
+	Apps []appUsage `json:"apps,omitempty"`
 
 	// Advice is what the kernel would set each application's reservation to,
 	// and what it is waiting for where it holds. Adapting says whether it is
@@ -264,6 +264,58 @@ type usageResult struct {
 	TunnelSeparated bool `json:"tunnel_separated,omitempty"`
 }
 
+// oldestProfilesVersion is the oldest usage document this report reads.
+//
+// Version 1 named each profile by the application's bare name. The kernel
+// discards one at restore, because it could never match it to a workload
+// again; this report only shows it, so it reads it, names each profile as
+// written, and says so — an operator who has updated this machine and not yet
+// the kernel still sees what their applications use.
+const oldestProfilesVersion = 1
+
+// profileNote is what a profile named without its namespace says.
+const profileNote = "profiled before the kernel recorded namespaces"
+
+// appUsage is one application's profile, named by namespace and name as the
+// kernel keys it. A profile with no namespace — from a kernel older than
+// namespaced profiles — keeps an empty one and a note, never a guessed one.
+type appUsage struct {
+	Namespace string `json:"namespace"`
+	Note      string `json:"note,omitempty"`
+	usage.Summary
+}
+
+// label is the application as the report names it.
+func (a appUsage) label() string {
+	if a.Namespace == "" {
+		return a.App
+	}
+	return kernel.AppKey(a.Namespace, a.App)
+}
+
+func appUsages(sums []usage.Summary) []appUsage {
+	out := make([]appUsage, 0, len(sums))
+	for _, s := range sums {
+		ns, name, qualified := kernel.SplitAppKey(s.App)
+		s.App = name
+		a := appUsage{Namespace: ns, Summary: s}
+		if !qualified {
+			a.Note = profileNote
+		}
+		out = append(out, a)
+	}
+	return out
+}
+
+// adviceLabel is an advised workload as the report names it: as the profile
+// table names it, by namespace and name.
+func adviceLabel(a kernel.Adaptation) string {
+	if a.Namespace == "" {
+		return a.App
+	}
+	return kernel.AppKey(a.Namespace, a.App)
+}
+
 func (r usageResult) Human(w io.Writer) error {
 	fprintf(w, "Observed usage in %q — %dh window", r.Instance, r.Hours)
 	if r.Ago != "" {
@@ -276,14 +328,22 @@ func (r usageResult) Human(w io.Writer) error {
 	if len(r.Apps) == 0 {
 		fprintln(w, "  Nothing profiled yet.")
 	} else {
-		fprintf(w, "  %-20s %4s  %9s %9s %8s   %9s %9s %8s  %s\n",
+		fprintf(w, "  %-28s %4s  %9s %9s %8s   %9s %9s %8s  %s\n",
 			"application", "pods", "cpu p95", "reserved", "spare", "mem p95", "reserved", "spare", "last hour")
+		bare := false
 		for _, a := range r.Apps {
-			fprintf(w, "  %-20s %4d  %9s %9s %8s   %9s %9s %8s  %s\n",
-				a.App, a.Pods,
+			name := a.label()
+			if a.Namespace == "" {
+				name, bare = name+" *", true
+			}
+			fprintf(w, "  %-28s %4d  %9s %9s %8s   %9s %9s %8s  %s\n",
+				name, a.Pods,
 				milli(a.CPU.Day.P95), milli(a.RequestCPUMilli), spare(a.CPUHeadroom()),
 				mib(a.Mem.Day.P95), mib(a.RequestMemMiB), spare(a.MemHeadroom()),
 				trend(a.CPU))
+		}
+		if bare {
+			fprintf(w, "  * %s; which namespace it ran in was not recorded.\n", profileNote)
 		}
 		fprintln(w)
 		fprintln(w, "  'spare' is what a pod reserves divided by its p95 — 4.0x means four times")
@@ -336,11 +396,11 @@ func (r usageResult) writeAdvice(w io.Writer) {
 	}
 	fprintln(w)
 	fprintln(w, "Right-sizing — what TechnoCore makes of that, per pod")
-	fprintf(w, "  %-20s %14s %14s %10s  %s\n", "application", "reserved now", "would be", "per month", "")
+	fprintf(w, "  %-28s %14s %14s %10s  %s\n", "application", "reserved now", "would be", "per month", "")
 	for _, a := range r.Advice {
 		now := fmt.Sprintf("%dm/%dMi", a.CurrentCPUMilli, a.CurrentMemMiB)
 		if !a.Act {
-			fprintf(w, "  %-20s %14s %14s %10s  holding: %s\n", a.App, now, "—", "—", a.Hold)
+			fprintf(w, "  %-28s %14s %14s %10s  holding: %s\n", adviceLabel(a), now, "—", "—", a.Hold)
 			continue
 		}
 		note := ""
@@ -349,8 +409,8 @@ func (r usageResult) writeAdvice(w io.Writer) {
 			// system's final opinion and concludes it got the answer wrong.
 			note = "a bounded step; it will move further next time"
 		}
-		fprintf(w, "  %-20s %14s %14s %10s  %s\n",
-			a.App, now, fmt.Sprintf("%dm/%dMi", a.CPUMilli, a.MemMiB),
+		fprintf(w, "  %-28s %14s %14s %10s  %s\n",
+			adviceLabel(a), now, fmt.Sprintf("%dm/%dMi", a.CPUMilli, a.MemMiB),
 			signedUSD(a.MonthlyDeltaUSD()), note)
 	}
 	fprintln(w)

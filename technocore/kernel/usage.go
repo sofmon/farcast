@@ -17,7 +17,10 @@ import (
 // pod the meter already saw. That ordering is the attribution rule: the
 // profile set can never name an application the cost path does not, and a
 // reading for a pod that vanished between the two calls is dropped rather
-// than filed under a guess.
+// than filed under a guess. The key is the cost path's too — AppKey, the
+// namespace and the name — so two namespaces' "web" are two profiles, as
+// they are two ledger entries, and neither is resized on the other's
+// readings.
 //
 // Nothing here can fail the tick. Per [ADR 0014] decision 2 usage is
 // advisory, so every namespace refusing is still only a finding — the exact
@@ -36,7 +39,7 @@ func (r *Reconciler) sampleUsage(ctx context.Context, namespaces []string, rep *
 		index[key{w.Namespace, w.Name}] = w
 	}
 
-	byApp := map[string][]usage.PodUsage{}
+	byApp := map[string][]usage.PodUsage{} // by AppKey, as the ledger
 	fresh := make(map[string]time.Time, len(rep.Workloads))
 	for _, ns := range namespaces {
 		items, err := r.Cluster.ListPodMetrics(ctx, ns, r.Selector)
@@ -50,9 +53,6 @@ func (r *Reconciler) sampleUsage(ctx context.Context, namespaces []string, rep *
 			if w == nil {
 				continue
 			}
-			// Remembered whether or not it is new. Recording only the new
-			// ones would erase the memory of a repeat on the very tick that
-			// saw it, and the same reading would be taken in again next tick.
 			// Remembered whether or not it is new. Recording only the new
 			// ones would erase the memory of a repeat on the very tick that
 			// saw it, and the same reading would be taken in again next tick.
@@ -70,7 +70,8 @@ func (r *Reconciler) sampleUsage(ctx context.Context, namespaces []string, rep *
 				rep.UsageUnavailable = append(rep.UsageUnavailable, fmt.Sprintf("%s: %v", id, err))
 				continue
 			}
-			byApp[w.App] = append(byApp[w.App], usage.PodUsage{
+			key := AppKey(w.Namespace, w.App)
+			byApp[key] = append(byApp[key], usage.PodUsage{
 				Pod: m.Metadata.Name, CPUMilli: cpu, MemMiB: mem,
 				RequestCPUMilli: w.CPUMilli, RequestMemMiB: w.MemMiB,
 			})
@@ -136,7 +137,13 @@ type Profiles struct {
 }
 
 // ProfilesVersion is the shape of the persisted usage document.
-const ProfilesVersion = 1
+//
+// Version 2 (2026-11-12) keys profiles by AppKey, as the ledger keys
+// spending. A version 1 document's bare-named profiles could never be matched
+// to a workload again, so a version 1 document is discarded at restore and
+// said out loud, as any unreadable one is — a day of advisory history, and
+// never a resize made on another namespace's readings.
+const ProfilesVersion = 2
 
 // Defaults for where the profiles live. They are a separate ConfigMap from
 // the ledger deliberately: the ledger must always be writable, and an

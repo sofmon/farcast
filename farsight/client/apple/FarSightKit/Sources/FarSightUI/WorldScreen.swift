@@ -25,6 +25,12 @@ public struct WorldScreen: View {
         self.init(model: WorldModel(world: world, store: store))
     }
 
+    /// The smallest a Mac window drawing the map may be: with the HUD's
+    /// regular insets, a focused app is still drawn whole there, at least
+    /// `WorldModel.leastFullPanelWidth` wide, every figure of FarCast's own
+    /// surfaces whole.
+    public static let minimumWindow = CGSize(width: 667, height: 460)
+
     public var body: some View {
         ZStack {
             WorldViewport(model: model, backdrop: backdrop)

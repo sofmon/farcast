@@ -56,12 +56,30 @@ func wl(kind, ns, name string, ready, desired int, images ...string) cluster.Wor
 
 func credentialOf(c string) string { return strings.Repeat(c, 64) }
 
+// vectorRates are what the vector kernel accrued, per application, keyed as
+// a version 2 kernel keys them: namespace and name.
+func vectorRates() map[string]float64 {
+	return map[string]float64{
+		"shop/api": 0.0625, "shop/web": 0.03125, "farcast-system/technocore": 0.015625,
+		"farcast-system/fatline": 0.03125, "farcast-system/datasphered": 0.03125,
+	}
+}
+
 // vectorCheckpoint is a real kernel checkpoint, built through the real ledger.
 //
 // Every rate is a binary fraction and every interval a whole number of hours,
 // so the sums are exact whatever order the ledger adds its buckets in: a
 // vector that changed with map iteration order would be no vector at all.
 func vectorCheckpoint(t *testing.T, mutate func(*kernel.Checkpoint)) string {
+	t.Helper()
+	return vectorCheckpointOf(t, vectorRates(), mutate)
+}
+
+// vectorCheckpointOf is vectorCheckpoint accruing rates under the keys given:
+// namespaced, as a version 2 kernel accrues, or bare, as a version 1 kernel
+// did. The total is the same 0.171875 an hour either way, so the confirmed
+// window calibrates to exactly 1 whichever is used.
+func vectorCheckpointOf(t *testing.T, rates map[string]float64, mutate func(*kernel.Checkpoint)) string {
 	t.Helper()
 	start := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
 	end := time.Date(2026, 12, 1, 0, 0, 0, 0, time.UTC)
@@ -70,9 +88,7 @@ func vectorCheckpoint(t *testing.T, mutate func(*kernel.Checkpoint)) string {
 		t.Fatal(err)
 	}
 	at := time.Date(2026, 11, 12, 9, 0, 0, 0, time.UTC)
-	for app, rate := range map[string]float64{
-		"api": 0.0625, "web": 0.03125, "technocore": 0.015625, "fatline": 0.03125, "datasphered": 0.03125,
-	} {
+	for app, rate := range rates {
 		ledger.Accrue(at, app, rate, 132*time.Hour)
 	}
 	// What the model expected for the window, so calibration stays exactly 1.
@@ -180,6 +196,19 @@ func healthyInputs(t *testing.T) worldInputs {
 	}
 }
 
+// sharedWeb adds a blog namespace, metered, running its own web beside
+// shop's.
+func sharedWeb(in worldInputs) worldInputs {
+	in.Apps.Namespaces = append(in.Apps.Namespaces, "blog")
+	in.Apps.Meter.Namespaces = append(in.Apps.Meter.Namespaces, "blog")
+	in.Meta.Kernel.Namespaces = append(in.Meta.Kernel.Namespaces, "blog")
+	in.Apps.Workloads["blog"] = []cluster.Workload{wl("Deployment", "blog", "web", 1, 1, vecRegistry+"/app/blog/web"+digestOf("8"))}
+	in.Meta.Deployments["blog"] = config.Deployment{Repository: "https://github.com/example/blog", Ref: "refs/heads/main",
+		Commit: "1111111111111111111111111111111111111111", ManifestDigest: "sha256:" + strings.Repeat("8", 64),
+		DeployedAt: time.Date(2026, 11, 11, 7, 0, 0, 0, time.UTC)}
+	return in
+}
+
 type worldVector struct {
 	name   string
 	inputs func(t *testing.T) worldInputs
@@ -256,13 +285,84 @@ func worldVectors() []worldVector {
 		}},
 		{"shared_app_name", func(t *testing.T) worldInputs {
 			in := healthyInputs(t)
-			in.Apps.Namespaces = append(in.Apps.Namespaces, "blog")
-			in.Apps.Meter.Namespaces = append(in.Apps.Meter.Namespaces, "blog")
-			in.Meta.Kernel.Namespaces = append(in.Meta.Kernel.Namespaces, "blog")
-			in.Apps.Workloads["blog"] = []cluster.Workload{wl("Deployment", "blog", "web", 1, 1, vecRegistry+"/app/blog/web"+digestOf("8"))}
-			in.Meta.Deployments["blog"] = config.Deployment{Repository: "https://github.com/example/blog", Ref: "refs/heads/main",
-				Commit: "1111111111111111111111111111111111111111", ManifestDigest: "sha256:" + strings.Repeat("8", 64),
-				DeployedAt: time.Date(2026, 11, 11, 7, 0, 0, 0, time.UTC)}
+			// shop's web accrued before the kernel recorded namespaces: a
+			// version 1 kernel's bare key, carried into this period. With
+			// blog running a web too, that share is one or the other's.
+			rates := vectorRates()
+			rates["web"] = rates["shop/web"]
+			delete(rates, "shop/web")
+			in.Spend.Raw = vectorCheckpointOf(t, rates, nil)
+			return sharedWeb(in)
+		}},
+		{"shared_app_name_namespaced", func(t *testing.T) worldInputs {
+			// Two namespaces' web, each accrued under its own key: each has
+			// its own figure, and no caveat.
+			in := sharedWeb(healthyInputs(t))
+			rates := vectorRates()
+			rates["shop/web"] = 0.015625
+			rates["blog/web"] = 0.015625 + 0.0078125
+			rates["shop/api"] -= 0.0078125
+			in.Spend.Raw = vectorCheckpointOf(t, rates, nil)
+			return in
+		}},
+		{"legacy_bare_keys", func(t *testing.T) worldInputs {
+			// A checkpoint as a version 1 kernel wrote it: every key bare, no
+			// stops, no floor. Each name runs in one namespace, so each
+			// figure is still its application's; the kernel's silence about
+			// stops and the floor is said, never read as "none".
+			in := healthyInputs(t)
+			rates := map[string]float64{}
+			for key, rate := range vectorRates() {
+				_, name, _ := kernel.SplitAppKey(key)
+				rates[name] = rate
+			}
+			in.Spend.Raw = vectorCheckpointOf(t, rates, func(cp *kernel.Checkpoint) { cp.Version = 1 })
+			return in
+		}},
+		{"cost_guard_stop", func(t *testing.T) worldInputs {
+			// The kernel stopped shop/api and recorded it. shop/web is at zero
+			// too, with no record: somebody else stopped it, so it gets no
+			// reason.
+			in := healthyInputs(t)
+			in.Spend.Raw = vectorCheckpoint(t, func(cp *kernel.Checkpoint) {
+				cp.Observed.Level, cp.Observed.Limit = cost.LevelReached.String(), 20
+				cp.Stops = []kernel.Stop{{Namespace: "shop", Deployment: "api", At: vectorNow.Add(-50 * time.Minute),
+					Reason: kernel.StopReasonCostGuard, HourlyUSD: 0.0625}}
+			})
+			in.Apps.Workloads["shop"] = []cluster.Workload{
+				wl("Deployment", "shop", "api", 0, 0, vecRegistry+"/app/shop/api"+digestOf("6")),
+				wl("Deployment", "shop", "web", 0, 0, vecRegistry+"/app/shop/web"+digestOf("5")),
+			}
+			return in
+		}},
+		{"stale_stop_record", func(t *testing.T) worldInputs {
+			// The checkpoint still records shop/web's stop, but the operator
+			// has brought it back since: a stale record never labels a running
+			// application.
+			in := healthyInputs(t)
+			in.Spend.Raw = vectorCheckpoint(t, func(cp *kernel.Checkpoint) {
+				cp.Stops = []kernel.Stop{{Namespace: "shop", Deployment: "web", At: vectorNow.Add(-3 * time.Hour),
+					Reason: kernel.StopReasonCostGuard, HourlyUSD: 0.03125}}
+			})
+			return in
+		}},
+		{"at_floor", func(t *testing.T) worldInputs {
+			// Every application stopped by the kernel, and spending still
+			// over: the floor, with what still burns and the levers left.
+			in := healthyInputs(t)
+			in.Spend.Raw = vectorCheckpoint(t, func(cp *kernel.Checkpoint) {
+				cp.Observed.Level, cp.Observed.Limit = cost.LevelReached.String(), 20
+				cp.Stops = []kernel.Stop{
+					{Namespace: "shop", Deployment: "api", At: vectorNow.Add(-2 * time.Hour), Reason: kernel.StopReasonCostGuard, HourlyUSD: 0.0625},
+					{Namespace: "shop", Deployment: "web", At: vectorNow.Add(-2 * time.Hour), Reason: kernel.StopReasonCostGuard, HourlyUSD: 0.03125},
+				}
+				cp.Floor = &kernel.Floor{Since: vectorNow.Add(-90*time.Minute + 123456789), HourlyUSD: 0.078125,
+					Levers: []string{kernel.LeverCarrier, kernel.LeverRelease}}
+			})
+			in.Apps.Workloads["shop"] = []cluster.Workload{
+				wl("Deployment", "shop", "api", 0, 0, vecRegistry+"/app/shop/api"+digestOf("6")),
+				wl("Deployment", "shop", "web", 0, 0, vecRegistry+"/app/shop/web"+digestOf("5")),
+			}
 			return in
 		}},
 		{"mixed_evidence", func(t *testing.T) worldInputs {

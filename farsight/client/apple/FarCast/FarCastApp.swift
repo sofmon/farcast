@@ -19,6 +19,7 @@ struct FarCastApp: App {
         WindowGroup("FarCast") {
             #if os(macOS)
             ConnectedRoot(app: connected)
+                .frame(minWidth: WorldScreen.minimumWindow.width, minHeight: WorldScreen.minimumWindow.height)
             #else
             FixtureRoot()
             #endif
@@ -26,13 +27,17 @@ struct FarCastApp: App {
         #if os(macOS)
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1440, height: 900)
+        .windowResizability(.contentMinSize)
         #endif
         #if os(macOS)
+        // No smaller than a focused app can be drawn whole in.
         Window("Illustrative world", id: "illustrative") {
             FixtureRoot(marked: true)
+                .frame(minWidth: WorldScreen.minimumWindow.width, minHeight: WorldScreen.minimumWindow.height)
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1440, height: 900)
+        .windowResizability(.contentMinSize)
         Settings {
             CLISettingsView(app: connected)
         }

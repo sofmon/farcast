@@ -41,6 +41,7 @@ struct AppPanel: View {
         .position(x: rect.midX, y: rect.midY)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(accessibilityText)
+        .accessibilityValue(spokenSurface)
         .accessibilityAddTraits(.isButton)
         .accessibilityAction { model.focus(on: app.id) }
     }
@@ -247,6 +248,15 @@ struct AppPanel: View {
         }
         if app.isIllustrative { return Theme.illustrative }
         return Theme.secondaryText
+    }
+
+    /// What a FarCast component's surface says, every figure and every word
+    /// of its notes, for VoiceOver: the panel is one element, so its "more"
+    /// button is not one of its own, and nothing on the surface may be left
+    /// to that button alone. Empty where no surface is drawn.
+    private var spokenSurface: String {
+        guard group.isSystem, level == .full else { return "" }
+        return SystemSummary(app: app, model: model).spoken
     }
 
     private var accessibilityText: String {
