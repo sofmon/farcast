@@ -1,6 +1,8 @@
 package keeper
 
 import (
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"os"
@@ -9,6 +11,8 @@ import (
 	"time"
 
 	"github.com/goccy/go-yaml"
+
+	"github.com/sofmon/farcast/fatline/identity"
 )
 
 // File names inside a keeper's directory. The material files are separate from
@@ -49,6 +53,12 @@ type Config struct {
 	BackupExcluded bool   `yaml:"backup_excluded"`
 	BackupNote     string `yaml:"backup_note,omitempty"`
 
+	// KeySHA256 is the fingerprint (identity.KeyFingerprint) of the key this
+	// device made and its certificate certifies, and KeyStore where that key
+	// was born (KeyStoreFile). Empty on a record from before ADR 0020.
+	KeySHA256 string `yaml:"key_sha256,omitempty"`
+	KeyStore  string `yaml:"key_store,omitempty"`
+
 	// WipedAt is when this device's key material was wiped, and WipedReason
 	// why. The record and the ledger stay: the ledger is the evidence an
 	// audit reads, and 'keeper status' needs the record to read it.
@@ -72,7 +82,15 @@ func (s *Store) Dir() string { return s.dir }
 // LedgerPath is where this keeper records what it has pushed.
 func (s *Store) LedgerPath() string { return filepath.Join(s.dir, ledgerFile) }
 
-// Install writes a packet's material into dir, ready for the daemon.
+// Install writes a packet's certificate and bundle into dir, beside the key
+// this device made for it, ready for the daemon.
+//
+// The packet carries no key (ADR 0020 decision 3): the device made its own
+// with 'keeper request', and the certificate must certify that key, pending or
+// already installed. A certificate for any other key is a security event — the
+// request was replaced on its way to the operator, or the packet is another
+// device's — and Install refuses it with a *ForeignKeyError, having written,
+// created and removed nothing.
 //
 // The material comes to rest UNARMORED, and that is the honest consequence of
 // what a keeper is for: a device that re-seeds at 03:00 without waking anyone
@@ -84,6 +102,10 @@ func (s *Store) LedgerPath() string { return filepath.Join(s.dir, ledgerFile) }
 // backup guarantee, because ADR 0008 says a platform that cannot guarantee the
 // exclusion cannot be a keeper. `force` records the operator overriding that,
 // which is theirs to do and is written into the record either way.
+//
+// Re-installing the packet for the key already installed is idempotent, so a
+// crash part way is mended by running it again, and it never touches a
+// request pending beside that key: a renewal's packet must still install.
 func Install(dir string, p *Packet, force bool) (*Store, error) {
 	if err := p.Validate(); err != nil {
 		return nil, err
@@ -94,32 +116,49 @@ func Install(dir string, p *Packet, force bool) (*Store, error) {
 		// exists to prevent — and unlike a backup pipeline it is continuous.
 		return nil, err
 	}
-	if err := os.MkdirAll(dir, dirMode); err != nil {
-		return nil, fmt.Errorf("keeper: preparing %s: %w", dir, err)
+	if err := verifyLeaf(p, time.Now()); err != nil {
+		return nil, err
 	}
-	if err := os.Chmod(dir, dirMode); err != nil {
-		return nil, fmt.Errorf("keeper: securing %s: %w", dir, err)
+	certKey, err := identity.CertKeyFingerprint(p.LeafCertPEM)
+	if err != nil {
+		return nil, fmt.Errorf("keeper: the packet's certificate: %w", err)
 	}
 
-	excluded, note := true, ""
-	if err := excludeFromBackup(dir); err != nil {
-		excluded, note = false, err.Error()
-		if !force {
-			return nil, fmt.Errorf(
-				"keeper: %w\n\nThe bundle, this device's private key and the ledger would rest somewhere the platform "+
-					"may copy off the device. ADR 0008 says a platform that cannot guarantee the exclusion cannot "+
-					"be a keeper.\n\nIf you have arranged the exclusion yourself, re-run with --accept-backup-risk "+
-					"and the record will say that you did.", err)
+	// What this device holds for the instance: a pending request's key, when
+	// the record beside it names this instance, and an installed one.
+	var pendingKey string
+	pending, err := PendingRequest(dir)
+	if err != nil {
+		return nil, err
+	}
+	if pending != nil && pending.Instance == p.Instance {
+		if pendingKey, err = heldKeyFingerprint(dir, requestKeyFile); err != nil {
+			return nil, err
+		}
+	}
+	installedKey, err := heldKeyFingerprint(dir, leafKey)
+	if err != nil {
+		return nil, err
+	}
+	matchedPending := pendingKey != "" && pendingKey == certKey
+	matchedInstalled := !matchedPending && installedKey != "" && installedKey == certKey
+	if !matchedPending && !matchedInstalled {
+		return nil, &ForeignKeyError{
+			Instance: p.Instance, Device: p.Device,
+			CertKey: certKey, Pending: pendingKey, Installed: installedKey,
 		}
 	}
 
+	excluded, note, err := Prepare(dir, force)
+	if err != nil {
+		return nil, err
+	}
 	for _, f := range []struct {
 		name string
 		data []byte
 	}{
 		{caFile, p.CACertPEM},
 		{leafFile, p.LeafCertPEM},
-		{leafKey, p.LeafKeyPEM},
 		{bundleFile, p.Bundle},
 	} {
 		if err := writeSecret(filepath.Join(dir, f.name), f.data); err != nil {
@@ -127,11 +166,41 @@ func Install(dir string, p *Packet, force bool) (*Store, error) {
 		}
 	}
 
+	keyStore := KeyStoreFile
+	if matchedPending {
+		if pending.KeyStore != "" {
+			keyStore = pending.KeyStore
+		}
+		// The key moves; it is never copied. A rename within the directory
+		// is atomic, so a crash leaves it under one name or the other, and
+		// running install again finds it either way.
+		if err := os.Rename(filepath.Join(dir, requestKeyFile), filepath.Join(dir, leafKey)); err != nil {
+			return nil, fmt.Errorf("keeper: moving the request's key into place: %w", err)
+		}
+	} else {
+		switch {
+		case pending != nil && pending.KeySHA256 == certKey && pending.KeyStore != "":
+			keyStore = pending.KeyStore
+		default:
+			if prev, perr := (&Store{dir: dir}).Config(); perr == nil && prev.KeyStore != "" {
+				keyStore = prev.KeyStore
+			}
+		}
+	}
+	// A rename keeps the request key's mode and a re-install rewrites nothing
+	// of the key, so its mode is set here either way: os.WriteFile honours a
+	// mode only when it creates a file, and a key that came back from a
+	// re-enrolment world-readable is a regression nobody watched happen.
+	if err := os.Chmod(filepath.Join(dir, leafKey), fileMode); err != nil {
+		return nil, fmt.Errorf("keeper: securing %s: %w", leafKey, err)
+	}
+
 	cfg := Config{
-		Version: packetVersion, Instance: p.Instance, Device: p.Device,
+		Version: recordVersion, Instance: p.Instance, Device: p.Device,
 		Carrier: p.Carrier, ServerName: p.ServerName, Generation: p.Generation,
 		Budget: p.Budget, Window: p.Window, InstalledAt: time.Now().UTC(),
 		BackupExcluded: excluded, BackupNote: note,
+		KeySHA256: certKey, KeyStore: keyStore,
 	}
 	out, err := yaml.Marshal(cfg)
 	if err != nil {
@@ -140,7 +209,55 @@ func Install(dir string, p *Packet, force bool) (*Store, error) {
 	if err := writeSecret(filepath.Join(dir, configFile), out); err != nil {
 		return nil, err
 	}
+
+	switch {
+	case matchedPending:
+		if err := os.Remove(filepath.Join(dir, requestRecordFile)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("keeper: removing the request record: %w", err)
+		}
+	case pending != nil && pending.KeySHA256 == certKey && pendingKey == "":
+		// The record of the request this key came from, left by an install
+		// that stopped after moving the key: its key is the installed one, so
+		// nothing is pending. A record naming any other key is a renewal and
+		// stays.
+		if err := os.Remove(filepath.Join(dir, requestRecordFile)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("keeper: removing the request record: %w", err)
+		}
+	}
 	return &Store{dir: dir}, nil
+}
+
+// verifyLeaf checks the packet's certificate chains to the packet's CA as a
+// client leaf. It proves the CA's signature and the EKU without depending on
+// this device's clock agreeing with the operator's: a leaf starts a minute
+// before it was issued, and a board with no real-time clock can lag until it
+// syncs, so the check runs at the later of now and the leaf's NotBefore. An
+// expired leaf is still refused.
+func verifyLeaf(p *Packet, now time.Time) error {
+	block, _ := pem.Decode(p.LeafCertPEM)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return errors.New("keeper: the packet's certificate is not PEM")
+	}
+	leaf, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return errors.New("keeper: the packet's certificate does not parse")
+	}
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(p.CACertPEM) {
+		return errors.New("keeper: the packet's CA certificate does not parse")
+	}
+	at := now
+	if leaf.NotBefore.After(at) {
+		at = leaf.NotBefore
+	}
+	if _, err := leaf.Verify(x509.VerifyOptions{
+		Roots:       roots,
+		KeyUsages:   []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+		CurrentTime: at,
+	}); err != nil {
+		return fmt.Errorf("keeper: the packet's certificate does not chain to its CA: %w", err)
+	}
+	return nil
 }
 
 // OpenStore loads an installed keeper.
@@ -148,6 +265,11 @@ func OpenStore(dir string) (*Store, error) {
 	s := &Store{dir: dir}
 	if _, err := os.Stat(filepath.Join(dir, configFile)); err != nil {
 		if os.IsNotExist(err) {
+			if r, rerr := PendingRequest(dir); rerr == nil && r != nil {
+				return nil, fmt.Errorf("keeper: nothing is enrolled at %s; a request made %s is pending here: "+
+					"carry it to the operator's machine and install the packet it returns",
+					dir, r.CreatedAt.UTC().Format("2006-01-02"))
+			}
 			return nil, fmt.Errorf("keeper: nothing is enrolled at %s", dir)
 		}
 		return nil, err
@@ -206,8 +328,9 @@ func (s *Store) CACert() ([]byte, error) {
 	return os.ReadFile(filepath.Join(s.dir, caFile))
 }
 
-// Wipe deletes the two files on this device that could open anything: the
-// bundle and the leaf's private key.
+// Wipe deletes the files on this device that could open anything: the
+// bundle and the leaf's private key — and a pending request's key and record,
+// which would otherwise outlive the keeper they were made to renew.
 //
 // The ledger is deliberately KEPT, and so is the record 'keeper status' needs
 // to read it (ADR 0008: a device that erased its own history on the way out
@@ -231,7 +354,7 @@ func (s *Store) Wipe(reason string, at time.Time) error {
 			return err
 		}
 	}
-	for _, f := range []string{leafKey, bundleFile} {
+	for _, f := range []string{leafKey, bundleFile, requestKeyFile, requestRecordFile} {
 		if err := os.Remove(filepath.Join(s.dir, f)); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("keeper: removing %s: %w", f, err)
 		}
@@ -300,7 +423,7 @@ func refuseSyncedPath(dir string) error {
 		if strings.Contains(slashed, needle+"/") || strings.HasSuffix(slashed, needle) {
 			return fmt.Errorf(
 				"keeper: refusing to install into %s, which is inside %q — a synced folder uploads this "+
-					"device's bundle continuously, to the kind of cloud this design exists to keep it off",
+					"device's bundle and key continuously, to the kind of cloud this design exists to keep it off",
 				abs, root)
 		}
 	}

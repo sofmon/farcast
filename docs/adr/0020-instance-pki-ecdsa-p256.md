@@ -1,6 +1,6 @@
 # ADR 0020 — The Instance PKI Moves to ECDSA P-256
 
-**Status:** Accepted (2026-11-11). Not yet implemented: the code still issues Ed25519, and the documents that describe the code say so, with a pointer here. The evidence is a probe on the dev Mac (macOS 27, SDK 27.2) and the iOS 26.0 simulator. The findings below say which ran where. Nothing ran on a physical iPhone, an iPad or a Vision Pro.
+**Status:** Accepted (2026-11-11). Implemented 2026-11-13: the instance PKI issues and accepts ECDSA P-256 only, keepers enrol by request, LeafToken is v2, and FarSightKit's regression runs in `./check.sh` on macOS and the iOS simulator. Verification 3 (the re-walk) and 4 (the 7.5 gates) are owed. The re-walk is billable, about USD 0.40, and a separate session the operator approves before anything is created. The rest of this record keeps its 2026-11-11 wording. The evidence is a probe on the dev Mac (macOS 27, SDK 27.2) and the iOS 26.0 simulator. The findings below say which ran where. Nothing ran on a physical iPhone, an iPad or a Vision Pro.
 
 **Date:** 2026-11-11
 
@@ -129,6 +129,8 @@ The request records which. `keeper request` creates the keeper directory under `
 - the device shows the SHA-256 fingerprint of the request's SubjectPublicKeyInfo;
 - `keeper enroll` shows the same fingerprint and issues only once the operator confirms it against the device's screen, or passes `--key-sha256 <hex>`;
 - the fingerprint covers the SubjectPublicKeyInfo, not the request bytes, because an ECDSA request's signature has more than one valid encoding.
+
+*(Note, 2026-11-13, as built: `keeper enroll` meets "shows the same fingerprint" by showing it once it matches, never before. Shown first and then asked for, the request's fingerprint — which is the sender's value until confirmed — can be copied back from the line above, or from the scrollback of a failed attempt, and that confirms nothing; the habituation that rules out a bare "yes" rules that out too. So at a terminal the operator types the fingerprint as the device shows it, all 16 groups or at least the last 8 (128 bits, P-256's security level); the full fingerprint is printed after a match, as confirmed, and no refusal prints any of it. `--key-sha256` takes all 64 characters, for scripts and the runbooks. This is a stricter reading of the sentence above, not a change to it.)*
 
 **What the operator's machine checks.** It parses the request and requires all of the following, explicitly:
 - `PublicKeyAlgorithm` ECDSA;

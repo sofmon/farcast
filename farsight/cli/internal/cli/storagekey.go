@@ -856,8 +856,8 @@ func (r keyRotateResult) Human(w io.Writer) error {
 			fprintf(w, "so the ones enrolled before this may already refuse. Re-enrol each device once a\n")
 			fprintf(w, "rotation has finished:\n")
 		}
-		for _, d := range r.Reenrol {
-			fprintf(w, "      farcast keeper enroll %s %s --out <path> --passphrase-file <path>\n", r.Instance, d)
+		for _, line := range reenrolLines(r.Instance, r.Reenrol) {
+			fprintf(w, "      %s\n", line)
 		}
 	}
 	if len(r.Scopes) > 0 {

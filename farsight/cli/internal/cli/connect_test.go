@@ -3,10 +3,16 @@ package cli
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"io"
 	"log/slog"
+	"math/big"
 	"os"
 	"strings"
 	"testing"
@@ -998,5 +1004,56 @@ func TestStatusDoesNotWaitOutATimeout(t *testing.T) {
 	}
 	if attempts != 1 {
 		t.Errorf("--status dialled %d times, want exactly one", attempts)
+	}
+}
+
+// B-T15. A store minted before ADR 0020 holds an Ed25519 CA. connect refuses
+// it before it dials anything or applies anything, and says the way out: there
+// is no CA rotation, so release and install a new instance.
+func TestConnectRefusesAnEd25519Store(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	const name = "prod"
+	connectedInstance(t, dir, name)
+	mtls, err := dir.LoadInstanceMTLS(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, key, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "FarCast Instance CA: " + name},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+		KeyUsage: x509.KeyUsageCertSign, BasicConstraintsValid: true, IsCA: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, key.Public(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mtls.CACertPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	if err := dir.SaveInstanceMTLS(name, mtls); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, statusOnly := range []bool{true, false} {
+		dialled := 0
+		fc := &fakeCluster{}
+		c := testConnect(&fakeProvider{}, &fakeBuilder{})
+		c.statusOnly = statusOnly
+		c.newCluster = func(string) clusterApplier { return fc }
+		c.dial = func(context.Context, string, tunnel.ClientIdentity) (tunnelConn, error) {
+			dialled++
+			return &fakeConn{st: fatline.ConnStatus{Connected: true}}, nil
+		}
+		env, _ := testEnv(dir, output.ModeHuman)
+		err := c.Run(context.Background(), env, []string{name})
+		if err == nil || !strings.Contains(err.Error(), "ADR 0020") || !strings.Contains(err.Error(), "'farcast release prod'") ||
+			!errors.Is(err, identity.ErrRetiredAlgorithm) {
+			t.Errorf("connect (status %v) over an Ed25519 store = %v; want a refusal naming ADR 0020 and 'farcast release'", statusOnly, err)
+		}
+		if dialled != 0 || len(fc.applied) != 0 {
+			t.Errorf("connect (status %v) dialled %d time(s) and applied %d manifest(s) before refusing", statusOnly, dialled, len(fc.applied))
+		}
 	}
 }

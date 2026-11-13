@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "about": "The Ed25519 PKI ADR 0020 retired, in the shapes crypto.go issued before it: a CA and a server leaf for the fixture's server name. For negative tests only: Apple's TLS stacks cannot complete a handshake with it. Test data; trusted nowhere else.",
+  "server_name": "fixture.fatline.farcast",
+  "issued_at": "2026-11-13T00:00:00Z",
+  "verify_at": "2026-11-14T00:00:00Z",
+  "ca": {
+    "cert_pem": "-----BEGIN CERTIFICATE-----\nMIIBQTCB9KADAgECAgEBMAUGAytlcDAnMSUwIwYDVQQDExxGYXJDYXN0IEluc3Rh\nbmNlIENBOiBmaXh0dXJlMB4XDTI2MTExMjIzNTkwMFoXDTI4MTExMjAwMDAwMFow\nJzElMCMGA1UEAxMcRmFyQ2FzdCBJbnN0YW5jZSBDQTogZml4dHVyZTAqMAUGAytl\ncAMhADjCgFUeu99Ju8341R7ob3wGW+6yHRec6UBTUA16vq/do0UwQzAOBgNVHQ8B\nAf8EBAMCAQYwEgYDVR0TAQH/BAgwBgEB/wIBADAdBgNVHQ4EFgQUP21olf7huQca\nA2Jd5Xvxm6p1UqEwBQYDK2VwA0EA9KuQ5VR4gQs6SFD5Jd5bruJ9Fw7b6d9ea9GD\nwq0zAbudygHFvmE4Dlyj5JOaSf2g/kTq5mA6RhBL1FSfn37fAQ==\n-----END CERTIFICATE-----\n"
+  },
+  "server": {
+    "identity": "fixture.fatline.farcast",
+    "cert_pem": "-----BEGIN CERTIFICATE-----\nMIIBcjCCASSgAwIBAgIBAjAFBgMrZXAwJzElMCMGA1UEAxMcRmFyQ2FzdCBJbnN0\nYW5jZSBDQTogZml4dHVyZTAeFw0yNjExMTIyMzU5MDBaFw0yNzAyMTEwMDAwMDBa\nMCIxIDAeBgNVBAMTF2ZpeHR1cmUuZmF0bGluZS5mYXJjYXN0MCowBQYDK2VwAyEA\n1gr49CetMlaihLQEwb91gIODkIEVjY+iQc1GReJ7ZtmjejB4MA4GA1UdDwEB/wQE\nAwIHgDATBgNVHSUEDDAKBggrBgEFBQcDATAMBgNVHRMBAf8EAjAAMB8GA1UdIwQY\nMBaAFD9taJX+4bkHGgNiXeV78ZuqdVKhMCIGA1UdEQQbMBmCF2ZpeHR1cmUuZmF0\nbGluZS5mYXJjYXN0MAUGAytlcANBAC/v1vN5Hd519Koy//Vj5fTmW8nrixP6VY5C\n9qL3kax8nDB7Hqxq4h3cZyJpnzLUcIwn/9dF+wL76ruNgqv1dg8=\n-----END CERTIFICATE-----\n",
+    "key_pem": "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIAPLjwezfCJVOB69RQOXG+waRXGUjjW4LdeRJxF3eWWw\n-----END PRIVATE KEY-----\n"
+  }
+}

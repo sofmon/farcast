@@ -593,12 +593,22 @@ type keeperPlan struct {
 //
 // The bundle and leaf key go with the instance, when provably its: release
 // already destroys the keyring they derive from, and afterwards they have no
-// lawful use — only the power to open ciphertext the cloud may still hold. The
+// lawful use — only the power to open ciphertext the cloud may still hold. A
+// renewal request pending beside them goes too (keeper.Store.Wipe). The
 // ledger never goes.
 func planKeeper(env *Env, name string, meta *config.InstanceMetadata) *keeperPlan {
 	dir := env.ConfigDir.KeeperDir(name)
 	store, err := keeper.OpenStore(dir)
 	if err != nil {
+		// A request made here and never installed proves nothing about
+		// which instance it was for — no certificate came back to compare —
+		// so it is left, and said.
+		if pending, perr := keeper.PendingRequest(dir); perr == nil && pending != nil {
+			return &keeperPlan{report: releaseKeeper{
+				Dir: dir, Action: "untouched",
+				Reason: fmt.Sprintf("a pending request for an instance named %q, which nothing proves is this one; 'farcast keeper uninstall %s' discards it", name, name),
+			}}
+		}
 		return nil // nothing enrolled here
 	}
 	plan := &keeperPlan{report: releaseKeeper{Dir: dir, Ledger: store.LedgerPath()}}

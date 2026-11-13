@@ -12,10 +12,19 @@ package cli
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
+	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -80,21 +89,145 @@ func keeperEnv(t *testing.T, mode output.Mode) (*Env, *bytes.Buffer, *bytes.Buff
 	return env, out, errb, dir, passFile
 }
 
-func enroll(t *testing.T, env *Env, passFile, device string, extra ...string) string {
+// deviceEnv is env as the keeper device sees it: the same config directory
+// (this machine plays both parts), and output of its own, so what the device
+// prints — its key's fingerprint above all — never reaches what a test reads
+// of the operator's screen.
+func deviceEnv(env *Env) (*Env, *bytes.Buffer) {
+	var b bytes.Buffer
+	dev := *env
+	dev.Out, dev.Err = &b, &b
+	dev.Printer = &output.Printer{Mode: output.ModeHuman, Out: &b, Err: &b}
+	return &dev, &b
+}
+
+// makeRequest runs 'keeper request prod' on the device, replacing a request
+// pending there, and returns the request file and the fingerprint it printed.
+func makeRequest(t *testing.T, env *Env) (path, fp string) {
+	t.Helper()
+	dev, _ := deviceEnv(env)
+	path = filepath.Join(t.TempDir(), "device.csr")
+	c := &keeperRequestCommand{out: path, replace: true, acceptRisk: true}
+	if err := c.Run(context.Background(), dev, []string{"prod"}); err != nil {
+		t.Fatalf("keeper request: %v", err)
+	}
+	r, err := keeper.PendingRequest(env.ConfigDir.KeeperDir("prod"))
+	if err != nil || r == nil {
+		t.Fatalf("no request pending after 'keeper request': %+v, %v", r, err)
+	}
+	return path, r.KeySHA256
+}
+
+// byRequest fills an enroll command with a new request from the device and
+// the fingerprint it printed, as the runbooks run it.
+func byRequest(t *testing.T, env *Env, c *keeperEnrollCommand) *keeperEnrollCommand {
+	t.Helper()
+	c.request, c.keySHA256 = makeRequest(t, env)
+	return c
+}
+
+// enrollByRequest is the whole operator flow for one device of "prod": the
+// device's request, into this machine's keeper directory, then enroll by
+// request with the fingerprint confirmed.
+func enrollByRequest(t *testing.T, env *Env, passFile, device string) (packetPath, fp string) {
 	t.Helper()
 	packet := filepath.Join(t.TempDir(), device+".packet")
-	c := &keeperEnrollCommand{out: packet, passphraseFile: passFile, budget: keeper.DefaultBudget, window: keeper.DefaultWindow}
-	_ = extra
+	c := byRequest(t, env, &keeperEnrollCommand{out: packet, passphraseFile: passFile, budget: keeper.DefaultBudget, window: keeper.DefaultWindow})
 	if err := c.Run(context.Background(), env, []string{"prod", device}); err != nil {
 		t.Fatalf("keeper enroll %s: %v", device, err)
 	}
+	return packet, c.keySHA256
+}
+
+// enroll is enrollByRequest for a test that needs only the packet.
+func enroll(t *testing.T, env *Env, passFile, device string, extra ...string) string {
+	t.Helper()
+	_ = extra
+	packet, _ := enrollByRequest(t, env, passFile, device)
 	return packet
 }
 
-func TestKeeperEnrollThenInstall(t *testing.T) {
-	env, out, _, dir, passFile := keeperEnv(t, output.ModeHuman)
-	packet := enroll(t, env, passFile, "study-desktop")
+// leaksFingerprint reports whether text holds two consecutive groups of fp,
+// spaced ("3f2a 9c01") or bare ("3f2a9c01"). One group alone can occur by
+// chance (a year, say), and two cannot be told from a copy of the key's.
+func leaksFingerprint(text, fp string) bool {
+	text = strings.ToLower(text)
+	for i := 0; i+8 <= len(fp); i += 4 {
+		a, b := fp[i:i+4], fp[i+4:i+8]
+		if strings.Contains(text, a+" "+b) || strings.Contains(text, a+b) || strings.Contains(text, a+":"+b) {
+			return true
+		}
+	}
+	return false
+}
 
+// B-T9. The flow end to end: the device makes its key and request, the
+// operator enrols it with the fingerprint confirmed, and the device installs
+// the certificate beside its key — which, at every step, is on the device and
+// nowhere else.
+func TestKeeperRequestEnrollInstall(t *testing.T) {
+	env, out, _, dir, passFile := keeperEnv(t, output.ModeHuman)
+
+	// The device's half: the request, 0600, never over another file.
+	dev, devOut := deviceEnv(env)
+	reqPath := filepath.Join(t.TempDir(), "study-desktop.csr")
+	if err := (&keeperRequestCommand{out: reqPath, acceptRisk: true}).Run(context.Background(), dev, []string{"prod"}); err != nil {
+		t.Fatalf("keeper request: %v", err)
+	}
+	if info, err := os.Stat(reqPath); err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("request file: %v, %v; want mode 0600", info, err)
+	}
+	pending, err := keeper.PendingRequest(dir.KeeperDir("prod"))
+	if err != nil || pending == nil {
+		t.Fatalf("PendingRequest = %+v, %v", pending, err)
+	}
+	fp := pending.KeySHA256
+	first, second := fingerprintLines(fp)
+	for _, want := range []string{
+		`a new key for "prod", and the request that enrols it`, "it holds no secret", "(mode 0600)",
+		"key sha256  " + first + "\n              " + second + "\n",
+		"--request " + reqPath + " --key-sha256 " + fp,
+	} {
+		if !strings.Contains(devOut.String(), want) {
+			t.Errorf("the device's output lacks %q:\n%s", want, devOut.String())
+		}
+	}
+	keyBefore, err := os.ReadFile(filepath.Join(dir.KeeperDir("prod"), "request.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := (&keeperRequestCommand{out: reqPath, acceptRisk: true, replace: true}).Run(context.Background(), dev, []string{"prod"}); err == nil || !strings.Contains(err.Error(), "refusing to overwrite") {
+		t.Errorf("a request over an existing file = %v; want it refused", err)
+	}
+	if now, _ := os.ReadFile(filepath.Join(dir.KeeperDir("prod"), "request.key")); !bytes.Equal(now, keyBefore) {
+		t.Error("a request refused for its --out still replaced the pending key")
+	}
+	// JSON says the same fingerprint.
+	jdev, jout := deviceEnv(env)
+	jdev.Printer.Mode = output.ModeJSON
+	jreq := filepath.Join(t.TempDir(), "j.csr")
+	if err := (&keeperRequestCommand{out: jreq, acceptRisk: true, replace: true}).Run(context.Background(), jdev, []string{"prod"}); err != nil {
+		t.Fatal(err)
+	}
+	var jr struct {
+		KeySHA256 string `json:"key_sha256"`
+		KeyStore  string `json:"key_store"`
+		Replaced  bool   `json:"replaced"`
+	}
+	if err := json.Unmarshal(jout.Bytes(), &jr); err != nil {
+		t.Fatalf("JSON request result: %v\n%s", err, jout)
+	}
+	if p, _ := keeper.PendingRequest(dir.KeeperDir("prod")); p == nil || jr.KeySHA256 != p.KeySHA256 || jr.KeyStore != keeper.KeyStoreFile || !jr.Replaced {
+		t.Errorf("JSON request result = %+v; want the pending key's fingerprint, a file key, replaced", jr)
+	}
+	reqPath, fp = jreq, jr.KeySHA256
+
+	// The operator's half.
+	packet := filepath.Join(t.TempDir(), "study-desktop.packet")
+	c := &keeperEnrollCommand{out: packet, passphraseFile: passFile, budget: keeper.DefaultBudget, window: keeper.DefaultWindow, request: reqPath, keySHA256: fp}
+	if err := c.Run(context.Background(), env, []string{"prod", "study-desktop"}); err != nil {
+		t.Fatalf("keeper enroll: %v", err)
+	}
 	if !strings.Contains(out.String(), "study-desktop") {
 		t.Errorf("enrolment did not report the device:\n%s", out)
 	}
@@ -122,8 +255,23 @@ func TestKeeperEnrollThenInstall(t *testing.T) {
 	if meta.Keepers[0].Expires.IsZero() {
 		t.Error("no expiry was recorded; a leaf that stops working silently is a keeper that stops keeping")
 	}
+	p := openPacket(t, packet)
+	token, err := identity.LeafTokenPEM(p.LeafCertPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(meta.Keepers[0].KeySHA256, []string{fp}) || !slices.Equal(meta.Keepers[0].LeafTokens, []string{token}) {
+		t.Errorf("record = %+v; want key %s and token %s", meta.Keepers[0], fp, token)
+	}
+	if certFP, err := identity.CertKeyFingerprint(p.LeafCertPEM); err != nil || certFP != fp {
+		t.Errorf("the packet's certificate certifies %s (%v); want the request's %s", certFP, err, fp)
+	}
 
 	// Install it on this machine acting as the device.
+	requestKey, err := os.ReadFile(filepath.Join(dir.KeeperDir("prod"), "request.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	out.Reset()
 	inst := &keeperInstallCommand{passphraseFile: passFile, acceptRisk: true}
 	if err := inst.Run(context.Background(), env, []string{packet}); err != nil {
@@ -137,7 +285,7 @@ func TestKeeperEnrollThenInstall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Device != "study-desktop" || cfg.Instance != "prod" {
+	if cfg.Device != "study-desktop" || cfg.Instance != "prod" || cfg.KeySHA256 != fp || cfg.KeyStore != keeper.KeyStoreFile {
 		t.Errorf("installed record = %+v", cfg)
 	}
 	// The bundle carries the generation the instance is ALREADY at. A device
@@ -145,6 +293,40 @@ func TestKeeperEnrollThenInstall(t *testing.T) {
 	// against.
 	if cfg.Generation != 3 {
 		t.Errorf("Generation = %d, want the instance's current 3", cfg.Generation)
+	}
+	if !strings.Contains(out.String(), "…"+identity.FingerprintTail(fp)) {
+		t.Errorf("install does not name the key it installed:\n%s", out)
+	}
+
+	// The device's key is at keepers/prod/leaf.key, and nowhere else: not in
+	// the config directory, not in the request or the packet carried between
+	// the machines, not in what the packet opens to.
+	var holders []string
+	if err := filepath.WalkDir(dir.Path(), func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		data, rerr := os.ReadFile(path)
+		if rerr != nil {
+			return rerr
+		}
+		if bytes.Contains(data, requestKey) {
+			holders = append(holders, path)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(dir.KeeperDir("prod"), "leaf.key"); !slices.Equal(holders, []string{want}) {
+		t.Errorf("the device's key is held at %v; want only %s", holders, want)
+	}
+	for _, carried := range []string{reqPath, packet} {
+		if data, err := os.ReadFile(carried); err != nil || bytes.Contains(data, requestKey) || bytes.Contains(data, []byte("PRIVATE KEY")) {
+			t.Errorf("%s carries a private key (%v)", carried, err)
+		}
+	}
+	if bytes.Contains(p.LeafCertPEM, []byte("PRIVATE")) || bytes.Contains(p.CACertPEM, []byte("PRIVATE")) || len(p.LeafKeyPEM) != 0 {
+		t.Error("the opened packet holds a private key")
 	}
 }
 
@@ -230,7 +412,7 @@ func TestKeeperEnrollRefusals(t *testing.T) {
 		if err := dir.SaveInstanceMTLS("prod", mtls); err != nil {
 			t.Fatal(err)
 		}
-		c := &keeperEnrollCommand{out: filepath.Join(t.TempDir(), "p"), passphraseFile: passFile, budget: 8, window: keeper.DefaultWindow}
+		c := byRequest(t, env, &keeperEnrollCommand{out: filepath.Join(t.TempDir(), "p"), passphraseFile: passFile, budget: 8, window: keeper.DefaultWindow})
 		err = c.Run(context.Background(), env, []string{"prod", "study-desktop"})
 		if err == nil || !strings.Contains(err.Error(), "CA") {
 			t.Errorf("err = %v, want a refusal naming the missing CA key", err)
@@ -243,7 +425,7 @@ func TestKeeperEnrollRefusals(t *testing.T) {
 		if err := os.WriteFile(path, []byte("someone else's packet"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		c := &keeperEnrollCommand{out: path, passphraseFile: passFile, budget: 8, window: keeper.DefaultWindow}
+		c := byRequest(t, env, &keeperEnrollCommand{out: path, passphraseFile: passFile, budget: 8, window: keeper.DefaultWindow})
 		err := c.Run(context.Background(), env, []string{"prod", "study-desktop"})
 		if err == nil || !strings.Contains(err.Error(), "refusing to overwrite") {
 			t.Errorf("err = %v, want a refusal to overwrite", err)
@@ -257,7 +439,7 @@ func TestKeeperEnrollRefusals(t *testing.T) {
 		env, _, _, dir, passFile := keeperEnv(t, output.ModeHuman)
 		for _, bad := range []string{"", "Study", "a/b"} {
 			out := filepath.Join(t.TempDir(), "p")
-			c := &keeperEnrollCommand{out: out, passphraseFile: passFile, budget: 8, window: keeper.DefaultWindow}
+			c := byRequest(t, env, &keeperEnrollCommand{out: out, passphraseFile: passFile, budget: 8, window: keeper.DefaultWindow})
 			if err := c.Run(context.Background(), env, []string{"prod", bad}); err == nil {
 				t.Errorf("enroll accepted the device name %q", bad)
 			}
@@ -291,7 +473,7 @@ func TestKeeperEnrollRefusals(t *testing.T) {
 		if err := dir.SaveInstanceMTLS("prod", mtls); err != nil {
 			t.Fatal(err)
 		}
-		c := &keeperEnrollCommand{out: filepath.Join(t.TempDir(), "p"), passphraseFile: passFile, budget: 8, window: keeper.DefaultWindow}
+		c := byRequest(t, env, &keeperEnrollCommand{out: filepath.Join(t.TempDir(), "p"), passphraseFile: passFile, budget: 8, window: keeper.DefaultWindow})
 		err = c.Run(context.Background(), env, []string{"prod", "Study"})
 		if err == nil {
 			t.Fatal("enroll accepted an invalid device name")
@@ -311,9 +493,28 @@ func TestKeeperEnrollRefusals(t *testing.T) {
 		if err := dir.SaveInstanceMetadata("prod", meta); err != nil {
 			t.Fatal(err)
 		}
-		c := &keeperEnrollCommand{out: filepath.Join(t.TempDir(), "p"), passphraseFile: passFile, budget: 8, window: keeper.DefaultWindow}
+		c := byRequest(t, env, &keeperEnrollCommand{out: filepath.Join(t.TempDir(), "p"), passphraseFile: passFile, budget: 8, window: keeper.DefaultWindow})
 		if err := c.Run(context.Background(), env, []string{"prod", "study-desktop"}); err == nil {
 			t.Error("enroll produced a packet for an instance with no carrier")
+		}
+	})
+
+	// Enrolment is by request: without one there is nothing to certify, and
+	// the refusal says where a request comes from.
+	t.Run("no request", func(t *testing.T) {
+		env, _, _, _, passFile := keeperEnv(t, output.ModeHuman)
+		out := filepath.Join(t.TempDir(), "p")
+		c := &keeperEnrollCommand{out: out, passphraseFile: passFile, budget: 8, window: keeper.DefaultWindow}
+		err := c.Run(context.Background(), env, []string{"prod", "study-desktop"})
+		if exitCodeOf(err) != 2 || !strings.Contains(err.Error(), "--request") || !strings.Contains(err.Error(), "keeper request prod") {
+			t.Errorf("enroll with no request = %v; want a usage error naming 'keeper request'", err)
+		}
+		c = &keeperEnrollCommand{out: out, passphraseFile: passFile, budget: 8, window: keeper.DefaultWindow, request: "x.csr", keySHA256: "not hex"}
+		if err := c.Run(context.Background(), env, []string{"prod", "study-desktop"}); exitCodeOf(err) != 2 || strings.Contains(err.Error(), "not hex") {
+			t.Errorf("a malformed --key-sha256 = %v; want a usage error that does not repeat it", err)
+		}
+		if _, err := os.Stat(out); err == nil {
+			t.Error("a refused enrolment wrote a packet")
 		}
 	})
 }
@@ -420,10 +621,10 @@ func TestKeeperReEnrolmentReadmitsARevokedDevice(t *testing.T) {
 func TestKeeperStatusTotalsTheFleetBudget(t *testing.T) {
 	env, out, _, _, passFile := keeperEnv(t, output.ModeHuman)
 	_ = enroll(t, env, passFile, "study-desktop")
-	small := &keeperEnrollCommand{
+	small := byRequest(t, env, &keeperEnrollCommand{
 		out: filepath.Join(t.TempDir(), "laptop.packet"), passphraseFile: passFile,
 		budget: 1, window: keeper.DefaultWindow,
-	}
+	})
 	if err := small.Run(context.Background(), env, []string{"prod", "laptop"}); err != nil {
 		t.Fatal(err)
 	}
@@ -647,9 +848,15 @@ func TestEveryCommandTheCLIAdvisesExists(t *testing.T) {
 		resolves(t, line)
 	}
 	// A collector that found nothing would pass for the wrong reason.
-	for _, want := range []string{"storage key rotate", "storage key rekey", "keeper enroll", "storage unseal", "storage state", "keeper uninstall"} {
+	for _, want := range []string{"storage key rotate", "storage key rekey", "keeper enroll", "storage unseal", "storage state", "keeper uninstall", "keeper request"} {
 		if !slices.ContainsFunc(found, func(c string) bool { return strings.Contains(c, want) }) {
 			t.Errorf("no advised command mentions %q; the collector missed it or the advice changed:\n%v", want, found)
+		}
+	}
+	// Re-enrolment is by request (ADR 0020): every advised enroll carries one.
+	for _, c := range found {
+		if strings.Contains(c, "keeper enroll") && !strings.Contains(c, "--request") {
+			t.Errorf("%q advises an enrolment without a request", c)
 		}
 	}
 }
@@ -923,7 +1130,15 @@ func TestAKeeperChecksItsLeafBindsItsBundle(t *testing.T) {
 		t.Fatal(err)
 	}
 	bundle := []byte("version: 1\n")
-	bound, _, err := identity.IssueKeeperClient(m.CACertPEM, m.CAKeyPEM, "prod", "laptop", bundle)
+	reqKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reqDER, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{}, reqKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound, err := identity.IssueKeeperClient(m.CACertPEM, m.CAKeyPEM, "prod", "laptop", bundle, reqDER)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1523,7 +1738,8 @@ func openPacket(t *testing.T, path string) *keeper.Packet {
 // say which device a tunnel stream in Shrike's picture was.
 func TestEnrolRecordsTheLeafToken(t *testing.T) {
 	env, _, _, dir, passFile := keeperEnv(t, output.ModeHuman)
-	p := openPacket(t, enroll(t, env, passFile, "laptop"))
+	path, fp := enrollByRequest(t, env, passFile, "laptop")
+	p := openPacket(t, path)
 	want, err := identity.LeafTokenPEM(p.LeafCertPEM)
 	if err != nil {
 		t.Fatal(err)
@@ -1534,6 +1750,9 @@ func TestEnrolRecordsTheLeafToken(t *testing.T) {
 	}
 	if len(meta.Keepers) != 1 || !slices.Equal(meta.Keepers[0].LeafTokens, []string{want}) {
 		t.Errorf("Keepers = %+v, want the packet's leaf token %s recorded", meta.Keepers, want)
+	}
+	if !slices.Equal(meta.Keepers[0].KeySHA256, []string{fp}) {
+		t.Errorf("Keepers = %+v, want the request's key %s recorded", meta.Keepers, fp)
 	}
 	// The token names the device's leaf, not the operator's.
 	opLeaf, err := dir.LoadOperatorLeaf("prod")
@@ -1550,8 +1769,9 @@ func TestEnrolRecordsTheLeafToken(t *testing.T) {
 // must still be named as this device's. A revocation keeps them too.
 func TestReEnrolmentKeepsEarlierLeafTokens(t *testing.T) {
 	env, _, _, dir, passFile := keeperEnv(t, output.ModeHuman)
-	first := openPacket(t, enroll(t, env, passFile, "laptop"))
-	second := openPacket(t, enroll(t, env, passFile, "laptop"))
+	path1, fp1 := enrollByRequest(t, env, passFile, "laptop")
+	path2, fp2 := enrollByRequest(t, env, passFile, "laptop")
+	first, second := openPacket(t, path1), openPacket(t, path2)
 	t1, _ := identity.LeafTokenPEM(first.LeafCertPEM)
 	t2, _ := identity.LeafTokenPEM(second.LeafCertPEM)
 	if err := (&keeperRevokeCommand{assumeYes: true}).Run(context.Background(), env, []string{"prod", "laptop"}); err != nil {
@@ -1564,6 +1784,10 @@ func TestReEnrolmentKeepsEarlierLeafTokens(t *testing.T) {
 	if len(meta.Keepers) != 1 || !slices.Equal(meta.Keepers[0].LeafTokens, []string{t1, t2}) {
 		t.Errorf("Keepers = %+v, want tokens [%s %s], oldest first", meta.Keepers, t1, t2)
 	}
+	// The keys accumulate the same way, and a revoke records every one.
+	if fp1 == fp2 || !slices.Equal(meta.Keepers[0].KeySHA256, []string{fp1, fp2}) || !slices.Equal(meta.Keepers[0].RevokedKeySHA256, []string{fp1, fp2}) {
+		t.Errorf("Keepers = %+v, want keys and revoked keys [%s %s]", meta.Keepers, fp1, fp2)
+	}
 }
 
 // Enroll and install speak of the budget the way status does — in days, with a
@@ -1572,7 +1796,7 @@ func TestReEnrolmentKeepsEarlierLeafTokens(t *testing.T) {
 func TestEnrollAndInstallSpeakInDays(t *testing.T) {
 	env, out, _, _, passFile := keeperEnv(t, output.ModeHuman)
 	packet := filepath.Join(t.TempDir(), "one.packet")
-	c := &keeperEnrollCommand{out: packet, passphraseFile: passFile, budget: 1, window: keeper.DefaultWindow}
+	c := byRequest(t, env, &keeperEnrollCommand{out: packet, passphraseFile: passFile, budget: 1, window: keeper.DefaultWindow})
 	if err := c.Run(context.Background(), env, []string{"prod", "one"}); err != nil {
 		t.Fatalf("enroll: %v", err)
 	}
@@ -1589,7 +1813,7 @@ func TestEnrollAndInstallSpeakInDays(t *testing.T) {
 	}
 
 	jenv, jout, _, _, jpass := keeperEnv(t, output.ModeJSON)
-	jc := &keeperEnrollCommand{out: filepath.Join(t.TempDir(), "j.packet"), passphraseFile: jpass, budget: 8, window: keeper.DefaultWindow}
+	jc := byRequest(t, jenv, &keeperEnrollCommand{out: filepath.Join(t.TempDir(), "j.packet"), passphraseFile: jpass, budget: 8, window: keeper.DefaultWindow})
 	if err := jc.Run(context.Background(), jenv, []string{"prod", "j"}); err != nil {
 		t.Fatalf("enroll (json): %v", err)
 	}
@@ -1599,8 +1823,10 @@ func TestEnrollAndInstallSpeakInDays(t *testing.T) {
 }
 
 // The packet is not keys.yaml: losing it loses nothing, and the hazard is the
-// opposite one — whoever holds it with the passphrase holds the device. The
-// walk's build told the operator the packet's loss was permanent data loss.
+// opposite one — whoever holds it with the passphrase reads what its bundle
+// opens. Since ADR 0020 it holds no private key, so it is no longer the
+// device: it cannot re-seed through the tunnel. The walk's build told the
+// operator the packet's loss was permanent data loss.
 func TestEnrollWarnsOfDisclosureNotLoss(t *testing.T) {
 	env, _, errb, _, passFile := keeperEnv(t, output.ModeHuman)
 	enroll(t, env, passFile, "study-desktop")
@@ -1608,21 +1834,29 @@ func TestEnrollWarnsOfDisclosureNotLoss(t *testing.T) {
 	if strings.Contains(got, datasphere.KeyLossWarning) {
 		t.Errorf("enroll calls the packet a keyring:\n%s", got)
 	}
+	flat := strings.Join(strings.Fields(got), " ")
 	for _, want := range []string{
 		"Losing the packet loses nothing",
-		"can read what is stored under the keys it carries",
-		"'farcast keeper revoke' alone stops neither",
+		"can read what is stored under the keys its bundle carries",
+		"holds no private key", "cannot re-seed through the tunnel",
+		"provided the key it certifies is the one you confirmed",
+		"'farcast keeper revoke' does not retire the bundle",
 		"'farcast storage key rotate prod', then 'farcast storage key rekey prod'",
 		"nothing undoes what was read before",
-		`holds keeper "study-desktop"`,
+		"make a new request on the device",
 	} {
-		if !strings.Contains(got, want) {
+		if !strings.Contains(flat, want) {
 			t.Errorf("enroll's warning omits %q:\n%s", want, got)
+		}
+	}
+	for _, gone := range []string{"re-seed a keyholder replica that restarts", `holds keeper "study-desktop"`} {
+		if strings.Contains(flat, gone) {
+			t.Errorf("enroll's warning still says %q, which a packet with no key cannot do:\n%s", gone, got)
 		}
 	}
 	// The remedy it names is the one revoke prints, in the same order.
 	remedy := revokeRemedy("prod")
-	if !strings.Contains(got, "'"+remedy[0]+"'") || !strings.Contains(got, "'"+remedy[1]+"'") {
+	if !strings.Contains(flat, "'"+remedy[0]+"'") || !strings.Contains(flat, "'"+remedy[1]+"'") {
 		t.Errorf("enroll's remedy is not revoke's %v:\n%s", remedy[:2], got)
 	}
 }
@@ -2048,4 +2282,630 @@ func TestKeeperStatusNamesRefusalsAfterSending(t *testing.T) {
 		}
 	}
 	onlyPrintable(t, "keeper status", out.String())
+}
+
+// B-T3b. 'keeper install' builds a directory from a packet's instance and
+// 'keeper request' from its argument, through keeper.ValidateInstance; the
+// rule is the one 'farcast install' names instances by, held equal here
+// rather than by making install.go call the keeper package.
+func TestKeeperInstanceRuleIsInstallsRule(t *testing.T) {
+	if keeper.MaxInstanceLen != maxInstanceName {
+		t.Errorf("keeper.MaxInstanceLen = %d; install allows %d", keeper.MaxInstanceLen, maxInstanceName)
+	}
+	for _, n := range []string{
+		"prod", "a", "a-1", "z9", strings.Repeat("a", 32), strings.Repeat("a", 33),
+		"Prod", "1a", "a-", "-a", "a_b", "../x", "a/b", "a.b", "", "a b", "é",
+	} {
+		k, i := keeper.ValidateInstance(n), validateInstanceName(n)
+		if (k == nil) != (i == nil) {
+			t.Errorf("%q: keeper.ValidateInstance = %v, validateInstanceName = %v", n, k, i)
+		}
+	}
+}
+
+// A request's --out is claimed before any key exists: a taken path is refused
+// with nothing made, and with --replace the pending request survives it. A
+// second request is refused unless it replaces the first.
+func TestKeeperRequestRefusals(t *testing.T) {
+	env, _, _, dir, _ := keeperEnv(t, output.ModeHuman)
+	dev, _ := deviceEnv(env)
+	kdir := dir.KeeperDir("prod")
+
+	taken := filepath.Join(t.TempDir(), "taken")
+	if err := os.WriteFile(taken, []byte("someone's file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&keeperRequestCommand{out: taken, acceptRisk: true}).Run(context.Background(), dev, []string{"prod"}); err == nil || !strings.Contains(err.Error(), "refusing to overwrite") {
+		t.Errorf("a request over a taken path = %v", err)
+	}
+	if _, err := os.Stat(kdir); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("a refused request made %s (%v)", kdir, err)
+	}
+	if got, _ := os.ReadFile(taken); string(got) != "someone's file" {
+		t.Error("the taken path was replaced")
+	}
+
+	for _, bad := range [][]string{nil, {"../x"}, {"Prod"}, {"a", "b"}} {
+		out := filepath.Join(t.TempDir(), "r.csr")
+		if err := (&keeperRequestCommand{out: out, acceptRisk: true}).Run(context.Background(), dev, bad); err == nil {
+			t.Errorf("keeper request %v was accepted", bad)
+		}
+		if _, err := os.Stat(out); err == nil {
+			t.Errorf("keeper request %v wrote a request", bad)
+		}
+	}
+	if err := (&keeperRequestCommand{acceptRisk: true}).Run(context.Background(), dev, []string{"prod"}); exitCodeOf(err) != 2 {
+		t.Errorf("keeper request without --out = %v; want a usage error", err)
+	}
+
+	first, fp := makeRequest(t, env)
+	key, err := os.ReadFile(filepath.Join(kdir, "request.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := filepath.Join(t.TempDir(), "second.csr")
+	err = (&keeperRequestCommand{out: second, acceptRisk: true}).Run(context.Background(), dev, []string{"prod"})
+	if !errors.Is(err, keeper.ErrPendingRequest) || !strings.Contains(err.Error(), "--replace") {
+		t.Errorf("a second request = %v; want ErrPendingRequest naming --replace", err)
+	}
+	if _, err := os.Stat(second); err == nil {
+		t.Error("a refused request left its --out file")
+	}
+	if err := (&keeperRequestCommand{out: first, acceptRisk: true, replace: true}).Run(context.Background(), dev, []string{"prod"}); err == nil {
+		t.Error("--replace over a taken --out went ahead")
+	}
+	if now, _ := os.ReadFile(filepath.Join(kdir, "request.key")); !bytes.Equal(now, key) {
+		t.Error("--replace with a bad --out discarded the pending request")
+	}
+	if r, _ := keeper.PendingRequest(kdir); r == nil || r.KeySHA256 != fp {
+		t.Errorf("the pending request after the refusals = %+v", r)
+	}
+}
+
+// B-T10. With --key-sha256, the request's key must be the one named; a
+// mismatch issues nothing and records nothing, and nothing printed — nor the
+// error — holds the request's fingerprint, which would sit in the scrollback
+// for the next attempt to copy. A match prints it, confirmed.
+func TestEnrollRefusesAFingerprintMismatch(t *testing.T) {
+	env, out, errb, dir, passFile := keeperEnv(t, output.ModeHuman)
+	req, fp := makeRequest(t, env)
+	before, err := os.ReadFile(filepath.Join(dir.InstancePath("prod"), "metadata.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := strings.Repeat("0", 32) + fp[32:] // the right tail, the wrong key
+	for _, wrong := range []string{other, strings.ToUpper(strings.Repeat("ab", 32))} {
+		packet := filepath.Join(t.TempDir(), "p")
+		c := &keeperEnrollCommand{out: packet, passphraseFile: passFile, budget: 8, window: keeper.DefaultWindow, request: req, keySHA256: wrong}
+		err := c.Run(context.Background(), env, []string{"prod", "laptop"})
+		if err == nil || !strings.Contains(err.Error(), "is not the one --key-sha256 names") || !strings.Contains(err.Error(), "nothing was issued") {
+			t.Fatalf("a wrong --key-sha256 = %v", err)
+		}
+		if _, serr := os.Stat(packet); serr == nil {
+			t.Error("a refused enrolment wrote a packet")
+		}
+		if now, _ := os.ReadFile(filepath.Join(dir.InstancePath("prod"), "metadata.yaml")); !bytes.Equal(now, before) {
+			t.Error("a refused enrolment changed the record")
+		}
+		if leaksFingerprint(out.String()+errb.String()+err.Error(), fp) {
+			t.Errorf("a refusal showed the request's fingerprint:\nerr: %v\nstdout: %s\nstderr: %s", err, out, errb)
+		}
+	}
+
+	// The right one, spaced and in upper case as a person types it.
+	packet := filepath.Join(t.TempDir(), "p")
+	typed := strings.ToUpper(identity.FormatFingerprint(fp))
+	c := &keeperEnrollCommand{out: packet, passphraseFile: passFile, budget: 8, window: keeper.DefaultWindow, request: req, keySHA256: typed}
+	if err := c.Run(context.Background(), env, []string{"prod", "laptop"}); err != nil {
+		t.Fatalf("the right --key-sha256: %v", err)
+	}
+	first, second := fingerprintLines(fp)
+	if !strings.Contains(errb.String(), "key sha256  "+first+"\n            "+second+" — confirmed against laptop") {
+		t.Errorf("the confirmed fingerprint was not printed:\n%s", errb.String())
+	}
+}
+
+// B-T11. At a terminal with no --key-sha256, the operator types the
+// fingerprint as the device shows it: at least the last 8 groups. Nothing of
+// it is shown before the answer, nor in a refusal; a match prints it whole,
+// confirmed.
+func TestEnrollConfirmsInteractively(t *testing.T) {
+	const prompt = "Type the fingerprint 'farcast keeper request' printed on laptop"
+	groups := func(fp string) []string { return strings.Fields(identity.FormatFingerprint(fp)) }
+	for _, c := range []struct {
+		name   string
+		answer func(fp string) string
+		issued bool
+		want   string
+	}{
+		{"the last 8 groups", func(fp string) string { return strings.Join(groups(fp)[8:], " ") }, true, ""},
+		{"all 16, colon-separated, upper case", func(fp string) string { return strings.ToUpper(strings.Join(groups(fp), ":")) }, true, ""},
+		{"the last 4 groups", func(fp string) string { return strings.Join(groups(fp)[12:], " ") }, false, "at least the last 8 groups"},
+		{"8 groups that are not the suffix", func(fp string) string { return strings.Join(groups(fp)[:8], " ") }, false, "nothing was issued"},
+		{"not hex", func(string) string { return "yes" }, false, "at least the last 8 groups"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			env, out, errb, dir, passFile := keeperEnv(t, output.ModeHuman)
+			req, fp := makeRequest(t, env)
+			env.In = strings.NewReader(c.answer(fp) + "\n")
+			packet := filepath.Join(t.TempDir(), "p")
+			cmd := &keeperEnrollCommand{out: packet, passphraseFile: passFile, budget: 8, window: keeper.DefaultWindow, request: req,
+				interactive: func(*Env) bool { return true }}
+			err := cmd.Run(context.Background(), env, []string{"prod", "laptop"})
+			text := errb.String()
+			at := strings.Index(text, prompt)
+			if at < 0 {
+				t.Fatalf("no prompt was shown:\n%s", text)
+			}
+			if leaksFingerprint(text[:at], fp) {
+				t.Errorf("the fingerprint was shown before the prompt:\n%s", text[:at])
+			}
+			if !strings.Contains(text[at:min(len(text), at+len(prompt)+80)], "at least the last 8") {
+				t.Errorf("the prompt does not say how much to type:\n%s", text)
+			}
+			meta, merr := dir.LoadInstanceMetadata("prod")
+			if merr != nil {
+				t.Fatal(merr)
+			}
+			_, perr := os.Stat(packet)
+			if c.issued {
+				if err != nil {
+					t.Fatalf("enroll = %v; want it issued", err)
+				}
+				first, second := fingerprintLines(fp)
+				if !strings.Contains(text[at:], first+"\n            "+second+" — confirmed against laptop") {
+					t.Errorf("the full fingerprint was not printed after the answer, confirmed:\n%s", text)
+				}
+				if perr != nil || len(meta.Keepers) != 1 || !slices.Equal(meta.Keepers[0].KeySHA256, []string{fp}) {
+					t.Errorf("packet %v, record %+v", perr, meta.Keepers)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("enroll = %v; want a refusal saying %q", err, c.want)
+			}
+			if perr == nil || len(meta.Keepers) != 0 {
+				t.Errorf("a refused confirmation wrote a packet (%v) or a record (%+v)", perr, meta.Keepers)
+			}
+			if leaksFingerprint(out.String()+text[at+len(prompt):]+err.Error(), fp) {
+				t.Errorf("a refusal showed the request's fingerprint:\nerr: %v\nstdout: %s\nstderr: %s", err, out, text)
+			}
+		})
+	}
+
+	// Not at a terminal, and no --key-sha256: refused, as a usage error.
+	env, out, errb, _, passFile := keeperEnv(t, output.ModeHuman)
+	req, fp := makeRequest(t, env)
+	packet := filepath.Join(t.TempDir(), "p")
+	err := (&keeperEnrollCommand{out: packet, passphraseFile: passFile, budget: 8, window: keeper.DefaultWindow, request: req}).Run(context.Background(), env, []string{"prod", "laptop"})
+	if exitCodeOf(err) != 2 || !strings.Contains(err.Error(), "--key-sha256") {
+		t.Errorf("non-interactive enroll with no --key-sha256 = %v; want a usage error", err)
+	}
+	if _, serr := os.Stat(packet); serr == nil {
+		t.Error("an unconfirmed enrolment wrote a packet")
+	}
+	if leaksFingerprint(out.String()+errb.String()+err.Error(), fp) {
+		t.Error("the refusal showed the request's fingerprint")
+	}
+}
+
+// enrollFrom runs enroll for prod/device from a request file, confirmed with
+// fp, into a fresh packet path. It returns the path and the error.
+func enrollFrom(t *testing.T, env *Env, passFile, device, req, fp string) (string, error) {
+	t.Helper()
+	packet := filepath.Join(t.TempDir(), device+".packet")
+	c := &keeperEnrollCommand{out: packet, passphraseFile: passFile, budget: 8, window: keeper.DefaultWindow, request: req, keySHA256: fp}
+	return packet, c.Run(context.Background(), env, []string{"prod", device})
+}
+
+// B-T12. ADR 0020 decision 3: a key is never certified across devices,
+// instances or a revoke, and of a device's own keys only the newest is
+// re-issued — against every instance this machine records.
+func TestEnrollRefusesAKeyCertifiedElsewhere(t *testing.T) {
+	refused := func(t *testing.T, env *Env, dir config.Dir, passFile, device, req, fp, want string) {
+		t.Helper()
+		before, err := os.ReadFile(filepath.Join(dir.InstancePath("prod"), "metadata.yaml"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		packet, err := enrollFrom(t, env, passFile, device, req, fp)
+		if err == nil || !strings.Contains(err.Error(), want) || !strings.Contains(err.Error(), "nothing was issued") {
+			t.Fatalf("enroll %s = %v; want a refusal saying %q", device, err, want)
+		}
+		if _, serr := os.Stat(packet); serr == nil {
+			t.Error("a refused enrolment wrote a packet")
+		}
+		if now, _ := os.ReadFile(filepath.Join(dir.InstancePath("prod"), "metadata.yaml")); !bytes.Equal(now, before) {
+			t.Error("a refused enrolment changed the record")
+		}
+	}
+	keepers := func(t *testing.T, dir config.Dir) map[string]config.Keeper {
+		t.Helper()
+		meta, err := dir.LoadInstanceMetadata("prod")
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := map[string]config.Keeper{}
+		for _, k := range meta.Keepers {
+			out[k.Device] = k
+		}
+		return out
+	}
+	revoke := func(t *testing.T, env *Env, device string) {
+		t.Helper()
+		if err := (&keeperRevokeCommand{assumeYes: true}).Run(context.Background(), env, []string{"prod", device}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("another device of this instance", func(t *testing.T) {
+		env, _, _, dir, passFile := keeperEnv(t, output.ModeHuman)
+		req, fp := makeRequest(t, env)
+		if _, err := enrollFrom(t, env, passFile, "phone", req, fp); err != nil {
+			t.Fatal(err)
+		}
+		refused(t, env, dir, passFile, "laptop", req, fp, "already certified for prod/phone")
+	})
+
+	t.Run("a device of another instance", func(t *testing.T) {
+		env, _, _, dir, passFile := keeperEnv(t, output.ModeHuman)
+		req, fp := makeRequest(t, env)
+		if err := dir.CreateInstance("lab"); err != nil {
+			t.Fatal(err)
+		}
+		if err := dir.SaveInstanceMetadata("lab", &config.InstanceMetadata{Name: "lab",
+			Keepers: []config.Keeper{{Device: "bench", KeySHA256: []string{fp}}}}); err != nil {
+			t.Fatal(err)
+		}
+		refused(t, env, dir, passFile, "laptop", req, fp, "already certified for lab/bench")
+	})
+
+	t.Run("a revoked device", func(t *testing.T) {
+		env, _, _, dir, passFile := keeperEnv(t, output.ModeHuman)
+		req, fp := makeRequest(t, env)
+		if _, err := enrollFrom(t, env, passFile, "phone", req, fp); err != nil {
+			t.Fatal(err)
+		}
+		revoke(t, env, "phone")
+		k := keepers(t, dir)["phone"]
+		if !slices.Equal(k.RevokedKeySHA256, k.KeySHA256) || len(k.KeySHA256) != 1 {
+			t.Errorf("after revoke: keys %v, revoked %v; want every key recorded as revoked", k.KeySHA256, k.RevokedKeySHA256)
+		}
+		refused(t, env, dir, passFile, "phone", req, fp, "before it was revoked")
+		// Nor under another name: a revoke is not a device's alone.
+		refused(t, env, dir, passFile, "laptop", req, fp, "certified for prod/phone before it was revoked")
+	})
+
+	t.Run("a key from before a revoke, after a re-enrolment", func(t *testing.T) {
+		env, _, _, dir, passFile := keeperEnv(t, output.ModeHuman)
+		req1, k1 := makeRequest(t, env)
+		if _, err := enrollFrom(t, env, passFile, "phone", req1, k1); err != nil {
+			t.Fatal(err)
+		}
+		revoke(t, env, "phone")
+		req2, k2 := makeRequest(t, env)
+		if _, err := enrollFrom(t, env, passFile, "phone", req2, k2); err != nil {
+			t.Fatal(err)
+		}
+		k := keepers(t, dir)["phone"]
+		if k.Revoked || !slices.Equal(k.KeySHA256, []string{k1, k2}) || !slices.Equal(k.RevokedKeySHA256, []string{k1}) {
+			t.Fatalf("after re-enrolment: %+v; want unrevoked, keys [K1 K2], revoked [K1]", k)
+		}
+		refused(t, env, dir, passFile, "phone", req1, k1, "before it was revoked")
+	})
+
+	t.Run("an older key of the same device", func(t *testing.T) {
+		env, _, _, dir, passFile := keeperEnv(t, output.ModeHuman)
+		req2, k2 := makeRequest(t, env)
+		if _, err := enrollFrom(t, env, passFile, "phone", req2, k2); err != nil {
+			t.Fatal(err)
+		}
+		req3, k3 := makeRequest(t, env)
+		if _, err := enrollFrom(t, env, passFile, "phone", req3, k3); err != nil {
+			t.Fatal(err)
+		}
+		refused(t, env, dir, passFile, "phone", req2, k2, "an older key of phone")
+
+		// The newest is re-issued — a lost packet, made again from the
+		// request still on hand — and neither list grows.
+		if _, err := enrollFrom(t, env, passFile, "phone", req3, k3); err != nil {
+			t.Fatalf("re-issuing to the newest key: %v", err)
+		}
+		k := keepers(t, dir)["phone"]
+		if !slices.Equal(k.KeySHA256, []string{k2, k3}) || len(k.RevokedKeySHA256) != 0 || len(k.LeafTokens) != 3 {
+			t.Errorf("after a re-issue: %+v; want keys [K2 K3], none revoked, three leaves", k)
+		}
+	})
+
+	t.Run("a record that will not load", func(t *testing.T) {
+		env, _, _, dir, passFile := keeperEnv(t, output.ModeHuman)
+		req, fp := makeRequest(t, env)
+		// A directory with no record holds no rows, and is passed over.
+		if err := dir.CreateInstance("empty"); err != nil {
+			t.Fatal(err)
+		}
+		if err := dir.CreateInstance("broken"); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir.InstancePath("broken"), "metadata.yaml"), []byte("name: [broken\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		refused(t, env, dir, passFile, "phone", req, fp, "cannot check the key against broken's records")
+		if err := os.Remove(filepath.Join(dir.InstancePath("broken"), "metadata.yaml")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := enrollFrom(t, env, passFile, "phone", req, fp); err != nil {
+			t.Errorf("with every record readable: %v", err)
+		}
+	})
+}
+
+// The fingerprint check runs again inside the record's update, over the rows
+// as they are then: UpdateInstanceMetadata reloads rather than locks, so that
+// is where a concurrent enrolment shows. One that certified the same key for
+// another device while this one waited at its prompt makes this one remove
+// the packet it wrote.
+func TestEnrollRechecksTheRecordItWrites(t *testing.T) {
+	env, _, _, dir, passFile := keeperEnv(t, output.ModeHuman)
+	req, fp := makeRequest(t, env)
+	env.In = &whileReading{r: strings.NewReader(fp + "\n"), meanwhile: func() {
+		if _, err := dir.UpdateInstanceMetadata("prod", func(m *config.InstanceMetadata) error {
+			m.Keepers = append(m.Keepers, config.Keeper{Device: "phone", KeySHA256: []string{fp}})
+			return nil
+		}); err != nil {
+			t.Error(err)
+		}
+	}}
+	packet := filepath.Join(t.TempDir(), "p")
+	c := &keeperEnrollCommand{out: packet, passphraseFile: passFile, budget: 8, window: keeper.DefaultWindow, request: req,
+		interactive: func(*Env) bool { return true }}
+	err := c.Run(context.Background(), env, []string{"prod", "laptop"})
+	if err == nil || !strings.Contains(err.Error(), "already certified for prod/phone") ||
+		!strings.Contains(err.Error(), "the packet was removed, and its certificate never left this machine") {
+		t.Fatalf("enroll = %v; want the re-check's refusal", err)
+	}
+	if _, serr := os.Stat(packet); !errors.Is(serr, fs.ErrNotExist) {
+		t.Errorf("the packet survived the refusal (%v)", serr)
+	}
+	meta, err := dir.LoadInstanceMetadata("prod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(meta.Keepers) != 1 || meta.Keepers[0].Device != "phone" {
+		t.Errorf("Keepers = %+v; want only the concurrent enrolment", meta.Keepers)
+	}
+}
+
+// A record that will not write, for any reason but the re-check's refusal,
+// takes the packet with it: a certificate whose key no row holds is one the
+// record-based refusals of ADR 0020 decision 3 cannot see. The same request
+// then enrols once the record writes again.
+func TestEnrollRemovesThePacketWhenTheRecordFails(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes into a read-only directory")
+	}
+	env, _, _, dir, passFile := keeperEnv(t, output.ModeHuman)
+	req, fp := makeRequest(t, env)
+	// Everything enroll reads before the record still reads; only writing
+	// metadata.yaml (a temporary file and a rename here) fails.
+	instDir := dir.InstancePath("prod")
+	if err := os.Chmod(instDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(instDir, 0o700) })
+
+	packet := filepath.Join(t.TempDir(), "p")
+	c := &keeperEnrollCommand{out: packet, passphraseFile: passFile, budget: 8, window: keeper.DefaultWindow, request: req, keySHA256: fp}
+	err := c.Run(context.Background(), env, []string{"prod", "laptop"})
+	if err == nil || !strings.Contains(err.Error(), "recording the enrolment failed") ||
+		!strings.Contains(err.Error(), "the packet was removed") {
+		t.Fatalf("enroll = %v; want the record's failure, with the packet removed", err)
+	}
+	if _, serr := os.Stat(packet); !errors.Is(serr, fs.ErrNotExist) {
+		t.Errorf("the packet survived a record that failed (%v)", serr)
+	}
+
+	if err := os.Chmod(instDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	meta, err := dir.LoadInstanceMetadata("prod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(meta.Keepers) != 0 {
+		t.Fatalf("Keepers = %+v; a failed record recorded something", meta.Keepers)
+	}
+	c = &keeperEnrollCommand{out: packet, passphraseFile: passFile, budget: 8, window: keeper.DefaultWindow, request: req, keySHA256: fp}
+	if err := c.Run(context.Background(), env, []string{"prod", "laptop"}); err != nil {
+		t.Fatalf("enroll again from the same request: %v", err)
+	}
+	if meta, err = dir.LoadInstanceMetadata("prod"); err != nil {
+		t.Fatal(err)
+	}
+	if len(meta.Keepers) != 1 || !slices.Equal(meta.Keepers[0].KeySHA256, []string{fp}) {
+		t.Errorf("Keepers = %+v; want laptop recorded with the request's key", meta.Keepers)
+	}
+}
+
+// whileReading runs meanwhile once, before its first read: something that
+// happens while a command waits for an answer.
+type whileReading struct {
+	r         io.Reader
+	meanwhile func()
+	done      bool
+}
+
+func (w *whileReading) Read(p []byte) (int, error) {
+	if !w.done {
+		w.done = true
+		w.meanwhile()
+	}
+	return w.r.Read(p)
+}
+
+// B-T13. A request that fails decision 3's checks is refused naming the
+// check, with nothing issued and no fingerprint shown: a refused request's key
+// is no one's to confirm.
+func TestEnrollRefusesAnInvalidRequest(t *testing.T) {
+	env, out, errb, dir, passFile := keeperEnv(t, output.ModeHuman)
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{}, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := filepath.Join(t.TempDir(), "ed25519.csr")
+	if err := os.WriteFile(req, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	spki, err := x509.MarshalPKIXPublicKey(priv.Public())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(spki)
+	fp := hex.EncodeToString(sum[:])
+
+	packet, err := enrollFrom(t, env, passFile, "laptop", req, fp)
+	if err == nil || !strings.Contains(err.Error(), "(key-algorithm)") || !strings.Contains(err.Error(), "nothing was issued") {
+		t.Fatalf("an Ed25519 request = %v; want it refused naming key-algorithm", err)
+	}
+	if leaksFingerprint(out.String()+errb.String()+err.Error(), fp) {
+		t.Errorf("the refusal showed the request's fingerprint:\nerr: %v\nstdout: %s\nstderr: %s", err, out, errb)
+	}
+	if _, serr := os.Stat(packet); serr == nil {
+		t.Error("a refused request was issued a packet")
+	}
+	if meta, _ := dir.LoadInstanceMetadata("prod"); meta == nil || len(meta.Keepers) != 0 {
+		t.Error("a refused request was recorded")
+	}
+
+	// And what is not a request at all.
+	notReq := filepath.Join(t.TempDir(), "cert.csr")
+	mtls, _ := dir.LoadInstanceMTLS("prod")
+	if err := os.WriteFile(notReq, mtls.CACertPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := enrollFrom(t, env, passFile, "laptop", notReq, fp); err == nil || !strings.Contains(err.Error(), "(malformed)") {
+		t.Errorf("a certificate passed as a request = %v; want it refused as malformed", err)
+	}
+}
+
+// B-T17. A device holding only a request is a device on its way to being a
+// keeper: status lists it as such, and uninstall discards it.
+func TestKeeperStatusShowsAPendingRequest(t *testing.T) {
+	env, _, _, dir, passFile := keeperEnv(t, output.ModeHuman)
+	_, fp := makeRequest(t, env)
+
+	jenv, jout, _ := testEnvBoth(dir, output.ModeJSON)
+	if err := (&keeperStatusCommand{}).Run(context.Background(), jenv, nil); err != nil {
+		t.Fatalf("keeper status: %v", err)
+	}
+	var got struct {
+		Keeping []struct {
+			Instance string `json:"instance"`
+			Error    string `json:"error"`
+			Pending  *struct {
+				RequestedAt time.Time `json:"requested_at"`
+				KeySHA256   string    `json:"key_sha256"`
+			} `json:"pending"`
+		} `json:"keeping"`
+	}
+	if err := json.Unmarshal(jout.Bytes(), &got); err != nil {
+		t.Fatalf("%v\n%s", err, jout)
+	}
+	if len(got.Keeping) != 1 || got.Keeping[0].Error != "" || got.Keeping[0].Pending == nil || got.Keeping[0].Pending.KeySHA256 != fp {
+		t.Fatalf("status = %s; want prod with its pending request and no error", jout)
+	}
+
+	henv, hout, _ := testEnvBoth(dir, output.ModeHuman)
+	if err := (&keeperStatusCommand{}).Run(context.Background(), henv, nil); err != nil {
+		t.Fatal(err)
+	}
+	if want := "prod: not a keeper yet — request pending since "; !strings.Contains(hout.String(), want) ||
+		!strings.Contains(hout.String(), "…"+identity.FingerprintTail(fp)+"; carry it to the operator's machine") {
+		t.Errorf("status lacks the pending request:\n%s", hout)
+	}
+
+	// Installed, the request is gone; a renewal beside the key is shown.
+	packet := filepath.Join(t.TempDir(), "p")
+	req2, fp2 := makeRequest(t, env)
+	c := &keeperEnrollCommand{out: packet, passphraseFile: passFile, budget: 8, window: keeper.DefaultWindow, request: req2, keySHA256: fp2}
+	if err := c.Run(context.Background(), env, []string{"prod", "laptop"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&keeperInstallCommand{passphraseFile: passFile, acceptRisk: true}).Run(context.Background(), env, []string{packet}); err != nil {
+		t.Fatal(err)
+	}
+	_, fp3 := makeRequest(t, env)
+	hout.Reset()
+	if err := (&keeperStatusCommand{}).Run(context.Background(), henv, []string{"prod"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`prod (as "laptop"`, "key         …" + identity.FingerprintTail(fp2), "renewal     request pending since", identity.FingerprintTail(fp3)} {
+		if !strings.Contains(hout.String(), want) {
+			t.Errorf("status lacks %q:\n%s", want, hout)
+		}
+	}
+	// The operator's fleet row names the newest key certified.
+	jout.Reset()
+	if err := (&keeperStatusCommand{}).Run(context.Background(), jenv, nil); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(jout.String(), `"key_sha256":"`+fp2+`"`) && !strings.Contains(jout.String(), `"key_sha256": "`+fp2+`"`) {
+		t.Errorf("status JSON does not name the installed key:\n%s", jout)
+	}
+}
+
+func TestUninstallDiscardsAPendingRequest(t *testing.T) {
+	env, out, _, dir, _ := keeperEnv(t, output.ModeHuman)
+	makeRequest(t, env)
+	kdir := dir.KeeperDir("prod")
+	if err := (&keeperUninstallCommand{}).Run(context.Background(), env, []string{"prod"}); exitCodeOf(err) != 2 {
+		t.Errorf("an unconfirmed uninstall = %v; want a usage error", err)
+	}
+	if _, err := os.Stat(filepath.Join(kdir, "request.key")); err != nil {
+		t.Fatal("an unconfirmed uninstall discarded the request")
+	}
+	if err := (&keeperUninstallCommand{assumeYes: true}).Run(context.Background(), env, []string{"prod"}); err != nil {
+		t.Fatalf("keeper uninstall: %v", err)
+	}
+	for _, f := range []string{"request.key", "request.yaml"} {
+		if _, err := os.Stat(filepath.Join(kdir, f)); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("%s survived uninstall", f)
+		}
+	}
+	if !strings.Contains(out.String(), "pending request for \"prod\" is discarded") {
+		t.Errorf("uninstall did not say what it discarded:\n%s", out)
+	}
+	if err := (&keeperUninstallCommand{assumeYes: true}).Run(context.Background(), env, []string{"prod"}); err == nil {
+		t.Error("uninstalling nothing succeeded")
+	}
+}
+
+// Release leaves a pending request on this machine alone — no certificate
+// came back to prove which instance it was for — and says how to discard it.
+func TestReleaseLeavesAPendingRequestAndSaysSo(t *testing.T) {
+	env, out, _, dir, _ := keeperEnv(t, output.ModeHuman)
+	makeRequest(t, env)
+	prov := registerFake(t, &fakeProvider{})
+	if _, err := dir.UpdateInstanceMetadata("prod", func(m *config.InstanceMetadata) error {
+		m.Provider = prov
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	giveStorage(t, dir, "prod")
+	if err := (&releaseCommand{assumeYes: true}).Run(context.Background(), env, []string{"prod"}); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir.KeeperDir("prod"), "request.key")); err != nil {
+		t.Errorf("release removed the pending request: %v", err)
+	}
+	for _, want := range []string{"untouched", "a pending request for an instance named \"prod\"", "'farcast keeper uninstall prod' discards it"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("release lacks %q:\n%s", want, out)
+		}
+	}
 }

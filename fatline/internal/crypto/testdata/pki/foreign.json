@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "about": "ADR 0020's foreign-CA fixture: another ECDSA P-256 CA with the fixture CA's subject, issuing a server leaf for the fixture's server name. A client that pins the fixture CA must refuse it. Test data; trusted nowhere else.",
+  "server_name": "fixture.fatline.farcast",
+  "issued_at": "2026-11-13T00:00:00Z",
+  "verify_at": "2026-11-14T00:00:00Z",
+  "ca": {
+    "cert_pem": "-----BEGIN CERTIFICATE-----\nMIIBgjCCASigAwIBAgIBATAKBggqhkjOPQQDAjAnMSUwIwYDVQQDExxGYXJDYXN0\nIEluc3RhbmNlIENBOiBmaXh0dXJlMB4XDTI2MTExMjIzNTkwMFoXDTI4MTExMjAw\nMDAwMFowJzElMCMGA1UEAxMcRmFyQ2FzdCBJbnN0YW5jZSBDQTogZml4dHVyZTBZ\nMBMGByqGSM49AgEGCCqGSM49AwEHA0IABAbWxhKvLgRxH5Ky4NYATX36Esx/eDae\nbzINi0AfbPK19XIr6dcjPKdL3adb7Qxxj8hhZpInYphvUYUOGsISoMSjRTBDMA4G\nA1UdDwEB/wQEAwIBBjASBgNVHRMBAf8ECDAGAQH/AgEAMB0GA1UdDgQWBBSGSCZM\nltzPklAxqARzOzWLUIaeIzAKBggqhkjOPQQDAgNIADBFAiAqh0uCMAJQza/xhY3+\noHoiZUMFjvkMBJxiwfbcPqqlzgIhAIF+zrOh9YNyQbRjLKrHPf3/JVEzBEYzKVkX\nCjX6pfJ0\n-----END CERTIFICATE-----\n",
+    "key_sha256": "909c392706f521f3d1e054920f371ff22ec36bd7a7674f8af74eb9ebff1bf38b"
+  },
+  "server": {
+    "identity": "fixture.fatline.farcast",
+    "cert_pem": "-----BEGIN CERTIFICATE-----\nMIIBsjCCAVigAwIBAgIBAjAKBggqhkjOPQQDAjAnMSUwIwYDVQQDExxGYXJDYXN0\nIEluc3RhbmNlIENBOiBmaXh0dXJlMB4XDTI2MTExMjIzNTkwMFoXDTI3MDIxMTAw\nMDAwMFowIjEgMB4GA1UEAxMXZml4dHVyZS5mYXRsaW5lLmZhcmNhc3QwWTATBgcq\nhkjOPQIBBggqhkjOPQMBBwNCAAShWwipRLvE8UG6E9sM+vUxS4MZtVxYjD2ZZqq5\naV3/YMJoiczmqSZUelQWUTR96Efl/nG78pdvxO5gVOEva/aLo3oweDAOBgNVHQ8B\nAf8EBAMCB4AwEwYDVR0lBAwwCgYIKwYBBQUHAwEwDAYDVR0TAQH/BAIwADAfBgNV\nHSMEGDAWgBSGSCZMltzPklAxqARzOzWLUIaeIzAiBgNVHREEGzAZghdmaXh0dXJl\nLmZhdGxpbmUuZmFyY2FzdDAKBggqhkjOPQQDAgNIADBFAiBTD7eKsqNF+ZOCaDA2\nmKx988Jnje8ddhx2bh9cSy4xTwIhAJ1uqHXS46c5VEfucsQXXG+t1/Fx870TaK/J\nPPj2OxI4\n-----END CERTIFICATE-----\n",
+    "key_pem": "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgNahajSB4io0n2z3m\nf/UMjZlm25bxhdngQkoDCXExDxyhRANCAAShWwipRLvE8UG6E9sM+vUxS4MZtVxY\njD2ZZqq5aV3/YMJoiczmqSZUelQWUTR96Efl/nG78pdvxO5gVOEva/aL\n-----END PRIVATE KEY-----\n",
+    "key_sha256": "361f84b3ffc23dd9a24b37bbd74dd255241e98cf0f2bface929bee2bde058039"
+  }
+}

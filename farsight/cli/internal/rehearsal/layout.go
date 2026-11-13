@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
+	"github.com/sofmon/farcast/farsight/cli/internal/keeper"
 	"github.com/sofmon/farcast/fatline/identity"
 )
 
@@ -122,10 +123,19 @@ func makeLayout(root string, s Spec, tools, tunnelAddr string, now time.Time) (m
 	if err != nil {
 		return material{}, err
 	}
-	keeperCert, keeperKey, err := identity.IssueKeeperClient(mint.CACertPEM, mint.CAKeyPEM, inst, keeperDevice, []byte("rehearsal-bundle"))
+	// The keeper is enrolled as a real one is (ADR 0020 decision 3): its key
+	// is made for its request, the CA certifies the request's key, and the
+	// key exists only here in memory and in harness/keeper-phone.key — never
+	// handed to anything that holds the CA key.
+	req, err := keeper.GenerateRequest()
 	if err != nil {
 		return material{}, err
 	}
+	keeperCert, err := identity.IssueKeeperClient(mint.CACertPEM, mint.CAKeyPEM, inst, keeperDevice, []byte("rehearsal-bundle"), req.RequestDER)
+	if err != nil {
+		return material{}, err
+	}
+	keeperKey := req.KeyPEM
 	m := material{
 		caCert: mint.CACertPEM, serverCert: mint.ServerCertPEM, serverKey: mint.ServerKeyPEM,
 		khCert: khCert, khKey: khKey, keeperCert: keeperCert, keeperKey: keeperKey,
@@ -258,6 +268,12 @@ func loadLayout(s Spec, tools string) (material, string, error) {
 		if *f.into, err = read(f.path); err != nil {
 			return material{}, "", err
 		}
+	}
+	// A rehearsal made before ADR 0020 has an Ed25519 CA, which FatLine no
+	// longer loads. Its scratch data is what a fresh rehearsal recreates, so
+	// there is no migration: it is refused, and says so.
+	if err := identity.RequireP256CA(m.caCert); err != nil {
+		return material{}, "", errors.New("this rehearsal was made before ADR 0020 moved the instance PKI to P-256; start a new one in a new directory")
 	}
 	meta, err := config.Dir(d.Config).LoadInstanceMetadata(s.Instance)
 	if err != nil {

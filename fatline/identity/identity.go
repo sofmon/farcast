@@ -11,6 +11,11 @@
 // and the keepers' and nothing else. The CA private key is the crown jewel:
 // the operator holds it and it is NEVER shipped to the cluster — only the CA
 // certificate and the server leaf+key are.
+//
+// Every key in it is ECDSA P-256 (ADR 0020). A keeper's leaf certifies a key
+// the device made and kept: the device sends a PKCS#10 request (ParseRequest),
+// the operator confirms its key's fingerprint against the device's screen,
+// and IssueKeeperClient certifies that key and nothing else in the request.
 package identity
 
 import (
@@ -89,12 +94,19 @@ func KeeperBundleDigest(bundle []byte) string {
 
 // leafTokenDomain separates a leaf token from the leaf's ordinary SHA-256
 // fingerprint, so the token cannot be joined against a fingerprint printed
-// anywhere else.
-const leafTokenDomain = "farcast-leaf-token-v1"
+// anywhere else. v2 hashes the signed body (ADR 0020 decision 4); v1 hashed
+// the whole DER.
+const leafTokenDomain = "farcast-leaf-token-v2"
 
 // LeafToken is the opaque name a tunnel peer is attributed by: the first 8
-// bytes of SHA-256 over a domain label and the leaf's DER, as 16 hex
-// characters.
+// bytes of SHA-256 over a domain label and the leaf's signed body
+// (RawTBSCertificate), as 16 hex characters.
+//
+// Why the body and not the whole DER (v2, ADR 0020 decision 4): an ECDSA
+// signature has two valid encodings, s and n − s, so a leaf holder could
+// re-encode its certificate and present a second DER that verifies — and
+// whole-DER hashing gave one leaf two tokens. The body is what the CA signed,
+// and its random serial and key keep it unique per leaf.
 //
 // It names a leaf, not a device, and only the operator's machine can turn it
 // back into a device: it records the token when it issues a keeper's leaf, and
@@ -107,25 +119,32 @@ const leafTokenDomain = "farcast-leaf-token-v1"
 // stable per-device pseudonym in a provider-ingested log would let the
 // provider follow one device across addresses for the leaf's whole life, and
 // count the fleet (ADR 0015).
-func LeafToken(der []byte) string {
+//
+// It takes a parsed certificate, not bytes, so that no caller can hand it the
+// whole DER by mistake.
+func LeafToken(cert *x509.Certificate) string {
+	if cert == nil {
+		return ""
+	}
 	h := sha256.New()
 	h.Write([]byte(leafTokenDomain))
-	h.Write(der)
+	h.Write(cert.RawTBSCertificate)
 	return hex.EncodeToString(h.Sum(nil)[:8])
 }
 
 // LeafTokenPEM is LeafToken over the first certificate in a PEM block — what
-// the operator's machine holds when it issues a leaf. It hashes the DER, as
-// FatLine does, never the PEM text.
+// the operator's machine holds when it issues a leaf. It parses the DER and
+// hashes the signed body, as FatLine does, never the PEM text.
 func LeafTokenPEM(certPEM []byte) (string, error) {
 	block, _ := pem.Decode(certPEM)
 	if block == nil || block.Type != "CERTIFICATE" {
 		return "", errors.New("identity: no certificate in the PEM given")
 	}
-	if _, err := x509.ParseCertificate(block.Bytes); err != nil {
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
 		return "", fmt.Errorf("identity: parse leaf: %w", err)
 	}
-	return LeafToken(block.Bytes), nil
+	return LeafToken(cert), nil
 }
 
 // AppURI is the identity a deployed application presents to the keyholder's
@@ -189,8 +208,15 @@ func IssueKeyholderServer(caCertPEM, caKeyPEM []byte, instance string) (certPEM,
 	return leaf.CertPEM, leaf.KeyPEM, nil
 }
 
-// IssueKeeperClient issues one keeper device's client leaf from an
-// already-minted CA (phase 5.4).
+// IssueKeeperClient certifies one keeper device's key from an already-minted
+// CA (phase 5.4), by request (ADR 0020 decision 3).
+//
+// The device generates its key where the key will live and sends a PKCS#10
+// request for it; the operator's machine never holds it. requestDER is that
+// request: it must pass decision 3's checks (a *RequestError says which one
+// failed), and the leaf certifies its public key and honours nothing else in
+// it. The identity, the bundle binding, the EKU and the validity are the
+// operator's.
 //
 // It is a separate issuance from Mint's operator leaf for the reason the
 // keeper design turns on: each device is named, so one can be revoked without
@@ -199,8 +225,8 @@ func IssueKeyholderServer(caCertPEM, caKeyPEM []byte, instance string) (certPEM,
 //
 // The CA private key is an argument and is never retained. That is what keeps
 // a keeper unable to enrol another keeper: minting happens on the operator's
-// machine, and the device receives a leaf rather than the authority to make
-// one.
+// machine, and the device receives a certificate rather than the authority to
+// make one.
 //
 // The leaf carries the CA's ordinary 90-day validity, which is the fleet's
 // only automatic revocation: a device that is never re-enrolled stops being
@@ -211,25 +237,26 @@ func IssueKeyholderServer(caCertPEM, caKeyPEM []byte, instance string) (certPEM,
 // leaf re-seeds with that bundle and no other: a stolen leaf cannot carry keys
 // of its own making, and once a rotation moves the instance's key pin past the
 // bundle, the leaf can push nothing at all.
-func IssueKeeperClient(caCertPEM, caKeyPEM []byte, instance, device string, bundle []byte) (certPEM, keyPEM []byte, err error) {
+func IssueKeeperClient(caCertPEM, caKeyPEM []byte, instance, device string, bundle, requestDER []byte) (certPEM []byte, err error) {
 	if instance == "" {
-		return nil, nil, errors.New("identity: empty instance name")
+		return nil, errors.New("identity: empty instance name")
 	}
 	if device == "" {
-		return nil, nil, errors.New("identity: empty device name")
+		return nil, errors.New("identity: empty device name")
 	}
 	if len(bundle) == 0 {
-		return nil, nil, errors.New("identity: a keeper leaf binds a bundle, and none was given")
+		return nil, errors.New("identity: a keeper leaf binds a bundle, and none was given")
 	}
 	ca, err := fcrypto.LoadCA(caCertPEM, caKeyPEM)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	leaf, err := ca.IssueClientBinding(KeeperURI(instance, device), KeeperBundleURIPrefix+KeeperBundleDigest(bundle))
+	certPEM, err = ca.IssueClientFromRequest(requestDER, KeeperURI(instance, device), x509.ExtKeyUsageClientAuth,
+		KeeperBundleURIPrefix+KeeperBundleDigest(bundle))
 	if err != nil {
-		return nil, nil, fmt.Errorf("identity: issue keeper client cert: %w", err)
+		return nil, fmt.Errorf("identity: issue keeper client cert: %w", err)
 	}
-	return leaf.CertPEM, leaf.KeyPEM, nil
+	return certPEM, nil
 }
 
 // Material is a per-instance mTLS identity, PEM-encoded for storage. CAKeyPEM is

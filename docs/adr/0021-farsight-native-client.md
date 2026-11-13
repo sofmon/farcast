@@ -1,6 +1,6 @@
 # ADR 0021 — FarSight's Client: Native Shells, Apple First
 
-**Status:** Accepted (2026-11-11). Decision 2 amended the same day: the app world map replaces tiling as the base layout. Decision 9's first step has begun — `farsight/client/apple/` holds FarSightKit and the FarCast app target, drawing the map against an illustrative fixture. Decision 9's Connected view is built on macOS (2026-11-12) and awaits its no-cost rehearsal and first live read; nothing else below is built. Decisions 2 and 9 amended, and decision 6 corrected, 2026-11-12: a group is a namespace labelled with its repository; a read-only Connected view on macOS comes before 7.1; tile ingress and device leaves are decided together; cluster calls also need `gcloud`, and every one runs under a pinned gcloud account. This ADR depends on [ADR 0020](0020-instance-pki-ecdsa-p256.md): without it, no Apple client can reach FatLine on stock APIs. The tile-path evidence below comes from a probe on macOS 27 and the iOS 26.0 simulator, with no packet capture and no physical device. visionOS was not probed.
+**Status:** Accepted (2026-11-11). Decision 2 amended the same day: the app world map replaces tiling as the base layout. Decision 9's first step has begun — `farsight/client/apple/` holds FarSightKit and the FarCast app target, drawing the map against an illustrative fixture. Decision 9's Connected view is built on macOS (2026-11-12) and awaits its no-cost rehearsal and first live read; nothing else below is built, apart from Verification 1's ADR 0020 regression (2026-11-13). Decisions 2 and 9 amended, and decision 6 corrected, 2026-11-12: a group is a namespace labelled with its repository; a read-only Connected view on macOS comes before 7.1; tile ingress and device leaves are decided together; cluster calls also need `gcloud`, and every one runs under a pinned gcloud account. This ADR depends on [ADR 0020](0020-instance-pki-ecdsa-p256.md): without it, no Apple client can reach FatLine on stock APIs. The tile-path evidence below comes from a probe on macOS 27 and the iOS 26.0 simulator, with no packet capture and no physical device. visionOS was not probed.
 
 **Date:** 2026-11-11
 
@@ -260,7 +260,7 @@ The dashboard, the install wizard, connect and release, keeper custody, and seal
 
 **9. FarSight moves ahead of AllThing.** The order:
 1. **The Apple shell prototype, against fixtures.** Fixtures come from `farcast … -o json`. It covers the app world map, the dashboard and the wizard, with no backend change. *Begun 2026-11-11:* the map, its HUD and the core apps' first surfaces run on macOS and the iPad simulator. Their fixture is the prototype canvas's illustrative world, because no CLI command yet reports apps by namespace with the repository `run` recorded, or graded connections; fixtures move to CLI output as commands gain those fields. The wizard is not started. A read-only Connected view on macOS follows it (amended below).
-2. **ADR 0020 implemented,** and Phase 5 Session A walked again.
+2. **ADR 0020 implemented,** and Phase 5 Session A walked again. *Implemented 2026-11-13; the re-walk is owed.*
 3. **The CLI's consent protocol and explicit environment** (decision 6), walked from a terminal.
 4. **7.1, the macOS shell** driving the bundled CLI, with the tile bridge tested against local servers.
 5. **The tile-ingress ADR, with the device-leaf ADR or after it** (amended below), then 7.3: tiles reach real applications, behind the packet-capture gate. Device-leaf enrolment first gains a CLI consumer that is walked end to end before a GUI depends on it, per PLAN principle 3.
@@ -449,7 +449,7 @@ Stated because *"blind to content"* is FarCast's standard, and installing a clie
 
 ## Verification
 
-1. **The ADR 0020 regression lives in this package.** Mutual TLS from URLSession and `NWConnection` to a Go test server built from the vectors, plus the negative test against Ed25519.
+1. **The ADR 0020 regression lives in this package.** Mutual TLS from URLSession and `NWConnection` to a Go test server built from the vectors, plus the negative test against Ed25519. *(Built 2026-11-13: `FarSightTLSTests`, run by `./check.sh` on macOS and the iOS simulator.)*
 2. **The tile gate, per platform family,** recorded in a runbook.
    - *When:* it is passed on each platform family (Mac, iPhone, iPad, Vision Pro) before that family's client renders tiles.
    - *Setup:* a physical device and a packet capture on the uplink.

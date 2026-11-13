@@ -441,7 +441,7 @@ The order (ADR 0021 decision 9):
      - `instances` and `world` are new read-only CLI commands, walked from a terminal first (principle 3). They are the one CLI change ahead of step 3.
      - It shows no tiles, does no background reads, adds no standing cost, and nothing in it changes an instance.
      - Its conditions are in the amendment: a pinned gcloud account, an explicit environment, no CA key or keyring opened, golden vectors, and a no-cost rehearsal before the first read of a live instance.
-2. **ADR 0020 implemented,** and the Phase 5 Session A runbook walked again.
+2. **ADR 0020 implemented,** and the Phase 5 Session A runbook walked again. *Implemented 2026-11-13; the re-walk (ADR 0020 Verification 3) is owed. It is billable, about USD 0.40, and a separate session the operator approves before anything is created.*
 3. **The CLI gains a consent protocol and an explicit environment, walked from a terminal.**
    - The consent protocol is `--plan` and `--confirm <digest>` plus progress events, so a GUI never passes a bare `--yes`.
    - The explicit environment is the checkout, the tool paths and the pinned gcloud account the CLI is given.

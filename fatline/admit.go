@@ -70,7 +70,7 @@ func (s *Server) peer(cs *tls.ConnectionState) (role, token string) {
 	default:
 		return "", ""
 	}
-	return role, identity.LeafToken(cs.PeerCertificates[0].Raw)
+	return role, identity.LeafToken(cs.PeerCertificates[0])
 }
 
 // admitted reports whether the peer's leaf carries an identity the tunnel

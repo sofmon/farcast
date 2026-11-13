@@ -2,6 +2,8 @@
 
 **Status: ✅ complete, walked twice.** On 2026-10-06, from the operator's machine only, criterion 7 failed, and a defect found while fixing it meant criterion 4 had passed for the wrong reason. Three criteria genuinely needed a second machine and were recorded as unwalked. On 2026-11-10 [the consolidated Phase 5 walk](phase-5-session-a.md#results--walked-2026-11-10) walked every criterion except criterion 5, and criterion 7 only in part, with a second machine that held the keeper binary and nothing else. Every criterion has now passed. Twelve were walked on 2026-11-10. Criterion 5, the exhausted budget, rests on 2026-10-06 alone, and so does criterion 7's "still works until rekey" half. That walk closed Phase 5. Its record for 5.4 is [at the end](#walked-2026-11-10--session-a).
 
+*Rewritten 2026-11-13 for [ADR 0020](../adr/0020-instance-pki-ecdsa-p256.md) (enrolment by request), not yet walked: the device makes its own key and sends a request, the operator confirms the key's fingerprint before enrolling it, and the packet carries a certificate and no private key. The device steps below follow that flow. The results recorded below were walked against the flow as it was then, and stay as they were.*
+
 The 2026-10-06 walk shared instance `p54` with [the 5.3 re-walk](phase-5-3-validation.md), which is where the full record and all seven defects live — 5.4 criterion 3 needs an application recovering from `ErrStorageSealed`, so the applications had to be deployed anyway, and deploying them is most of the 5.3 re-walk. One cluster, both phases, about three hours and roughly $0.30.
 
 **On 2026-10-06 the keeper was installed on the operator's own machine, by decision.** That proves the mechanics and says nothing about the property — the bundle sat beside the keyring it is supposed to be independent of. Criterion 2 was therefore left open, not passed, and criteria 8 and 9 with it, until 2026-11-10.
@@ -33,48 +35,74 @@ Several checks below need a client the CLI refuses to be: a keeper claiming the 
 
 ```bash
 # go test runs in the package's directory, so relative paths are resolved
-# against FARCAST_WALK_CWD — the directory you run from.
+# against FARCAST_WALK_CWD — the directory you run from. -timeout 0, because
+# keyscan over $HOME can outlast go test's default ten minutes.
 probe() { FARCAST_WALK=1 FARCAST_WALK_INSTANCE="$INSTANCE" FARCAST_WALK_CWD="$PWD" "$@" \
-  go test -mod=vendor -tags walk -count=1 -run TestWalkProbe -v ./farsight/cli/internal/cli/; }
+  go test -mod=vendor -tags walk -count=1 -timeout 0 -run TestWalkProbe -v ./farsight/cli/internal/cli/; }
 # e.g. probe env FARCAST_WALK_PROBE=state
 
-# As the enrolled device, with its own leaf and bundle from its newest packet.
+# Walk keeper W: a keeper enrolled by request into a scratch config directory
+# on THIS machine, outside the checkout (section 1). FarCast never carries the
+# device's own key off the device, so every hand-made keeper request below
+# presents W.
+WKEEP="$(mktemp -d)/walk-keeper"
+W_STORE="$WKEEP/keepers/$INSTANCE"
 # It is a function rather than one long variable, so it works in zsh too.
+asW() { probe env FARCAST_WALK_LEAF=store:"$W_STORE" FARCAST_WALK_BUNDLE=store:"$W_STORE" "$@"; }
+
+# The device's newest packet, for 'packet' and 'open'.
 PACKET=./study.packet
-asdevice() { probe env FARCAST_WALK_LEAF=packet:"$PACKET" FARCAST_WALK_BUNDLE=packet:"$PACKET" \
-  FARCAST_WALK_PASSPHRASE_FILE=./pass "$@"; }
 ```
 
-`FARCAST_WALK_PROBE` is one of `packet`, `state`, `push`, `seal`, `release-hold`, `tunnel` or `open`. The inputs are listed in the header of [`walkprobe_test.go`](../../farsight/cli/internal/cli/walkprobe_test.go): `FARCAST_WALK_LEAF` (`operator` | `store:<dir>` | `packet:<file>`), `FARCAST_WALK_BUNDLE` (`store:<dir>` | `packet:<file>` | `keys:<file>` | `keys:@live`, this machine's keyring), `FARCAST_WALK_PASSPHRASE_FILE`, `FARCAST_WALK_ORDINAL`, `FARCAST_WALK_INTENT`, `FARCAST_WALK_GENERATION`, `FARCAST_WALK_CERT` and `FARCAST_WALK_KEY` for `tunnel`, `FARCAST_WALK_PACKET` and `FARCAST_WALK_OBJECT` for `packet` and `open`, and `FARCAST_WALK_HOLD=1` to make `seal` a hold. It prints key ids and never key material. The packet and its passphrase file stay on the operator's machine after enrolment, so `packet:"$PACKET"` is the device's leaf and bundle there. `keeper enroll` refuses to overwrite its `--out` file. So each time the device is re-enrolled (section 5's `--budget 1`, section 6a), write the new packet to a new path, install it on the device, and set `PACKET` to it. [The consolidated walk runbook](phase-5-session-a.md) runs every check below in one session.
+`FARCAST_WALK_PROBE` is one of `packet`, `keyscan`, `state`, `push`, `seal`, `release-hold`, `tunnel` or `open`. The inputs are listed in the header of [`walkprobe_test.go`](../../farsight/cli/internal/cli/walkprobe_test.go): `FARCAST_WALK_LEAF` (`operator` | `store:<dir>`; `packet:<file>` was retired by ADR 0020, because a packet carries no private key), `FARCAST_WALK_BUNDLE` (`store:<dir>` | `packet:<file>` | `keys:<file>` | `keys:@live`, this machine's keyring), `FARCAST_WALK_PASSPHRASE_FILE`, `FARCAST_WALK_ORDINAL`, `FARCAST_WALK_INTENT`, `FARCAST_WALK_GENERATION`, `FARCAST_WALK_CERT` and `FARCAST_WALK_KEY` for `tunnel`, `FARCAST_WALK_PACKET` and `FARCAST_WALK_OBJECT` for `packet` and `open`, `FARCAST_WALK_KEY_SHA256` and `FARCAST_WALK_SCAN` for `keyscan`, and `FARCAST_WALK_HOLD=1` to make `seal` a hold. It prints key ids and fingerprints, and never key material. The device's key stays on the device, which is the property, so the probe cannot present the device; it presents W, which is a keeper like any other to the keyholder. The packet and its passphrase file stay on the operator's machine after enrolment, for `packet` and `open`. `keeper enroll` refuses to overwrite its `--out` file. So each time the device is re-enrolled (section 5's `--budget 1`, section 6a), make a new request on it, write the new packet to a new path, install it on the device, and set `PACKET` to it. [The consolidated walk runbook](phase-5-session-a.md) runs every check below in one session.
 
 ---
 
 ## 1. Does enrolment produce something only that device can use?
 
+*(Rewritten 2026-11-13: enrolment is by request, [ADR 0020](../adr/0020-instance-pki-ecdsa-p256.md) decision 3.)* The device makes its key first. On the second machine:
+
 ```bash
-farcast keeper enroll "$INSTANCE" study-desktop --out ./study.packet --passphrase-file ./pass
+farcast keeper request "$INSTANCE" --out ./study.csr      # --accept-backup-risk on Linux, after seeing it refused without
 ```
 
-**Expect:** a 0600 packet, a reported expiry about 90 days out, and — with one device enrolled — the line saying two are wanted.
+**Expect:** a 0600 request file, and the key's fingerprint as two lines of eight groups. Record the fingerprint from the device's screen, and carry `study.csr` to the operator's machine. On the operator's machine, first with any other 64 hex characters as the fingerprint, then with the device's:
 
-Then check what is *not* in it. The packet is armored, so open it with the passphrase and confirm the CA key and the keyring are absent, and that the leaf's URI is `farcast://<instance>/keeper/study-desktop`. The unit suite asserts this; the walk should confirm it against a real instance's own material, because the assertion is only as good as the fixture behind it.
+```bash
+farcast keeper enroll "$INSTANCE" study-desktop --request ./study.csr --key-sha256 <not the device's> --out ./study.packet --passphrase-file ./pass
+farcast keeper enroll "$INSTANCE" study-desktop --request ./study.csr --key-sha256 <the device's fingerprint> --out ./study.packet --passphrase-file ./pass
+```
+
+**Expect:** the first refused — "the request's key is not the one --key-sha256 names; nothing was issued" — with no packet and nothing of the fingerprint on screen. The second prints the fingerprint "confirmed against study-desktop", then a 0600 packet, a reported expiry about 90 days out, and — with one device enrolled — the line saying two are wanted.
+
+Then check what is *not* in it. The packet is armored, so open it with the passphrase and confirm the CA key, the keyring and any private key are absent, and that the leaf's URI is `farcast://<instance>/keeper/study-desktop`. The unit suite asserts this; the walk should confirm it against a real instance's own material, because the assertion is only as good as the fixture behind it.
 
 ```bash
 probe env FARCAST_WALK_PROBE=packet FARCAST_WALK_PACKET=./study.packet FARCAST_WALK_PASSPHRASE_FILE=./pass
 ```
 
-**Expect:** two leaf URIs, `farcast://<instance>/keeper/study-desktop` and `urn:farcast:keeper-bundle:sha256:…`, a clientAuth-only extended key usage and an expiry about 90 days out. Then `the leaf binds the bundle it carries`, the bundle's scopes with their KEK ids, and `checked against this machine's keyring: no master key in the bundle`. The probe prints `FAIL` and fails if the packet carries a master key id or any private key besides the leaf's. *(Corrected 2026-10-08: this step said "open it" with nothing to open it with. The probe is that tool, and the second URI is new.)*
+**Expect:** `the packet carries no private key`, `packet version 2`, and `leaf certifies key <…>` equal to the fingerprint the device printed. Then two leaf URIs, `farcast://<instance>/keeper/study-desktop` and `urn:farcast:keeper-bundle:sha256:…`, a clientAuth-only extended key usage and an expiry about 90 days out. Then `the leaf binds the bundle it carries`, the bundle's scopes with their KEK ids, and `checked against this machine's keyring: no master key in the bundle`. The probe prints `FAIL` and fails if the packet carries a master key id or any private key at all. *(Corrected 2026-10-08: this step said "open it" with nothing to open it with. The probe is that tool, and the second URI is new.)* And no PEM file under `$HOME` holds the device's key: `probe env FARCAST_WALK_PROBE=keyscan FARCAST_WALK_KEY_SHA256=<the device's fingerprint> FARCAST_WALK_SCAN="$HOME"` ends `none certifies …`; record its counts (files, skipped, private keys). It reads PEM text in readable regular files of 1 MiB or less and follows no symlink, so a key embedded as escaped text in JSON or YAML, archived or encrypted is not seen, and neither is a folder macOS keeps from it (those count as skipped).
+
+Then enrol walk keeper W on this machine, the keeper the hand-made requests below present:
+
+```bash
+FARCAST_CONFIG_HOME="$WKEEP" farcast keeper request "$INSTANCE" --out ./w.csr
+farcast keeper enroll "$INSTANCE" walk --request ./w.csr --key-sha256 <W's fingerprint> --budget 1 --out ./w.packet --passphrase-file ./pass
+FARCAST_CONFIG_HOME="$WKEEP" farcast keeper install ./w.packet --passphrase-file ./pass
+```
+
+W never runs `keeper run`. At budget 1 it counts in the fleet total until section 7 revokes it; section 9 lists it `REVOKED`.
 
 ## 2. Does a device with no FarCast state become a keeper?
 
-On the second machine, with no instance installed and no keyring:
+On the second machine, with no instance installed and no keyring — the machine that ran `keeper request` in section 1, whose key the packet's certificate certifies:
 
 ```bash
 farcast keeper install ./study.packet --passphrase-file ./pass
 farcast keeper status
 ```
 
-**Expect:** the install reports the backup exclusion was read back (on macOS), and `status` shows the device keeping the instance with a budget and an empty ledger.
+**Expect:** the install names the key, made on this device, and reports the backup exclusion was read back (on macOS), and `status` shows the device keeping the instance with a budget and an empty ledger. Inventory the device: the keeper binary and the keeper directory, and in it no `request.key` or `request.yaml` — install moved the key to `leaf.key`. Then copy W's packet (`./w.packet`) to the device and install it there: **expect** it refused as a `security event` — its certificate certifies a key this device does not hold — with nothing in the keeper directory changed. Delete it, and the packets and passphrase, from the device.
 
 This is the criterion that says a keeper is a *role*, not a second operator machine: nothing was installed, no cloud credential is present, and no kubeconfig exists.
 
@@ -107,17 +135,17 @@ farcast keeper run "$INSTANCE" --once
 **Expect:** `hold — sealed by the operator: runbook`, no push attempted, and no ledger entry. Then confirm the second line of defence by pushing anyway with a hand-made request: the keyholder must refuse `restart-reseed` against a hold on its own, without relying on the device's good behaviour.
 
 ```bash
-asdevice FARCAST_WALK_PROBE=push FARCAST_WALK_INTENT=restart-reseed FARCAST_WALK_ORDINAL=0
+asW FARCAST_WALK_PROBE=push FARCAST_WALK_INTENT=restart-reseed FARCAST_WALK_ORDINAL=0
 ```
 
 **Expect** `replica 0 REFUSED` with code `operator-hold`, and the hold still in place in `farcast storage state "$INSTANCE"`.
 
-And then push the way a **modified** keeper would, because the honest request is not the threat. With the device's own leaf: `POST /v1/release-hold`, `POST /v1/seal?hold=true`, and an unseal claiming `intent=operator-unseal`. **Expect `403 permission` for all three, and the hold untouched.** Until 2026-10-06 all three succeeded: the control surface took its authority from the request, and the walk's own probe passed only because it declared its intent honestly.
+And then push the way a **modified** keeper would, because the honest request is not the threat. With a keeper's own leaf — W's: `POST /v1/release-hold`, `POST /v1/seal?hold=true`, and an unseal claiming `intent=operator-unseal`. **Expect `403 permission` for all three, and the hold untouched.** Until 2026-10-06 all three succeeded: the control surface took its authority from the request, and the walk's own probe passed only because it declared its intent honestly.
 
 ```bash
-asdevice FARCAST_WALK_PROBE=release-hold FARCAST_WALK_ORDINAL=0
-asdevice FARCAST_WALK_PROBE=seal FARCAST_WALK_HOLD=1 FARCAST_WALK_ORDINAL=1
-asdevice FARCAST_WALK_PROBE=push FARCAST_WALK_INTENT=operator-unseal FARCAST_WALK_ORDINAL=0
+asW FARCAST_WALK_PROBE=release-hold FARCAST_WALK_ORDINAL=0
+asW FARCAST_WALK_PROBE=seal FARCAST_WALK_HOLD=1 FARCAST_WALK_ORDINAL=1
+asW FARCAST_WALK_PROBE=push FARCAST_WALK_INTENT=operator-unseal FARCAST_WALK_ORDINAL=0
 ```
 
 *(Added 2026-10-08: until now this step named no tool for the hand-made requests. The probe is that tool.)*
@@ -132,10 +160,10 @@ Set a deliberately small budget at enrolment (`--budget 1`), re-seed once, then 
 
 This is the criterion the boot label exists for, and it needs a push that a restart did not justify.
 
-The 2026-10-06 walk produced one by pushing a second time into a replica that was **serving** — and that push is now refused outright (`409 already-serving`): a re-seed only reaches a replica that restarted. That is the better outcome, a solicitation into a live process stopped rather than detected afterwards, and it is worth confirming first. With the device's own leaf, push `restart-reseed` at a serving replica: **expect `already-serving`, and the replica's keys untouched** (`farcast storage state` shows no replica flagged).
+The 2026-10-06 walk produced one by pushing a second time into a replica that was **serving** — and that push is now refused outright (`409 already-serving`): a re-seed only reaches a replica that restarted. That is the better outcome, a solicitation into a live process stopped rather than detected afterwards, and it is worth confirming first. With a keeper's own leaf (W's), push `restart-reseed` at a serving replica: **expect `already-serving`, and the replica's keys untouched** (`farcast storage state` shows no replica flagged).
 
 ```bash
-asdevice FARCAST_WALK_PROBE=push FARCAST_WALK_INTENT=restart-reseed FARCAST_WALK_ORDINAL=0   # replica 0 serving
+asW FARCAST_WALK_PROBE=push FARCAST_WALK_INTENT=restart-reseed FARCAST_WALK_ORDINAL=0   # replica 0 serving
 ```
 
 The audit can still be walked, because a plain seal is indistinguishable from a restart by design. Re-seed a restarted replica; seal it with `farcast storage seal` — no `--hold`, and **no restart**; then let the keeper re-seed it again. Same process, two re-seeds.
@@ -156,7 +184,7 @@ Deploy a fresh set of applications, so `run` mints new scopes. `--namespace` min
 farcast run "$INSTANCE" github.com/sofmon/farcast --manifest manifest/examples/sdk-demo/farcast --namespace sdk-demo-2
 ```
 
-**Expect:** the new scopes minted with the key-loss warning, then handed to the serving replicas. The key pin is raised silently. A `warning: the instance's key pin was not raised` line means it was not, and the rest of this step cannot pass. `kubectl -n farcast-system get configmap datasphered-pin -o yaml` shows more `require` key ids than before, and no scope name. The output ends with a re-enrol list. It starts *"Every keeper's bundle predates …"* and gives one `farcast keeper enroll "$INSTANCE" study-desktop --out <path> --passphrase-file <path>` line per enrolled device.
+**Expect:** the new scopes minted with the key-loss warning, then handed to the serving replicas. The key pin is raised silently. A `warning: the instance's key pin was not raised` line means it was not, and the rest of this step cannot pass. `kubectl -n farcast-system get configmap datasphered-pin -o yaml` shows more `require` key ids than before, and no scope name. The output ends with a re-enrol list. It starts *"Every keeper's bundle predates …"*, then `farcast keeper request "$INSTANCE" --out <path>   (on each device)`, then one `farcast keeper enroll "$INSTANCE" <device> --request <path> --out <path> --passphrase-file <path>` line for each enrolled device that is not revoked (here, study-desktop and walk).
 
 Then, before re-enrolling anything, restart a replica and let the keeper look:
 
@@ -167,7 +195,7 @@ farcast storage state "$INSTANCE"                                      # replica
 farcast keeper run "$INSTANCE" --once                                  # on the device
 ```
 
-**Expect** `this device: stale-bundle`, naming the key pin: the instance's pin refuses this device's bundle because an application was added. Then `replica 0: stale-bundle — restart-sealed, and not re-seeded`, pointing to that line, and exit status `3` (`echo $?` on the device). *(Updated 2026-11-10: the pin's verdict is printed once per pass, and `--once` exits by outcome.)* Expect also no push, the device's ledger line count unchanged, and replica 0 still `restart-sealed`. Then recover it from the operator's machine with `farcast storage unseal "$INSTANCE"`. Re-enrol and reinstall the device from the list `run` printed before going on. Its next packet binds the new bundle. `enroll` refuses to overwrite an existing file, so give it a new `--out`, such as `./study-2.packet`, and set `PACKET` to it so `asdevice` presents the device as it now is.
+**Expect** `this device: stale-bundle`, naming the key pin: the instance's pin refuses this device's bundle because an application was added. Then `replica 0: stale-bundle — restart-sealed, and not re-seeded`, pointing to that line, and exit status `3` (`echo $?` on the device). *(Updated 2026-11-10: the pin's verdict is printed once per pass, and `--once` exits by outcome.)* Expect also no push, the device's ledger line count unchanged, and replica 0 still `restart-sealed`. Then recover it from the operator's machine with `farcast storage unseal "$INSTANCE"`. Re-enrol and reinstall the device from the list `run` printed before going on — by request, as it prints it: a new `farcast keeper request "$INSTANCE" --out ./study-2.csr` on the device (a renewal beside its installed key), `farcast keeper enroll "$INSTANCE" study-desktop --request ./study-2.csr --key-sha256 <its new fingerprint> --out ./study-2.packet --passphrase-file ./pass` here, and `farcast keeper install` there. Its next packet binds the new bundle. `enroll` refuses to overwrite an existing file, hence the new `--out`; set `PACKET` to it. Re-enrol W the same way, keeping its budget at 1 (`FARCAST_CONFIG_HOME="$WKEEP"` for its request and install, `./w2.csr`, `./w2.packet`, and `--budget 1` on its enroll), so `asW` presents a keeper as current as the device.
 
 ## 7. Does revocation say what it does not do?
 
@@ -175,7 +203,7 @@ farcast keeper run "$INSTANCE" --once                                  # on the 
 farcast keeper revoke "$INSTANCE" study-desktop -y
 ```
 
-**Expect:** the report says it did not reach the cluster, names the sequence that retires the bundle — `farcast storage key rotate`, `farcast storage key rekey`, then re-enrolling every keeper kept — and says what that does not undo: anything already read, the names, and a restarted replica re-seeded by the device until the rotation writes the key pin — after which every replica refuses its bundle (`below-pin`), for as long as a replica has the pin loaded (`none loaded` in `storage state`, restored by `storage key pin`). *(Updated 2026-11-10: the text predated the pin.)* Then confirm the uncomfortable half: before the rotation, the revoked device can **still** re-seed, because its certificate is still valid. That is what the ADR says, and the walk should demonstrate it rather than assume the message is enough.
+**Expect:** the report says it did not reach the cluster, names the sequence that retires the bundle — `farcast storage key rotate`, `farcast storage key rekey`, then re-enrolling every keeper kept — and says what that does not undo: anything already read, the names, and a restarted replica re-seeded by the device until the rotation writes the key pin — after which every replica refuses its bundle (`below-pin`), for as long as a replica has the pin loaded (`none loaded` in `storage state`, restored by `storage key pin`). *(Updated 2026-11-10: the text predated the pin.)* Then confirm the uncomfortable half: before the rotation, a revoked device can **still** re-seed, because its certificate is still valid. That is what the ADR says, and the walk should demonstrate it rather than assume the message is enough. Demonstrate it with walk keeper W: `farcast keeper revoke "$INSTANCE" walk -y`, restart a replica (`kubectl -n farcast-system delete pod datasphered-0`, then `storage state` until it reads `restart-sealed`), and `asW FARCAST_WALK_PROBE=push FARCAST_WALK_INTENT=restart-reseed FARCAST_WALK_ORDINAL=0` re-seeds it. *(Since 2026-11-13: W, because FarCast never carries the device's own key off the device, and a probe that presents a keeper needs one whose key is on this machine.)*
 
 Then retire what the device holds, and prove it from the bundle's side rather than the command's:
 
@@ -214,21 +242,21 @@ probe env FARCAST_WALK_PROBE=open FARCAST_WALK_PACKET="$PACKET" FARCAST_WALK_PAS
 
 ### 7a. The key pin, with no serving replica left, and the bundle a keeper leaf is bound to
 
-*(Added 2026-10-08.)* Run this after the rotation has finished with every replica answering, and before the device is re-enrolled, so that `$PACKET` still holds its pre-rotation bundle. Before the pin existed, a replica that had restarted held nothing to compare a bundle against. With the whole fleet restarted at once, a keeper enrolled before a rotation re-seeded the retired keys and nothing refused it. Seal the fleet that way:
+*(Added 2026-10-08.)* Run this after the rotation has finished with every replica answering, and before the device or W is re-enrolled, so that W's store still holds its pre-rotation bundle. Before the pin existed, a replica that had restarted held nothing to compare a bundle against. With the whole fleet restarted at once, a keeper enrolled before a rotation re-seeded the retired keys and nothing refused it. Seal the fleet that way:
 
 ```bash
 kubectl -n farcast-system delete pod -l app.kubernetes.io/name=datasphered
 farcast storage state "$INSTANCE"                       # both restart-sealed; none serving
 farcast keeper run "$INSTANCE" --once                   # on the device
-asdevice FARCAST_WALK_PROBE=push FARCAST_WALK_INTENT=restart-reseed FARCAST_WALK_ORDINAL=0
+asW FARCAST_WALK_PROBE=push FARCAST_WALK_INTENT=restart-reseed FARCAST_WALK_ORDINAL=0
 ```
 
 **Expect** the keeper to report `this device: stale-bundle`, naming the key pin, once; each replica's `stale-bundle` line to point to it; exit status `3`; and no push. That is the device behaving. The probe then pushes anyway, as a device that does not behave would. Expect `replica 0 REFUSED` with code `below-pin`. That is the keyholder refusing on its own, with no serving replica to compare against. Both replicas stay `restart-sealed`.
 
-Then, still with both sealed, present the device's leaf with a bundle that is current and satisfies the pin but is not the one the leaf was issued for. The operator's own keyring will do:
+Then, still with both sealed, present a keeper's leaf (W's) with a bundle that is current and satisfies the pin but is not the one the leaf was issued for. The operator's own keyring will do:
 
 ```bash
-probe env FARCAST_WALK_PROBE=push FARCAST_WALK_LEAF=packet:"$PACKET" FARCAST_WALK_PASSPHRASE_FILE=./pass \
+probe env FARCAST_WALK_PROBE=push FARCAST_WALK_LEAF=store:"$W_STORE" \
   FARCAST_WALK_BUNDLE=keys:@live \
   FARCAST_WALK_INTENT=restart-reseed FARCAST_WALK_ORDINAL=0
 ```
@@ -241,7 +269,7 @@ Reboot the keeper. **Expect** `keeper run` to resume with its ledger and budget 
 
 ## 9. What the fleet costs
 
-Two keepers double the bundles at rest and double the solicitation endpoints. Confirm `keeper status` on the operator's machine lists both devices and their expiries, and that budgets are read as a **fleet** total rather than per device — ADR 0008 finding 6 says the reconciliation watches the aggregate.
+Two keepers double the bundles at rest and double the solicitation endpoints. Confirm `keeper status` on the operator's machine lists both devices with their expiries, and that budgets are read as a **fleet** total rather than per device — ADR 0008 finding 6 says the reconciliation watches the aggregate. Walk keeper W is listed too, `REVOKED` since section 7, with no date and no budget, and outside the fleet total. Uninstall W at the end: `FARCAST_CONFIG_HOME="$WKEEP" farcast keeper uninstall "$INSTANCE" --yes`, then delete `$WKEEP`'s parent directory.
 
 ---
 
@@ -249,8 +277,8 @@ Two keepers double the bundles at rest and double the solicitation endpoints. Co
 
 | # | Criterion | Result |
 |---|---|---|
-| 1 | An enrolment packet carries a bundle and a device leaf, and neither the keyring nor the CA key | ✅ master key ids absent from the bundle; leaf `farcast://p54/keeper/study-vm`, clientAuth only. **Re-confirmed 2026-11-10** (S9): `farcast://p5a/keeper/device-a` and the `urn:farcast:keeper-bundle:sha256:…` URI, clientAuth, "the leaf binds the bundle it carries", and no master key |
-| 2 | A machine with no FarCast state becomes a keeper from the packet alone | ✅ **walked 2026-11-10** (S9), on device A, an Ubuntu VM with the keeper binary and no gcloud, kubectl, kubeconfig or FarCast state. Install was refused without `--accept-backup-risk` and accepted with it. After `rm a.packet pass` the device held the 0700 keeper directory, five 0600 files, and nothing else. *(2026-10-06: not walked — installed on the operator's machine, which holds the keyring.)* |
+| 1 | An enrolment packet carries a bundle and a device leaf, and neither the keyring nor the CA key *(since 2026-11-13: a certificate and no private key; the key made on the device)* | ✅ master key ids absent from the bundle; leaf `farcast://p54/keeper/study-vm`, clientAuth only. **Re-confirmed 2026-11-10** (S9): `farcast://p5a/keeper/device-a` and the `urn:farcast:keeper-bundle:sha256:…` URI, clientAuth, "the leaf binds the bundle it carries", and no master key |
+| 2 | A machine with no FarCast state becomes a keeper from the packet alone *(since 2026-11-13: a certificate and no private key; the key made on the device)* | ✅ **walked 2026-11-10** (S9), on device A, an Ubuntu VM with the keeper binary and no gcloud, kubectl, kubeconfig or FarCast state. Install was refused without `--accept-backup-risk` and accepted with it. After `rm a.packet pass` the device held the 0700 keeper directory, five 0600 files, and nothing else. *(2026-10-06: not walked — installed on the operator's machine, which holds the keyring.)* |
 | 3 | A restart-sealed replica is re-seeded unattended, and an application recovers without restarting | ✅ `re-seeded … (process bbf993a8)`; `alpha` kept reading at restart count 0. **Re-confirmed 2026-11-10** (S10), on device A: `replica 0: re-seeded …`, alpha at 0 restarts, A's ledger at 1 of 8 and the operator's unchanged. Replica 1 served throughout, the case section 3's note describes. Each re-seed was a `keeper run --once` pass that the walker started; the long-running mode (the same pass every 15 minutes) was not walked |
 | 4 | An operator hold is refused by the device **and** by the keyholder independently | ✅ **walked 2026-11-10** (S13), now for the right reason. A's keeper reported the hold on both replicas, pushed nothing and wrote no ledger line. Pushed anyway as A: `restart-reseed` got `409 operator-hold`, and `release-hold`, `seal --hold` and an `operator-unseal` claim each got `403 permission`, with the hold still in place. Authority comes from the role on the leaf, not from the request. *(2026-10-06: passed for the wrong reason — the keyholder refused a push that declared `restart-reseed`, but took that intent from the request, so a keeper claiming `operator-unseal`, or calling `release-hold`, was obeyed. Fixed 2026-10-06.)* |
 | 5 | An exhausted budget refuses, legibly, and leaves storage sealed | ✅ `budget-exhausted — 2 of 2 in the last 30 days, none expires before 2026-11-05`; replica stayed sealed. Walked 2026-10-06 and **not re-walked on 2026-11-10**: device B's `--budget 1` there only made up the fleet total, and B was re-enrolled before it ever pushed |

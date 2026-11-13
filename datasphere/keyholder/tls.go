@@ -1,6 +1,8 @@
 package keyholder
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
@@ -43,20 +45,23 @@ func AllowPusher(instance string) func(uri string) bool {
 // ControlTLS is the mutually-authenticated listener that accepts seal-state
 // changes. Only a leaf issued by the instance's own CA — which lives on the
 // operator's machine and which the cloud cannot mint — reaches the handler.
+//
+// A client leaf whose key is not ECDSA P-256 is refused at the handshake,
+// whatever its identity (ADR 0020 decision 2): the instance CA issues nothing
+// else, so such a leaf is either from before ADR 0020 or not the CA's doing.
 func ControlTLS(cert tls.Certificate, clientCA *x509.CertPool, allow func(uri string) bool) *tls.Config {
-	cfg := &tls.Config{
+	return &tls.Config{
 		MinVersion:   tls.VersionTLS13,
 		MaxVersion:   tls.VersionTLS13,
 		Certificates: []tls.Certificate{cert},
 		ClientAuth:   tls.RequireAndVerifyClientCert,
 		ClientCAs:    clientCA,
-	}
-	if allow != nil {
-		cfg.VerifyConnection = func(cs tls.ConnectionState) error {
-			if len(cs.PeerCertificates) == 0 {
-				return errors.New("keyholder: no client certificate")
+		VerifyConnection: func(cs tls.ConnectionState) error {
+			leaf, err := p256Peer(cs)
+			if err != nil || allow == nil {
+				return err
 			}
-			for _, uri := range cs.PeerCertificates[0].URIs {
+			for _, uri := range leaf.URIs {
 				if allow(uri.String()) {
 					return nil
 				}
@@ -64,9 +69,8 @@ func ControlTLS(cert tls.Certificate, clientCA *x509.CertPool, allow func(uri st
 			// The refusal does not name what was presented: the peer knows
 			// what it sent, and an error is a poor place to echo identities.
 			return errors.New("keyholder: client identity is not authorized to change the seal state")
-		}
+		},
 	}
-	return cfg
 }
 
 // DataTLS is the application-facing listener.
@@ -83,20 +87,22 @@ func ControlTLS(cert tls.Certificate, clientCA *x509.CertPool, allow func(uri st
 // listener that admitted an unidentified caller would be exactly the fail-open
 // the decision forbids, so the handshake refuses and the handler never sees
 // the request.
+//
+// As on the control listener, a client leaf whose key is not ECDSA P-256 is
+// refused at the handshake (ADR 0020 decision 2).
 func DataTLS(cert tls.Certificate, clientCA *x509.CertPool, allow func(uri string) bool) *tls.Config {
-	cfg := &tls.Config{
+	return &tls.Config{
 		MinVersion:   tls.VersionTLS13,
 		MaxVersion:   tls.VersionTLS13,
 		Certificates: []tls.Certificate{cert},
 		ClientAuth:   tls.RequireAndVerifyClientCert,
 		ClientCAs:    clientCA,
-	}
-	if allow != nil {
-		cfg.VerifyConnection = func(cs tls.ConnectionState) error {
-			if len(cs.PeerCertificates) == 0 {
-				return errors.New("keyholder: no client certificate")
+		VerifyConnection: func(cs tls.ConnectionState) error {
+			leaf, err := p256Peer(cs)
+			if err != nil || allow == nil {
+				return err
 			}
-			for _, uri := range cs.PeerCertificates[0].URIs {
+			for _, uri := range leaf.URIs {
 				if allow(uri.String()) {
 					return nil
 				}
@@ -104,9 +110,22 @@ func DataTLS(cert tls.Certificate, clientCA *x509.CertPool, allow func(uri strin
 			// As on the control surface: the peer knows what it sent, and an
 			// error is a poor place to echo identities.
 			return errors.New("keyholder: client identity is not authorized to use storage")
-		}
+		},
 	}
-	return cfg
+}
+
+// p256Peer returns the verified client leaf, refusing a missing one and one
+// whose key is not ECDSA P-256 (ADR 0020 decision 2). The check is the
+// keyholder's own: it mirrors FatLine's and does not import it.
+func p256Peer(cs tls.ConnectionState) (*x509.Certificate, error) {
+	if len(cs.PeerCertificates) == 0 {
+		return nil, errors.New("keyholder: no client certificate")
+	}
+	leaf := cs.PeerCertificates[0]
+	if k, ok := leaf.PublicKey.(*ecdsa.PublicKey); !ok || k.Curve != elliptic.P256() {
+		return nil, errors.New("keyholder: the client certificate's key is not ECDSA P-256 (ADR 0020)")
+	}
+	return leaf, nil
 }
 
 // LoadTLS builds a certificate from PEM material.

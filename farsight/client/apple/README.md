@@ -19,6 +19,7 @@ One Swift/SwiftUI codebase for macOS, iPadOS, iOS and visionOS ([ADR 0021](../..
   - `FarSightUI` — the map and its HUD: panels at three levels of detail (marker, glance, full), the connection layers, the minimap, the app strip, the ⌘K jump palette, and the backdrop under them (`Backdrop/backdrop.heic`). Also `WorldFeed`, which holds what was read from each instance, and `ConnectedWorldScreen`, a window's map of it.
   - `FarSightFixtures` — `world.json`, two illustrative instances, and `FixtureReader`, which reads them as a reader of instances would.
   - `Tests/FarSightCoreTests/Vectors/` — the CLI's golden vectors, copied byte for byte from `farsight/cli/internal/cli/testdata/`; `./check.sh` refuses a copy that differs. They are test data and never ship in the app.
+  - `Tests/FarSightTLSTests/` — ADR 0020's Apple regression ([ADR 0021](../../../docs/adr/0021-farsight-native-client.md) Verification 1), a test target with no dependency that no product links: mutual TLS from URLSession and `NWConnection` to Go servers on 127.0.0.1, the Ed25519 negative, and the enrolment request template against Go's request vectors (below). Its `Vectors/pki/` is a copy of FatLine's PKI vectors, `fatline/internal/crypto/testdata/pki/`, byte for byte; `./check.sh` refuses a copy that differs. Test data, never shipped: the keys in it are trusted nowhere else.
 - `FarSight.xcodeproj` — the `FarCast` app target, one target for every platform, with folder-synchronized sources in `FarCast/`. No project generator.
   - `FarCast/FarCastApp.swift` — the app's scenes, on every platform.
   - `FarCast/ConnectedApp.swift`, `ProcessExecutor.swift`, `SettingsView.swift`, `SetupView.swift` — macOS only: the confirmed paths and the feed, the executor that starts `farcast` (Foundation `Process`, no shell), Settings, and the window shown before any paths are confirmed.
@@ -149,17 +150,60 @@ That run checks the file it just wrote: it matches the painter, it is seamless a
 - the source gate;
 - `swift test`;
 - the app built for macOS, the iOS simulator and the visionOS simulator;
-- `xcodebuild test` on macOS and an iOS simulator.
+- `xcodebuild test` on macOS and an iOS simulator;
+- in each of the three test runs, ADR 0020's Apple regression against its Go servers, every live test passed by name (below).
 
 The source gate holds the client to allowlists, not denylists:
 - file types (Swift, the manifests and project, JSON and text), the one backdrop image by its path, and no links;
 - the CLI's golden vectors: each of `app`, `instances`, `kinds`, `version` and `world` under `Tests/FarSightCoreTests/Vectors/` is byte for byte the directory Go's tests hold to the CLI, with nothing added or missing (Finder's `.DS_Store` aside);
+- FatLine's PKI vectors: `pki` under `Tests/FarSightTLSTests/Vectors/` is byte for byte `fatline/internal/crypto/testdata/pki/`, which Go's tests hold to what `crypto.go` issues, with nothing added or missing;
 - Swift attributes, with `unsafe` and `unsafeFlags` refused outside `unsafe-allowlist.txt`;
 - a static package manifest, with each target's settings drawn from a fixed set, and its resources, by exact path and rule, from another;
 - the project's exact objects and fields, its build-setting keys, one Info.plist file holding only the build's commit, and one scheme with no actions;
 - the guardrails as `xcodebuild` resolves them, for every configuration and SDK.
 
 Adding any of these — a new attribute, setting, resource, file type or project object — is a reviewed change to `check.sh`. The gate was mutation-tested against each bypass that review found. It is a regex and allowlist gate, not a Swift parser.
+
+### ADR 0020's Apple regression
+
+ADR 0020 moved the instance PKI to ECDSA P-256 because Apple's TLS can neither present nor accept Ed25519. `FarSightTLSTests` holds that to the code (ADR 0021 Verification 1). Its seven live tests, each named `ADR 0020 live: …`, run against three Go servers from `fatline/internal/crypto/applefixture_test.go`. Each runs FatLine's own `ServerTLSConfig`, admitting only the fixture's operator leaf, and presents a different certificate: the P-256 fixture's server leaf, a leaf from another CA with the same subject, and an Ed25519 leaf. The tests check:
+- URLSession completes TLS 1.3 mutual authentication over HTTP/2, with an identity formed in memory (no keychain item, no prompt) and trust pinned to the fixture CA and server name;
+- `NWConnection` does the same over HTTP/1.1, pinning the server's key;
+- neither reaches an Ed25519 server: the handshake fails before any trust callback runs, and a pass there would mean Apple's TLS changed, so ADR 0020 is revisited;
+- the pinned trust refuses another name and another CA, and FatLine refuses a client with no certificate.
+
+The offline tests need no server: the copied vectors decode, the identity forms in memory, Swift fingerprints a key as Go does, and the enrolment request template (ADR 0021 decision 3) rebuilds each of Go's six request vectors byte for byte, with CryptoKit verifying each signature.
+
+`./check.sh` starts the servers after `swift build` and stops them after `xcodebuild test`. It names their addresses to the tests as `FARSIGHT_TLS_P256`, `FARSIGHT_TLS_FOREIGN` and `FARSIGHT_TLS_ED25519`, and to `xcodebuild test` with a `TEST_RUNNER_` prefix, which xcodebuild strips on the way to the runner. Without them, as in a plain `swift test` or Xcode's Test button, the live tests are skipped with a reason. A skipped test still counts in "Test run with N tests", so the check also requires all seven to report passed, by name, in each of its three runs. The scheme stays free of actions and variables, which its shape check requires, so Xcode's Test button always skips them.
+
+To run the regression by hand, start the servers in one terminal, from the repository root:
+
+```bash
+go test -mod=vendor -c -o /tmp/applefixture.test ./fatline/internal/crypto/ \
+  && (cd fatline/internal/crypto && FARCAST_APPLE_FIXTURE=/tmp/a.json /tmp/applefixture.test -test.run '^TestServeAppleFixture$')
+```
+
+They serve until their stdin closes: here stdin is the terminal, so Ctrl-D stops them. Two things make it this form rather than a plain `go test -run TestServeAppleFixture`:
+- `go test` hands a test binary an empty stdin, so the servers would stop at once, and it applies a 10-minute timeout. A binary run directly has neither.
+- The binary reads its vectors from `testdata/` relative to the directory it runs in, so it runs from `fatline/internal/crypto`.
+
+Then, in a second terminal, from `FarSightKit/`:
+
+```bash
+export FARSIGHT_TLS_P256=$(plutil -extract p256 raw -o - /tmp/a.json) \
+  FARSIGHT_TLS_FOREIGN=$(plutil -extract foreign raw -o - /tmp/a.json) \
+  FARSIGHT_TLS_ED25519=$(plutil -extract ed25519 raw -o - /tmp/a.json)
+swift test --filter FarSightTLSTests
+```
+
+When Go's PKI vectors change (`FARCAST_UPDATE_VECTORS=1 go test -mod=vendor ./fatline/internal/crypto/ -run Vector`, then reviewed), copy them again, from the repository root:
+
+```bash
+rm -rf farsight/client/apple/FarSightKit/Tests/FarSightTLSTests/Vectors/pki \
+  && cp -R fatline/internal/crypto/testdata/pki farsight/client/apple/FarSightKit/Tests/FarSightTLSTests/Vectors/
+```
+
+### Snapshots and renders
 
 `FARSIGHT_SNAPSHOTS=<dir> swift test` in `FarSightKit/` also writes the snapshot test's frames as PNGs. They are drawn offscreen, so they show layout, not the glass.
 

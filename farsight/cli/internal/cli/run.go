@@ -668,8 +668,8 @@ func (c *runCommand) handScopesToTheKeyholder(ctx context.Context, env *Env, met
 	if kept := keepersToReenrol(meta); len(kept) > 0 {
 		fprintf(env.Err, "\nEvery keeper's bundle predates %s, so each refuses to re-seed a replica that restarts\n"+
 			"until it is re-enrolled — a replica restored without %s would refuse its requests:\n", apps, apps)
-		for _, d := range kept {
-			fprintf(env.Err, "      farcast keeper enroll %s %s --out <path> --passphrase-file <path>\n", meta.Name, d)
+		for _, line := range reenrolLines(meta.Name, kept) {
+			fprintf(env.Err, "      %s\n", line)
 		}
 	}
 }

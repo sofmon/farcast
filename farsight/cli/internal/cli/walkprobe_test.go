@@ -6,10 +6,10 @@
 // from a DISHONEST client — a keeper that claims to be the operator, a lost
 // device pushing its old bundle, an application leaf at the public tunnel. The
 // CLI refuses all of those before it sends anything, which is right and makes
-// it useless for showing the cluster refuses them too. macOS curl cannot load
-// an Ed25519 leaf, and a new tool on the operator's machine is a dependency
-// this project does not take. So the probe is Go, in this package, behind a
-// build tag, and never part of any ordinary test run:
+// it useless for showing the cluster refuses them too, and a new tool on the
+// operator's machine is a dependency this project does not take. So the probe
+// is Go, in this package, behind a build tag, and never part of any ordinary
+// test run:
 //
 //	FARCAST_WALK=1 FARCAST_WALK_PROBE=<probe> FARCAST_WALK_INSTANCE=<name> … \
 //	  go test -mod=vendor -tags walk -run TestWalkProbe -v ./farsight/cli/internal/cli/
@@ -23,8 +23,9 @@
 // moved to a fixed path.
 //
 // It skips unless FARCAST_WALK=1, takes no default instance, and never prints
-// key material — key IDs only. It reads the operator's config directory the
-// way the CLI does ($FARCAST_CONFIG_HOME, then the user config directory).
+// key material: key IDs, public-key fingerprints and, for keyscan, file paths
+// only. It reads the operator's config directory the way the CLI does
+// ($FARCAST_CONFIG_HOME, then the user config directory).
 //
 // go test runs the probe in the package's directory, not the caller's, so a
 // relative path is resolved against FARCAST_WALK_CWD, and refused without it
@@ -35,9 +36,14 @@
 //
 // Probes (FARCAST_WALK_PROBE):
 //
-//	packet        decode a keeper packet: leaf URIs, EKU, expiry, the bundle's
-//	              scopes and key IDs, whether the leaf binds the bundle; FAIL if
-//	              it carries a master key ID or any private key but the leaf's
+//	packet        decode a keeper packet: its version, the key its leaf
+//	              certifies, leaf URIs, EKU, expiry, the bundle's scopes and key
+//	              IDs, whether the leaf binds the bundle; FAIL if it carries a
+//	              master key ID or any private key at all (ADR 0020: a packet
+//	              carries a certificate, and the key stays on the device)
+//	keyscan       walk the given roots for private keys and FAIL if one is the
+//	              key FARCAST_WALK_KEY_SHA256 names: a device's key, looked for
+//	              where it must not be (prints paths and counts, never a key)
 //	state         every replica's state as the given leaf sees it
 //	push          push a bundle with a leaf, intent and generation of your choosing
 //	seal          seal (FARCAST_WALK_HOLD=1 for a hold) with the given leaf
@@ -49,10 +55,15 @@
 // Inputs:
 //
 //	FARCAST_WALK_CWD      the directory relative paths are resolved against
-//	FARCAST_WALK_LEAF     operator | store:<dir> | packet:<file>   (default operator)
+//	FARCAST_WALK_LEAF     operator | store:<dir>   (default operator). packet:<file>
+//	                      was retired by ADR 0020: a packet carries no private key,
+//	                      so a dishonest keeper is a walk keeper enrolled by request
+//	                      into a scratch store, presented with store:<dir>
 //	FARCAST_WALK_BUNDLE   store:<dir> | packet:<file> | keys:<keys.yaml> | keys:@live (this machine's keyring)
 //	FARCAST_WALK_PACKET   the packet for 'packet' and 'open'
 //	FARCAST_WALK_PASSPHRASE_FILE   a packet's passphrase
+//	FARCAST_WALK_KEY_SHA256   the fingerprint 'keyscan' looks for, as 'keeper request' printed it
+//	FARCAST_WALK_SCAN     the roots 'keyscan' walks, separated by colons
 //	FARCAST_WALK_ORDINAL  replica (default 0)
 //	FARCAST_WALK_INTENT   operator-unseal | restart-reseed | hand-over | operator-unseal+below-pin
 //	FARCAST_WALK_GENERATION   default: what the replica reports, plus one
@@ -62,11 +73,14 @@
 package cli
 
 import (
+	"bytes"
 	"context"
+	"crypto"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -74,6 +88,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/goccy/go-yaml"
 
 	"github.com/sofmon/farcast/datasphere"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
@@ -116,8 +132,10 @@ func TestWalkProbe(t *testing.T) {
 		w.tunnel()
 	case "open":
 		w.open()
+	case "keyscan":
+		w.keyscan()
 	default:
-		t.Fatalf("FARCAST_WALK_PROBE=%q: want packet, state, push, seal, release-hold, tunnel or open", probe)
+		t.Fatalf("FARCAST_WALK_PROBE=%q: want packet, keyscan, state, push, seal, release-hold, tunnel or open", probe)
 	}
 }
 
@@ -150,8 +168,8 @@ type material struct {
 	carrier, serverName string
 }
 
-// openPacket opens a sealed keeper packet with the passphrase file.
-func (w *walk) openPacket(path string) *keeper.Packet {
+// sealedPacket reads a sealed keeper packet and its passphrase.
+func (w *walk) sealedPacket(path string) ([]byte, string) {
 	w.t.Helper()
 	sealed, err := os.ReadFile(w.path(path))
 	if err != nil {
@@ -165,7 +183,14 @@ func (w *walk) openPacket(path string) *keeper.Packet {
 	if err != nil {
 		w.t.Fatal(err)
 	}
-	p, err := keeper.Open(sealed, strings.TrimRight(string(pass), "\r\n"))
+	return sealed, strings.TrimRight(string(pass), "\r\n")
+}
+
+// openPacket opens a sealed keeper packet with the passphrase file.
+func (w *walk) openPacket(path string) *keeper.Packet {
+	w.t.Helper()
+	sealed, pass := w.sealedPacket(path)
+	p, err := keeper.Open(sealed, pass)
 	if err != nil {
 		w.t.Fatalf("open the packet: %v", err)
 	}
@@ -204,12 +229,10 @@ func (w *walk) leaf() material {
 		clear(bundle)
 		return material{from: "keeper store " + cfg.Device, ca: ca, cert: cert, key: key, carrier: cfg.Carrier, serverName: cfg.ServerName}
 	case strings.HasPrefix(spec, "packet:"):
-		p := w.openPacket(strings.TrimPrefix(spec, "packet:"))
-		defer p.Zero()
-		return material{from: "packet " + p.Device, ca: p.CACertPEM, cert: slices.Clone(p.LeafCertPEM), key: slices.Clone(p.LeafKeyPEM),
-			carrier: p.Carrier, serverName: p.ServerName}
+		w.t.Fatalf("FARCAST_WALK_LEAF=packet: was retired by ADR 0020: a packet carries no private key. " +
+			"Present a walk keeper enrolled by request into a scratch store, with store:<dir>")
 	}
-	w.t.Fatalf("FARCAST_WALK_LEAF=%q: want operator, store:<dir> or packet:<file>", spec)
+	w.t.Fatalf("FARCAST_WALK_LEAF=%q: want operator or store:<dir>", spec)
 	return material{}
 }
 
@@ -445,7 +468,34 @@ func (w *walk) packet() {
 	if path == "" {
 		w.t.Fatal("FARCAST_WALK_PACKET is required")
 	}
-	p := w.openPacket(path)
+	// The plaintext first, before anything decodes it: a packet carries no
+	// private key at all (ADR 0020), whatever Open would make of one.
+	sealed, pass := w.sealedPacket(path)
+	plaintext, err := datasphere.Unarmor(datasphere.ArmorKeeperPacket, sealed, pass)
+	if err != nil {
+		w.t.Fatalf("open the packet: %v", err)
+	}
+	if bytes.Contains(plaintext, []byte("PRIVATE KEY")) || bytes.Contains(plaintext, []byte("leaf_key_pem")) {
+		w.say("FAIL: the packet carries a private key")
+		w.t.Fail()
+	} else {
+		w.say("the packet carries no private key")
+	}
+	var head struct {
+		Version int `yaml:"version"`
+	}
+	err = yaml.Unmarshal(plaintext, &head)
+	clear(plaintext)
+	if err != nil {
+		// The parser quotes source around an error, and this source is key
+		// material: only the shape is reported.
+		w.t.Fatal("the packet's plaintext did not decode")
+	}
+	w.say("packet version %d", head.Version)
+	p, err := keeper.Open(sealed, pass)
+	if err != nil {
+		w.t.Fatalf("open the packet: %v", err)
+	}
 	defer p.Zero()
 	block, _ := pem.Decode(p.LeafCertPEM)
 	if block == nil {
@@ -455,7 +505,13 @@ func (w *walk) packet() {
 	if err != nil {
 		w.t.Fatal(err)
 	}
+	certifies, err := identity.KeyFingerprint(cert.PublicKey)
+	if err != nil {
+		w.t.Fatal(err)
+	}
 	w.say("device %s of %s, carrier %s, server name %s", p.Device, p.Instance, p.Carrier, p.ServerName)
+	// Compared on the walk with what 'keeper request' printed on the device.
+	w.say("leaf certifies key %s", identity.FormatFingerprint(certifies))
 	w.say("leaf URIs %v, extended key usage %v, expires %s", leafURIs(p.LeafCertPEM), cert.ExtKeyUsage, cert.NotAfter.UTC().Format(time.RFC3339))
 	if err := leafBindsBundle(p.LeafCertPEM, p.Bundle); err != nil {
 		w.say("FAIL: %v", err)
@@ -492,14 +548,123 @@ func (w *walk) packet() {
 	} else {
 		w.say("no keyring on this machine to check the master keys against (%v)", err)
 	}
-	if n := strings.Count(string(p.LeafKeyPEM), "PRIVATE KEY-----") / 2; n != 1 {
-		w.say("FAIL: the leaf key file holds %d private keys", n)
-		w.t.Fail()
-	}
 	if strings.Contains(string(p.CACertPEM), "PRIVATE KEY") || strings.Contains(string(p.LeafCertPEM), "PRIVATE KEY") {
-		w.say("FAIL: a private key rides outside the leaf key")
+		w.say("FAIL: a private key rides with the certificates")
 		w.t.Fail()
 	}
+}
+
+// keyscanMaxFile is the largest file keyscan reads. A PEM key is a few hundred
+// bytes; what is larger is a disk image or a database, and reading every one
+// of those would make the probe the slowest step of a walk.
+const keyscanMaxFile = 1 << 20
+
+// keyscan looks for a device's private key where it must not be: it walks the
+// roots FARCAST_WALK_SCAN names, without following symlinks, and parses every
+// PEM block whose type ends in PRIVATE KEY (PKCS#8, SEC 1 or PKCS#1). One
+// whose key's fingerprint is FARCAST_WALK_KEY_SHA256 is a FAIL, reported by
+// its path. It prints counts and paths, never key material.
+func (w *walk) keyscan() {
+	want, err := identity.ParseFingerprint(os.Getenv("FARCAST_WALK_KEY_SHA256"))
+	if err != nil {
+		w.t.Fatalf("FARCAST_WALK_KEY_SHA256 is required: the fingerprint 'keeper request' printed (%v)", err)
+	}
+	roots := os.Getenv("FARCAST_WALK_SCAN")
+	if roots == "" {
+		w.t.Fatal("FARCAST_WALK_SCAN is required: the directories to scan, separated by colons")
+	}
+	var files, keys, skipped int
+	var found []string
+	for _, root := range strings.Split(roots, ":") {
+		if root == "" {
+			continue
+		}
+		f, k, s, hits := scanForKey(w.path(root), want)
+		files, keys, skipped = files+f, keys+k, skipped+s
+		found = append(found, hits...)
+	}
+	for _, path := range found {
+		w.say("FAIL: %s holds the private key whose fingerprint ends %s", path, identity.FingerprintTail(want))
+		w.t.Fail()
+	}
+	verdict := "none certifies"
+	switch {
+	case len(found) == 1:
+		verdict = "1 certifies"
+	case len(found) > 1:
+		verdict = fmt.Sprintf("%d certify", len(found))
+	}
+	w.say("scanned %d files (skipped %d: unreadable, or over %d bytes), found %d private keys, %s %s",
+		files, skipped, keyscanMaxFile, keys, verdict, identity.FingerprintTail(want))
+}
+
+// scanForKey walks root without following symlinks and returns how many files
+// it read, how many private keys it parsed, how many entries it skipped, and
+// the paths of those holding the key whose fingerprint is want.
+func scanForKey(root, want string) (files, keys, skipped int, found []string) {
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			skipped++
+			if d != nil && d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if !d.Type().IsRegular() { // directories are walked; symlinks and devices are not followed
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil || info.Size() > keyscanMaxFile {
+			skipped++
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			skipped++
+			return nil
+		}
+		defer clear(data)
+		files++
+		for rest := data; ; {
+			var block *pem.Block
+			block, rest = pem.Decode(rest)
+			if block == nil {
+				break
+			}
+			if !strings.HasSuffix(block.Type, "PRIVATE KEY") {
+				continue
+			}
+			pub := publicOf(block.Bytes)
+			clear(block.Bytes)
+			if pub == nil {
+				continue
+			}
+			keys++
+			if fp, err := identity.KeyFingerprint(pub); err == nil && fp == want {
+				found = append(found, path)
+			}
+		}
+		return nil
+	})
+	return files, keys, skipped, found
+}
+
+// publicOf is the public half of a DER private key in PKCS#8, SEC 1 or PKCS#1,
+// or nil when it is none of them.
+func publicOf(der []byte) any {
+	if k, err := x509.ParsePKCS8PrivateKey(der); err == nil {
+		if s, ok := k.(crypto.Signer); ok {
+			return s.Public()
+		}
+		return nil
+	}
+	if k, err := x509.ParseECPrivateKey(der); err == nil {
+		return k.Public()
+	}
+	if k, err := x509.ParsePKCS1PrivateKey(der); err == nil {
+		return k.Public()
+	}
+	return nil
 }
 
 // open reads one stored object with a packet's scope keys and nothing else.

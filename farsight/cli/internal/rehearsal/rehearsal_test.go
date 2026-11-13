@@ -3,12 +3,19 @@ package rehearsal_test
 import (
 	"bytes"
 	"context"
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io/fs"
+	"math/big"
 	"net"
 	"os"
 	"path/filepath"
@@ -1394,5 +1401,137 @@ func TestKeyholdersAnswerStateOnly(t *testing.T) {
 	if len(lines) != 2 || !strings.Contains(lines[0], " keyholder POST /v1/seal") || !strings.HasSuffix(lines[0], " | refused") ||
 		!strings.Contains(lines[1], " keyholder POST /v1/release-hold | refused") {
 		t.Errorf("calls.log: %q", lines)
+	}
+}
+
+// TestTheRehearsalKeeperIsEnrolledByRequest: the harness's keeper is enrolled
+// as a real one is since ADR 0020. Its key was made for its request, the CA
+// certified that key as a keeper leaf binding the bundle, and the key is the
+// harness's alone: nothing under the instance's config directory holds it.
+// A rehearsal made before ADR 0020 has an Ed25519 CA, and a restart over one
+// is refused.
+func TestTheRehearsalKeeperIsEnrolledByRequest(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "r")
+	o := rehearsal.Options{Dir: dir, Home: t.TempDir(), Tools: testBinary(t)}
+	rig, err := rehearsal.Start(t.Context(), o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rig.Close() })
+
+	harness := filepath.Join(rig.Dir, "harness")
+	certPEM, err := os.ReadFile(filepath.Join(harness, "keeper-phone.crt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM, err := os.ReadFile(filepath.Join(harness, "keeper-phone.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyFP := privateKeyFingerprint(t, keyPEM)
+	if keyFP == "" {
+		t.Fatal("keeper-phone.key holds no private key")
+	}
+	certFP, err := identity.CertKeyFingerprint(certPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if certFP != keyFP {
+		t.Errorf("the keeper's certificate certifies %s; its key is %s", certFP, keyFP)
+	}
+	block, _ := pem.Decode(certPEM)
+	leaf, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var uris []string
+	for _, u := range leaf.URIs {
+		uris = append(uris, u.String())
+	}
+	want := []string{identity.KeeperURI(instance, "phone"), identity.KeeperBundleURIPrefix + identity.KeeperBundleDigest([]byte("rehearsal-bundle"))}
+	if !slices.Equal(uris, want) {
+		t.Errorf("the keeper's leaf names %v; want %v", uris, want)
+	}
+	if _, ok := leaf.PublicKey.(*ecdsa.PublicKey); !ok {
+		t.Errorf("the keeper's key is %T, not ECDSA", leaf.PublicKey)
+	}
+
+	// Nothing under the instance's config directory holds that key.
+	inst := filepath.Join(rig.ConfigDir, "instances", instance)
+	walked := 0
+	if err := filepath.WalkDir(inst, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || !d.Type().IsRegular() {
+			return err
+		}
+		data, rerr := os.ReadFile(path)
+		if rerr != nil {
+			return nil // ca.key and keys.yaml are mode 000, and are not the keeper's
+		}
+		walked++
+		if bytes.Contains(data, keyPEM) || (bytes.Contains(data, []byte("PRIVATE KEY")) && privateKeyFingerprint(t, data) == keyFP) {
+			t.Errorf("%s holds the keeper's private key", path)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if walked == 0 {
+		t.Fatal("guard: the walk read nothing")
+	}
+
+	// A rehearsal from before ADR 0020: an Ed25519 CA. A restart refuses it.
+	if err := rig.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_, edKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "FarCast Instance CA: " + instance},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+		KeyUsage: x509.KeyUsageCertSign, BasicConstraintsValid: true, IsCA: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, edKey.Public(), edKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inst, "fatline", "ca.crt"), pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if again, err := rehearsal.Start(t.Context(), o); err == nil {
+		_ = again.Close()
+		t.Error("a restart over an Ed25519 CA started")
+	} else if !strings.Contains(err.Error(), "ADR 0020") || !strings.Contains(err.Error(), "start a new one") {
+		t.Errorf("a restart over an Ed25519 CA = %v; want it refused, saying to start a new one", err)
+	}
+}
+
+// privateKeyFingerprint is the fingerprint of the first PKCS#8 key in data, or
+// "" when there is none.
+func privateKeyFingerprint(t *testing.T, data []byte) string {
+	t.Helper()
+	for rest := data; ; {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			return ""
+		}
+		if block.Type != "PRIVATE KEY" {
+			continue
+		}
+		k, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+		if err != nil {
+			continue
+		}
+		s, ok := k.(crypto.Signer)
+		if !ok {
+			continue
+		}
+		fp, err := identity.KeyFingerprint(s.Public())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fp
 	}
 }

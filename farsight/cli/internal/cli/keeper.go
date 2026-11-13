@@ -68,12 +68,18 @@ func keeperIdentity(cfg keeper.Config, caPEM, leafCert, leafKey []byte) (tunnel.
 // product stance the ADR records is that running FarCast as a server needs at
 // least two of them.
 //
-// Two verbs run on the OPERATOR's machine (enroll, revoke) because they need
-// the CA key. Two run on the KEEPER device (install, run). status runs on
-// either and reads whatever ledgers that machine has.
+// Enrolment is by request (ADR 0020 decision 3). The device makes its own key
+// and a request for it (request); the operator's machine certifies that key
+// once the operator has confirmed its fingerprint against the device's screen
+// (enroll), and the device installs the certificate beside its key (install).
+// No private key ever travels. Two verbs run on the OPERATOR's machine (enroll,
+// revoke) because they need the CA key. Three run on the KEEPER device
+// (request, install, run). status runs on either and reads whatever ledgers
+// that machine has.
 
 func newKeeperCommand() Command {
 	subs := NewRegistry()
+	subs.Register(&keeperRequestCommand{})
 	subs.Register(&keeperEnrollCommand{})
 	subs.Register(&keeperInstallCommand{})
 	subs.Register(&keeperRunCommand{})
@@ -82,22 +88,31 @@ func newKeeperCommand() Command {
 	subs.Register(&keeperUninstallCommand{})
 	return &group{
 		name:     "keeper",
-		synopsis: "Devices that re-seed a restart-sealed instance unattended (enroll, install, run, status, revoke, uninstall)",
+		synopsis: "Devices that re-seed a restart-sealed instance unattended (request, enroll, install, run, status, revoke, uninstall)",
 		subs:     subs,
 		usage: `
-Usage: farcast keeper <enroll|install|run|status|revoke|uninstall> [flags] [arguments]
+Usage: farcast keeper <request|enroll|install|run|status|revoke|uninstall> [flags] [arguments]
 
 A keeper is an operator-owned device that hands a restarted keyholder its key
 material back, so storage recovers in minutes instead of whenever somebody
 wakes up. Running FarCast as a server needs at least two enrolled keepers.
 
 Subcommands:
-  enroll   Issue a device its own leaf and bundle       (operator's machine)
+  request  Make this device a key, and the request that enrols it (keeper device)
+  enroll   Certify a request's key, and issue the bundle (operator's machine)
   install  Accept an enrolment packet on this device    (keeper device)
   run      Keep an instance: watch, and re-seed         (keeper device)
   status   Reconcile what this machine's ledgers record (either)
   revoke   Withdraw a device from the fleet             (operator's machine)
   uninstall Wipe this device's bundle and key, keep its ledger (keeper device)
+
+Enrolment is by request (ADR 0020): the device makes its own key and sends a
+request carrying only the public half; the operator confirms the key's
+fingerprint against the device's screen before certifying it; and install
+refuses a certificate for any other key. FarCast never sends the device's key
+anywhere: no request, packet or command carries it. On a desktop it is a 0600
+file, not bound to hardware, and with --accept-backup-risk a backup may still
+copy it.
 
 What a keeper holds is a derived scope bundle and its own device leaf — exactly
 what an unsealed keyholder already holds in RAM, and nothing more. It never
@@ -123,23 +138,46 @@ type keeperEnrollCommand struct {
 	passphraseFile string
 	budget         int
 	window         time.Duration
+	request        string
+	keySHA256      string
+	// interactive says whether a person is at the terminal to type the
+	// device's fingerprint; nil is isInteractive. A seam, so the prompt is
+	// tested without a terminal.
+	interactive func(*Env) bool
 }
 
-func (*keeperEnrollCommand) Name() string     { return "enroll" }
-func (*keeperEnrollCommand) Synopsis() string { return "Issue a device its own leaf and bundle" }
+func (*keeperEnrollCommand) Name() string { return "enroll" }
+func (*keeperEnrollCommand) Synopsis() string {
+	return "Certify a device's requested key, and issue it the bundle"
+}
 
 func (*keeperEnrollCommand) Usage() string {
 	return strings.TrimSpace(`
-Usage: farcast keeper enroll <instance> <device> --out <path> --passphrase-file <path>
+Usage: farcast keeper enroll <instance> <device> --request <path> [--key-sha256 <hex>] --out <path> --passphrase-file <path>
 
-Enrol one device as a keeper. Run this on the machine that holds the instance's
-CA key and keyring — no other machine can do it, which is the point.
+Enrol one device as a keeper, from the request it made. Run this on the machine
+that holds the instance's CA key and keyring — no other machine can do it,
+which is the point.
 
-It writes a passphrase-armored packet carrying that device's own certificate,
-the scope bundle it will re-seed with, and how to reach and verify the instance.
-Carry it to the device on whatever medium you trust and run 'keeper install'.
+The device made its own key with 'farcast keeper request' and printed the
+key's fingerprint; the request file carries only the public half. A request
+travels unauthenticated, so the key is certified only once you confirm the
+fingerprint against the device's screen: pass it as --key-sha256, or, at a
+terminal, type it when asked — all 16 groups, or at least the last 8. Nothing
+of it is shown before it matches, so it cannot be copied from this screen.
+
+A key is never reused: one already certified for another device or instance,
+one certified before a revoke, and a device's older key are refused. Re-issuing
+to a device's newest key — a lost packet, made again from the request still on
+hand — is allowed while the device is not revoked.
+
+It writes a passphrase-armored packet carrying the device's certificate, the
+scope bundle it will re-seed with, and how to reach and verify the instance,
+and no private key. Carry it to the device and run 'keeper install' there.
 
 Flags:
+      --request <path>           The request the device made
+      --key-sha256 <hex>         The fingerprint the device printed (else asked)
       --out <path>               Where to write the packet
       --passphrase-file <path>   File holding the passphrase; "-" reads stdin
       --budget <n>               Reseeds allowed per window (default 8)
@@ -150,15 +188,22 @@ material it is fed, and an instance that handed out bundles would be exactly
 the solicitation endpoint this design exists to avoid.
 
 The device's certificate expires in 90 days. That is the fleet's only automatic
-revocation, and re-enrolling is how a device keeps keeping.`)
+revocation, and re-enrolling — from a new request — is how a device keeps
+keeping.`)
 }
 
 func (c *keeperEnrollCommand) SetFlags(fs *flag.FlagSet) {
+	fs.StringVar(&c.request, "request", "", "the request the device made")
+	fs.StringVar(&c.keySHA256, "key-sha256", "", "the key fingerprint the device printed")
 	fs.StringVar(&c.out, "out", "", "where to write the packet")
 	fs.StringVar(&c.passphraseFile, "passphrase-file", "", "file holding the passphrase")
 	fs.IntVar(&c.budget, "budget", keeper.DefaultBudget, "reseeds allowed per window")
 	fs.DurationVar(&c.window, "window", keeper.DefaultWindow, "the budget window")
 }
+
+// maxRequestFile bounds what enroll reads of a request file. A P-256 request is
+// under a kilobyte; identity.ParseRequest refuses anything over this.
+const maxRequestFile = 64 << 10
 
 func (c *keeperEnrollCommand) Run(_ context.Context, env *Env, args []string) error {
 	if len(args) != 2 {
@@ -170,6 +215,17 @@ func (c *keeperEnrollCommand) Run(_ context.Context, env *Env, args []string) er
 	}
 	if c.out == "" {
 		return usagef("--out is required: the packet is a file you carry to the device")
+	}
+	if c.request == "" {
+		return usagef("--request is required: run 'farcast keeper request %s --out <path>' on the device, and carry the request here", name)
+	}
+	var confirmed string
+	if c.keySHA256 != "" {
+		fp, err := identity.ParseFingerprint(c.keySHA256)
+		if err != nil {
+			return usagef("--key-sha256: %v", err)
+		}
+		confirmed = fp
 	}
 	passphrase, err := readPassphrase(env, c.passphraseFile)
 	if err != nil {
@@ -202,6 +258,35 @@ func (c *keeperEnrollCommand) Run(_ context.Context, env *Env, args []string) er
 	if err != nil {
 		return err
 	}
+
+	// The request. Refused, it says why and nothing of its key: a refused
+	// request's fingerprint is no one's to confirm.
+	req, err := readKeeperRequest(c.request)
+	if err != nil {
+		return err
+	}
+	fp := req.KeySHA256
+
+	// ADR 0020 decision 3: a key is never certified across devices,
+	// instances or a revoke — against every instance this machine records.
+	records, err := keeperRecords(env)
+	if err != nil {
+		return err
+	}
+	if err := keyCertifiedElsewhere(records, name, device, fp); err != nil {
+		return fmt.Errorf("%w; nothing was issued", err)
+	}
+
+	// The confirmation. The request's fingerprint is the sender's claim until
+	// it matches what the device shows, and it is printed only once it has:
+	// shown first, it could be copied back from the line above, or from the
+	// scrollback of a failed attempt, which confirms nothing.
+	if err := c.confirm(env, device, fp, confirmed); err != nil {
+		return err
+	}
+	first, second := fingerprintLines(fp)
+	fprintf(env.Err, "key sha256  %s\n            %s — confirmed against %s\n", first, second, device)
+
 	// Every scope the keyring holds, because a keeper re-seeds an instance
 	// rather than an application: one that carried a subset would restore
 	// storage for some applications and leave others sealed, which is a
@@ -225,11 +310,10 @@ func (c *keeperEnrollCommand) Run(_ context.Context, env *Env, args []string) er
 	}
 	defer clear(payload)
 
-	leafCert, leafKey, err := identity.IssueKeeperClient(mtls.CACertPEM, mtls.CAKeyPEM, name, device, payload)
+	leafCert, err := identity.IssueKeeperClient(mtls.CACertPEM, mtls.CAKeyPEM, name, device, payload, req.DER)
 	if err != nil {
 		return err
 	}
-	defer clear(leafKey)
 	expires := leafExpiry(leafCert)
 	// The token Shrike's tunnel table will attribute this leaf's streams by.
 	// Computed and recorded here because this is the only moment this
@@ -243,9 +327,9 @@ func (c *keeperEnrollCommand) Run(_ context.Context, env *Env, args []string) er
 	}
 
 	packet := &keeper.Packet{
-		Version: 1, Instance: name, Device: device,
+		Version: 2, Instance: name, Device: device,
 		Carrier: meta.Carrier.Endpoint, ServerName: identity.ServerName(name),
-		CACertPEM: mtls.CACertPEM, LeafCertPEM: leafCert, LeafKeyPEM: leafKey,
+		CACertPEM: mtls.CACertPEM, LeafCertPEM: leafCert,
 		Bundle: payload, Generation: generation,
 		Budget: c.budget, Window: c.window, IssuedAt: time.Now().UTC(),
 	}
@@ -257,51 +341,202 @@ func (c *keeperEnrollCommand) Run(_ context.Context, env *Env, args []string) er
 	if err != nil {
 		if os.IsExist(err) {
 			// Never overwrite. The file that is already there may be another
-			// device's packet, and a packet is the only copy of a leaf's
-			// private key that ever exists outside the device it is for.
+			// device's packet, and a packet carries a bundle: whoever holds it
+			// with its passphrase reads what the bundle's keys open.
 			return fmt.Errorf("%s already exists; refusing to overwrite it", c.out)
 		}
 		return err
 	}
 	if _, err := file.Write(sealed); err != nil {
 		_ = file.Close()
+		_ = os.Remove(c.out)
 		return err
 	}
 	if err := file.Close(); err != nil {
+		_ = os.Remove(c.out)
 		return err
 	}
 
+	// The record, re-checked against this instance's rows as they are now:
+	// UpdateInstanceMetadata reloads and retries rather than locking, so this
+	// closure is where a concurrent enroll or revoke of this instance shows.
+	var refused error
 	if _, err := env.ConfigDir.UpdateInstanceMetadata(name, func(m *config.InstanceMetadata) error {
+		if err := keyCertifiedElsewhere(map[string][]config.Keeper{name: m.Keepers}, name, device, fp); err != nil {
+			refused = err
+			return err
+		}
 		m.Keepers = upsertKeeper(m.Keepers, config.Keeper{
 			Device: device, EnrolledAt: time.Now().UTC(), Expires: expires,
 			Generation: generation, Budget: c.budget, Window: c.window,
-			LeafTokens: []string{leafToken},
+			LeafTokens: []string{leafToken}, KeySHA256: []string{fp},
 		})
 		return nil
 	}); err != nil {
-		return fmt.Errorf("the packet was written but recording the enrolment failed: %w", err)
+		// Either way the packet is this command's own file (created O_EXCL
+		// above), its certificate has gone nowhere else, and it is removed:
+		// a certificate whose key no record holds is one decision 3's
+		// record-based refusals cannot see, and whose leaf token nobody can
+		// name. It holds no private key, so removing it loses nothing that
+		// running enroll again does not make.
+		_ = os.Remove(c.out)
+		if refused != nil {
+			return fmt.Errorf("%w; the packet was removed, and its certificate never left this machine", refused)
+		}
+		return fmt.Errorf("recording the enrolment failed (%w); the packet was removed, and its certificate never left this machine: run enroll again", err)
 	}
 
-	warnPacketDisclosure(env.Err, c.out, name, device)
+	warnPacketDisclosure(env.Err, c.out, name)
 	return env.Printer.Print(keeperEnrollResult{
 		Instance: name, Device: device, Path: c.out,
 		Generation: generation, Budget: c.budget, Window: c.window.String(), window: c.window, Expires: expires,
-		Fleet: activeKeepers(meta.Keepers, device),
+		Fleet: activeKeepers(meta.Keepers, device), KeySHA256: fp,
 	})
 }
 
-// warnPacketDisclosure is what enroll says about the packet it wrote. The
-// hazard is disclosure, not loss: the packet holds a derived bundle and a leaf,
-// never keys.yaml, so losing it loses nothing — and whoever holds it with the
-// passphrase holds the device. What retires that is the same as for a lost
-// device, so it is said in the words 'keeper revoke' uses: revoking alone does
+// readKeeperRequest reads and checks a device's enrolment request. A refusal
+// names the request's fault and never its key.
+func readKeeperRequest(path string) (identity.Request, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return identity.Request{}, fmt.Errorf("read the request: %w", err)
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxRequestFile+1))
+	_ = f.Close()
+	if err != nil {
+		return identity.Request{}, fmt.Errorf("read the request: %w", err)
+	}
+	req, err := identity.ParseRequest(data)
+	if err != nil {
+		var re *identity.RequestError
+		if errors.As(err, &re) {
+			return identity.Request{}, fmt.Errorf("the request from %s was refused (%s): %s; nothing was issued", path, re.Refusal, re.Detail)
+		}
+		return identity.Request{}, fmt.Errorf("the request from %s was refused: %w; nothing was issued", path, err)
+	}
+	return req, nil
+}
+
+// confirm holds the request's key to the fingerprint the device printed:
+// --key-sha256 when given, else typed at a terminal. It prints nothing of the
+// request's fingerprint, before or in a refusal.
+func (c *keeperEnrollCommand) confirm(env *Env, device, fp, given string) error {
+	if given != "" {
+		if given != fp {
+			return fmt.Errorf("the request's key is not the one --key-sha256 names; nothing was issued. "+
+				"If you copied the fingerprint from %s's screen, the request was replaced on its way here: make a new one on the device", device)
+		}
+		return nil
+	}
+	interactive := c.interactive
+	if interactive == nil {
+		interactive = isInteractive
+	}
+	if !interactive(env) {
+		return usagef("refusing to issue without confirming the request's key: pass --key-sha256 <the fingerprint 'farcast keeper request' printed on %s>", device)
+	}
+	answer, err := newPrompter(env.In, env.Err).line(fmt.Sprintf(
+		"Type the fingerprint 'farcast keeper request' printed on %s (all 16 groups, or at least the last 8)", device))
+	if err != nil {
+		return err
+	}
+	ok, err := identity.FingerprintSuffixMatches(fp, answer)
+	if err != nil {
+		return fmt.Errorf("type at least the last 8 groups of the fingerprint as %s shows it; nothing was issued", device)
+	}
+	if !ok {
+		return fmt.Errorf("the request's key does not end with what was typed; nothing was issued. "+
+			"If you typed it from %s's screen, the request was replaced on its way here: make a new one on the device", device)
+	}
+	return nil
+}
+
+// keeperRecords is every instance's keeper rows on this machine. An instance
+// directory with no record holds no rows and is skipped; a record that will
+// not load fails closed, naming the instance: a key it would have refused is
+// not certified because it could not be read.
+func keeperRecords(env *Env) (map[string][]config.Keeper, error) {
+	names, err := env.ConfigDir.ListInstances()
+	if err != nil {
+		return nil, fmt.Errorf("cannot check the key against this machine's records (%v); nothing was issued", err)
+	}
+	records := make(map[string][]config.Keeper, len(names))
+	for _, in := range names {
+		m, err := env.ConfigDir.LoadInstanceMetadata(in)
+		if errors.Is(err, config.ErrNoInstanceRecord) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("cannot check the key against %s's records (%v); nothing was issued", in, err)
+		}
+		records[in] = m.Keepers
+	}
+	return records, nil
+}
+
+// keyCertifiedElsewhere applies ADR 0020 decision 3 to a key about to be
+// certified for instance/device, against the rows this machine records: a key
+// is never certified across devices, instances or a revoke. In order:
+//
+//   - one in any row's RevokedKeySHA256, this device's included, is refused:
+//     that list outlives the re-enrolment that clears the row's Revoked flag;
+//   - one recorded for another device, of this instance or another, is
+//     refused;
+//   - one recorded for this device is a re-issue, allowed only to the
+//     device's newest key while the device is not revoked.
+func keyCertifiedElsewhere(records map[string][]config.Keeper, instance, device, fp string) error {
+	instances := make([]string, 0, len(records))
+	for in := range records {
+		instances = append(instances, in)
+	}
+	sort.Strings(instances)
+	for _, in := range instances {
+		for _, k := range records[in] {
+			if slices.Contains(k.RevokedKeySHA256, fp) {
+				return fmt.Errorf("this key was certified for %s/%s before it was revoked; a key is never reused across a revoke", in, k.Device)
+			}
+		}
+	}
+	for _, in := range instances {
+		for _, k := range records[in] {
+			if in == instance && k.Device == device {
+				continue
+			}
+			if slices.Contains(k.KeySHA256, fp) {
+				return fmt.Errorf("this key is already certified for %s/%s; a device makes a new key for each instance and each request", in, k.Device)
+			}
+		}
+	}
+	for _, k := range records[instance] {
+		if k.Device != device || !slices.Contains(k.KeySHA256, fp) {
+			continue
+		}
+		if k.Revoked {
+			return fmt.Errorf("this key was certified for %s/%s before it was revoked; a key is never reused across a revoke", instance, device)
+		}
+		if k.KeySHA256[len(k.KeySHA256)-1] != fp {
+			return fmt.Errorf("this key is an older key of %s; it made a newer one since, so enrol from a new request", device)
+		}
+	}
+	return nil
+}
+
+// warnPacketDisclosure is what enroll says about the packet it wrote (ADR 0020
+// Consequences). The hazard is disclosure, not loss, and since ADR 0020 it is
+// the bundle's alone: the packet carries a derived bundle and a certificate,
+// never a private key and never keys.yaml. Losing it loses nothing; whoever
+// holds it with the passphrase can read what the bundle's keys open, and
+// cannot present the device's leaf, whose key never left the device —
+// provided the key it certifies is the one the operator confirmed. What
+// retires the bundle is said in the words 'keeper revoke' uses: revoking does
 // not, rotating does, and nothing undoes what was read before.
-func warnPacketDisclosure(w io.Writer, path, instance, device string) {
+func warnPacketDisclosure(w io.Writer, path, instance string) {
 	fprintf(w, "WARNING: the passphrase is the only thing protecting %s. Anyone holding the packet and the\n", path)
-	fprintf(w, "passphrase holds keeper %q: they can read what is stored under the keys it carries, and\n", device)
-	fprintf(w, "re-seed a keyholder replica that restarts. 'farcast keeper revoke' alone stops neither; rotating\n")
-	fprintf(w, "the keys does ('farcast storage key rotate %s', then 'farcast storage key rekey %s'),\n", instance, instance)
-	fprintf(w, "and nothing undoes what was read before. Losing the packet loses nothing: enrol the device again.\n")
+	fprintf(w, "passphrase can read what is stored under the keys its bundle carries. It holds no private key, so it\n")
+	fprintf(w, "cannot re-seed through the tunnel, provided the key it certifies is the one you confirmed. 'farcast keeper\n")
+	fprintf(w, "revoke' does not retire the bundle; rotating the keys does ('farcast storage key rotate %s', then\n", instance)
+	fprintf(w, "'farcast storage key rekey %s'), and nothing undoes what was read before. Losing the packet loses\n", instance)
+	fprintf(w, "nothing: make a new request on the device and enrol it again.\n")
 }
 
 type keeperEnrollResult struct {
@@ -313,6 +548,9 @@ type keeperEnrollResult struct {
 	Window     string    `json:"window"`
 	Expires    time.Time `json:"expires,omitzero"`
 	Fleet      int       `json:"fleet"`
+	// KeySHA256 is the confirmed fingerprint of the key the certificate
+	// certifies.
+	KeySHA256 string `json:"key_sha256"`
 
 	// window is Window as a duration, for the human line. JSON keeps the
 	// flag's own syntax ("720h0m0s"), which a script can parse back.
@@ -322,10 +560,11 @@ type keeperEnrollResult struct {
 func (r keeperEnrollResult) Human(w io.Writer) error {
 	fprintf(w, "✓ enrolled %q as a keeper of %q\n", r.Device, r.Instance)
 	fprintf(w, "  packet      %s (mode 0600)\n", r.Path)
+	fprintf(w, "  key sha256  …%s (confirmed)\n", identity.FingerprintTail(r.KeySHA256))
 	fprintf(w, "  bundle      generation %d\n", r.Generation)
 	fprintf(w, "  budget      %s per %s\n", plural(r.Budget, "reseed", "reseeds"), humanWindowOr(r.window, r.Window))
 	if !r.Expires.IsZero() {
-		fprintf(w, "  expires     %s — re-enrol before then or this device stops keeping\n",
+		fprintf(w, "  expires     %s — re-enrol before then, from a new request, or this device stops keeping\n",
 			r.Expires.UTC().Format(time.RFC3339))
 	}
 	fprintf(w, "\nOn the device: farcast keeper install %s --passphrase-file <path>\n", r.Path)
@@ -350,7 +589,16 @@ func (*keeperInstallCommand) Usage() string {
 	return strings.TrimSpace(`
 Usage: farcast keeper install <packet> --passphrase-file <path> [--accept-backup-risk]
 
-Accept an enrolment packet on the device that will do the keeping.
+Accept an enrolment packet on the device that will do the keeping: the device
+that ran 'farcast keeper request' for it.
+
+Install writes only the certificate and the bundle, beside the key 'keeper
+request' made here, and moves that key into place. The packet carries no key.
+A certificate for any other key is refused as a security event, with nothing
+installed: either the packet is another device's, or the request was replaced
+on its way to the operator and someone else's key was certified under this
+device's name. The certificate must also chain to the packet's CA as a client
+certificate.
 
 The material comes to rest unarmored, and that is what a keeper is: a device
 that re-seeds at 03:00 cannot hold a passphrase behind a human. What protects
@@ -390,9 +638,13 @@ func (c *keeperInstallCommand) Run(_ context.Context, env *Env, args []string) e
 	}
 	defer packet.Zero()
 
+	// Open validated the packet's instance name (keeper.ValidateInstance)
+	// before it is joined into this path.
 	dir := env.ConfigDir.KeeperDir(packet.Instance)
 	store, err := keeper.Install(dir, packet, c.acceptRisk)
 	if err != nil {
+		// A *keeper.ForeignKeyError is returned as it is: its message is
+		// the security event, and what to do about it.
 		return err
 	}
 	cfg, err := store.Config()
@@ -403,6 +655,7 @@ func (c *keeperInstallCommand) Run(_ context.Context, env *Env, args []string) e
 		Instance: cfg.Instance, Device: cfg.Device, Dir: store.Dir(),
 		Generation: cfg.Generation, Budget: cfg.Budget, Window: cfg.Window.String(), window: cfg.Window,
 		BackupExcluded: cfg.BackupExcluded, BackupNote: cfg.BackupNote,
+		KeySHA256: cfg.KeySHA256, KeyStore: cfg.KeyStore,
 	})
 }
 
@@ -415,6 +668,8 @@ type keeperInstallResult struct {
 	Window         string `json:"window"`
 	BackupExcluded bool   `json:"backup_excluded"`
 	BackupNote     string `json:"backup_note,omitempty"`
+	KeySHA256      string `json:"key_sha256"`
+	KeyStore       string `json:"key_store"`
 
 	// window is Window as a duration, for the human line (see keeperEnrollResult).
 	window time.Duration
@@ -437,6 +692,9 @@ func backupNote(s string) string { return strings.TrimPrefix(s, "keeper: ") }
 func (r keeperInstallResult) Human(w io.Writer) error {
 	fprintf(w, "✓ this device is now keeper %q of %q\n", r.Device, r.Instance)
 	fprintf(w, "  state       %s (mode 0700)\n", r.Dir)
+	if r.KeySHA256 != "" {
+		fprintf(w, "  key sha256  …%s, made on this device and certified\n", identity.FingerprintTail(r.KeySHA256))
+	}
 	fprintf(w, "  bundle      generation %d\n", r.Generation)
 	fprintf(w, "  budget      %s per %s\n", plural(r.Budget, "reseed", "reseeds"), humanWindowOr(r.window, r.Window))
 	if r.BackupExcluded {
@@ -513,7 +771,8 @@ func (c *keeperRunCommand) Run(ctx context.Context, env *Env, args []string) err
 	name := args[0]
 	store, err := keeper.OpenStore(env.ConfigDir.KeeperDir(name))
 	if err != nil {
-		return fmt.Errorf("%w\nEnrol this device on the machine that holds %q's CA key, then 'farcast keeper install'", err, name)
+		return fmt.Errorf("%w\nMake a request here ('farcast keeper request %s --out <path>'), enrol it on the machine that holds %q's CA key, "+
+			"then 'farcast keeper install' here", err, name, name)
 	}
 	cfg, err := store.Config()
 	if err != nil {
@@ -685,7 +944,7 @@ func keeperLeafUsable(leafPEM, bundle []byte, now time.Time) error {
 	}
 	if exp := leafExpiry(leafPEM); !exp.IsZero() && now.After(exp) {
 		return &exitCodeError{code: exitCannotKeep, err: fmt.Errorf(
-			"this device's certificate expired on %s, and every keyholder refuses it; re-enrol it with 'farcast keeper enroll' on the operator's machine",
+			"this device's certificate expired on %s, and every keyholder refuses it; re-enrol it from a new request ('farcast keeper request' here, then 'farcast keeper enroll' on the operator's machine)",
 			exp.Format(time.RFC3339))}
 	}
 	return nil
@@ -867,7 +1126,7 @@ func leafBindsBundle(leafPEM, bundle []byte) error {
 		}
 	}
 	return errors.New("this device's leaf does not bind the bundle it holds — it was enrolled before the keyholder required that — " +
-		"so every keyholder refuses its re-seeds; re-enrol it with 'farcast keeper enroll' on the operator's machine")
+		"so every keyholder refuses its re-seeds; re-enrol it from a new request ('farcast keeper request' here, then 'farcast keeper enroll' on the operator's machine)")
 }
 
 // keeperReplicas is how many replicas a keeper checks.
@@ -955,9 +1214,22 @@ func (*keeperStatusCommand) Run(_ context.Context, env *Env, args []string) erro
 	results := make([]keeperStatusEntry, 0, len(names))
 	for _, name := range names {
 		entry := keeperStatusEntry{Instance: name}
-		store, err := keeper.OpenStore(env.ConfigDir.KeeperDir(name))
+		dir := env.ConfigDir.KeeperDir(name)
+		// A request made here and not installed yet: beside a keeper (a
+		// renewal), or alone — a device on its way to being one, which is
+		// said as such and not as an error.
+		pending, perr := keeper.PendingRequest(dir)
+		if pending != nil {
+			entry.Pending = &pendingRequest{RequestedAt: pending.CreatedAt, KeySHA256: pending.KeySHA256}
+		}
+		store, err := keeper.OpenStore(dir)
 		if err != nil {
-			entry.Error = err.Error()
+			if entry.Pending == nil {
+				if perr != nil {
+					err = perr
+				}
+				entry.Error = err.Error()
+			}
 			results = append(results, entry)
 			continue
 		}
@@ -976,6 +1248,7 @@ func (*keeperStatusCommand) Run(_ context.Context, env *Env, args []string) erro
 		audit := keeper.Reconcile(name, ledger)
 		budget := keeper.Budget(ledger, cfg.Budget, cfg.Window, time.Now().UTC())
 		entry.Device, entry.Generation = cfg.Device, cfg.Generation
+		entry.KeySHA256 = cfg.KeySHA256
 		entry.Wiped, entry.WipedReason = cfg.WipedAt, cfg.WipedReason
 		entry.BackupExcluded, entry.BackupNote = cfg.BackupExcluded, cfg.BackupNote
 		entry.Reseeds, entry.Boots, entry.Refused = audit.Reseeds, audit.Boots, audit.Refused
@@ -1051,6 +1324,19 @@ type keeperStatusEntry struct {
 	Wiped       time.Time `json:"wiped,omitzero"`
 	WipedReason string    `json:"wiped_reason,omitempty"`
 	Error       string    `json:"error,omitempty"`
+	// KeySHA256 is the fingerprint of the key this device made and its
+	// certificate certifies; empty on a record from before ADR 0020.
+	KeySHA256 string `json:"key_sha256,omitempty"`
+	// Pending is a request made on this device and not installed yet: the
+	// whole of an entry for a device on its way to being a keeper, or a
+	// renewal beside an installed one.
+	Pending *pendingRequest `json:"pending,omitempty"`
+}
+
+// pendingRequest is what status says of a request waiting on this device.
+type pendingRequest struct {
+	RequestedAt time.Time `json:"requested_at"`
+	KeySHA256   string    `json:"key_sha256"`
 }
 
 type fleetRow struct {
@@ -1060,6 +1346,8 @@ type fleetRow struct {
 	Revoked  bool      `json:"revoked,omitempty"`
 	Budget   int       `json:"budget,omitempty"`
 	Window   string    `json:"window,omitempty"`
+	// KeySHA256 is the newest key this machine certified for the device.
+	KeySHA256 string `json:"key_sha256,omitempty"`
 }
 
 // fleetBudget is what an instance's keepers may push between them in one
@@ -1090,6 +1378,9 @@ func fleetRows(fleet map[string][]config.Keeper) []fleetRow {
 	for instance, keepers := range fleet {
 		for _, k := range keepers {
 			row := fleetRow{Instance: instance, Device: k.Device, Expires: k.Expires, Revoked: k.Revoked, Budget: k.Budget}
+			if n := len(k.KeySHA256); n > 0 {
+				row.KeySHA256 = k.KeySHA256[n-1]
+			}
 			if k.Window > 0 {
 				row.Window = keeper.HumanWindow(k.Window)
 			}
@@ -1155,7 +1446,17 @@ func (r keeperStatusResult) Human(w io.Writer) error {
 			fprintf(w, "%s: %s\n", e.Instance, e.Error)
 			continue
 		}
+		if e.Device == "" && e.Pending != nil {
+			fprintf(w, "%s: not a keeper yet — %s\n", e.Instance, pendingLine(e.Pending))
+			continue
+		}
 		fprintf(w, "%s (as %q, bundle generation %d)\n", e.Instance, e.Device, e.Generation)
+		if e.KeySHA256 != "" {
+			fprintf(w, "  key         …%s, made on this device\n", identity.FingerprintTail(e.KeySHA256))
+		}
+		if e.Pending != nil {
+			fprintf(w, "  renewal     %s\n", pendingLine(e.Pending))
+		}
 		if !e.Wiped.IsZero() {
 			fprintf(w, "  material    wiped %s (%s) — this device no longer keeps it\n", e.Wiped.Format("2006-01-02"), e.WipedReason)
 		}
@@ -1230,6 +1531,12 @@ func (r keeperStatusResult) Human(w io.Writer) error {
 	return nil
 }
 
+// pendingLine says what status knows of a request waiting on this device.
+func pendingLine(p *pendingRequest) string {
+	return fmt.Sprintf("request pending since %s, key …%s; carry it to the operator's machine",
+		p.RequestedAt.UTC().Format("2006-01-02"), identity.FingerprintTail(p.KeySHA256))
+}
+
 // ------------------------------------------------------------- revoke
 
 type keeperRevokeCommand struct{ assumeYes bool }
@@ -1255,8 +1562,12 @@ command prints how rather than implying it already happened:
   farcast storage key rotate <instance>   new keys for every application; the
                                           bundle opens nothing written after
   farcast storage key rekey <instance>    moves existing objects onto them
-  farcast keeper enroll ...               every keeper you keep: their bundles
-                                          predate the rotation
+  farcast keeper request ...              on every keeper you keep, a new key:
+  farcast keeper enroll ... --request     their bundles predate the rotation
+
+Every key the device was certified for is recorded as revoked, and stays
+refused: re-enrolling the device later readmits it only with a new key from a
+new request, never one it held before.
 
 What that does not undo is printed too. Names stay computable, because a
 scope's name key cannot rotate. Rekey covers only what is already stored.
@@ -1321,6 +1632,11 @@ func (c *keeperRevokeCommand) Run(_ context.Context, env *Env, args []string) er
 			if m.Keepers[i].Device == device {
 				m.Keepers[i].Revoked = true
 				m.Keepers[i].RevokedAt = time.Now().UTC()
+				// Every key the device held, kept where a re-enrolment
+				// cannot clear it: that clears Revoked, deliberately, and a
+				// key certified before the revoke must stay refused (ADR 0020
+				// decision 3).
+				m.Keepers[i].RevokedKeySHA256 = appendNew(m.Keepers[i].RevokedKeySHA256, m.Keepers[i].KeySHA256...)
 			}
 		}
 		return nil
@@ -1339,11 +1655,25 @@ func (c *keeperRevokeCommand) Run(_ context.Context, env *Env, args []string) er
 // first — on the 2026-10-06 walk the pair rewrote nothing, because neither
 // reached an application's scope.
 func revokeRemedy(instance string) []string {
-	return []string{
+	return append([]string{
 		"farcast storage key rotate " + instance,
 		"farcast storage key rekey " + instance,
-		"farcast keeper enroll " + instance + " <device> --out <path> --passphrase-file <path>   (each keeper you keep)",
+	}, reenrolLines(instance, nil)...)
+}
+
+// reenrolLines is how a keeper is enrolled again since ADR 0020, as every
+// command that advises it prints it: a new request on each device, then
+// enroll by request on this machine — per device when they are named, and
+// once with <device> when they are not.
+func reenrolLines(instance string, devices []string) []string {
+	lines := []string{"farcast keeper request " + instance + " --out <path>   (on each device)"}
+	if len(devices) == 0 {
+		return append(lines, "farcast keeper enroll "+instance+" <device> --request <path> --out <path> --passphrase-file <path>   (each keeper you keep)")
 	}
+	for _, d := range devices {
+		lines = append(lines, "farcast keeper enroll "+instance+" "+d+" --request <path> --out <path> --passphrase-file <path>")
+	}
+	return lines
 }
 
 type keeperRevokeResult struct {
@@ -1407,13 +1737,30 @@ func upsertKeeper(list []config.Keeper, k config.Keeper) []config.Keeper {
 			//
 			// Except the leaf tokens, which accumulate. The earlier leaf is
 			// still valid in the cluster until its own NotAfter, and a stream
-			// it opens must still be named as this device's.
+			// it opens must still be named as this device's. The fingerprints
+			// of the keys certified accumulate too, oldest first and once
+			// each, and the keys revoked are carried over unchanged: nothing
+			// ever clears them (ADR 0020 decision 3).
 			k.LeafTokens = append(slices.Clone(list[i].LeafTokens), k.LeafTokens...)
+			k.KeySHA256 = appendNew(slices.Clone(list[i].KeySHA256), k.KeySHA256...)
+			k.RevokedKeySHA256 = appendNew(slices.Clone(list[i].RevokedKeySHA256), k.RevokedKeySHA256...)
 			list[i] = k
 			return list
 		}
 	}
 	return append(list, k)
+}
+
+// appendNew appends each of add not already in list, keeping list's order. A
+// re-issue to the same key moves nothing: the order is when each key was first
+// certified, and the newest is last.
+func appendNew(list []string, add ...string) []string {
+	for _, a := range add {
+		if !slices.Contains(list, a) {
+			list = append(list, a)
+		}
+	}
+	return list
 }
 
 // activeKeepers counts the fleet, optionally including one about to be added.
@@ -1463,8 +1810,10 @@ func (*keeperUninstallCommand) Usage() string {
 	return strings.TrimSpace(`
 Usage: farcast keeper uninstall <instance> [-y]
 
-Run on a keeper DEVICE. Delete the two files here that could open anything —
-the bundle and the leaf's private key — and stop keeping the instance.
+Run on a keeper DEVICE. Delete the files here that could open anything — the
+bundle and the leaf's private key, and a pending request's key — and stop
+keeping the instance. A directory holding only a pending request is accepted
+too: its key and record are discarded.
 
 The ledger stays, and so does the record 'farcast keeper status' needs to read
 it: it is the evidence of what this device did with key material, and a device
@@ -1473,7 +1822,8 @@ reads afterwards. The certificates stay too; they are public.
 
 This does not revoke the device — the operator's 'farcast keeper revoke' does
 that, on the machine that enrolled it — and it reaches nothing in the cluster.
-Enrol and install again to keep the instance once more.`)
+To keep the instance once more, make a new request ('farcast keeper request'),
+have it enrolled, and install the packet that comes back.`)
 }
 
 func (c *keeperUninstallCommand) SetFlags(fs *flag.FlagSet) {
@@ -1486,9 +1836,19 @@ func (c *keeperUninstallCommand) Run(_ context.Context, env *Env, args []string)
 		return usagef("keeper uninstall takes one instance argument")
 	}
 	name := args[0]
-	store, err := keeper.OpenStore(env.ConfigDir.KeeperDir(name))
-	if err != nil {
+	if err := keeper.ValidateInstance(name); err != nil {
 		return err
+	}
+	dir := env.ConfigDir.KeeperDir(name)
+	store, err := keeper.OpenStore(dir)
+	if err != nil {
+		// A device on its way to being a keeper holds a request's key and
+		// nothing else; uninstalling it discards that.
+		pending, perr := keeper.PendingRequest(dir)
+		if perr != nil || pending == nil {
+			return err
+		}
+		store = nil
 	}
 	if !c.assumeYes {
 		interactive := env.Printer.Mode == output.ModeHuman && isTerminal(env.In)
@@ -1504,6 +1864,12 @@ func (c *keeperUninstallCommand) Run(_ context.Context, env *Env, args []string)
 			return nil
 		}
 	}
+	if store == nil {
+		if err := keeper.DiscardRequest(dir); err != nil {
+			return err
+		}
+		return env.Printer.Print(keeperUninstallResult{Instance: name, Dir: dir, Status: "discarded"})
+	}
 	if err := store.Wipe("uninstalled on this device", time.Now()); err != nil {
 		return err
 	}
@@ -1513,11 +1879,15 @@ func (c *keeperUninstallCommand) Run(_ context.Context, env *Env, args []string)
 type keeperUninstallResult struct {
 	Instance string `json:"instance"`
 	Dir      string `json:"dir"`
-	Ledger   string `json:"ledger"`
-	Status   string `json:"status"`
+	Ledger   string `json:"ledger,omitempty"`
+	Status   string `json:"status"` // wiped | discarded
 }
 
 func (r keeperUninstallResult) Human(w io.Writer) error {
+	if r.Status == "discarded" {
+		fprintf(w, "✓ this device's pending request for %q is discarded: its key is deleted, and a packet issued for it will be refused here\n", r.Instance)
+		return nil
+	}
 	fprintf(w, "✓ this device no longer keeps %q: its bundle and leaf key are wiped\n", r.Instance)
 	fprintf(w, "  ledger kept at %s — 'farcast keeper status %s' still reads it\n", r.Ledger, r.Instance)
 	return nil

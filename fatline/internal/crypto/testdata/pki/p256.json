@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "about": "ADR 0020's conformance fixture: what crypto.go issues for the instance \"fixture\" at issued_at, through its own issuers. Test data; trusted nowhere else.",
+  "instance": "fixture",
+  "server_name": "fixture.fatline.farcast",
+  "issued_at": "2026-11-13T00:00:00Z",
+  "verify_at": "2026-11-14T00:00:00Z",
+  "ca": {
+    "cert_pem": "-----BEGIN CERTIFICATE-----\nMIIBgTCCASigAwIBAgIBATAKBggqhkjOPQQDAjAnMSUwIwYDVQQDExxGYXJDYXN0\nIEluc3RhbmNlIENBOiBmaXh0dXJlMB4XDTI2MTExMjIzNTkwMFoXDTI4MTExMjAw\nMDAwMFowJzElMCMGA1UEAxMcRmFyQ2FzdCBJbnN0YW5jZSBDQTogZml4dHVyZTBZ\nMBMGByqGSM49AgEGCCqGSM49AwEHA0IABKzz0I4jC96W7jkv8aWX74iKrR+K6VLS\nCCY6Z7kgoh83TUg/NwdBbLfv4I3LMHMCoGyJAD3zG6fkzwK39m4kmIOjRTBDMA4G\nA1UdDwEB/wQEAwIBBjASBgNVHRMBAf8ECDAGAQH/AgEAMB0GA1UdDgQWBBRfkcan\nANozTsWRo/M0WTCnmTAtUTAKBggqhkjOPQQDAgNHADBEAiBiNjtZwv8ke+G2G4ua\nl/Sig68fxXr2d1zabessMsHgfgIgfwhUyL2Kj8TckPDYzuBynlRASMXCH432NYq3\n6/j1u9k=\n-----END CERTIFICATE-----\n",
+    "key_sha256": "540484b09c1b77241b71f2ca120608abc2d8164361fb56c7e54b8c6ff439c6bc"
+  },
+  "server": {
+    "identity": "fixture.fatline.farcast",
+    "cert_pem": "-----BEGIN CERTIFICATE-----\nMIIBsTCCAVigAwIBAgIBAjAKBggqhkjOPQQDAjAnMSUwIwYDVQQDExxGYXJDYXN0\nIEluc3RhbmNlIENBOiBmaXh0dXJlMB4XDTI2MTExMjIzNTkwMFoXDTI3MDIxMTAw\nMDAwMFowIjEgMB4GA1UEAxMXZml4dHVyZS5mYXRsaW5lLmZhcmNhc3QwWTATBgcq\nhkjOPQIBBggqhkjOPQMBBwNCAASsEMk8+SJH9ikMR6nqSdwIRbxPbE+m1eiiTFPH\nnOI3jT/ZkTxmHoO3rOtaBfUZV15GSefxjqSsVBk/dMNvNfOSo3oweDAOBgNVHQ8B\nAf8EBAMCB4AwEwYDVR0lBAwwCgYIKwYBBQUHAwEwDAYDVR0TAQH/BAIwADAfBgNV\nHSMEGDAWgBRfkcanANozTsWRo/M0WTCnmTAtUTAiBgNVHREEGzAZghdmaXh0dXJl\nLmZhdGxpbmUuZmFyY2FzdDAKBggqhkjOPQQDAgNHADBEAiAh0YQWLLDw7ryM8JN8\n3DW1hqOEnNKZPHiWSgxLuQR8NAIgRP6A1mQWA8mbPhGjk9W2WdQglsxem1GYBMAM\nFWFd79c=\n-----END CERTIFICATE-----\n",
+    "key_pem": "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg+0oVUhduG4ERv2oT\nfSXgHkoZv31gJCkejTxXtTWtuFOhRANCAASsEMk8+SJH9ikMR6nqSdwIRbxPbE+m\n1eiiTFPHnOI3jT/ZkTxmHoO3rOtaBfUZV15GSefxjqSsVBk/dMNvNfOS\n-----END PRIVATE KEY-----\n",
+    "key_sha256": "bf7d3bdafcf5c2d0e439fac8a5ceb207bf213365ac4df234e548aaf6f076a8d7"
+  },
+  "client": {
+    "identity": "farcast://fixture/operator",
+    "cert_pem": "-----BEGIN CERTIFICATE-----\nMIIBtzCCAV6gAwIBAgIBAzAKBggqhkjOPQQDAjAnMSUwIwYDVQQDExxGYXJDYXN0\nIEluc3RhbmNlIENBOiBmaXh0dXJlMB4XDTI2MTExMjIzNTkwMFoXDTI3MDIxMTAw\nMDAwMFowJTEjMCEGA1UEAxMaZmFyY2FzdDovL2ZpeHR1cmUvb3BlcmF0b3IwWTAT\nBgcqhkjOPQIBBggqhkjOPQMBBwNCAARhjkvgzIt9zo1u/EcR2yhq/qX+FdbAKHpR\nseSUErHJK2iUcrP/VoQtYOQyGUdUCugLrGoHcWytro0Jpvm5GPduo30wezAOBgNV\nHQ8BAf8EBAMCB4AwEwYDVR0lBAwwCgYIKwYBBQUHAwIwDAYDVR0TAQH/BAIwADAf\nBgNVHSMEGDAWgBRfkcanANozTsWRo/M0WTCnmTAtUTAlBgNVHREEHjAchhpmYXJj\nYXN0Oi8vZml4dHVyZS9vcGVyYXRvcjAKBggqhkjOPQQDAgNHADBEAiASsnSWyIL4\nyvNWrpNHa3LpljBQeULIie4Z0QoWRUgCegIgOariV6LBl6q+iyFBGJ2jEjKvhxJx\ncVjGWUtlEVUQL3k=\n-----END CERTIFICATE-----\n",
+    "key_pem": "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgmFrJl9oIR7h0ME9I\nfN8UHfZlxyWKRk6yz2ApfIqNrXihRANCAARhjkvgzIt9zo1u/EcR2yhq/qX+FdbA\nKHpRseSUErHJK2iUcrP/VoQtYOQyGUdUCugLrGoHcWytro0Jpvm5GPdu\n-----END PRIVATE KEY-----\n",
+    "key_sha256": "299c970474d965c076fc93c3d3471e555be87f447e7f35a1a2b67c12667dd6ee"
+  }
+}

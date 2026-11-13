@@ -14,15 +14,20 @@
 #   5  golangci-lint, mandatory — a missing linter fails the check
 #   6  go test -race
 #   7  the Apple client: the source gate (only allowed file types and the
-#      one backdrop image, no links; the CLI's vectors copied byte for byte;
-#      no unsafe, unsafeFlags or attribute outside an allowed set, outside the
-#      reviewed allowlist; a static manifest with no third-party package and
-#      each target's settings and resources from an allowlist; the project held
-#      to an exact shape, reviewed setting keys, one Info.plist holding only
-#      the build's commit, and one action-free scheme; the guardrails in effect
-#      for every configuration and SDK), swift build and swift test, the app
-#      built for macOS, the iOS simulator and the visionOS simulator, and
-#      xcodebuild test on macOS and an iOS simulator (minutes, the first time)
+#      one backdrop image, no links; the CLI's vectors and FatLine's PKI
+#      vectors copied byte for byte; no unsafe, unsafeFlags or attribute
+#      outside an allowed set, outside the reviewed allowlist; a static
+#      manifest with no third-party package and each target's settings and
+#      resources from an allowlist; the project held to an exact shape,
+#      reviewed setting keys, one Info.plist holding only the build's commit,
+#      and one action-free scheme; the guardrails in effect for every
+#      configuration and SDK), swift build and swift test, the app built for
+#      macOS, the iOS simulator and the visionOS simulator, and xcodebuild
+#      test on macOS and an iOS simulator (minutes, the first time). Each of
+#      the three test runs includes ADR 0020's Apple regression: mutual TLS
+#      from URLSession and NWConnection to Go servers built from the PKI
+#      vectors and FatLine's ServerTLSConfig, on 127.0.0.1, whose live tests
+#      must all pass by name
 #   8  the randomized hand-over model, with --model (minutes)
 #
 # There is no hosted CI. Run this before every commit and before every live
@@ -52,7 +57,20 @@ note() { printf '%s    %s%s\n' "$DIM" "$1" "$RST"; }
 die()  { printf '\n%s  ✗ %s%s\n' "$RED$BOLD" "$1" "$RST" >&2; exit 1; }
 
 TMP=''
-cleanup() { [ -n "$TMP" ] && rm -rf "$TMP" || true; }
+# ADR 0020's Apple regression server (step 7b) reads a FIFO this shell holds
+# open on descriptor 9: closing it is the server's signal to stop, and the
+# kill makes sure of it. bash hands descriptor 9 to every child, so each
+# long-running command started while it is open (swift test, every
+# xcodebuild, and the $(...) shell kit_test runs in) closes it first: then
+# this shell is its only holder, and the server stops however the check
+# ends, even when a kill -9 leaves no chance to clean up.
+FIXTURE_PID=''
+fixture_stop() {
+  exec 9>&-
+  [ -n "$FIXTURE_PID" ] && { kill "$FIXTURE_PID" 2>/dev/null; wait "$FIXTURE_PID" 2>/dev/null; } || true
+  FIXTURE_PID=''
+}
+cleanup() { fixture_stop; [ -n "$TMP" ] && rm -rf "$TMP" || true; }
 on_err() {
   local rc=$?
   printf '\n%s✗ FAILED during: %s%s\n' "$RED$BOLD" "$STEP" "$RST" >&2
@@ -67,7 +85,7 @@ MODEL=''
 for arg in "$@"; do
   case "$arg" in
     --model) MODEL=1 ;;
-    -h|--help) sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;;
     *) printf 'unknown argument: %s\nusage: ./check.sh [--model]\n' "$arg" >&2; exit 2 ;;
   esac
 done
@@ -88,7 +106,7 @@ unset XCODE_XCCONFIG_FILE
 
 # ---- tools -------------------------------------------------------------------
 step "0 — tools"
-for tool in go gofmt golangci-lint diff mktemp; do
+for tool in go gofmt golangci-lint diff mktemp mkfifo; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     if [ "$tool" = golangci-lint ]; then
       die "golangci-lint is not on PATH. The lint guardrail is mandatory (AGENTS.md, ADR 0002); install it (e.g. brew install golangci-lint) and re-run."
@@ -224,6 +242,18 @@ apple_files() {
 counted() {
   awk '/Test run with [0-9]+ tests/ { for (i = 1; i < NF; i++) if ($i == "with") n += $(i + 1) } END { print n + 0 }' "$1"
 }
+# ADR 0020's Apple regression (step 7b starts its servers): a skipped test
+# still counts in "Test run with N tests", so the count cannot see a run that
+# silently skipped the live tests. Each run must report every one of them
+# passed, by name, and none skipped or failed.
+REGRESSION_LIVE=7
+live_passed() {  # <log> <what>
+  local n bad
+  n=$(grep -cE 'Test "ADR 0020 live: [^"]*" passed after' "$1" || true)
+  bad=$(grep -cE 'Test "ADR 0020 live: [^"]*" (skipped|failed)' "$1" || true)
+  [ "$n" -eq "$REGRESSION_LIVE" ] && [ "$bad" -eq 0 ] \
+    || { tail -n 20 "$TMP/applefixture.log" >&2; die "$2: $n of the $REGRESSION_LIVE ADR 0020 live tests passed"; }
+}
 
 step "7a — Swift source gate"
 # What is in the tree at all: no links, which could pull in sources from
@@ -242,26 +272,29 @@ strays=$(apple_files -type f ! -name .DS_Store | tr '\0' '\n' | awk -F/ -v backd
 [ -z "$strays" ] || { printf '%s\n' "$strays" >&2; die "files of a type the Apple client does not allow (above); a new type is a reviewed change to this step"; }
 ok "only Swift sources and their manifests, project, data and the backdrop; no links"
 
-# The CLI's golden vectors (ADR 0021 decision 7, Verification 4): Go's tests
-# hold them to what the CLI prints, and FarSightKit's tests decode copies of
-# them. So each copy must be Go's own, byte for byte, and hold nothing Go's
-# does not: a copy edited to make a Swift test pass would hide a broken
-# contract. Finder's .DS_Store is ignored on both sides, as the file-type
-# step above ignores it.
-GOVECTORS=farsight/cli/internal/cli/testdata
-KITVECTORS=$KIT/Tests/FarSightCoreTests/Vectors
-VECTOR_DIRS="app instances kinds version world"
-[ -d "$KITVECTORS" ] || die "FarSightKit has no copy of the CLI's vectors at $KITVECTORS"
-have=$(find "$KITVECTORS" -mindepth 1 -maxdepth 1 ! -name .DS_Store -print | sed "s|^$KITVECTORS/||" | sort | paste -sd' ' -)
-[ "$have" = "$VECTOR_DIRS" ] || die "FarSightKit's vectors hold '$have', not the CLI's '$VECTOR_DIRS'"
-for d in $VECTOR_DIRS; do
-  [ -d "$GOVECTORS/$d" ] || die "the CLI has no $d vectors at $GOVECTORS/$d"
-  if ! diff -r -x .DS_Store "$GOVECTORS/$d" "$KITVECTORS/$d" >"$TMP/vectors.diff" 2>&1; then
-    head -n 20 "$TMP/vectors.diff" >&2
-    die "FarSightKit's copy of the CLI's $d vectors is not Go's (above). Copy them again: rm -rf '$KITVECTORS/$d' && cp -R '$GOVECTORS/$d' '$KITVECTORS/'"
-  fi
-done
-ok "FarSightKit decodes the CLI's own vectors ($VECTOR_DIRS), byte for byte"
+# Go's golden vectors, which FarSightKit's tests decode from copies: the
+# CLI's (ADR 0021 decision 7, Verification 4), which Go's tests hold to what
+# the CLI prints, and FatLine's PKI vectors (ADR 0020), which Go's tests hold
+# to what crypto.go issues and the Apple regression serves. So each copy must
+# be Go's own, byte for byte, and hold nothing Go's does not: a copy edited
+# to make a Swift test pass would hide a broken contract. Finder's .DS_Store
+# is ignored on both sides, as the file-type step above ignores it.
+vector_copy() {  # <go testdata> <kit Vectors> "<subdirs>"
+  local go=$1 kit=$2 dirs=$3 have d
+  [ -d "$kit" ] || die "FarSightKit has no copy of Go's vectors at $kit"
+  have=$(find "$kit" -mindepth 1 -maxdepth 1 ! -name .DS_Store -print | sed "s|^$kit/||" | sort | paste -sd' ' -)
+  [ "$have" = "$dirs" ] || die "FarSightKit's vectors at $kit hold '$have', not Go's '$dirs'"
+  for d in $dirs; do
+    [ -d "$go/$d" ] || die "Go has no $d vectors at $go/$d"
+    if ! diff -r -x .DS_Store "$go/$d" "$kit/$d" >"$TMP/vectors.diff" 2>&1; then
+      head -n 20 "$TMP/vectors.diff" >&2
+      die "FarSightKit's copy of $go/$d is not Go's (above). Copy it again: rm -rf '$kit/$d' && cp -R '$go/$d' '$kit/'"
+    fi
+  done
+  ok "FarSightKit decodes Go's own vectors from $go ($dirs), byte for byte"
+}
+vector_copy farsight/cli/internal/cli/testdata "$KIT/Tests/FarSightCoreTests/Vectors" "app instances kinds version world"
+vector_copy fatline/internal/crypto/testdata   "$KIT/Tests/FarSightTLSTests/Vectors"  "pki"
 
 # Strict memory safety flags unsafe constructs but not every way around it:
 # @unchecked Sendable (ADR 0021 decision 4), an 'unsafe' marker, unsafeFlags,
@@ -320,7 +353,8 @@ ALLOWED_SETTINGS="$GUARDRAILS
 # reads. A 'process' rule runs a build tool over the file.
 RESOURCES='FarSightUI|Backdrop/backdrop.heic|{"copy":{}}
 FarSightFixtures|world.json|{"copy":{}}
-FarSightCoreTests|Vectors|{"copy":{}}'
+FarSightCoreTests|Vectors|{"copy":{}}
+FarSightTLSTests|Vectors|{"copy":{}}'
 for ((t = 0; t < targets; t++)); do
   name=$(pj "targets.$t.name" raw); type=$(pj "targets.$t.type" raw)
   case "$type" in regular|test) ;; *) die "FarSightKit target $name is a $type target; only regular and test targets are allowed without an ADR" ;; esac
@@ -501,7 +535,7 @@ ok "FarCast: the project has its reviewed shape, keys and scheme, and the guardr
 
 xcode() {
   local log=$1; shift
-  if ! xcodebuild "$@" -project "$PROJECT" -scheme FarCast -derivedDataPath "$DERIVED" >"$TMP/$log.log" 2>&1; then
+  if ! xcodebuild "$@" -project "$PROJECT" -scheme FarCast -derivedDataPath "$DERIVED" >"$TMP/$log.log" 2>&1 9>&-; then
     grep -E 'error:|warning:|failed' "$TMP/$log.log" | sort -u | head -n 40 >&2 || tail -n 40 "$TMP/$log.log" >&2 || true
     die "xcodebuild $* failed (log above, abridged)"
   fi
@@ -514,14 +548,43 @@ if ! (cd "$KIT" && swift build --build-tests >"$TMP/swift-build.log" 2>&1); then
   die "swift build failed"
 fi
 ok "swift build"
-if ! (cd "$KIT" && swift test >"$TMP/swift-test.log" 2>&1); then
+# ADR 0020's Apple regression (ADR 0021 Verification 1): Go servers built
+# from the PKI vectors and FatLine's own ServerTLSConfig, on 127.0.0.1, up
+# for every test run below (fatline/internal/crypto/applefixture_test.go).
+# The test binary is compiled and run directly, because go test hands a test
+# binary an empty stdin, and its stdin is the server's lifeline.
+go test -mod=vendor -c -o "$TMP/applefixture.test" ./fatline/internal/crypto/
+mkfifo "$TMP/applefixture.in"
+# Run from the package directory: the binary reads testdata/pki relative to it.
+# exec, so $! is the test binary's own PID and fixture_stop's kill reaches it.
+( cd "$ROOT/fatline/internal/crypto" && exec env FARCAST_APPLE_FIXTURE="$TMP/applefixture.json" \
+    "$TMP/applefixture.test" -test.run '^TestServeAppleFixture$' -test.timeout 2h ) \
+  <"$TMP/applefixture.in" >"$TMP/applefixture.log" 2>&1 &
+FIXTURE_PID=$!
+exec 9>"$TMP/applefixture.in"  # held open: its close is the server's signal to stop
+# From here to fixture_stop, a long-running command starts with 9>&- (above).
+for ((i = 0; i < 100; i++)); do
+  [ -s "$TMP/applefixture.json" ] && break
+  kill -0 "$FIXTURE_PID" 2>/dev/null || break
+  sleep 0.1
+done
+[ -s "$TMP/applefixture.json" ] || { tail -n 20 "$TMP/applefixture.log" >&2; die "the Apple regression's Go server did not start"; }
+fixture_addr() { local a; a=$(plutil -extract "$1" raw -o - "$TMP/applefixture.json" 2>/dev/null) && [[ $a =~ ^127\.0\.0\.1:[0-9]+$ ]] && printf '%s' "$a"; }
+TLS_P256=$(fixture_addr p256) && TLS_FOREIGN=$(fixture_addr foreign) && TLS_ED25519=$(fixture_addr ed25519) \
+  || die "the Apple regression's Go server wrote unexpected addresses"
+ok "the Apple regression's Go servers listen on 127.0.0.1 (P-256, another CA, Ed25519)"
+# The addresses reach the test commands only.
+if ! (cd "$KIT" && FARSIGHT_TLS_P256="$TLS_P256" FARSIGHT_TLS_FOREIGN="$TLS_FOREIGN" FARSIGHT_TLS_ED25519="$TLS_ED25519" \
+  swift test >"$TMP/swift-test.log" 2>&1) 9>&-; then
   { grep -E 'error|✘|failed' "$TMP/swift-test.log" | head -n 40 || tail -n 40 "$TMP/swift-test.log"; } >&2 || true
+  tail -n 20 "$TMP/applefixture.log" >&2 || true
   die "swift test failed"
 fi
 tests=$(counted "$TMP/swift-test.log")
 [ "$tests" -gt 0 ] || die "swift test ran no tests"
+live_passed "$TMP/swift-test.log" "swift test"
 SWIFT_TESTS=$tests
-ok "swift test: $tests tests"
+ok "swift test: $tests tests, the $REGRESSION_LIVE ADR 0020 live tests passed by name among them"
 
 step "7c — the app, built for every platform it ships on"
 xcode build-macos build -destination 'platform=macOS'
@@ -538,8 +601,12 @@ step "7d — xcodebuild test, on macOS and an iOS simulator"
 # runtime — what swift test cannot do for iOS.
 kit_test() {
   local log=$1; shift
-  if ! (cd "$KIT" && xcodebuild test -scheme FarSightKit-Package -derivedDataPath "$ROOT/$DERIVED" "$@") >"$TMP/$log.log" 2>&1; then
+  # xcodebuild hands TEST_RUNNER_ variables to the test runner, prefix stripped.
+  if ! (cd "$KIT" && env TEST_RUNNER_FARSIGHT_TLS_P256="$TLS_P256" TEST_RUNNER_FARSIGHT_TLS_FOREIGN="$TLS_FOREIGN" \
+    TEST_RUNNER_FARSIGHT_TLS_ED25519="$TLS_ED25519" \
+    xcodebuild test -scheme FarSightKit-Package -derivedDataPath "$ROOT/$DERIVED" "$@") >"$TMP/$log.log" 2>&1; then
     { grep -E 'error:|✘|failed|FAILED' "$TMP/$log.log" | grep -v linkd | sort -u | head -n 40 || tail -n 40 "$TMP/$log.log"; } >&2 || true
+    tail -n 20 "$TMP/applefixture.log" >&2 || true
     die "xcodebuild test $* failed (log above, abridged)"
   fi
   local n
@@ -547,20 +614,24 @@ kit_test() {
   # The same tests as swift test ran, every one: a scheme that skips some
   # must not pass as a smaller run.
   [ "$n" -eq "$SWIFT_TESTS" ] || die "xcodebuild test $* ran $n tests, not the $SWIFT_TESTS swift test ran"
+  live_passed "$TMP/$log.log" "xcodebuild test $*"
   printf '%s\n' "$n"
 }
 # Assigned first: a failure inside $(...) must stop the check, not print a
-# blank count.
-tests=$(kit_test test-macos -destination 'platform=macOS')
+# blank count. The $(...) shell closes descriptor 9 with exec: a 9>&- on the
+# call would leave bash a saved copy of it in that shell.
+tests=$(exec 9>&-; kit_test test-macos -destination 'platform=macOS')
 ok "macOS: $tests tests"
 # All of xcodebuild's output is read (no early exit), so it is never cut off
 # mid-write; the first eligible iPhone wins.
-(cd "$KIT" && xcodebuild -showdestinations -scheme FarSightKit-Package >"$TMP/destinations.txt" 2>&1) \
+(cd "$KIT" && xcodebuild -showdestinations -scheme FarSightKit-Package >"$TMP/destinations.txt" 2>&1) 9>&- \
   || { tail -n 20 "$TMP/destinations.txt" >&2; die "xcodebuild -showdestinations failed"; }
 SIM=$(awk -F'id:' '/Ineligible destinations/ { done = 1 } !done && !found && /platform:iOS Simulator/ && /name:iPhone/ && !/placeholder/ { split($2, a, ","); print a[1]; found = 1 }' "$TMP/destinations.txt")
 [ -n "$SIM" ] || die "no iPhone simulator that runs iOS 26 or later is installed to test on. Add one in Xcode (Settings › Components), then re-run."
-tests=$(kit_test test-ios -destination "id=$SIM")
+tests=$(exec 9>&-; kit_test test-ios -destination "id=$SIM")
 ok "iOS simulator $SIM: $tests tests"
+fixture_stop
+ok "the ADR 0020 live tests passed by name on macOS and the iOS simulator; the Go servers are stopped"
 
 # ---- 8. model --------------------------------------------------------------------
 MODELNOTE="model: not run (--model)"

@@ -62,5 +62,14 @@ let package = Package(
             dependencies: ["FarSightUI", "FarSightCore", "FarSightFixtures"],
             swiftSettings: onMain
         ),
+        // ADR 0020's Apple regression (ADR 0021 Verification 1): mutual TLS from
+        // URLSession and NWConnection to Go servers built from the PKI vectors,
+        // the Ed25519 negative, and the enrolment request template against Go's
+        // vectors. Test-only: the app links none of it.
+        .testTarget(
+            name: "FarSightTLSTests",
+            resources: [.copy("Vectors")],
+            swiftSettings: guardrails
+        ),
     ]
 )

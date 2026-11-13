@@ -2,7 +2,10 @@ package keyholder
 
 import (
 	"bytes"
+	"crypto"
+	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
@@ -155,15 +158,15 @@ func TestDataTLSRefusesTheUnidentifiedAtTheHandshake(t *testing.T) {
 
 // A minimal CA for the handshake test. This package cannot import
 // fatline/internal/crypto, and the point of the test is the listener, not the
-// issuance.
+// issuance. It is ECDSA P-256, as the instance CA is (ADR 0020).
 type handshakeCA struct {
 	cert *x509.Certificate
-	key  ed25519.PrivateKey
+	key  *ecdsa.PrivateKey
 }
 
 func newHandshakeCA(t *testing.T) *handshakeCA {
 	t.Helper()
-	pub, key, err := ed25519.GenerateKey(rand.Reader)
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -172,7 +175,7 @@ func newHandshakeCA(t *testing.T) *handshakeCA {
 		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
 		IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign,
 	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, pub, key)
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,13 +186,23 @@ func newHandshakeCA(t *testing.T) *handshakeCA {
 	return &handshakeCA{cert: cert, key: key}
 }
 
+// issue mints a P-256 leaf from tmpl, as the instance CA does.
 func (ca *handshakeCA) issue(t *testing.T, tmpl *x509.Certificate) tls.Certificate {
 	t.Helper()
-	pub, key, err := ed25519.GenerateKey(rand.Reader)
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca.cert, pub, ca.key)
+	return ca.issueWithKey(t, tmpl, key)
+}
+
+// issueWithKey mints a leaf from tmpl over key's public half — an Ed25519 or
+// P-384 leaf under the P-256 CA, for the tests that show such a leaf is
+// refused. It takes the signer rather than the public key alone because a TLS
+// client needs it to finish the handshake.
+func (ca *handshakeCA) issueWithKey(t *testing.T, tmpl *x509.Certificate, key crypto.Signer) tls.Certificate {
+	t.Helper()
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca.cert, key.Public(), ca.key)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -296,4 +309,77 @@ func TestAKeeperOverRealTLSHasNoOperatorPower(t *testing.T) {
 		t.Errorf("a keeper placing a hold = %d, want 403", code)
 	}
 	held("operator-decision")
+}
+
+// ADR 0020 decision 2, through both listeners production uses: a leaf the
+// instance CA signed, carrying an identity the listener admits, is still
+// refused at the handshake when its key is not ECDSA P-256 — and with no
+// identity rule at all. The same leaf shape over a P-256 key is admitted, so
+// what is refused is the key and nothing else.
+func TestKeyholderRefusesANonP256PeerLeaf(t *testing.T) {
+	ca := newHandshakeCA(t)
+	pool := x509.NewCertPool()
+	pool.AddCert(ca.cert)
+
+	_, edKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p384Key, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	errHandler := errors.New("reached the handler")
+	for _, listener := range []struct {
+		name   string
+		config func(tls.Certificate, *x509.CertPool, func(string) bool) *tls.Config
+		allow  func(string) bool
+		uri    string
+	}{
+		{"ControlTLS", ControlTLS, AllowPusher("prod"), "farcast://prod/operator"},
+		{"ControlTLS with no identity rule", ControlTLS, nil, "farcast://prod/operator"},
+		{"DataTLS", DataTLS, AllowData("prod"), "farcast://prod/app/apps/web"},
+		{"DataTLS with no identity rule", DataTLS, nil, "farcast://prod/app/apps/web"},
+	} {
+		t.Run(listener.name, func(t *testing.T) {
+			srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			}))
+			srv.TLS = listener.config(ca.issue(t, serverTemplate()), pool, listener.allow)
+			srv.StartTLS()
+			defer srv.Close()
+
+			dial := func(leaf tls.Certificate) error {
+				client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{
+					RootCAs: pool, MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{leaf}}}}
+				defer client.CloseIdleConnections()
+				resp, err := client.Get(srv.URL + "/")
+				if err != nil {
+					return err
+				}
+				defer func() { _ = resp.Body.Close() }()
+				if resp.StatusCode != http.StatusOK {
+					return errHandler
+				}
+				return nil
+			}
+
+			for _, retired := range []struct {
+				what string
+				key  crypto.Signer
+			}{{"an Ed25519 leaf", edKey}, {"a P-384 leaf", p384Key}} {
+				err := dial(ca.issueWithKey(t, clientTemplate(listener.uri), retired.key))
+				if err == nil {
+					t.Fatalf("%s from the instance CA was admitted", retired.what)
+				}
+				if errors.Is(err, errHandler) {
+					t.Fatalf("%s reached the handler; the listener let it through", retired.what)
+				}
+			}
+			if err := dial(ca.issue(t, clientTemplate(listener.uri))); err != nil {
+				t.Fatalf("a P-256 leaf with the same identity was refused: %v", err)
+			}
+		})
+	}
 }

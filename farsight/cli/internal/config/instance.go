@@ -216,7 +216,8 @@ type Keyholder struct {
 // Keeper records one enrolled keeper device, from the operator's side.
 //
 // Nothing secret is here: the device's leaf went to the device, and its private
-// key was never on this machine after issuance. What this records is the fleet
+// key was never on this machine (ADR 0020 decision 3: the device made it, and
+// sent a request for it). What this records is the fleet
 // — who is enrolled, since when, and until when their credential is valid —
 // because a fleet nobody wrote down cannot be audited or revoked.
 type Keeper struct {
@@ -237,8 +238,9 @@ type Keeper struct {
 	// audit of old ledger entries can still attribute them.
 	Revoked   bool      `yaml:"revoked,omitempty"`
 	RevokedAt time.Time `yaml:"revoked_at,omitzero"`
-	// LeafTokens are the opaque tokens (identity.LeafToken) of every leaf
-	// this machine issued to the device, oldest first. Shrike's tunnel table
+	// LeafTokens are the opaque tokens (identity.LeafToken, v2: over the
+	// leaf's signed body, ADR 0020 decision 4) of every leaf this machine
+	// issued to the device, oldest first. Shrike's tunnel table
 	// attributes a stream by token and only this list turns one back into a
 	// device name, on this machine. Every leaf is kept, not just the newest:
 	// an older leaf stays valid in the cluster until its NotAfter, after a
@@ -246,6 +248,18 @@ type Keeper struct {
 	// most needs named. Empty on a device enrolled before 2026-11-10, which
 	// the report shows as not enrolled from this machine until re-enrolled.
 	LeafTokens []string `yaml:"leaf_tokens,omitempty"`
+	// KeySHA256 are the SPKI fingerprints (identity.KeyFingerprint) of every
+	// key this machine certified for the device, oldest first. Enroll refuses
+	// a key recorded under another device or instance, or on a revoked
+	// device, and re-issues only to the device's newest key (ADR 0020
+	// decision 3: a key is never reused across devices, instances or a
+	// revoke).
+	KeySHA256 []string `yaml:"key_sha256,omitempty"`
+	// RevokedKeySHA256 is every fingerprint this device held when it was
+	// revoked, copied here by 'keeper revoke' and never cleared. Re-enrolment
+	// clears Revoked, deliberately; this list is what stops it readmitting a
+	// key certified before the revoke.
+	RevokedKeySHA256 []string `yaml:"revoked_key_sha256,omitempty"`
 }
 
 // Kernel records the in-cluster TechnoCore.

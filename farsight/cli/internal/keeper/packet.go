@@ -7,6 +7,11 @@
 //   - A keeper holds a derived scope BUNDLE and its own device leaf. It never
 //     holds the master keyring, and it never holds the instance CA key — so a
 //     stolen keeper can re-seed and cannot mint another keeper.
+//   - A keeper's private key is made on the keeper, and nothing here sends it
+//     anywhere (ADR 0020 decision 3). The device sends a request carrying
+//     the public key; the packet that comes back carries a certificate for
+//     that key and the bundle, and never a key — install refuses a
+//     certificate for any other key as a security event.
 //   - A keeper is OUTBOUND-ONLY. It dials FatLine; nothing listens on it, so
 //     every flow of key material starts on the operator's own hardware.
 //   - A keeper never clears a deliberate seal. "Sealed because restarted" and
@@ -18,6 +23,7 @@
 //     stays under it, which is why the ledger has to actually be read.
 //
 // [ADR 0008]: ../../../../docs/adr/0008-in-cluster-key-delivery.md
+// [ADR 0020]: ../../../../docs/adr/0020-instance-pki-ecdsa-p256.md
 package keeper
 
 import (
@@ -30,8 +36,14 @@ import (
 	"github.com/sofmon/farcast/datasphere"
 )
 
-// packetVersion is the wire schema of an enrolment packet.
-const packetVersion = 1
+// packetVersion is the wire schema of an enrolment packet. Version 1 carried
+// the device's private key, minted on the operator's machine; ADR 0020 retired
+// it, and version 2 carries a certificate for a key the device made.
+const packetVersion = 2
+
+// recordVersion is the schema of keeper.yaml, the installed keeper's record.
+// It is its own number: the record did not change shape when the packet did.
+const recordVersion = 1
 
 // DefaultBudget and DefaultWindow bound how often a keeper may re-seed before
 // it refuses and asks for a human.
@@ -49,10 +61,11 @@ const (
 // Packet is what an operator hands to a device to enrol it.
 //
 // It carries three things that must travel together and nothing else: the
-// device's own leaf, what it needs to reach and verify the instance, and the
-// scope bundle it will push. Assembling it is the operator's act, on the
-// operator's machine — a packet never comes through the instance, which must
-// not become a distributor of the material it is fed.
+// certificate for the key the device made, what it needs to reach and verify
+// the instance, and the scope bundle it will push. It carries no private key:
+// the device's key never left the device. Assembling it is the operator's
+// act, on the operator's machine — a packet never comes through the instance,
+// which must not become a distributor of the material it is fed.
 type Packet struct {
 	Version  int    `yaml:"version"`
 	Instance string `yaml:"instance"`
@@ -68,7 +81,10 @@ type Packet struct {
 
 	CACertPEM   []byte `yaml:"ca_cert_pem"`
 	LeafCertPEM []byte `yaml:"leaf_cert_pem"`
-	LeafKeyPEM  []byte `yaml:"leaf_key_pem"`
+	// LeafKeyPEM is read only to be refused: a version 2 packet never
+	// carries a private key, and 'keeper enroll' never sets it. A packet that
+	// holds one was not made by this build's enroll (ADR 0020).
+	LeafKeyPEM []byte `yaml:"leaf_key_pem,omitempty"`
 
 	// Bundle is a marshalled datasphere.Bundle: scope keys and their ids. It
 	// is exactly what an unsealed keyholder already holds in RAM, and no more
@@ -82,15 +98,26 @@ type Packet struct {
 	IssuedAt time.Time     `yaml:"issued_at"`
 }
 
-// Validate checks a packet is internally complete.
+// Validate checks a packet is internally complete, and carries no key.
 func (p *Packet) Validate() error {
 	switch {
 	case p == nil:
 		return fmt.Errorf("keeper: no packet")
+	case p.Version == 1:
+		return fmt.Errorf("keeper: this is a version 1 packet, which carries the device's private key; ADR 0020 retired it " +
+			"(docs/adr/0020-instance-pki-ecdsa-p256.md). Enrol the device again by request: 'farcast keeper request <instance>' " +
+			"on the device, then 'farcast keeper enroll … --request' on the operator's machine")
 	case p.Version != packetVersion:
 		return fmt.Errorf("keeper: packet version %d is not supported by this build", p.Version)
+	case len(p.LeafKeyPEM) > 0:
+		return fmt.Errorf("keeper: this packet carries a private key, which a version 2 packet never does (ADR 0020): " +
+			"'farcast keeper enroll' did not write it. Do not install it; tell the operator")
 	case strings.TrimSpace(p.Instance) == "":
 		return fmt.Errorf("keeper: packet names no instance")
+	case ValidateInstance(p.Instance) != nil:
+		// Install joins this name into a directory path, reads keys from it,
+		// and prints it in a security event.
+		return ValidateInstance(p.Instance)
 	case ValidateDevice(p.Device) != nil:
 		return ValidateDevice(p.Device)
 	case strings.TrimSpace(p.Carrier) == "":
@@ -99,8 +126,8 @@ func (p *Packet) Validate() error {
 		return fmt.Errorf("keeper: packet carries no server name, so the device cannot verify what answers")
 	case len(p.CACertPEM) == 0:
 		return fmt.Errorf("keeper: packet carries no CA certificate, so the device cannot verify the instance at all")
-	case len(p.LeafCertPEM) == 0 || len(p.LeafKeyPEM) == 0:
-		return fmt.Errorf("keeper: packet carries no device identity")
+	case len(p.LeafCertPEM) == 0:
+		return fmt.Errorf("keeper: packet carries no device certificate")
 	case len(p.Bundle) == 0:
 		return fmt.Errorf("keeper: packet carries no bundle, so the device has nothing to re-seed with")
 	case p.Budget <= 0:
@@ -111,7 +138,8 @@ func (p *Packet) Validate() error {
 	return nil
 }
 
-// Zero overwrites the packet's key material in place.
+// Zero overwrites the packet's key material in place: the bundle, and a
+// private key a packet should never have carried.
 //
 // Hygiene rather than a guarantee, exactly as datasphere.Bundle.Zero says of
 // itself: the garbage collector may already have copied these bytes. It
@@ -148,15 +176,27 @@ func Open(data []byte, passphrase string) (*Packet, error) {
 	}
 	defer clear(plaintext)
 	var p Packet
-	if err := yaml.Unmarshal(plaintext, &p); err != nil {
-		// The parser quotes source around an error, and this source is key
-		// material. Only the shape is reported.
-		return nil, fmt.Errorf("keeper: the packet did not decode")
-	}
-	if err := p.Validate(); err != nil {
+	if err := decodePacket(plaintext, &p); err != nil {
 		return nil, err
 	}
 	return &p, nil
+}
+
+// decodePacket decodes plaintext into p and validates it. On a refusal it
+// zeroes what it decoded first: the packets refused for carrying a private
+// key are exactly the ones whose decoded key and bundle Zero exists for.
+func decodePacket(plaintext []byte, p *Packet) error {
+	if err := yaml.Unmarshal(plaintext, p); err != nil {
+		p.Zero()
+		// The parser quotes source around an error, and this source is key
+		// material. Only the shape is reported.
+		return fmt.Errorf("keeper: the packet did not decode")
+	}
+	if err := p.Validate(); err != nil {
+		p.Zero()
+		return err
+	}
+	return nil
 }
 
 // MaxDeviceLen bounds a device name. It becomes part of a certificate URI and

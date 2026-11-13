@@ -318,6 +318,14 @@ func ensureIdentity(env *Env, name string, connected bool) (config.MTLSMaterial,
 		if err != nil {
 			return config.MTLSMaterial{}, fmt.Errorf("load identity for %q: %w", name, err)
 		}
+		// ADR 0020: the instance PKI is ECDSA P-256. A store minted before it
+		// holds an Ed25519 CA, which Apple's TLS can neither present nor
+		// accept and FatLine no longer loads; there is no CA rotation, so the
+		// way out is a new instance. Refused here, before anything is dialled
+		// or applied, for connect and redeploy alike.
+		if err := identity.RequireP256CA(m.CACertPEM); err != nil {
+			return config.MTLSMaterial{}, fmt.Errorf("instance %q: %w — 'farcast release %s', then 'farcast install'", name, err, name)
+		}
 		return m, nil
 	}
 	mat, err := identity.Mint(name)

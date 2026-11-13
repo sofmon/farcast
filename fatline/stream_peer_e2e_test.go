@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"log/slog"
 	"strings"
 	"sync"
@@ -110,6 +111,17 @@ func keeperAndOperator(t *testing.T, cfg fatline.Config, device string) (keeper,
 	return keeper, operator, keeperCert, operatorCert
 }
 
+// leafOf parses a client certificate's leaf, as FatLine's handshake hands it
+// to the token: LeafToken takes the parsed certificate, never raw DER.
+func leafOf(t *testing.T, c tls.Certificate) *x509.Certificate {
+	t.Helper()
+	leaf, err := x509.ParseCertificate(c.Certificate[0])
+	if err != nil {
+		t.Fatalf("parse leaf: %v", err)
+	}
+	return leaf
+}
+
 // relay opens a route, moves a few bytes and closes it, so the relay
 // finishes and its event is emitted.
 func relay(t *testing.T, conn *tunnel.Conn, route string) {
@@ -136,8 +148,8 @@ func relay(t *testing.T, conn *tunnel.Conn, route string) {
 func TestTunnelStreamsNameTheirPeer(t *testing.T) {
 	events := &eventLog{}
 	keeper, operator, keeperCert, operatorCert := keeperAndOperator(t, fatline.Config{Events: events}, "laptop")
-	keeperToken := identity.LeafToken(keeperCert.Certificate[0])
-	operatorToken := identity.LeafToken(operatorCert.Certificate[0])
+	keeperToken := identity.LeafToken(leafOf(t, keeperCert))
+	operatorToken := identity.LeafToken(leafOf(t, operatorCert))
 	if keeperToken == operatorToken {
 		t.Fatal("the two leaves share a token; the test would prove nothing")
 	}
@@ -235,7 +247,7 @@ func TestNoKeeperNameOrTokenReachesFatLinesLog(t *testing.T) {
 	if strings.Contains(out, device) {
 		t.Errorf("a keeper's device name reached FatLine's log:\n%s", out)
 	}
-	if token := identity.LeafToken(keeperCert.Certificate[0]); strings.Contains(out, token) {
+	if token := identity.LeafToken(leafOf(t, keeperCert)); strings.Contains(out, token) {
 		t.Errorf("a keeper's leaf token reached FatLine's log:\n%s", out)
 	}
 }
