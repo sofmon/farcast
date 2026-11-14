@@ -564,3 +564,114 @@ func TestLoadOperatorLeafNeedsNoCAKey(t *testing.T) {
 		t.Error("LoadInstanceMTLS succeeded without a CA key; the test proves nothing")
 	}
 }
+
+// TestSystemImagesRoundTrip: every origin, with every field a build records,
+// reads back exactly (ADR 0023 decision 4).
+func TestSystemImagesRoundTrip(t *testing.T) {
+	d := testDir(t)
+	if err := d.CreateInstance("prod"); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+	const repo = "us-central1-docker.pkg.dev/proj-1/farcast-prod/system/"
+	digest := func(c byte) string { return "@sha256:" + strings.Repeat(string(c), 64) }
+	built := time.Date(2026, 11, 13, 15, 58, 28, 0, time.UTC)
+	in := &InstanceMetadata{
+		Name: "prod",
+		SystemImages: map[string]SystemImage{
+			"fatline":     {Image: repo + "fatline" + digest('e'), Origin: OriginEmbedded, Go: "go1.27.4", Farcast: "v0.1.0"},
+			"shrike":      {Image: repo + "shrike" + digest('f'), Origin: OriginOperator, Go: "go1.27.5", Farcast: "v0.1.0", BuiltAt: built, Source: "/Users/op/src/farcast"},
+			"technocore":  {Image: repo + "technocore" + digest('d'), Origin: OriginDevelopment, Go: "go1.27.4", Farcast: "dev", BuiltAt: built, Source: "/work/farcast"},
+			"datasphered": {Image: "registry.example/ds" + digest('c'), Origin: OriginNamed, Farcast: "v0.1.0"},
+		},
+	}
+	if err := d.SaveInstanceMetadata("prod", in); err != nil {
+		t.Fatalf("SaveInstanceMetadata: %v", err)
+	}
+	out, err := d.LoadInstanceMetadata("prod")
+	if err != nil {
+		t.Fatalf("LoadInstanceMetadata: %v", err)
+	}
+	if len(out.SystemImages) != 4 {
+		t.Fatalf("read back %d system images, want 4: %+v", len(out.SystemImages), out.SystemImages)
+	}
+	for name, want := range in.SystemImages {
+		if got := out.SystemImages[name]; got != want {
+			t.Errorf("%s round-tripped to %+v, want %+v", name, got, want)
+		}
+	}
+	// A named or embedded image was never built here: no time is written for it.
+	raw, err := os.ReadFile(filepath.Join(d.InstancePath("prod"), metadataFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(string(raw), "built_at"); n != 2 {
+		t.Errorf("built_at written %d times, want only for the two builds:\n%s", n, raw)
+	}
+}
+
+// TestSystemImagesMergePerKey: two commands deploying different components at
+// once each keep their own record, and only one key moved on both sides is a
+// conflict, named by its key.
+func TestSystemImagesMergePerKey(t *testing.T) {
+	d := testDir(t)
+	if err := d.Ensure(); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	if err := d.CreateInstance("prod"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	old := SystemImage{Image: "r/system/fatline@sha256:" + strings.Repeat("0", 64), Origin: OriginEmbedded, Go: "go1.27.3", Farcast: "v1"}
+	if err := d.SaveInstanceMetadata("prod", &InstanceMetadata{Name: "prod", SystemImages: map[string]SystemImage{"fatline": old}}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// "kernel deploy" reads the record...
+	kernel, err := d.LoadInstanceMetadata("prod")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	// ...while "redeploy" records a new FatLine.
+	fatline := SystemImage{Image: "r/system/fatline@sha256:" + strings.Repeat("e", 64), Origin: OriginEmbedded, Go: "go1.27.4", Farcast: "v2"}
+	if _, err := d.UpdateInstanceMetadata("prod", func(m *InstanceMetadata) error {
+		m.SystemImages["fatline"] = fatline
+		return nil
+	}); err != nil {
+		t.Fatalf("redeploy's write: %v", err)
+	}
+	// kernel deploy writes back its stale copy with its own key added.
+	technocore := SystemImage{Image: "r/system/technocore@sha256:" + strings.Repeat("e", 64), Origin: OriginEmbedded, Go: "go1.27.4", Farcast: "v2"}
+	if kernel.SystemImages == nil {
+		kernel.SystemImages = map[string]SystemImage{}
+	}
+	kernel.SystemImages["technocore"] = technocore
+	if err := d.SaveInstanceMetadata("prod", kernel); err != nil {
+		t.Fatalf("a write to another component conflicted: %v", err)
+	}
+	got, err := d.LoadInstanceMetadata("prod")
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if got.SystemImages["fatline"] != fatline {
+		t.Errorf("redeploy's fatline record was lost: %+v", got.SystemImages["fatline"])
+	}
+	if got.SystemImages["technocore"] != technocore {
+		t.Errorf("kernel deploy's technocore record was lost: %+v", got.SystemImages["technocore"])
+	}
+
+	// The same key moved differently on both sides is a real conflict.
+	mine, err := d.LoadInstanceMetadata("prod")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if _, err := d.UpdateInstanceMetadata("prod", func(m *InstanceMetadata) error {
+		m.SystemImages["technocore"] = SystemImage{Image: "r/system/technocore@sha256:" + strings.Repeat("a", 64), Origin: OriginNamed}
+		return nil
+	}); err != nil {
+		t.Fatalf("other writer: %v", err)
+	}
+	mine.SystemImages["technocore"] = SystemImage{Image: "r/system/technocore@sha256:" + strings.Repeat("b", 64), Origin: OriginOperator}
+	err = d.SaveInstanceMetadata("prod", mine)
+	if !errors.Is(err, ErrMetadataConflict) || !strings.Contains(err.Error(), "SystemImages[technocore]") {
+		t.Fatalf("colliding save = %v, want ErrMetadataConflict naming SystemImages[technocore]", err)
+	}
+}

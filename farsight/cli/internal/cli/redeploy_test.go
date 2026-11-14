@@ -28,6 +28,7 @@ func testRedeploy(p planck.Provider, b imageBuilder) *redeployCommand {
 	c.findSource = func(string) (string, error) {
 		return "", errors.New("no farcast checkout at or above the working directory")
 	}
+	asRelease(&c.fatlineDeployer, nil)
 	return c
 }
 
@@ -165,8 +166,8 @@ func TestRedeployDeploysThePreflightedDigest(t *testing.T) {
 	if got := onlyFatline(fb.resolved); len(got) != 1 || got[0] != want {
 		t.Fatalf("preflighted %v, want [%s] derived from the instance registry", got, want)
 	}
-	if len(fb.built) != 0 {
-		t.Fatal("a preflight hit must not build anything")
+	if len(fb.built) != 0 || len(fb.embedded) != 0 {
+		t.Fatal("a tag that already holds the carried image must not be built or pushed")
 	}
 	if fb.user != "oauth2accesstoken" || fb.pass != "tok" {
 		t.Errorf("preflight used %q/%q, want the minted registry token", fb.user, fb.pass)
@@ -174,7 +175,7 @@ func TestRedeployDeploysThePreflightedDigest(t *testing.T) {
 	if len(fp.ensured) != 1 {
 		t.Fatalf("EnsureRegistry called %d times, want 1 (idempotent ensure)", len(fp.ensured))
 	}
-	pinned := pinnedRef(want, "a")
+	pinned := pinnedRef(want, tagDigest)
 	if len(fc.applied) != 1 || !bytes.Contains(fc.applied[0], []byte(pinned)) {
 		t.Fatalf("deploy did not carry the digest-pinned image %s:\n%s", pinned, fc.applied)
 	}
@@ -230,11 +231,10 @@ func TestRedeployBuildsTheImageWhenTheRegistryHasNone(t *testing.T) {
 	}
 	opts := fb.built[0]
 	if opts.SourceDir != "/checkouts/farcast" || opts.Package != "./fatline/cmd/fatline" ||
-		opts.Ref != instanceImageRef(name) || opts.BinaryPath != "/fatline" ||
-		len(opts.Entrypoint) != 1 || opts.Entrypoint[0] != "/fatline" {
+		opts.Repository != pinnedRepository(instanceImageRef(name)) || opts.BinaryPath != "/fatline" {
 		t.Fatalf("build options = %+v", opts)
 	}
-	pushed := pinnedRef(opts.Ref, "b")
+	pushed := pinnedRef(opts.Repository, "b")
 	if len(fc.applied) != 1 || !bytes.Contains(fc.applied[0], []byte(pushed)) {
 		t.Fatalf("deploy did not carry the pushed digest %s:\n%s", pushed, fc.applied)
 	}
@@ -254,7 +254,7 @@ func TestRedeployReappliesAnUnchangedImage(t *testing.T) {
 	dir := config.Dir(t.TempDir())
 	const name = "prod"
 	connectedInstance(t, dir, name)
-	pinned := pinnedRef(instanceImageRef(name), "a") // what the fake builder resolves to
+	pinned := pinnedRef(instanceImageRef(name), tagDigest) // what the version tag holds: the carried image
 	recordRunningImage(t, dir, name, pinned)
 
 	fc := &fakeCluster{}
@@ -354,7 +354,7 @@ func TestRedeployJSONOutput(t *testing.T) {
 		t.Fatalf("result=%+v", res)
 	}
 	if res.Registry != "us-central1-docker.pkg.dev/proj-1/farcast-prod" ||
-		res.PreviousImage != previous || res.Image != pinnedRef(instanceImageRef(name), "a") || !res.ImageChanged {
+		res.PreviousImage != previous || res.Image != pinnedRef(instanceImageRef(name), tagDigest) || !res.ImageChanged {
 		t.Fatalf("images not reported: %+v", res)
 	}
 	if errb := env.Err.(*bytes.Buffer).String(); strings.Contains(errb, "[y/N]") {
@@ -397,12 +397,11 @@ func TestRedeployNeverMintsIdentity(t *testing.T) {
 	}
 }
 
-// TestRedeploySourceForcesARebuild is the whole point of the command's most
-// important path. The image tag is derived from the *CLI's* version, which does
-// not move when FatLine's own code changes — so a preflight against a connected
-// instance always hits the image that is already there. If --source did not
-// force a rebuild, an operator patching a FatLine security bug would redeploy
-// their own stale image and be told it succeeded.
+// TestRedeploySourceForcesARebuild is the operator's own patch path (ADR 0023
+// decision 6). An operator build is its own image, under its own source- tag
+// and its own record, so --source always builds and nothing is looked up
+// first: the version tag holds only the image this farcast carries, and
+// redeploying that would ship none of the operator's fix.
 func TestRedeploySourceForcesARebuild(t *testing.T) {
 	dir := config.Dir(t.TempDir())
 	const name = "prod"
@@ -431,6 +430,25 @@ func TestRedeploySourceForcesARebuild(t *testing.T) {
 	if fc.applied == nil {
 		t.Error("rebuilt but never applied the workload")
 	}
+	if len(fb.embedded) != 0 {
+		t.Errorf("--source pushed the carried image too: %v", fb.embedded)
+	}
+	meta, _ := dir.LoadInstanceMetadata(name)
+	for _, c := range []string{"fatline", "shrike"} {
+		if rec := meta.SystemImages[c]; rec.Origin != config.OriginOperator || rec.Source != builtFrom(c, fb) {
+			t.Errorf("%s recorded as %+v, want operator-built from the --source checkout", c, rec)
+		}
+	}
+}
+
+// builtFrom is the checkout the fake build of component c was given.
+func builtFrom(c string, fb *fakeBuilder) string {
+	for _, o := range fb.built {
+		if strings.HasSuffix(o.Repository, "/system/"+c) {
+			return o.SourceDir
+		}
+	}
+	return ""
 }
 
 // TestRedeployRejectsBothImageFlags: "deploy exactly this" and "build from here"

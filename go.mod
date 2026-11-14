@@ -2,7 +2,7 @@ module github.com/sofmon/farcast
 
 go 1.26
 
-toolchain go1.27.0
+toolchain go1.27.4
 
 require (
 	cloud.google.com/go/auth v0.18.2

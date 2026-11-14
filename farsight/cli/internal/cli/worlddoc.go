@@ -15,6 +15,7 @@ import (
 	dsdeploy "github.com/sofmon/farcast/datasphere/deploy"
 	"github.com/sofmon/farcast/farsight/cli/internal/buildinfo"
 	"github.com/sofmon/farcast/farsight/cli/internal/cluster"
+	"github.com/sofmon/farcast/farsight/cli/internal/components"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/keyholder"
 	fldeploy "github.com/sofmon/farcast/fatline/deploy"
@@ -253,6 +254,11 @@ type worldComponent struct {
 	Ready   *int    `json:"ready"`
 	Desired *int    `json:"desired"`
 	Version *string `json:"version"`
+	// Go is the Go release that compiled the component's image, from this
+	// machine's record of where that image came from (ADR 0023 decision 6).
+	// It is set exactly when Version is and that record names the same
+	// image; otherwise null, never guessed.
+	Go *string `json:"go"`
 }
 
 type worldGroup struct {
@@ -643,6 +649,17 @@ func digestVersion(image string) string {
 	return "sha256:" + digest[:12]
 }
 
+// matchedGo is the Go release recorded for a component's image, when the
+// record names exactly that image and says which Go compiled it.
+func matchedGo(meta *config.InstanceMetadata, name, image string) *string {
+	rec, ok := meta.SystemImages[name]
+	if !ok || image == "" || rec.Image != image || rec.Go == "" {
+		return nil
+	}
+	v := rec.Go
+	return &v
+}
+
 // matchedVersion is the version of the image the record says was deployed,
 // when the cluster runs exactly that image. A cluster running something else
 // gets no version: it is reported, never guessed.
@@ -694,6 +711,9 @@ func (b *worldBuilder) components() {
 		c.State = workloadState(w.Ready, w.Desired)
 		c.Ready, c.Desired = ptr(w.Ready), ptr(w.Desired)
 		c.Version = matchedVersion(w.Images, image)
+		if c.Version != nil {
+			c.Go = matchedGo(meta, name, image)
+		}
 		return c
 	}
 	boundary := component(roleBoundary, fldeploy.DefaultName, recorded(meta.Registry))
@@ -719,6 +739,7 @@ func (b *worldBuilder) components() {
 		monitor.Ready, monitor.Desired = ptr(fatline.Ready), ptr(fatline.Desired)
 		if v := digestVersion(fatline.Images[1]); v != "" {
 			monitor.Version = &v
+			monitor.Go = matchedGo(meta, components.Shrike.Name, fatline.Images[1])
 		}
 	}
 	switch {

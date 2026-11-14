@@ -176,6 +176,9 @@ func (t *tool) kubectlEnvironment(kubeconfig string) string {
 	if v, ok := t.env("KUBECONFIG"); !ok || !sameFile(v, kubeconfig) {
 		return "KUBECONFIG does not name the kubeconfig given with --kubeconfig"
 	}
+	if v, ok := t.env("KUBERC"); !ok || v != "off" {
+		return "KUBERC is not off, so a kuberc file could change this call"
+	}
 	if reason := t.gcloudDirectory(); reason != "" {
 		return reason
 	}

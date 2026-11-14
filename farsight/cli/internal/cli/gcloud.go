@@ -24,6 +24,19 @@ import (
 // account is that account and whose project is the instance's — chosen by
 // reading gcloud's own configuration files, never by running gcloud, and never
 // by asking which configuration happens to be active.
+//
+// kubectl's environment for those reads is cluster.Env, pinned with the
+// choice made here (cluster.GCloud{Dir, Config}): built from an allowlist, so
+// nothing the shell exported reaches it unless the allowlist names it. KUBECONFIG
+// names the instance's own kubeconfig, so the plugin's token cache is keyed by
+// the instance's context; CLOUDSDK_CONFIG names the directory the guard read,
+// and CLOUDSDK_ACTIVE_CONFIG_NAME the configuration it chose. Every other
+// CLOUDSDK_* variable is dropped, CLOUDSDK_AUTH_ACCESS_TOKEN and
+// CLOUDSDK_CORE_ACCOUNT among them, which gcloud honours over its files. Only
+// 'world' is pinned. Every other command runs kubectl unpinned until ADR 0023's
+// M2 and keeps the parent's KUBECONFIG, so it fills the cache entry 'world'
+// reads only when the shell's own KUBECONFIG already names the instance's
+// kubeconfig: the residual ADR 0021 decision 9 documents, which M2 removes.
 
 // gcloudConfig is one named gcloud configuration, as its file states it.
 type gcloudConfig struct {
@@ -271,35 +284,4 @@ func chooseGCloud(environ []string, name string, meta *config.InstanceMetadata) 
 			source, name, meta.Project, consideredText(configs, meta.GCloudAccount), name))
 	}
 	return gcloudChoice{Dir: dir, Source: source, Config: match[0].Name}, nil
-}
-
-// kubectlEnv is the whole environment kubectl runs with for a read: this
-// process's own, minus every variable that would choose an identity or a
-// cluster behind the guard's back, plus the three that pin them.
-//
-//   - KUBECONFIG names the instance's own kubeconfig, so the auth plugin's
-//     token cache — keyed by the current context of $KUBECONFIG, not by
-//     kubectl's --kubeconfig — is keyed by this instance's context, never by
-//     a work cluster's.
-//   - CLOUDSDK_CONFIG names the directory the guard read, so gcloud checks
-//     the same files.
-//   - CLOUDSDK_ACTIVE_CONFIG_NAME names the configuration the guard chose.
-//
-// Dropped: KUBECONFIG, every CLOUDSDK_* variable (CLOUDSDK_AUTH_ACCESS_TOKEN
-// and CLOUDSDK_CORE_ACCOUNT among them, which gcloud honours over its files),
-// and GOOGLE_APPLICATION_CREDENTIALS.
-func kubectlEnv(parent []string, kubeconfig string, c gcloudChoice) []string {
-	out := make([]string, 0, len(parent)+3)
-	for _, kv := range parent {
-		k, _, _ := strings.Cut(kv, "=")
-		if k == "KUBECONFIG" || k == "GOOGLE_APPLICATION_CREDENTIALS" || strings.HasPrefix(k, "CLOUDSDK_") {
-			continue
-		}
-		out = append(out, kv)
-	}
-	return append(out,
-		"KUBECONFIG="+kubeconfig,
-		"CLOUDSDK_CONFIG="+c.Dir,
-		"CLOUDSDK_ACTIVE_CONFIG_NAME="+c.Config,
-	)
 }

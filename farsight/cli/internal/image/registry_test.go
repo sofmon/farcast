@@ -26,6 +26,10 @@ type testRegistry struct {
 	blobs     map[string][]byte
 	manifests map[string]manifestEntry
 	sawAuth   bool
+	requests  []string // "METHOD /path", in order
+
+	// putDigestLie, when set, is the digest a manifest PUT claims to have stored.
+	putDigestLie string
 
 	requireAuth bool
 	user, pass  string
@@ -56,12 +60,31 @@ func (r *testRegistry) sawCredentials() bool {
 	return r.sawAuth
 }
 
-func (r *testRegistry) serve(w http.ResponseWriter, req *http.Request) {
-	if req.Header.Get("Authorization") != "" {
-		r.mu.Lock()
-		r.sawAuth = true
-		r.mu.Unlock()
+// calls lists the requests the registry has seen, in order.
+func (r *testRegistry) calls() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.requests...)
+}
+
+// writes lists the requests that could have stored something: POST, PATCH, PUT.
+func (r *testRegistry) writes() []string {
+	var out []string
+	for _, c := range r.calls() {
+		if strings.HasPrefix(c, "POST ") || strings.HasPrefix(c, "PATCH ") || strings.HasPrefix(c, "PUT ") {
+			out = append(out, c)
+		}
 	}
+	return out
+}
+
+func (r *testRegistry) serve(w http.ResponseWriter, req *http.Request) {
+	r.mu.Lock()
+	r.requests = append(r.requests, req.Method+" "+req.URL.Path)
+	if req.Header.Get("Authorization") != "" {
+		r.sawAuth = true
+	}
+	r.mu.Unlock()
 	if r.requireAuth {
 		want := "Basic " + base64.StdEncoding.EncodeToString([]byte(r.user+":"+r.pass))
 		if req.Header.Get("Authorization") != want {
@@ -98,6 +121,9 @@ func (r *testRegistry) serveManifest(w http.ResponseWriter, req *http.Request, r
 		entry := manifestEntry{body: body, mediaType: req.Header.Get("Content-Type")}
 		r.manifests[repo+":"+id] = entry
 		r.manifests[repo+":"+digest] = entry
+		if r.putDigestLie != "" {
+			digest = r.putDigestLie
+		}
 		r.mu.Unlock()
 		w.Header().Set("Docker-Content-Digest", digest)
 		w.WriteHeader(http.StatusCreated)
@@ -232,4 +258,33 @@ func seedBase(t *testing.T, r *testRegistry, repo, tag string) string {
 	r.manifests[repo+":"+digest] = entry
 	r.mu.Unlock()
 	return r.host() + "/" + repo + ":" + tag + "@" + digest
+}
+
+// seededDocuments returns the three documents a release commits for the base
+// seedBase published at pinned: the index, its linux/amd64 manifest and that
+// manifest's config, exactly as the registry holds them.
+func seededDocuments(t *testing.T, r *testRegistry, pinned string) (index, manifest, config []byte) {
+	t.Helper()
+	ref, err := oci.ParseReference(pinned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	index, ok := r.manifest(ref.Repository, ref.Digest)
+	if !ok {
+		t.Fatalf("no index at %s", pinned)
+	}
+	var idx oci.Index
+	if err := json.Unmarshal(index, &idx); err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range idx.Manifests {
+		if d.Platform != nil && d.Platform.Architecture == "amd64" {
+			manifest, _ = r.manifest(ref.Repository, d.Digest)
+		}
+	}
+	var m oci.Manifest
+	if err := json.Unmarshal(manifest, &m); err != nil {
+		t.Fatal(err)
+	}
+	return index, manifest, r.blob(ref.Repository, m.Config.Digest)
 }

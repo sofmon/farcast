@@ -5,10 +5,28 @@
 # never reaches — and the Apple client's Swift guardrails (ADR 0021 decision
 # 4), so it needs a Mac with Xcode.
 #
+#   0  tools, and exactly go.mod's toolchain Go (its toolchain line), from
+#      the module cache: everything below runs under it, gofmt included;
+#      no GOFLAGS or GOEXPERIMENT, from the environment or the go env file
 #   1  gofmt over every Go file outside vendor/
+#   1b what FarCast's binaries can start (ADR 0023 decision 1): every package
+#      farcast (5 platforms, untagged and farcast_embedded) and the four
+#      components link, parsed with go/ast and compared with the reviewed
+#      exec-allowlist.txt (about 1.3 s; about 7 s with an empty build cache)
+#   1c THIRD_PARTY_NOTICES is what vendor/ and the pinned Go give (about
+#      0.1 s once the release tool is built; about 8 s with an empty build
+#      cache)
 #   2  dependencies: go.sum, go.mod and vendor/ agree, byte for byte, and the
 #      vendored module count is the reviewed one; the SDK has none at all
-#   3  build, natively and for linux/amd64 the way the images are built
+#   3  build, natively and for linux/amd64, the components' platform
+#   3b reproducibility (ADR 0023 decision 4): three release builds of the
+#      components, their layers and the Linux farcast that carries them are
+#      identical, two of them with an empty build cache; the components and
+#      layers built from a copy at another path are the same; the tagged
+#      components package vets, tests and builds, on the pinned base's
+#      documents under farsight/cli/internal/image/base/ (about 1.4 min and
+#      about 2.1 GiB of temporary files at the peak, build caches included;
+#      steps 1b, 1c and 3b measured 2026-11-13 on the dev Mac)
 #   4  go vet, including the integration- and walk-tagged files (type-checked,
 #      never run)
 #   5  golangci-lint, mandatory — a missing linter fails the check
@@ -31,8 +49,9 @@
 #   8  the randomized hand-over model, with --model (minutes)
 #
 # There is no hosted CI. Run this before every commit and before every live
-# walk; it is offline by construction (GOPROXY=off, and a Swift client with
-# nothing to resolve) and touches no cloud.
+# walk; it is offline by construction (GOPROXY=off, with exactly go.mod's
+# toolchain Go, from the module cache, and a Swift client with nothing to
+# resolve) and touches no cloud.
 #
 # Usage:  ./check.sh [--model]
 #   FARCAST_MODEL=1 is the same as --model; FARCAST_MODEL_SEEDS, _STEPS,
@@ -90,15 +109,29 @@ for arg in "$@"; do
   esac
 done
 
-ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# Physical, not logical: the go command takes its working directory from $PWD,
+# and step 3b's tagged commands use the release tool's overlay, whose keys are
+# the symlink-resolved source path. Through a symlinked checkout they would
+# match nothing.
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 cd "$ROOT"
 TMP=$(mktemp -d)
 
+# The exact Go this check runs with: go.mod's toolchain line, the release FarCast
+# is built with (ADR 0023 M0). It is the only place the number is written; the
+# release tool reads it with the same rule.
+PIN=$(awk '$1 == "toolchain" { print $2 }' go.mod)
+[ -n "$PIN" ] || die "go.mod has no toolchain line: it names the exact Go this check and the release use"
+
 # An operator's environment must not change what is checked: GOFLAGS could add
-# -tags=integration and run cloud tests, a newer toolchain directive could be
-# downloaded, a module could be fetched, and a stray go.work would change what
-# ./... means. The model is run only by step 8, never inside the race step.
-export GOWORK=off GOTOOLCHAIN=local GOPROXY=off GOFLAGS=
+# -tags=integration and run cloud tests, another Go could check the code, a
+# module could be fetched, and a stray go.work would change what ./... means.
+# GOTOOLCHAIN names the pin exactly, and GOPROXY=off means it is never fetched
+# here: step 0 says how to fetch it once. An empty GOFLAGS does not override
+# one set with 'go env -w' (the go command falls back to its env file), so
+# step 0 also refuses a GOFLAGS or GOEXPERIMENT that file sets. The model is
+# run only by step 8, never inside the race step.
+export GOWORK=off GOTOOLCHAIN="$PIN" GOPROXY=off GOFLAGS=
 unset FARCAST_MODEL
 # Likewise for Xcode: XCODE_XCCONFIG_FILE overrides every build setting of
 # every target, so a stray one could switch a Swift guardrail off.
@@ -106,7 +139,9 @@ unset XCODE_XCCONFIG_FILE
 
 # ---- tools -------------------------------------------------------------------
 step "0 — tools"
-for tool in go gofmt golangci-lint diff mktemp mkfifo; do
+# gofmt is not looked up on PATH: GOTOOLCHAIN never switches that binary, so
+# step 1 runs the pinned toolchain's own (GOFMT, below).
+for tool in go golangci-lint diff mktemp mkfifo; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     if [ "$tool" = golangci-lint ]; then
       die "golangci-lint is not on PATH. The lint guardrail is mandatory (AGENTS.md, ADR 0002); install it (e.g. brew install golangci-lint) and re-run."
@@ -125,16 +160,24 @@ done
 XCODE=$(xcodebuild -version 2>/dev/null | awk 'NR == 1')
 [ -n "$XCODE" ] || die "xcodebuild cannot find Xcode; point xcode-select at it (xcode-select -s /Applications/Xcode.app)"
 SWIFTV=$(swift --version 2>/dev/null | awk 'NR == 1' | sed 's/.*Swift version \([0-9.]*\).*/\1/')
-GOV=$(go env GOVERSION)
-WANT=$(awk '$1=="toolchain"{sub(/^go/,"",$2);print $2}' go.mod)
-if [ -n "$WANT" ] && ! awk -v have="${GOV#go}" -v want="$WANT" 'BEGIN{
-    n=split(have,h,"."); m=split(want,w,".");
-    for(i=1;i<=(n>m?n:m);i++){a=(i<=n?h[i]+0:0); b=(i<=m?w[i]+0:0); if(a>b) exit 0; if(a<b) exit 1}
-    exit 0}'; then
-  die "go is $GOV, older than the module's toolchain go$WANT. The images build with golang:1.27 (fatline/Containerfile), so an older local Go checks code the images never compile."
+# With GOPROXY=off a pin that is not in the module cache fails here. The
+# fetch is the developer's deliberate act, once per pin: GOENV=off, because an
+# empty variable does not override a value set with 'go env -w', and the
+# module cache named, so the download lands where this check looks.
+if ! GOV=$(go env GOVERSION 2>"$TMP/goversion.log"); then
+  MC=$(GOTOOLCHAIN=local go env GOMODCACHE)
+  die "this check runs with exactly $PIN (go.mod's toolchain line), and it is not in the module cache. Fetch it once, checked against sum.golang.org whatever your go env file says: env GOENV=off GOMODCACHE=$MC GOFLAGS= GOPROXY=https://proxy.golang.org GOSUMDB=sum.golang.org GONOSUMDB= GOPRIVATE= GOINSECURE= GOTOOLCHAIN=$PIN go version (about 74 MB from proxy.golang.org), then re-run."
 fi
+[ "$GOV" = "$PIN" ] || die "go reports $GOV under GOTOOLCHAIN=$PIN; this check runs with exactly $PIN (go.mod's toolchain line)"
+# Not GOENV=off here, which could hide a GOMODCACHE the pin is found in.
+for v in GOFLAGS GOEXPERIMENT; do
+  val=$(go env "$v") || die "go env $v failed (above)"
+  [ -z "$val" ] || die "go env $v is set (in the environment, or with 'go env -w' in $(go env GOENV)); it changes what is built and checked. Unset it ('unset $v', or 'go env -u $v') and re-run."
+done
+GOFMT="$(go env GOROOT)/bin/gofmt"
+[ -x "$GOFMT" ] || die "the pinned toolchain has no gofmt at $GOFMT"
 LINT=$(golangci-lint version 2>&1 | awk 'NR == 1')
-ok "$GOV (module toolchain go$WANT)"
+ok "$GOV (exactly go.mod's toolchain line), gofmt from the same toolchain"
 ok "$LINT"
 ok "$XCODE, Swift $SWIFTV"
 
@@ -143,12 +186,30 @@ step "1 — gofmt (both modules)"
 # Pruned rather than filtered: never run 'gofmt -w .' at the root — it rewrites
 # vendor/, which step 2 would then refuse.
 FMT=$(find . \( -path ./vendor -o -path ./.claude -o -path ./.git -o -path ./bin \) -prune \
-  -o -name '*.go' -type f -print0 | xargs -0 gofmt -l)
+  -o -name '*.go' -type f -print0 | xargs -0 "$GOFMT" -l)
 if [ -n "$FMT" ]; then
   printf '%s\n' "$FMT" >&2
   die "gofmt would change the files above; format them one by one (gofmt -w <file>), never the repository root"
 fi
 ok "every Go file is formatted"
+
+# ---- 1b. what the binaries can start --------------------------------------------
+# Before step 2, so a vendored change reaches this gate rather than tripping
+# step 2's byte comparison first. The listing is a syntax-tree checker (package
+# execgate), not a grep: it resolves each file's import names and sees
+# references, aliases, dot imports and the release's tagged files.
+step "1b — what FarCast's binaries can start (ADR 0023 decision 1)"
+go run ./farsight/cli/cmd/farcast-release execsites > "$TMP/exec.txt" \
+  || die "listing what FarCast's binaries can start failed (above)"
+grep -v '^#' exec-allowlist.txt | diff -u - "$TMP/exec.txt" \
+  || die "what FarCast's binaries can start has changed (above). Review every added line under ADR 0023 decision 1, and update exec-allowlist.txt in the same commit."
+ok "farcast on 5 platforms (untagged and farcast_embedded) and 4 components: $(wc -l < "$TMP/exec.txt" | tr -d ' ') reviewed lines"
+
+# ---- 1c. third-party notices ------------------------------------------------------
+step "1c — third-party notices"
+go run ./farsight/cli/cmd/farcast-release notices > "$TMP/notices" && cmp -s "$TMP/notices" THIRD_PARTY_NOTICES \
+  || die "THIRD_PARTY_NOTICES is not what vendor/ and the pinned Go give; regenerate it with 'go run ./farsight/cli/cmd/farcast-release notices -o THIRD_PARTY_NOTICES' and review the diff"
+ok "THIRD_PARTY_NOTICES is what vendor/ and $PIN give"
 
 # ---- 2. dependencies -------------------------------------------------------------
 offline_hint() {
@@ -194,9 +255,41 @@ step "3 — build"
 go build -mod=vendor ./...
 ok "root, native"
 GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -mod=vendor -trimpath ./...
-ok "root, linux/amd64 without cgo — how the images are built"
+ok "root, linux/amd64 without cgo (the components' platform)"
 (cd sdk/go && go build ./... && GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath ./...)
 ok "sdk/go, native and linux/amd64"
+
+# ---- 3b. reproducibility --------------------------------------------------------
+# Three release builds of this tree (a with the warm cache, b and d each with
+# an empty one) must give byte-identical SHA256SUMS: the components, their
+# layers, the digest table and the Linux farcast that carries them. A fourth,
+# c, builds the layers from a copy at another absolute path, and must give the
+# same eight components and layers; its table differs by design (the copy has
+# no .git, so its revision is empty). -allow-dirty because the tree is usually
+# dirty here; a release refuses dirty, and that is unit-tested. The working
+# tree is never written: the layers are overlaid.
+step "3b — reproducibility (ADR 0023 decision 4)"
+R="$TMP/repro"; mkdir -p "$R"
+rel() { go run ./farsight/cli/cmd/farcast-release "$@"; }
+rel build -allow-dirty -targets linux/amd64 -out "$R/a"               >"$R/a.log" 2>&1 || { tail -n 30 "$R/a.log" >&2; die "the release build failed (above)"; }
+GOCACHE="$R/cache-b" rel build -allow-dirty -targets linux/amd64 -out "$R/b" >"$R/b.log" 2>&1 || { tail -n 30 "$R/b.log" >&2; die "the release build failed with an empty cache (above)"; }
+GOCACHE="$R/cache-d" rel build -allow-dirty -targets linux/amd64 -out "$R/d" >"$R/d.log" 2>&1 || { tail -n 30 "$R/d.log" >&2; die "the release build failed with an empty cache (above)"; }
+mkdir "$R/src"
+tar -cf - --exclude=./.git --exclude=./.claude --exclude=./bin \
+  --exclude=./farsight/client/apple/.build --exclude=./farsight/client/apple/FarSightKit/.build \
+  --exclude=./farsight/client/apple/FarSightKit/.swiftpm --exclude=./farsight/cli/internal/components/layers . | tar -xf - -C "$R/src"
+(cd "$R/src" && GOCACHE="$R/cache-c" go run ./farsight/cli/cmd/farcast-release layers -out "$R/c") >"$R/c.log" 2>&1 \
+  || { tail -n 30 "$R/c.log" >&2; die "the layers build from another path failed (above)"; }
+cmp -s "$R/a/SHA256SUMS" "$R/b/SHA256SUMS" && cmp -s "$R/a/SHA256SUMS" "$R/d/SHA256SUMS" \
+  || { diff "$R/a/SHA256SUMS" "$R/b/SHA256SUMS" >&2; diff "$R/a/SHA256SUMS" "$R/d/SHA256SUMS" >&2; die "three builds of the same tree differ (above): the components, their layers or the Linux farcast that carries them are not reproducible"; }
+SAME='  (components/[a-z]+|layers/[a-z]+\.tar\.gz)$'
+grep -E "$SAME" "$R/a/SHA256SUMS" > "$R/a.same"; grep -E "$SAME" "$R/c/SHA256SUMS" > "$R/c.same"
+[ "$(wc -l < "$R/a.same")" -eq 8 ] && cmp -s "$R/a.same" "$R/c.same" \
+  || { diff "$R/a.same" "$R/c.same" >&2; die "the components or layers built from another source path differ from those built here (above)"; }
+go vet -tags farcast_embedded -overlay "$R/a/overlay.json" ./farsight/cli/internal/components/ ./farsight/cli/cmd/farcast/
+go test -tags farcast_embedded -overlay "$R/a/overlay.json" ./farsight/cli/internal/components/
+go build -tags farcast_embedded -overlay "$R/a/overlay.json" -o "$R/farcast-host" ./farsight/cli/cmd/farcast
+ok "three builds: identical components, layers, table and Linux farcast; the same components and layers from another path; the tagged package vets, tests and builds for this host"
 
 # ---- 4. vet ----------------------------------------------------------------------
 step "4 — go vet"

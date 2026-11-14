@@ -172,7 +172,7 @@ func (c *worldCommand) Run(ctx context.Context, env *Env, args []string) error {
 	}
 	kubeconfig := env.ConfigDir.InstanceKubeconfigPath(name)
 	g := &gatherer{
-		cl:       c.newCluster(kubeconfig, kubectlEnv(environ, kubeconfig, choice)),
+		cl:       c.newCluster(kubeconfig, cluster.Env(environ, kubeconfig, cluster.GCloud{Dir: choice.Dir, Config: choice.Config})),
 		timeouts: c.timeouts,
 		paths:    localPaths(env.ConfigDir, choice, environ),
 	}

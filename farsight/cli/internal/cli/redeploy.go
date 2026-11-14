@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sofmon/farcast/farsight/cli/internal/components"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/fatline/deploy"
 )
@@ -51,10 +52,25 @@ func (*redeployCommand) Usage() string {
 Usage: farcast redeploy <instance> [flags]
 
 Re-render and re-apply FatLine's workload for an instance that is already
-connected: resolve the image (building and pushing it into the instance's own
-registry when it is missing, exactly as connect does), render the workload for
-the carrier the instance is already bound to, apply it, and wait for the
-rollout. Use it to roll out a FatLine fix without destroying the instance.
+connected: resolve FatLine's and Shrike's images exactly as connect does (the
+images this farcast carries, pushed into the instance's own registry when the
+version tag does not already hold them), render the workload for the carrier
+the instance is already bound to, apply it, and wait for the rollout. Use it to
+roll out a FatLine fix without destroying the instance.
+
+A release farcast keeps an operator-built image (--source) recorded for this
+instance until --embedded or --source is passed, and an image another farcast
+version deployed too: replacing either is said, and needs --embedded. A farcast
+built from source carries no images. With no --source, it keeps an operator or
+development build recorded for this instance, and compiles any image it does
+not keep from a farcast checkout on this machine with its Go, after its build
+confirmation (which --yes answers), recording it as a development build.
+
+--fatline-image deploys FatLine's image exactly as given, with nothing looked
+up or pushed for it, so it works when the registry cannot be ensured: Shrike
+is then not deployed, and the command says so. Otherwise Shrike's image is
+still resolved as above, so --embedded beside it replaces Shrike's alone, and
+needs the registry.
 
 It never provisions a carrier and never mints an mTLS identity — those stay
 'farcast connect's job — so nothing new becomes billable and the public
@@ -65,28 +81,37 @@ in the workload template rather than in the image; it says so plainly when that
 is what happened.
 
 Flags:
-  -y, --yes         Skip the confirmation of what will change, and the build
-                    confirmation (required non-interactively)
-  --fatline-image   FatLine container image to deploy (default: this instance's
-                    own registry, at system/fatline for this farcast version)
-  --source <dir>    farcast checkout to build FatLine's image from
-                    (default: auto-detected from the working directory)
+  -y, --yes         Skip the confirmation of what will change and, for --source
+                    or a source build, the build confirmation (required
+                    non-interactively)
+  --fatline-image   FatLine image to deploy, digest-pinned
+                    (repository@sha256:…) (default: the image this farcast
+                    carries, pushed to the instance registry's system/fatline)
+  --source <dir>    farcast checkout to build the images from with this
+                    machine's Go (a release farcast needs none); recorded as
+                    operator-built
+  --embedded        Deploy the images this farcast carries, replacing an
+                    operator-built image or one another farcast version
+                    deployed (never implied by --yes). Beside --fatline-image
+                    it governs Shrike's image alone
 
 With --output json the command prints one JSON result and never prompts.`)
 }
 
 func (c *redeployCommand) SetFlags(fs *flag.FlagSet) {
-	c.setYesFlag(fs, "skip the change confirmation and the build confirmation")
+	c.setYesFlag(fs, "skip the change confirmation and, for --source or a source build, the build confirmation")
 	c.setImageFlags(fs)
 }
 
 func (c *redeployCommand) Run(ctx context.Context, env *Env, args []string) error {
 	c.ensureDefaults()
-	// The two image flags are opposed intents — "deploy exactly this" versus
-	// "build from here and deploy that" — so accepting both would mean silently
-	// honouring one. Naming the conflict beats guessing.
-	if c.fatlineImage != "" && c.sourceDir != "" {
-		return usagef("--fatline-image deploys an image as given and --source builds a new one; pass one or the other")
+	// The image flags are opposed intents — "deploy exactly this", "build from
+	// here and deploy that", "deploy what this farcast carries" — so accepting
+	// two for the same image would mean silently honouring one. Naming the
+	// conflict beats guessing. --fatline-image and --embedded are not such a
+	// pair: the first names FatLine's image, the second then governs Shrike's.
+	if err := c.checkImageFlags(); err != nil {
+		return err
 	}
 	if len(args) == 0 {
 		return usagef("redeploy requires an instance name")
@@ -95,6 +120,11 @@ func (c *redeployCommand) Run(ctx context.Context, env *Env, args []string) erro
 		return usagef("redeploy takes one instance name; got %d arguments", len(args))
 	}
 	name := args[0]
+	// Before the record is read: a farcast whose carried components it must
+	// not push is refused before anything is asked or called.
+	if err := c.precheck(); err != nil {
+		return err
+	}
 
 	meta, err := env.ConfigDir.LoadInstanceMetadata(name)
 	if err != nil {
@@ -128,24 +158,25 @@ func (c *redeployCommand) Run(ctx context.Context, env *Env, args []string) erro
 	// have to be built and pushed into it. A failure only stops a redeploy that
 	// needs it: with an explicit --fatline-image nothing is looked up or pushed,
 	// so an instance whose stored credential predates ADR 0007's role can still
-	// be repaired.
+	// be repaired. --embedded beside it needs the registry for Shrike's image.
 	reg, err := c.ensureRegistry(ctx, env, name, meta)
 	if err != nil {
-		if c.fatlineImage == "" {
-			return err
+		if c.registryRequired() {
+			return c.registryFailed(err)
 		}
 		fprintf(env.Err, "Warning: %v\n", err)
 		fprintln(env.Err, "Continuing: --fatline-image names an image this redeploy neither looks up nor pushes.")
 	}
 
-	img, err := c.resolveImage(ctx, env, reg)
+	resolved, err := c.resolveImage(ctx, env, reg, meta)
 	if err != nil {
 		return err
 	}
+	img := resolved.Ref
 	// A redeploy is how an instance connected before the monitor shipped gets
 	// one: the sidecar's image is resolved the same way FatLine's is, and
-	// built if the registry does not have it yet.
-	shrikeImg, err := c.resolveSidecarImage(ctx, env, reg)
+	// pushed if the registry does not have it yet.
+	shrike, err := c.resolveSidecarImage(ctx, env, reg, meta)
 	if err != nil {
 		return err
 	}
@@ -164,7 +195,7 @@ func (c *redeployCommand) Run(ctx context.Context, env *Env, args []string) erro
 		return errors.New("redeploy not confirmed")
 	}
 
-	manifests, err := renderWorkload(img, shrikeImg, carrier, mtls)
+	manifests, err := renderWorkload(img, shrike.Ref, carrier, mtls)
 	if err != nil {
 		return err
 	}
@@ -194,6 +225,8 @@ func (c *redeployCommand) Run(ctx context.Context, env *Env, args []string) erro
 	}
 
 	recordDeployedImage(meta, img)
+	recordSystemImage(meta, components.FatLine.Name, resolved.Record)
+	recordSystemImage(meta, components.Shrike.Name, shrike.Record)
 	meta.UpdatedAt = time.Now().UTC()
 	if err := env.ConfigDir.SaveInstanceMetadata(name, meta); err != nil {
 		fprintf(env.Err, "Warning: %s is running, but recording that locally failed: %v\n", img, err)

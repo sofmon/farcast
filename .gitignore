@@ -29,3 +29,8 @@
 /farsight/client/apple/FarSightKit/.build/
 /farsight/client/apple/FarSightKit/.swiftpm/
 xcuserdata/
+
+# The layers and digest table a release build embeds in farcast (ADR 0023
+# decision 4). farcast-release supplies them with go build -overlay from its
+# -out directory; they are never written here and never committed.
+/farsight/cli/internal/components/layers/

@@ -113,6 +113,8 @@ This lists clusters (read-only) — the cheapest possible check:
 go run ./planck/cmd/planck validate --provider gke --project "$PROJECT_ID" --credentials "$KEY"
 ```
 
+*(2026-11-13: since [ADR 0023](../adr/0023-one-download-farcast.md) M0 the harness sets `GOOGLE_API_USE_CLIENT_CERTIFICATE=false` and unsets `GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES` in its own process before anything else runs, as `farcast` does, so the Google libraries it links never start a certificate provider or an executable credential source. Nothing to set by hand.)*
+
 ✅ Expect: `credentials OK`. A permissions or API error here means stop and fix
 Step 1/2 before continuing.
 
@@ -262,7 +264,9 @@ test prompting and the destructive confirmation:
 ## Optional — isolate Planck with the harness
 
 If `install` fails and you want to tell whether the problem is Planck or the CLI,
-drive the provider directly (this creates/deletes a real cluster too):
+drive the provider directly (this creates/deletes a real cluster too). The
+harness turns client certificates and executable credential sources off in its
+own process, as above (ADR 0023 M0, 2026-11-13):
 
 ```bash
 go run ./planck/cmd/planck create --provider gke --project "$PROJECT_ID" --location "$REGION" --name farcast-probe --credentials "$KEY"

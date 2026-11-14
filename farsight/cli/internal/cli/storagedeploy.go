@@ -10,6 +10,7 @@ import (
 	"time"
 
 	dsdeploy "github.com/sofmon/farcast/datasphere/deploy"
+	"github.com/sofmon/farcast/farsight/cli/internal/components"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/fatline/identity"
 	"github.com/sofmon/farcast/technocore/pricing"
@@ -66,10 +67,17 @@ func (*storageDeployCommand) Synopsis() string {
 
 func (*storageDeployCommand) Usage() string {
 	return strings.TrimSpace(`
-Usage: farcast storage deploy <instance> [--datasphered-image REF] [--source DIR] [-y]
+Usage: farcast storage deploy <instance> [--datasphered-image REF@sha256:… | --source DIR | --embedded] [-y]
 
 Deploy the keyholder: the one in-cluster process that holds DataSphere key
 material, and holds it only in memory.
+
+Its image is the one this farcast carries, pushed into the instance's own
+registry when the version tag does not already hold it. --datasphered-image
+deploys a digest-pinned image as given; --source builds one from a farcast
+checkout with this machine's Go and records it as operator-built, which later
+deploys keep until --embedded or --source. A release farcast replaces an image
+another farcast version deployed only with --embedded.
 
 It comes up SEALED and stays sealed until you run 'farcast storage unseal'.
 That is not a defect — key material never rests on cloud infrastructure, so it
@@ -85,9 +93,10 @@ not, so the command you reach for during an outage cannot make one worse.`)
 }
 
 func (c *storageDeployCommand) SetFlags(fs *flag.FlagSet) {
-	fs.StringVar(&c.image, "datasphered-image", "", "keyholder container image (default: the instance registry's system/datasphered)")
-	fs.StringVar(&c.deployer.sourceDir, "source", "", "farcast checkout to build the image from (default: auto-detected)")
-	c.deployer.setYesFlag(fs, "skip the cost confirmation")
+	fs.StringVar(&c.image, "datasphered-image", "", imageFlagUsage("keyholder", components.Datasphered))
+	fs.StringVar(&c.deployer.sourceDir, "source", "", "farcast checkout to build the keyholder's image from with this machine's Go; recorded as operator-built")
+	c.deployer.setEmbeddedFlag(fs)
+	c.deployer.setYesFlag(fs, "skip the cost confirmation and, for --source or a source build, the build confirmation")
 }
 
 func (c *storageDeployCommand) Run(ctx context.Context, env *Env, args []string) error {
@@ -96,9 +105,17 @@ func (c *storageDeployCommand) Run(ctx context.Context, env *Env, args []string)
 	}
 	name := args[0]
 	c.ensureDefaults()
-	c.deployer.component = keyholderComponent
+	c.deployer.component = components.Datasphered
 	c.deployer.fatlineImage = c.image
 	c.deployer.ensureDefaults()
+	if err := c.deployer.checkImageFlags(); err != nil {
+		return err
+	}
+	// Before the record is read: a farcast whose carried components it must
+	// not push is refused before anything is asked or called.
+	if err := c.deployer.precheck(); err != nil {
+		return err
+	}
 
 	meta, err := env.ConfigDir.LoadInstanceMetadata(name)
 	if err != nil {
@@ -184,10 +201,11 @@ func (c *storageDeployCommand) Run(ctx context.Context, env *Env, args []string)
 	if err != nil {
 		return err
 	}
-	img, err := c.deployer.resolveImage(ctx, env, reg)
+	resolved, err := c.deployer.resolveImage(ctx, env, reg, meta)
 	if err != nil {
 		return err
 	}
+	img := resolved.Ref
 
 	mtls, err := env.ConfigDir.LoadInstanceMTLS(name)
 	if err != nil {
@@ -242,6 +260,7 @@ func (c *storageDeployCommand) Run(ctx context.Context, env *Env, args []string)
 		meta.Keyholder.ScopePrefix = previous.ScopePrefix
 		meta.Keyholder.Generation = previous.Generation
 	}
+	recordSystemImage(meta, components.Datasphered.Name, resolved.Record)
 	meta.UpdatedAt = time.Now().UTC()
 	if err := env.ConfigDir.SaveInstanceMetadata(name, meta); err != nil {
 		return fmt.Errorf("record the keyholder before deploying it: %w", err)

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/sofmon/farcast/datasphere"
+	"github.com/sofmon/farcast/farsight/cli/internal/components"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/keyholder"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
@@ -470,19 +471,14 @@ func TestDeployRequiresConsentForStandingCost(t *testing.T) {
 // The two system workloads must not share an image path, or one would
 // overwrite the other in the instance's registry.
 func TestSystemComponentsHaveDistinctImagePaths(t *testing.T) {
-	if fatlineComponent.ImagePath == keyholderComponent.ImagePath {
+	if components.FatLine.ImagePath == components.Datasphered.ImagePath {
 		t.Fatal("FatLine and the keyholder share an image path")
 	}
-	if fatlineComponent.BinaryPath == keyholderComponent.BinaryPath {
+	if components.FatLine.BinaryPath == components.Datasphered.BinaryPath {
 		t.Fatal("FatLine and the keyholder share a binary path")
 	}
-	a := instanceSystemImage("reg.example/proj/inst", fatlineComponent)
-	b := instanceSystemImage("reg.example/proj/inst", keyholderComponent)
-	if a == b {
-		t.Fatalf("both components resolve to %s", a)
-	}
-	if !strings.Contains(b, "system/datasphered") {
-		t.Errorf("the keyholder image is not under system/: %s", b)
+	if !strings.HasPrefix(components.Datasphered.ImagePath, "system/") {
+		t.Errorf("the keyholder image is not under system/: %s", components.Datasphered.ImagePath)
 	}
 }
 
@@ -504,6 +500,8 @@ func testStorageDeploy(fp *fakeProvider, fb *fakeBuilder) *storageDeployCommand 
 		return fp, nil
 	}
 	c.deployer.newBuilder = func(func(string)) imageBuilder { return fb }
+	c.deployer.findSource = func(string) (string, error) { return "/checkouts/farcast", nil }
+	asRelease(&c.deployer, nil)
 	return c
 }
 

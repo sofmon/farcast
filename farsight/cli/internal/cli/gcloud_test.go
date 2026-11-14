@@ -119,25 +119,42 @@ func TestGCloudCoreReadsOnlyTheCoreSection(t *testing.T) {
 	}
 }
 
-// kubectl's environment pins the identity: the instance's own kubeconfig, the
-// directory the guard read, the configuration it chose — and nothing that
-// would choose another identity behind it.
-func TestKubectlEnvironmentPinsTheIdentity(t *testing.T) {
+// kubectl's environment for 'world' is cluster.Env, pinned: the instance's own
+// kubeconfig, the directory the guard read and the configuration it chose,
+// KUBERC=off, and from the shell only what the allowlist names. Nothing that
+// would choose another identity, and no proxy, reaches it (ADR 0021 decision
+// 9; ADR 0023 M0).
+func TestWorldKubectlEnvironmentIsPinnedAndBuilt(t *testing.T) {
+	f := newWorldFixture(t)
+	gdir := envValueOf(f.cmd.environ(), "CLOUDSDK_CONFIG")
 	parent := []string{
-		"PATH=/usr/local/bin:/usr/bin", "HOME=/Users/op", "LANG=en_GB.UTF-8",
-		"KUBECONFIG=/Users/op/.kube/work", "CLOUDSDK_AUTH_ACCESS_TOKEN=planted", "CLOUDSDK_CORE_ACCOUNT=someone@work.example",
-		"CLOUDSDK_CORE_PROJECT=work-prod", "CLOUDSDK_CONFIG=/Users/op/.config/gcloud-work", "CLOUDSDK_ACTIVE_CONFIG_NAME=work",
-		"GOOGLE_APPLICATION_CREDENTIALS=/Users/op/key.json", "CLOUDSDK_AUTH_ACCESS_TOKEN_FILE=/tmp/t",
+		"PATH=/usr/local/bin:relative::/usr/bin", "HOME=/Users/op", "LANG=en_GB.UTF-8",
+		"KUBECONFIG=/Users/op/.kube/work", "KUBERC=/Users/op/.kube/kuberc", "KUBECTL_KUBERC=true",
+		"CLOUDSDK_AUTH_ACCESS_TOKEN=planted", "CLOUDSDK_CORE_ACCOUNT=someone@work.example",
+		"CLOUDSDK_CORE_PROJECT=work-prod", "CLOUDSDK_CONFIG=" + gdir, "CLOUDSDK_ACTIVE_CONFIG_NAME=work",
+		"CLOUDSDK_AUTH_ACCESS_TOKEN_FILE=/tmp/t", "CLOUDSDK_PYTHON=/opt/python3",
+		"GOOGLE_APPLICATION_CREDENTIALS=/Users/op/key.json", "FARCAST_CONFIG_HOME=/tmp/farcast",
+		"HTTP_PROXY=http://127.0.0.1:9", "HTTPS_PROXY=http://127.0.0.1:9", "ALL_PROXY=socks5://127.0.0.1:9", "NO_PROXY=*",
+		"http_proxy=http://127.0.0.1:9", "https_proxy=http://127.0.0.1:9", "all_proxy=socks5://127.0.0.1:9", "no_proxy=*",
 	}
-	env := kubectlEnv(parent, "/cfg/instances/atlas/kubeconfig.yaml", gcloudChoice{Dir: "/Users/op/.config/gcloud", Config: "personal"})
+	f.cmd.environ = func() []string { return parent }
+	f.run(t)
 	want := []string{
-		"PATH=/usr/local/bin:/usr/bin", "HOME=/Users/op", "LANG=en_GB.UTF-8",
-		"KUBECONFIG=/cfg/instances/atlas/kubeconfig.yaml",
-		"CLOUDSDK_CONFIG=/Users/op/.config/gcloud",
 		"CLOUDSDK_ACTIVE_CONFIG_NAME=personal",
+		"CLOUDSDK_CONFIG=" + gdir,
+		"HOME=/Users/op",
+		"KUBECONFIG=" + f.dir.InstanceKubeconfigPath("atlas"),
+		"KUBERC=off",
+		"LANG=en_GB.UTF-8",
+		"PATH=/usr/local/bin:/usr/bin",
 	}
-	if !slices.Equal(env, want) {
-		t.Errorf("environment\n got %q\nwant %q", env, want)
+	if !slices.Equal(f.kenv, want) {
+		t.Errorf("environment\n got %q\nwant %q", f.kenv, want)
+	}
+	for _, kv := range f.kenv {
+		if k, _, _ := strings.Cut(kv, "="); strings.HasSuffix(strings.ToUpper(k), "_PROXY") {
+			t.Errorf("a proxy reached kubectl: %s", k)
+		}
 	}
 }
 

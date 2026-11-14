@@ -1,21 +1,26 @@
-// Package image builds and publishes FarCast's own container images from the
-// operator's machine, with no container engine anywhere in the loop (ADR 0007).
+// Package image publishes FarCast's own container images to the instance's
+// registry from the operator's machine, with no container engine anywhere in
+// the loop (ADR 0007).
 //
-// The instance owns its registry, and the operator's machine is the only build
-// anchor for the images the instance runs — that is what keeps the trust chain
-// Git repo → operator's machine → the instance's own registry → the instance,
-// with no third party in the runtime path. FarCast's system images earn that
-// treatment cheaply: a static, cross-compiled Go binary laid onto a
-// digest-pinned distroless base has no build steps to execute, so there is
-// nothing a container engine would do here that this package cannot.
+// A released farcast pushes the components it carries. The build anchor is the
+// released, reproducible layers: farcast-release compiles the four components
+// with exactly go.mod's toolchain Go, packs each into a deterministic layer,
+// assembles it on the digest-pinned distroless base, and compiles the layers and
+// their manifest digests into farcast (ADR 0023 decision 4, amending ADR 0010
+// decision 8). PushEmbedded assembles the carried layer on the same base, and
+// refuses before anything is uploaded unless the result is the manifest the
+// release recorded.
 //
-// The shape is therefore: compile with the local Go toolchain (the one tool a
-// source-built farcast already requires), pack the binary into a deterministic
-// layer, append it to the pinned base pulled through the oci package, and push
-// to the instance's registry. Nothing but the base image enters from outside,
-// and the base enters by digest — gcr.io is untrusted transport, not an
-// authority. What comes back out is a digest-pinned reference, because a deploy
-// that names a tag can be redirected by whoever can write that tag.
+// Compiling is the --source path, the operator's own patch path, and the
+// development fallback of a farcast that carries no components. It uses the Go
+// on the operator's PATH under an allowlisted environment, never downloads, and
+// tags what it pushes by its own digest (source-<12 hex>), so an operator build
+// never overwrites the version tag.
+//
+// Either way, nothing but the base image enters from outside, and the base
+// enters by digest: gcr.io is untrusted transport, not an authority. What comes
+// back out is a digest-pinned reference, because a deploy that names a tag can
+// be redirected by whoever can write that tag.
 package image
 
 import (
@@ -45,11 +50,6 @@ const Module = "github.com/sofmon/farcast"
 // Distroless runs as a non-root user, so the bit that matters is world-execute.
 const binaryMode = 0o755
 
-// targetPlatform is what FarCast's system images are built for. GKE Autopilot
-// nodes are amd64, and a mismatch here is the classic silent failure: the
-// kubelet pulls happily and the container dies with an exec format error.
-var targetPlatform = oci.Platform{OS: "linux", Architecture: "amd64"}
-
 // ErrNotFound reports that a reference does not exist in the registry. It is
 // what `farcast connect`'s preflight tests for: a miss means "offer to build
 // and push", while any other failure means "stop and tell the operator".
@@ -59,9 +59,10 @@ var ErrNotFound = oci.ErrNotFound
 // container engine on the operator's machine (ADR 0007).
 type Builder struct {
 	// Compile builds the Go package at pkg (e.g. "./fatline/cmd/fatline") inside
-	// sourceDir for linux/amd64 and returns the static binary. Nil uses the local
-	// Go toolchain; tests inject a fake.
-	Compile func(ctx context.Context, sourceDir, pkg string) ([]byte, error)
+	// sourceDir for ComponentPlatform and returns the static binary with the Go
+	// release that compiled it. Nil uses the local Go toolchain; tests inject a
+	// fake.
+	Compile func(ctx context.Context, sourceDir, pkg string) (Binary, error)
 	// Progress, when set, receives short human-readable progress lines.
 	Progress func(string)
 
@@ -70,96 +71,150 @@ type Builder struct {
 	base string
 }
 
-// Options describes one image build.
+// CreatedBy is the history line of a component's layer: "farcast: " + pkg.
+func CreatedBy(pkg string) string {
+	return "farcast: " + pkg
+}
+
+// ComponentLayer is a component's layer: one regular file at binaryPath, mode
+// 0755, built by oci.BuildLayer. The one layer recipe, for the release step and
+// every push.
+func ComponentLayer(binaryPath string, data []byte) (oci.Layer, error) {
+	return oci.BuildLayer([]oci.File{{Path: binaryPath, Mode: binaryMode, Data: data}})
+}
+
+// Assemble appends a component's layer to base for ComponentPlatform, with
+// Entrypoint []string{binaryPath} and CreatedBy(pkg). The one assembly, for the
+// release step and both pushes.
+func Assemble(base *oci.Image, layer oci.Layer, pkg, binaryPath string) (*oci.Image, error) {
+	return oci.AppendLayer(base, layer, oci.AppendOptions{
+		Platform:   ComponentPlatform,
+		Entrypoint: []string{binaryPath},
+		CreatedBy:  CreatedBy(pkg),
+	})
+}
+
+// SourceTag is the tag an operator build is pushed under: "source-" + the first
+// 12 hex characters of its manifest digest.
+func SourceTag(manifestDigest string) string {
+	hex := strings.TrimPrefix(manifestDigest, "sha256:")
+	if len(hex) > 12 {
+		hex = hex[:12]
+	}
+	return "source-" + hex
+}
+
+// Pushed is what a push returns.
+type Pushed struct {
+	Ref       string // repository@sha256:…, the tag dropped
+	GoVersion string // the Go release that compiled the binary in the top layer
+}
+
+// Options describes one operator build (--source, or the development fallback).
 type Options struct {
-	SourceDir  string   // repo checkout root
-	Package    string   // Go package to compile, e.g. "./fatline/cmd/fatline"
-	Ref        string   // target reference, e.g. <prefix>/system/fatline:<version>
-	BinaryPath string   // path of the binary inside the image, e.g. "/fatline"
-	Entrypoint []string // image entrypoint, e.g. []string{"/fatline"}
+	SourceDir  string // checkout root
+	Package    string // e.g. "./fatline/cmd/fatline"
+	Repository string // <prefix>/system/<component>, with no tag; pushed as :SourceTag(digest)
+	BinaryPath string // e.g. "/fatline"; the entrypoint is []string{BinaryPath}
 }
 
 // validate rejects an incomplete build before anything is compiled, pulled, or
 // billed.
+//
+// Repository is checked on the raw string before it is parsed, because
+// oci.ParseReference fills in "latest" when a reference has neither a tag nor a
+// digest: a parsed reference can never show that a tag was absent.
 func (o Options) validate() error {
 	switch {
 	case o.SourceDir == "":
 		return errors.New("image: no source directory — the build needs a farcast checkout")
 	case o.Package == "":
 		return errors.New("image: no Go package to compile")
-	case o.Ref == "":
-		return errors.New("image: no target image reference")
+	case o.Repository == "":
+		return errors.New("image: no target repository")
+	case strings.Contains(o.Repository, "@"):
+		return fmt.Errorf("image: repository %q must not carry a digest: an operator build is tagged by its own", o.Repository)
+	case strings.LastIndex(o.Repository, ":") > strings.LastIndex(o.Repository, "/"):
+		return fmt.Errorf("image: repository %q must not carry a tag: an operator build is tagged by its own digest", o.Repository)
 	case o.BinaryPath == "" || !strings.HasPrefix(o.BinaryPath, "/"):
 		return fmt.Errorf("image: binary path %q must be absolute inside the image", o.BinaryPath)
-	case len(o.Entrypoint) == 0:
-		return errors.New("image: no entrypoint — the distroless base defines none, so the container would have nothing to run")
+	}
+	if _, err := oci.ParseReference(o.Repository); err != nil {
+		return err
 	}
 	return nil
 }
 
 // BuildAndPush compiles, assembles onto the digest-pinned distroless base, and
-// pushes. It returns the digest-pinned reference of what it pushed.
+// pushes under SourceTag of the manifest digest, so an operator build never
+// overwrites the version tag. It returns the digest-pinned reference of what it
+// pushed and the Go release that compiled it.
 //
 // user and pass authenticate to the target registry only: for Artifact Registry
 // they are the literal "oauth2accesstoken" and a short-lived access token minted
 // in-process from the stored service-account key. They are scoped to that host
 // so the base-image pull stays anonymous — the instance's credentials are never
 // offered to a registry the operator does not own.
-func (b *Builder) BuildAndPush(ctx context.Context, opts Options, user, pass string) (string, error) {
+func (b *Builder) BuildAndPush(ctx context.Context, opts Options, user, pass string) (Pushed, error) {
 	if err := opts.validate(); err != nil {
-		return "", err
+		return Pushed{}, err
 	}
-	target, err := oci.ParseReference(opts.Ref)
+	repo, err := oci.ParseReference(opts.Repository)
 	if err != nil {
-		return "", err
+		return Pushed{}, err
 	}
 	base, err := oci.ParseReference(b.baseRef())
 	if err != nil {
-		return "", fmt.Errorf("image: base image %q: %w", b.baseRef(), err)
+		return Pushed{}, fmt.Errorf("image: base image %q: %w", b.baseRef(), err)
 	}
 	if base.Digest == "" {
-		return "", fmt.Errorf("image: base image %s is not pinned by digest", base)
+		return Pushed{}, fmt.Errorf("image: base image %s is not pinned by digest", base)
 	}
 
-	b.progress("compiling %s for %s", opts.Package, targetPlatform)
-	binary, err := b.compile()(ctx, opts.SourceDir, opts.Package)
+	b.progress("compiling %s for %s", opts.Package, ComponentPlatform)
+	bin, err := b.compile()(ctx, opts.SourceDir, opts.Package)
 	if err != nil {
-		return "", err
+		return Pushed{}, err
 	}
-	if len(binary) == 0 {
-		return "", fmt.Errorf("image: compiling %s produced an empty binary", opts.Package)
+	if len(bin.Data) == 0 {
+		return Pushed{}, fmt.Errorf("image: compiling %s produced an empty binary", opts.Package)
 	}
 
-	client := b.client(target.Registry, user, pass)
+	client := b.client(repo.Registry, user, pass)
 
 	b.progress("fetching base image %s", base)
-	baseImage, err := client.Pull(ctx, base, targetPlatform)
+	baseImage, err := client.Pull(ctx, base, ComponentPlatform)
 	if err != nil {
-		return "", fmt.Errorf("image: pull base %s: %w", base, err)
+		return Pushed{}, fmt.Errorf("image: pull base %s: %w", base, err)
 	}
 
-	layer, err := oci.BuildLayer([]oci.File{{Path: opts.BinaryPath, Mode: binaryMode, Data: binary}})
+	layer, err := ComponentLayer(opts.BinaryPath, bin.Data)
 	if err != nil {
-		return "", err
+		return Pushed{}, err
 	}
-	assembled, err := oci.AppendLayer(baseImage, layer, oci.AppendOptions{
-		Platform:   targetPlatform,
-		Entrypoint: opts.Entrypoint,
-		CreatedBy:  "farcast: " + opts.Package,
-	})
+	assembled, err := Assemble(baseImage, layer, opts.Package, opts.BinaryPath)
 	if err != nil {
-		return "", err
+		return Pushed{}, err
+	}
+	_, digest, err := assembled.ManifestBytes()
+	if err != nil {
+		return Pushed{}, err
 	}
 	b.progress("assembled %d layers, %s of new content", len(assembled.Layers), mib(len(layer.Blob)))
 
+	target := repo
+	target.Tag, target.Digest = SourceTag(digest), ""
 	b.progress("pushing %s", target)
-	digest, err := client.Push(ctx, target, assembled)
+	pushed, err := client.Push(ctx, target, assembled)
 	if err != nil {
-		return "", fmt.Errorf("image: push %s: %w", target, err)
+		return Pushed{}, fmt.Errorf("image: push %s: %w", target, err)
+	}
+	if pushed != digest {
+		return Pushed{}, fmt.Errorf("image: pushed %s as %s, not the %s assembled here", target, pushed, digest)
 	}
 	pinned := target.WithDigest(digest).String()
 	b.progress("pushed %s", pinned)
-	return pinned, nil
+	return Pushed{Ref: pinned, GoVersion: bin.GoVersion}, nil
 }
 
 // Resolve returns the digest-pinned reference for ref, or ErrNotFound.
@@ -196,7 +251,7 @@ func (b *Builder) baseRef() string {
 	return BaseImage
 }
 
-func (b *Builder) compile() func(context.Context, string, string) ([]byte, error) {
+func (b *Builder) compile() func(context.Context, string, string) (Binary, error) {
 	if b.Compile != nil {
 		return b.Compile
 	}
@@ -242,7 +297,7 @@ func (b *Builder) Mirror(ctx context.Context, src, dst, dstUser, dstPass string)
 		return "", fmt.Errorf("image: %s is already in the instance's registry", src)
 	}
 	b.progress("mirroring %s", src)
-	digest, err := b.client(to.Registry, dstUser, dstPass).Copy(ctx, from, to, targetPlatform)
+	digest, err := b.client(to.Registry, dstUser, dstPass).Copy(ctx, from, to, ComponentPlatform)
 	if err != nil {
 		return "", fmt.Errorf("mirror %s into %s: %w", src, to.Repository, err)
 	}

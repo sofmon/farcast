@@ -63,7 +63,7 @@ The read-back is the provider's word about its configuration, not about its beha
 
 For an instance not recorded as system-only, release also says that the applications' output may be among the logs. The output says the dates are approximate: audit entries expire 400 days after *each* write, a project may have changed `_Default`, and metric points expire 24 months after each sample. Ingested entries cannot be deleted per cluster. The `stdout`/`stderr` log names are project-wide, so deleting them would destroy other clusters' logs. For metric data, only deleting the project guarantees it goes sooner.
 
-**6. `farcast logs` stays on kubectl.** It reads the node's file through the API server. Its usage text now says where logs live and who can see them, rather than claiming nothing collects them.
+**6. `farcast logs` stays on kubectl.** It reads the node's file through the API server. Its usage text now says where logs live and who can see them, rather than claiming nothing collects them. *(2026-11-13: [ADR 0023](0023-one-download-farcast.md), accepted that day, changes this at its M2: `logs` reads the pod `log` subresource with an in-process client, still through the provider-run API server. ADR 0023 restates the caller (a read-only service account instead of a human email) and the user agent, and M3b adds where a device subject is logged. Until M2 lands, `logs` runs `kubectl` as here.)*
 
 ## What the provider still sees
 

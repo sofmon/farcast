@@ -2,7 +2,6 @@ package oci
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -35,11 +34,10 @@ func (c *Client) Push(ctx context.Context, ref Reference, im *Image) (string, er
 		}
 	}
 
-	body, err := json.Marshal(im.Manifest)
+	body, digest, err := im.ManifestBytes()
 	if err != nil {
-		return "", fmt.Errorf("oci: encode manifest: %w", err)
+		return "", err
 	}
-	digest := digestOf(body)
 
 	resp, err := c.do(ctx, call{
 		method:   http.MethodPut,

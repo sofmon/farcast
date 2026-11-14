@@ -263,6 +263,8 @@ The conformance vectors include signatures whose r or s needs a 0x00 pad, and on
    - on a physical iPhone, a permanent Secure Enclave key (`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, keychain-formed identity) signs a TLS handshake from a background task with the device locked;
    - the keeper's inner mutual TLS to a Go keyholder test server, carried over a FatLine stream, presents that key, through a Swift loopback relay or ADR 0021 decision 7's Go fallback.
 
+   *(2026-11-13: [ADR 0023](0023-one-download-farcast.md), accepted that day, adds a Mac case beside the permanent key the Context leaves untested, as a probe in its M5: a Secure Enclave P-256 key kept by a Developer ID app without App Sandbox. The candidate is a non-permanent key whose `dataRepresentation` blob sits in a 0600 file, and the probe both creates the key and restores it from that file. It is ADR 0023's M5 dependency, not a 7.5 gate, and it changes nothing this ADR decided.)*
+
 ## Revisit triggers
 
 - Apple's TLS stack advertises ML-DSA (0x0904–0x0906) in its ClientHello. That would make a post-quantum, Secure Enclave-held identity possible on Apple.

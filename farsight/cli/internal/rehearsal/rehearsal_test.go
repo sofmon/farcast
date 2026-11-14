@@ -49,7 +49,9 @@ func TestMain(m *testing.M) {
 	// reports. Every read runs this binary as kubectl, the plugin and gcloud,
 	// a dozen and more times; the children inherit this. It changes nothing
 	// a test asserts: GORACE is no variable the fake kubectl refuses, and
-	// race reports still print.
+	// race reports still print. cluster.Env passes GORACE for exactly this
+	// reason: kubectl's environment is otherwise an allowlist (ADR 0023 M0),
+	// and without it every read here would sleep a second per tool.
 	if os.Getenv("GORACE") == "" {
 		if err := os.Setenv("GORACE", raceQuiet); err != nil {
 			panic(err)
@@ -96,10 +98,12 @@ func startRig(t *testing.T, o rehearsal.Options) *rehearsal.Rig {
 	return rig
 }
 
-// shellNoise are variables a developer's shell may export that 'farcast
-// world' passes on to kubectl (its kubectlEnv drops only KUBECONFIG,
-// GOOGLE_APPLICATION_CREDENTIALS and CLOUDSDK_*), and that the fake kubectl
-// refuses on sight. cli.Main runs in process, with this test's environment.
+// shellNoise are variables a developer's shell may export that the fake
+// kubectl refuses on sight. farcast drops them itself now: kubectl's
+// environment is built from an allowlist (cluster.Env, ADR 0023 M0). The rig
+// still removes them, so that the environment rehearsed is the app's, not
+// whatever the developer's shell holds. cli.Main runs in process, with this
+// test's environment.
 var shellNoise = []string{
 	"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
 	"http_proxy", "https_proxy", "all_proxy", "no_proxy",
@@ -110,9 +114,20 @@ var shellNoise = []string{
 // for these settings — PATH, HOME and CLOUDSDK_CONFIG — after removing what
 // a developer's shell may export. Every test that runs cli.Main calls it.
 // The variables must be absent, not empty.
+//
+// cli.Main changes this process's environment for good: it sets
+// GOOGLE_API_USE_CLIENT_CERTIFICATE=false and unsets
+// GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES (ADR 0023 decision 1). t.Setenv
+// records both first, so each test leaves them as it found them.
 func asTheApp(t *testing.T, rig *rehearsal.Rig) {
 	t.Helper()
 	for _, k := range shellNoise {
+		t.Setenv(k, "")
+		if err := os.Unsetenv(k); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, k := range []string{"GOOGLE_API_USE_CLIENT_CERTIFICATE", "GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES"} {
 		t.Setenv(k, "")
 		if err := os.Unsetenv(k); err != nil {
 			t.Fatal(err)
@@ -610,6 +625,7 @@ func kubectlEnv(t *testing.T, rig *rehearsal.Rig) []string {
 		"KUBECONFIG=" + instanceKubeconfig(rig),
 		"CLOUDSDK_CONFIG=" + rig.GCloudDir,
 		"CLOUDSDK_ACTIVE_CONFIG_NAME=rehearsal",
+		"KUBERC=off",
 		"GORACE=" + os.Getenv("GORACE"), // see TestMain
 	}
 }
@@ -686,6 +702,8 @@ func TestFakeKubectlRefusesWhatMustNotReachIt(t *testing.T) {
 		{"a relative PATH entry", "PATH", "", with(without(base, "PATH"), "PATH=bin:"+rig.Path())},
 		{"another kubeconfig", "KUBECONFIG", "", with(without(base, "KUBECONFIG"), "KUBECONFIG="+filepath.Join(t.TempDir(), "kubeconfig"))},
 		{"the decoy configuration", "another identity", "", with(without(base, "CLOUDSDK_ACTIVE_CONFIG_NAME"), "CLOUDSDK_ACTIVE_CONFIG_NAME=work")},
+		{"kuberc on", "KUBERC", "/nonexistent-kuberc", with(without(base, "KUBERC"), "KUBERC=/nonexistent-kuberc")},
+		{"no KUBERC", "KUBERC", "", without(base, "KUBERC")},
 	} {
 		code, out, errOut := runTool(kubectl, args, c.env)
 		if code != 1 || out != "" || !strings.Contains(errOut, c.names) || (c.value != "" && strings.Contains(errOut, c.value)) {

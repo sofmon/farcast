@@ -53,7 +53,7 @@ All three are mutable after creation (`gcloud … clusters update`, or `ClusterU
 
    This is a FarCast **invariant**, in the same spirit as "Autopilot always on" — with an escape hatch (see 5) rather than a per-install knob. Authorized networks gate only the IP endpoints; the operator's DNS path stays open via IAM (`container.clusters.connect`) and `AllowExternalTraffic`, and the cluster-level `Cluster.MasterAuthorizedNetworksConfig` is left unset (the SDK forbids setting both it and the nested config).
 
-2. **Operator/CLI access is via the DNS endpoint + IAM** (`container.clusters.connect`). The kubeconfig Planck returns uses the **DNS FQDN** (`server: https://uid.<region>.gke.goog`), not a public IP, with the `gke-gcloud-auth-plugin` exec credential.
+2. **Operator/CLI access is via the DNS endpoint + IAM** (`container.clusters.connect`). The kubeconfig Planck returns uses the **DNS FQDN** (`server: https://uid.<region>.gke.goog`), not a public IP, with the `gke-gcloud-auth-plugin` exec credential. *(2026-11-13: [ADR 0023](0023-one-download-farcast.md), accepted that day, replaces the exec credential at its M2. `farcast` then mints the cluster token itself, in memory, as an identity bound to the instance, and still reaches the cluster through the DNS endpoint and IAM. Until M2 lands, the plugin is what authenticates, and the matching Negative consequence below stands.)*
 
 3. **In-cluster components (TechnoCore) use the internal endpoint** — unchanged, no special handling.
 

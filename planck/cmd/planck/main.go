@@ -20,7 +20,27 @@ import (
 )
 
 func main() {
+	if err := hardenEnvironment(); err != nil {
+		fail("planck: cannot harden the process environment: %v\n", err)
+		os.Exit(1)
+	}
 	os.Exit(run(os.Args))
+}
+
+// hardenEnvironment closes the two routes by which vendored Google code starts
+// programs nobody asked for (ADR 0023 decision 1): a certificate provider for
+// a client certificate, and an executable named by an external-account
+// credential. This harness drives real GCP with a service-account key and
+// links the same Google libraries as farcast, so it turns both off in its own
+// process before anything else runs.
+//
+// It is a copy of hardenEnvironment in farsight/cli/internal/cli/cli.go, its
+// twin: two calls, which do not earn a package both could import.
+func hardenEnvironment() error {
+	if err := os.Setenv("GOOGLE_API_USE_CLIENT_CERTIFICATE", "false"); err != nil {
+		return err
+	}
+	return os.Unsetenv("GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES")
 }
 
 func run(args []string) int {

@@ -25,6 +25,7 @@ func testKernelDeploy(fc *fakeCluster, b imageBuilder) *kernelDeployCommand {
 	c.deployer.newBuilder = func(func(string)) imageBuilder { return b }
 	c.deployer.newCluster = func(string) clusterApplier { return fc }
 	c.deployer.findSource = func(string) (string, error) { return "/checkouts/farcast", nil }
+	asRelease(&c.deployer, nil)
 	// deploy refuses to meter a namespace that does not exist, so the ones
 	// these tests meter have to be in the cluster. A test that wants the
 	// refusal sets this itself.

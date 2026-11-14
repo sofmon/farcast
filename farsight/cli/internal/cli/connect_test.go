@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/sofmon/farcast/farsight/cli/internal/buildinfo"
+	"github.com/sofmon/farcast/farsight/cli/internal/components"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/image"
 	"github.com/sofmon/farcast/farsight/cli/internal/oci"
@@ -80,38 +81,171 @@ func (f *fakeConn) Close() error                                       { f.close
 // registry is contacted.
 type fakeBuilder struct {
 	resolved   []string // refs Resolve was asked for, in order
-	pinned     string   // Resolve's answer; derived from the ref when empty
+	pinned     string   // Resolve's answer for a tag; derived from the ref when empty
 	resolveErr error
+	// resolveFn, when set, answers every Resolve instead of the fields above.
+	resolveFn func(ref string) (string, error)
 
 	built    []image.Options // BuildAndPush calls, in order
-	builtRef string          // BuildAndPush's answer; derived from the ref when empty
+	builtRef string          // BuildAndPush's answer; derived from the repository when empty
+	builtGo  string          // the Go BuildAndPush reports; "go1.27.5" when empty
 	buildErr error
+
+	embedded  []image.EmbeddedOptions // PushEmbedded calls, in order
+	pushedRef string                  // PushEmbedded's answer; the Ref's repository @ opts.Manifest when empty
+	pushErr   error
 
 	user, pass string // credentials the most recent call received
 }
 
+// tagDigest is the hex digit a version tag resolves to by default: the one the
+// fake carried components' manifests are made of, so a tag holds the image
+// this farcast carries unless a test says otherwise.
+const tagDigest = "e"
+
 func (f *fakeBuilder) Resolve(_ context.Context, ref, user, pass string) (string, error) {
 	f.resolved = append(f.resolved, ref)
 	f.user, f.pass = user, pass
+	if f.resolveFn != nil {
+		return f.resolveFn(ref)
+	}
 	if f.resolveErr != nil {
 		return "", f.resolveErr
+	}
+	if strings.Contains(ref, "@sha256:") {
+		return ref, nil // a HEAD by digest answers with the digest it was asked for
 	}
 	if f.pinned != "" {
 		return f.pinned, nil
 	}
-	return pinnedRef(ref, "a"), nil
+	return pinnedRef(ref, tagDigest), nil
 }
 
-func (f *fakeBuilder) BuildAndPush(_ context.Context, opts image.Options, user, pass string) (string, error) {
+func (f *fakeBuilder) BuildAndPush(_ context.Context, opts image.Options, user, pass string) (image.Pushed, error) {
 	f.built = append(f.built, opts)
 	f.user, f.pass = user, pass
 	if f.buildErr != nil {
-		return "", f.buildErr
+		return image.Pushed{}, f.buildErr
+	}
+	goV := f.builtGo
+	if goV == "" {
+		goV = "go1.27.5"
 	}
 	if f.builtRef != "" {
-		return f.builtRef, nil
+		return image.Pushed{Ref: f.builtRef, GoVersion: goV}, nil
 	}
-	return pinnedRef(opts.Ref, "b"), nil
+	return image.Pushed{Ref: pinnedRef(opts.Repository, "b"), GoVersion: goV}, nil
+}
+
+func (f *fakeBuilder) PushEmbedded(_ context.Context, opts image.EmbeddedOptions, user, pass string) (image.Pushed, error) {
+	f.embedded = append(f.embedded, opts)
+	f.user, f.pass = user, pass
+	if f.pushErr != nil {
+		return image.Pushed{}, f.pushErr
+	}
+	if f.pushedRef != "" {
+		return image.Pushed{Ref: f.pushedRef, GoVersion: opts.GoVersion}, nil
+	}
+	return image.Pushed{Ref: pinnedRepository(opts.Ref) + "@" + opts.Manifest, GoVersion: opts.GoVersion}, nil
+}
+
+// The build a release farcast in these tests reports, and the revision its
+// carried components were built at.
+const (
+	testVersion  = "v0.9.0"
+	testRevision = "0123456789abcdef0123456789abcdef01234567"
+	carriedGo    = "go1.27.4"
+)
+
+func releaseBuild() buildinfo.Info {
+	return buildinfo.Info{Version: testVersion, Commit: testRevision[:7], Date: "2026-11-13T00:00:00Z", Revision: testRevision}
+}
+
+// sha is a digest made of one repeated hex digit.
+func sha(hexDigit string) string { return "sha256:" + strings.Repeat(hexDigit, 64) }
+
+// fakeCarried stands in for what a farcast carries (ADR 0023 decision 4): by
+// default the four components, whose manifests are sha256:e…, built at
+// testRevision against image.BaseImage. none is a source build: it carries
+// nothing.
+type fakeCarried struct {
+	none     bool
+	base     string
+	revision string
+	modified bool
+	arts     map[string]components.Artifact
+	layerErr error
+}
+
+func newFakeCarried() *fakeCarried {
+	f := &fakeCarried{base: image.BaseImage, revision: testRevision, arts: map[string]components.Artifact{}}
+	for _, c := range components.All() {
+		f.arts[c.Name] = components.Artifact{
+			Component: c, GoVersion: carriedGo,
+			BinarySHA256: strings.Repeat("e", 64), BinarySize: 7,
+			Layer: sha("e"), LayerSize: 5, DiffID: sha("e"), Config: sha("e"),
+			Manifest: sha(tagDigest),
+		}
+	}
+	return f
+}
+
+func (f *fakeCarried) Embedded() bool { return !f.none }
+func (f *fakeCarried) Lookup(name string) (components.Artifact, bool) {
+	if f.none {
+		return components.Artifact{}, false
+	}
+	a, ok := f.arts[name]
+	return a, ok
+}
+func (f *fakeCarried) Layer(name string) ([]byte, error) {
+	if f.none {
+		return nil, components.ErrNotEmbedded
+	}
+	if f.layerErr != nil {
+		return nil, f.layerErr
+	}
+	return []byte("layer " + name), nil
+}
+func (f *fakeCarried) Base() string {
+	if f.none {
+		return ""
+	}
+	return f.base
+}
+func (f *fakeCarried) Revision() string {
+	if f.none {
+		return ""
+	}
+	return f.revision
+}
+func (f *fakeCarried) Modified() bool { return !f.none && f.modified }
+
+// asRelease makes d a release farcast carrying c (newFakeCarried when nil).
+func asRelease(d *fatlineDeployer, c *fakeCarried) {
+	if c == nil {
+		c = newFakeCarried()
+	}
+	d.carried = c
+	d.build = releaseBuild
+	d.now = func() time.Time { return time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC) }
+}
+
+// asSourceBuild makes d a farcast built from source: it carries nothing, and
+// its version is whatever the test says.
+func asSourceBuild(d *fatlineDeployer, version string) {
+	d.carried = &fakeCarried{none: true}
+	d.build = func() buildinfo.Info { return buildinfo.Info{Version: version, Commit: "none", Date: "unknown"} }
+	d.now = func() time.Time { return time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC) }
+}
+
+// pinnedRepository is ref with its tag dropped: the repository an operator
+// build is pushed to, under a tag of its own digest.
+func pinnedRepository(ref string) string {
+	if i := strings.LastIndex(ref, ":"); i > strings.LastIndex(ref, "/") {
+		return ref[:i]
+	}
+	return ref
 }
 
 // pinnedRef mimics what the real builder returns: the tag is dropped, because
@@ -125,6 +259,9 @@ func pinnedRef(ref, hexDigit string) string {
 
 // testConnect wires every cloud-touching seam to a fake, so no connect test can
 // open a cloud provider, reach a registry, or build an image by accident.
+//
+// It is a release farcast carrying the fake components; a test of a source
+// build says so with asSourceBuild.
 func testConnect(p planck.Provider, b imageBuilder) *connectCommand {
 	c := newConnectCommand()
 	c.openProvider = func(*config.InstanceMetadata, *config.InstanceCredentials) (planck.Provider, error) {
@@ -134,6 +271,7 @@ func testConnect(p planck.Provider, b imageBuilder) *connectCommand {
 	c.findSource = func(string) (string, error) {
 		return "", errors.New("no farcast checkout at or above the working directory")
 	}
+	asRelease(&c.fatlineDeployer, nil)
 	return c
 }
 
@@ -144,10 +282,16 @@ func connectedDial(allowlist ...string) func(context.Context, string, tunnel.Cli
 	}
 }
 
-// instanceImageRef is the default --fatline-image for the fake registry: the
-// instance's own registry at the system path, tagged with this build's version.
+// instanceImageRef is FatLine's version tag in the fake registry: the
+// instance's own registry at the system path, tagged with the test release's
+// version.
 func instanceImageRef(instance string) string {
-	return "us-central1-docker.pkg.dev/proj-1/farcast-" + instance + "/system/fatline:" + buildinfo.Get().Version
+	return instanceRepo(instance, "fatline") + ":" + testVersion
+}
+
+// instanceRepo is a component's repository in the fake registry.
+func instanceRepo(instance, component string) string {
+	return "us-central1-docker.pkg.dev/proj-1/farcast-" + instance + "/system/" + component
 }
 
 // onlyFatline filters image refs to FatLine's own, so a test about the
@@ -163,11 +307,11 @@ func onlyFatline(refs []string) []string {
 	return out
 }
 
-// refsOf pulls the image references out of recorded BuildAndPush calls.
+// refsOf pulls the target repositories out of recorded BuildAndPush calls.
 func refsOf(opts []image.Options) []string {
 	var out []string
 	for _, o := range opts {
-		out = append(out, o.Ref)
+		out = append(out, o.Repository)
 	}
 	return out
 }
@@ -256,6 +400,10 @@ func connectedInstance(t *testing.T, dir config.Dir, name string) *config.Instan
 	return meta
 }
 
+// testNamedImage is an operator-named image: digest-pinned, as every image flag
+// must be.
+var testNamedImage = "registry.example/fatline@" + sha("c")
+
 func TestConnectBootstrapsAndReports(t *testing.T) {
 	dir := config.Dir(t.TempDir())
 	const name = "prod"
@@ -266,7 +414,7 @@ func TestConnectBootstrapsAndReports(t *testing.T) {
 	var dialed string
 	c := testConnect(&fakeProvider{}, fb)
 	c.assumeYes = true
-	c.fatlineImage = "img:test" // an explicit override: deployed as given
+	c.fatlineImage = testNamedImage // an explicit override: deployed as given
 	c.newCluster = func(string) clusterApplier { return fc }
 	c.dial = func(_ context.Context, endpoint string, id tunnel.ClientIdentity) (tunnelConn, error) {
 		dialed = endpoint
@@ -298,7 +446,7 @@ func TestConnectBootstrapsAndReports(t *testing.T) {
 	if len(shrikeRefs(fb.resolved)) == 0 {
 		t.Errorf("the Shrike sidecar's image was never resolved: %v", fb.resolved)
 	}
-	if !bytes.Contains(fc.applied[0], []byte("img:test")) {
+	if !bytes.Contains(fc.applied[0], []byte(testNamedImage)) {
 		t.Fatalf("deploy did not use the overridden image:\n%s", fc.applied[0])
 	}
 	meta, _ := dir.LoadInstanceMetadata(name)
@@ -465,14 +613,14 @@ func TestConnectDefaultsImageToTheInstanceRegistry(t *testing.T) {
 	if got := onlyFatline(fb.resolved); len(got) != 1 || got[0] != want {
 		t.Fatalf("preflighted %v, want [%s] derived from the instance registry", got, want)
 	}
-	if len(fb.built) != 0 {
-		t.Fatal("a preflight hit must not build anything")
+	if len(fb.built) != 0 || len(fb.embedded) != 0 {
+		t.Fatal("a tag that already holds the carried image must not be built or pushed")
 	}
 	if fb.user != "oauth2accesstoken" || fb.pass != "tok" {
 		t.Errorf("preflight used %q/%q, want the minted registry token", fb.user, fb.pass)
 	}
 	// The deploy is pinned by digest, not by the tag that was looked up.
-	pinned := pinnedRef(want, "a")
+	pinned := pinnedRef(want, tagDigest)
 	if !bytes.Contains(fc.applied[0], []byte(pinned)) {
 		t.Fatalf("deploy did not carry the digest-pinned image %s:\n%s", pinned, fc.applied[0])
 	}
@@ -514,14 +662,13 @@ func TestConnectBuildsTheImageWhenTheRegistryHasNone(t *testing.T) {
 	}
 	opts := fb.built[0]
 	if opts.SourceDir != "/checkouts/farcast" || opts.Package != "./fatline/cmd/fatline" ||
-		opts.Ref != instanceImageRef(name) || opts.BinaryPath != "/fatline" ||
-		len(opts.Entrypoint) != 1 || opts.Entrypoint[0] != "/fatline" {
+		opts.Repository != pinnedRepository(instanceImageRef(name)) || opts.BinaryPath != "/fatline" {
 		t.Fatalf("build options = %+v", opts)
 	}
 	if fb.user != "oauth2accesstoken" || fb.pass != "tok" {
 		t.Errorf("push used %q/%q, want the minted registry token", fb.user, fb.pass)
 	}
-	pushed := pinnedRef(opts.Ref, "b")
+	pushed := pinnedRef(opts.Repository, "b")
 	if !bytes.Contains(fc.applied[0], []byte(pushed)) {
 		t.Fatalf("deploy did not carry the pushed digest %s:\n%s", pushed, fc.applied[0])
 	}
@@ -539,6 +686,7 @@ func TestConnectMissingImageWithoutCheckoutFails(t *testing.T) {
 	fc := &fakeCluster{ip: "34.0.0.1"}
 	fb := &fakeBuilder{resolveErr: image.ErrNotFound}
 	c := testConnect(&fakeProvider{}, fb) // findSource fails by default
+	asSourceBuild(&c.fatlineDeployer, "dev")
 	c.assumeYes = true
 	c.newCluster = func(string) clusterApplier { return fc }
 	c.dial = func(context.Context, string, tunnel.ClientIdentity) (tunnelConn, error) {
@@ -551,8 +699,9 @@ func TestConnectMissingImageWithoutCheckoutFails(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected an error when the image is missing and there is no checkout")
 	}
-	// The message has to name what is missing and how to supply it.
-	for _, want := range []string{instanceImageRef(name), "checkout", "--source"} {
+	// The message has to name what is missing and how to supply it, and that
+	// a release farcast would need none of it.
+	for _, want := range []string{instanceRepo(name, "fatline"), "checkout", "--source", "a release farcast needs no checkout"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not mention %q", err, want)
 		}
@@ -576,6 +725,7 @@ func TestConnectMissingImageNonInteractiveRequiresYes(t *testing.T) {
 	fc := &fakeCluster{ip: "34.0.0.1"}
 	fb := &fakeBuilder{resolveErr: image.ErrNotFound}
 	c := testConnect(&fakeProvider{}, fb) // assumeYes stays false; env is non-interactive
+	asSourceBuild(&c.fatlineDeployer, "dev")
 	c.findSource = func(string) (string, error) { return "/checkouts/farcast", nil }
 	c.newCluster = func(string) clusterApplier { return fc }
 
@@ -673,6 +823,9 @@ func TestConnectRegistryFailureDoesNotBreakReconnect(t *testing.T) {
 	if !strings.Contains(errb.String(), "Warning") || !strings.Contains(errb.String(), "permission denied") {
 		t.Errorf("expected a warning naming the refusal:\n%s", errb.String())
 	}
+	if !strings.Contains(errb.String(), "Continuing: this connect deploys nothing") {
+		t.Errorf("expected the reconnect to say it deploys nothing:\n%s", errb.String())
+	}
 }
 
 func TestConnectRegistryFailureStopsBootstrap(t *testing.T) {
@@ -724,6 +877,17 @@ func TestConnectExplicitImageSurvivesRegistryFailure(t *testing.T) {
 	if !bytes.Contains(fc.applied[0], []byte(c.fatlineImage)) {
 		t.Fatalf("deploy did not use the supplied image:\n%s", fc.applied[0])
 	}
+	// This connect deploys FatLine, so it does not claim to deploy nothing
+	// (review finding CON2-2), and it says Shrike is left out.
+	errb := env.Err.(*bytes.Buffer).String()
+	for _, want := range []string{"Warning: ", "--fatline-image names an image this connect neither looks up nor pushes", "deploying FatLine alone"} {
+		if !strings.Contains(errb, want) {
+			t.Errorf("stderr does not say %q:\n%s", want, errb)
+		}
+	}
+	if strings.Contains(errb, "deploys nothing") {
+		t.Errorf("a connect that deploys FatLine said it deploys nothing:\n%s", errb)
+	}
 }
 
 func TestConnectUnsupportedCarrier(t *testing.T) {
@@ -769,7 +933,7 @@ func TestConnectJSONOutput(t *testing.T) {
 	if !res.Connected || res.Carrier != "nlb" || res.Endpoint != "34.0.0.2:8443" || res.Identity != "farcast://prod/operator" {
 		t.Fatalf("result=%+v", res)
 	}
-	if res.Registry != "us-central1-docker.pkg.dev/proj-1/farcast-prod" || res.Image != pinnedRef(instanceImageRef(name), "a") {
+	if res.Registry != "us-central1-docker.pkg.dev/proj-1/farcast-prod" || res.Image != pinnedRef(instanceImageRef(name), tagDigest) {
 		t.Fatalf("registry/image not reported: %+v", res)
 	}
 }
@@ -850,7 +1014,7 @@ func TestConnectStatusRejectsImageFlags(t *testing.T) {
 
 	c := testConnect(&fakeProvider{}, &fakeBuilder{})
 	c.statusOnly = true
-	c.fatlineImage = "example.test/repo/fatline:2"
+	c.fatlineImage = testNamedImage
 	c.dial = connectedDial()
 
 	env, _ := testEnv(dir, output.ModeHuman)
@@ -961,7 +1125,7 @@ func TestABootstrapWaitsForTheCarrierToStartForwarding(t *testing.T) {
 
 	c := testConnect(&fakeProvider{}, &fakeBuilder{})
 	c.assumeYes = true
-	c.fatlineImage = "img:test"
+	c.fatlineImage = testNamedImage
 	c.newCluster = func(string) clusterApplier { return &fakeCluster{ip: "34.0.0.9"} }
 	c.warmupRetry, c.warmupWindow = time.Millisecond, time.Second
 

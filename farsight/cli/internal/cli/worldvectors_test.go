@@ -137,6 +137,16 @@ func vectorMeta() *config.InstanceMetadata {
 				Commit: "4f2a9c1e8b7d6a5f4e3c2b1a0f9e8d7c6b5a4938", ManifestDigest: "sha256:" + strings.Repeat("9", 64),
 				DeployedAt: time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC), StorageWired: true},
 		},
+		// Where each component's image came from (ADR 0023 decision 4): three
+		// carried by the release that deployed them, and the kernel an
+		// operator build with a newer Go.
+		SystemImages: map[string]config.SystemImage{
+			"fatline":     {Image: vecFatLineImage, Origin: config.OriginEmbedded, Go: "go1.27.4", Farcast: "v0.0.0-vector"},
+			"shrike":      {Image: vecShrikeImage, Origin: config.OriginEmbedded, Go: "go1.27.4", Farcast: "v0.0.0-vector"},
+			"datasphered": {Image: vecKeyholderImage, Origin: config.OriginEmbedded, Go: "go1.27.4", Farcast: "v0.0.0-vector"},
+			"technocore": {Image: vecKernelImage, Origin: config.OriginOperator, Go: "go1.27.5", Farcast: "v0.0.0-vector",
+				BuiltAt: time.Date(2026, 11, 11, 9, 0, 0, 0, time.UTC), Source: "/home/operator/farcast"},
+		},
 	}
 }
 
@@ -384,6 +394,14 @@ func worldVectors() []worldVector {
 				shrike.HostStat{App: "api", Namespace: "shop", Host: "old-cdn.example", Port: "443", Allows: 40,
 					LastSeen: time.Date(2026, 11, 10, 11, 0, 0, 0, time.UTC)},
 			)
+			// This machine's records of where the boundary's and the monitor's
+			// images came from name other images than the ones running: their
+			// versions are still read from the cluster, and their Go is null,
+			// never guessed (ADR 0023 M1).
+			in.Meta.SystemImages["fatline"] = config.SystemImage{Image: vecRegistry + "/fatline" + digestOf("a"),
+				Origin: config.OriginEmbedded, Go: "go1.27.3", Farcast: "v0.0.0-older"}
+			in.Meta.SystemImages["shrike"] = config.SystemImage{Image: vecRegistry + "/shrike" + digestOf("b"),
+				Origin: config.OriginEmbedded, Go: "go1.27.3", Farcast: "v0.0.0-older"}
 			return in
 		}},
 		{"unattributed_denial", func(t *testing.T) worldInputs {

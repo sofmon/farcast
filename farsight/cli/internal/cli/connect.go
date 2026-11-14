@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sofmon/farcast/farsight/cli/internal/components"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
 	"github.com/sofmon/farcast/fatline"
@@ -126,11 +127,17 @@ Usage: farcast connect <instance> [flags]
 
 Establish the FatLine mutually-authenticated tunnel into an instance. The first
 connect bootstraps: it mints the instance's per-instance mTLS identity (the CA
-key stays on this machine), ensures the instance's own image registry, puts
-FatLine's image there — compiled from a farcast checkout on this machine, with
-no container engine involved — deploys FatLine into the cluster, and provisions
-its public point of presence: a standing ~$18/month load balancer, confirmed
-against the cost limit. Later connects reuse all of it and re-dial.
+key stays on this machine), ensures the instance's own image registry, pushes
+FatLine's and Shrike's images there — the images this farcast carries, checked
+against the digests it was released with — deploys FatLine into the cluster, and
+provisions its public point of presence: a standing ~$18/month load balancer,
+confirmed against the cost limit. Later connects reuse all of it and re-dial.
+
+A farcast built from source carries no images. With no --source, it keeps an
+operator or development build recorded for this instance, and compiles any
+image it does not keep from a farcast checkout on this machine with its Go,
+after its build confirmation (which --yes answers), recording it as a
+development build.
 
 To change what an already-connected instance runs, use 'farcast redeploy': this
 command opens the tunnel, that one replaces the workload inside it.
@@ -139,12 +146,19 @@ Flags:
   --carrier <nlb>   Data-plane carrier (default nlb: public mTLS load balancer)
   --status          Only dial the bound carrier and report status (no bootstrap,
                     and no registry access at all)
-  -y, --yes         Skip the load-balancer cost confirmation and the build
-                    confirmation (required non-interactively)
-  --fatline-image   FatLine container image to deploy (default: this instance's
-                    own registry, at system/fatline for this farcast version)
-  --source <dir>    farcast checkout to build FatLine's image from
-                    (default: auto-detected from the working directory)
+  -y, --yes         Skip the load-balancer cost confirmation and, for --source
+                    or a source build, the build confirmation (required
+                    non-interactively)
+  --fatline-image   FatLine image to deploy, digest-pinned
+                    (repository@sha256:…) (default: the image this farcast
+                    carries, pushed to the instance registry's system/fatline)
+  --source <dir>    farcast checkout to build the images from with this
+                    machine's Go (a release farcast needs none); recorded as
+                    operator-built
+  --embedded        Deploy the images this farcast carries, replacing an
+                    operator-built image or one another farcast version
+                    deployed (never implied by --yes). Beside --fatline-image
+                    it governs Shrike's image alone
 
 With --output json the command prints one JSON result and never prompts.`)
 }
@@ -152,7 +166,7 @@ With --output json the command prints one JSON result and never prompts.`)
 func (c *connectCommand) SetFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.carrier, "carrier", "nlb", "data-plane carrier (nlb: public mTLS load balancer)")
 	fs.BoolVar(&c.statusOnly, "status", false, "only dial the bound carrier and report status")
-	c.setYesFlag(fs, "skip the load-balancer cost and build confirmations")
+	c.setYesFlag(fs, "skip the load-balancer cost confirmation and, for --source or a source build, the build confirmation")
 	c.setImageFlags(fs)
 }
 
@@ -167,12 +181,10 @@ func (c *connectCommand) Run(ctx context.Context, env *Env, args []string) error
 	if c.carrier != "nlb" {
 		return usagef("unsupported carrier %q (only \"nlb\" is implemented in this phase)", c.carrier)
 	}
-	// The same opposed intents redeploy rejects: "deploy exactly this" versus
-	// "build from here and deploy that". Image resolution is shared between the
-	// two commands, and it answers --fatline-image before it ever considers
-	// --source, so accepting both here would silently honour one of them.
-	if c.fatlineImage != "" && c.sourceDir != "" {
-		return usagef("--fatline-image deploys an image as given and --source builds a new one; pass one or the other")
+	// The same rules redeploy, kernel deploy and storage deploy apply to their
+	// image flags, before anything is loaded.
+	if err := c.checkImageFlags(); err != nil {
+		return err
 	}
 	name := args[0]
 
@@ -200,12 +212,26 @@ func (c *connectCommand) Run(ctx context.Context, env *Env, args []string) error
 			return usagef("--status only dials the bound carrier and reports; it deploys nothing, so --fatline-image has no effect")
 		case c.sourceDir != "" && c.statusOnly:
 			return usagef("--status only dials the bound carrier and reports; it builds nothing, so --source has no effect")
+		case c.embedded && c.statusOnly:
+			return usagef("--status only dials the bound carrier and reports; it deploys nothing, so --embedded has no effect")
 		case c.fatlineImage != "":
 			return usagef("FatLine is already deployed for %q, and --fatline-image only applies to the first connect; "+
 				"run 'farcast redeploy %s --fatline-image …' to change the running image", name, name)
 		case c.sourceDir != "":
 			return usagef("FatLine is already deployed for %q, so this connect builds nothing; --source only applies to the first connect; "+
 				"run 'farcast redeploy %s --source …' to rebuild FatLine's image and roll it out", name, name)
+		case c.embedded:
+			return usagef("FatLine is already deployed for %q, so this connect deploys nothing; run 'farcast redeploy %s --embedded' to replace its image", name, name)
+		}
+	}
+
+	// A farcast whose carried components it must not push is refused here: the
+	// first moment connect knows it will deploy, and before it mints anything,
+	// asks the cost question or ensures the registry. A reconnect and --status
+	// deploy nothing, so they are never refused for it.
+	if !c.statusOnly && !connected {
+		if err := c.precheck(); err != nil {
+			return err
 		}
 	}
 
@@ -225,13 +251,18 @@ func (c *connectCommand) Run(ctx context.Context, env *Env, args []string) error
 		var rerr error
 		if reg, rerr = c.ensureRegistry(ctx, env, name, meta); rerr != nil {
 			if c.needsRegistry(connected) {
-				return rerr
+				return c.registryFailed(rerr)
 			}
 			// This connect neither pushes nor pulls, so a permission-denied
 			// ensure — an instance whose stored installer credential predates
-			// ADR 0007's role — must not break a working reconnect.
+			// ADR 0007's role — must not break a working reconnect, or a first
+			// connect that deploys the image --fatline-image names.
 			fprintf(env.Err, "Warning: %v\n", rerr)
-			fprintln(env.Err, "Continuing: this connect deploys nothing, so it needs no image from the registry.")
+			if connected {
+				fprintln(env.Err, "Continuing: this connect deploys nothing, so it needs no image from the registry.")
+			} else {
+				fprintln(env.Err, "Continuing: --fatline-image names an image this connect neither looks up nor pushes.")
+			}
 		}
 	}
 
@@ -286,9 +317,10 @@ func (c *connectCommand) Run(ctx context.Context, env *Env, args []string) error
 // needsRegistry reports whether this connect cannot proceed without the
 // instance's registry. Only a bootstrap that has to source FatLine's image from
 // it does: a reconnect re-dials what is already running, and an explicit
-// --fatline-image names an image the operator vouches for.
+// --fatline-image names an image the operator vouches for, unless --embedded
+// beside it asks for Shrike's carried image (registryRequired).
 func (c *connectCommand) needsRegistry(connected bool) bool {
-	return !connected && c.fatlineImage == ""
+	return !connected && c.registryRequired()
 }
 
 // ensureIdentity mints the per-instance mTLS material on first connect (the CA
@@ -357,19 +389,19 @@ func (c *connectCommand) bootstrap(ctx context.Context, env *Env, name string, m
 		}
 	}
 
-	img, err := c.resolveImage(ctx, env, reg)
+	img, err := c.resolveImage(ctx, env, reg, meta)
 	if err != nil {
 		return err
 	}
 	// Shrike ships with the boundary, not after it. It was built at 2.2 and
 	// deployed by nothing until now, so every connected instance enforced
 	// egress correctly and told no one when something was refused.
-	shrikeImg, err := c.resolveSidecarImage(ctx, env, reg)
+	shrikeImg, err := c.resolveSidecarImage(ctx, env, reg, meta)
 	if err != nil {
 		return err
 	}
 
-	manifests, err := renderWorkload(img, shrikeImg, deploy.CarrierLoadBalancer, mtls)
+	manifests, err := renderWorkload(img.Ref, shrikeImg.Ref, deploy.CarrierLoadBalancer, mtls)
 	if err != nil {
 		return err
 	}
@@ -382,9 +414,12 @@ func (c *connectCommand) bootstrap(ctx context.Context, env *Env, name string, m
 		return fmt.Errorf("deploy FatLine: %w", err)
 	}
 	// The load balancer now exists (billable) — record it before the wait,
-	// together with the exact image the cluster was told to run.
+	// together with the exact images the cluster was told to run and where
+	// they came from (ADR 0023 decision 4).
 	meta.FatLineDeployed = true
-	recordDeployedImage(meta, img)
+	recordDeployedImage(meta, img.Ref)
+	recordSystemImage(meta, components.FatLine.Name, img.Record)
+	recordSystemImage(meta, components.Shrike.Name, shrikeImg.Record)
 	meta.UpdatedAt = time.Now().UTC()
 	if err := env.ConfigDir.SaveInstanceMetadata(name, meta); err != nil {
 		// The ordering above exists precisely so a billable resource is never

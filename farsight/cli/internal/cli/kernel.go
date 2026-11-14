@@ -11,23 +11,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sofmon/farcast/farsight/cli/internal/components"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	tcdeploy "github.com/sofmon/farcast/technocore/deploy"
 	"github.com/sofmon/farcast/technocore/kernel"
 )
-
-const (
-	// technocore is the kernel's component identity in the instance registry
-	// (ADR 0007 decision 6: system/<component>).
-	technocoreImagePath = "system/technocore"
-	technocorePackage   = "./technocore/cmd/technocore"
-	technocoreBinary    = "/technocore"
-)
-
-var technocoreComponent = systemComponent{
-	Name: "technocore", ImagePath: technocoreImagePath,
-	Package: technocorePackage, BinaryPath: technocoreBinary,
-}
 
 // newKernelCommand builds the `farcast kernel` group.
 func newKernelCommand() Command {
@@ -122,10 +110,17 @@ func (*kernelDeployCommand) Synopsis() string {
 
 func (*kernelDeployCommand) Usage() string {
 	return strings.TrimSpace(`
-Usage: farcast kernel deploy <instance> [--technocore-image REF] [--namespaces a,b] [--source DIR]
-                              [--adapt[=false]] [--adapt-cooldown D] [--interval D] [-y]
+Usage: farcast kernel deploy <instance> [--technocore-image REF@sha256:… | --source DIR | --embedded]
+                              [--namespaces a,b] [--adapt[=false]] [--adapt-cooldown D] [--interval D] [-y]
 
 Deploy TechnoCore into an instance.
+
+Its image is the one this farcast carries, pushed into the instance's own
+registry when the version tag does not already hold it. --technocore-image
+deploys a digest-pinned image as given; --source builds one from a farcast
+checkout with this machine's Go and records it as operator-built, which later
+deploys keep until --embedded or --source. A release farcast replaces an image
+another farcast version deployed only with --embedded.
 
 It meters what the instance costs from the resource requests its workloads
 declare — the quantity GKE Autopilot actually bills — warns at 50%, 75% and 90%
@@ -153,13 +148,14 @@ below the defaults exist for walking a behaviour in minutes.`)
 }
 
 func (c *kernelDeployCommand) SetFlags(fs *flag.FlagSet) {
-	fs.StringVar(&c.image, "technocore-image", "", "kernel container image (default: the instance registry's system/technocore)")
+	fs.StringVar(&c.image, "technocore-image", "", imageFlagUsage("TechnoCore", components.TechnoCore))
 	fs.StringVar(&c.namespaces, "namespaces", "", "comma-separated namespaces to meter (default: farcast-system)")
-	fs.StringVar(&c.deployer.sourceDir, "source", "", "farcast checkout to build the image from (default: auto-detected)")
+	fs.StringVar(&c.deployer.sourceDir, "source", "", "farcast checkout to build TechnoCore's image from with this machine's Go; recorded as operator-built")
+	c.deployer.setEmbeddedFlag(fs)
 	fs.Var(&c.adapt, "adapt", "let the kernel resize applications to what they actually use (off by default; recorded)")
 	fs.Var(&c.cooldown, "adapt-cooldown", "how long a resized application is left alone (default 6h; 0 restores it; recorded)")
 	fs.Var(&c.interval, "interval", "how often the kernel reconciles (default 30s; 0 restores it; recorded)")
-	c.deployer.setYesFlag(fs, "skip the cost confirmation")
+	c.deployer.setYesFlag(fs, "skip the cost confirmation and, for --source or a source build, the build confirmation")
 }
 
 // existingNamespaces is the set of namespaces the instance actually has.
@@ -193,9 +189,17 @@ func (c *kernelDeployCommand) Run(ctx context.Context, env *Env, args []string) 
 		return usagef("kernel deploy takes one instance argument")
 	}
 	name := args[0]
-	c.deployer.component = technocoreComponent
+	c.deployer.component = components.TechnoCore
 	c.deployer.fatlineImage = c.image
 	c.deployer.ensureDefaults()
+	if err := c.deployer.checkImageFlags(); err != nil {
+		return err
+	}
+	// Before the record is read: a farcast whose carried components it must
+	// not push is refused before anything is asked or called.
+	if err := c.deployer.precheck(); err != nil {
+		return err
+	}
 
 	meta, err := env.ConfigDir.LoadInstanceMetadata(name)
 	if err != nil {
@@ -304,10 +308,11 @@ func (c *kernelDeployCommand) Run(ctx context.Context, env *Env, args []string) 
 	if err != nil {
 		return err
 	}
-	img, err := c.deployer.resolveImage(ctx, env, reg)
+	resolved, err := c.deployer.resolveImage(ctx, env, reg, meta)
 	if err != nil {
 		return err
 	}
+	img := resolved.Ref
 
 	manifests, err := tcdeploy.Render(tcdeploy.Config{
 		Image:        img,
@@ -358,6 +363,7 @@ func (c *kernelDeployCommand) Run(ctx context.Context, env *Env, args []string) 
 		Confirmations: confirmations,
 		RecordedAt:    time.Now().UTC(),
 	}
+	recordSystemImage(meta, components.TechnoCore.Name, resolved.Record)
 	meta.UpdatedAt = time.Now().UTC()
 	if err := env.ConfigDir.SaveInstanceMetadata(name, meta); err != nil {
 		return fmt.Errorf("record the kernel before deploying it: %w", err)

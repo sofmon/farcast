@@ -20,9 +20,32 @@ import (
 // Main is the CLI entry point. args is the full process argument list
 // (program name at index 0). It returns the process exit code.
 func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if err := hardenEnvironment(); err != nil {
+		fprintf(stderr, "farcast: cannot harden the process environment: %v\n", err)
+		return 1
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	return run(ctx, args, stdin, stdout, stderr)
+}
+
+// hardenEnvironment closes the two routes by which vendored Google code starts programs
+// nobody asked for (ADR 0023 decision 1). Process-wide, before anything else runs.
+//
+// GOOGLE_API_USE_CLIENT_CERTIFICATE=false keeps the Google client libraries from
+// running a certificate provider to present a client certificate.
+// GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES unset keeps an external-account
+// credential file from naming an executable to run for a token. The cost: an
+// organization that enforces certificate-based access refuses this CLI.
+//
+// It runs here and not in a package init, so the unit tests, which call run,
+// keep their environment. The planck harness keeps its own copy
+// (planck/cmd/planck).
+func hardenEnvironment() error {
+	if err := os.Setenv("GOOGLE_API_USE_CLIENT_CERTIFICATE", "false"); err != nil {
+		return err
+	}
+	return os.Unsetenv("GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES")
 }
 
 func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {

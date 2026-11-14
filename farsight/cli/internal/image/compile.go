@@ -11,54 +11,91 @@ import (
 	"strings"
 )
 
+// Binary is a compiled component and the Go release that compiled it.
+type Binary struct {
+	Data      []byte
+	GoVersion string // from the binary's own build info
+}
+
+// GoCompile is the default Builder.Compile, goCompile. It is exported so that
+// farcast-release's tests can show that the release's component build and this
+// one give the same bytes for the same source.
+func GoCompile(ctx context.Context, sourceDir, pkg string) (Binary, error) {
+	return goCompile(ctx, sourceDir, pkg)
+}
+
 // goCompile is the default Builder.Compile: it cross-compiles pkg inside
-// sourceDir for the target platform using the local Go toolchain.
+// sourceDir for ComponentPlatform with the recipe in recipe.go.
 //
-// This is the one subprocess in the image path, and it is deliberately the
-// smallest thing that can be: no flags beyond what hermeticity requires, no
-// credentials, no state outside a temporary directory it removes. The build is
-// hermetic by construction — CGO off so the binary is static and needs no libc
-// in the base, -mod=vendor so no module is fetched from the network, and -trimpath
-// so absolute paths from the operator's machine do not end up inside the image
-// FarCast publishes.
+// It is the operator's own patch path (--source) and the development fallback
+// of a farcast that carries no components. A release farcast pushes the layers
+// it carries instead and needs no Go at all (ADR 0023 decision 4).
 //
-// The Go toolchain is the only external tool the image path needs, and it is
-// already a prerequisite for having a farcast binary at all (source-first
-// distribution), so this adds nothing to what an operator must install.
-//
-// One caveat, deliberately not hidden: go.mod pins an exact toolchain, so on a
-// machine whose Go is older the go command fetches that toolchain once, through
-// the checksum-verified module proxy. The build itself still fetches nothing —
-// and the pin is what makes this build and fatline/Containerfile's reference
-// build use the same compiler.
-func goCompile(ctx context.Context, sourceDir, pkg string) ([]byte, error) {
+// The Go is the operator's choice: whichever go is on PATH, asked where its
+// toolchain lives, so that a version manager's shim works. It is refused when it
+// is older than the checkout's go.mod toolchain line, and a newer one is used as
+// it is (ADR 0023 decision 6). Nothing is ever downloaded: the build runs with
+// GOTOOLCHAIN=local, GOPROXY=off and -mod=vendor. Nothing is inherited either:
+// the build's environment is BuildEnviron's allowlist, so a GOFLAGS, a go env
+// file, a GOCACHEPROG or a GIT_DIR in the operator's shell cannot change or
+// stamp what is built, and CheckBinary verifies the result.
+func goCompile(ctx context.Context, sourceDir, pkg string) (Binary, error) {
+	tc, err := FindToolchain(ctx, os.Environ(), sourceDir)
+	if errors.Is(err, ErrNoGo) {
+		return Binary{}, &wrapped{
+			msg: "image: building a component from source needs the Go toolchain on PATH (a release farcast needs none: it carries its components)",
+			err: ErrNoGo,
+		}
+	}
+	if err != nil {
+		return Binary{}, fmt.Errorf("%w (a version manager's shim on PATH must resolve to a Go for %s)", err, sourceDir)
+	}
+	floor, err := ToolchainFloor(sourceDir)
+	if err != nil {
+		return Binary{}, err
+	}
+	if err := checkFloor(tc.Go, tc.Version, floor); err != nil {
+		return Binary{}, err
+	}
+
 	dir, err := os.MkdirTemp("", "farcast-image-")
 	if err != nil {
-		return nil, fmt.Errorf("image: create build directory: %w", err)
+		return Binary{}, fmt.Errorf("image: create build directory: %w", err)
 	}
 	defer func() { _ = os.RemoveAll(dir) }()
 
 	out := filepath.Join(dir, "binary")
-	cmd := exec.CommandContext(ctx, "go", "build", "-trimpath", "-mod=vendor", "-o", out, pkg)
+	cmd := exec.CommandContext(ctx, tc.Go, BuildFlags(out, pkg)...)
 	cmd.Dir = sourceDir
-	// Duplicate keys are resolved last-wins by os/exec, so these override any
-	// GOOS/GOARCH/CGO_ENABLED the operator has set for their own machine.
-	cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS="+targetPlatform.OS, "GOARCH="+targetPlatform.Architecture)
+	cmd.Env = BuildEnviron(os.Environ(), tc, "local", "")
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		if errors.Is(err, exec.ErrNotFound) {
-			return nil, errors.New("image: the Go toolchain is not on PATH — building FarCast's own image needs it")
-		}
 		if msg := strings.TrimSpace(stderr.String()); msg != "" {
-			return nil, fmt.Errorf("image: go build %s: %s", pkg, msg)
+			return Binary{}, fmt.Errorf("image: go build %s: %s", pkg, msg)
 		}
-		return nil, fmt.Errorf("image: go build %s: %w", pkg, err)
+		return Binary{}, fmt.Errorf("image: go build %s: %w", pkg, err)
 	}
-	binary, err := os.ReadFile(out)
+	data, err := os.ReadFile(out)
 	if err != nil {
-		return nil, fmt.Errorf("image: read compiled binary: %w", err)
+		return Binary{}, fmt.Errorf("image: read compiled binary: %w", err)
 	}
-	return binary, nil
+	v, err := CheckBinary(data)
+	if err != nil {
+		return Binary{}, fmt.Errorf("image: %s: %w", pkg, err)
+	}
+	if v != tc.Version {
+		return Binary{}, fmt.Errorf("image: %s reported %s but built with %s", tc.Go, tc.Version, v)
+	}
+	return Binary{Data: data, GoVersion: v}, nil
 }
+
+// wrapped is an error with its own message that still matches a sentinel.
+type wrapped struct {
+	msg string
+	err error
+}
+
+func (w *wrapped) Error() string { return w.msg }
+func (w *wrapped) Unwrap() error { return w.err }

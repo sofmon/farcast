@@ -1,0 +1,187 @@
+# What FarCast's shipped binaries can start (ADR 0023 decision 1).
+#
+# ./check.sh step 1b compares this file, without its '#' lines, byte for byte
+# with the output of
+#
+#   go run ./farsight/cli/cmd/farcast-release execsites
+#
+# A difference fails the check. Every added line is reviewed where it lives,
+# under ADR 0023 decision 1, and this file is updated in the same commit.
+#
+# What is listed. farcast for darwin/arm64, darwin/amd64, linux/amd64,
+# linux/arm64 and windows/amd64, each untagged and with -tags
+# farcast_embedded (the configuration the release builds), the lines being
+# the union of the two; fatline, shrike, technocore and datasphered for
+# linux/amd64. For each, every non-standard package it links, first-party and
+# vendored, as `go list -e -mod=vendor -deps` reports it with cgo off; each of
+# their files is parsed with go/ast (package execgate). The lines are:
+#
+#   <binary> <goos/goarch> import <importpath> os/exec
+#   <binary> <goos/goarch> ref <file> <func> <package>.<Name> <n>x
+#   <binary> <goos/goarch> linkname <file> <local> <target>
+#
+# A ref is any reference to a watched name, through the import's own name, an
+# alias or a dot import: os/exec Command, CommandContext and Cmd; os
+# StartProcess; syscall ForkExec, StartProcess, Exec, CreateProcess and
+# CreateProcessAsUser; golang.org/x/sys/unix Exec; golang.org/x/sys/windows
+# CreateProcess, CreateProcessAsUser and ShellExecute; and SYS_EXECVE,
+# SYS_EXECVEAT, SYS_FORK, SYS_VFORK, SYS_CLONE, SYS_CLONE3 and SYS_POSIX_SPAWN
+# in syscall and golang.org/x/sys/unix. A linkname line is a //go:linkname
+# whose target's last element contains exec, fork, spawn or startprocess. No
+# line carries a line number; the count catches a second site in a function.
+#
+# Known limits. The checker does not see a raw Syscall whose number is a
+# literal rather than a SYS_* name, assembly (.s) files, or a //go:linkname to
+# an innocuously named function. Nor does it see a process started through a
+# procedure looked up by name: NewProc("CreateProcessW") or FindProc on a
+# DLL loaded through golang.org/x/sys/windows or syscall, from any package,
+# or a new function in x/sys/windows that calls its package-level
+# procCreateProcessW, procCreateProcessAsUserW or procShellExecuteW under
+# another name. Nor a darwin //go:cgo_import_dynamic of an exec, fork or
+# spawn symbol with its trampoline, as x/sys/unix does for other libc
+# symbols. cgo is off, and Go has no in-process plugin loading without it.
+# Changing the arguments of a listed call does not change its line: every
+# site is also reviewed where it lives.
+#
+# Review, 2026-11-13, at ADR 0023 M0 (Go go1.27.4). Each line below was read
+# at its site.
+#
+# First-party, farcast only:
+# - cluster/cluster.go execRunner.command: kubectl, found on the PATH of an
+#   environment built from an allowlist (cluster.Env), with KUBERC=off. The
+#   Cmd line is the same function's *exec.Cmd return type.
+# - image/recipe.go FindToolchain: `go env GOROOT GOVERSION GOMODCACHE
+#   GOCACHE`, asked of the go on PATH with GOTOOLCHAIN=local. --source and
+#   the development fallback only.
+# - image/compile.go goCompile: <GOROOT>/bin/go build, with an environment
+#   built from an allowlist. --source and the development fallback only.
+#
+# Vendored, on every farcast platform and in datasphered:
+# - cloud.google.com/go/auth/credentials/internal/externalaccount
+#   (executable_provider.go) and golang.org/x/oauth2/google/externalaccount
+#   (executablecredsource.go), runtimeEnvironment.run: an external-account
+#   credential's executable. Both refuse to run it unless
+#   GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES is 1; farcast and the planck
+#   harness unset it in their own process.
+# - cloud.google.com/go/auth/internal/transport/cert and
+#   google.golang.org/api/internal/cert (secureconnect_cert.go),
+#   secureConnectSource.getClientCertificate, and
+#   github.com/googleapis/enterprise-certificate-proxy/client (client.go) Cred,
+#   with the *exec.Cmd field of its signer type (the '-' line): certificate
+#   providers for a client certificate. Both libraries create them only when client certificates are
+#   on; the auth library turns them on by default when the variable is unset.
+#   farcast and the planck harness set GOOGLE_API_USE_CLIENT_CERTIFICATE=false.
+# - golang.org/x/sys/unix (syscall_unix.go) Exec: the wrapper's call to
+#   syscall.Exec. Nothing listed references unix.Exec.
+#
+# datasphered links the vendored sites above and does not change its own
+# environment: hardening the in-cluster process is outside ADR 0023 M0 and
+# would change its image digest. fatline, shrike and technocore have no lines.
+#
+# Vendored, farcast on windows/amd64 only (untested until ADR 0023 M4):
+# - cloud.google.com/go/auth/internal/compute and
+#   google.golang.org/grpc/internal/googlecloud (manufacturer_windows.go)
+#   manufacturer: powershell.exe with "Get-WmiObject -Class Win32_BIOS", to
+#   learn whether the machine is a Google Compute Engine VM. Neither variable
+#   turns it off.
+datasphered linux/amd64 import cloud.google.com/go/auth/credentials/internal/externalaccount os/exec
+datasphered linux/amd64 import cloud.google.com/go/auth/internal/transport/cert os/exec
+datasphered linux/amd64 import github.com/googleapis/enterprise-certificate-proxy/client os/exec
+datasphered linux/amd64 ref vendor/cloud.google.com/go/auth/credentials/internal/externalaccount/executable_provider.go runtimeEnvironment.run os/exec.CommandContext 1x
+datasphered linux/amd64 ref vendor/cloud.google.com/go/auth/internal/transport/cert/secureconnect_cert.go secureConnectSource.getClientCertificate os/exec.Command 1x
+datasphered linux/amd64 ref vendor/github.com/googleapis/enterprise-certificate-proxy/client/client.go - os/exec.Cmd 1x
+datasphered linux/amd64 ref vendor/github.com/googleapis/enterprise-certificate-proxy/client/client.go Cred os/exec.Command 1x
+datasphered linux/amd64 ref vendor/golang.org/x/sys/unix/syscall_unix.go Exec syscall.Exec 1x
+farcast darwin/amd64 import cloud.google.com/go/auth/credentials/internal/externalaccount os/exec
+farcast darwin/amd64 import cloud.google.com/go/auth/internal/transport/cert os/exec
+farcast darwin/amd64 import github.com/googleapis/enterprise-certificate-proxy/client os/exec
+farcast darwin/amd64 import github.com/sofmon/farcast/farsight/cli/internal/cluster os/exec
+farcast darwin/amd64 import github.com/sofmon/farcast/farsight/cli/internal/image os/exec
+farcast darwin/amd64 import golang.org/x/oauth2/google/externalaccount os/exec
+farcast darwin/amd64 import google.golang.org/api/internal/cert os/exec
+farcast darwin/amd64 ref farsight/cli/internal/cluster/cluster.go execRunner.command os/exec.Cmd 1x
+farcast darwin/amd64 ref farsight/cli/internal/cluster/cluster.go execRunner.command os/exec.CommandContext 1x
+farcast darwin/amd64 ref farsight/cli/internal/image/compile.go goCompile os/exec.CommandContext 1x
+farcast darwin/amd64 ref farsight/cli/internal/image/recipe.go FindToolchain os/exec.CommandContext 1x
+farcast darwin/amd64 ref vendor/cloud.google.com/go/auth/credentials/internal/externalaccount/executable_provider.go runtimeEnvironment.run os/exec.CommandContext 1x
+farcast darwin/amd64 ref vendor/cloud.google.com/go/auth/internal/transport/cert/secureconnect_cert.go secureConnectSource.getClientCertificate os/exec.Command 1x
+farcast darwin/amd64 ref vendor/github.com/googleapis/enterprise-certificate-proxy/client/client.go - os/exec.Cmd 1x
+farcast darwin/amd64 ref vendor/github.com/googleapis/enterprise-certificate-proxy/client/client.go Cred os/exec.Command 1x
+farcast darwin/amd64 ref vendor/golang.org/x/oauth2/google/externalaccount/executablecredsource.go runtimeEnvironment.run os/exec.CommandContext 1x
+farcast darwin/amd64 ref vendor/golang.org/x/sys/unix/syscall_unix.go Exec syscall.Exec 1x
+farcast darwin/amd64 ref vendor/google.golang.org/api/internal/cert/secureconnect_cert.go secureConnectSource.getClientCertificate os/exec.Command 1x
+farcast darwin/arm64 import cloud.google.com/go/auth/credentials/internal/externalaccount os/exec
+farcast darwin/arm64 import cloud.google.com/go/auth/internal/transport/cert os/exec
+farcast darwin/arm64 import github.com/googleapis/enterprise-certificate-proxy/client os/exec
+farcast darwin/arm64 import github.com/sofmon/farcast/farsight/cli/internal/cluster os/exec
+farcast darwin/arm64 import github.com/sofmon/farcast/farsight/cli/internal/image os/exec
+farcast darwin/arm64 import golang.org/x/oauth2/google/externalaccount os/exec
+farcast darwin/arm64 import google.golang.org/api/internal/cert os/exec
+farcast darwin/arm64 ref farsight/cli/internal/cluster/cluster.go execRunner.command os/exec.Cmd 1x
+farcast darwin/arm64 ref farsight/cli/internal/cluster/cluster.go execRunner.command os/exec.CommandContext 1x
+farcast darwin/arm64 ref farsight/cli/internal/image/compile.go goCompile os/exec.CommandContext 1x
+farcast darwin/arm64 ref farsight/cli/internal/image/recipe.go FindToolchain os/exec.CommandContext 1x
+farcast darwin/arm64 ref vendor/cloud.google.com/go/auth/credentials/internal/externalaccount/executable_provider.go runtimeEnvironment.run os/exec.CommandContext 1x
+farcast darwin/arm64 ref vendor/cloud.google.com/go/auth/internal/transport/cert/secureconnect_cert.go secureConnectSource.getClientCertificate os/exec.Command 1x
+farcast darwin/arm64 ref vendor/github.com/googleapis/enterprise-certificate-proxy/client/client.go - os/exec.Cmd 1x
+farcast darwin/arm64 ref vendor/github.com/googleapis/enterprise-certificate-proxy/client/client.go Cred os/exec.Command 1x
+farcast darwin/arm64 ref vendor/golang.org/x/oauth2/google/externalaccount/executablecredsource.go runtimeEnvironment.run os/exec.CommandContext 1x
+farcast darwin/arm64 ref vendor/golang.org/x/sys/unix/syscall_unix.go Exec syscall.Exec 1x
+farcast darwin/arm64 ref vendor/google.golang.org/api/internal/cert/secureconnect_cert.go secureConnectSource.getClientCertificate os/exec.Command 1x
+farcast linux/amd64 import cloud.google.com/go/auth/credentials/internal/externalaccount os/exec
+farcast linux/amd64 import cloud.google.com/go/auth/internal/transport/cert os/exec
+farcast linux/amd64 import github.com/googleapis/enterprise-certificate-proxy/client os/exec
+farcast linux/amd64 import github.com/sofmon/farcast/farsight/cli/internal/cluster os/exec
+farcast linux/amd64 import github.com/sofmon/farcast/farsight/cli/internal/image os/exec
+farcast linux/amd64 import golang.org/x/oauth2/google/externalaccount os/exec
+farcast linux/amd64 import google.golang.org/api/internal/cert os/exec
+farcast linux/amd64 ref farsight/cli/internal/cluster/cluster.go execRunner.command os/exec.Cmd 1x
+farcast linux/amd64 ref farsight/cli/internal/cluster/cluster.go execRunner.command os/exec.CommandContext 1x
+farcast linux/amd64 ref farsight/cli/internal/image/compile.go goCompile os/exec.CommandContext 1x
+farcast linux/amd64 ref farsight/cli/internal/image/recipe.go FindToolchain os/exec.CommandContext 1x
+farcast linux/amd64 ref vendor/cloud.google.com/go/auth/credentials/internal/externalaccount/executable_provider.go runtimeEnvironment.run os/exec.CommandContext 1x
+farcast linux/amd64 ref vendor/cloud.google.com/go/auth/internal/transport/cert/secureconnect_cert.go secureConnectSource.getClientCertificate os/exec.Command 1x
+farcast linux/amd64 ref vendor/github.com/googleapis/enterprise-certificate-proxy/client/client.go - os/exec.Cmd 1x
+farcast linux/amd64 ref vendor/github.com/googleapis/enterprise-certificate-proxy/client/client.go Cred os/exec.Command 1x
+farcast linux/amd64 ref vendor/golang.org/x/oauth2/google/externalaccount/executablecredsource.go runtimeEnvironment.run os/exec.CommandContext 1x
+farcast linux/amd64 ref vendor/golang.org/x/sys/unix/syscall_unix.go Exec syscall.Exec 1x
+farcast linux/amd64 ref vendor/google.golang.org/api/internal/cert/secureconnect_cert.go secureConnectSource.getClientCertificate os/exec.Command 1x
+farcast linux/arm64 import cloud.google.com/go/auth/credentials/internal/externalaccount os/exec
+farcast linux/arm64 import cloud.google.com/go/auth/internal/transport/cert os/exec
+farcast linux/arm64 import github.com/googleapis/enterprise-certificate-proxy/client os/exec
+farcast linux/arm64 import github.com/sofmon/farcast/farsight/cli/internal/cluster os/exec
+farcast linux/arm64 import github.com/sofmon/farcast/farsight/cli/internal/image os/exec
+farcast linux/arm64 import golang.org/x/oauth2/google/externalaccount os/exec
+farcast linux/arm64 import google.golang.org/api/internal/cert os/exec
+farcast linux/arm64 ref farsight/cli/internal/cluster/cluster.go execRunner.command os/exec.Cmd 1x
+farcast linux/arm64 ref farsight/cli/internal/cluster/cluster.go execRunner.command os/exec.CommandContext 1x
+farcast linux/arm64 ref farsight/cli/internal/image/compile.go goCompile os/exec.CommandContext 1x
+farcast linux/arm64 ref farsight/cli/internal/image/recipe.go FindToolchain os/exec.CommandContext 1x
+farcast linux/arm64 ref vendor/cloud.google.com/go/auth/credentials/internal/externalaccount/executable_provider.go runtimeEnvironment.run os/exec.CommandContext 1x
+farcast linux/arm64 ref vendor/cloud.google.com/go/auth/internal/transport/cert/secureconnect_cert.go secureConnectSource.getClientCertificate os/exec.Command 1x
+farcast linux/arm64 ref vendor/github.com/googleapis/enterprise-certificate-proxy/client/client.go - os/exec.Cmd 1x
+farcast linux/arm64 ref vendor/github.com/googleapis/enterprise-certificate-proxy/client/client.go Cred os/exec.Command 1x
+farcast linux/arm64 ref vendor/golang.org/x/oauth2/google/externalaccount/executablecredsource.go runtimeEnvironment.run os/exec.CommandContext 1x
+farcast linux/arm64 ref vendor/golang.org/x/sys/unix/syscall_unix.go Exec syscall.Exec 1x
+farcast linux/arm64 ref vendor/google.golang.org/api/internal/cert/secureconnect_cert.go secureConnectSource.getClientCertificate os/exec.Command 1x
+farcast windows/amd64 import cloud.google.com/go/auth/credentials/internal/externalaccount os/exec
+farcast windows/amd64 import cloud.google.com/go/auth/internal/compute os/exec
+farcast windows/amd64 import cloud.google.com/go/auth/internal/transport/cert os/exec
+farcast windows/amd64 import github.com/googleapis/enterprise-certificate-proxy/client os/exec
+farcast windows/amd64 import github.com/sofmon/farcast/farsight/cli/internal/cluster os/exec
+farcast windows/amd64 import github.com/sofmon/farcast/farsight/cli/internal/image os/exec
+farcast windows/amd64 import golang.org/x/oauth2/google/externalaccount os/exec
+farcast windows/amd64 import google.golang.org/api/internal/cert os/exec
+farcast windows/amd64 import google.golang.org/grpc/internal/googlecloud os/exec
+farcast windows/amd64 ref farsight/cli/internal/cluster/cluster.go execRunner.command os/exec.Cmd 1x
+farcast windows/amd64 ref farsight/cli/internal/cluster/cluster.go execRunner.command os/exec.CommandContext 1x
+farcast windows/amd64 ref farsight/cli/internal/image/compile.go goCompile os/exec.CommandContext 1x
+farcast windows/amd64 ref farsight/cli/internal/image/recipe.go FindToolchain os/exec.CommandContext 1x
+farcast windows/amd64 ref vendor/cloud.google.com/go/auth/credentials/internal/externalaccount/executable_provider.go runtimeEnvironment.run os/exec.CommandContext 1x
+farcast windows/amd64 ref vendor/cloud.google.com/go/auth/internal/compute/manufacturer_windows.go manufacturer os/exec.Command 1x
+farcast windows/amd64 ref vendor/cloud.google.com/go/auth/internal/transport/cert/secureconnect_cert.go secureConnectSource.getClientCertificate os/exec.Command 1x
+farcast windows/amd64 ref vendor/github.com/googleapis/enterprise-certificate-proxy/client/client.go - os/exec.Cmd 1x
+farcast windows/amd64 ref vendor/github.com/googleapis/enterprise-certificate-proxy/client/client.go Cred os/exec.Command 1x
+farcast windows/amd64 ref vendor/golang.org/x/oauth2/google/externalaccount/executablecredsource.go runtimeEnvironment.run os/exec.CommandContext 1x
+farcast windows/amd64 ref vendor/google.golang.org/api/internal/cert/secureconnect_cert.go secureConnectSource.getClientCertificate os/exec.Command 1x
+farcast windows/amd64 ref vendor/google.golang.org/grpc/internal/googlecloud/manufacturer_windows.go manufacturer os/exec.Command 1x

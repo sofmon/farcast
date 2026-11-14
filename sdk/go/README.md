@@ -43,7 +43,7 @@ The package is named **`farcast`** even though the import path ends in `/go`. Re
 import farcast "github.com/sofmon/farcast/sdk/go"
 ```
 
-Minimum Go version: **1.26** (matches the repository toolchain; the logger is built on the standard library's `log/slog`).
+Minimum Go version: **1.26** (the `go` line of `sdk/go/go.mod`; the logger is built on the standard library's `log/slog`).
 
 ---
 

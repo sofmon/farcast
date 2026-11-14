@@ -91,7 +91,6 @@ farcast/
 │
 ├── fatline/                        ← Networking, routing, proxy & encryption
 │   ├── README.md
-│   ├── Containerfile               ← Distroless data-plane image
 │   ├── docs/
 │   ├── cmd/
 │   │   └── fatline/
@@ -278,7 +277,7 @@ DataSphere is the storage abstraction layer. It proxies all file storage and ret
 FatLine is the networking layer for a FarCast instance's applications. Instance-to-instance and instance-to-internet traffic, and the operator's tunnel, flow through it. It acts as router, proxy, and encryption boundary in one. By default, all connections are denied. FatLine only permits outbound traffic to external endpoints that are explicitly declared in an application's `./farcast` manifest. Nothing an application sends leaves the instance without passing through it.
 
 Three things do not pass through FatLine ([ADR 0019](docs/adr/0019-what-the-cluster-tells-its-provider.md)):
-- the operator's control-plane calls, which go to the provider's API server through kubectl;
+- the operator's control-plane calls, which go to the provider's API server through kubectl, which [ADR 0023](docs/adr/0023-one-download-farcast.md)'s M2, not yet built, is to replace with an in-process client;
 - what the cluster reports about itself (above);
 - image pulls, which are node egress.
 
@@ -298,7 +297,7 @@ The user installs an app called "farcast".
 - **On iPhone, iPad and Vision Pro** it is a thin client that never holds cloud credentials.
 - **A server** runs inside the FarCast instance.
 
-The native clients are accepted and not yet built ([ADR 0021](docs/adr/0021-farsight-native-client.md)), so today the CLI is what exists. Even then, on macOS the app will not yet be one download: the CLI still needs `kubectl`, the GKE auth plugin, `gcloud`, Go and a farcast checkout.
+The native clients are accepted and not yet built ([ADR 0021](docs/adr/0021-farsight-native-client.md)), so today the CLI is what exists. Even then, on macOS the app will not yet be one download: the CLI still needs `kubectl`, the GKE auth plugin and `gcloud`, and Go and a farcast checkout. [ADR 0023](docs/adr/0023-one-download-farcast.md), accepted 2026-11-13, is removing them in stages, so that `farcast` alone is enough to install and run FarCast. Its M1 is built (2026-11-13, not yet walked) to take Go and the checkout out: a farcast built by the release tool carries FarCast's own components and pushes them, and needs Go and a checkout only for `--source`, an operator's own build of a component. The release tool builds such a farcast, and `./check.sh` checks on the dev Mac that its builds are byte-identical; the same check on a second host has not run. A farcast built from source still compiles each missing image from a checkout with Go. The rest is not yet built. A Google account, a billing account, a privileged setup in the browser once per project and once per instance, and reading the bill stay outside any app.
 
 When opened, the app provides two functions: (1) **Install** — a guided process to deploy FarCast to a cloud environment, where the operator provides admin credentials for their chosen cloud provider, and (2) **Connect** — open a FarSight session towards a running FarCast instance. Install runs on macOS only, from the GUI or the CLI, because it needs the cloud admin credential. Connect is available from every client.
 
@@ -398,7 +397,7 @@ Each module folder contains its own `README.md` with:
 > Phases 0 through 5 are complete. The lifecycle works end to end and is **validated against real cloud infrastructure**, not only unit tests.
 >
 > **Phase 0–1 (foundation and provisioning):** the manifest parser, the Go SDK, and the FarSight CLI driving Planck's GKE Autopilot provider behind a private control plane, with a mandatory cost limit and an image registry of the instance's own.
-> **Phase 2 (the boundary):** FatLine's mTLS tunnel and deny-by-default egress, Shrike's policy engine, and `farcast connect`, which compiles FatLine's image locally with the Go toolchain and deploys it pinned by digest — no container engine anywhere.
+> **Phase 2 (the boundary):** FatLine's mTLS tunnel and deny-by-default egress, Shrike's policy engine, and `farcast connect`, which compiled FatLine's image locally with the Go toolchain and deploys it pinned by digest — no container engine anywhere. Since [ADR 0023](docs/adr/0023-one-download-farcast.md) M1 (built 2026-11-13, not yet walked) a farcast built by the release tool pushes the image it carries instead, and compiling is `--source`'s. A farcast built from source still compiles it.
 > **Phase 3 (storage):** DataSphere's encrypting store, both blob formats, the operator-held keyring, the GCS adapter, and the in-cluster keyholder that never receives the master key. The provider holds opaque name tokens and ciphertext, confirmed independently with `gcloud`.
 > **Phase 4 (running applications):** the kernel meters spending on two signals and enforces the limit; a `./farcast` manifest becomes workloads; `farcast run` reads a repository **inside the instance**, shows the operator what it declares, builds it there and deploys it — so deploying does not depend on the machine you happen to be sitting at; and each application reaches only the hosts it declared, identified by a credential it holds rather than by where it sits.
 >

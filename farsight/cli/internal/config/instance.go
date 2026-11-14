@@ -319,6 +319,39 @@ type KernelConfirmation struct {
 	AsOf  time.Time `yaml:"as_of,omitempty"`
 }
 
+// SystemImage is where one of FarCast's own components' deployed image came
+// from (ADR 0023 decision 4). It is valid only while Image equals the
+// component's deploy record: Registry.FatLineDigest for fatline, Kernel.Image
+// for technocore and Keyholder.Image for datasphered. Shrike has no deploy
+// record of its own, so this is its only one.
+//
+// Nothing secret lives here. Source is a local path, in a local 0600 file, and
+// never leaves this machine.
+type SystemImage struct {
+	Image   string    `yaml:"image"`             // digest-pinned reference
+	Origin  string    `yaml:"origin"`            // OriginEmbedded, OriginOperator, OriginDevelopment or OriginNamed
+	Go      string    `yaml:"go,omitempty"`      // Go release that compiled it; "" for named
+	Farcast string    `yaml:"farcast,omitempty"` // version of the farcast that pushed, built or named it
+	BuiltAt time.Time `yaml:"built_at,omitzero"` // operator and development builds only
+	Source  string    `yaml:"source,omitempty"`  // absolute checkout path; operator and development builds only
+}
+
+// The origins a SystemImage can record.
+const (
+	// OriginEmbedded is the image the deploying farcast carried and pushed.
+	OriginEmbedded = "embedded"
+	// OriginOperator is an image built from an explicit --source checkout. It
+	// is kept by later commands until --embedded or --source.
+	OriginOperator = "operator"
+	// OriginDevelopment is an image a farcast that carries no components (a
+	// source build) compiled on its own, with no --source. A release farcast
+	// replaces it.
+	OriginDevelopment = "development"
+	// OriginNamed is an image the operator named with --<component>-image and
+	// that was deployed as given.
+	OriginNamed = "named"
+)
+
 // Deployment is what this machine recorded about the last successful 'farcast
 // run' into one namespace: the repository it came from and the exact tree that
 // was read (ADR 0021 decision 2, amended 2026-11-12).
@@ -404,6 +437,12 @@ type InstanceMetadata struct {
 	// last successful 'farcast run' deployed there. 'run' refuses a namespace
 	// recorded under another repository unless told to replace it.
 	Deployments map[string]Deployment `yaml:"deployments,omitempty"`
+
+	// SystemImages is, per component name (datasphered, fatline, shrike,
+	// technocore), where the image this machine last deployed came from (ADR
+	// 0023 decision 4). It is merged per key, so two commands deploying
+	// different components at once do not conflict (see mergeOntoNewer).
+	SystemImages map[string]SystemImage `yaml:"system_images,omitempty"`
 
 	// loaded and loadedSum are how a write knows it is replacing the record it
 	// read rather than one somebody else has since written. Unexported, so
@@ -577,7 +616,11 @@ func (d Dir) SaveInstanceMetadata(name string, m *InstanceMetadata) error {
 //
 // Top-level granularity is the right grain here: each command owns a distinct
 // subtree of this struct, so two commands writing the same field at once means
-// two commands doing the same job.
+// two commands doing the same job. SystemImages is the one exception: it is a
+// map that every deploying command writes its own key of, so 'redeploy' and
+// 'kernel deploy' running at once would collide on the whole field while each
+// touched only its own component. It is merged per key instead, with the same
+// three-way rule (a missing key counts as a value).
 func mergeOntoNewer(baseRaw []byte, mine *InstanceMetadata, newerRaw []byte) (*InstanceMetadata, error) {
 	var base, newer InstanceMetadata
 	if err := yaml.Unmarshal(baseRaw, &base); err != nil {
@@ -604,6 +647,14 @@ func mergeOntoNewer(baseRaw []byte, mine *InstanceMetadata, newerRaw []byte) (*I
 			}
 			continue
 		}
+		if f.Name == "SystemImages" {
+			merged, err := mergeSystemImages(base.SystemImages, mine.SystemImages, newer.SystemImages)
+			if err != nil {
+				return nil, err
+			}
+			out.SystemImages = merged
+			continue
+		}
 		baseF, mineF, newerF := bv.Field(i).Interface(), mv.Field(i).Interface(), ov.Field(i).Interface()
 		switch {
 		case reflect.DeepEqual(mineF, baseF):
@@ -616,6 +667,51 @@ func mergeOntoNewer(baseRaw []byte, mine *InstanceMetadata, newerRaw []byte) (*I
 	}
 
 	return &out, nil
+}
+
+// mergeSystemImages is mergeOntoNewer's three-way rule applied to each key of
+// SystemImages rather than to the map as a whole. A key absent on one side is
+// a value like any other, so a component one side recorded and the other
+// never touched survives, and one that only the caller removed is removed.
+func mergeSystemImages(base, mine, newer map[string]SystemImage) (map[string]SystemImage, error) {
+	keys := map[string]bool{}
+	for _, m := range []map[string]SystemImage{base, mine, newer} {
+		for k := range m {
+			keys[k] = true
+		}
+	}
+	names := make([]string, 0, len(keys))
+	for k := range keys {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+
+	out := map[string]SystemImage{}
+	for _, k := range names {
+		b, bok := base[k]
+		m, mok := mine[k]
+		n, nok := newer[k]
+		same := func(x SystemImage, xok bool, y SystemImage, yok bool) bool {
+			return xok == yok && (!xok || reflect.DeepEqual(x, y))
+		}
+		take, tok := n, nok
+		switch {
+		case same(m, mok, b, bok):
+			// Untouched here; whatever is on disk stands.
+		case same(n, nok, b, bok), same(n, nok, m, mok):
+			take, tok = m, mok
+		default:
+			return nil, fmt.Errorf("%w: field SystemImages[%s] was changed by this command and by something else at the same time", ErrMetadataConflict, k)
+		}
+		if tok {
+			out[k] = take
+		}
+	}
+	if len(out) == 0 {
+		// Nothing left is no map, as a record that never had the field reads.
+		return nil, nil
+	}
+	return out, nil
 }
 
 // LoadInstanceMetadata reads metadata.yaml for an instance.

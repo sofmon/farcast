@@ -1,6 +1,6 @@
 # ADR 0006 — Connect-Time FatLine Bootstrap via kubectl, Not a Vendored Kubernetes Client
 
-**Status:** Accepted
+**Status:** Accepted. *(2026-11-13: [ADR 0023](0023-one-download-farcast.md), accepted that day, supersedes decisions 1, 2 and 4 when its M2 lands. An in-process Kubernetes client with server-side apply then replaces the `kubectl` subprocess, still with no vendored Kubernetes client, and the test seam moves from `Runner` to an HTTP round-tripper. Decision 3 is kept. Until M2 lands, `connect` and every other cluster command shell to `kubectl` as described here.)*
 
 **Date:** 2026-06-23
 

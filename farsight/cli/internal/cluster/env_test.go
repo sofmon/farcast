@@ -2,14 +2,233 @@ package cluster
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 )
+
+// TestMain lets this test binary stand in for kubectl: linked as kubectl
+// (selfAsKubectl), it prints its arguments and its whole environment. A Go
+// binary rather than a shell script, because macOS strips every DYLD_*
+// variable before it starts /bin/sh, so a script could never show one leaking.
+func TestMain(m *testing.M) {
+	if filepath.Base(os.Args[0]) == "kubectl" {
+		args, _ := json.Marshal(os.Args[1:])
+		fmt.Printf("args=%s\n", args)
+		for _, kv := range os.Environ() {
+			fmt.Println(kv)
+		}
+		os.Exit(0)
+	}
+	os.Exit(m.Run())
+}
+
+// raceQuiet stops a race-built binary from sleeping a second when it exits
+// 0; the self-kubectl is one. Env passes GORACE through for exactly this.
+const raceQuiet = "GORACE=atexit_sleep_ms=0"
+
+// selfAsKubectl links this test binary into a fresh directory as kubectl and
+// returns the directory.
+func selfAsKubectl(t *testing.T) string {
+	t.Helper()
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	if err := os.Symlink(self, filepath.Join(dir, "kubectl")); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// kubectlSaw is what the self-kubectl printed: its arguments and its
+// environment, one entry per line.
+func kubectlSaw(t *testing.T, c *Client) (args, env []string) {
+	t.Helper()
+	out, err := c.runner.Run(context.Background(), nil, "version")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimRight(string(out), "\n"), "\n")
+	first, ok := strings.CutPrefix(lines[0], "args=")
+	if !ok {
+		t.Fatalf("not the self-kubectl's output: %q", out)
+	}
+	if err := json.Unmarshal([]byte(first), &args); err != nil {
+		t.Fatal(err)
+	}
+	return args, lines[1:]
+}
+
+// shellParent is a developer's shell: everything Env must keep, and
+// everything it must drop.
+var shellParent = []string{
+	"PATH=/usr/bin::bin:/opt/homebrew/bin",
+	"HOME=/Users/op", "TMPDIR=/var/folders/xy/T/", "LANG=en_GB.UTF-8", "LC_ALL=en_GB.UTF-8", raceQuiet,
+	"KUBECONFIG=/work", "KUBERC=/evil", "KUBECTL_KUBERC=true", "KUBECACHEDIR=/Users/op/.kube/cache",
+	"CLOUDSDK_AUTH_ACCESS_TOKEN=planted-token", "CLOUDSDK_CORE_ACCOUNT=someone@work.example",
+	"CLOUDSDK_PYTHON=/opt/python/bin/python3", "CLOUDSDK_CONFIG=/g", "CLOUDSDK_ACTIVE_CONFIG_NAME=work",
+	"GOOGLE_APPLICATION_CREDENTIALS=/Users/op/key.json", "HTTPS_PROXY=http://127.0.0.1:9", "https_proxy=http://127.0.0.1:9",
+	"DYLD_INSERT_LIBRARIES=/tmp/x.dylib", "LD_PRELOAD=/tmp/x.so", "PYTHONPATH=/tmp/py", "BASH_ENV=/tmp/bashenv",
+	"SSL_CERT_FILE=/tmp/ca.pem", "FARCAST_CONFIG_HOME=/tmp/farcast", "GOFLAGS=-tags=integration",
+}
+
+// ADR 0023 M0: kubectl's environment is an allowlist. Unpinned, it keeps the
+// parent's gcloud selection and the parent's KUBECONFIG (the token-cache key
+// every command but 'world' has always used), and GORACE.
+func TestEnvIsBuiltFromAnAllowlist(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the Windows allowlist is untested until ADR 0023 M4")
+	}
+	got := Env(shellParent, "/cfg/instances/atlas/kubeconfig.yaml", GCloud{})
+	want := []string{
+		"CLOUDSDK_ACTIVE_CONFIG_NAME=work",
+		"CLOUDSDK_CONFIG=/g",
+		"GORACE=atexit_sleep_ms=0",
+		"HOME=/Users/op",
+		"KUBECONFIG=/work",
+		"KUBERC=off",
+		"LANG=en_GB.UTF-8",
+		"LC_ALL=en_GB.UTF-8",
+		"PATH=/usr/bin:/opt/homebrew/bin",
+		"TMPDIR=/var/folders/xy/T/",
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("Env\n got %q\nwant %q", got, want)
+	}
+
+	// A relative HOME or TMPDIR is dropped, and a key the parent repeats is
+	// passed once, with the value a process would see: the last.
+	got = Env([]string{"HOME=home", "TMPDIR=.", "LANG=C", "LANG=en_GB.UTF-8"}, "/kc", GCloud{})
+	if want := []string{"KUBERC=off", "LANG=en_GB.UTF-8"}; !slices.Equal(got, want) {
+		t.Errorf("Env\n got %q\nwant %q", got, want)
+	}
+}
+
+// Pinned ('world'), the instance's kubeconfig and the chosen gcloud
+// configuration replace the parent's.
+func TestEnvPinnedReplacesTheParentsGCloudSelection(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the Windows allowlist is untested until ADR 0023 M4")
+	}
+	got := Env(shellParent, "/cfg/instances/atlas/kubeconfig.yaml", GCloud{Dir: "/Users/op/.config/gcloud", Config: "personal"})
+	want := []string{
+		"CLOUDSDK_ACTIVE_CONFIG_NAME=personal",
+		"CLOUDSDK_CONFIG=/Users/op/.config/gcloud",
+		"GORACE=atexit_sleep_ms=0",
+		"HOME=/Users/op",
+		"KUBECONFIG=/cfg/instances/atlas/kubeconfig.yaml",
+		"KUBERC=off",
+		"LANG=en_GB.UTF-8",
+		"LC_ALL=en_GB.UTF-8",
+		"PATH=/usr/bin:/opt/homebrew/bin",
+		"TMPDIR=/var/folders/xy/T/",
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("Env\n got %q\nwant %q", got, want)
+	}
+}
+
+// Whatever environment a client was built with, kubectl runs with exactly
+// one KUBERC, and it is off: no kuberc file can change a call.
+func TestEveryKubectlRunsWithKubercOff(t *testing.T) {
+	bin := selfAsKubectl(t)
+	kuberc := func(env []string) []string {
+		var out []string
+		for _, kv := range env {
+			if strings.HasPrefix(kv, "KUBERC=") {
+				out = append(out, kv)
+			}
+		}
+		return out
+	}
+
+	t.Setenv("PATH", bin)
+	t.Setenv("GORACE", "atexit_sleep_ms=0")
+	t.Setenv("KUBERC", "/evil")
+	_, env := kubectlSaw(t, New("/kc"))
+	if got := kuberc(env); !slices.Equal(got, []string{"KUBERC=off"}) {
+		t.Errorf("through New, kubectl saw %q", got)
+	}
+
+	_, env = kubectlSaw(t, NewWithEnv("/kc", []string{"PATH=" + bin, raceQuiet, "KUBERC=/x"}))
+	if got := kuberc(env); !slices.Equal(got, []string{"KUBERC=off"}) {
+		t.Errorf("through NewWithEnv, kubectl saw %q", got)
+	}
+}
+
+// New no longer hands kubectl this process's environment: what the parent
+// exported reaches it only through Env's allowlist.
+func TestNewDoesNotInheritTheParentEnvironment(t *testing.T) {
+	bin := selfAsKubectl(t)
+	t.Setenv("PATH", bin)
+	t.Setenv("GORACE", "atexit_sleep_ms=0")
+	t.Setenv("CLOUDSDK_AUTH_ACCESS_TOKEN", "planted-token")
+	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:9")
+	t.Setenv("DYLD_INSERT_LIBRARIES", "/nonexistent/x.dylib")
+	_, env := kubectlSaw(t, New("/kc"))
+	if len(env) == 0 {
+		t.Fatal("kubectl printed no environment")
+	}
+	for _, kv := range env {
+		for _, k := range []string{"CLOUDSDK_AUTH_ACCESS_TOKEN=", "HTTPS_PROXY=", "DYLD_INSERT_LIBRARIES="} {
+			if strings.HasPrefix(kv, k) {
+				t.Errorf("the parent's %s reached kubectl", strings.TrimSuffix(k, "="))
+			}
+		}
+	}
+	if !slices.Contains(env, "PATH="+bin) {
+		t.Errorf("kubectl's PATH is not the parent's: %q", env)
+	}
+}
+
+// The auth plugin keys its one token-cache entry by the current context of
+// the file KUBECONFIG names. New keeps the parent's KUBECONFIG, or none,
+// and never names the instance's there: that entry belongs to 'world' (ADR
+// 0021 decision 9). kubectl itself always gets the instance's with --kubeconfig.
+func TestNewKeepsTheParentsTokenCacheKey(t *testing.T) {
+	bin := selfAsKubectl(t)
+	t.Setenv("PATH", bin)
+	t.Setenv("GORACE", "atexit_sleep_ms=0")
+	const instanceKC = "/cfg/instances/atlas/kubeconfig.yaml"
+	kubeconfigs := func(env []string) []string {
+		var out []string
+		for _, kv := range env {
+			if strings.HasPrefix(kv, "KUBECONFIG=") {
+				out = append(out, kv)
+			}
+		}
+		return out
+	}
+
+	t.Setenv("KUBECONFIG", "/Users/op/.kube/work")
+	args, env := kubectlSaw(t, New(instanceKC))
+	if !slices.Equal(args[:2], []string{"--kubeconfig", instanceKC}) {
+		t.Errorf("kubectl's arguments: %q", args)
+	}
+	if got := kubeconfigs(env); !slices.Equal(got, []string{"KUBECONFIG=/Users/op/.kube/work"}) {
+		t.Errorf("with the parent's KUBECONFIG set, kubectl saw %q", got)
+	}
+
+	if err := os.Unsetenv("KUBECONFIG"); err != nil {
+		t.Fatal(err)
+	}
+	args, env = kubectlSaw(t, New(instanceKC))
+	if !slices.Equal(args[:2], []string{"--kubeconfig", instanceKC}) {
+		t.Errorf("kubectl's arguments: %q", args)
+	}
+	if got := kubeconfigs(env); len(got) != 0 {
+		t.Errorf("with no KUBECONFIG in the parent, kubectl saw %q", got)
+	}
+}
 
 // fakeKubectl writes an executable named kubectl into a fresh directory and
 // returns that directory. The script is the test's stand-in for kubectl: no

@@ -5,6 +5,10 @@
 // surface is a security concern (ADR 0006), and the stored kubeconfig already
 // drives the control plane through the gke-gcloud-auth-plugin exec credential.
 //
+// kubectl never inherits this process's environment. Every call runs with one
+// built from an allowlist (Env, ADR 0023 M0), with KUBERC=off, and finds
+// kubectl on that environment's own PATH.
+//
 // The exec boundary is the Runner interface, so the connect orchestration is
 // unit-tested with a fake; the real cloud path is integration-gated.
 package cluster
@@ -19,6 +23,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -98,11 +103,10 @@ func markOf(stderr string) error {
 
 // execRunner runs the real kubectl binary, against a kubeconfig.
 //
-// With env nil it runs the kubectl found on this process's PATH and inherits
-// this process's whole environment, which is what every command but 'world'
-// still does. With env set (NewWithEnv) the subprocess gets exactly env and
-// nothing else, and kubectl is looked up on env's own PATH: the binary that
-// runs is the one the environment it runs in would find.
+// The subprocess gets exactly env, with KUBERC=off enforced, and nothing else
+// from this process; kubectl is looked up on env's own PATH, so the binary
+// that runs is the one the environment it runs in would find. New builds env
+// with Env, unpinned; 'world' hands NewWithEnv one pinned to its identity.
 type execRunner struct {
 	kubeconfig string
 	env        []string
@@ -112,15 +116,12 @@ type execRunner struct {
 
 func (r execRunner) command(ctx context.Context, args []string) (*exec.Cmd, error) {
 	full := append([]string{"--kubeconfig", r.kubeconfig}, args...)
-	if r.env == nil {
-		return exec.CommandContext(ctx, "kubectl", full...), nil
-	}
 	path, ok := lookPathIn("kubectl", envValue(r.env, "PATH"))
 	if !ok {
 		return nil, &subprocessError{msg: r.missingText(), mark: ErrKubectlMissing}
 	}
 	cmd := exec.CommandContext(ctx, path, full...)
-	cmd.Env = append([]string{}, r.env...)
+	cmd.Env = withKubercOff(r.env)
 	return cmd, nil
 }
 
@@ -182,14 +183,21 @@ func envValue(env []string, key string) string {
 // name. An empty entry is not the current directory here — a binary planted
 // in whatever directory the CLI happens to run from must never be the kubectl
 // that holds the operator's cluster credential.
+//
+// On Windows the file is name.exe, and Windows keeps no execute bit to check.
+// That branch is untested until ADR 0023 M4.
 func lookPathIn(name, pathValue string) (string, bool) {
+	windows := runtime.GOOS == "windows"
+	if windows {
+		name += ".exe"
+	}
 	for _, dir := range filepath.SplitList(pathValue) {
 		if dir == "" || !filepath.IsAbs(dir) {
 			continue
 		}
 		p := filepath.Join(dir, name)
 		info, err := os.Stat(p)
-		if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+		if err != nil || !info.Mode().IsRegular() || (!windows && info.Mode().Perm()&0o111 == 0) {
 			continue
 		}
 		return p, true
@@ -204,14 +212,24 @@ type Client struct {
 
 // New returns a Client that shells to kubectl using the kubeconfig at the given
 // path (the per-instance kubeconfig.yaml the CLI stored at install time).
+//
+// kubectl runs with Env(os.Environ(), kubeconfigPath, GCloud{}): an
+// environment built from an allowlist, unpinned, so it acts as whichever gcloud
+// configuration the parent selects (ADR 0023 M0 changes what reaches kubectl,
+// not who it acts as) and keeps the parent's KUBECONFIG, never the instance's.
+// It is NewWithEnv with that environment, keeping its own words for a missing
+// kubectl.
 func New(kubeconfigPath string) *Client {
-	return &Client{runner: execRunner{kubeconfig: kubeconfigPath}}
+	return &Client{runner: execRunner{
+		kubeconfig: kubeconfigPath,
+		env:        Env(os.Environ(), kubeconfigPath, GCloud{}),
+	}}
 }
 
-// NewWithEnv is New with kubectl's whole environment given rather than
-// inherited: the subprocess sees env and nothing else, and kubectl is found on
-// env's PATH. env must not be nil; an empty one is an environment with
-// nothing in it, which finds no kubectl.
+// NewWithEnv is New with kubectl's whole environment given: the subprocess
+// sees env, with KUBERC=off enforced, and nothing else, and kubectl is found on
+// env's PATH. A nil or empty env is an environment with nothing in it, which
+// finds no kubectl.
 //
 // It exists for 'farcast world', which pins the identity kubectl's auth plugin
 // acts as (ADR 0021 decision 9, amended 2026-11-12): what reaches the plugin
