@@ -2,7 +2,7 @@
 
 [ADR 0023](../adr/0023-one-download-farcast.md) M1 puts FarCast's four components inside `farcast`. This runbook proves it twice. R0 rebuilds a release on a second host OS and compares it byte for byte. W0–W7 install a live instance with a farcast built by `farcast-release`, from a shell with **no `go` on `PATH` and no checkout reachable**, and check that every system image deployed is the carried digest.
 
-**Status.** Written 2026-11-13 against the code as built. **Not walked: R0 has not run, and W0–W7 have not run.** Nothing below is a result until the Results table at the end says so.
+**Status.** Written 2026-11-13 against the code as built. ***W0–W7 walked 2026-11-14** at 44890cb against instance `$INSTANCE`: every system image deployed was the carried digest, recorded `origin: embedded`, from a shell with no Go and no checkout, and the instance is released. **R0 has not run.** The [Results](#results) are at the end. The walk corrected W1, W4 and W6 in place, each marked 2026-11-14: none of them is a defect in the product.*
 
 **The pinned base's three documents are in the tree,** under `farsight/cli/internal/image/base/`: fetched 2026-11-13 anonymously from gcr.io and checked against `image.BaseImage`'s digest chain. `farcast-release build` builds a release on them, and `./check.sh` step 3b checks on the dev Mac that its builds are byte-identical. That is one host: R0 is the second, and has not run. A base bump is `farcast-release base -write`, reviewed and committed.
 
@@ -122,6 +122,8 @@ farcast install --name "$INSTANCE" --cost-limit 100 --region us-central1 --crede
 ```
 *Expect* the install to finish as on the Phase 5 walk. Nothing here touches FarCast's own images.
 
+*(2026-11-14: without a terminal, as an agent runs it, the command as written stops twice: first at a prompt for the GCP project ID, then at install's own confirmation. Add `--project <the project id>`, taken from the FarCast gcloud configuration and not printed, and `--yes`, which answers only the spend the operator approved before W1.)*
+
 ## W2. `farcast connect`
 
 In the walk shell: `farcast connect "$INSTANCE" --yes`.
@@ -140,6 +142,8 @@ In the walk shell: `farcast kernel deploy "$INSTANCE" --yes`.
 
 In the walk shell: `farcast storage deploy "$INSTANCE" --yes`.
 - It prints the bucket grant **before** it applies anything. Apply it from the observing shell, as in [the phase-3 runbook](phase-3-validation.md) and Session A's S4, and wait for it to propagate.
+
+  *(2026-11-14: the printed `gcloud storage` commands still crash on the walk Mac's gcloud under Python 3.14 (`ssl.PROTOCOL_TLSv1`), and that gcloud refuses the system's Python 3.9. `gsutil` loads. The walk applied the same two bucket-level bindings with `gsutil iam get gs://<bucket>`, adding `roles/storage.objectAdmin` and `roles/storage.legacyBucketReader` for the printed principal to that JSON, and `gsutil iam set`. That way no token is printed. The replicas crash-looped until the grant landed, and ran sealed about a minute after it.)*
 - `running statefulset/datasphered` is `carried`'s `datasphered` manifest; `origins` shows `datasphered` as `embedded`.
 - `farcast storage unseal "$INSTANCE"` in the walk shell, as on every walk: the replicas come up sealed.
 - **`world` shows the Go of all four.** `world` reads as a pinned account. The operator types, in their own terminal, which is neither the walk shell nor the observing shell, so it sets both names first:
@@ -164,6 +168,8 @@ From the observing shell, which has Go (at or above go1.27.4) and a checkout of 
 - *Expect* both images built, pushed under `source-<12 hex>`, and `origins` showing `origin: operator` with the Go on that shell's `PATH` (`metadata.yaml` also records the checkout path; never record it).
 - Back in the walk shell, `farcast redeploy "$INSTANCE" --yes` **keeps** the operator build, and its note names both Go versions and `--embedded`.
 - Then `farcast redeploy "$INSTANCE" --embedded --yes` replaces it with the carried images, and says so. `running deployment/fatline` is `carried`'s again; `origins` shows `embedded`.
+
+*(2026-11-14: with exactly go1.27.4 on the observing shell's `PATH`, the operator build of the walked commit is byte-identical to the carried images, with the same manifest digests. So the deployed digests never change. `--embedded` then changes only the record, from `operator` to `embedded`, and prints no replacement note, because the note is printed only when the deployed digest changes. To see "and says so", build with a Go other than the pinned one.)*
 
 ## W6b (optional, no extra cost). The skew guard
 
@@ -197,25 +203,25 @@ In the walk shell: `farcast release "$INSTANCE" --delete-data --yes`.
 
 ## Results
 
-Not walked. To be filled in by the walk, with placeholders only.
+W0–W7 walked 2026-11-14 on the dev Mac, against instance `$INSTANCE`, with placeholders only. R0 has not run: it is the operator's step on the Ubuntu keeper VM.
 
 | Step | Result | Notes |
 |---|---|---|
-| Commit | | |
-| R0 revision and tags match on both hosts | | |
-| R0 three builds identical, Mac | | sha256 of `SHA256SUMS`: |
-| R0 three builds identical, VM | | sha256 of `SHA256SUMS`: ; `uname -srm`: |
-| R0 Mac and VM identical | | |
-| R0 `go version -m` lines | | |
-| W0 `./check.sh` | | |
-| W0 `shasum -c`, `go version -m` | | |
-| W0 `command -v go gofmt` printed nothing | | |
-| W0 `farcast version`, four components | | first 12 hex of each manifest: |
-| W1 install | | |
-| W2 connect: no build prompt, carried digests deployed, `embedded` recorded | | |
-| W3 kernel deploy | | |
-| W4 storage deploy, unseal, `world` `go` ×4 | | |
-| W5 redeploy reuses, no upload | | |
-| W6 operator build kept, then replaced | | |
-| W6b skew guard; `--fatline-image` with `--embedded` replaces Shrike alone | | |
-| W7 release, nothing left billing | | |
+| Commit | ✅ | `44890cb` (`44890cb555fdb26636da222b8a61da92cd44a569`), on `origin/main` before the walk; walked from a clean tree |
+| R0 revision and tags match on both hosts | Not run | R0 is an operator step on the keeper VM |
+| R0 three builds identical, Mac | Not run | sha256 of `SHA256SUMS`: not run as R0. W0's single build is in the W0 row below |
+| R0 three builds identical, VM | Not run | sha256 of `SHA256SUMS`: ; `uname -srm`: |
+| R0 Mac and VM identical | Not run | |
+| R0 `go version -m` lines | Not run | |
+| W0 `./check.sh` | ✅ | `check passed: root + sdk/go + Apple client · go1.27.4 · golangci-lint 2.15.0 · 31 vendored modules · Swift 6.4.2 · model: not run (--model)` |
+| W0 `shasum -c`, `go version -m` | ✅ | W0 step 2's own build, not R0's: 14 of 14 `OK`. `-tags=farcast_embedded`, `vcs.revision=44890cb555fdb26636da222b8a61da92cd44a569`, `vcs.modified=false`, go1.27.4. sha256 of its `SHA256SUMS`: `9a845ac6924b03dce66752deb0d998c7951a39eaa0d3bddcc693809c5c89a822` |
+| W0 `command -v go gofmt` printed nothing | ✅ | The walk shell's `PATH` was `$WALK/bin:$WALK/tools:/usr/bin:/bin`, its working directory `$WALK`, and no checkout was reachable from it. gcloud ran there without a finding |
+| W0 `farcast version`, four components | ✅ | Four components, each go1.27.4, on linux/amd64. First 12 hex of each manifest: datasphered `af98339c72cb`, fatline `6022502be77f`, shrike `62bff3f232f4`, technocore `1cc8e8e6522b` |
+| W1 install | ✅ | Finished as on Phase 5. Run without a terminal, it needed `--project` and `--yes` (W1's note) |
+| W2 connect: no build prompt, carried digests deployed, `embedded` recorded | ✅ | fatline and shrike were pushed as "the image this farcast carries" (go1.27.4, the carried digests), with no build prompt. `running deployment/fatline` printed `carried`'s fatline and shrike manifests. Version tag at the carried digest: yes, for both, and no `source-…` tag. `origins`: fatline and shrike `embedded`, go1.27.4, the walk farcast's version |
+| W3 kernel deploy | ✅ | The carried technocore was pushed, with no build prompt. `running deployment/technocore` is `carried`'s technocore manifest, the version tag under `system/technocore` holds it, and `origins` shows `embedded` |
+| W4 storage deploy, unseal, `world` `go` ×4 | ✅ | The grant was printed before the keyholder was applied, and applied with gsutil (W4's note). `running statefulset/datasphered` is `carried`'s datasphered manifest, recorded `embedded`. Unseal: 2 of 2 replicas at generation 1. After the operator typed `pin-gcloud` with `"$WALK/bin/farcast"`, `origins` still showed all four `embedded`. `world` `go`: fatline `go1.27.4`, technocore `go1.27.4`, shrike `go1.27.4`, datasphered `go1.27.4` |
+| W5 redeploy reuses, no upload | ✅ | "already holds the image this farcast carries" for fatline and shrike, and no push. The tags, versions and update times under `system/fatline` and `system/shrike` were unchanged, and so were the deployed digests |
+| W6 operator build kept, then replaced | ✅, except "says so" | Built on the observing shell's go1.27.4 from a clean checkout of 44890cb. Both images were pushed under `source-<12 hex>` and are byte-identical to the carried ones. `origins`: `operator`, go1.27.4. The walk shell's `redeploy` kept them, and its note named both Go versions and `--embedded`. `--embedded` put `origins` back to `embedded` with `carried`'s digests running, but printed no replacement note, because no digest changed (W6's note) |
+| W6b skew guard; `--fatline-image` with `--embedded` replaces Shrike alone | Skipped | No second release farcast of another version is at hand. 44890cb is the first commit with `farcast-release`, so no other release carries different fatline and shrike images |
+| W7 release, nothing left billing | ✅ | `release` reported the cluster, registry and bucket deleted after 5–6 minutes. Checked against the cloud afterwards: clusters, registries, buckets, forwarding rules, addresses, target pools, disks and VMs all 0 (also 0 before W1). The local record was removed, `$WALK` was deleted, and the release was deleted once this table was filled in |
