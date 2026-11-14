@@ -18,6 +18,8 @@ import (
 	"fmt"
 	"strings"
 	"text/template"
+	"unicode"
+	"unicode/utf8"
 )
 
 // Defaults for a build.
@@ -201,6 +203,34 @@ func Render(c Config) ([]byte, error) {
 			"to be on the cluster, which is what building here avoids", c.Repo)
 	}
 
+	// The Containerfile and the context come from a ./farcast manifest, the
+	// text of a repository the operator is still deciding whether to trust;
+	// the rest from the operator's flags. Every one of them is written into
+	// the YAML below, and a line break in one (a newline, or U+0085, U+2028
+	// or U+2029, which the API server's reader also ends a line at) would add
+	// documents of its own to a stream the operator's credential applies. The
+	// Kaniko arguments are double-quoted, so a quote or a backslash would end
+	// or escape them. For the Containerfile and the context the manifest
+	// parser refuses all of this before anything is built (manifest/README.md,
+	// rules 31 and 32); this is the same refusal, for every value, where the
+	// YAML is written.
+	values := []struct{ what, value string }{
+		{"repository", c.Repo},
+		{"ref", c.Ref},
+		{"containerfile", c.Containerfile},
+		{"context", c.ContextSubPath},
+		{"destination", c.Destination},
+		{"git secret", c.GitSecret},
+	}
+	for _, h := range c.EgressHosts {
+		values = append(values, struct{ what, value string }{"egress host", h})
+	}
+	for _, f := range values {
+		if err := plain(f.what, f.value); err != nil {
+			return nil, err
+		}
+	}
+
 	dockerfile, err := dockerfileArg(c.Containerfile, c.ContextSubPath)
 	if err != nil {
 		return nil, err
@@ -261,6 +291,27 @@ func contextURL(repo, ref string) string {
 	repo = strings.TrimPrefix(repo, "https://")
 	repo = strings.TrimPrefix(repo, "git://")
 	return "git://" + repo + "#" + ref
+}
+
+// plain refuses a value that would not stay one YAML scalar when it is
+// written into the template: text that is not UTF-8, any character
+// unicode.IsPrint refuses (every control character, the line and paragraph
+// separators, the byte order mark), a double quote or a backslash. The
+// message names a character by its code point and never quotes the value, so
+// the refusal prints safely.
+func plain(what, value string) error {
+	if !utf8.ValidString(value) {
+		return fmt.Errorf("build: the %s is not UTF-8", what)
+	}
+	for i, r := range value {
+		if !unicode.IsPrint(r) {
+			return fmt.Errorf("build: the %s holds %U at byte %d, a character that does not print", what, r, i)
+		}
+		if r == '"' || r == '\\' {
+			return fmt.Errorf("build: the %s holds %q at byte %d, which no repository, ref, path or name needs", what, string(r), i)
+		}
+	}
+	return nil
 }
 
 func hasDigest(image string) bool {
@@ -429,13 +480,17 @@ spec:
       containers:
         - name: kaniko
           image: {{.Builder}}
+          # Quoted: the Containerfile and the context are a manifest's text,
+          # and a plain scalar would read a " #" in one as a comment and a ": "
+          # as a key, so the build would not be the one the operator reviewed.
+          # Render refuses a quote, a backslash and anything that does not print.
           args:
-            - --context={{.ContextURL}}
+            - "--context={{.ContextURL}}"
 {{- if .ContextSubPath}}
-            - --context-sub-path={{.ContextSubPath}}
+            - "--context-sub-path={{.ContextSubPath}}"
 {{- end}}
-            - --dockerfile={{.Dockerfile}}
-            - --destination={{.Destination}}
+            - "--dockerfile={{.Dockerfile}}"
+            - "--destination={{.Destination}}"
             # Where the caller reads the digest back from, without parsing
             # logs: Kubernetes surfaces this file in the Pod's status.
             - --digest-file={{.DigestFile}}

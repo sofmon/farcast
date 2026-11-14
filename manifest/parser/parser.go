@@ -12,6 +12,8 @@ import (
 	"net"
 	"os"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/goccy/go-yaml"
 )
@@ -228,7 +230,7 @@ func validateApp(raw *rawApp, path string) (*App, []error) {
 		app.Name = *raw.Name
 	}
 
-	// containerfile (rules 18–20).
+	// containerfile (rules 18–20, 31).
 	if raw.Containerfile == nil {
 		errs = append(errs, newFieldError(path+".containerfile", "is required"))
 	} else if err := validateRelPath(*raw.Containerfile, path+".containerfile"); err != nil {
@@ -237,7 +239,7 @@ func validateApp(raw *rawApp, path string) (*App, []error) {
 		app.Containerfile = *raw.Containerfile
 	}
 
-	// context (rules 21–23). Optional.
+	// context (rules 21–23, 32). Optional.
 	if raw.Context != nil {
 		if err := validateRelPath(*raw.Context, path+".context"); err != nil {
 			errs = append(errs, err)
@@ -291,11 +293,17 @@ func validateExternal(raw *rawExternal, path string) (*External, []error) {
 		ext.Host = *raw.Host
 	}
 
-	// reason (rule 29).
+	// reason (rules 29, 33).
 	if raw.Reason == nil {
 		errs = append(errs, newFieldError(path+".reason", "is required"))
 	} else if *raw.Reason == "" {
 		errs = append(errs, newFieldError(path+".reason", "must not be empty"))
+	} else if err := printableText(*raw.Reason, path+".reason"); err != nil {
+		// Rule 33. The reason is shown to the operator as written, and it
+		// is carried in the egress policy's JSON, which leaves U+0085 and
+		// U+FEFF unescaped (fatline/policy), so the policy stream would be
+		// refused at apply time, after the builds had billed.
+		errs = append(errs, err)
 	} else {
 		ext.Reason = *raw.Reason
 	}
@@ -343,7 +351,8 @@ func validateDNSLabel(s, path string) error {
 }
 
 // validateRelPath enforces that a path is non-empty, relative (no leading
-// slash), and contains no ".." segments. We deliberately do not use
+// slash), contains no ".." segments, and holds only characters that print and
+// neither a double quote nor a backslash. We deliberately do not use
 // filepath.Clean — it silently collapses ".." against earlier segments,
 // which would hide escape attempts like "./a/../../b".
 func validateRelPath(s, path string) error {
@@ -361,6 +370,40 @@ func validateRelPath(s, path string) error {
 	for _, seg := range strings.Split(s, "/") {
 		if seg == ".." {
 			return newFieldError(path, "must not contain %q segment", "..")
+		}
+	}
+	// Rules 31 and 32. The path becomes one of the build Job's arguments,
+	// written inside a double-quoted YAML scalar (planck/build). A character
+	// that does not print could end that scalar's line, to kubectl's reader or
+	// to the API server's, and add documents of its own to the stream the
+	// operator's credential applies; a double quote or a backslash would end
+	// or escape the scalar. None of them belongs in a repository path, so the
+	// manifest is refused here, before anything is built.
+	if err := printableText(s, path); err != nil {
+		return err
+	}
+	if i := strings.IndexAny(s, "\"\\"); i >= 0 {
+		return newFieldError(path, "must not contain %q, which a repository path does not need (at byte %d)", s[i:i+1], i)
+	}
+	return nil
+}
+
+// printableText refuses text that is not UTF-8, or that holds a character
+// unicode.IsPrint refuses: every C0 and C1 control (a newline, a tab, a
+// carriage return, U+0085 NEXT LINE), the line and paragraph separators, and
+// the format characters (the byte order mark, the bidi overrides). It is the
+// rule farcast's own terminal output applies to somebody else's text
+// (farsight/cli/internal/output.Printable), applied here at the source.
+//
+// The message names the character by its code point and never quotes the
+// value, so the refusal itself prints safely.
+func printableText(s, path string) error {
+	if !utf8.ValidString(s) {
+		return newFieldError(path, "must be UTF-8")
+	}
+	for i, r := range s {
+		if !unicode.IsPrint(r) {
+			return newFieldError(path, "must hold only characters that print (got %U at byte %d)", r, i)
 		}
 	}
 	return nil

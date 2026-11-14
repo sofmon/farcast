@@ -25,13 +25,14 @@ func fprintln(w io.Writer, args ...any) {
 // every rune of it prints, and its Go-quoted form otherwise.
 //
 // It exists for text somebody else wrote. A manifest comes from a repository
-// the operator is deciding whether to trust, and the parser checks only that a
-// declaration's reason is not empty — so a reason can carry an escape sequence
-// that erases the line above it, a carriage return that overwrites the host it
-// sits beside, a newline that forges a declaration of its own, or a bidi
-// override that reverses what is read. Every one of those would rewrite the
-// review that is the gate. Quoting rather than stripping keeps the evidence:
-// the operator sees that the text was strange, and what it was.
+// the operator is deciding whether to trust, and a reason or a path could
+// carry an escape sequence that erases the line above it, a carriage return
+// that overwrites the host it sits beside, a newline that forges a declaration
+// of its own, or a bidi override that reverses what is read. Every one of
+// those would rewrite the review that is the gate. Since 2026-11-14 the parser
+// refuses such a manifest itself, by this same rule (manifest/README.md, rules
+// 31–33), and this is the second layer. Quoting rather than stripping keeps
+// the evidence: the operator sees that the text was strange, and what it was.
 //
 // What prints is output.Printable's rule: unicode.IsPrint rather than a check
 // for ASCII control characters, because the bidi overrides are format

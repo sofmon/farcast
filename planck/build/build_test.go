@@ -345,6 +345,86 @@ func TestAContainerfileOutsideTheContextIsRefused(t *testing.T) {
 	}
 }
 
+// The Containerfile and the context are a ./farcast manifest's text, from a
+// repository the operator is still deciding whether to trust, and every value
+// here is written into YAML a credential applies. A line break in one ends the
+// argument and adds documents of its own (here, a RoleBinding in
+// farcast-system); U+0085, U+2028 and U+2029 are line breaks to the API
+// server's reader; a quote or a backslash ends or escapes the quoted
+// argument. Render refuses each, in every value it writes, and its refusal
+// never carries the value raw.
+func TestRenderRefusesAValueThatWouldNotStayOneScalar(t *testing.T) {
+	injected := "Containerfile\n---\napiVersion: rbac.authorization.k8s.io/v1\nkind: RoleBinding\n" +
+		"metadata:\n  name: injected\n  namespace: farcast-system\n  annotations:\n    rest: |1"
+	bad := map[string]string{
+		"a document":      injected,
+		"U+0085":          "Containerfile\u0085",
+		"U+2028":          "Containerfile\u2028",
+		"U+2029":          "Containerfile\u2029",
+		"a byte order":    "Containerfile\ufeff",
+		"a return":        "Containerfile\r",
+		"a tab":           "Contai\tnerfile",
+		"an escape":       "Containerfile\x1b[2K",
+		"a bidi override": "Containerfile\u202e",
+		"a quote":         `Contai"nerfile`,
+		"a backslash":     `services\Containerfile`,
+		"not UTF-8":       "Containerfile\xff",
+	}
+	set := map[string]func(*Config, string){
+		"containerfile": func(c *Config, v string) { c.Containerfile = v },
+		"context":       func(c *Config, v string) { c.ContextSubPath, c.Containerfile = v, "Containerfile" },
+		"ref":           func(c *Config, v string) { c.Ref = v },
+		"repository":    func(c *Config, v string) { c.Repo = "https://github.com/example/" + v },
+		"destination":   func(c *Config, v string) { c.Destination = "reg.example/app/" + v },
+		"git secret":    func(c *Config, v string) { c.GitSecret = v },
+		"egress host":   func(c *Config, v string) { c.EgressHosts = []string{"github.com", v} },
+	}
+	for field, put := range set {
+		for what, v := range bad {
+			c := sampleConfig()
+			put(&c, v)
+			out, err := Render(c)
+			if err == nil {
+				t.Errorf("%s holding %s was rendered:\n%s", field, what, out)
+				continue
+			}
+			if !strings.Contains(err.Error(), "the "+field+" ") {
+				t.Errorf("%s holding %s: the refusal does not name the %s: %v", field, what, field, err)
+			}
+			if strings.ContainsAny(err.Error(), "\n\r\x1b\u0085\u2028\u2029\ufeff\u202e") {
+				t.Errorf("%s holding %s: the refusal carries the value raw: %q", field, what, err)
+			}
+		}
+	}
+}
+
+// Quoting is what keeps a path that prints the path the operator reviewed. As
+// a plain scalar, " #" would start a comment and drop the rest, and ": " or a
+// trailing ":" would make the argument a mapping.
+func TestAPrintablePathIsBuiltAsWritten(t *testing.T) {
+	for _, p := range []string{
+		"a #b/Containerfile",
+		"a: b/Containerfile",
+		"a/Containerfile:",
+		"- x/Containerfile",
+		"&a *b !c |d >e @f `g %h {i} [j] 'k'/Containerfile",
+		"сервис/Containerfile",
+		" spaced /Containerfile ",
+	} {
+		c := sampleConfig()
+		c.Containerfile = p
+		_, docs := render(t, c)
+		if a := args(t, docs); !hasArg(a, "--dockerfile="+p) {
+			t.Errorf("containerfile %q reached the builder as %q", p, a)
+		}
+		c.ContextSubPath, c.Containerfile = p, p+"/Containerfile"
+		_, docs = render(t, c)
+		if a := args(t, docs); !hasArg(a, "--context-sub-path="+c.ContextSubPath) || !hasArg(a, "--dockerfile=Containerfile") {
+			t.Errorf("context %q reached the builder as %q", c.ContextSubPath, a)
+		}
+	}
+}
+
 func TestASubPathIsOnlyPassedWhenSet(t *testing.T) {
 	_, docs := render(t, sampleConfig())
 	for _, a := range args(t, docs) {

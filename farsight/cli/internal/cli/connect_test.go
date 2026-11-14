@@ -47,6 +47,7 @@ type fakeCluster struct {
 }
 
 func (f *fakeCluster) Apply(_ context.Context, m []byte) error {
+	checkApplied(m)
 	f.applied = append(f.applied, m)
 	return f.applyErr
 }

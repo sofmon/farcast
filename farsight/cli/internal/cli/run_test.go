@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -73,6 +74,7 @@ type fakeRunCluster struct {
 }
 
 func (f *fakeRunCluster) Apply(_ context.Context, m []byte) error {
+	checkApplied(m)
 	f.applied = append(f.applied, string(m))
 	if f.jobs == nil {
 		f.jobs = map[string]bool{}
@@ -656,10 +658,16 @@ func TestStorageIsWiredWhenTheInstanceHasAKeyholder(t *testing.T) {
 		}
 	}
 	// Each application is also given its identity on the data path, minted
-	// from this machine's CA key (ADR 0018 decision 1).
-	for _, want := range []string{"FARCAST_STORAGE_CLIENT_CERT", "FARCAST_STORAGE_CLIENT_KEY", "BEGIN PRIVATE KEY"} {
-		if !strings.Contains(workloads, want) {
-			t.Errorf("no storage identity reached the workloads: no %s", want)
+	// from this machine's CA key (ADR 0018 decision 1), in its own Secret.
+	for _, app := range []string{"api", "web"} {
+		data := egressSecretData(t, f, app)
+		for key, want := range map[string]string{
+			"FARCAST_STORAGE_CLIENT_CERT": "-----BEGIN CERTIFICATE-----",
+			"FARCAST_STORAGE_CLIENT_KEY":  "-----BEGIN PRIVATE KEY-----",
+		} {
+			if !strings.HasPrefix(data[key], want) {
+				t.Errorf("no storage identity reached %s: %s does not start with %s", app, key, want)
+			}
 		}
 	}
 }
@@ -706,6 +714,13 @@ func TestWithoutAKeyholderNoStorageIsWired(t *testing.T) {
 	}
 	if strings.Contains(appliedWith(t, f, "kind: Deployment"), "BEGIN CERTIFICATE") {
 		t.Error("an instance with no key holder still got a CA wired into its applications")
+	}
+	for _, app := range []string{"api", "web"} {
+		for key := range egressSecretData(t, f, app) {
+			if strings.HasPrefix(key, "FARCAST_STORAGE_") {
+				t.Errorf("an instance with no key holder still gave %s a storage identity: %s", app, key)
+			}
+		}
 	}
 }
 
@@ -922,31 +937,49 @@ func TestRunWritesAPerApplicationPolicy(t *testing.T) {
 // translator rendered, the way the container will receive it.
 func credentialFromSecret(t *testing.T, f *fakeRunCluster, app string) string {
 	t.Helper()
+	raw, ok := egressSecretData(t, f, app)["FARCAST_FATLINE_PROXY"]
+	if !ok {
+		t.Fatalf("%s's egress Secret has no proxy address", app)
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatalf("%s's proxy address does not parse: %q", app, raw)
+	}
+	credential, _ := u.User.Password()
+	if credential == "" {
+		t.Fatalf("%s's proxy address carries no credential: %q", app, raw)
+	}
+	return credential
+}
+
+// egressSecretData decodes the data of the egress Secret the translator
+// rendered for app: the bytes each value carries, which is what the container
+// reads.
+func egressSecretData(t *testing.T, f *fakeRunCluster, app string) map[string]string {
+	t.Helper()
 	stream := appliedWith(t, f, "kind: Secret\nmetadata:\n  name: "+app+"-egress")
 	for _, d := range strings.Split(stream, "\n---\n") {
 		var m struct {
-			Kind     string `yaml:"kind"`
 			Metadata struct {
 				Name string `yaml:"name"`
 			} `yaml:"metadata"`
-			StringData map[string]string `yaml:"stringData"`
+			Data map[string]string `yaml:"data"`
 		}
 		if yaml.Unmarshal([]byte(d), &m) != nil || m.Metadata.Name != app+"-egress" {
 			continue
 		}
-		raw := m.StringData["FARCAST_FATLINE_PROXY"]
-		u, err := url.Parse(raw)
-		if err != nil {
-			t.Fatalf("%s's proxy address does not parse: %q", app, raw)
+		out := make(map[string]string, len(m.Data))
+		for k, v := range m.Data {
+			b, err := base64.StdEncoding.Strict().DecodeString(v)
+			if err != nil {
+				t.Fatalf("%s-egress: data.%s is not standard base64: %v", app, k, err)
+			}
+			out[k] = string(b)
 		}
-		credential, _ := u.User.Password()
-		if credential == "" {
-			t.Fatalf("%s's proxy address carries no credential: %q", app, raw)
-		}
-		return credential
+		return out
 	}
 	t.Fatalf("no egress Secret for %s", app)
-	return ""
+	return nil
 }
 
 // An unreadable existing policy must stop the deploy, not be replaced: writing

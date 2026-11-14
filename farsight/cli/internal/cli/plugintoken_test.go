@@ -40,7 +40,9 @@ func TestMain(m *testing.M) {
 	if filepath.Base(os.Args[0]) == "kubectl" {
 		os.Exit(fakeKubectlMain(os.Args[1:]))
 	}
-	os.Exit(m.Run())
+	// Every stream a fake cluster was asked to apply must pass the
+	// in-process client's checks (manifests_test.go).
+	os.Exit(finishTests(m.Run(), os.Stderr))
 }
 
 const pluginCacheFile = "gke_gcloud_auth_plugin_cache"

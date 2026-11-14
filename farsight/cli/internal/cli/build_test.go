@@ -26,6 +26,7 @@ type fakeJobs struct {
 }
 
 func (f *fakeJobs) Apply(_ context.Context, m []byte) error {
+	checkApplied(m)
 	f.applied = append(f.applied, m)
 	return f.applyErr
 }

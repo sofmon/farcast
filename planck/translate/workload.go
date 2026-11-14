@@ -47,8 +47,13 @@ metadata:
 #
 # What it authorises is exactly this app's declared hosts, nothing wider, and it
 # is reminted on every deploy.
-stringData:
-  FARCAST_FATLINE_PROXY: {{.ProxyURL}}
+#
+# Rendered as data:, each value the base64 of the exact bytes the application
+# reads, because in Kubernetes' words "The stringData field for a Secret does
+# not work well with server-side apply" (ADR 0023 decision 2). Each value is
+# quoted, so no YAML reader can take one for anything but a string.
+data:
+  FARCAST_FATLINE_PROXY: "{{.ProxyURLB64}}"
 {{- if $.HasStorage}}
   # This application's identity on the keyholder's data path (ADR 0018
   # decision 1): the leaf that names it farcast://<instance>/app/<ns>/<name>,
@@ -60,10 +65,8 @@ stringData:
   # rotated on every deploy, and worth exactly one application's storage to
   # whoever reads it — which a cloud that can read the keyholder's memory
   # already has. It binds neighbours, tenants and thieves, not the provider.
-  FARCAST_STORAGE_CLIENT_CERT: |
-{{.ClientCert}}
-  FARCAST_STORAGE_CLIENT_KEY: |
-{{.ClientKey}}
+  FARCAST_STORAGE_CLIENT_CERT: "{{.ClientCertB64}}"
+  FARCAST_STORAGE_CLIENT_KEY: "{{.ClientKeyB64}}"
 {{- end}}
 ---
 apiVersion: v1

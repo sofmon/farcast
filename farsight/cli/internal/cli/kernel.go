@@ -314,7 +314,7 @@ func (c *kernelDeployCommand) Run(ctx context.Context, env *Env, args []string) 
 	}
 	img := resolved.Ref
 
-	manifests, err := tcdeploy.Render(tcdeploy.Config{
+	manifests, err := kernelManifests(tcdeploy.Config{
 		Image:        img,
 		Instance:     name,
 		Meter:        namespaces,
@@ -330,16 +330,6 @@ func (c *kernelDeployCommand) Run(ctx context.Context, env *Env, args []string) 
 	if err != nil {
 		return err
 	}
-	// Seed the list the kernel re-reads with the same namespaces its own
-	// bindings cover. Without this the two views start disagreeing: the
-	// workload can list them and the kernel has not been told they exist, so
-	// nothing in them is counted until the first `kernel meter`.
-	seed, err := kernel.RenderNamespacesConfigMap(tcdeploy.DefaultNamespace, kernel.DefaultNamespacesName, namespaces)
-	if err != nil {
-		return err
-	}
-	manifests = append(manifests, []byte("---\n")...)
-	manifests = append(manifests, seed...)
 
 	// Recorded BEFORE the apply, like every other billable thing this CLI
 	// creates: a workload running in a cluster that local state does not know
@@ -399,6 +389,31 @@ func (c *kernelDeployCommand) Run(ctx context.Context, env *Env, args []string) 
 		Interval:       effective(knobs.Interval, kernel.DefaultInterval),
 		AdaptCooldown:  effective(knobs.AdaptCooldown, kernel.DefaultCooldown),
 	})
+}
+
+// kernelManifests is the one stream 'kernel deploy' applies: TechnoCore's
+// workload, then the seed of the namespace list the kernel re-reads. The seed
+// comes last, after the RoleBindings the workload holds, for meterManifest's
+// reason: a stream stopped between them must not leave the kernel told to
+// meter a namespace it cannot read (TestTheMeteredListIsAppliedAfterItsBindings).
+//
+// The seed holds the same namespaces the workload's own bindings cover, for
+// the non-empty cfg.Meter kernel deploy always passes (parseNamespaces starts
+// it with farcast-system); an empty one would seed an empty list while the
+// workload still bound farcast-system. Without it the two views start disagreeing: the workload can list them and
+// the kernel has not been told they exist, so nothing in them is counted until
+// the first 'kernel meter'.
+func kernelManifests(cfg tcdeploy.Config) ([]byte, error) {
+	manifests, err := tcdeploy.Render(cfg)
+	if err != nil {
+		return nil, err
+	}
+	seed, err := kernel.RenderNamespacesConfigMap(tcdeploy.DefaultNamespace, kernel.DefaultNamespacesName, cfg.Meter)
+	if err != nil {
+		return nil, err
+	}
+	manifests = append(manifests, []byte("---\n")...)
+	return append(manifests, seed...), nil
 }
 
 // kernelKnobs is what the kernel runs with beyond its limit and namespaces.

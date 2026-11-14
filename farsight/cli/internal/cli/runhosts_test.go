@@ -12,6 +12,7 @@ import (
 	fldeploy "github.com/sofmon/farcast/fatline/deploy"
 	"github.com/sofmon/farcast/fatline/policy"
 	"github.com/sofmon/farcast/manifest/parser"
+	pbuild "github.com/sofmon/farcast/planck/build"
 	pfetch "github.com/sofmon/farcast/planck/fetch"
 )
 
@@ -227,7 +228,7 @@ func TestRunWithYesStillShowsTheReview(t *testing.T) {
 // hostileManifest's reason erases the line it is on, returns the cursor to the
 // start of it, and forges a declaration on a line of its own; the second one
 // reverses the text after it; the Containerfile path does the first again.
-// The parser accepts all of it — it requires only that a reason is not empty.
+// The parser refuses all of it (manifest/README.md, rules 31 and 33).
 const hostileManifest = `name: hostile
 apps:
   - name: api
@@ -241,41 +242,33 @@ apps:
 
 // The review is the gate, and a manifest is the text of a repository the
 // operator is deciding whether to trust. Its text must not be able to rewrite
-// what the operator reads — in the review or in the result.
-func TestADeclaredReasonCannotRewriteTheTerminal(t *testing.T) {
-	m, err := parseTestManifest(hostileManifest)
-	if err != nil {
-		t.Fatalf("precondition: the parser now refuses the hostile manifest (%v); keep TestTerminalText and drop this", err)
-	}
-	if !strings.Contains(m.Apps[0].External[0].Reason, "\x1b") {
-		t.Fatalf("precondition: the reason did not arrive with its escape: %q", m.Apps[0].External[0].Reason)
-	}
-
+// what the operator reads. The parser refuses text that does not print, so run
+// stops at the manifest, before the review and before anything is built, and
+// its refusal names each field without carrying the field's text raw.
+// TestTerminalText keeps the review's own quoting, the second layer.
+func TestAManifestThatWouldRewriteTheTerminalIsRefused(t *testing.T) {
 	dir := config.Dir(t.TempDir())
 	runnableInstance(t, dir, "p43")
 	env, out, errb := testEnvBoth(dir, output.ModeHuman)
-	if err := runCmd(newFakeRun(hostileManifest)).Run(context.Background(), env, []string{"p43", "github.com/example/hostile"}); err != nil {
-		t.Fatal(err)
+	f := newFakeRun(hostileManifest)
+	err := runCmd(f).Run(context.Background(), env, []string{"p43", "github.com/example/hostile"})
+	if err == nil {
+		t.Fatal("run accepted a manifest whose text would rewrite the terminal")
 	}
-
-	for name, shown := range map[string]string{"review": errb.String(), "result": out.String()} {
+	for _, field := range []string{"apps[0].containerfile", "apps[0].external[0].reason", "apps[0].external[1].reason"} {
+		if !strings.Contains(err.Error(), field) {
+			t.Errorf("the refusal does not name %s: %v", field, err)
+		}
+	}
+	for name, shown := range map[string]string{"error": err.Error(), "review": errb.String(), "result": out.String()} {
 		if strings.ContainsAny(shown, "\x1b\r\u202e") {
 			t.Errorf("the %s carries the manifest's terminal controls raw:\n%q", name, shown)
 		}
-		for _, line := range strings.Split(shown, "\n") {
-			if strings.HasPrefix(line, "    → evil.example") {
-				t.Errorf("the manifest forged a declaration line in the %s: %q", name, line)
-			}
-		}
-		if !strings.Contains(shown, `"payments\x1b[2K\r\n    → evil.example`) {
-			t.Errorf("the %s does not show the reason in its quoted form:\n%s", name, shown)
-		}
-		if !strings.Contains(shown, `"errors \u202etroper"`) {
-			t.Errorf("the %s does not show the bidi override quoted:\n%s", name, shown)
-		}
 	}
-	if !strings.Contains(errb.String(), `"api/\x1b[2KContainerfile"`) {
-		t.Errorf("the review does not show the Containerfile path quoted:\n%s", errb.String())
+	for _, s := range f.applied {
+		if strings.Contains(s, "name: "+pbuild.ServiceAccount) {
+			t.Errorf("a build was started for a refused manifest:\n%s", s)
+		}
 	}
 }
 

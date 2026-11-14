@@ -84,6 +84,7 @@ Path to the Containerfile that builds this application, relative to the reposito
 - Non-empty string.
 - Must be a **relative** path (no leading `/`).
 - Must not contain `..` segments. This prevents a manifest from referencing files outside the repository.
+- Must hold only characters that print, and neither a double quote nor a backslash. The path becomes an argument of the build Job farcast applies with the operator's credential, so a newline in it, or a line break only the API server's YAML reader sees (U+0085, U+2028, U+2029), would add documents of its own to that stream. "Print" is Go's `unicode.IsPrint`: no control character (a tab included), no line or paragraph separator, no format character such as the byte order mark or a bidi override, and the text must be UTF-8. A space, `#`, `:` or a letter outside ASCII is kept as written.
 - The parser does **not** verify the file exists on disk. Planck will report an error at build time if the file is missing.
 - Only the filename `Containerfile` is canonical. `Dockerfile` is not accepted as an alternative.
 
@@ -102,6 +103,8 @@ containerfile: ""
 containerfile: /etc/Containerfile         # absolute
 containerfile: ../other-repo/Containerfile # escapes repo
 containerfile: ./services/../Containerfile # contains ..
+containerfile: "Containerfile\n---\nkind: RoleBinding" # a newline
+containerfile: 'services\api\Containerfile'          # backslashes
 ```
 
 #### `context`
@@ -110,7 +113,7 @@ The build context directory passed to the container build, relative to the repos
 
 Use `context` when a service's Containerfile needs to include files from a parent directory — the classic monorepo case where multiple services share code. For example, with `containerfile: ./services/api/Containerfile` and `context: .`, the build runs from the repository root and the Containerfile can `COPY ./shared` to pull in shared libraries.
 
-**Rules:** identical to `containerfile` — non-empty when present, relative, no `..`, no absolute paths. Parser does not verify the directory exists.
+**Rules:** identical to `containerfile` — non-empty when present, relative, no `..`, no absolute paths, only characters that print, and neither a double quote nor a backslash. Parser does not verify the directory exists.
 
 **Valid:**
 
@@ -150,6 +153,7 @@ Each entry is an object:
 **`reason` rules:**
 
 - Non-empty string.
+- Only characters that print, as for `containerfile`; quotes and backslashes are fine. The reason is carried in the egress policy farcast applies, and an escape sequence, a carriage return or a bidi override in it could rewrite the review the operator reads.
 - Shown verbatim to the operator. Write it for a human reviewer.
 
 **Example:**
@@ -311,6 +315,14 @@ The parser must reject a manifest when any of the following conditions hold. Eac
 29. `reason` is missing, not a string, or empty.
 30. Two entries in the same app's `external` list have the same `host`. (Duplicates *across* different apps' lists are allowed — each app has its own independent allowlist.)
 
+### Characters
+
+Added 2026-11-14. Each of these fields reaches a stream farcast applies to the cluster, or the operator's terminal, so text that does not print is refused before anything is built.
+
+31. `containerfile` is not UTF-8, holds a character that does not print (Go's `unicode.IsPrint`), or holds a double quote or a backslash.
+32. `context` is not UTF-8, holds a character that does not print, or holds a double quote or a backslash.
+33. `reason` is not UTF-8, or holds a character that does not print.
+
 ---
 
 ## Reserved / Not Yet Specified
@@ -342,10 +354,11 @@ App            := { name: Name,
                     containerfile: RelPath,
                     context?: RelPath,
                     external?: [External, ...] }
-External       := { host: Hostname, reason: NonEmptyString }
-RelPath        := non-empty relative path; no leading '/'; no '..' segments
+External       := { host: Hostname, reason: Text }
+RelPath        := non-empty relative path; no leading '/'; no '..' segments;
+                  only printable characters; no '"' and no '\'
 Hostname       := valid DNS hostname; no scheme, no port, no path, no wildcards, no IPs
-NonEmptyString := string with length >= 1
+Text           := string with length >= 1; only printable characters
 ```
 
 All keys not listed above are rejected. All fields marked as required must be present; a missing required field is an error, not a default.

@@ -470,7 +470,7 @@ func TestDNSReachesTheNodeLocalCacheAsWellAsKubeDNS(t *testing.T) {
 func TestTheProxyAddressIsTheEgressServiceAndThePolicySelectsThePods(t *testing.T) {
 	_, docs := render(t, sampleConfig())
 
-	proxy := at(t, pick(t, docs, "Secret", "api-egress"), "stringData").(map[string]any)["FARCAST_FATLINE_PROXY"].(string)
+	proxy := secretData(t, docs, "api-egress")["FARCAST_FATLINE_PROXY"]
 	if !strings.Contains(proxy, FatLineService) {
 		t.Errorf("proxy = %q, want the egress Service %q", proxy, FatLineService)
 	}
@@ -511,8 +511,8 @@ func TestEachAppGetsItsOwnCredentialInItsOwnSecret(t *testing.T) {
 
 	seen := map[string]string{}
 	for _, app := range []string{"api", "web"} {
-		sec := at(t, pick(t, docs, "Secret", app+"-egress"), "stringData").(map[string]any)
-		proxy, ok := sec["FARCAST_FATLINE_PROXY"].(string)
+		sec := secretData(t, docs, app+"-egress")
+		proxy, ok := sec["FARCAST_FATLINE_PROXY"]
 		if !ok || proxy == "" {
 			t.Fatalf("%s has no proxy address", app)
 		}
@@ -646,9 +646,9 @@ func TestWithoutAnInstanceNoInstanceIDIsRendered(t *testing.T) {
 func TestEachAppGetsItsOwnStorageIdentityInTheSecret(t *testing.T) {
 	_, docs := render(t, sampleConfig())
 	for app, marker := range map[string]string{"api": "APILEAF", "web": "WEBLEAF"} {
-		sec := at(t, pick(t, docs, "Secret", app+"-egress"), "stringData").(map[string]any)
-		cert, _ := sec["FARCAST_STORAGE_CLIENT_CERT"].(string)
-		key, _ := sec["FARCAST_STORAGE_CLIENT_KEY"].(string)
+		sec := secretData(t, docs, app+"-egress")
+		cert := sec["FARCAST_STORAGE_CLIENT_CERT"]
+		key := sec["FARCAST_STORAGE_CLIENT_KEY"]
 		if !strings.Contains(cert, marker) {
 			t.Errorf("%s: FARCAST_STORAGE_CLIENT_CERT does not carry %s's own leaf", app, app)
 		}

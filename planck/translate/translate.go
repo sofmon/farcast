@@ -19,6 +19,7 @@ package translate
 
 import (
 	"bytes"
+	"encoding/base64"
 	"fmt"
 	"strings"
 
@@ -244,9 +245,9 @@ func Render(c Config) ([]byte, error) {
 		}
 		entry := appData{
 			Name: app.Name, Image: image,
-			ProxyURL: policy.ProxyURL("http",
+			ProxyURLB64: secretValue([]byte(policy.ProxyURL("http",
 				FatLineService+"."+SystemNamespace+".svc.cluster.local",
-				FatLineEgressPort, app.Name, credential),
+				FatLineEgressPort, app.Name, credential))),
 		}
 		if data.HasStorage {
 			st := c.Storage[app.Name]
@@ -258,8 +259,8 @@ func Render(c Config) ([]byte, error) {
 				return nil, fmt.Errorf("translate: no storage scope for app %q; its leaf would name a scope "+
 					"the keyring never minted (ADR 0018 decision 5)", app.Name)
 			}
-			entry.ClientCert = indentPEM(st.CertPEM)
-			entry.ClientKey = indentPEM(st.KeyPEM)
+			entry.ClientCertB64 = secretValue(blockScalarText(st.CertPEM))
+			entry.ClientKeyB64 = secretValue(blockScalarText(st.KeyPEM))
 			entry.Scope = st.Scope
 			entry.SecretsPrefix = st.SecretsPrefix
 		}
@@ -322,16 +323,34 @@ func indentPEM(pem []byte) string {
 	return strings.Join(lines, "\n")
 }
 
+// blockScalarText is the string a "|" block scalar holding pem reads as, which
+// is what the egress Secret carried while it was rendered as stringData: the
+// lines without their trailing newlines, then exactly one (YAML's clip
+// chomping). indentPEM lays out the same lines. That holds for a PEM as
+// encoding/pem writes it, which is the only kind run passes: LF line ends and
+// no leading whitespace on its first line. A CRLF PEM, or one that is only
+// newlines, would have read differently as a block scalar.
+func blockScalarText(pem []byte) []byte {
+	return []byte(strings.TrimRight(string(pem), "\n") + "\n")
+}
+
+// secretValue renders one value of a Secret's data: the standard base64 of
+// the bytes the application reads.
+func secretValue(b []byte) string {
+	return base64.StdEncoding.EncodeToString(b)
+}
+
 type appData struct {
 	Name  string
 	Image string
-	// ProxyURL is the app's egress address with its own credential in it
-	// (ADR 0013 decision 2).
-	ProxyURL string
-	// ClientCert and ClientKey are the app's storage identity, PEM indented
-	// for a YAML block scalar; empty when storage is not wired.
-	ClientCert string
-	ClientKey  string
+	// ProxyURLB64 is the base64 of the app's egress address, which carries
+	// its own credential (ADR 0013 decision 2).
+	ProxyURLB64 string
+	// ClientCertB64 and ClientKeyB64 are the base64 of the app's storage
+	// identity, each PEM ending in one newline; empty when storage is not
+	// wired.
+	ClientCertB64 string
+	ClientKeyB64  string
 	// Scope and SecretsPrefix are this application's own key space.
 	Scope         string
 	SecretsPrefix string

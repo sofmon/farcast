@@ -324,6 +324,91 @@ apps:
 `,
 			wantAll: []string{"duplicate host", "api.stripe.com"},
 		},
+		// Rule 31 — containerfile holds a character that does not print, a
+		// double quote or a backslash. The first is the stream injection:
+		// the newline would end the build Job's argument and add a document.
+		{
+			name: "Rule31_ContainerfileAddsADocument",
+			yaml: `name: my-app
+apps:
+  - name: server
+    containerfile: "Containerfile\n---\napiVersion: rbac.authorization.k8s.io/v1\nkind: RoleBinding"
+`,
+			wantAll: []string{"apps[0].containerfile", "print", "U+000A"},
+		},
+		{
+			name: "Rule31_ContainerfileNextLine",
+			yaml: `name: my-app
+apps:
+  - name: server
+    containerfile: "Containerfile\N"
+`,
+			wantAll: []string{"apps[0].containerfile", "print", "U+0085"},
+		},
+		{
+			name: "Rule31_ContainerfileQuote",
+			yaml: `name: my-app
+apps:
+  - name: server
+    containerfile: 'Contai"nerfile'
+`,
+			wantAll: []string{"apps[0].containerfile", `"\""`},
+		},
+		{
+			name: "Rule31_ContainerfileBackslash",
+			yaml: `name: my-app
+apps:
+  - name: server
+    containerfile: 'services\api/Containerfile'
+`,
+			wantAll: []string{"apps[0].containerfile", `"\\"`},
+		},
+		// Rule 32 — context, the same.
+		{
+			name: "Rule32_ContextLineSeparator",
+			yaml: `name: my-app
+apps:
+  - name: server
+    containerfile: ./Containerfile
+    context: "services\L"
+`,
+			wantAll: []string{"apps[0].context", "print", "U+2028"},
+		},
+		{
+			name: "Rule32_ContextQuote",
+			yaml: `name: my-app
+apps:
+  - name: server
+    containerfile: ./Containerfile
+    context: 'serv"ices'
+`,
+			wantAll: []string{"apps[0].context", `"\""`},
+		},
+		// Rule 33 — reason holds a character that does not print.
+		{
+			name: "Rule33_ReasonByteOrderMark",
+			yaml: `name: my-app
+apps:
+  - name: server
+    containerfile: ./Containerfile
+    external:
+      - host: api.stripe.com
+        reason: "payments\uFEFF"
+`,
+			wantAll: []string{"external[0].reason", "print", "U+FEFF"},
+		},
+		{
+			name: "Rule33_ReasonEscape",
+			yaml: `name: my-app
+apps:
+  - name: server
+    containerfile: ./Containerfile
+    external:
+      - host: api.stripe.com
+        reason: "payments\e[2K"
+`,
+			wantAll: []string{"external[0].reason", "print", "U+001B"},
+		},
 	}
 
 	for _, tc := range cases {
@@ -537,6 +622,32 @@ func TestParse_BOMAndCRLF(t *testing.T) {
 	y := "\uFEFFname: my-app\r\napps:\r\n  - name: server\r\n    containerfile: ./Containerfile\r\n"
 	if _, err := Parse([]byte(y)); err != nil {
 		t.Errorf("BOM + CRLF should parse, got %v", err)
+	}
+}
+
+// Rules 31–33 refuse what does not print, not what is unusual: a space, a
+// hash, a colon, a single quote or a letter outside ASCII is kept as written,
+// and a reason may quote and escape as it likes.
+func TestParse_PrintableTextIsKept(t *testing.T) {
+	y := `name: my-app
+apps:
+  - name: server
+    containerfile: "сервис/a b #c: 'd'/Containerfile"
+    context: "сервис/a b #c: 'd'"
+    external:
+      - host: api.stripe.com
+        reason: "say \"pay\" \\ now — 支付"
+`
+	m, err := Parse([]byte(y))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	a := m.Apps[0]
+	if a.Containerfile != "сервис/a b #c: 'd'/Containerfile" || a.Context != "сервис/a b #c: 'd'" {
+		t.Errorf("paths not kept: %q, %q", a.Containerfile, a.Context)
+	}
+	if got := a.External[0].Reason; got != `say "pay" \ now — 支付` {
+		t.Errorf("reason not kept: %q", got)
 	}
 }
 
