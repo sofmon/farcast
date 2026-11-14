@@ -228,6 +228,91 @@ func TestListingRefusesAnyOtherPackageError(t *testing.T) {
 	}
 }
 
+// farcast never links a test fake: the rehearsal or kubetest, or a package
+// under either, on any of its platforms, untagged or tagged (ADR 0023 M2,
+// D15). The real client, kube, and a package whose name only begins like a
+// fake's, are not fakes.
+func TestListingRefusesALinkedFake(t *testing.T) {
+	const fake = "; it must never be in the product binary"
+	dir := writeModule(t, map[string]string{
+		"farsight/cli/internal/kube/kube.go":                     "package kube\n",
+		"farsight/cli/internal/kube/kubetest/kubetest.go":        "package kubetest\n\nimport _ \"github.com/sofmon/farcast/farsight/cli/internal/kube\"\n",
+		"farsight/cli/internal/rehearsal/rehearsal.go":           "package rehearsal\n",
+		"farsight/cli/internal/rehearsal/scenario/scenario.go":   "package scenario\n",
+		"farsight/cli/internal/rehearsalnotes/rehearsalnotes.go": "package rehearsalnotes\n",
+		"farsight/cli/cmd/farcast/main.go":                       "package main\n\nimport (\n\t_ \"github.com/sofmon/farcast/farsight/cli/internal/kube\"\n\t_ \"github.com/sofmon/farcast/farsight/cli/internal/rehearsalnotes\"\n)\n\nfunc main() {}\n",
+		// Each fake is linked on one platform or in one configuration only.
+		"farsight/cli/cmd/farcast/fake_windows.go":      "package main\n\nimport _ \"github.com/sofmon/farcast/farsight/cli/internal/kube/kubetest\"\n",
+		"farsight/cli/cmd/farcast/fake_darwin_arm64.go": "package main\n\nimport _ \"github.com/sofmon/farcast/farsight/cli/internal/rehearsal\"\n",
+		"farsight/cli/cmd/farcast/fake_tagged.go":       "//go:build farcast_embedded\n\npackage main\n\nimport _ \"github.com/sofmon/farcast/farsight/cli/internal/rehearsal/scenario\"\n",
+	})
+	farcast := func(tagged bool, platforms ...string) target {
+		return target{binary: "farcast", pkg: "./farsight/cli/cmd/farcast", platforms: platforms, tagged: tagged}
+	}
+	for _, c := range []struct {
+		name string
+		t    target
+		want string // the whole error; "" for a listing that succeeds
+	}{
+		{"linux/amd64, untagged: kube and a look-alike only", farcast(false, "linux/amd64"), ""},
+		{"the five platforms, untagged", farcast(false, "darwin/arm64", "darwin/amd64", "linux/amd64", "linux/arm64", "windows/amd64"),
+			"farcast links the test fake github.com/sofmon/farcast/farsight/cli/internal/kube/kubetest" + fake + "\n" +
+				"farcast links the test fake github.com/sofmon/farcast/farsight/cli/internal/rehearsal" + fake},
+		{"linux/amd64, tagged", farcast(true, "linux/amd64"),
+			"farcast links the test fake github.com/sofmon/farcast/farsight/cli/internal/rehearsal/scenario" + fake},
+	} {
+		lines, err := list(context.Background(), dir, listEnviron(), []target{c.t})
+		switch {
+		case c.want == "" && err != nil:
+			t.Errorf("%s: the listing failed: %v", c.name, err)
+		case c.want != "" && err == nil:
+			t.Errorf("%s: the listing succeeded: %q", c.name, lines)
+		case c.want != "" && err.Error() != c.want:
+			t.Errorf("%s: the listing failed with\n%s\nwant\n%s", c.name, err, c.want)
+		}
+	}
+
+	// The fakes are refused in farcast only: another binary may link them.
+	x := farcast(true, "darwin/arm64", "windows/amd64")
+	x.binary = "farcast-rehearsal"
+	if lines, err := list(context.Background(), dir, listEnviron(), []target{x}); err != nil {
+		t.Errorf("a dev tool linking the fakes: %v (%q)", err, lines)
+	}
+}
+
+// technocore never links a package of farsight/, directly or through another
+// package: the kernel's client stays in technocore/kube (ADR 0009 decision
+// 3). farcast, which is itself under farsight/, may, and a tree whose name
+// only begins with farsight is another tree.
+func TestListingRefusesAKernelThatLinksTheCLI(t *testing.T) {
+	const kernel = "; the kernel's client stays in technocore/kube (ADR 0009 decision 3)"
+	technocore := target{binary: "technocore", pkg: "./technocore/cmd/technocore", platforms: []string{"linux/amd64"}}
+	files := func(kubeImports string) map[string]string {
+		return map[string]string{
+			"farsight/wire/wire.go":             "package wire\n",
+			"farsightkit/farsightkit.go":        "package farsightkit\n",
+			"technocore/kube/kube.go":           "package kube\n\nimport _ \"" + kubeImports + "\"\n",
+			"technocore/cmd/technocore/main.go": "package main\n\nimport _ \"github.com/sofmon/farcast/technocore/kube\"\n\nfunc main() {}\n",
+			"farsight/cli/cmd/x/wire.go":        "package main\n\nimport _ \"github.com/sofmon/farcast/farsight/wire\"\n",
+		}
+	}
+
+	dir := writeModule(t, files("github.com/sofmon/farcast/farsight/wire"))
+	lines, err := list(context.Background(), dir, listEnviron(), []target{technocore})
+	if want := "technocore links github.com/sofmon/farcast/farsight/wire" + kernel; err == nil || err.Error() != want {
+		t.Errorf("technocore linking farsight/wire through technocore/kube: err %v, lines %q; want the error\n%s", err, lines, want)
+	}
+	x := target{binary: "farcast", pkg: "./farsight/cli/cmd/x", platforms: []string{"linux/amd64"}}
+	if lines, err := list(context.Background(), dir, listEnviron(), []target{x}); err != nil {
+		t.Errorf("farcast linking farsight/: %v (%q)", err, lines)
+	}
+
+	dir = writeModule(t, files("github.com/sofmon/farcast/farsightkit"))
+	if lines, err := list(context.Background(), dir, listEnviron(), []target{technocore}); err != nil {
+		t.Errorf("technocore linking farsightkit, outside farsight/: %v (%q)", err, lines)
+	}
+}
+
 // Run takes no arguments, and lists only from the repository root.
 func TestRunTakesNoArguments(t *testing.T) {
 	var out, errb bytes.Buffer

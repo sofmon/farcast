@@ -1,0 +1,246 @@
+package kube_test
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+	"testing"
+
+	"github.com/sofmon/farcast/farsight/cli/internal/kube"
+	"github.com/sofmon/farcast/farsight/cli/internal/kube/kubetest"
+	tkube "github.com/sofmon/farcast/technocore/kube"
+)
+
+func splitOne(t *testing.T, stream string) kube.Document {
+	t.Helper()
+	docs, err := kube.SplitStream([]byte(stream))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(docs) != 1 {
+		t.Fatalf("%d documents", len(docs))
+	}
+	return docs[0]
+}
+
+const settingsV1 = `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: settings
+  namespace: web
+  labels:
+    app.kubernetes.io/managed-by: farcast
+data:
+  mode: "on"
+`
+
+const settingsV2 = `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: settings
+  namespace: web
+  labels:
+    app.kubernetes.io/managed-by: farcast
+data:
+  mode: "off"
+`
+
+// TestApplyIsOneServerSideApply: §5.3's request exactly, for a create and an
+// update, with force on and off: PATCH to the document's path, the apply
+// patch media type, the document's own bytes, and fieldManager=farcast,
+// fieldValidation=Strict and force as given.
+func TestApplyIsOneServerSideApply(t *testing.T) {
+	s := kubetest.New(t)
+	c, _ := connect(t, s, "writer")
+	ctx := t.Context()
+
+	created := splitOne(t, settingsV1)
+	meta, err := c.Apply(ctx, created, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Name != "settings" || meta.Namespace != "web" || meta.UID == "" || meta.ResourceVersion == "" {
+		t.Errorf("create answered %+v", meta)
+	}
+	if len(meta.ManagedFields) != 1 || meta.ManagedFields[0].Manager != "farcast" || meta.ManagedFields[0].Operation != "Apply" {
+		t.Errorf("create's managed fields = %+v, want farcast/Apply", meta.ManagedFields)
+	}
+	r := last(t, s)
+	if r.Method != http.MethodPatch || r.Path != "/api/v1/namespaces/web/configmaps/settings" ||
+		r.RawQuery != "fieldManager=farcast&fieldValidation=Strict&force=true" ||
+		r.ContentType != "application/apply-patch+yaml" || r.Accept != "application/json" || !bytes.Equal(r.Body, created.Raw) {
+		t.Errorf("apply sent %s %s?%s (%s, Accept %s)\n%s", r.Method, r.Path, r.RawQuery, r.ContentType, r.Accept, r.Body)
+	}
+
+	updated := splitOne(t, settingsV2)
+	meta2, err := c.Apply(ctx, updated, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta2.UID != meta.UID || meta2.ResourceVersion == meta.ResourceVersion {
+		t.Errorf("update answered uid %s rv %s; want the same object at a new resourceVersion", meta2.UID, meta2.ResourceVersion)
+	}
+	if r := last(t, s); r.RawQuery != "fieldManager=farcast&fieldValidation=Strict&force=false" || !bytes.Equal(r.Body, updated.Raw) {
+		t.Errorf("a non-forced apply sent ?%s", r.RawQuery)
+	}
+	cm, err := c.GetConfigMap(ctx, "web", "settings")
+	if err != nil || cm.Data["mode"] != "off" {
+		t.Errorf("after the update: %+v, %v", cm, err)
+	}
+}
+
+// TestApplyConflictSurfacesFieldConflicts: a 409 whose causes are
+// FieldManagerConflict comes back as an APIError FieldConflicts reads, and
+// is not retried.
+func TestApplyConflictSurfacesFieldConflicts(t *testing.T) {
+	s := kubetest.New(t)
+	c, _ := connect(t, s, "writer")
+	path := "/api/v1/namespaces/web/configmaps/settings"
+	s.Fail(http.MethodPatch, path, http.StatusConflict, kube.Status{
+		Status: tkube.Status{Reason: "Conflict", Message: `Apply failed with 1 conflict: conflict with "technocore": .data.mode`},
+		Details: &kube.StatusDetails{Name: "settings", Kind: "configmaps", Causes: []kube.StatusCause{
+			{Type: "FieldManagerConflict", Message: `conflict with "technocore"`, Field: ".data.mode"},
+		}},
+	})
+	_, err := c.Apply(t.Context(), splitOne(t, settingsV1), false)
+	causes, ok := kube.FieldConflicts(err)
+	if !ok || len(causes) != 1 || causes[0].Field != ".data.mode" || causes[0].Message != `conflict with "technocore"` {
+		t.Fatalf("FieldConflicts(%v) = %+v, %v", err, causes, ok)
+	}
+	if !errors.Is(err, tkube.ErrConflict) {
+		t.Errorf("a conflict does not unwrap to tkube.ErrConflict: %v", err)
+	}
+	if n := len(requestsTo(s, http.MethodPatch, path)); n != 1 {
+		t.Errorf("%d PATCHes; a conflict is not retried", n)
+	}
+}
+
+// TestApplyRefusesADocumentSplitStreamWouldNot: a hand-built Document with a
+// kind outside the table, a name that walks the path, or no bytes is
+// refused, and nothing is sent. So is one SplitStream would refuse for what
+// its bytes say (F-F3): Apply sends Raw, so it checks Raw again, and Raw must
+// be the document the Document names.
+func TestApplyRefusesADocumentSplitStreamWouldNot(t *testing.T) {
+	s := kubetest.New(t)
+	c, _ := connect(t, s, "writer")
+	good := splitOne(t, settingsV1)
+	crb := mustKind(t, "rbac.authorization.k8s.io/v1", "ClusterRoleBinding")
+	crbBytes := func(name string) []byte {
+		return []byte("apiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRoleBinding\nmetadata:\n  name: " + name +
+			"\nroleRef:\n  apiGroup: rbac.authorization.k8s.io\n  kind: ClusterRole\n  name: cluster-admin\nsubjects:\n- kind: User\n  name: reader@x.iam.gserviceaccount.com\n")
+	}
+	secretKind := mustKind(t, "v1", "Secret")
+	deployment := mustKind(t, "apps/v1", "Deployment")
+	const constructs = "which farcast's renderers never write; the API server reads YAML differently and could see keys this check does not"
+	unnamed := crb
+	unnamed.Names = nil
+	bad := []struct {
+		d    kube.Document
+		want string // the refusal's reason, when the row pins it
+	}{
+		{kube.Document{Kind: kube.Kind{Kind: "Pod", APIVersion: "v1", Resource: "pods", Namespaced: true}, Namespace: "web", Name: "p", Raw: good.Raw}, ""},
+		{kube.Document{Kind: kube.Kind{Kind: "ConfigMap", APIVersion: "v1", Resource: "secrets", Namespaced: true}, Namespace: "web", Name: "x", Raw: good.Raw}, ""},
+		{kube.Document{Kind: good.Kind, Namespace: "web", Name: "..", Raw: good.Raw}, ""},
+		{kube.Document{Kind: good.Kind, Namespace: "", Name: "settings", Raw: good.Raw}, ""},
+		{kube.Document{Kind: good.Kind, Namespace: "web", Name: "settings"}, ""},
+		// The ClusterRoleBinding row's one name: by the Kind's row, by
+		// dropping the row's Names, and by bytes that name another.
+		{kube.Document{Kind: crb, Name: "grant-everything", Raw: crbBytes("grant-everything")},
+			"a ClusterRoleBinding may only be named farcast-reader-namespaces"},
+		{kube.Document{Kind: unnamed, Name: "grant-everything", Raw: crbBytes("grant-everything")},
+			"a ClusterRoleBinding may only be named farcast-reader-namespaces"},
+		{kube.Document{Kind: crb, Name: "farcast-reader-namespaces", Raw: crbBytes("grant-everything")},
+			"a ClusterRoleBinding may only be named farcast-reader-namespaces"},
+		// Bytes another document's, or carrying what SplitStream refuses.
+		{kube.Document{Kind: good.Kind, Namespace: "web", Name: "other", Raw: good.Raw},
+			`its bytes are v1 ConfigMap "settings" in namespace "web", not the document it names`},
+		{kube.Document{Kind: secretKind, Namespace: "web", Name: "settings", Raw: good.Raw},
+			`its bytes are v1 ConfigMap "settings" in namespace "web", not the document it names`},
+		{kube.Document{Kind: secretKind, Namespace: "web", Name: "s",
+			Raw: []byte("apiVersion: v1\nkind: Secret\nmetadata:\n  name: s\n  namespace: web\nstringData:\n  token: plain\n")},
+			"a Secret's stringData does not work well with server-side apply (Kubernetes); render data: with base64 values"},
+		{kube.Document{Kind: good.Kind, Namespace: "web", Name: "settings", Raw: append(append([]byte(nil), good.Raw...), "status: {}\n"...)},
+			"it carries status, which only the API server sets"},
+		{kube.Document{Kind: good.Kind, Namespace: "web", Name: "settings", Raw: append([]byte("---\n"), good.Raw...)},
+			"its bytes hold a --- line, so they are more than one document"},
+		{kube.Document{Kind: good.Kind, Namespace: "web", Name: "settings", Raw: []byte(strings.ReplaceAll(string(good.Raw), "\n", "\r\n"))},
+			"it carries a carriage return, which farcast's renderers never write"},
+		{kube.Document{Kind: good.Kind, Namespace: "web", Name: "settings", Raw: []byte("# only a comment\n")}, "its bytes hold no document"},
+		// Bytes in which the API server's YAML reader sees a key go-yaml does
+		// not (C-C2-1, C-C2-2): Apply checks them again by the same rules.
+		{kube.Document{Kind: deployment, Namespace: "web", Name: "d", Raw: []byte(kube.FlowHidingStatus)},
+			"it uses a YAML value written right after its colon, " + constructs},
+		{kube.Document{Kind: secretKind, Namespace: "web", Name: "s", Raw: []byte(kube.QuestionHidingStringData)},
+			"it uses a YAML plain scalar inside a flow collection that is not one word of [A-Za-z0-9._/-], " + constructs},
+		{kube.Document{Kind: secretKind, Namespace: "web", Name: "s", Raw: []byte(kube.MultiLineHidingStringData)},
+			"it uses a YAML plain scalar inside a flow collection that is not one word of [A-Za-z0-9._/-], " + constructs},
+		{kube.Document{Kind: secretKind, Namespace: "web", Name: "s", Raw: []byte(kube.BareEntryHidingStringData)},
+			"it uses a YAML sequence entry with nothing after its - on that line, " + constructs},
+		{kube.Document{Kind: secretKind, Namespace: "web", Name: "s", Raw: []byte(kube.LoneQuestionHidingStatus)},
+			"it uses a YAML plain scalar that starts with an indicator character, " + constructs},
+		{kube.Document{Kind: secretKind, Namespace: "web", Name: "s", Raw: []byte(kube.UTF16Polyglot())},
+			"it is not UTF-8; the API server's YAML reader decodes a body that starts with a UTF-16 byte order mark as UTF-16, and this check does not"},
+		{kube.Document{Kind: good.Kind, Namespace: "web", Name: "settings", Raw: append([]byte("\xfe\xff"), good.Raw...)},
+			"it is not UTF-8; the API server's YAML reader decodes a body that starts with a UTF-16 byte order mark as UTF-16, and this check does not"},
+	}
+	for i, b := range bad {
+		_, err := c.Apply(t.Context(), b.d, true)
+		if !errors.Is(err, kube.ErrRefusedDocument) {
+			t.Errorf("document %d: err = %v, want ErrRefusedDocument", i, err)
+			continue
+		}
+		msg := err.Error()
+		if !strings.HasPrefix(msg, "kube: document 0 (") || strings.Count(msg, "kube:") != 1 || !strings.HasSuffix(msg, "; nothing was sent") {
+			t.Errorf("document %d: refusal %q is not one framed sentence", i, msg)
+		}
+		if want := fmt.Sprintf("kube: document 0 (%s %q) is refused: %s; nothing was sent", b.d.Kind.Kind, b.d.Name, b.want); b.want != "" && msg != want {
+			t.Errorf("document %d: refusal = %q\nwant          %q", i, msg, want)
+		}
+	}
+	if n := len(s.Requests()); n != 0 {
+		t.Errorf("%d requests for refused documents", n)
+	}
+
+	// The one name the row allows is applied.
+	if _, err := c.Apply(t.Context(), kube.Document{Kind: crb, Name: "farcast-reader-namespaces", Raw: crbBytes("farcast-reader-namespaces")}, true); err != nil {
+		t.Errorf("the reader's ClusterRoleBinding: %v", err)
+	}
+}
+
+// TestDeleteSecretIsPreconditionedOnItsUID: the one delete carries the
+// Secret's uid as its precondition; another uid is a 409, an absent Secret a
+// 404, and no uid sends nothing.
+func TestDeleteSecretIsPreconditionedOnItsUID(t *testing.T) {
+	s := kubetest.New(t)
+	s.Put(obj("v1", "Secret", "web", "git-credential", map[string]any{"metadata": map[string]any{"uid": "uid-1"}}))
+	c, _ := connect(t, s, "writer")
+	ctx := t.Context()
+
+	if err := c.DeleteSecret(ctx, "web", "git-credential", ""); !errors.Is(err, kube.ErrRefusedDocument) {
+		t.Errorf("no uid: err = %v, want ErrRefusedDocument", err)
+	}
+	if n := len(s.Requests()); n != 0 {
+		t.Errorf("a delete without a uid sent %d requests", n)
+	}
+	if err := c.DeleteSecret(ctx, "web", "git-credential", "uid-2"); !errors.Is(err, tkube.ErrConflict) {
+		t.Errorf("another uid: err = %v, want tkube.ErrConflict", err)
+	}
+	if err := c.DeleteSecret(ctx, "web", "git-credential", "uid-1"); err != nil {
+		t.Fatalf("its own uid: %v", err)
+	}
+	r := last(t, s)
+	// The body is compared byte for byte, never decoded into a struct:
+	// encoding/json would read "Preconditions" or "UID" too, and the API
+	// server, which decodes case-sensitively and drops an unknown key from a
+	// DELETE body, would delete without the precondition.
+	const wantBody = `{"apiVersion":"v1","kind":"DeleteOptions","preconditions":{"uid":"uid-1"}}`
+	if r.Method != http.MethodDelete || r.Path != "/api/v1/namespaces/web/secrets/git-credential" || r.ContentType != "application/json" ||
+		string(r.Body) != wantBody {
+		t.Errorf("delete sent %s %s (%s) %s\nwant body %s", r.Method, r.Path, r.ContentType, r.Body, wantBody)
+	}
+	if err := c.DeleteSecret(ctx, "web", "git-credential", "uid-1"); !errors.Is(err, tkube.ErrNotFound) {
+		t.Errorf("an absent Secret: err = %v, want tkube.ErrNotFound", err)
+	}
+}

@@ -35,6 +35,11 @@
 // procCreateProcessAsUserW or procShellExecuteW under another name; and a
 // darwin //go:cgo_import_dynamic of an exec or spawn symbol with its
 // trampoline. exec-allowlist.txt states these limits in its header.
+//
+// The listing also refuses two links, whatever the scan finds (ADR 0023 M2,
+// D15): farcast, on any platform and in either configuration, linking a test
+// fake (the rehearsal, or kubetest, an ordinary package so that the rehearsal
+// binary can use it); and technocore linking any package of farsight/.
 package execgate
 
 import (
@@ -119,9 +124,57 @@ const embeddedTag = "farcast_embedded"
 // //go:embed patterns name layer files that only a release build overlays.
 const componentsPath = "github.com/sofmon/farcast/farsight/cli/internal/components"
 
+// fakeTrees are the test fakes farcast must never link: each import path and
+// every package under it.
+var fakeTrees = []string{
+	"github.com/sofmon/farcast/farsight/cli/internal/rehearsal",
+	"github.com/sofmon/farcast/farsight/cli/internal/kube/kubetest",
+}
+
+// cliTree is what technocore must never link: every package of farsight/.
+const cliTree = "github.com/sofmon/farcast/farsight"
+
+// under reports whether importPath is tree or a package under it.
+func under(importPath, tree string) bool {
+	return importPath == tree || strings.HasPrefix(importPath, tree+"/")
+}
+
+// refusedLinks checks every job's dependency list: farcast links no test fake
+// on any platform, untagged or tagged, and technocore links no package of
+// farsight/. It returns one error per refused package, sorted, or nil.
+func refusedLinks(jobs []*job) error {
+	refused := map[string]bool{}
+	for _, j := range jobs {
+		for _, p := range j.pkgs {
+			switch j.t.binary {
+			case "farcast":
+				for _, tree := range fakeTrees {
+					if under(p.ImportPath, tree) {
+						refused[fmt.Sprintf("farcast links the test fake %s; it must never be in the product binary", p.ImportPath)] = true
+					}
+				}
+			case "technocore":
+				if under(p.ImportPath, cliTree) {
+					refused[fmt.Sprintf("technocore links %s; the kernel's client stays in technocore/kube (ADR 0009 decision 3)", p.ImportPath)] = true
+				}
+			}
+		}
+	}
+	msgs := make([]string, 0, len(refused))
+	for m := range refused {
+		msgs = append(msgs, m)
+	}
+	sort.Strings(msgs)
+	errs := make([]error, len(msgs))
+	for i, m := range msgs {
+		errs[i] = errors.New(m)
+	}
+	return errors.Join(errs...)
+}
+
 // Run lists what the shipped binaries can start, one line per site, sorted and
 // unique, on stdout. Exit 0 when listed, 1 on a failure (a go list error, a
-// parse error), 2 on a usage error.
+// refused link, a parse error), 2 on a usage error.
 func Run(ctx context.Context, args []string, env []string, stdout, stderr io.Writer) int {
 	if len(args) != 0 {
 		_, _ = fmt.Fprintln(stderr, "usage: farcast-release execsites (no arguments; run it in the repository root)")
@@ -208,6 +261,9 @@ func list(ctx context.Context, root string, env []string, targets []target) ([]s
 		if j.err != nil {
 			return nil, j.err
 		}
+	}
+	if err := refusedLinks(jobs); err != nil {
+		return nil, err
 	}
 
 	// Every file any job links, each scanned once.
