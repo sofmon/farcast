@@ -16,8 +16,9 @@ import (
 // without recording what it read (D9).
 //
 // It prints the schema, the date the document was made, the instance's
-// status, each section's outcome, counts — of groups, apps, hosts, and lines
-// by kind and evidence — the alert kinds with their counts, the number of
+// status, each section's outcome, counts — of groups (and of those whose
+// applications were not read, by kind), apps, hosts, and lines by kind and
+// evidence — the alert kinds with their counts, the number of
 // caveats, and whether spend and network were read. Every word it prints is
 // either a number or a value from a closed set the CLI's README fixes; any
 // other value is printed as "other". So it never prints a name, a host, a
@@ -71,6 +72,9 @@ func Summarize(r io.Reader, w io.Writer) error {
 			Apps []struct {
 				State string `json:"state"`
 			} `json:"apps"`
+			AppsError *struct {
+				Kind string `json:"kind"`
+			} `json:"apps_error"`
 		} `json:"groups"`
 		Hosts []json.RawMessage `json:"hosts"`
 		Lines []struct {
@@ -151,15 +155,25 @@ func Summarize(r io.Reader, w io.Writer) error {
 	fmt.Fprintf(&b, "components: %s\n", orNone(comps))
 
 	apps := map[string]int{}
-	nApps := 0
+	unread := map[string]int{}
+	nApps, nUnread := 0, 0
 	for _, g := range doc.Groups {
 		for _, a := range g.Apps {
 			apps[closed(a.State, states)]++
 			nApps++
 		}
+		if g.AppsError != nil {
+			unread[closed(g.AppsError.Kind, errorKinds)]++
+			nUnread++
+		}
 	}
-	fmt.Fprintf(&b, "groups %d · apps %d (%s) · hosts %d · hosts omitted %d\n",
-		len(doc.Groups), nApps, orNone(counted(apps)), len(doc.Hosts), doc.Instance.HostsOmitted)
+	groups := fmt.Sprint(len(doc.Groups))
+	if nUnread > 0 {
+		// A group whose applications the reader could not read (P5).
+		groups += fmt.Sprintf(" (%d not read: %s)", nUnread, strings.Join(counted(unread), " · "))
+	}
+	fmt.Fprintf(&b, "groups %s · apps %d (%s) · hosts %d · hosts omitted %d\n",
+		groups, nApps, orNone(counted(apps)), len(doc.Hosts), doc.Instance.HostsOmitted)
 
 	lines := map[string]int{}
 	for _, l := range doc.Lines {
@@ -190,10 +204,14 @@ func Summarize(r io.Reader, w io.Writer) error {
 // The closed sets, as farsight/cli/README.md fixes them.
 var (
 	sectionNames = []string{"spend", "apps", "policy", "network", "seal"}
-	errorKinds   = []string{
+	// errorKinds are the 21 of ADR 0023 M2.4, in the README's order. The
+	// five the gcloud identity's kubectl reads had are retired, and read as
+	// "other".
+	errorKinds = []string{
 		"record_unreadable", "not_found", "not_connected", "tunnel_unreachable", "kernel_absent", "not_checkpointed",
-		"version_skew", "kubectl_missing", "kubectl_failed", "gcloud_mismatch", "gcloud_signed_out", "auth_tool_missing",
-		"timeout", "internal",
+		"version_skew", "credential_missing", "credential_refused", "unsafe_environment", "endpoint_refused",
+		"cluster_unreachable", "unauthorized", "forbidden", "cluster_rejected", "document_unreadable",
+		"rollout_stalled", "not_migrated", "plan_changed", "timeout", "internal",
 	}
 	statuses      = []string{"provisioning", "running", "unreachable", "deleting", "error"}
 	cloudLoggings = []string{"system_only", "unverified", "unknown"}

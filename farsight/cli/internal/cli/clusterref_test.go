@@ -153,7 +153,7 @@ func TestOpenClusterRefusesInOrder(t *testing.T) {
 		{"4, no reader", s.Endpoint(), true, nil, false, errCredentialMissing,
 			`instance "atlas" has no reader identity; run 'farcast reader init atlas'`},
 		{"4, not the derived reader", s.Endpoint(), true, &config.Reader{Email: "writer@kubetest.invalid"}, false, errCredentialMissing,
-			`instance "atlas" records the reader writer@kubetest.invalid, which is not the reader farcast derives for it (` + readerName(name) + `@<a name under .invalid>); nothing was sent`},
+			`instance "atlas" records the reader "writer@kubetest.invalid", which is not the reader farcast derives for it (` + readerName(name) + `@<a name under .invalid>); nothing was sent`},
 		{"4, a key not uploaded", s.Endpoint(), true, &config.Reader{Email: derived}, false, errCredentialMissing,
 			`instance "atlas"'s reader key is not yet uploaded; run the printed Cloud Shell script, then 'farcast reader record atlas --key-id <id>'`},
 		{"4, a reader not verified", s.Endpoint(), true, &config.Reader{Email: derived, KeyID: strings.Repeat("ab", 20)}, false, errCredentialMissing,
@@ -185,8 +185,79 @@ func TestOpenClusterRefusesInOrder(t *testing.T) {
 			t.Errorf("step %s: %v matches the other sentinel too", row.step, err)
 		}
 	}
+
+	// 1b, after step 1 and before step 2 (A18-8): a record checkedReader
+	// refuses, refused with its value quoted, and nothing read. None has a
+	// usable reader, so step 4 would refuse each as a missing reader, and
+	// step 3 each without a cluster-ca.crt as the endpoint; the last has a
+	// cluster-ca.crt that cannot be read, which step 2 would refuse as the
+	// endpoint after reading it (mutation O6c). A row passes only if
+	// checkedReader comes first, before a path is built from the recorded
+	// name or anything is read from one.
+	key := strings.Repeat("ab", 20)
+	reads := observeConfigReads(t)
+	for _, row := range []struct {
+		field, value string
+		meta         config.InstanceMetadata
+		caDir        bool // cluster-ca.crt is a directory, which no read can open
+	}{
+		{"name", "atlas\x1b[2J", config.InstanceMetadata{Name: "atlas\x1b[2J", Project: "proj-test1", Reader: &config.Reader{Email: derived, KeyID: key}}, false},
+		{"name", "../atlas", config.InstanceMetadata{Name: "../atlas", Project: "proj-test1"}, false},
+		{"project ID", "proj'$(id)", config.InstanceMetadata{Name: name, Project: "proj'$(id)", Reader: &config.Reader{Email: derived, KeyID: key}}, false},
+		{"key id", strings.ToUpper(key), config.InstanceMetadata{Name: name, Project: "proj-test1", Reader: &config.Reader{Email: derived, KeyID: strings.ToUpper(key)}}, false},
+		{"project ID", "proj'$(id)", config.InstanceMetadata{Name: name, Project: "proj'$(id)", Reader: &config.Reader{Email: derived, KeyID: key, GrantedAt: readerGrantedAt}}, true},
+	} {
+		meta := row.meta
+		meta.Provider, meta.Region, meta.Endpoint = "gke", "us-central1", s.Endpoint()
+		dir := config.Dir(filepath.Join(t.TempDir(), "cfg"))
+		if row.caDir {
+			if err := os.MkdirAll(filepath.Join(dir.InstancePath(meta.Name), "cluster-ca.crt"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}
+		c, err := openCluster(clusterRef{Dir: dir, Meta: &meta, Identity: kube.Reader, Warn: &bytes.Buffer{}})
+		want := fmt.Sprintf(msgUnsafeRecord, meta.Name, row.field, row.value)
+		if c != nil || err == nil || err.Error() != want || !errors.Is(err, errCredentialMissing) || errors.Is(err, kube.ErrEndpointRefused) {
+			t.Errorf("step 1b, the %s %q (an unreadable cluster-ca.crt: %v): openCluster = %v, %v; want %q, matching errCredentialMissing alone", row.field, row.value, row.caDir, c, err, want)
+		}
+	}
+	if got := reads(); len(got) != 0 {
+		t.Errorf("step 1b read %v from records it refuses", got)
+	}
 	if got := s.Requests(); len(got) != 0 {
 		t.Errorf("the refusals sent %d requests", len(got))
+	}
+}
+
+// A cluster-ca.crt that exists and cannot be read is refused as the
+// endpoint (A18-8), never read as absent: a loopback endpoint is trusted on
+// its own CA alone, and a Google endpoint with a CA beside it is refused. The
+// record is otherwise one that reads.
+func TestAnUnreadableClusterCAIsRefusedAsTheEndpoint(t *testing.T) {
+	s := kubetest.New(t)
+	dir, meta := readerInstance(t, s, "atlas", true)
+	ca := filepath.Join(dir.InstancePath("atlas"), "cluster-ca.crt")
+	if err := os.Remove(ca); err != nil {
+		t.Fatal(err)
+	}
+	// A directory in its place: reading it fails whoever runs the test.
+	if err := os.Mkdir(ca, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	_, readErr := os.ReadFile(ca)
+	if readErr == nil {
+		t.Fatal("a directory read as a file")
+	}
+	c, err := openCluster(clusterRef{Dir: dir, Meta: meta, Identity: kube.Reader, Warn: &bytes.Buffer{}})
+	want := fmt.Sprintf("instance %q's cluster-ca.crt exists and cannot be read (%v); nothing was sent", "atlas", readErr)
+	if c != nil || err == nil || err.Error() != want {
+		t.Fatalf("openCluster = %v, %v; want %q", c, err, want)
+	}
+	if !errors.Is(err, kube.ErrEndpointRefused) || errors.Is(err, errCredentialMissing) {
+		t.Errorf("%v does not match kube.ErrEndpointRefused alone", err)
+	}
+	if got := s.Requests(); len(got) != 0 {
+		t.Errorf("the refusal sent %d requests", len(got))
 	}
 }
 
@@ -229,7 +300,7 @@ func TestReaderEmailMustBeTheDerivedOne(t *testing.T) {
 			edited := *meta
 			edited.Reader = &config.Reader{Email: email, KeyID: keyID, GrantedAt: readerGrantedAt, Scope: "metered"}
 			c, err := openCluster(clusterRef{Dir: dir, Meta: &edited, Identity: kube.Reader, Warn: &bytes.Buffer{}})
-			want := fmt.Sprintf("instance %q records the reader %s, which is not the reader farcast derives for it (%s@<a name under .invalid>); nothing was sent", name, email, readerName(name))
+			want := fmt.Sprintf("instance %q records the reader %q, which is not the reader farcast derives for it (%s@<a name under .invalid>); nothing was sent", name, email, readerName(name))
 			if c != nil || !errors.Is(err, errCredentialMissing) || err.Error() != want {
 				t.Errorf("%s: openCluster = %v, %v; want %q", email, c, err, want)
 			}
@@ -285,7 +356,7 @@ func TestReaderEmailMustBeTheDerivedOne(t *testing.T) {
 		} {
 			meta.Reader = &config.Reader{Email: email, KeyID: keyID, GrantedAt: readerGrantedAt, Scope: "metered"}
 			c, err := openCluster(clusterRef{Dir: dir, Meta: meta, Identity: kube.Reader, Warn: &bytes.Buffer{}})
-			want := fmt.Sprintf("instance %q records the reader %s, which is not the reader farcast derives for it (%s); nothing was sent", name, email, derived)
+			want := fmt.Sprintf("instance %q records the reader %q, which is not the reader farcast derives for it (%s); nothing was sent", name, email, derived)
 			if c != nil || !errors.Is(err, errCredentialMissing) || err.Error() != want {
 				t.Errorf("%q: openCluster = %v, %v; want %q", email, c, err, want)
 			}

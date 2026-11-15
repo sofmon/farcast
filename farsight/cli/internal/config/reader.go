@@ -139,6 +139,17 @@ func statExists(path string) (bool, error) {
 	return true, nil
 }
 
+// SaveClusterCA writes cluster-ca.crt, the CA a loopback cluster endpoint is
+// trusted on (the rehearsal's own cluster, ADR 0023 M2.4), 0600 and whole or
+// not at all. An empty PEM is refused and writes nothing: on disk it would be
+// a CA that is present and that the endpoint rule refuses, not an absent one.
+func (d Dir) SaveClusterCA(name string, pem []byte) error {
+	if len(pem) == 0 {
+		return fmt.Errorf("write %s: a cluster CA needs its PEM", clusterCAFile)
+	}
+	return writeFileAtomic(d.instanceFile(name, clusterCAFile), pem)
+}
+
 // LoadClusterCA reads cluster-ca.crt, the CA a loopback cluster endpoint is
 // trusted on. Absent is ok=false and no error: a Google endpoint has none.
 func (d Dir) LoadClusterCA(name string) (pem []byte, ok bool, err error) {

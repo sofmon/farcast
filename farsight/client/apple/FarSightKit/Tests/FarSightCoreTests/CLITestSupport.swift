@@ -162,30 +162,27 @@ enum Fixture {
 
     static let settings = CLISettings(
         farcast: "/Users/op/src/farcast/bin/farcast",
-        kubectl: "/usr/local/bin/kubectl",
-        authPlugin: "/opt/homebrew/bin/gke-gcloud-auth-plugin",
-        gcloud: "/opt/homebrew/bin/gcloud",
-        configDirectory: "/Users/op/Library/Application Support/farcast",
-        gcloudDirectory: "/Users/op/.config/gcloud"
+        configDirectory: "/Users/op/Library/Application Support/farcast"
     )
 
     static let executable = FileEntry.file(executable: true, worldWritable: false)
     static let directory = FileEntry.directory(worldWritable: false)
 
-    /// Every path in `settings` as it should be, and the tools' directories.
+    /// Both paths in `settings` as they should be, and farcast's directory.
     static func probe(for settings: CLISettings = settings) -> FakeProbe {
         var entries: [String: FileEntry] = [:]
-        for tool in [settings.farcast, settings.kubectl, settings.authPlugin, settings.gcloud] where !tool.isEmpty {
-            entries[tool] = executable
-            if let parent = ChildEnvironment.directory(of: tool) { entries[parent] = directory }
+        if !settings.farcast.isEmpty {
+            entries[settings.farcast] = executable
+            if let parent = ChildEnvironment.directory(of: settings.farcast) { entries[parent] = directory }
         }
-        for directory in [settings.configDirectory, settings.gcloudDirectory] where !directory.isEmpty {
-            entries[directory] = Self.directory
+        if !settings.configDirectory.isEmpty {
+            entries[settings.configDirectory] = directory
         }
         return FakeProbe(entries: entries)
     }
 
-    /// The app's own environment, with what must never reach farcast in it.
+    /// The app's own environment, with what must never reach farcast in it:
+    /// a gcloud configuration and a debug setting among them.
     static let parent: [String: String] = [
         "HOME": home,
         "PATH": "/usr/bin:/bin",
@@ -193,6 +190,7 @@ enum Fixture {
         "LANG": "en_US.UTF-8",
         "KUBECONFIG": "/Users/op/.kube/config",
         "CLOUDSDK_CONFIG": "/elsewhere",
+        "GODEBUG": "http2debug=2",
     ]
 
     static func reader(

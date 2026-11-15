@@ -42,8 +42,11 @@ public struct CLIWorld: Sendable, Equatable {
 /// or alert — reads as unknown. A figure the map cannot draw becomes a
 /// problem with that figure, never a refusal of the instance.
 public enum CLIDocuments {
-    /// The one schema this build reads (Go: `worldSchema`).
-    public static let schema = 1
+    /// The one schema this build reads (Go: `worldSchema`). Schema 2 is ADR
+    /// 0023 M2.4's: the instances document carries `reader` and `migrated`
+    /// in place of `gcloud_pinned`, and a world's errors carry the in-process
+    /// client's kinds, never the five it retired.
+    public static let schema = 2
 
     /// `farcast version -o json`: only `version` and `commit` are read; every
     /// other field is ignored.
@@ -91,11 +94,18 @@ public enum CLIDocuments {
         case "kernel_absent": .kernelAbsent
         case "not_checkpointed": .notCheckpointed
         case "version_skew": .versionSkew
-        case "kubectl_missing": .kubectlMissing
-        case "kubectl_failed": .kubectlFailed
-        case "gcloud_mismatch": .gcloudMismatch
-        case "gcloud_signed_out": .gcloudSignedOut
-        case "auth_tool_missing": .authToolMissing
+        case "credential_missing": .credentialMissing
+        case "credential_refused": .credentialRefused
+        case "unsafe_environment": .unsafeEnvironment
+        case "endpoint_refused": .endpointRefused
+        case "cluster_unreachable": .clusterUnreachable
+        case "unauthorized": .unauthorized
+        case "forbidden": .forbidden
+        case "cluster_rejected": .clusterRejected
+        case "document_unreadable": .documentUnreadable
+        case "rollout_stalled": .rolloutStalled
+        case "not_migrated": .notMigrated
+        case "plan_changed": .planChanged
         case "timeout": .timeout
         case "internal": .internal
         default: .unknown
@@ -127,10 +137,11 @@ public enum CLIDocuments {
         }
     }
 
-    /// A schema-1 document, checked in this order: a JSON object; not an
-    /// error envelope; a schema number; schema 1, before the rest is
-    /// decoded, so a schema-2 document of another shape reads as skew rather
-    /// than as a document that could not be read; then the whole of it.
+    /// A schema-2 document, checked in this order: a JSON object; not an
+    /// error envelope; a schema number; schema 2, before the rest is
+    /// decoded, so a schema-1 or schema-3 document of another shape reads as
+    /// skew rather than as a document that could not be read; then the whole
+    /// of it.
     private static func document<T: Decodable>(_ type: T.Type, _ data: Data, _ what: String) throws(ReadFailure) -> T {
         let top = try head(data, what)
         if top.hasError { throw envelope(data, what) }
@@ -212,7 +223,8 @@ public enum CLIDocuments {
             recordedLimitCents: entry.costLimit?.cents,
             components: components,
             problem: problem,
-            gcloudPinned: entry.gcloudPinned
+            reader: entry.reader.map(readerState),
+            migrated: entry.migrated
         )
     }
 
@@ -225,6 +237,19 @@ public enum CLIDocuments {
         case "unreachable": .unreachable
         case "deleting": .deleting
         case "error": .error
+        default: .unknown
+        }
+    }
+
+    /// The instance's reader identity, as `farcast instances` works it out
+    /// from the record and whether `reader.key` is on this Mac.
+    static func readerState(_ wire: String) -> ReaderState {
+        switch wire {
+        case "none": .none
+        case "key_missing": .keyMissing
+        case "not_uploaded": .notUploaded
+        case "not_granted": .notGranted
+        case "granted": .granted
         default: .unknown
         }
     }
@@ -588,7 +613,12 @@ private struct WorldMapping {
                 desired: desired
             ))
         }
-        return AppGroup(id: id, namespace: namespace, source: Self.source(group), apps: apps)
+        // The reader may not read this namespace (ADR 0023 M2.4, P5): its
+        // applications were not read, and any app above is one a line names.
+        let appsProblem = group.appsError.map {
+            SectionProblem(section: .apps, kind: CLIDocuments.kind($0.kind), message: $0.message)
+        }
+        return AppGroup(id: id, namespace: namespace, source: Self.source(group), apps: apps, appsProblem: appsProblem)
     }
 
     /// The group's label: the repository `run` recorded on this Mac, its ref

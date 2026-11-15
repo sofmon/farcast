@@ -12,9 +12,10 @@ struct VectorTests {
     static let worldVectors = [
         "account_in_message.json", "at_floor.json", "checkpoint_version_skew.json", "cost_guard_stop.json",
         "cost_reached_stopped_apps.json", "drift.json",
-        "error_gcloud_mismatch.json", "error_not_found.json", "healthy.json", "host_cap_exceeded.json",
-        "hostile_host_name.json", "keepers.json", "legacy_bare_keys.json", "mixed_evidence.json", "never_connected.json",
-        "no_kernel.json", "nothing_read.json", "release_incomplete.json", "removed_app_violation.json", "sealed_replica.json",
+        "error_not_found.json", "healthy.json", "host_cap_exceeded.json",
+        "hostile_host_name.json", "keepers.json", "legacy_bare_keys.json", "mixed_evidence.json", "namespace_unread.json",
+        "never_connected.json", "no_kernel.json", "nothing_read.json", "reader_missing.json", "release_incomplete.json",
+        "removed_app_violation.json", "sealed_replica.json",
         "shared_app_name.json", "shared_app_name_namespaced.json", "stale_checkpoint.json", "stale_stop_record.json",
         "system_namespace_rows.json", "tunnel_down.json", "unattributed_denial.json", "unmetered_namespace.json",
     ]
@@ -43,8 +44,9 @@ struct VectorTests {
     func everyWorldVectorIsDecodedOrRefused() throws {
         let names = try Vectors.names("world")
         #expect(names == Self.worldVectors)
+        // The one envelope left since ADR 0023 M2.4: world's reader-related
+        // refusals are each section's, never the whole document's.
         let refusals: [String: SectionProblem.Kind] = [
-            "error_gcloud_mismatch.json": .gcloudMismatch,
             "error_not_found.json": .notFound,
         ]
         for name in names {
@@ -139,20 +141,94 @@ struct VectorTests {
         #expect(instance.groups.count == 1)
     }
 
+    @Test("every world vector is schema 2, the schema this build reads")
+    func everyWorldVectorIsSchemaTwo() throws {
+        struct Head: Decodable { let schema: Int? }
+        #expect(CLIDocuments.schema == 2)
+        for name in try Vectors.names("world") where name != "error_not_found.json" {
+            #expect(try JSONDecoder().decode(Head.self, from: try Vectors.data("world/\(name)")).schema == 2, "\(name)")
+        }
+        for name in try Vectors.names("instances") {
+            #expect(try JSONDecoder().decode(Head.self, from: try Vectors.data("instances/\(name)")).schema == 2, "\(name)")
+        }
+    }
+
     @Test("nothing_read: five problems, with the vector's kinds; spending not read")
     func nothingRead() throws {
         let instance = try Self.instance(Self.world("nothing_read"))
         #expect(instance.problems.map(\.section) == [.spend, .apps, .policy, .network, .seal])
-        #expect(instance.problems.map(\.kind) == [.gcloudSignedOut, .gcloudSignedOut, .gcloudSignedOut, .tunnelUnreachable, .tunnelUnreachable])
+        #expect(instance.problems.map(\.kind) == [.credentialRefused, .credentialRefused, .credentialRefused, .tunnelUnreachable, .tunnelUnreachable])
         #expect(!instance.spending.isRead)
         #expect(instance.spending.level == .unknown)
         #expect(instance.groups.flatMap(\.apps).filter { $0.system != nil }.allSatisfy { $0.state == .unknown })
+    }
+
+    @Test("reader_missing: no reader, so the three cluster sections are not read and the two through the tunnel are")
+    func readerMissing() throws {
+        let world = try Self.world("reader_missing")
+        let instance = try Self.instance(world)
+        #expect(instance.problems.map(\.section) == [.spend, .apps, .policy])
+        #expect(instance.problems.allSatisfy { $0.kind == .credentialMissing })
+        #expect(instance.problem(in: .network) == nil && instance.problem(in: .seal) == nil)
+        #expect(instance.network?.replica == "fatline-5d8c7b9f4-x2k7q")
+        #expect(!instance.spending.isRead)
+        #expect(ProblemText.summary(instance.problems) == ["3 sections not read · credential missing"])
+        // The message is the CLI's, as the vector holds it.
+        struct Sections: Decodable {
+            struct Status: Decodable {
+                struct Problem: Decodable { let message: String }
+                let error: Problem?
+            }
+
+            let spend: Status
+        }
+        struct Document: Decodable { let sections: Sections }
+        let wire = try JSONDecoder().decode(Document.self, from: try Vectors.data("world/reader_missing.json")).sections
+        #expect(instance.problem(in: .spend)?.message == wire.spend.error?.message)
+        #expect(world.connections.contains { $0.kind == .tunnel })
+    }
+
+    @Test("namespace_unread: the group the reader may not read is marked forbidden, with no apps; the others read; the alert stays")
+    func namespaceUnread() throws {
+        struct Group: Decodable {
+            struct Problem: Decodable { let kind: String, message: String }
+            let namespace: String
+            let appsError: Problem?
+
+            enum CodingKeys: String, CodingKey {
+                case namespace
+                case appsError = "apps_error"
+            }
+        }
+        struct Document: Decodable { let groups: [Group] }
+        let wire = try JSONDecoder().decode(Document.self, from: try Vectors.data("world/namespace_unread.json")).groups
+        let world = try Self.world("namespace_unread")
+        let instance = try Self.instance(world)
+        // The apps section was read: the mark is the group's, never the instance's.
+        #expect(instance.problems.isEmpty)
+        let lab = try #require(instance.groups.first { $0.namespace == "lab" })
+        #expect(lab.appsProblem?.section == .apps)
+        #expect(lab.appsProblem?.kind == .forbidden)
+        #expect(lab.appsProblem?.message == wire.first { $0.namespace == "lab" }?.appsError?.message)
+        #expect(lab.apps.isEmpty)
+        #expect(lab.source == "repository not recorded on this Mac · not metered")
+        #expect(ProblemText.groupNotRead(try #require(lab.appsProblem)) == "applications not read · forbidden")
+        let shop = try #require(instance.groups.first { $0.namespace == "shop" })
+        #expect(shop.appsProblem == nil)
+        #expect(shop.apps.map(\.name) == ["api", "web"])
+        #expect(shop.apps.allSatisfy { $0.state == .running })
+        #expect(instance.groups.filter { $0.appsProblem != nil }.map(\.namespace) == ["lab"])
+        let alert = try #require(world.alerts.first { $0.kind == .unmeteredNamespace })
+        #expect(alert.id == "atlas/unmetered_namespace:component:kernel:lab")
+        #expect(alert.subject == .app(Self.technocore))
     }
 
     @Test("release_incomplete: the instance may still be billing, and the alert is about it")
     func releaseIncomplete() throws {
         let world = try Self.world("release_incomplete")
         #expect(try Self.instance(world).status == .deleting)
+        #expect(try Self.instance(world).problems.map(\.kind)
+            == [.clusterUnreachable, .clusterUnreachable, .clusterUnreachable, .timeout, .timeout])
         let alert = try #require(world.alerts.first { $0.kind == .releaseIncomplete })
         #expect(alert.subject == .instance("atlas"))
         #expect(alert.severity == .critical)
@@ -288,7 +364,9 @@ struct VectorTests {
         #expect(instance.problem(in: .apps)?.message == wire.apps.error?.message)
         #expect(instance.problem(in: .policy)?.message == wire.policy.error?.message)
         #expect(instance.problem(in: .policy)?.message.contains("\n") == true)
-        #expect(instance.problem(in: .policy)?.kind == .gcloudSignedOut)
+        #expect(instance.problem(in: .spend)?.kind == .clusterRejected)
+        #expect(instance.problem(in: .apps)?.kind == .forbidden)
+        #expect(instance.problem(in: .policy)?.kind == .unauthorized)
         #expect(instance.network?.fatlineReplicas == nil)
     }
 
@@ -412,7 +490,7 @@ struct VectorTests {
         #expect(listing.stamp == CLIStamp(version: "v0.0.0-vector", commit: "0e54eb1"))
         #expect(listing.instances.map(\.name) == ["atlas", "broken", "empty", "lab"])
         let atlas = listing.instances[0], broken = listing.instances[1], blank = listing.instances[2], lab = listing.instances[3]
-        #expect(atlas.gcloudPinned == true)
+        #expect(atlas.reader == .granted && atlas.migrated == true)
         #expect(atlas.status == .running && atlas.cloudLogging == .systemOnly)
         #expect(atlas.components == [.boundary: true, .kernel: true, .storage: true])
         #expect(atlas.components[.monitor] == nil)
@@ -420,10 +498,11 @@ struct VectorTests {
         for unreadable in [broken, blank] {
             #expect(unreadable.problem?.section == .record)
             #expect(unreadable.problem?.kind == .recordUnreadable)
-            #expect(unreadable.status == .unknown && unreadable.components.isEmpty && unreadable.gcloudPinned == nil)
+            #expect(unreadable.status == .unknown && unreadable.components.isEmpty)
+            #expect(unreadable.reader == nil && unreadable.migrated == nil)
         }
         #expect(lab.status == .provisioning && lab.cloudLogging == .unverified)
-        #expect(lab.gcloudPinned == false)
+        #expect(lab.reader == ReaderState.none && lab.migrated == false)
         #expect(lab.components == [.boundary: false, .monitor: false, .kernel: false, .storage: false])
         #expect(lab.recordedLimitCents == 1250)
     }
@@ -437,7 +516,8 @@ struct VectorTests {
     func everyErrorKindMaps() throws {
         struct Kinds: Decodable { let kinds: [String] }
         let wire = try JSONDecoder().decode(Kinds.self, from: try Vectors.data("kinds/kinds.json")).kinds
-        #expect(wire.count == 14)
+        #expect(wire.count == 21)
+        #expect(!wire.contains { ["kubectl_missing", "kubectl_failed", "gcloud_mismatch", "gcloud_signed_out", "auth_tool_missing"].contains($0) })
         let mapped = wire.map(CLIDocuments.kind)
         #expect(!mapped.contains(.unknown))
         #expect(Set(mapped) == Set(SectionProblem.Kind.allCases).subtracting([.unknown]))

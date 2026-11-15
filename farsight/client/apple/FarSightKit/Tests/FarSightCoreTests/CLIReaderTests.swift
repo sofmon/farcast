@@ -40,7 +40,7 @@ struct CLIReaderTests {
             try Self.argv("world", "atlas"), try Self.argv("world", "broken"),
             try Self.argv("world", "empty"), try Self.argv("world", "lab"),
         ])
-        let environment = try ChildEnvironment.build(parent: Fixture.parent, settings: Fixture.settings)
+        let environment = try ChildEnvironment.build(parent: Fixture.parent)
         for invocation in invocations {
             #expect(invocation.executable == Fixture.settings.farcast)
             #expect(invocation.environment == environment)
@@ -64,8 +64,8 @@ struct CLIReaderTests {
         }
         await refusesAll("before any listing")
 
-        executor.answer(try Self.argv("version"), with: .result(Fixture.exited(1, try Vectors.data("world/error_gcloud_mismatch.json"))))
-        #expect(await awaitFailure { _ = try await reader.listInstances() }?.kind == .gcloudMismatch)
+        executor.answer(try Self.argv("version"), with: .result(Fixture.exited(1, try Vectors.data("world/error_not_found.json"))))
+        #expect(await awaitFailure { _ = try await reader.listInstances() }?.kind == .notFound)
         await refusesAll("after a failed listing")
 
         executor.answer(try Self.argv("version"), with: .result(Fixture.exited(0, try Vectors.data("version/version.json"))))
@@ -119,7 +119,7 @@ struct CLIReaderTests {
 
     @Test("every way a run can end maps to a kind", arguments: [
         (ExecutionResult(outcome: .exited(0), stdout: Data("not json".utf8)), SectionProblem.Kind.internal, "farcast's world output is not a JSON object"),
-        (ExecutionResult(outcome: .exited(0), stdout: Data(#"{"schema":2}"#.utf8)), .versionSkew, "farcast wrote schema 2"),
+        (ExecutionResult(outcome: .exited(0), stdout: Data(#"{"schema":3}"#.utf8)), .versionSkew, "farcast wrote schema 3"),
         (ExecutionResult(outcome: .exited(2), stderr: Data("flag provided but not defined: -x\n".utf8)), .internal,
          "farcast refused the command line FarCast gave it (exit 2): flag provided but not defined: -x"),
         (ExecutionResult(outcome: .exited(3)), .internal, "farcast world atlas exited 3 and printed nothing"),
@@ -141,8 +141,14 @@ struct CLIReaderTests {
 
     @Test("an envelope on a failed run is the failure, with its kind")
     func envelopesMapToKinds() async throws {
-        for (vector, kind) in [("error_gcloud_mismatch", SectionProblem.Kind.gcloudMismatch), ("error_not_found", .notFound)] {
-            let data = try Vectors.data("world/\(vector).json")
+        let envelopes: [(Data, SectionProblem.Kind)] = [
+            (try Vectors.data("world/error_not_found.json"), .notFound),
+            // A kind ADR 0023 M2.4 added, in an envelope written here.
+            (Data(#"{"error":{"message":"instance \"atlas\" has no reader identity","code":1,"kind":"credential_missing"}}"#.utf8), .credentialMissing),
+            // One it retired reads as no reason the map knows.
+            (Data(#"{"error":{"message":"m","code":1,"kind":"gcloud_mismatch"}}"#.utf8), .unknown),
+        ]
+        for (data, kind) in envelopes {
             let reader = Fixture.reader(try Fixture.executor(worlds: ["atlas": .result(Fixture.exited(1, data))]))
             _ = try await reader.listInstances()
             let refusal = await awaitFailure { _ = try await reader.readWorld("atlas") }
@@ -154,13 +160,13 @@ struct CLIReaderTests {
     @Test("Settings that need attention, or no home directory, run nothing")
     func settingsProblemsRunNothing() async throws {
         var relative = Fixture.settings
-        relative.kubectl = "bin/kubectl"
+        relative.farcast = "bin/farcast"
         let executor = try Fixture.executor()
         let refusal = await awaitFailure {
             _ = try await Fixture.reader(executor, settings: relative, probe: Fixture.probe()).listInstances()
         }
         #expect(refusal?.kind == .internal)
-        #expect(refusal?.message.hasPrefix("Settings need attention: kubectl: must be an absolute path") == true)
+        #expect(refusal?.message.hasPrefix("Settings need attention: farcast: must be an absolute path") == true)
 
         var homeless = Fixture.parent
         homeless["HOME"] = nil
@@ -209,12 +215,15 @@ struct CLIReaderTests {
         #expect(await awaitFailure { _ = try await reader.terminalCommand(for: "atlas") }?.kind == .notFound)
         _ = try await reader.listInstances()
         let command = try await reader.terminalCommand(for: "atlas")
-        #expect(command.hasPrefix("env -i 'CLOUDSDK_CONFIG=/Users/op/.config/gcloud' 'HOME=/Users/op' "))
-        let environment = try ChildEnvironment.build(parent: Fixture.parent, settings: settings)
+        #expect(command.hasPrefix(
+            "env -i 'HOME=/Users/op' 'LANG=en_US.UTF-8' 'PATH=/usr/bin:/bin:/usr/sbin:/sbin' 'TMPDIR=/var/folders/xy/T/' "
+        ))
+        let environment = try ChildEnvironment.build(parent: Fixture.parent)
         for (key, value) in environment {
             #expect(command.contains("'\(key)=\(value)'"), "\(key)")
         }
         #expect(!command.contains("KUBECONFIG") && !command.contains("/elsewhere"))
+        #expect(!command.contains("CLOUDSDK") && !command.contains("GODEBUG"))
         #expect(command.hasSuffix(
             "'/Users/op/src/farcast/bin/farcast' '--config' '/Users/op/it'\\''s/farcast' '-o' 'json' 'world' '--' 'atlas'"
         ))
@@ -245,11 +254,11 @@ struct CLIReaderTests {
         #expect(refusal == ReadFailure(kind: .internal, message: "Settings need attention: farcast: nothing is at this path"))
 
         var open = Fixture.probe()
-        open.entries[Fixture.settings.gcloudDirectory] = .directory(worldWritable: true)
-        let gcloud = await awaitFailure { _ = try await Fixture.reader(executor, probe: open).listInstances() }
-        #expect(gcloud == ReadFailure(
+        open.entries[Fixture.settings.configDirectory] = .directory(worldWritable: true)
+        let directory = await awaitFailure { _ = try await Fixture.reader(executor, probe: open).listInstances() }
+        #expect(directory == ReadFailure(
             kind: .internal,
-            message: "Settings need attention: gcloud configuration directory: is writable by anyone on this Mac"
+            message: "Settings need attention: farcast configuration directory: is writable by anyone on this Mac"
         ))
         #expect(executor.invocations.isEmpty)
     }

@@ -2,12 +2,16 @@ package cli
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/sofmon/farcast/farsight/cli/internal/cluster"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
+	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
+	tkube "github.com/sofmon/farcast/technocore/kube"
 )
 
 func TestLogsFindsTheAppWithoutBeingToldTheNamespace(t *testing.T) {
@@ -20,7 +24,7 @@ func TestLogsFindsTheAppWithoutBeingToldTheNamespace(t *testing.T) {
 		logsBody:    "hello from the app\n",
 	}
 	c := &logsCommand{lines: 200}
-	c.newCluster = func(string) logReader { return f }
+	c.newCluster = func(clusterRef) (logReader, error) { return f, nil }
 	if err := c.Run(context.Background(), env, []string{"p43", "api"}); err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +47,7 @@ func TestLogsRefusesToGuessBetweenTwoAppsWithTheSameName(t *testing.T) {
 		"two": {appDeployment("two", "api", 1, 1, "app")},
 	}}
 	c := &logsCommand{lines: 200}
-	c.newCluster = func(string) logReader { return f }
+	c.newCluster = func(clusterRef) (logReader, error) { return f, nil }
 	err := c.Run(context.Background(), env, []string{"p43", "api"})
 	if err == nil {
 		t.Fatal("logs picked one of two identically named applications")
@@ -65,7 +69,7 @@ func TestLogsPassesTailFollowAndPrevious(t *testing.T) {
 		"my-platform": {appDeployment("my-platform", "api", 1, 1, "app")},
 	}}
 	c := &logsCommand{lines: 25, follow: true, previous: true}
-	c.newCluster = func(string) logReader { return f }
+	c.newCluster = func(clusterRef) (logReader, error) { return f, nil }
 	if err := c.Run(context.Background(), env, []string{"p43", "api"}); err != nil {
 		t.Fatal(err)
 	}
@@ -75,6 +79,37 @@ func TestLogsPassesTailFollowAndPrevious(t *testing.T) {
 			t.Errorf("log args = %v, want %v", f.logArgs, want)
 			break
 		}
+	}
+}
+
+// ADR 0023 M2.4, A18-11: when no namespace's read finds the app, the error
+// keeps every namespace's error in its chain, so the envelope finds a cluster
+// sentinel in any of them, whichever namespace came first. Its text is what
+// it was: each namespace's error after its name, joined by "; ". A 403 among
+// them gets the reader's sentence (§8.1); this one is no Kubernetes Status.
+func TestLogsKeepsEveryNamespacesErrorInTheChain(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	meteringInstance(t, dir, "p43", "one", "two")
+	env, out := testEnv(dir, output.ModeHuman)
+
+	unreachable := fmt.Errorf("list one: %w", kube.ErrUnreachable)
+	forbidden := fmt.Errorf("list two: %w", tkube.ErrForbidden)
+	f := &fakeReader{errs: map[string]error{"one": unreachable, "two": forbidden}}
+	c := &logsCommand{lines: 200}
+	c.newCluster = func(clusterRef) (logReader, error) { return f, nil }
+	err := c.Run(context.Background(), env, []string{"p43", "api"})
+	want := fmt.Sprintf("no application %q in farcast-system, one, two, and 2 namespaces could not be read (one: %v; two: %v); %s",
+		"api", unreachable, forbidden, msgReaderIAMRefused)
+	if err == nil || err.Error() != want {
+		t.Fatalf("logs = %v\nwant %s", err, want)
+	}
+	for _, sentinel := range []error{kube.ErrUnreachable, tkube.ErrForbidden} {
+		if !errors.Is(err, sentinel) {
+			t.Errorf("%v does not match %v", err, sentinel)
+		}
+	}
+	if f.logged != "" || out.Len() != 0 {
+		t.Errorf("it read %q and wrote %q anyway", f.logged, out.String())
 	}
 }
 
@@ -94,7 +129,7 @@ func TestLogsTargetsTheKindItFound(t *testing.T) {
 				"apps": {workloadOf(kind, "apps", "thing", 1, 1, "app")},
 			}}
 			c := &logsCommand{lines: 10}
-			c.newCluster = func(string) logReader { return f }
+			c.newCluster = func(clusterRef) (logReader, error) { return f, nil }
 			if err := c.Run(context.Background(), env, []string{"p43", "thing"}); err != nil {
 				t.Fatal(err)
 			}

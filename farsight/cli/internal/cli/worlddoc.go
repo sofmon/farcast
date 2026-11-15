@@ -27,13 +27,17 @@ import (
 	"github.com/sofmon/farcast/technocore/pricing"
 )
 
-// The world document, schema 1: one instance, map-ready (farsight/cli/README.md,
+// The world document, schema 2: one instance, map-ready (farsight/cli/README.md,
 // "farcast world"). Everything here is a pure function of what was gathered
 // plus the clock — no I/O, no time.Now — so the golden vectors under
 // testdata/world are byte-stable and the read route can later serve the very
 // same document from inside the instance.
 
-const worldSchema = 1
+// worldSchema is the schema of both documents the FarCast app reads, this one
+// and 'instances'. Schema 2 (ADR 0023 M2.4) carries the in-process client's
+// error kinds and never the five it retired, each group's apps_error, and
+// the instances' reader state and migration in place of gcloud_pinned.
+const worldSchema = 2
 
 const (
 	// checkpointStaleAfter is three default checkpoint intervals.
@@ -266,6 +270,12 @@ type worldGroup struct {
 	Metered    *bool            `json:"metered"`
 	Provenance *worldProvenance `json:"provenance"`
 	Apps       []worldApp       `json:"apps"`
+	// AppsError is why this namespace's workloads were not read while the
+	// rest were (P5, A18-1): the reader may not read it. It is null when they
+	// were read, and when the apps section failed as a whole, whose own error
+	// says why. With it set, the group holds no workload: an application a
+	// line names there is drawn with its state unknown.
+	AppsError *sectionProblem `json:"apps_error"`
 }
 
 type worldProvenance struct {
@@ -420,6 +430,9 @@ type appsInput struct {
 	System     []cluster.Workload
 	Namespaces []string
 	Workloads  map[string][]cluster.Workload
+	// Unread are the namespaces whose workloads the reader may not read, and
+	// why (P5): each is still a group, marked, while the rest are read.
+	Unread map[string]*sectionProblem
 	// Meter is the technocore-namespaces document.
 	Meter meterInput
 }
@@ -568,10 +581,9 @@ func cloudLoggingOf(v string) string {
 }
 
 // problem is a section problem with every address, cloud name and account in
-// its message replaced by what it is. A kubectl error can name the control
-// plane, a tunnel error the carrier, and an API server's refusal or gcloud's
-// credential error the account it ran as: the document never carries any of
-// them.
+// its message replaced by what it is. A cluster error can name the control
+// plane, a tunnel error the carrier, and an API server's refusal the account
+// it ran as, the instance's reader: the document never carries any of them.
 func (b *worldBuilder) problem(p *sectionProblem) *sectionProblem {
 	if p == nil {
 		return nil
@@ -579,18 +591,39 @@ func (b *worldBuilder) problem(p *sectionProblem) *sectionProblem {
 	return &sectionProblem{Kind: p.Kind, Message: scrubMessage(p.Message, b.meta)}
 }
 
-// emailLike is anything shaped like an account: a person's, a service
-// account's, or the work identity a token cached under this instance's own
-// context was minted for.
+// emailLike is anything shaped like an account: a person's, or a service
+// account's, the instance's reader in either of its forms among them
+// (…@<project>.iam.gserviceaccount.com, or …@<name>.invalid on a test
+// cluster).
 var emailLike = regexp.MustCompile(`[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}`)
+
+// recordedReader matches the reader email meta records, whatever its case,
+// as it is written and as %q writes it, or is nil when no reader with an @ is
+// recorded. openCluster's refusal of a reader that is not the derived one
+// prints the recorded email, quoted (A18-8), and one emailLike does not take
+// for an account — a dotless domain, an internationalized one, one holding a
+// character that does not print — is still one. A value with no @ is no
+// account, and nothing is replaced for it.
+func recordedReader(meta *config.InstanceMetadata) *regexp.Regexp {
+	if meta.Reader == nil || !strings.Contains(meta.Reader.Email, "@") {
+		return nil
+	}
+	email := meta.Reader.Email
+	quoted := strconv.Quote(email)
+	quoted = quoted[1 : len(quoted)-1]
+	forms := regexp.QuoteMeta(quoted)
+	if quoted != email {
+		forms += "|" + regexp.QuoteMeta(email)
+	}
+	return regexp.MustCompile("(?i)(?:" + forms + ")")
+}
 
 func scrubMessage(msg string, meta *config.InstanceMetadata) string {
 	// Accounts first, before a project inside a service account's address
-	// is replaced and leaves the rest of the address behind. The pinned one
-	// by name, whatever its case — GKE's refusals spell it as the token
-	// does — and then anything else shaped like one.
-	if a := strings.TrimSpace(meta.GCloudAccount); a != "" {
-		msg = regexp.MustCompile("(?i)"+regexp.QuoteMeta(a)).ReplaceAllLiteralString(msg, "<account>")
+	// is replaced and leaves the rest of the address behind. The recorded
+	// reader by name, then anything else shaped like an account.
+	if re := recordedReader(meta); re != nil {
+		msg = re.ReplaceAllLiteralString(msg, "<account>")
 	}
 	msg = emailLike.ReplaceAllLiteralString(msg, "<account>")
 
@@ -974,7 +1007,7 @@ func (b *worldBuilder) ensureApp(ns, name, namedBy string) bool {
 		return true
 	}
 	state := stateUnknown
-	if b.appsRead() {
+	if b.appsRead() && g.AppsError == nil {
 		state = stateNotDeployed
 		b.caveats = append(b.caveats, fmt.Sprintf("%s is named by %s but not running in the cluster", tenantOf(ns, name), namedBy))
 	}
@@ -1016,6 +1049,13 @@ func (b *worldBuilder) groupsAndApps() {
 		b.group(ns)
 	}
 	if b.appsRead() {
+		// A namespace the reader may not read is a group still, marked, so
+		// whatever is said of it (that it is not metered among them) is said.
+		for ns, p := range apps.Unread {
+			if g := b.group(ns); g != nil {
+				g.AppsError = b.problem(p)
+			}
+		}
 		for ns, ws := range apps.Workloads {
 			g := b.group(ns)
 			if g == nil {

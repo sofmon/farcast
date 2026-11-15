@@ -662,10 +662,11 @@ func TestReaderCommandIsRegistered(t *testing.T) {
 	if _, errOut, code := farcastIn(t, dir, "reader"); code != 2 || !strings.Contains(errOut, "reader requires a subcommand (grant, init, record)") {
 		t.Errorf("reader alone: exit %d, %q", code, errOut)
 	}
-	// Until ADR 0023 M2.4 no read command reads as the reader, and the help
-	// says so rather than that the cluster reads already run as it.
-	if flat := strings.Join(strings.Fields(out), " "); !strings.Contains(flat, "From ADR 0023 M2.4 farcast's cluster reads run as it") ||
-		!strings.Contains(flat, "until then only 'reader grant' reads as it") || strings.Contains(flat, "that farcast's cluster reads run as") {
-		t.Errorf("help reader says the cluster reads already run as the reader:\n%s", out)
+	// Since ADR 0023 M2.4 the read commands' cluster reads run as the reader,
+	// and the help says which, and that the writing commands do not yet.
+	if flat := strings.Join(strings.Fields(out), " "); !strings.Contains(flat, "The cluster reads of 'world', 'ps', 'costs', 'usage' and 'logs' run as it") ||
+		!strings.Contains(flat, "The commands that write still run kubectl as the active gcloud configuration") ||
+		strings.Contains(flat, "until then") {
+		t.Errorf("help reader does not say which reads run as the reader:\n%s", out)
 	}
 }

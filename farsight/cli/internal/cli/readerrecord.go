@@ -14,11 +14,10 @@ import (
 )
 
 // msgPreviousReaderKey is what `reader record` prints after a rotation: the
-// key it replaced still works in Google until the human deletes it. Until
-// ADR 0023 M2.4 'reader grant' is the only command that reads as the reader,
-// so it is the read that proves the new key works; M2.4 moves world onto the
-// reader and this line back to design §7.2's "Once 'farcast world %s' reads".
-const msgPreviousReaderKey = "The previous key %s still works. Once 'farcast reader grant %s' has read with the new key, delete it from Cloud Shell: %s"
+// key it replaced still works in Google until the human deletes it. 'world'
+// reads as the reader (ADR 0023 M2.4), so a world that reads is the proof
+// that the new key works (design §7.2, A18-16).
+const msgPreviousReaderKey = "The previous key %s still works. Once 'farcast world %s' reads, delete it from Cloud Shell: %s"
 
 // readerRecordCommand records the key id the Cloud Shell script printed. It is
 // local only (design §7.2).

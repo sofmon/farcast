@@ -18,7 +18,8 @@
 // WithRBAC check (403, before any object is looked up), WithHandler, the
 // answers queued by Fail, the answers set by Script, and then the emulation.
 // Everything the emulation does not cover answers 405. Every request is
-// recorded, whatever its answer.
+// recorded, whatever its answer, unless WithoutRecording; and WithAnswered
+// sees each one after its answer.
 package kubetest
 
 import (
@@ -124,6 +125,8 @@ type options struct {
 	access      func(id string, a kube.ResourceAttributes) bool
 	rbac        map[string][]byte
 	warnings    func(r Request) []string
+	answered    func(r Request, status int)
+	noRecording bool
 }
 
 type identity struct {
@@ -210,6 +213,31 @@ func WithRBAC(email string, stream []byte) Option {
 // every request.
 func WithWarnings(f func(r Request) []string) Option {
 	return func(o *options) { o.warnings = f }
+}
+
+// WithAnswered calls f once for every request the server recorded or would
+// have recorded, after its answer: the API's and /token's, the refused ones
+// included (a 401, a 403, a 405, an injected failure, an assertion that did
+// not verify, a body too large). r is the request as Requests records it, As
+// and KeyID included, and status is the code the answer was sent with; 0 when
+// nothing was answered, because the client went away while WithDelay held the
+// request. A request that arrives while the server is closing is answered 503
+// and is neither recorded nor passed to f, so once Close returns f is not
+// called again.
+//
+// f runs on the request's own goroutine, so calls may overlap. r.Body is f's
+// own copy, and on /token it holds the signed assertion: f must not keep or
+// print it.
+func WithAnswered(f func(r Request, status int)) Option {
+	return func(o *options) { o.answered = f }
+}
+
+// WithoutRecording keeps no request log: Requests returns nil. A rehearsal
+// serves for days, and every /token body holds a signed assertion, which a
+// log would keep for the server's whole life. WithAnswered still sees every
+// request.
+func WithoutRecording() Option {
+	return func(o *options) { o.noRecording = true }
 }
 
 // New starts a TLS server on 127.0.0.1:0, with a leaf for IP 127.0.0.1 issued by
@@ -366,7 +394,11 @@ func (s *Server) AddKey(id, email string, pub *rsa.PublicKey) {
 }
 
 // Requests is every request, in order. Each Body is the caller's own copy.
+// With WithoutRecording it is nil.
 func (s *Server) Requests() []Request {
+	if s.opts.noRecording {
+		return nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make([]Request, len(s.requests))
@@ -414,6 +446,9 @@ func (s *Server) enter() bool {
 }
 
 func (s *Server) record(r Request) {
+	if s.opts.noRecording {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.requests = append(s.requests, r)
@@ -447,6 +482,16 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	defer s.inflight.Done()
 
+	aw := &answerWriter{ResponseWriter: w}
+	req := s.answer(aw, r)
+	if f := s.opts.answered; f != nil {
+		req.Body = bytes.Clone(req.Body)
+		f(req, aw.status)
+	}
+}
+
+// answer answers one request and returns it as recorded.
+func (s *Server) answer(w http.ResponseWriter, r *http.Request) Request {
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBody+1))
 	req := Request{
 		Method:      r.Method,
@@ -462,23 +507,66 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		s.record(req)
 		if err != nil {
 			writeStatus(w, http.StatusBadRequest, "", "kubetest: the request body could not be read", nil)
-			return
+			return req
 		}
 		writeStatus(w, http.StatusRequestEntityTooLarge, "", "kubetest: the request body is larger than 64 MiB", nil)
-		return
+		return req
 	}
 	if r.URL.Path == tokenPath {
-		s.serveToken(w, r, req)
-		return
+		return s.serveToken(w, r, req)
 	}
-	s.serveAPI(w, r, req)
+	return s.serveAPI(w, r, req)
 }
 
-// serveAPI is every non-token request, in the order the package comment gives.
-func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request, req Request) {
+// answerWriter is the ResponseWriter every answer is written through, so
+// that the code it was sent with is known afterwards (WithAnswered).
+type answerWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *answerWriter) WriteHeader(code int) {
+	if w.status == 0 {
+		w.status = code
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *answerWriter) Write(b []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.ResponseWriter.Write(b)
+}
+
+// Flush passes a flush on, as a followed log needs; a flush before any header
+// sends 200.
+func (w *answerWriter) Flush() {
+	f, ok := w.ResponseWriter.(http.Flusher)
+	if !ok {
+		return
+	}
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	f.Flush()
+}
+
+// Unwrap lets http.ResponseController reach the connection's writer.
+func (w *answerWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+// serveAPI is every non-token request, in the order the package comment
+// gives. It returns the request as recorded.
+func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request, req Request) Request {
 	info, as := s.authenticate(r.Header.Get("Authorization"))
 	req.As = as
 	s.record(req)
+	s.answerAPI(w, r, req, info)
+	return req
+}
+
+// answerAPI answers one recorded API request.
+func (s *Server) answerAPI(w http.ResponseWriter, r *http.Request, req Request, info *tokenInfo) {
 	if !s.hold(r.Context(), req) {
 		return
 	}

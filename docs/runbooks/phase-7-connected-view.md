@@ -2,13 +2,15 @@
 
 The macOS FarCast app reads the operator's instances by running the operator's own `farcast` ([ADR 0021](../adr/0021-farsight-native-client.md) decision 9, amended 2026-11-12). This runbook walks it twice: first from Finder against an instance that lives on this Mac, then against a live one. It is the ADR's "Walked before it is relied on", and the rehearsal step of its Verification 5.
 
-**Part R costs nothing and touches no cloud.** Everything in it listens on 127.0.0.1: a real FatLine and Shrike, two keyholder replicas, and fake `kubectl`, `gke-gcloud-auth-plugin` and `gcloud` (`farsight/cli/README.md`, "The no-cost rehearsal").
+**Part R costs nothing and touches no cloud.** Everything in it listens on 127.0.0.1: a local Kubernetes API server and token endpoint, a real FatLine and Shrike, and two keyholder replicas (`farsight/cli/README.md`, "The no-cost rehearsal"). *(2026-11-15: until [ADR 0023](../adr/0023-one-download-farcast.md) M2.4 the cluster was three fake tools, `kubectl`, `gke-gcloud-auth-plugin` and `gcloud`.)*
 
 **Part L reads a live instance.** A read adds no standing cost, but it needs an instance up, and an instance up is billable. Ask before standing one up (L0).
 
-**Gate G1 (2026-11-12): Q1 and Q2 accepted.** The app's child `PATH` ends with the system's own directories, and its `CLOUDSDK_CONFIG` is the gcloud directory confirmed in Settings. Without the second, a `farcast` started from Finder would read the operator's real `~/.config/gcloud`. So R4 to R9 are not blocked.
+**Gate G1 (2026-11-12): Q1 and Q2 accepted.** The app's child `PATH` ends with the system's own directories, and its `CLOUDSDK_CONFIG` is the gcloud directory confirmed in Settings. Without the second, a `farcast` started from Finder would read the operator's real `~/.config/gcloud`. So R4 to R9 are not blocked. *(2026-11-15: since ADR 0023 M2.4 the child's `PATH` is the system's own directories alone, and it has no `CLOUDSDK_CONFIG`: `farcast` runs no tool for the app's three commands, so neither question arises.)*
 
 **Commit walked:** `5bb19ac` (2026-11-12). **Status:** Part R walked 2026-11-12. R2, R5 and R8.3–R8.5 were not reported, and Part L is not walked. Eight findings, listed under Results.
+
+*(2026-11-15: R1, R3–R9 and Part L were rewritten for ADR 0023 M2.4. The rehearsal's cluster is now a local API server, and every read runs as the instance's reader. **The rewritten Part R is not yet walked:** the Results below are the 2026-11-12 walk of the old rig. Part L is still not walked.)*
 
 Throughout:
 - Run every command from the checkout root, and keep that checkout outside `~/Documents`, `~/Desktop` and `~/Downloads`, which TCC prompts for.
@@ -43,7 +45,7 @@ plutil -extract FarCastCommit raw farsight/client/apple/.build/DerivedData/Build
 ```
 
 - Its banner reads `FarCast rehearsal — commit $COMMIT`. A line starting `warning:` means the `farcast` given was built from another commit: stop, and go back to R0.
-- Keep the printed block. It is the six paths for Settings, the state directory, and the commands to change the scenario and to stop.
+- Keep the printed block. It is the two paths for Settings (`farcast` and `farcast configuration directory`), the instance's reader as Check shows it, the state directory, and the commands to change the scenario and to stop.
 - Leave it running in this terminal. Drive the rest from a second one, with `DIR` set.
 
 ### R2. Open it once from Finder, with nothing planted
@@ -73,19 +75,20 @@ This is Verification 5's second bullet, end to end. R4 to R9 run in this instanc
 
 - Expect the setup view and the commit line.
 - `cat "$DIR/calls.log"` prints nothing.
-- `pgrep -fl 'json (version|instances|world)|/kube/bin/kubectl '` prints nothing. The pattern matches the app's `farcast` (`… -o json world -- …`) and the fake `kubectl`, and not the harness, whose own command line holds `bin/farcast`.
+- `pgrep -fl 'json (version|instances|world)'` prints nothing. The pattern matches the app's `farcast` (`… -o json world -- …`), and not the harness, whose own command line holds `bin/farcast`.
+- The planted variables cannot show in `calls.log` since M2.4: `farcast` reads none of them for these three commands, and a line carries no variable. That the child drops them is held by FarSightKit's `ChildEnvironmentTests` and cli's `TestWorldPresentsOnlyTheReaderToken`; this step shows the reads still work with them planted.
 
 ### R4. Settings
 
-Open Settings (⌘,), enter the six paths R1 printed, press Check, then Confirm.
+Open Settings (⌘,), enter the two paths R1 printed, press Check, then Confirm.
 
-- Check shows `farcast <version> · commit $COMMIT — matches this build`, and `rehearsal` with "gcloud account pinned".
+- Check shows `farcast <version> · commit $COMMIT — matches this build`, and `rehearsal` with "reader granted".
 - Settings refuses a mistyped path, and a relative one, before Check can run.
 
 ### R5. The launch listing, and nothing else
 
 - The map shows `rehearsal`, not read yet.
-- Quit, and reopen with R3's command. `cat "$DIR/calls.log"` still prints nothing: `version` and `instances` read files on this Mac only, and call no tool.
+- Quit, and reopen with R3's command. `cat "$DIR/calls.log"` still prints nothing: `version` and `instances` read files on this Mac only, and send no request.
 
 ### R6. Refresh (⌘R)
 
@@ -98,15 +101,14 @@ Every fact in the `healthy` row of the table in R7, and also:
 Then the log:
 
 ```bash
-grep -v ' | ok$' "$DIR/calls.log"                                     # prints nothing
-grep ' kubectl ' "$DIR/calls.log" | awk '{print $5}' | sort -u         # get
-grep -E ' (gke-gcloud-auth-plugin|gcloud) ' "$DIR/calls.log" | cut -d' ' -f2- | sort -u
-#   gcloud config config-helper --format=json | ok
-#   gke-gcloud-auth-plugin | ok
-grep -E 'planted|work\.invalid|CLOUDSDK_AUTH|CLOUDSDK_CORE|GOOGLE_APPLICATION|nonexistent|PROXY' "$DIR/calls.log"   # prints nothing
+grep -v ' as reader | ok$' "$DIR/calls.log"                           # prints nothing
+awk '{print $2, $3}' "$DIR/calls.log" | sort -u
+#   cluster GET
+#   token POST
+grep ' token ' "$DIR/calls.log" | awk '{print $4}' | sort -u           # /token
 ```
 
-Every line ends `| ok`. Every `kubectl` line's first argument after `--kubeconfig <path>` is `get`. The other lines are `gke-gcloud-auth-plugin`, with no arguments, and `gcloud config config-helper --format=json`. No line names a planted variable: the fake `kubectl` would have refused it, and said which.
+Every line ends `as reader | ok`: no request was the writer's, carried no token, or was refused. Every `cluster` line is a `GET` of one of `world`'s reads (workload lists, the labelled namespaces, and the ConfigMaps in `farcast-system`), and every `token` line is a `POST /token`. A 404 for a ConfigMap the rehearsal does not hold is an answer, and reads `ok`.
 
 ### R7. Each scenario
 
@@ -119,26 +121,29 @@ Switch with `./bin/farcast-rehearsal scenario --dir "$DIR" <name>`, then Refresh
 | `stale-checkpoint` | The `checkpoint_stale` alert, and "checkpoint stale" on the chip. |
 | `cost-reached` | The critical `cost` alert, and spending over the $50 limit: the total reads more than 100% beside "limit reached", never a few percent (F6). `web` stopped, with no reason given: this kernel recorded no stop. |
 | `at-floor` *(added 2026-11-12, after this walk)* | The critical `cost` alert, and beside it the critical `at_floor` alert on TechnoCore, its title naming the levers: drop the load-balancer carrier, or release the instance. Spending over the limit, as in `cost-reached`. `api` and `web` each "stopped by the cost guard". TechnoCore's panel says what still burns a month and names the same levers; the spending line says "at the floor". |
-| `signed-out` | Spend, apps and policy each `gcloud_signed_out`. Network and seal still read. Shrike's panel shows what it watched, "1 line watched" and "0 refusals seen", never "not watching" or "not read" (F1). Each panel says each of its own failed sections in one sentence, and no kubectl or gcloud text: TechnoCore "spending not read · signed out of gcloud — run gcloud auth login" and "apps not read · …", FatLine "egress policy not read · …", DataSphere "apps not read · …" (F3). Its figures stay whole. The chip reads "3 sections not read · signed out of gcloud" and stays on screen; narrowed, it drops the spending before that, then says "3 sections not read" (F4). gcloud's own message appears once, behind the chip's info button. |
-| `identity-mismatch` | The read is refused with `gcloud_mismatch` before any `kubectl` runs: `grep -c ' kubectl ' "$DIR/calls.log"` is the same before and after the Refresh. Every panel says "the read was refused · gcloud identity does not match — farcast instances pin-gcloud", and the chip "read refused · gcloud identity does not match", never "read not read" (F5). |
+| `token-refused` *(since ADR 0023 M2.4)* | Spend, apps and policy each `credential_refused`. Network and seal still read. Shrike's panel shows what it watched, "1 line watched" and "0 refusals seen", never "not watching" or "not read" (F1). Each panel says each of its own failed sections in one sentence, and no API server text: TechnoCore "spending not read · credential refused — check this machine's clock; then the key id (farcast reader record); a reader key expires with its certificate: farcast reader init <instance> --rotate" and "apps not read · …", FatLine "egress policy not read · …", DataSphere "apps not read · …" (F3). Its figures stay whole. The chip reads "3 sections not read · credential refused" and stays on screen; narrowed, it drops the spending before that, then says "3 sections not read" (F4). farcast's own message appears once, behind the chip's info button. The lines `calls.log` gains are `token` lines ending `refused: token-refused refuses every assertion`, and none is a `cluster` line. |
+| `unauthorized` *(since ADR 0023 M2.4)* | Spend, apps and policy each `unauthorized`, network and seal read, as in `token-refused`. The sentence's remedy: "the cluster refused the reader's token: check that the Cloud Shell step granted roles/container.clusterViewer; farcast instances shows the reader's state". The chip reads "3 sections not read · unauthorized". `calls.log`'s `cluster` lines end `refused: unauthorized answers every read`. |
+| `forbidden` *(since ADR 0023 M2.4)* | Spend and policy each `forbidden`; apps, network and seal read. TechnoCore "spending not read · forbidden — the reader may not read this: farcast reader grant <instance>; if the reader was just set up, IAM changes can take 7 minutes or longer", and FatLine "egress policy not read · …". The chip reads "2 sections not read · forbidden". Only the checkpoint's and the egress policy's `calls.log` lines end `refused: forbidden answers this read`. |
+| `reader-missing` *(since ADR 0023 M2.4)* | Spend, apps and policy each `credential_missing`, network and seal read, and nothing sent to the cluster: `wc -l < "$DIR/calls.log"` is the same before and after the Refresh. The chip reads "3 sections not read · credential missing". Settings › Check shows `rehearsal` with "reader key missing, not on this Mac" and the `farcast reader init … --rotate` line, never the reader's email. |
 | `denied` | The `denied` alert on `shop/web`, and a refused line to `tracker.invalid`, on the first read after the switch. |
 | `slow-cluster` | R9's. |
 
 - A failed read keeps the last good snapshot, faded, with its read time.
 - Walk `denied` last. Its refusals stay in Shrike's picture, and its alert stays within the hour, until the harness restarts, as a real Shrike's do. R8's restart clears them.
 - Return to `healthy` at the end.
+- `signed-out` and `identity-mismatch` were retired with the gcloud identity (ADR 0023 M2.4): the harness refuses them and names `token-refused` and `forbidden`. Their rows in the 2026-11-12 Results are the old rig's.
 
 ### R8. Failure paths
 
-1. **The tunnel goes away.** Ctrl-C the harness, then Refresh. Network and seal read `tunnel_unreachable`. Apps, spend and policy still read, because the fake tools are files. The declared line to `telemetry.invalid` reads "declared · use not read", and its card "declared by shop/api, use not read", never "unused" (F8). TechnoCore still counts "0 apps stopped": Shrike's state not read is no application's. DataSphere's keepers needing attention read "not read", never 0.
-2. **The harness comes back.** Restart it on **the same directory**: `./bin/farcast-rehearsal --dir "$DIR" --farcast "$PWD/bin/farcast"`. It rebinds the same tunnel port and reuses its own leaves, so Settings stay as they are. Refresh: healthy again, the keeper included, and no `denied` alert. If it says the port is in use, stop whatever holds it, or start a new rehearsal in a new directory and enter Settings again. *(Since 2026-11-13: a rehearsal directory made before [ADR 0020](../adr/0020-instance-pki-ecdsa-p256.md) moved the instance PKI to P-256 holds an Ed25519 CA, and a restart refuses it with "start a new one in a new directory"; do that, and enter Settings again.)*
+1. **The tunnel goes away.** `./bin/farcast-rehearsal scenario --dir "$DIR" tunnel-down`, wait a moment for FatLine to stop listening, then Refresh. Network and seal read `tunnel_unreachable`. Apps, spend and policy still read, because the cluster stays up. The declared line to `telemetry.invalid` reads "declared · use not read", and its card "declared by shop/api, use not read", never "unused" (F8). TechnoCore still counts "0 apps stopped": Shrike's state not read is no application's. DataSphere's keepers needing attention read "not read", never 0.
+2. **The harness comes back.** `./bin/farcast-rehearsal scenario --dir "$DIR" healthy`, then Ctrl-C the harness, and restart it on **the same directory**: `./bin/farcast-rehearsal --dir "$DIR" --farcast "$PWD/bin/farcast"`. It rebinds the same tunnel and cluster ports, reuses its own leaves and writes a new `cluster-ca.crt`, so Settings stay as they are. Refresh: healthy again, the keeper included, and no `denied` alert. If it says the port is in use, stop whatever holds it, or start a new rehearsal in a new directory and enter Settings again. *(Since 2026-11-13: a rehearsal directory made before [ADR 0020](../adr/0020-instance-pki-ecdsa-p256.md) moved the instance PKI to P-256 holds an Ed25519 CA, and a restart refuses it with "start a new one in a new directory"; do that, and enter Settings again.)* *(Since 2026-11-15: a directory made before ADR 0023 M2.4 holds the fake tools and no `cluster-ca.crt`, and a restart refuses it the same way.)*
 3. **farcast goes missing.** `mv ./bin/farcast ./bin/farcast.away`, then Refresh. Refresh lists first, and the listing's preflight finds nothing at the path before it runs anything: "Settings need attention: farcast: nothing is at this path". Restore it with `mv ./bin/farcast.away ./bin/farcast`.
 4. *Optionally,* `chmod -x ./bin/farcast`, then Refresh: "Settings need attention: farcast: is not executable by you". Restore it with `chmod 755 ./bin/farcast`. ("could not be started" comes only from a file that passes these checks and still will not exec.)
 5. **A build without its commit.** Run the app from Xcode's Run button: "built without its commit", and nothing runs (`calls.log` gains nothing). Quit it, and reopen with R3's command.
 
 ### R9. Quit mid-read
 
-Switch to `slow-cluster`, Refresh, then ⌘Q within 5 seconds. Two seconds later, `pgrep -fl 'json (version|instances|world)|/kube/bin/kubectl '` prints nothing and exits 1, which is `pgrep`'s "no match". That means quitting stopped the read and every process it started. Exit 0 with lines printed would be a finding. Switch back to `healthy`.
+Switch to `slow-cluster`, Refresh, then ⌘Q within 5 seconds. Two seconds later, `pgrep -fl 'json (version|instances|world)'` prints nothing and exits 1, which is `pgrep`'s "no match". That means quitting stopped the read; since ADR 0023 M2.4 it starts no other process. Exit 0 with lines printed would be a finding. `calls.log` may end with lines `refused: the caller left while the answer was held`, which are not. Switch back to `healthy`.
 
 ### R10. Teardown
 
@@ -165,20 +170,21 @@ It comes after Part R passes, and after `farcast world` has been walked from a t
 - Standing one up is billable. Present the cost, the duration and the teardown, and wait for a yes. Approval does not carry over from another walk.
 - Every instance `farcast instances` lists is read on Refresh. Make sure that list is what you mean to read.
 
-### L1. Identity
+### L1. The reader
 
-- **The operator types this in their own terminal**, never through an agent's shell, because it names the account: `farcast instances pin-gcloud $INSTANCE --account <the FarCast account>`. Use only the FarCast gcloud configuration, never a work one.
-- The walk records only that `farcast instances -o json` shows `"gcloud_pinned": true`. It never prints the email.
-- Check that gcloud is signed in without printing a secret. Never run `gcloud auth print-access-token`, even with its output redirected: zsh's MULTIOS still sends it to the pipe.
+Since [ADR 0023](../adr/0023-one-download-farcast.md) M2.4, `world` reads the cluster as the instance's own read-only service account, its reader, and reads no cluster section without one. Set it up with [phase 1's step 7b](phase-1-validation.md#7b-the-instances-reader-identity--not-yet-walked), which is not yet walked: `farcast reader init`, the printed script pasted into Cloud Shell by an Owner of the project, `farcast reader record`, and `farcast reader grant` once the instance is connected.
+- **The operator runs these**, in their own terminal and Cloud Shell, never through an agent's shell: the script names the project and the account.
+- `reader grant` still applies its RBAC through kubectl as the active gcloud configuration, until M2.7. Use only the FarCast gcloud configuration for it, never a work one. Check that gcloud is signed in without printing a secret. Never run `gcloud auth print-access-token`, even with its output redirected: zsh's MULTIOS still sends it to the pipe.
+- Where the organization forbids service-account key upload, there can be no reader, and this walk stops here. Record that, and nothing else.
+- The walk records only that `farcast instances -o json` shows `"reader":"granted"` for `$INSTANCE`. It never prints the email or the key id.
 
 ### L1b. The real paths in Settings
 
-R10's Forget left the tool fields empty. The operator enters:
+R10's Forget left the `farcast` field empty. The operator enters:
 - the real `farcast`: R0's `./bin/farcast`, by its absolute path;
-- the real `kubectl`, `gke-gcloud-auth-plugin` and `gcloud`;
-- the two real configuration directories.
+- the real farcast configuration directory.
 
-Then Check, then Confirm. Check must show the commit match, and `$INSTANCE` with "gcloud account pinned". The paths are never recorded: they hold the home directory.
+Then Check, then Confirm. Check must show the commit match, and `$INSTANCE` with "reader granted". The paths are never recorded: they hold the home directory.
 
 ### L2. A terminal walk under the app's own environment
 
@@ -187,24 +193,25 @@ Then Check, then Confirm. Check must show the commit match, and `$INSTANCE` with
   ```bash
   sh -c "$(pbpaste)" 2>/dev/null | ./bin/farcast-rehearsal summarize
   ```
-  The command holds home and gcloud paths and the instance's name. farcast's stderr is dropped; a refusal arrives as the envelope on stdout, whose kind `summarize` prints.
+  The command holds home-directory paths and the instance's name. farcast's stderr is dropped; a refusal arrives as the envelope on stdout, whose kind `summarize` prints.
 - Record only that summary.
-- This is the same argv and environment the app will use. It proves that the real `gcloud`, a shell script that needs the system's utilities and finds its Python on `PATH`, runs on the app's `PATH` (Q1). The rehearsal cannot prove this: its tools are fakes.
+- This is the same argv and environment the app will use. It proves that `farcast` reads a live cluster as the reader under the app's environment, with only the system's own directories on `PATH` and no `CLOUDSDK_*` variable, and that GKE's DNS endpoint accepts the reader's token. The rehearsal cannot prove either: its cluster and token endpoint are on loopback.
 
 ### L3. The app
 
-One Refresh. Expect these outbound-firewall prompts, and allow each for this destination only:
-- `farcast` → the carrier's address and port;
-- `kubectl` → the control plane's `*.gke.goog:443` (on this Mac, Docker's binary behind `/usr/local/bin/kubectl`);
-- the Python that `gcloud` runs → `oauth2.googleapis.com:443`.
+One Refresh. Expect these outbound-firewall prompts, all for `farcast`, and allow each for this destination only:
+- the carrier's address and port;
+- the control plane's `*.gke.goog:443`;
+- `oauth2.googleapis.com:443`, where it mints the reader's token.
 
-Deny gcloud's update check, and anything else, and record it.
+Deny anything else, and record it. Nothing else should start: since M2.4 the app's `farcast` runs no kubectl and no gcloud.
 
-### L4. Record
+### L4. Record, and tear down
 
 - Record with the scrub rule, below.
-- There is nothing to tear down for a read.
-- If an instance was stood up for this walk, release it, and verify independently that nothing is left billing: clusters, registries, buckets, forwarding rules and addresses.
+- A read leaves nothing to tear down. The reader L1 set up does: its Google account, its uploaded keys and its project binding outlive the instance.
+- If an instance was stood up for this walk, release it. Its result prints a `reader:` line naming the account, and two Cloud Shell lines that delete it, the binding's removal first. **The operator** runs both in Cloud Shell, as an Owner of the project. Record only that they ran, and whether each succeeded.
+- Then verify independently that nothing is left billing: clusters, registries, buckets, forwarding rules and addresses.
 
 ---
 
@@ -213,7 +220,7 @@ Deny gcloud's update check, and anything else, and record it.
 - Never paste these into the transcript, an issue or the repository:
   - raw `world` or `instances` output from a live instance;
   - a live screenshot;
-  - a live `calls.log` (there is none: the tools are real);
+  - a live `calls.log` (there is none: the cluster is real);
   - a copied terminal command.
 - Record only `farcast-rehearsal summarize` output, and placeholders: `$INSTANCE`, `<namespace>`, `<host>`, `<repository>`.
 - Never record instance, namespace, app or host names, repository URLs, deployed commits, replica Pod names, the carrier's address, the project, account emails, home-directory paths, or times of day.

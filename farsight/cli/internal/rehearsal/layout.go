@@ -1,9 +1,12 @@
 package rehearsal
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -16,21 +19,13 @@ import (
 
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/keeper"
+	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 	"github.com/sofmon/farcast/fatline/identity"
 )
 
 // The state directory (D3) and the instance record in it (D4).
 
 const (
-	// gcloudConfigName is the rehearsal's own gcloud configuration, the one
-	// whose account the instance pins.
-	gcloudConfigName = "rehearsal"
-	// decoyConfigName is the configuration gcloud's active_config names: the
-	// same project under another account. Nothing may ever read as it.
-	decoyConfigName = "work"
-	decoyAccount    = "someone@work.invalid"
-	// mismatchProject is config_rehearsal's project in identity-mismatch.
-	mismatchProject = "another-project"
 	// keeperDevice is the one enrolled keeper.
 	keeperDevice = "phone"
 	// shopNamespace is the one application namespace.
@@ -40,18 +35,38 @@ const (
 )
 
 // The harness's own leaves, written on the first Start and read on a restart.
+// writerPubFile is the writer's public key, kept here so a restart registers
+// it without reading credentials.yaml, the file the tests prove 'world' never
+// opens.
 const (
 	khCertFile     = "keyholder-server.crt"
 	khKeyFile      = "keyholder-server.key"
 	keeperCertFile = "keeper-" + keeperDevice + ".crt"
 	keeperKeyFile  = "keeper-" + keeperDevice + ".key"
+	writerPubFile  = "writer.pub"
 )
 
-// The three fake tools, each a symlink to the harness binary.
+// The instance's identities in the rehearsal's cluster (ADR 0023 M2.4). The
+// reader's email is the loopback form farcast derives for the instance,
+// readerName(inst)@rehearsal.invalid; the writer's is a placeholder, and
+// every read it makes is refused.
 const (
-	toolKubectl = "kubectl"
-	toolPlugin  = "gke-gcloud-auth-plugin"
-	toolGCloud  = "gcloud"
+	identityDomain = "rehearsal.invalid"
+	writerEmail    = "writer@" + identityDomain
+	readerID       = "reader"
+	writerID       = "writer"
+	// readerDays is how long the reader's certificate, and so its key, lasts:
+	// 'farcast reader init's default.
+	readerDays = 365
+)
+
+// The reader's key in the instance directory (config's names for it), and
+// where reader-missing moves it.
+const (
+	readerKeyFile  = "reader.key"
+	readerCertFile = "reader.crt"
+	readerAwayFile = "reader.key.away"
+	clusterCAFile  = "cluster-ca.crt"
 )
 
 // component names, as FatLine's, the kernel's and the keyholder's deploy
@@ -63,13 +78,18 @@ const (
 	nameKeyholder = "datasphered"
 )
 
-// material is the TLS material a running rig needs, and nothing more: never
-// the CA's private key.
+// errMadeBeforeM24 refuses a directory a harness from before ADR 0023 M2.4
+// made: fake tools and a gcloud directory, and no cluster CA.
+const errMadeBeforeM24 = "this rehearsal was made before ADR 0023 M2.4 moved its cluster into the harness; start a new one in a new directory"
+
+// material is what a running rig needs, and nothing more: never the CA's
+// private key, and never a private key of the reader or the writer.
 type material struct {
 	caCert                []byte
 	serverCert, serverKey []byte // FatLine's
 	khCert, khKey         []byte // the keyholders'
 	keeperCert, keeperKey []byte // the keeper device's
+	readerPub, writerPub  *rsa.PublicKey
 }
 
 // imageRef is a component's digest-pinned reference in the rehearsal's
@@ -86,31 +106,29 @@ func hexOf(label string, n int) string {
 	return strings.Repeat(hex.EncodeToString(sum[:]), 2)[:n]
 }
 
-// toolLinks are the three links and the directory each lives in.
-func toolLinks(d Dirs) map[string]string {
-	return map[string]string{
-		toolKubectl: filepath.Join(d.KubeBin, toolKubectl),
-		toolPlugin:  filepath.Join(d.SDKBin, toolPlugin),
-		toolGCloud:  filepath.Join(d.SDKBin, toolGCloud),
-	}
+// readerName is the reader service account's ID farcast derives for an
+// instance: "farcast-reader-" and the first 8 hex characters of the name's
+// SHA-256. It is the cli package's readerName, which is unexported; the
+// rehearsal's end-to-end tests fail if the two ever differ, because farcast
+// then refuses the recorded reader.
+func readerName(inst string) string {
+	sum := sha256.Sum256([]byte(inst))
+	return "farcast-reader-" + hex.EncodeToString(sum[:])[:8]
 }
 
+// readerEmail is the instance's reader in the rehearsal's cluster.
+func readerEmail(inst string) string { return readerName(inst) + "@" + identityDomain }
+
 // makeLayout writes a new rehearsal into root, which exists and is empty. It
-// returns the spec (written last, so a directory a failed Start leaves is
-// never mistaken for a rehearsal) and the material the servers need.
-func makeLayout(root string, s Spec, tools, tunnelAddr string, now time.Time) (material, error) {
+// returns the material the servers need, and writes the spec last, so a
+// directory a failed Start leaves is never mistaken for a rehearsal.
+// cluster-ca.crt is not written here: the cluster writes it each time it
+// starts, since every start makes a new CA.
+func makeLayout(root string, s Spec, tunnelAddr, clusterAddr string, now time.Time) (material, error) {
 	d := s.Dirs
-	for _, dir := range []string{d.GCloud, filepath.Join(d.GCloud, "configurations"), filepath.Join(root, harnessSubdir), d.KubeBin, d.SDKBin} {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return material{}, err
-		}
-	}
-	// Every parent the layout made is the owner's alone, as B4 asks of a
-	// tool's directory.
-	for _, dir := range []string{filepath.Join(root, "kube"), filepath.Join(root, "sdk")} {
-		if err := os.Chmod(dir, 0o700); err != nil {
-			return material{}, err
-		}
+	harness := filepath.Join(root, harnessSubdir)
+	if err := os.MkdirAll(harness, 0o700); err != nil {
+		return material{}, err
 	}
 
 	// D4.1: the identity. The CA key is in memory here, and only here.
@@ -141,7 +159,7 @@ func makeLayout(root string, s Spec, tools, tunnelAddr string, now time.Time) (m
 		khCert: khCert, khKey: khKey, keeperCert: keeperCert, keeperKey: keeperKey,
 	}
 	for name, data := range map[string][]byte{khCertFile: khCert, khKeyFile: khKey, keeperCertFile: keeperCert, keeperKeyFile: keeperKey} {
-		if err := os.WriteFile(filepath.Join(root, harnessSubdir, name), data, 0o600); err != nil {
+		if err := os.WriteFile(filepath.Join(harness, name), data, 0o600); err != nil {
 			return material{}, err
 		}
 	}
@@ -167,11 +185,61 @@ func makeLayout(root string, s Spec, tools, tunnelAddr string, now time.Time) (m
 	if err := os.Chmod(cfg.InstanceKeyringPath(inst), 0); err != nil {
 		return material{}, err
 	}
-	if err := cfg.SaveInstanceKubeconfig(inst, kubeconfigYAML(inst)); err != nil {
+
+	// The reader (ADR 0023 M2.3), made as 'farcast reader init' makes it: an
+	// RSA-2048 key and its certificate. Its key id is 40 hex characters, the
+	// shape of Google's, derived from the public key as the tests' are.
+	readerKey, readerCert, err := kube.NewReaderKey(rand.Reader, now.Add(-time.Hour), readerDays)
+	if err != nil {
+		return material{}, err
+	}
+	if m.readerPub, err = certPublicKey(readerCert); err != nil {
+		return material{}, fmt.Errorf("the reader's certificate: %w", err)
+	}
+	keyID, err := keyIDOf(m.readerPub)
+	if err != nil {
+		return material{}, err
+	}
+	if err := cfg.SaveReaderKey(inst, readerKey, readerCert); err != nil {
+		return material{}, err
+	}
+	if err := placeReaderKey(s, s.Scenario); err != nil {
 		return material{}, err
 	}
 
-	// D4.2: the record. Every name in it is a .invalid placeholder.
+	// The writer: a key credentials.yaml holds, registered with the cluster so
+	// that a read made with it reaches the handler and is refused there. It
+	// exists so the tests can prove 'world' never opens it.
+	writer, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return material{}, err
+	}
+	m.writerPub = &writer.PublicKey
+	writerDER, err := x509.MarshalPKCS8PrivateKey(writer)
+	if err != nil {
+		return material{}, err
+	}
+	writerJSON, err := json.Marshal(map[string]string{
+		"type": "service_account", "client_email": writerEmail,
+		"private_key": string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: writerDER})),
+		"token_uri":   "https://" + clusterAddr + "/token",
+	})
+	if err != nil {
+		return material{}, err
+	}
+	if err := cfg.SaveInstanceCredentials(inst, &config.InstanceCredentials{Provider: "gke", ServiceAccountKey: string(writerJSON)}); err != nil {
+		return material{}, err
+	}
+	writerPub, err := x509.MarshalPKIXPublicKey(m.writerPub)
+	if err != nil {
+		return material{}, err
+	}
+	if err := os.WriteFile(filepath.Join(harness, writerPubFile), pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: writerPub}), 0o600); err != nil {
+		return material{}, err
+	}
+
+	// D4.2: the record. Every name in it is a .invalid placeholder. Region
+	// is never consulted: a loopback endpoint is classified without it.
 	token, err := identity.LeafTokenPEM(keeperCert)
 	if err != nil {
 		return material{}, err
@@ -182,10 +250,12 @@ func makeLayout(root string, s Spec, tools, tunnelAddr string, now time.Time) (m
 	}
 	meta := &config.InstanceMetadata{
 		Name: inst, Provider: "gke", Project: s.Project, Region: "rehearsal-local", Cluster: "farcast-" + inst,
-		Endpoint: "control-plane.rehearsal.invalid", Status: config.InstanceRunning,
+		Endpoint: clusterAddr, Status: config.InstanceRunning,
 		CostLimit: config.CostLimit{Amount: limitUSD, Currency: "USD", Period: "monthly"},
 		CreatedAt: now, UpdatedAt: now,
-		CloudLogging: config.CloudLoggingSystem, GCloudAccount: s.Account, FatLineDeployed: true,
+		Reader:          &config.Reader{Email: readerEmail(inst), KeyID: keyID, GrantedAt: now},
+		ServerSideApply: &config.ServerSideApply{Since: now, Farcast: "rehearsal"},
+		CloudLogging:    config.CloudLoggingSystem, FatLineDeployed: true,
 		Carrier:  &config.Carrier{Type: "rehearsal", Endpoint: tunnelAddr, ServerName: identity.ServerName(inst)},
 		Registry: &config.Registry{Prefix: "registry.rehearsal.invalid/farcast", FatLineDigest: s.Images[nameFatLine]},
 		Kernel: &config.Kernel{
@@ -204,23 +274,6 @@ func makeLayout(root string, s Spec, tools, tunnelAddr string, now time.Time) (m
 		return material{}, err
 	}
 
-	// gcloud's configuration directory, with a decoy active.
-	if err := os.WriteFile(filepath.Join(d.GCloud, "active_config"), []byte(decoyConfigName), 0o600); err != nil {
-		return material{}, err
-	}
-	if err := os.WriteFile(filepath.Join(d.GCloud, "configurations", "config_"+decoyConfigName),
-		[]byte(iniCore(decoyAccount, s.Project)), 0o600); err != nil {
-		return material{}, err
-	}
-	if err := writeGCloudConfig(s, s.Scenario); err != nil {
-		return material{}, err
-	}
-
-	for _, link := range toolLinks(d) {
-		if err := os.Symlink(tools, link); err != nil {
-			return material{}, err
-		}
-	}
 	if err := os.WriteFile(filepath.Join(root, callsLog), nil, 0o600); err != nil {
 		return material{}, err
 	}
@@ -228,20 +281,13 @@ func makeLayout(root string, s Spec, tools, tunnelAddr string, now time.Time) (m
 }
 
 // loadLayout reads what a restart needs from a rehearsal a stopped harness
-// left: the harness's leaves, the instance's CA certificate and FatLine's
-// leaf, and the tunnel address the record pins. It never opens ca.key, and it
-// issues nothing.
-func loadLayout(s Spec, tools string) (material, string, error) {
+// left: the harness's leaves and the writer's public key, the instance's CA
+// certificate and FatLine's leaf, the reader's public key from reader.crt
+// (which reader-missing never moves), and the tunnel's and the cluster's
+// addresses the record pins. It never opens ca.key, reader.key or
+// credentials.yaml, and it issues nothing.
+func loadLayout(s Spec) (m material, tunnelAddr, clusterAddr string, err error) {
 	d := s.Dirs
-	for name, link := range toolLinks(d) {
-		got, err := os.Readlink(link)
-		if err != nil || got != tools {
-			if err == nil {
-				err = fmt.Errorf("its %s links to %s", name, got)
-			}
-			return material{}, "", fmt.Errorf("this directory's tools do not link to %s (%v); start a new rehearsal in a new directory", tools, err)
-		}
-	}
 	read := func(path string) ([]byte, error) {
 		b, err := os.ReadFile(path)
 		if err != nil {
@@ -249,10 +295,10 @@ func loadLayout(s Spec, tools string) (material, string, error) {
 		}
 		return b, nil
 	}
-	var m material
-	var err error
 	harness := filepath.Join(d.Root, harnessSubdir)
-	fat := filepath.Join(config.Dir(d.Config).InstancePath(s.Instance), "fatline")
+	cfg := config.Dir(d.Config)
+	fat := filepath.Join(cfg.InstancePath(s.Instance), "fatline")
+	var writerPub, readerCert []byte
 	for _, f := range []struct {
 		path string
 		into *[]byte
@@ -261,32 +307,130 @@ func loadLayout(s Spec, tools string) (material, string, error) {
 		{filepath.Join(harness, khKeyFile), &m.khKey},
 		{filepath.Join(harness, keeperCertFile), &m.keeperCert},
 		{filepath.Join(harness, keeperKeyFile), &m.keeperKey},
+		{filepath.Join(harness, writerPubFile), &writerPub},
 		{filepath.Join(fat, "ca.crt"), &m.caCert},
 		{filepath.Join(fat, "server.crt"), &m.serverCert},
 		{filepath.Join(fat, "server.key"), &m.serverKey},
+		{filepath.Join(cfg.InstancePath(s.Instance), readerCertFile), &readerCert},
 	} {
 		if *f.into, err = read(f.path); err != nil {
-			return material{}, "", err
+			return material{}, "", "", err
 		}
 	}
 	// A rehearsal made before ADR 0020 has an Ed25519 CA, which FatLine no
 	// longer loads. Its scratch data is what a fresh rehearsal recreates, so
 	// there is no migration: it is refused, and says so.
 	if err := identity.RequireP256CA(m.caCert); err != nil {
-		return material{}, "", errors.New("this rehearsal was made before ADR 0020 moved the instance PKI to P-256; start a new one in a new directory")
+		return material{}, "", "", errors.New("this rehearsal was made before ADR 0020 moved the instance PKI to P-256; start a new one in a new directory")
 	}
-	meta, err := config.Dir(d.Config).LoadInstanceMetadata(s.Instance)
+	if m.readerPub, err = certPublicKey(readerCert); err != nil {
+		return material{}, "", "", fmt.Errorf("the rehearsal instance's reader.crt: %w", err)
+	}
+	if m.writerPub, err = publicKey(writerPub); err != nil {
+		return material{}, "", "", fmt.Errorf("the harness's %s: %w", writerPubFile, err)
+	}
+	meta, err := cfg.LoadInstanceMetadata(s.Instance)
 	if err != nil {
-		return material{}, "", fmt.Errorf("read the rehearsal instance's record: %w", err)
+		return material{}, "", "", fmt.Errorf("read the rehearsal instance's record: %w", err)
 	}
 	if meta.Carrier == nil {
-		return material{}, "", errors.New("the rehearsal instance's record names no tunnel; start a new rehearsal in a new directory")
+		return material{}, "", "", errors.New("the rehearsal instance's record names no tunnel; start a new rehearsal in a new directory")
 	}
-	host, _, err := net.SplitHostPort(meta.Carrier.Endpoint)
-	if err != nil || host != "127.0.0.1" {
-		return material{}, "", fmt.Errorf("the rehearsal instance's record names the tunnel %q, not one on 127.0.0.1", meta.Carrier.Endpoint)
+	if !onLoopback(meta.Carrier.Endpoint) {
+		return material{}, "", "", fmt.Errorf("the rehearsal instance's record names the tunnel %q, not one on 127.0.0.1", meta.Carrier.Endpoint)
 	}
-	return m, meta.Carrier.Endpoint, nil
+	if !onLoopback(meta.Endpoint) {
+		return material{}, "", "", fmt.Errorf("the rehearsal instance's record names the cluster %q, not one on 127.0.0.1", meta.Endpoint)
+	}
+	return m, meta.Carrier.Endpoint, meta.Endpoint, nil
+}
+
+// onLoopback reports whether addr is 127.0.0.1:<port>.
+func onLoopback(addr string) bool {
+	host, port, err := net.SplitHostPort(addr)
+	return err == nil && host == "127.0.0.1" && port != ""
+}
+
+// madeBeforeM24 reports whether root holds a rehearsal a harness from before
+// ADR 0023 M2.4 made: its rehearsal.json, the fake tools' directories or the
+// gcloud directory, and no instance with a cluster CA.
+func madeBeforeM24(root string) bool {
+	if _, err := os.Lstat(filepath.Join(root, specFile)); err != nil {
+		return false
+	}
+	old := false
+	for _, p := range []string{filepath.Join("kube", "bin"), filepath.Join("sdk", "bin"), "gcloud"} {
+		if _, err := os.Lstat(filepath.Join(root, p)); err == nil {
+			old = true
+		}
+	}
+	if !old {
+		return false
+	}
+	cas, err := filepath.Glob(filepath.Join(root, "config", "instances", "*", clusterCAFile))
+	return err == nil && len(cas) == 0
+}
+
+// placeReaderKey puts the instance's reader key where a scenario wants it:
+// aside, as reader.key.away, in reader-missing, and back as reader.key in
+// every other. A key already where it belongs is left alone.
+func placeReaderKey(s Spec, scenario string) error {
+	inst := config.Dir(s.Dirs.Config).InstancePath(s.Instance)
+	from, to := filepath.Join(inst, readerAwayFile), filepath.Join(inst, readerKeyFile)
+	if scenario == ScenarioReaderMissing {
+		from, to = to, from
+	}
+	if _, err := os.Lstat(from); isMissing(err) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	return os.Rename(from, to)
+}
+
+// certPublicKey is a PEM certificate's RSA public key.
+func certPublicKey(certPEM []byte) (*rsa.PublicKey, error) {
+	block, _ := pem.Decode(certPEM)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return nil, errors.New("no certificate")
+	}
+	c, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil, err
+	}
+	pub, ok := c.PublicKey.(*rsa.PublicKey)
+	if !ok {
+		return nil, fmt.Errorf("its key is %T, not RSA", c.PublicKey)
+	}
+	return pub, nil
+}
+
+// publicKey is a PEM PKIX public key, which must be RSA.
+func publicKey(pubPEM []byte) (*rsa.PublicKey, error) {
+	block, _ := pem.Decode(pubPEM)
+	if block == nil || block.Type != "PUBLIC KEY" {
+		return nil, errors.New("no public key")
+	}
+	k, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		return nil, err
+	}
+	pub, ok := k.(*rsa.PublicKey)
+	if !ok {
+		return nil, fmt.Errorf("its key is %T, not RSA", k)
+	}
+	return pub, nil
+}
+
+// keyIDOf is 40 hex characters derived from a public key: the first 20 bytes
+// of its SPKI's SHA-256.
+func keyIDOf(pub *rsa.PublicKey) (string, error) {
+	spki, err := x509.MarshalPKIXPublicKey(pub)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(spki)
+	return hex.EncodeToString(sum[:20]), nil
 }
 
 func caKeyPath(cfg config.Dir, inst string) string {
@@ -303,48 +447,6 @@ func notAfter(certPEM []byte) (time.Time, error) {
 		return time.Time{}, err
 	}
 	return c.NotAfter.UTC(), nil
-}
-
-// iniCore is a gcloud configuration file holding an account and a project.
-func iniCore(account, project string) string {
-	return "[core]\naccount = " + account + "\nproject = " + project + "\n"
-}
-
-// writeGCloudConfig writes config_rehearsal for a scenario: the instance's
-// account and project, or, in identity-mismatch, another project.
-func writeGCloudConfig(s Spec, scenario string) error {
-	project := s.Project
-	if scenario == ScenarioIdentityMismatch {
-		project = mismatchProject
-	}
-	return writeAtomic(filepath.Join(s.Dirs.GCloud, "configurations", "config_"+gcloudConfigName), []byte(iniCore(s.Account, project)))
-}
-
-// kubeconfigYAML has GKE's shape: one cluster, one context, and a user whose
-// credential comes from gke-gcloud-auth-plugin, named by bare name.
-func kubeconfigYAML(inst string) []byte {
-	name := "farcast-" + inst
-	return []byte(`apiVersion: v1
-kind: Config
-clusters:
-- name: ` + name + `
-  cluster:
-    server: https://control-plane.rehearsal.invalid
-contexts:
-- name: ` + name + `
-  context:
-    cluster: ` + name + `
-    user: ` + name + `
-current-context: ` + name + `
-users:
-- name: ` + name + `
-  user:
-    exec:
-      apiVersion: client.authentication.k8s.io/v1beta1
-      command: gke-gcloud-auth-plugin
-      provideClusterInfo: true
-      interactiveMode: Never
-`)
 }
 
 // isMissing reports a path that does not exist.

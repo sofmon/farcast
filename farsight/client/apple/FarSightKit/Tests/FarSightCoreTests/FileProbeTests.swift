@@ -78,7 +78,7 @@ struct FileProbeTests {
         }
     }
 
-    @Test("Settings refuse a tool that links into a directory anyone can write, on real files")
+    @Test("Settings refuse a farcast that links into a directory anyone can write, on real files")
     func linkIntoAnOpenDirectory() throws {
         try Self.inTemporaryDirectory { root in
             let probe = LocalFileProbe()
@@ -86,34 +86,34 @@ struct FileProbeTests {
             try Self.chmod("\(root)/open", 0o777)
             try FileManager.default.createDirectory(atPath: "\(root)/bin", withIntermediateDirectories: false)
             try Self.chmod("\(root)/bin", 0o755)
-            try Self.file("\(root)/open/kubectl", mode: 0o755)
-            try FileManager.default.createSymbolicLink(atPath: "\(root)/bin/kubectl", withDestinationPath: "\(root)/open/kubectl")
+            try Self.file("\(root)/open/farcast", mode: 0o755)
+            try FileManager.default.createSymbolicLink(atPath: "\(root)/bin/farcast", withDestinationPath: "\(root)/open/farcast")
 
-            let settings = CLISettings(kubectl: "\(root)/bin/kubectl")
-            let kubectl = settings.problems(probe: probe, bundlePath: "").first { $0.field == .kubectl }
-            #expect(kubectl?.message == "it links to a file in a directory anyone on this Mac can write")
+            let settings = CLISettings(farcast: "\(root)/bin/farcast")
+            let farcast = settings.problems(probe: probe, bundlePath: "").first { $0.field == .farcast }
+            #expect(farcast?.message == "it links to a file in a directory anyone on this Mac can write")
 
             try Self.chmod("\(root)/open", 0o755)
-            #expect(settings.problems(probe: probe, bundlePath: "").first { $0.field == .kubectl } == nil)
+            #expect(settings.problems(probe: probe, bundlePath: "").first { $0.field == .farcast } == nil)
         }
     }
 
-    @Test("Settings refuse a tool inside the bundle, with either one reached through a link, on real files")
+    @Test("Settings refuse a farcast inside the bundle, with either one reached through a link, on real files")
     func bundleThroughALink() throws {
         try Self.inTemporaryDirectory { root in
             let probe = LocalFileProbe()
             try FileManager.default.createDirectory(atPath: "\(root)/real/FarCast.app/Contents/MacOS", withIntermediateDirectories: true)
-            try Self.file("\(root)/real/FarCast.app/Contents/MacOS/kubectl", mode: 0o755)
+            try Self.file("\(root)/real/FarCast.app/Contents/MacOS/farcast", mode: 0o755)
             try FileManager.default.createSymbolicLink(atPath: "\(root)/alias", withDestinationPath: "\(root)/real")
 
-            // The bundle given through the link, as a bundle URL's path, and the tool typed where it is.
-            let direct = CLISettings(kubectl: "\(root)/real/FarCast.app/Contents/MacOS/kubectl")
-            let given = direct.problems(probe: probe, bundlePath: "\(root)/alias/FarCast.app/").first { $0.field == .kubectl }
+            // The bundle given through the link, as a bundle URL's path, and farcast typed where it is.
+            let direct = CLISettings(farcast: "\(root)/real/FarCast.app/Contents/MacOS/farcast")
+            let given = direct.problems(probe: probe, bundlePath: "\(root)/alias/FarCast.app/").first { $0.field == .farcast }
             #expect(given?.message == "is inside FarCast.app")
 
-            // The tool typed through the link, and the bundle given where it is.
-            let linked = CLISettings(kubectl: "\(root)/alias/FarCast.app/Contents/MacOS/kubectl")
-            let typed = linked.problems(probe: probe, bundlePath: "\(root)/real/FarCast.app/").first { $0.field == .kubectl }
+            // farcast typed through the link, and the bundle given where it is.
+            let linked = CLISettings(farcast: "\(root)/alias/FarCast.app/Contents/MacOS/farcast")
+            let typed = linked.problems(probe: probe, bundlePath: "\(root)/real/FarCast.app/").first { $0.field == .farcast }
             #expect(typed?.message == "is inside FarCast.app")
         }
     }

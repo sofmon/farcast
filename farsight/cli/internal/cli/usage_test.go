@@ -90,7 +90,7 @@ func runUsageWith(t *testing.T, dir config.Dir, body string, mode output.Mode, d
 	env, out := testEnv(dir, mode)
 	c := &usageCommand{}
 	f := usageReader(t, body)
-	c.newCluster = func(string) usageReaderIface { return f }
+	c.newCluster = func(clusterRef) (usageReaderIface, error) { return f, nil }
 	c.newDialer = func(context.Context, *Env, string) (streamDialer, func(), error) {
 		if d == nil {
 			return nil, nil, errors.New("no dialer")
@@ -239,7 +239,7 @@ func TestUsageRefusesAnInstanceWithNoKernel(t *testing.T) {
 	buildableInstance(t, dir, "bare")
 	env, _ := testEnv(dir, output.ModeHuman)
 	c := &usageCommand{}
-	c.newCluster = func(string) usageReaderIface { return &fakeReader{} }
+	c.newCluster = func(clusterRef) (usageReaderIface, error) { return &fakeReader{}, nil }
 	err := c.Run(context.Background(), env, []string{"bare"})
 	if err == nil || !strings.Contains(err.Error(), "kernel deploy") {
 		t.Fatalf("error is %v, want one naming the command that fixes it", err)
@@ -251,7 +251,7 @@ func TestUsageSaysWhenNothingHasBeenWrittenYet(t *testing.T) {
 	meteringInstance(t, dir, "p51")
 	env, _ := testEnv(dir, output.ModeHuman)
 	c := &usageCommand{}
-	c.newCluster = func(string) usageReaderIface { return &fakeReader{cmMissing: true} }
+	c.newCluster = func(clusterRef) (usageReaderIface, error) { return &fakeReader{cmMissing: true}, nil }
 	err := c.Run(context.Background(), env, []string{"p51"})
 	if err == nil || !strings.Contains(err.Error(), "has not written any usage profiles yet") {
 		t.Fatalf("error is %v", err)
@@ -266,7 +266,7 @@ func TestUsageRefusesAnUnknownDocumentVersion(t *testing.T) {
 	env, _ := testEnv(dir, output.ModeHuman)
 	c := &usageCommand{}
 	f := usageReader(t, `{"version":99,"at":"2026-09-09T12:00:00Z","store":{"version":1,"hours":24}}`)
-	c.newCluster = func(string) usageReaderIface { return f }
+	c.newCluster = func(clusterRef) (usageReaderIface, error) { return f, nil }
 	err := c.Run(context.Background(), env, []string{"p51"})
 	if err == nil || !strings.Contains(err.Error(), "older than the other") {
 		t.Fatalf("error is %v", err)
@@ -431,7 +431,7 @@ func TestUsageStillReportsComputeWhenThereIsNoTunnelAtAll(t *testing.T) {
 
 	env, out := testEnv(dir, output.ModeHuman)
 	c := &usageCommand{}
-	c.newCluster = func(string) usageReaderIface { return usageReader(t, body) }
+	c.newCluster = func(clusterRef) (usageReaderIface, error) { return usageReader(t, body), nil }
 	c.newDialer = func(context.Context, *Env, string) (streamDialer, func(), error) {
 		return nil, nil, errors.New("instance \"p51\" has no tunnel; run 'farcast connect p51' first")
 	}
@@ -457,7 +457,7 @@ func TestUsageSkipsTheNetworkWhenAsked(t *testing.T) {
 
 	env, out := testEnv(dir, output.ModeHuman)
 	c := &usageCommand{noNetwork: true}
-	c.newCluster = func(string) usageReaderIface { return usageReader(t, body) }
+	c.newCluster = func(clusterRef) (usageReaderIface, error) { return usageReader(t, body), nil }
 	called := false
 	c.newDialer = func(context.Context, *Env, string) (streamDialer, func(), error) {
 		called = true
@@ -520,7 +520,7 @@ func TestUsageSaysWhoseNetworkPictureItIs(t *testing.T) {
 			})
 			env, out := testEnv(dir, output.ModeHuman)
 			c := &usageCommand{}
-			c.newCluster = func(string) usageReaderIface { return f }
+			c.newCluster = func(clusterRef) (usageReaderIface, error) { return f, nil }
 			c.newDialer = func(context.Context, *Env, string) (streamDialer, func(), error) {
 				return d, func() {}, nil
 			}

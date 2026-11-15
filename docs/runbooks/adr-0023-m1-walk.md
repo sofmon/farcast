@@ -18,6 +18,7 @@ Throughout:
 - Never print a token. Never run `gcloud auth print-access-token`, even with its output redirected: zsh's MULTIOS still sends it to the pipe.
 - `KUBECONFIG` is the instance's own kubeconfig in every shell that runs `kubectl` or `farcast`. The operator's default kubeconfig can hold other clusters.
 - `farcast instances pin-gcloud` names an account, so **the operator types it**, in their own terminal, never through an agent's shell (W4). It is typed with the walked farcast's full path, `"$WALK/bin/farcast"`: a farcast from before M1 rewrites `metadata.yaml` without its `system_images`.
+  *(2026-11-15, ADR 0023 M2.4: `pin-gcloud` is retired, a usage error that writes nothing. `world` reads the cluster as the instance's reader instead, so a re-walk of W4's `world` check needs [phase 1's step 7b](phase-1-validation.md#7b-the-instances-reader-identity--not-yet-walked), which is not yet walked, in place of the pin. The results below were walked with the pin, and are not rewritten.)*
 
 ---
 
@@ -146,7 +147,7 @@ In the walk shell: `farcast storage deploy "$INSTANCE" --yes`.
   *(2026-11-14: the printed `gcloud storage` commands still crash on the walk Mac's gcloud under Python 3.14 (`ssl.PROTOCOL_TLSv1`), and that gcloud refuses the system's Python 3.9. `gsutil` loads. The walk applied the same two bucket-level bindings with `gsutil iam get gs://<bucket>`, adding `roles/storage.objectAdmin` and `roles/storage.legacyBucketReader` for the printed principal to that JSON, and `gsutil iam set`. That way no token is printed. The replicas crash-looped until the grant landed, and ran sealed about a minute after it.)*
 - `running statefulset/datasphered` is `carried`'s `datasphered` manifest; `origins` shows `datasphered` as `embedded`.
 - `farcast storage unseal "$INSTANCE"` in the walk shell, as on every walk: the replicas come up sealed.
-- **`world` shows the Go of all four.** `world` reads as a pinned account. The operator types, in their own terminal, which is neither the walk shell nor the observing shell, so it sets both names first:
+- **`world` shows the Go of all four.** `world` reads as a pinned account. *(2026-11-15: since ADR 0023 M2.4 it reads as the instance's reader, set up by [phase 1's step 7b](phase-1-validation.md#7b-the-instances-reader-identity--not-yet-walked) in place of the `pin-gcloud` line below, which is now a usage error.)* The operator types, in their own terminal, which is neither the walk shell nor the observing shell, so it sets both names first:
   ```bash
   WALK=<the walk directory>; INSTANCE=<name>
   "$WALK/bin/farcast" instances pin-gcloud "$INSTANCE" --account <the FarCast account>

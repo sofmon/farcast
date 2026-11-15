@@ -6,42 +6,76 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
 )
 
-// The scenarios: what the instance shows on the next Refresh (D8). The fake
-// tools, Shrike's status handler and the keyholders read the scenario from
+// The scenarios: what the instance shows on the next Refresh (D8). The
+// cluster's handler, its token endpoint, its delay, Shrike's status handler,
+// the keyholders and the tunnel's watcher read the scenario from
 // rehearsal.json on every call, so a switch needs no restart.
 const (
-	ScenarioHealthy          = "healthy"
-	ScenarioSealed           = "sealed"
-	ScenarioStaleCheckpoint  = "stale-checkpoint"
-	ScenarioCostReached      = "cost-reached"
-	ScenarioAtFloor          = "at-floor"
-	ScenarioDenied           = "denied"
-	ScenarioSignedOut        = "signed-out"
-	ScenarioIdentityMismatch = "identity-mismatch"
-	ScenarioSlowCluster      = "slow-cluster"
+	ScenarioHealthy         = "healthy"
+	ScenarioSealed          = "sealed"
+	ScenarioStaleCheckpoint = "stale-checkpoint"
+	ScenarioCostReached     = "cost-reached"
+	ScenarioAtFloor         = "at-floor"
+	ScenarioDenied          = "denied"
+	ScenarioSlowCluster     = "slow-cluster"
+	// ScenarioTokenRefused: the token endpoint refuses every assertion with
+	// invalid_grant, so 'world' shows credential_refused.
+	ScenarioTokenRefused = "token-refused"
+	// ScenarioUnauthorized: every read answers 401, the retry after the
+	// re-mint too.
+	ScenarioUnauthorized = "unauthorized"
+	// ScenarioForbidden: the kernel's checkpoint and the egress policy answer
+	// 403, so spend and policy show forbidden and apps still read.
+	ScenarioForbidden = "forbidden"
+	// ScenarioReaderMissing: reader.key is moved aside to reader.key.away,
+	// and back on any other scenario.
+	ScenarioReaderMissing = "reader-missing"
+	// ScenarioTunnelDown: FatLine's tunnel stops listening while the cluster
+	// stays up, and listens again on any other scenario.
+	ScenarioTunnelDown = "tunnel-down"
 )
 
 var scenarios = []string{
 	ScenarioHealthy, ScenarioSealed, ScenarioStaleCheckpoint, ScenarioCostReached, ScenarioAtFloor,
-	ScenarioDenied, ScenarioSignedOut, ScenarioIdentityMismatch, ScenarioSlowCluster,
+	ScenarioDenied, ScenarioSlowCluster, ScenarioTokenRefused, ScenarioUnauthorized, ScenarioForbidden,
+	ScenarioReaderMissing, ScenarioTunnelDown,
 }
+
+// retiredScenarios were the gcloud identity's scenarios, retired with the
+// fake tools when the cluster moved into the harness (ADR 0023 M2.4).
+var retiredScenarios = []string{"signed-out", "identity-mismatch"}
 
 // Scenarios is every scenario name, in the order the runbook walks them.
 func Scenarios() []string { return slices.Clone(scenarios) }
 
-// ValidScenario reports whether name is one of Scenarios.
-func ValidScenario(name string) bool { return slices.Contains(scenarios, name) }
+// RetiredScenarios are the scenario names that are no longer scenarios.
+func RetiredScenarios() []string { return slices.Clone(retiredScenarios) }
+
+// CheckScenario reports why name is not a scenario, nil when it is one. A
+// retired name says what replaced it; any other says what the scenarios are.
+// Every place that takes a scenario name asks it.
+func CheckScenario(name string) error {
+	switch {
+	case slices.Contains(scenarios, name):
+		return nil
+	case slices.Contains(retiredScenarios, name):
+		return fmt.Errorf("scenario %q was retired with ADR 0023 M2; use token-refused or forbidden", name)
+	}
+	return fmt.Errorf("unknown scenario %q; the scenarios are %s", name, strings.Join(scenarios, ", "))
+}
 
 // specFile is the rehearsal's own record, at the top of its directory.
 const specFile = "rehearsal.json"
 
-// defaultSlowSeconds is how long the fake kubectl sleeps in slow-cluster:
-// longer than world's 20-second kubectl read deadline.
+// defaultSlowSeconds is how long the cluster holds every answer in
+// slow-cluster, a /token's included: longer than world's 20-second deadline
+// for each cluster read.
 const defaultSlowSeconds = 25
 
 // period is how long a rehearsal's ledger runs. Its period starts five days
@@ -54,11 +88,10 @@ const (
 // errExpired is what every read says once the ledger's period has ended.
 const errExpired = "this rehearsal is older than its 30-day period; start a new one"
 
-// Spec is rehearsal.json: everything the fake tools, the keyholders and
-// Shrike's status handler need, read again on every call.
+// Spec is rehearsal.json: everything the cluster, the keyholders, Shrike's
+// status handler and the tunnel's watcher need, read again on every call.
 type Spec struct {
 	Instance string    `json:"instance"`
-	Account  string    `json:"account"`
 	Project  string    `json:"project"`
 	Scenario string    `json:"scenario"`
 	Started  time.Time `json:"started"`
@@ -68,28 +101,19 @@ type Spec struct {
 	// Images are FarCast's own components' digest-pinned references, the
 	// ones metadata.yaml records and the cluster answers run.
 	Images map[string]string `json:"images"`
-	// SlowSeconds is how long kubectl sleeps in slow-cluster.
+	// SlowSeconds is how long the cluster holds every answer in slow-cluster.
 	SlowSeconds float64 `json:"slow_seconds"`
 }
 
 // Dirs are the directories a rehearsal is made of.
 type Dirs struct {
-	Root    string `json:"root"`
-	Config  string `json:"config"`
-	GCloud  string `json:"gcloud"`
-	KubeBin string `json:"kube_bin"`
-	SDKBin  string `json:"sdk_bin"`
+	Root   string `json:"root"`
+	Config string `json:"config"`
 }
 
 // dirsUnder is the layout D3 fixes, under an already resolved root.
 func dirsUnder(root string) Dirs {
-	return Dirs{
-		Root:    root,
-		Config:  filepath.Join(root, "config"),
-		GCloud:  filepath.Join(root, "gcloud"),
-		KubeBin: filepath.Join(root, "kube", "bin"),
-		SDKBin:  filepath.Join(root, "sdk", "bin"),
-	}
+	return Dirs{Root: root, Config: filepath.Join(root, "config")}
 }
 
 // LoadSpec reads dir's rehearsal.json and checks it is one this build wrote.
@@ -112,13 +136,10 @@ func (s Spec) validate() error {
 	if err := validInstance(s.Instance); err != nil {
 		return err
 	}
-	if !ValidScenario(s.Scenario) {
-		return fmt.Errorf("unknown scenario %q", s.Scenario)
-	}
-	if err := validINIValue("account", s.Account); err != nil {
+	if err := CheckScenario(s.Scenario); err != nil {
 		return err
 	}
-	if err := validINIValue("project", s.Project); err != nil {
+	if err := validProject(s.Project); err != nil {
 		return err
 	}
 	if s.Started.IsZero() {
@@ -147,7 +168,7 @@ func (s Spec) periodEnd() time.Time { return s.periodStart().Add(periodLength) }
 func (s Spec) expired(now time.Time) bool { return !now.Before(s.periodEnd()) }
 
 // writeSpec replaces dir's rehearsal.json through a temporary file and a
-// rename, so a fake tool reading it mid-switch sees the old or the new one.
+// rename, so a handler reading it mid-switch sees the old or the new one.
 func writeSpec(dir string, s Spec) error {
 	data, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
@@ -180,11 +201,15 @@ func writeAtomic(path string, data []byte) error {
 }
 
 // SetScenario switches what a rehearsal's instance shows, from its next read.
-// identity-mismatch also moves the rehearsal's gcloud configuration to
-// another project, and every other scenario moves it back.
+// reader-missing also moves the instance's reader.key aside, and every other
+// scenario moves it back; tunnel-down takes effect within a moment, when the
+// harness's watcher next reads the scenario.
+//
+// A directory made before ADR 0023 M2.4 is refused, as Start refuses it: its
+// harness, if one runs, reads a rehearsal.json this build no longer writes.
 func SetScenario(dir, name string) error {
-	if !ValidScenario(name) {
-		return fmt.Errorf("unknown scenario %q; the scenarios are %s", name, strings.Join(scenarios, ", "))
+	if err := CheckScenario(name); err != nil {
+		return err
 	}
 	root, err := resolvePath(dir)
 	if err != nil {
@@ -193,6 +218,9 @@ func SetScenario(dir, name string) error {
 	if err := guard(root, ""); err != nil {
 		return err
 	}
+	if madeBeforeM24(root) {
+		return errors.New(errMadeBeforeM24)
+	}
 	s, err := LoadSpec(root)
 	if err != nil {
 		return fmt.Errorf("%s holds no rehearsal: %w", dir, err)
@@ -200,8 +228,8 @@ func SetScenario(dir, name string) error {
 	if s.Dirs.Root != root {
 		return fmt.Errorf("%s was made at %s; a rehearsal does not move", dir, s.Dirs.Root)
 	}
-	if err := writeGCloudConfig(s, name); err != nil {
-		return fmt.Errorf("write the rehearsal's gcloud configuration: %w", err)
+	if err := placeReaderKey(s, name); err != nil {
+		return fmt.Errorf("move the rehearsal instance's reader key: %w", err)
 	}
 	s.Scenario = name
 	return writeSpec(root, s)
@@ -222,16 +250,16 @@ func validInstance(name string) error {
 	return nil
 }
 
-// validINIValue refuses a value that would add a line or a section to the
-// gcloud configuration file it is written into.
-func validINIValue(what, v string) error {
-	if strings.TrimSpace(v) == "" {
-		return fmt.Errorf("no %s", what)
-	}
-	for _, r := range v {
-		if r < 0x20 || r == 0x7f || r == '[' || r == ']' || r == '=' {
-			return fmt.Errorf("the %s %q holds a character a gcloud configuration cannot carry", what, v)
-		}
+// projectIDShape is Google's project-ID shape, the one farcast's reader
+// checks (checkedReader): 6 to 30 characters, lowercase letters, digits and
+// hyphens, starting with a letter and not ending with a hyphen. A rehearsal
+// whose project failed it would show credential_missing on every read.
+var projectIDShape = regexp.MustCompile(`^[a-z][a-z0-9-]{4,28}[a-z0-9]$`)
+
+// validProject refuses a project farcast's reader would refuse.
+func validProject(project string) error {
+	if !projectIDShape.MatchString(project) {
+		return fmt.Errorf("the project %q is not one Google issues (6 to 30 of a-z, 0-9 and -, starting with a letter)", project)
 	}
 	return nil
 }

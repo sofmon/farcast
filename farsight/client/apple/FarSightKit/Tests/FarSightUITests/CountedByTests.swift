@@ -53,7 +53,7 @@ struct CountedByTests {
     }
 
     static let document = #"""
-    {"schema":1,"generated_at":"2026-11-12T10:00:00Z","farcast":{"version":"v0","commit":"0e54eb1"},
+    {"schema":2,"generated_at":"2026-11-12T10:00:00Z","farcast":{"version":"v0","commit":"0e54eb1"},
      "instance":{"name":"atlas","status":"running","cloud_logging":"system_only",
       "spend":{"read":true,"currency":"USD","period":"monthly","total_cents":10,"expected_cents":10,"has_confirmation":false,
                "limit_cents":5000,"recorded_limit_cents":5000,"level":"ok","checkpoint_stale":false},

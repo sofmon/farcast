@@ -68,14 +68,21 @@ type verified struct {
 
 // serveToken is POST /token. A verified assertion mints
 // "kubetest:<id>:<n>", or answers what WithTokenAnswer gives; anything else
-// answers 400 invalid_grant, and a method other than POST 405.
-func (s *Server) serveToken(w http.ResponseWriter, r *http.Request, req Request) {
+// answers 400 invalid_grant, and a method other than POST 405. It returns the
+// request as recorded.
+func (s *Server) serveToken(w http.ResponseWriter, r *http.Request, req Request) Request {
 	v := s.verifyAssertion(r.Method, req.ContentType, req.Body)
 	req.KeyID = v.kid
 	if v.err == nil {
 		req.As = v.id
 	}
 	s.record(req)
+	s.answerToken(w, r, req, v)
+	return req
+}
+
+// answerToken answers one recorded /token request.
+func (s *Server) answerToken(w http.ResponseWriter, r *http.Request, req Request, v verified) {
 	if !s.hold(r.Context(), req) {
 		return
 	}

@@ -55,10 +55,7 @@ func filled(argv []string, config, instance string) []string {
 func TestTheAppsArgvIsTheCLIs(t *testing.T) {
 	argv := appArgv(t)
 	dir := vectorConfigDir(t)
-	installedInstance(t, dir, "atlas") // no gcloud account pinned
-	// Never the operator's own gcloud directory, though nothing here should
-	// reach it: an unpinned instance is refused before it is looked for.
-	t.Setenv("CLOUDSDK_CONFIG", t.TempDir())
+	installedInstance(t, dir, "atlas") // no cluster endpoint and no reader recorded
 
 	runApp := func(t *testing.T, args []string) ([]byte, int) {
 		t.Helper()
@@ -120,14 +117,27 @@ func TestTheAppsArgvIsTheCLIs(t *testing.T) {
 		}
 	})
 
-	t.Run("world, refused before any kubectl", func(t *testing.T) {
+	t.Run("world, the cluster refused before anything is sent", func(t *testing.T) {
+		// The cluster's refusal is the sections', not the command's (ADR
+		// 0023 M2.4): a document, exit 0, with each section's kind.
 		out, code := runApp(t, filled(argv["world"], dir.Path(), "atlas"))
-		if code != 1 {
-			t.Fatalf("exit %d, want 1:\n%s", code, out)
+		if code != 0 {
+			t.Fatalf("exit %d, want 0:\n%s", code, out)
 		}
-		if kind, ecode := envelope(t, out); kind != kindGCloudMismatch || ecode != 1 {
-			t.Fatalf("kind %q (code %d), want %q: an unpinned instance is read as no one", kind, ecode, kindGCloudMismatch)
+		var doc struct {
+			Schema   int           `json:"schema"`
+			Sections worldSections `json:"sections"`
 		}
+		if err := json.Unmarshal(out, &doc); err != nil {
+			t.Fatalf("%v:\n%s", err, out)
+		}
+		if doc.Schema != worldSchema {
+			t.Errorf("world printed schema %d, not %d", doc.Schema, worldSchema)
+		}
+		wantSections(t, doc.Sections, map[string]string{
+			"apps": kindEndpointRefused, "policy": kindEndpointRefused, "spend": kindKernelAbsent,
+			"network": kindNotConnected, "seal": "skipped",
+		})
 	})
 
 	t.Run("world, -- ends the flags", func(t *testing.T) {

@@ -4,14 +4,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 	"github.com/sofmon/farcast/farsight/cli/internal/kube/kubetest"
@@ -174,83 +174,64 @@ func TestAnOpenedReaderAsksCanI(t *testing.T) {
 	}
 }
 
-// Every other method of an Open'd client says it is not in-process yet,
-// naming itself, and sends nothing: it never falls through to kubectl, which
-// an Open'd client does not have.
-func TestAnOpenedReaderRunsNothingElse(t *testing.T) {
+// ADR 0023 M2.4 (A18-2): an Open'd client is the reader, and refuses every
+// write before anything is sent: no token is minted and no request reaches
+// the server. It never falls through to kubectl, which it does not have.
+func TestAReaderClientNeverWrites(t *testing.T) {
 	s := kubetest.New(t)
 	c := openReader(t, s, nil)
 	ctx := t.Context()
-	var out bytes.Buffer
+	pin := []byte(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"datasphered-pin","namespace":"farcast-system","resourceVersion":"7"},"data":{"pin":"x"}}`)
 	for name, call := range map[string]func() error{
-		"Apply":         func() error { return c.Apply(ctx, []byte("kind: Namespace")) },
-		"RolloutStatus": func() error { return c.RolloutStatus(ctx, "web", "api", time.Second) },
-		"WaitExternalIP": func() error {
-			_, err := c.WaitExternalIP(ctx, "farcast-system", "fatline", time.Second)
-			return err
-		},
-		"WaitJob": func() error {
-			_, err := c.WaitJob(ctx, "farcast-system", "fetch", time.Second)
-			return err
-		},
-		"JobLogs": func() error {
-			_, err := c.JobLogs(ctx, "farcast-system", "fetch", 0)
-			return err
-		},
-		"Workloads": func() error {
-			_, err := c.Workloads(ctx, "web")
-			return err
-		},
-		"ConfigMapValue": func() error {
-			_, _, err := c.ConfigMapValue(ctx, "farcast-system", "technocore-ledger", "ledger.json")
-			return err
-		},
-		"ConfigMapData": func() error {
-			_, _, _, err := c.ConfigMapData(ctx, "farcast-system", "datasphered-pin")
-			return err
-		},
-		"CreateConfigMap":  func() error { return c.CreateConfigMap(ctx, []byte("{}")) },
-		"ReplaceConfigMap": func() error { return c.ReplaceConfigMap(ctx, []byte("{}")) },
-		"Namespaces": func() error {
-			_, err := c.Namespaces(ctx)
-			return err
-		},
-		"Logs": func() error { return c.Logs(ctx, &out, "web", "deployment/api", 10, false, false) },
+		"Apply":            func() error { return c.Apply(ctx, []byte("apiVersion: v1\nkind: Namespace\nmetadata:\n  name: web\n")) },
+		"CreateConfigMap":  func() error { return c.CreateConfigMap(ctx, pin) },
+		"ReplaceConfigMap": func() error { return c.ReplaceConfigMap(ctx, pin) },
 	} {
-		want := fmt.Sprintf("cluster: %s is not in-process until ADR 0023 M2.4", name)
-		if err := call(); err == nil || err.Error() != want {
-			t.Errorf("%s: err = %v, want %q", name, err, want)
+		if err := call(); err == nil || err.Error() != "cluster: a reader client never writes" {
+			t.Errorf("%s: err = %v, want the reader's refusal", name, err)
 		}
 	}
-	if out.Len() != 0 {
-		t.Errorf("Logs wrote %q", out.String())
-	}
 	if got := s.Requests(); len(got) != 0 {
-		t.Errorf("the refused methods sent %d requests", len(got))
+		t.Errorf("the refused writes sent %d requests", len(got))
 	}
 }
 
-// A kubectl client keeps every method as it was, and has no CanI: a review
-// is in-process only, and the kubectl client runs nothing for it.
+// A kubectl client has no CanI, Logs, Workloads or NamespacesLabelled: they
+// are in-process only, and the kubectl client refuses each, naming it, and
+// runs nothing for it (ADR 0023 M2.4). The writing commands build such a
+// client, and none of them calls these.
 func TestAKubectlClientHasNoCanI(t *testing.T) {
-	fr := &fakeRunner{}
-	for _, c := range []*Client{NewWithRunner(fr), New("/cfg/instances/atlas/kubeconfig.yaml"), NewWithEnv("/cfg/kubeconfig.yaml", nil)} {
+	// A kubectl that would answer, should a refusal ever fall through to one:
+	// it leaves a mark, and the test reads that nothing ran.
+	bin := t.TempDir()
+	ran := filepath.Join(t.TempDir(), "ran")
+	if err := os.WriteFile(filepath.Join(bin, "kubectl"), []byte("#!/bin/sh\ntouch '"+ran+"'\necho '{\"items\":[]}'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
+	var out bytes.Buffer
+	for _, c := range []*Client{newWithEnv("/kc", []string{"PATH=" + bin}), New("/cfg/instances/atlas/kubeconfig.yaml")} {
 		ok, err := c.CanI(context.Background(), kube.ResourceAttributes{Verb: "get", Resource: "secrets"})
-		if ok || err == nil || !strings.Contains(err.Error(), "CanI is in-process only") {
+		if ok || err == nil || err.Error() != "cluster: CanI is in-process only, and this client runs kubectl" {
 			t.Errorf("CanI on a kubectl client = %v, %v", ok, err)
 		}
+		for _, followed := range []bool{false, true} {
+			err := c.Logs(context.Background(), &out, "web", "deployment/api", 10, followed, false)
+			if err == nil || err.Error() != "cluster: Logs is in-process only, and this client runs kubectl" {
+				t.Errorf("Logs (follow %v) on a kubectl client = %v", followed, err)
+			}
+		}
+		ws, err := c.Workloads(context.Background(), "web")
+		if ws != nil || err == nil || err.Error() != "cluster: Workloads is in-process only, and this client runs kubectl" {
+			t.Errorf("Workloads on a kubectl client = %v, %v", ws, err)
+		}
+		names, err := c.NamespacesLabelled(context.Background(), "a=b")
+		if names != nil || err == nil || err.Error() != "cluster: NamespacesLabelled is in-process only, and this client runs kubectl" {
+			t.Errorf("NamespacesLabelled on a kubectl client = %v, %v", names, err)
+		}
 	}
-	if len(fr.calls) != 0 {
-		t.Errorf("CanI ran kubectl: %v", fr.calls)
-	}
-	// And the kubectl NamespacesLabelled is unchanged.
-	fr.out = map[string][]byte{"get": []byte(`{"items":[{"metadata":{"name":"web"}}]}`)}
-	names, err := NewWithRunner(fr).NamespacesLabelled(context.Background(), "a=b")
-	if err != nil || !slices.Equal(names, []string{"web"}) {
-		t.Errorf("kubectl NamespacesLabelled = %q, %v", names, err)
-	}
-	if want := []string{"get", "namespace", "-l", "a=b", "-o", "json"}; len(fr.calls) != 1 || !slices.Equal(fr.calls[0], want) {
-		t.Errorf("kubectl calls = %v, want %v", fr.calls, want)
+	if _, err := os.Stat(ran); err == nil || out.Len() != 0 {
+		t.Errorf("the refusals ran kubectl (%v) and wrote %q", err, out.String())
 	}
 }
 
@@ -266,6 +247,10 @@ func TestAnOpenedClientWritesEachWarningOnce(t *testing.T) {
 			return []string{"a", "b"}
 		case r.Path == reviewPath:
 			return []string{"b", "c", "flip \u202e here"}
+		case r.Path == "/api/v1/namespaces/farcast-system/configmaps/ledger":
+			return []string{"e"}
+		case strings.HasPrefix(r.Path, "/apis/apps/v1/namespaces/web/"):
+			return []string{"f"}
 		}
 		return nil
 	}
@@ -298,6 +283,19 @@ func TestAnOpenedClientWritesEachWarningOnce(t *testing.T) {
 	}
 	if got := strings.TrimPrefix(w.String(), want); got != "Warning (cluster): d\n" {
 		t.Errorf("after a refused list: %q appended, want the 403's own warning", got)
+	}
+
+	// The reads of M2.4 write theirs too: an absent ConfigMap's 404, and the
+	// two lists of Workloads, whose shared text is written once.
+	want = w.String()
+	if _, found, err := c.ConfigMapValue(ctx, "farcast-system", "ledger", "ledger.json"); found || err != nil {
+		t.Fatalf("an absent ConfigMap = %v, %v", found, err)
+	}
+	if _, err := c.Workloads(ctx, "web"); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimPrefix(w.String(), want); got != "Warning (cluster): e\nWarning (cluster): f\n" {
+		t.Errorf("after a ConfigMap read and a Workloads list: %q appended", got)
 	}
 
 	quiet := kubetest.New(t, kubetest.WithWarnings(warn))

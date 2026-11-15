@@ -16,6 +16,7 @@ import (
 	"github.com/sofmon/farcast/farsight/cli/internal/cluster"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/keyholder"
+	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
 	fldeploy "github.com/sofmon/farcast/fatline/deploy"
 	"github.com/sofmon/farcast/fatline/event"
@@ -25,6 +26,7 @@ import (
 	"github.com/sofmon/farcast/shrike"
 	tcdeploy "github.com/sofmon/farcast/technocore/deploy"
 	"github.com/sofmon/farcast/technocore/kernel"
+	tkube "github.com/sofmon/farcast/technocore/kube"
 )
 
 // The gather layer, tested with this package's own fakes. These assert which
@@ -88,9 +90,9 @@ func (f *fakeSeal) State(_ context.Context, i int) (keyholder.State, error) {
 	return keyholder.State{Phase: f.phases[i], Generation: 3, Keys: map[string][]string{"app-shop-api": {"k1"}}}, nil
 }
 
-// worldFixture is a connected instance with a kernel, a keyholder and one
-// deployed namespace, a cluster that answers for all of it, and a tunnel to a
-// real monitor.
+// worldFixture is a connected instance with a kernel, a keyholder, one
+// deployed namespace and a granted reader, a cluster that answers for all of
+// it, and a tunnel to a real monitor.
 type worldFixture struct {
 	dir      config.Dir
 	cl       *fakeWorldCluster
@@ -98,23 +100,23 @@ type worldFixture struct {
 	seal     *fakeSeal
 	cmd      *worldCommand
 	connects int
-	kenv     []string
+	// ref is what world handed its cluster seam.
+	ref clusterRef
 }
 
 func newWorldFixture(t *testing.T) *worldFixture {
 	t.Helper()
 	dir := config.Dir(t.TempDir())
 	meta := connectedInstance(t, dir, "atlas")
-	meta.Project, meta.GCloudAccount = "proj-atlas", "operator@example.org"
+	meta.Project = "proj-atlas"
+	meta.Reader = &config.Reader{Email: readerEmail("atlas", "proj-atlas"), KeyID: strings.Repeat("c0", 20),
+		GrantedAt: readerGrantedAt, Scope: "metered"}
 	meta.Kernel = &config.Kernel{Deployed: true, Applied: true, Namespaces: []string{"farcast-system", "shop"}}
 	meta.Keyholder = &config.Keyholder{Deployed: true, Replicas: 2}
 	meta.Deployments = map[string]config.Deployment{"shop": {Repository: "https://github.com/example/shop", StorageWired: true}}
 	if err := dir.SaveInstanceMetadata("atlas", meta); err != nil {
 		t.Fatal(err)
 	}
-	gdir := fakeGCloudDir(t, "work",
-		gcloudConfig{Name: "work", Account: "someone@work.example", Project: "work-prod"},
-		gcloudConfig{Name: "personal", Account: "operator@example.org", Project: "proj-atlas"})
 
 	doc := policy.Document{Version: policy.Version, Apps: []policy.App{{Name: "api", Namespace: "shop",
 		CredentialSHA256: credentialOf("a"), External: []parser.External{{Host: "api.example", Reason: "the api"}}}}}
@@ -152,10 +154,10 @@ func newWorldFixture(t *testing.T) *worldFixture {
 	f.cmd = &worldCommand{
 		now:     func() time.Time { return vectorNow },
 		stamp:   func() buildStamp { return vectorStamp },
-		environ: func() []string { return []string{"HOME=/nonexistent", "CLOUDSDK_CONFIG=" + gdir, "PATH=/usr/bin"} },
-		newCluster: func(_ string, env []string) worldCluster {
-			f.kenv = env
-			return f.cl
+		environ: func() []string { return []string{"HOME=/nonexistent", "PATH=/usr/bin"} },
+		newCluster: func(r clusterRef) (worldCluster, error) {
+			f.ref = r
+			return f.cl, nil
 		},
 		connect: func(context.Context, string, tunnel.ClientIdentity) (worldTunnel, error) {
 			f.connects++
@@ -210,11 +212,15 @@ func wantSections(t *testing.T, s worldSections, want map[string]string) {
 }
 
 // Everything readable is read: five sections, over one tunnel, and the seal
-// read keeps phase and generation and drops the key ids it was sent.
+// read keeps phase and generation and drops the key ids it was sent. The
+// cluster is opened as the instance's reader, with the record as read.
 func TestWorldReadsEverySectionOverOneTunnel(t *testing.T) {
 	f := newWorldFixture(t)
 	doc, raw := f.run(t)
 	wantSections(t, doc.Sections, map[string]string{"spend": "read", "apps": "read", "policy": "read", "network": "read", "seal": "read"})
+	if f.ref.Identity != kube.Reader || f.ref.Meta == nil || f.ref.Meta.Name != "atlas" || f.ref.Warn == nil || f.ref.Verifying {
+		t.Errorf("world opened the cluster with %+v; want the reader, the record and stderr, never verifying", f.ref)
+	}
 	if f.connects != 1 {
 		t.Errorf("opened %d tunnels, want one for both tunnel reads", f.connects)
 	}
@@ -228,7 +234,7 @@ func TestWorldReadsEverySectionOverOneTunnel(t *testing.T) {
 		t.Errorf("asked replicas %v, want [0 1]", f.seal.asked)
 	}
 	body, _ := json.Marshal(raw)
-	for _, never := range []string{"app-shop-api", "credential_sha256", credentialOf("a"), "proj-atlas", "9.9.9.9", "operator@example.org"} {
+	for _, never := range []string{"app-shop-api", "credential_sha256", credentialOf("a"), "proj-atlas", "9.9.9.9", readerEmail("atlas", "proj-atlas")} {
 		if strings.Contains(string(body), never) {
 			t.Errorf("the document carries %q", never)
 		}
@@ -239,35 +245,86 @@ func TestWorldReadsEverySectionOverOneTunnel(t *testing.T) {
 	}
 }
 
-// A kubectl that is not there is not asked for again: every cluster section
-// says so with the one kind, and the tunnel reads still happen.
-func TestWorldStopsAskingAKubectlThatIsMissing(t *testing.T) {
-	f := newWorldFixture(t)
-	f.cl.err = fmt.Errorf("kubectl not found: %w", cluster.ErrKubectlMissing)
-	doc, _ := f.run(t)
-	wantSections(t, doc.Sections, map[string]string{
-		"spend": kindKubectlMissing, "apps": kindKubectlMissing, "policy": kindKubectlMissing,
-		"network": "read", "seal": "read",
-	})
-	if len(f.cl.calls) != 1 {
-		t.Errorf("kubectl was asked %d times after it was found missing: %v", len(f.cl.calls), f.cl.calls)
-	}
-}
-
-func TestWorldMapsKubectlFailuresToKinds(t *testing.T) {
+// A cluster every later read would meet the same way is not asked again:
+// every cluster section says so with the one kind, and the tunnel reads still
+// happen. These are world's fatal kinds (design §8.1, A18-9).
+func TestWorldStopsAskingAClusterItCannotRead(t *testing.T) {
 	for _, tc := range []struct {
 		err  error
 		want string
 	}{
-		{fmt.Errorf("refresh: %w", cluster.ErrSignedOut), kindGCloudSignedOut},
-		{fmt.Errorf("plugin: %w", cluster.ErrAuthToolMissing), kindAuthToolMissing},
-		{fmt.Errorf("kubectl get: %w", context.DeadlineExceeded), kindTimeout},
-		{errors.New("Error from server (Forbidden)"), kindKubectlFailed},
+		{fmt.Errorf("x: %w", errCredentialMissing), kindCredentialMissing},
+		{fmt.Errorf("Google refused to mint a token: %w", kube.ErrTokenRefused), kindCredentialRefused},
+		{fmt.Errorf("GODEBUG: %w", kube.ErrUnsafeEnvironment), kindUnsafeEnvironment},
+		{fmt.Errorf("the pair: %w", kube.ErrEndpointRefused), kindEndpointRefused},
+		{&kube.APIError{Method: "GET", Path: "/apis/apps/v1/namespaces/farcast-system/deployments", Status: kube.Status{Status: tkube.Status{Code: 401}}}, kindUnauthorized},
+		{fmt.Errorf("kube: GET x: the API server could not be reached: %w", kube.ErrUnreachable), kindClusterUnreachable},
 	} {
-		f := newWorldFixture(t)
-		f.cl.err = tc.err
-		doc, _ := f.run(t)
-		wantSections(t, doc.Sections, map[string]string{"apps": tc.want, "spend": tc.want, "policy": tc.want})
+		t.Run(tc.want, func(t *testing.T) {
+			f := newWorldFixture(t)
+			f.cl.err = tc.err
+			doc, _ := f.run(t)
+			wantSections(t, doc.Sections, map[string]string{
+				"spend": tc.want, "apps": tc.want, "policy": tc.want,
+				"network": "read", "seal": "read",
+			})
+			if len(f.cl.calls) != 1 {
+				t.Errorf("the cluster was asked %d times after the first read failed with %s: %v", len(f.cl.calls), tc.want, f.cl.calls)
+			}
+		})
+	}
+}
+
+// Every other failure is said by its own kind, and the next read is still
+// asked; a failure no kind names is internal, never an empty kind (A18-9).
+func TestWorldMapsClusterFailuresToKinds(t *testing.T) {
+	forbidden := &kube.APIError{Method: "GET", Path: "/api/v1/namespaces/farcast-system/configmaps/x",
+		Status: kube.Status{Status: tkube.Status{Kind: "Status", Code: 403, Message: "forbidden"}}, KubernetesStatus: true}
+	for _, tc := range []struct {
+		err  error
+		want string
+	}{
+		{fmt.Errorf("kube: GET x: %w", context.DeadlineExceeded), kindTimeout},
+		{forbidden, kindForbidden},
+		{&kube.APIError{Method: "GET", Path: "/x", Status: kube.Status{Status: tkube.Status{Code: 500}}}, kindClusterRejected},
+		{fmt.Errorf("decode: %w", kube.ErrUnreadable), kindDocumentUnreadable},
+		{errors.New("something no kind names"), kindInternal},
+	} {
+		t.Run(tc.want, func(t *testing.T) {
+			f := newWorldFixture(t)
+			f.cl.err = tc.err
+			doc, _ := f.run(t)
+			wantSections(t, doc.Sections, map[string]string{"apps": tc.want, "spend": tc.want, "policy": tc.want})
+			if tc.want != kindTimeout && len(f.cl.calls) < 3 {
+				t.Errorf("%s stopped the later reads: %v", tc.want, f.cl.calls)
+			}
+		})
+	}
+}
+
+// A 403 is said with what the reader needs (A18-10): RBAC's Status, that
+// 'reader grant' binds it; anything else, the endpoint's IAM. Once, in each
+// section's message.
+func TestWorldSaysWhatAForbiddenReadNeeds(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status bool
+		suffix string
+	}{
+		{"rbac", true, "; run 'farcast reader grant atlas'"},
+		{"iam", false, "; " + msgReaderIAMRefused},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newWorldFixture(t)
+			f.cl.err = &kube.APIError{Method: "GET", Path: "/x", Status: kube.Status{Status: tkube.Status{Code: 403}}, KubernetesStatus: tc.status}
+			_, raw := f.run(t)
+			for _, section := range []string{"apps", "spend", "policy"} {
+				msg := sectionMessage(t, raw, section)
+				if !strings.HasSuffix(msg, tc.suffix) || strings.Count(msg, tc.suffix) != 1 {
+					t.Errorf("%s: %q; want it to end, once, %q", section, msg, tc.suffix)
+				}
+			}
+		})
 	}
 }
 
@@ -370,7 +427,7 @@ func TestWorldVersionSkew(t *testing.T) {
 		f := newWorldFixture(t)
 		f.cl.configMaps[fldeploy.DefaultNamespace+"/"+fldeploy.PolicyConfigMap+"/"+fldeploy.PolicyKey] = `{"version":1,"apps":[{"name":"x"}]}`
 		doc, _ := f.run(t)
-		wantSections(t, doc.Sections, map[string]string{"policy": kindKubectlFailed})
+		wantSections(t, doc.Sections, map[string]string{"policy": kindDocumentUnreadable})
 	})
 	t.Run("checkpoint", func(t *testing.T) {
 		f := newWorldFixture(t)
@@ -480,14 +537,14 @@ func TestWorldHumanQuotesWhatTheInstanceChose(t *testing.T) {
 }
 
 // blockingCluster is a control plane that never answers: every read waits
-// until its context ends, and then fails the way the cluster package says a
-// kubectl past its deadline failed.
+// until its context ends, and then fails the way the in-process client says
+// a call whose context ended failed.
 type blockingCluster struct{ calls atomic.Int32 }
 
 func (b *blockingCluster) wait(ctx context.Context) error {
 	b.calls.Add(1)
 	<-ctx.Done()
-	return fmt.Errorf("kubectl get: %w", ctx.Err())
+	return fmt.Errorf("kube: GET /apis/apps/v1/namespaces/farcast-system/deployments: %w", ctx.Err())
 }
 
 func (b *blockingCluster) Workloads(ctx context.Context, _ string) ([]cluster.Workload, error) {
@@ -515,9 +572,9 @@ func sectionMessage(t *testing.T, raw map[string]any, section string) string {
 // were not asked, and the tunnel reads — made alongside — still come back.
 func TestWorldASilentControlPlaneCostsOneReadNotTheCeiling(t *testing.T) {
 	f := newWorldFixture(t)
-	f.cmd.timeouts = worldTimeouts{ceiling: 20 * time.Second, kubectl: 100 * time.Millisecond, connect: 5 * time.Second, seal: 5 * time.Second}
+	f.cmd.timeouts = worldTimeouts{ceiling: 20 * time.Second, cluster: 100 * time.Millisecond, connect: 5 * time.Second, seal: 5 * time.Second}
 	silent := &blockingCluster{}
-	f.cmd.newCluster = func(string, []string) worldCluster { return silent }
+	f.cmd.newCluster = func(clusterRef) (worldCluster, error) { return silent, nil }
 	start := time.Now()
 	doc, raw := f.run(t)
 	elapsed := time.Since(start)
@@ -542,8 +599,8 @@ func TestWorldASilentControlPlaneCostsOneReadNotTheCeiling(t *testing.T) {
 // reported as a tunnel that "did not open".
 func TestWorldTheCeilingReachedByTheClusterDoesNotStarveTheTunnel(t *testing.T) {
 	f := newWorldFixture(t)
-	f.cmd.timeouts = worldTimeouts{ceiling: 2 * time.Second, kubectl: time.Hour, connect: 5 * time.Second, seal: 5 * time.Second}
-	f.cmd.newCluster = func(string, []string) worldCluster { return &blockingCluster{} }
+	f.cmd.timeouts = worldTimeouts{ceiling: 2 * time.Second, cluster: time.Hour, connect: 5 * time.Second, seal: 5 * time.Second}
+	f.cmd.newCluster = func(clusterRef) (worldCluster, error) { return &blockingCluster{}, nil }
 	doc, raw := f.run(t)
 	wantSections(t, doc.Sections, map[string]string{
 		"apps": kindTimeout, "spend": kindTimeout, "policy": kindTimeout, "network": "read", "seal": "read",
@@ -578,28 +635,52 @@ func TestWorldATunnelNeverTriedSaysSo(t *testing.T) {
 	}
 }
 
-// kubectl and its auth plugin name files in their errors — the instance's
-// kubeconfig, gcloud's credential store, a cache under the home directory.
-// A section message names none of this machine's paths.
+// A failure can name this machine's files — a key or a CA file that will not
+// load, a cache under the home directory. A section message names none of
+// this machine's paths: not from a read's error, nor from openCluster's own
+// refusal of a cluster-ca.crt it cannot read.
 func TestWorldSectionMessagesCarryNoLocalPath(t *testing.T) {
-	f := newWorldFixture(t)
-	gdir := envValueOf(f.cmd.environ(), "CLOUDSDK_CONFIG")
-	kubeconfig := f.dir.InstanceKubeconfigPath("atlas")
-	f.cl.err = fmt.Errorf("kubectl get: error loading config file %q: open %s: permission denied; "+
-		"see %s and /nonexistent/.kube/cache/discovery", kubeconfig, kubeconfig, filepath.Join(gdir, "credentials.db"))
-	doc, raw := f.run(t)
-	wantSections(t, doc.Sections, map[string]string{"apps": kindKubectlFailed})
-	msg := sectionMessage(t, raw, "apps")
-	for _, never := range []string{f.dir.Path(), gdir, "/nonexistent"} {
-		if strings.Contains(msg, never) {
-			t.Errorf("the message carries %q: %s", never, msg)
+	t.Run("a read", func(t *testing.T) {
+		f := newWorldFixture(t)
+		key := filepath.Join(f.dir.InstancePath("atlas"), "reader.key")
+		f.cl.err = fmt.Errorf("open %s: permission denied; see %s and /nonexistent/.kube/cache/discovery", key, key)
+		doc, raw := f.run(t)
+		wantSections(t, doc.Sections, map[string]string{"apps": kindInternal})
+		msg := sectionMessage(t, raw, "apps")
+		for _, never := range []string{f.dir.Path(), "/nonexistent"} {
+			if strings.Contains(msg, never) {
+				t.Errorf("the message carries %q: %s", never, msg)
+			}
 		}
-	}
-	for _, want := range []string{"<config>/instances/atlas/kubeconfig.yaml", "$CLOUDSDK_CONFIG/credentials.db", "~/.kube/cache"} {
-		if !strings.Contains(msg, want) {
-			t.Errorf("the message does not say %q: %s", want, msg)
+		for _, want := range []string{"<config>/instances/atlas/reader.key", "~/.kube/cache"} {
+			if !strings.Contains(msg, want) {
+				t.Errorf("the message does not say %q: %s", want, msg)
+			}
 		}
-	}
+	})
+	t.Run("the open", func(t *testing.T) {
+		f := newWorldFixture(t)
+		f.cmd.newCluster = nil // openCluster, as farcast runs it
+		if _, err := f.dir.UpdateInstanceMetadata("atlas", func(m *config.InstanceMetadata) error {
+			m.Endpoint = "gke-1a2b3c.europe-west4.gke.goog"
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		ca := filepath.Join(f.dir.InstancePath("atlas"), "cluster-ca.crt")
+		if err := os.WriteFile(ca, []byte("not read"), 0o000); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.ReadFile(ca); err == nil {
+			t.Skip("running as a user who can read a mode-000 file; the test would prove nothing")
+		}
+		doc, raw := f.run(t)
+		wantSections(t, doc.Sections, map[string]string{"apps": kindEndpointRefused, "spend": kindEndpointRefused, "network": "read"})
+		msg := sectionMessage(t, raw, "apps")
+		if strings.Contains(msg, f.dir.Path()) || !strings.Contains(msg, "<config>/instances/atlas/cluster-ca.crt") {
+			t.Errorf("the refusal names the file %q; want it relative to <config>", msg)
+		}
+	})
 }
 
 // A namespace the policy or the monitor names, and no other source does, is
@@ -637,7 +718,7 @@ func TestAGroupNamedOnlyByThePolicyIsMeteredByTheSameRule(t *testing.T) {
 	}
 
 	in = base(t)
-	in.Apps.Meter = meterInput{Problem: &sectionProblem{Kind: kindKubectlFailed, Message: "no list"}}
+	in.Apps.Meter = meterInput{Problem: &sectionProblem{Kind: kindDocumentUnreadable, Message: "no list"}}
 	doc = buildWorld(in)
 	if g := groupOf(doc, "lab"); g == nil || g.Metered != nil || alerted(doc) {
 		t.Errorf("list unread: group %+v, alerted %v; want metered null and no alert", g, alerted(doc))
@@ -668,9 +749,9 @@ func TestWorldNeverShowsACredentialInARepository(t *testing.T) {
 }
 
 // A record that does not parse is never quoted — not in the listing, not in
-// its human reading, not in the error 'world' returns, nor a pin's — even when the
-// fault sits right after the lines holding the project, the endpoints and the
-// pinned account, which the YAML parser's own message would print.
+// its human reading, not in the error 'world' returns — even when the fault
+// sits right after the lines holding the project, the endpoints and the
+// reader's account, which the YAML parser's own message would print.
 func TestAnUnparseableRecordIsNeverQuoted(t *testing.T) {
 	f := newWorldFixture(t)
 	path := filepath.Join(f.dir.InstancePath("atlas"), "metadata.yaml")
@@ -678,15 +759,17 @@ func TestAnUnparseableRecordIsNeverQuoted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(good), "gcloud_account: operator@example.org\n") {
-		t.Fatalf("guard: the record does not hold the account where this test breaks it:\n%s", good)
+	email := readerEmail("atlas", "proj-atlas")
+	line := "  email: " + email + "\n"
+	if !strings.Contains(string(good), line) {
+		t.Fatalf("guard: the record does not hold the reader's account where this test breaks it:\n%s", good)
 	}
-	broken := strings.Replace(string(good), "gcloud_account: operator@example.org\n", "gcloud_account: operator@example.org\nbroken: [unclosed\n", 1)
+	broken := strings.Replace(string(good), line, line+"broken: [unclosed\n", 1)
 	if err := os.WriteFile(path, []byte(broken), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	// What the fixture's record holds, and where it lives.
-	secrets := []string{"operator@example.org", "proj-atlas", "9.9.9.9", f.dir.Path()}
+	secrets := []string{email, "proj-atlas", "9.9.9.9", f.dir.Path()}
 
 	outputs := map[string]string{}
 	listing, code := runRouter(t, "--config", f.dir.Path(), "-o", "json", "instances")
@@ -704,14 +787,6 @@ func TestAnUnparseableRecordIsNeverQuoted(t *testing.T) {
 	}
 	outputs["world"] = err.Error()
 
-	pin := instancesVectorCommand()
-	pin.account = "operator@example.org"
-	err = pin.Run(context.Background(), env, []string{"pin-gcloud", "atlas"})
-	if kindOf(err) != kindRecordUnreadable {
-		t.Fatalf("pin-gcloud: kind %q, %v", kindOf(err), err)
-	}
-	outputs["pin-gcloud"] = err.Error()
-
 	for what, got := range outputs {
 		if !strings.Contains(got, "instances/atlas/metadata.yaml could not be parsed: a YAML syntax error at line ") {
 			t.Errorf("%s does not say where the record broke:\n%s", what, got)
@@ -728,12 +803,11 @@ func TestAnUnparseableRecordIsNeverQuoted(t *testing.T) {
 // of /Users/op is not the start of /Users/operator, and the config directory
 // inside the home reads <config>, not ~/….
 func TestLocalPathsAreReplacedAsWholeComponents(t *testing.T) {
-	g := &gatherer{paths: localPaths(config.Dir("/Users/op/.config/farcast"),
-		gcloudChoice{Dir: "/Volumes/keys/gcloud", Source: "$CLOUDSDK_CONFIG"}, []string{"HOME=/Users/op"})}
-	got := g.scrub(`open "/Users/op/.config/farcast/instances/a/kubeconfig.yaml": denied; /Users/operator/x; /Users/op; ` +
-		`/Volumes/keys/gcloud/credentials.db; /Volumes/keys/gcloud-old`)
-	want := `open "<config>/instances/a/kubeconfig.yaml": denied; /Users/operator/x; ~; ` +
-		`$CLOUDSDK_CONFIG/credentials.db; /Volumes/keys/gcloud-old`
+	g := &gatherer{paths: localPaths(config.Dir("/Users/op/.config/farcast"), []string{"HOME=/Users/op"})}
+	got := g.scrub(`open "/Users/op/.config/farcast/instances/a/reader.key": denied; /Users/operator/x; /Users/op; ` +
+		`/Users/op/.config/farcast-old; /Users/op/.kube`)
+	want := `open "<config>/instances/a/reader.key": denied; /Users/operator/x; ~; ` +
+		`~/.config/farcast-old; ~/.kube`
 	if got != want {
 		t.Errorf("scrubbed\n got %s\nwant %s", got, want)
 	}

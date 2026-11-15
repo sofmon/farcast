@@ -4,14 +4,18 @@
 // pin.
 //
 // It is moving from kubectl to the in-process client in internal/kube (ADR
-// 0023 decision 2), in the stages of ADR 0023 M2. A Client built by New,
-// NewWithEnv or NewWithRunner shells to kubectl for every method, as it always
-// has — the CLI holds cloud credentials, so its dependency surface is a
+// 0023 decision 2), in the stages of ADR 0023 M2. A Client built by Open is
+// the instance's reader, in-process: since ADR 0023 M2.4 every cluster read of
+// 'world', 'ps', 'costs', 'usage' and 'logs', and the verifying read and
+// reviews of 'reader grant', run through one. It answers every read and CanI, starts no
+// program, and refuses every write before anything is sent. A Client built by
+// New shells to kubectl for the writing commands, their reads included, as
+// the active gcloud configuration, until ADR 0023 M2.5 opens the writer
+// in-process — the CLI holds cloud credentials, so its dependency surface is a
 // security concern (ADR 0006), and the stored kubeconfig drives the control
-// plane through the gke-gcloud-auth-plugin exec credential. A Client built by
-// Open (M2.3) is the instance's reader, in-process: it answers
-// NamespacesLabelled and CanI, starts no program, and refuses every other
-// method until M2.4 moves the reads.
+// plane through the gke-gcloud-auth-plugin exec credential. Such a client
+// refuses CanI, Logs, Workloads and NamespacesLabelled, which no writing
+// command calls and which are in-process only.
 //
 // kubectl never inherits this process's environment. Every call runs with one
 // built from an allowlist (Env, ADR 0023 M0), with KUBERC=off, and finds
@@ -32,7 +36,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -46,20 +49,21 @@ type Runner interface {
 	Run(ctx context.Context, stdin []byte, args ...string) (stdout []byte, err error)
 }
 
-// ErrKubectlMissing marks a kubectl that could not be found. Every error a
-// missing kubectl produces wraps it, so a caller tells it from a kubectl that
-// ran and failed with errors.Is, never by its words.
-var ErrKubectlMissing = errors.New("kubectl not found")
+// errKubectlMissing marks a kubectl that could not be found. Every error a
+// missing kubectl produces wraps it. Since ADR 0023 M2.4 nothing outside this
+// package reads it, or the two marks below: they keep a kubectl failure's
+// text as it always read, until kubectl goes in ADR 0023 M2.7.
+var errKubectlMissing = errors.New("kubectl not found")
 
-// ErrAuthToolMissing marks a kubectl that ran but could not authenticate
+// errAuthToolMissing marks a kubectl that ran but could not authenticate
 // because the tool its kubeconfig names — the gke-gcloud-auth-plugin, or the
 // gcloud it runs — is not installed where it looks.
-var ErrAuthToolMissing = errors.New("the cluster's auth plugin or gcloud is missing")
+var errAuthToolMissing = errors.New("the cluster's auth plugin or gcloud is missing")
 
-// ErrSignedOut marks a kubectl that ran but whose credential plugin could not
+// errSignedOut marks a kubectl that ran but whose credential plugin could not
 // get a token because gcloud's user session has expired. Signing in again is
 // the operator's act; nothing here can do it for them.
-var ErrSignedOut = errors.New("gcloud is signed out")
+var errSignedOut = errors.New("gcloud is signed out")
 
 // subprocessError is a kubectl failure as it always read, marked with what it
 // means. The text is the same text it carried before it was marked: the mark
@@ -101,13 +105,13 @@ func markOf(stderr string) error {
 		strings.Contains(stderr, `"gke-gcloud-auth-plugin": executable file not found`),
 		strings.Contains(stderr, `"gcloud": executable file not found`),
 		strings.Contains(stderr, "gcloud: executable file not found"):
-		return ErrAuthToolMissing
+		return errAuthToolMissing
 	case strings.Contains(stderr, "Reauthentication failed"),
 		strings.Contains(stderr, "problem refreshing your current auth tokens"),
 		strings.Contains(stderr, "does not have any valid credentials"),
 		strings.Contains(stderr, "You do not currently have an active account selected"),
 		strings.Contains(stderr, "gcloud auth login"):
-		return ErrSignedOut
+		return errSignedOut
 	}
 	return nil
 }
@@ -117,7 +121,7 @@ func markOf(stderr string) error {
 // The subprocess gets exactly env, with KUBERC=off enforced, and nothing else
 // from this process; kubectl is looked up on env's own PATH, so the binary
 // that runs is the one the environment it runs in would find. New builds env
-// with Env, unpinned; 'world' hands NewWithEnv one pinned to its identity.
+// with Env.
 type execRunner struct {
 	kubeconfig string
 	env        []string
@@ -129,7 +133,7 @@ func (r execRunner) command(ctx context.Context, args []string) (*exec.Cmd, erro
 	full := append([]string{"--kubeconfig", r.kubeconfig}, args...)
 	path, ok := lookPathIn("kubectl", envValue(r.env, "PATH"))
 	if !ok {
-		return nil, &subprocessError{msg: r.missingText(), mark: ErrKubectlMissing}
+		return nil, &subprocessError{msg: r.missingText(), mark: errKubectlMissing}
 	}
 	cmd := exec.CommandContext(ctx, path, full...)
 	cmd.Env = withKubercOff(r.env)
@@ -150,7 +154,7 @@ func (r execRunner) missingText() string {
 // which reads like a crash.
 func (r execRunner) failure(ctx context.Context, args []string, stderr string, err error) error {
 	if errors.Is(err, exec.ErrNotFound) {
-		return &subprocessError{msg: r.missingText(), mark: ErrKubectlMissing, err: err}
+		return &subprocessError{msg: r.missingText(), mark: errKubectlMissing, err: err}
 	}
 	if cerr := ctx.Err(); cerr != nil {
 		return fmt.Errorf("kubectl %s: %w", strings.Join(args, " "), cerr)
@@ -217,62 +221,66 @@ func lookPathIn(name, pathValue string) (string, bool) {
 }
 
 // Client applies workloads to a cluster: over a kubeconfig, through kubectl
-// (New, NewWithEnv, NewWithRunner), or in-process as the instance's reader
-// (Open).
+// (New), or in-process as the instance's reader (Open).
 type Client struct {
 	runner Runner
 
 	// kube is the in-process client of an Open'd Client, and nil for a
-	// kubectl one. An Open'd Client has no runner.
+	// kubectl one. An Open'd Client has no runner: every method checks kube
+	// first, so it never reaches one.
 	kube *kube.Client
-	// warnings receives the kube client's Warning texts (Open); warned is
-	// how many of them have been written, under warnMu.
+	// warnings receives the kube client's Warning texts and Logs' notes
+	// (Open); warned is how many Warning texts have been written. Both are
+	// written under warnMu.
 	warnings io.Writer
 	warnMu   sync.Mutex
 	warned   int
+
+	// poll is the wait between the reads of RolloutStatus, WaitExternalIP and
+	// WaitJob; zero is each one's own (2 s, 3 s and 5 s). cluster's tests set
+	// it so that several reads take no time.
+	poll time.Duration
 }
 
 // New returns a Client that shells to kubectl using the kubeconfig at the given
 // path (the per-instance kubeconfig.yaml the CLI stored at install time).
 //
-// kubectl runs with Env(os.Environ(), kubeconfigPath, GCloud{}): an
-// environment built from an allowlist, unpinned, so it acts as whichever gcloud
-// configuration the parent selects (ADR 0023 M0 changes what reaches kubectl,
-// not who it acts as) and keeps the parent's KUBECONFIG, never the instance's.
-// It is NewWithEnv with that environment, keeping its own words for a missing
-// kubectl.
+// kubectl runs with Env(os.Environ()): an environment built from an
+// allowlist, so it acts as whichever gcloud configuration the parent selects
+// (ADR 0023 M0 changes what reaches kubectl, not who it acts as) and keeps the
+// parent's KUBECONFIG, never the instance's. Only the writing commands build
+// one, until ADR 0023 M2.5.
 func New(kubeconfigPath string) *Client {
 	return &Client{runner: execRunner{
 		kubeconfig: kubeconfigPath,
-		env:        Env(os.Environ(), kubeconfigPath, GCloud{}),
+		env:        Env(os.Environ()),
 	}}
 }
 
-// NewWithEnv is New with kubectl's whole environment given: the subprocess
+// newWithEnv is New with kubectl's whole environment given: the subprocess
 // sees env, with KUBERC=off enforced, and nothing else, and kubectl is found on
 // env's PATH. A nil or empty env is an environment with nothing in it, which
-// finds no kubectl.
-//
-// It exists for 'farcast world', which pins the identity kubectl's auth plugin
-// acts as (ADR 0021 decision 9, amended 2026-11-12): what reaches the plugin
-// is decided by the caller, not by whatever the operator's shell exported.
-func NewWithEnv(kubeconfigPath string, env []string) *Client {
+// finds no kubectl. It is for this package's environment tests, until kubectl
+// goes in ADR 0023 M2.7.
+func newWithEnv(kubeconfigPath string, env []string) *Client {
 	if env == nil {
 		env = []string{}
 	}
 	return &Client{runner: execRunner{
 		kubeconfig: kubeconfigPath, env: env,
-		missing: "kubectl not found on the PATH this read runs with — reading an instance needs kubectl, the gke-gcloud-auth-plugin and gcloud",
+		missing: "kubectl not found on the PATH this client runs with — deploying into an instance needs kubectl and the gke-gcloud-auth-plugin",
 	}}
 }
 
-// NewWithRunner returns a Client backed by a custom Runner (for tests).
-func NewWithRunner(r Runner) *Client { return &Client{runner: r} }
+// newWithRunner returns a Client backed by a custom Runner, for this
+// package's tests of the kubectl branches the writing commands still run.
+func newWithRunner(r Runner) *Client { return &Client{runner: r} }
 
 // Apply pipes a multi-document manifest to `kubectl apply -f -`. It is
-// idempotent: re-applying an unchanged workload is a no-op.
+// idempotent: re-applying an unchanged workload is a no-op. An Open'd client,
+// the reader, refuses it before anything is sent.
 func (c *Client) Apply(ctx context.Context, manifests []byte) error {
-	if err := c.kubectlOnly("Apply"); err != nil {
+	if err := c.neverWrites(); err != nil {
 		return err
 	}
 	_, err := c.runner.Run(ctx, manifests, "apply", "-f", "-")
@@ -280,10 +288,11 @@ func (c *Client) Apply(ctx context.Context, manifests []byte) error {
 }
 
 // RolloutStatus blocks until the named Deployment is rolled out or the timeout
-// elapses.
+// elapses. An Open'd client judges the Deployment itself, every 2 s, by
+// kube.RolloutState; a kubectl client leaves the waiting to kubectl.
 func (c *Client) RolloutStatus(ctx context.Context, namespace, name string, timeout time.Duration) error {
-	if err := c.kubectlOnly("RolloutStatus"); err != nil {
-		return err
+	if c.kube != nil {
+		return c.rolloutInProcess(ctx, namespace, name, timeout)
 	}
 	_, err := c.runner.Run(ctx, nil, "rollout", "status",
 		"deployment/"+name, "-n", namespace, "--timeout", durArg(timeout))
@@ -293,8 +302,8 @@ func (c *Client) RolloutStatus(ctx context.Context, namespace, name string, time
 // WaitExternalIP polls the named Service until its load-balancer ingress IP is
 // assigned or the timeout elapses.
 func (c *Client) WaitExternalIP(ctx context.Context, namespace, name string, timeout time.Duration) (string, error) {
-	if err := c.kubectlOnly("WaitExternalIP"); err != nil {
-		return "", err
+	if c.kube != nil {
+		return c.externalIPInProcess(ctx, namespace, name, timeout)
 	}
 	deadline := time.Now().Add(timeout)
 	for {
@@ -311,7 +320,7 @@ func (c *Client) WaitExternalIP(ctx context.Context, namespace, name string, tim
 		select {
 		case <-ctx.Done():
 			return "", ctx.Err()
-		case <-time.After(3 * time.Second):
+		case <-time.After(c.every(servicePoll)):
 		}
 	}
 }
@@ -346,8 +355,8 @@ type JobResult struct {
 // there until the timeout and be reported as a timeout, which is the wrong
 // diagnosis for a Containerfile that does not compile.
 func (c *Client) WaitJob(ctx context.Context, namespace, name string, timeout time.Duration) (JobResult, error) {
-	if err := c.kubectlOnly("WaitJob"); err != nil {
-		return JobResult{}, err
+	if c.kube != nil {
+		return c.waitJobInProcess(ctx, namespace, name, timeout)
 	}
 	deadline := time.Now().Add(timeout)
 	for {
@@ -371,7 +380,7 @@ func (c *Client) WaitJob(ctx context.Context, namespace, name string, timeout ti
 		select {
 		case <-ctx.Done():
 			return JobResult{}, ctx.Err()
-		case <-time.After(5 * time.Second):
+		case <-time.After(c.every(jobPoll)):
 		}
 	}
 }
@@ -398,8 +407,8 @@ func (c *Client) jobMessage(ctx context.Context, namespace, job string) (string,
 // fetch's stdout IS the manifest, and a tail of it is a manifest that parses
 // and is missing its first applications.
 func (c *Client) JobLogs(ctx context.Context, namespace, job string, lines int) (string, error) {
-	if err := c.kubectlOnly("JobLogs"); err != nil {
-		return "", err
+	if c.kube != nil {
+		return c.jobLogsInProcess(ctx, namespace, job, lines)
 	}
 	tail := "-1"
 	if lines > 0 {
@@ -416,9 +425,10 @@ func (c *Client) JobLogs(ctx context.Context, namespace, job string, lines int) 
 // Streamer is a Runner that can also write a command's output as it arrives.
 //
 // It is a second interface rather than a second method on Runner because
-// almost nothing needs it: following logs is the only place where waiting for
-// a subprocess to exit before showing anything would be wrong. A Runner that
-// does not implement it simply cannot follow.
+// almost nothing needed it: following logs was the only place where waiting
+// for a subprocess to exit before showing anything would be wrong. Since ADR
+// 0023 M2.4 Logs is in-process only, so nothing streams through kubectl; the
+// interface and execRunner's Stream go with kubectl in M2.7.
 type Streamer interface {
 	Stream(ctx context.Context, out io.Writer, args ...string) error
 }
@@ -433,7 +443,7 @@ func (r execRunner) Stream(ctx context.Context, out io.Writer, args ...string) e
 	cmd.Stdout, cmd.Stderr = out, &errb
 	if err := cmd.Run(); err != nil {
 		if errors.Is(err, exec.ErrNotFound) {
-			return &subprocessError{msg: r.missingText(), mark: ErrKubectlMissing, err: err}
+			return &subprocessError{msg: r.missingText(), mark: errKubectlMissing, err: err}
 		}
 		// A follow the operator interrupted is not a failure, and reporting it
 		// as one would end every 'farcast logs --follow' with an error.
@@ -467,78 +477,14 @@ type Workload struct {
 // in it at all. The Phase 4.3 walk found that — `farcast ps --all` claimed to
 // show FarCast's own components and silently omitted one of them.
 //
-// It reads JSON rather than a jsonpath or custom columns. Both of those are
-// output formats meant for a human to eyeball, and both would parse a
-// cluster's answer by position — a column that moves becomes silently wrong
-// data rather than an error.
+// It lists each kind on its own, paged, and stamps the kind from the list it
+// came from. It is in-process only (ADR 0023 M2.4): no writing command reads
+// workloads, so a kubectl client refuses it and runs nothing.
 func (c *Client) Workloads(ctx context.Context, namespace string) ([]Workload, error) {
-	if err := c.kubectlOnly("Workloads"); err != nil {
-		return nil, err
+	if c.kube == nil {
+		return nil, inProcessOnly("Workloads")
 	}
-	out, err := c.runner.Run(ctx, nil, "get", "deployments,statefulsets", "-n", namespace, "-o", "json")
-	if err != nil {
-		return nil, err
-	}
-	if len(bytes.TrimSpace(out)) == 0 {
-		return nil, nil
-	}
-	var list struct {
-		Items []struct {
-			Kind     string `json:"kind"`
-			Metadata struct {
-				Name              string            `json:"name"`
-				Namespace         string            `json:"namespace"`
-				Labels            map[string]string `json:"labels"`
-				CreationTimestamp time.Time         `json:"creationTimestamp"`
-			} `json:"metadata"`
-			Spec struct {
-				Replicas *int `json:"replicas"`
-				Template struct {
-					Spec struct {
-						Containers []struct {
-							Image string `json:"image"`
-						} `json:"containers"`
-					} `json:"spec"`
-				} `json:"template"`
-			} `json:"spec"`
-			Status struct {
-				ReadyReplicas int `json:"readyReplicas"`
-			} `json:"status"`
-		} `json:"items"`
-	}
-	if err := json.Unmarshal(out, &list); err != nil {
-		return nil, fmt.Errorf("cluster: read the deployments in %s: %w", namespace, err)
-	}
-	workloads := make([]Workload, 0, len(list.Items))
-	for _, it := range list.Items {
-		w := Workload{
-			Kind:      it.Kind,
-			Namespace: it.Metadata.Namespace,
-			Name:      it.Metadata.Name,
-			Ready:     it.Status.ReadyReplicas,
-			Labels:    it.Metadata.Labels,
-			CreatedAt: it.Metadata.CreationTimestamp,
-		}
-		if w.Namespace == "" {
-			w.Namespace = namespace
-		}
-		if w.Kind == "" {
-			w.Kind = "Deployment"
-		}
-		// A Deployment with no explicit replicas runs one. Reading that as
-		// zero would show every healthy application as stopped — and stopped
-		// is exactly what a protective cost shutdown leaves behind, so the two
-		// must never be confused.
-		w.Desired = 1
-		if it.Spec.Replicas != nil {
-			w.Desired = *it.Spec.Replicas
-		}
-		for _, ct := range it.Spec.Template.Spec.Containers {
-			w.Images = append(w.Images, ct.Image)
-		}
-		workloads = append(workloads, w)
-	}
-	return workloads, nil
+	return c.workloadsInProcess(ctx, namespace)
 }
 
 // ConfigMapValue returns one key from a ConfigMap, and reports whether the
@@ -548,9 +494,13 @@ func (c *Client) Workloads(ctx context.Context, namespace string) ([]Workload, e
 // dots, and jsonpath reads a dot as a path separator. `{.data.checkpoint.json}`
 // asks for something that does not exist and returns empty rather than
 // failing, and empty reads as "the kernel has never checkpointed".
+//
+// On an Open'd client the ConfigMap is absent only when the API server says
+// so: a 404 whose body is a Kubernetes Status. A 403, or a 404 from anything
+// else, is an error and never absent.
 func (c *Client) ConfigMapValue(ctx context.Context, namespace, name, key string) (string, bool, error) {
-	if err := c.kubectlOnly("ConfigMapValue"); err != nil {
-		return "", false, err
+	if c.kube != nil {
+		return c.configMapValueInProcess(ctx, namespace, name, key)
 	}
 	out, err := c.runner.Run(ctx, nil, "get", "configmap", name, "-n", namespace,
 		"--ignore-not-found", "-o", "json")
@@ -577,8 +527,8 @@ func (c *Client) ConfigMapValue(ctx context.Context, namespace, name, key string
 // reports whether it exists. The resourceVersion is what ReplaceConfigMap
 // compares against: a write only over what was read.
 func (c *Client) ConfigMapData(ctx context.Context, namespace, name string) (map[string]string, string, bool, error) {
-	if err := c.kubectlOnly("ConfigMapData"); err != nil {
-		return nil, "", false, err
+	if c.kube != nil {
+		return c.configMapDataInProcess(ctx, namespace, name)
 	}
 	out, err := c.runner.Run(ctx, nil, "get", "configmap", name, "-n", namespace,
 		"--ignore-not-found", "-o", "json")
@@ -605,9 +555,9 @@ func (c *Client) ConfigMapData(ctx context.Context, namespace, name string) (map
 
 // CreateConfigMap creates a ConfigMap and fails if it already exists. Unlike
 // Apply it never overwrites: the caller read "absent" and writes only over
-// that.
+// that. An Open'd client refuses it before anything is sent.
 func (c *Client) CreateConfigMap(ctx context.Context, manifest []byte) error {
-	if err := c.kubectlOnly("CreateConfigMap"); err != nil {
+	if err := c.neverWrites(); err != nil {
 		return err
 	}
 	_, err := c.runner.Run(ctx, manifest, "create", "-f", "-")
@@ -616,9 +566,10 @@ func (c *Client) CreateConfigMap(ctx context.Context, manifest []byte) error {
 
 // ReplaceConfigMap replaces a ConfigMap whose manifest names the
 // resourceVersion it was read at; the API server refuses it with a conflict
-// if anything has written since.
+// if anything has written since. An Open'd client refuses it before anything
+// is sent.
 func (c *Client) ReplaceConfigMap(ctx context.Context, manifest []byte) error {
-	if err := c.kubectlOnly("ReplaceConfigMap"); err != nil {
+	if err := c.neverWrites(); err != nil {
 		return err
 	}
 	_, err := c.runner.Run(ctx, manifest, "replace", "-f", "-")
@@ -629,10 +580,11 @@ func (c *Client) ReplaceConfigMap(ctx context.Context, manifest []byte) error {
 //
 // The whole list rather than a membership test per name: callers use it to
 // refuse before doing expensive work, and an operator who mistyped two names
-// should be told about both in one go.
+// should be told about both in one go. An Open'd client lists them paged and
+// sorted; a kubectl client in the server's order.
 func (c *Client) Namespaces(ctx context.Context) ([]string, error) {
-	if err := c.kubectlOnly("Namespaces"); err != nil {
-		return nil, err
+	if c.kube != nil {
+		return c.namespacesInProcess(ctx, "")
 	}
 	out, err := c.runner.Run(ctx, nil, "get", "namespace", "-o", "name")
 	if err != nil {
@@ -650,66 +602,30 @@ func (c *Client) Namespaces(ctx context.Context) ([]string, error) {
 }
 
 // NamespacesLabelled lists the namespaces that carry a label selector, by name,
-// sorted.
-//
-// An Open'd client lists them in-process, paged (ADR 0023 M2.3: the
-// verifying read of reader grant). A kubectl client reads JSON, for the reason
-// Workloads reads JSON: a namespace listing parsed by position is one column
-// move away from silently wrong data.
+// sorted, in-process and paged. It is in-process only (ADR 0023 M2.4): no
+// writing command calls it, so a kubectl client refuses it and runs nothing.
 func (c *Client) NamespacesLabelled(ctx context.Context, selector string) ([]string, error) {
-	if c.kube != nil {
-		return c.namespacesInProcess(ctx, selector)
+	if c.kube == nil {
+		return nil, inProcessOnly("NamespacesLabelled")
 	}
-	out, err := c.runner.Run(ctx, nil, "get", "namespace", "-l", selector, "-o", "json")
-	if err != nil {
-		return nil, err
-	}
-	if len(bytes.TrimSpace(out)) == 0 {
-		return []string{}, nil
-	}
-	var list struct {
-		Items []struct {
-			Metadata struct {
-				Name string `json:"name"`
-			} `json:"metadata"`
-		} `json:"items"`
-	}
-	if err := json.Unmarshal(out, &list); err != nil {
-		return nil, fmt.Errorf("cluster: read the namespaces labelled %s: %w", selector, err)
-	}
-	names := make([]string, 0, len(list.Items))
-	for _, it := range list.Items {
-		if it.Metadata.Name != "" {
-			names = append(names, it.Metadata.Name)
-		}
-	}
-	sort.Strings(names)
-	return names, nil
+	return c.namespacesInProcess(ctx, selector)
 }
 
-// Logs writes a workload's logs to w, optionally following them.
+// Logs writes a workload's logs to out, optionally following them. target is
+// deployment/<name> or statefulset/<name>, and lines is the tail of each
+// container's log, a negative lines all of it.
+//
+// It is in-process only (ADR 0023 M2.4): a kubectl client refuses it and runs
+// nothing. It reads the pod kubectl logs would choose (kube.PickPod, by the
+// workload's own selector), and every container of it: init, then main, then
+// ephemeral. Without follow they are read one after another; with follow at
+// once, at most five, each written to out a whole line at a time, and a
+// cancelled ctx is the operator ending the follow, not a failure. With
+// previous, a container that has no previous instance is a note on the
+// warnings writer, never on out, which carries the application's own bytes.
 func (c *Client) Logs(ctx context.Context, out io.Writer, namespace, target string, lines int, follow, previous bool) error {
-	if err := c.kubectlOnly("Logs"); err != nil {
-		return err
+	if c.kube == nil {
+		return inProcessOnly("Logs")
 	}
-	args := []string{"logs", "-n", namespace, target, fmt.Sprintf("--tail=%d", lines), "--all-containers=true"}
-	if follow {
-		args = append(args, "--follow")
-	}
-	if previous {
-		args = append(args, "--previous")
-	}
-	if follow {
-		s, ok := c.runner.(Streamer)
-		if !ok {
-			return errors.New("cluster: this client cannot follow logs")
-		}
-		return s.Stream(ctx, out, args...)
-	}
-	body, err := c.runner.Run(ctx, nil, args...)
-	if err != nil {
-		return err
-	}
-	_, err = out.Write(body)
-	return err
+	return c.logsInProcess(ctx, out, namespace, target, lines, follow, previous)
 }

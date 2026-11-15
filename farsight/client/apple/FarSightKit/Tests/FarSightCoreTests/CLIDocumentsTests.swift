@@ -7,9 +7,9 @@ import Testing
 /// map cannot draw, a field Go omits.
 @Suite("Reading farcast's documents")
 struct CLIDocumentsTests {
-    /// A world document, schema 1, about `atlas`, each part replaceable.
+    /// A world document, schema 2, about `atlas`, each part replaceable.
     struct Doc {
-        var schema: String? = "1"
+        var schema: String? = "2"
         var name = "atlas"
         var status = "running"
         var level = "ok"
@@ -59,7 +59,8 @@ struct CLIDocumentsTests {
     }
 
     @Test("a schema this build does not read is skew; no schema number is refused", arguments: [
-        ("2", SectionProblem.Kind.versionSkew), (nil, .internal), (#""1""#, .internal), ("1.5", .internal), ("null", .internal),
+        ("1", SectionProblem.Kind.versionSkew), ("3", .versionSkew), (nil, .internal), (#""2""#, .internal), ("2.5", .internal),
+        ("null", .internal),
     ] as [(String?, SectionProblem.Kind)])
     func schema(number: String?, kind: SectionProblem.Kind) {
         var doc = Doc()
@@ -70,12 +71,22 @@ struct CLIDocumentsTests {
         #expect(failure { _ = try CLIDocuments.instances(listing) }?.kind == kind)
     }
 
-    @Test("a schema-2 document of another shape reads as skew, not as one that could not be read")
+    @Test("a schema-3 document of another shape reads as skew, not as one that could not be read")
     func skewBeforeShape() {
-        let data = Data(#"{"schema":2,"instances":"a string now"}"#.utf8)
+        let data = Data(#"{"schema":3,"instances":"a string now"}"#.utf8)
         let refusal = failure { _ = try CLIDocuments.instances(data) }
         #expect(refusal?.kind == .versionSkew)
-        #expect(refusal?.message == "farcast wrote schema 2 and this FarCast reads schema 1; build both from the same commit")
+        #expect(refusal?.message == "farcast wrote schema 3 and this FarCast reads schema 2; build both from the same commit")
+    }
+
+    @Test("a schema-1 listing, with its gcloud pin, reads as skew: the app and its farcast were built from different commits")
+    func schemaOneIsSkew() {
+        let data = Data(#"{"schema":1,"generated_at":"2026-11-12T10:00:00Z","farcast":{"version":"v0","commit":"0e54eb1"},"instances":[{"name":"atlas","status":"running","gcloud_pinned":true}]}"#.utf8)
+        let refusal = failure { _ = try CLIDocuments.instances(data) }
+        #expect(refusal == ReadFailure(
+            kind: .versionSkew,
+            message: "farcast wrote schema 1 and this FarCast reads schema 2; build both from the same commit"
+        ))
     }
 
     @Test("what is not a JSON object is refused", arguments: ["not json", "[1,2]", "", "\"atlas\""])
@@ -107,7 +118,7 @@ struct CLIDocumentsTests {
 
     @Test("an envelope in a document gives the envelope's kind")
     func envelopeInDocument() {
-        let data = Data(#"{"schema":1,"error":{"message":"took too long","code":1,"kind":"timeout"}}"#.utf8)
+        let data = Data(#"{"schema":2,"error":{"message":"took too long","code":1,"kind":"timeout"}}"#.utf8)
         #expect(failure { _ = try CLIDocuments.world(data, asReadOf: "atlas") } == ReadFailure(kind: .timeout, message: "took too long"))
         #expect(failure { _ = try CLIDocuments.version(data) }?.kind == .timeout)
     }
@@ -302,7 +313,7 @@ struct CLIDocumentsTests {
 
     @Test("a listing entry carries only what it has: one omitted field never fails the listing")
     func sparseListing() throws {
-        let data = Data(#"{"schema":1,"generated_at":"2026-11-12T10:00:00Z","farcast":{"version":"v0","commit":"0e54eb1"},"instances":[{"name":"atlas"},{"name":"Bad_Name","status":"running","components":{"fatline":true,"kernel":false,"keyholder":false}},{"name":"x","error":{"kind":"record_unreadable","message":"m"}}]}"#.utf8)
+        let data = Data(#"{"schema":2,"generated_at":"2026-11-12T10:00:00Z","farcast":{"version":"v0","commit":"0e54eb1"},"instances":[{"name":"atlas"},{"name":"Bad_Name","status":"running","components":{"fatline":true,"kernel":false,"keyholder":false}},{"name":"x","error":{"kind":"record_unreadable","message":"m"}}]}"#.utf8)
         let listing = try CLIDocuments.instances(data)
         #expect(listing.instances[0] == InstanceListing(name: "atlas"))
         #expect(listing.instances[1].problem == SectionProblem(
@@ -311,10 +322,47 @@ struct CLIDocumentsTests {
         ))
         #expect(listing.instances[1].components == [.boundary: true, .kernel: false, .storage: false])
         #expect(listing.instances[2].problem?.kind == .recordUnreadable)
-        let nullList = Data(#"{"schema":1,"generated_at":"2026-11-12T10:00:00Z","farcast":{"version":"v0","commit":"0e54eb1"},"instances":null}"#.utf8)
+        let nullList = Data(#"{"schema":2,"generated_at":"2026-11-12T10:00:00Z","farcast":{"version":"v0","commit":"0e54eb1"},"instances":null}"#.utf8)
         #expect(try CLIDocuments.instances(nullList).instances.isEmpty)
-        let noList = Data(#"{"schema":1,"generated_at":"2026-11-12T10:00:00Z","farcast":{"version":"v0","commit":"0e54eb1"}}"#.utf8)
+        let noList = Data(#"{"schema":2,"generated_at":"2026-11-12T10:00:00Z","farcast":{"version":"v0","commit":"0e54eb1"}}"#.utf8)
         #expect(failure { _ = try CLIDocuments.instances(noList) }?.message.hasPrefix("farcast's instances output could not be read: instances") == true)
+    }
+
+    @Test("the reader's state: each word by an explicit table, a word this build does not know as unknown, none said as nil")
+    func readerStates() throws {
+        let words: [(String, ReaderState)] = [
+            ("none", .none), ("key_missing", .keyMissing), ("not_uploaded", .notUploaded),
+            ("not_granted", .notGranted), ("granted", .granted),
+        ]
+        #expect(Set(words.map(\.1)) == Set(ReaderState.allCases).subtracting([.unknown]))
+        for (word, state) in words {
+            #expect(CLIDocuments.readerState(word) == state, "\(word)")
+        }
+        for word in ["Granted", "keyMissing", "", "pinned", "granted "] {
+            #expect(CLIDocuments.readerState(word) == .unknown, "\(word)")
+        }
+        let entries = #"[{"name":"a","status":"running","reader":"not_granted","migrated":false},{"name":"b","status":"running","reader":"rotating","migrated":true},{"name":"c","status":"running"}]"#
+        let data = Data(#"{"schema":2,"generated_at":"2026-11-12T10:00:00Z","farcast":{"version":"v0","commit":"0e54eb1"},"instances":\#(entries)}"#.utf8)
+        let listing = try CLIDocuments.instances(data).instances
+        #expect(listing.map(\.reader) == [.notGranted, .unknown, nil])
+        #expect(listing.map(\.migrated) == [false, true, nil])
+    }
+
+    @Test("a group the reader may not read carries why, as the apps section's kind; a group read carries nothing")
+    func groupAppsError() throws {
+        var doc = Doc()
+        doc.groups = #"[{"namespace":"lab","metered":false,"provenance":null,"apps":[],"apps_error":{"kind":"forbidden","message":"the workloads in lab: 403"}},{"namespace":"shop","metered":true,"provenance":null,"apps":[{"name":"api","state":"running","ready":1,"desired":1,"stopped_by":null,"month_cents":100}],"apps_error":null},{"namespace":"odd","metered":true,"provenance":null,"apps":[],"apps_error":{"kind":"solar_flare","message":"m"}}]"#
+        let instance = try #require(try doc.world().instances.first)
+        let groups = Dictionary(uniqueKeysWithValues: instance.groups.map { ($0.namespace, $0) })
+        #expect(groups["lab"]?.appsProblem == SectionProblem(section: .apps, kind: .forbidden, message: "the workloads in lab: 403"))
+        #expect(groups["lab"]?.apps.isEmpty == true)
+        #expect(groups["shop"]?.appsProblem == nil)
+        #expect(groups["odd"]?.appsProblem?.kind == .unknown)
+        #expect(groups[Instance.systemNamespace]?.appsProblem == nil)
+        // The section was read: the marks are the groups', never a problem of the instance.
+        #expect(instance.problems.isEmpty)
+        let mark = try #require(groups["lab"]?.appsProblem)
+        #expect(ProblemText.groupNotRead(mark) == "applications not read · forbidden")
     }
 
     @Test("the group label: the repository without its scheme, the short ref, seven digits, never an at sign")

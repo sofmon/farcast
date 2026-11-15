@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/sofmon/farcast/farsight/cli/internal/cluster"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
+	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
 	tcdeploy "github.com/sofmon/farcast/technocore/deploy"
 )
@@ -85,7 +87,7 @@ func TestPsListsApplicationsAndHidesTheInstanceMachinery(t *testing.T) {
 		tcdeploy.DefaultNamespace: {appDeployment(tcdeploy.DefaultNamespace, "fatline", 2, 2, "system")},
 	}}
 	c := &psCommand{}
-	c.newCluster = func(string) lister { return f }
+	c.newCluster = func(clusterRef) (lister, error) { return f, nil }
 	if err := c.Run(context.Background(), env, []string{"p43"}); err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +104,7 @@ func TestPsListsApplicationsAndHidesTheInstanceMachinery(t *testing.T) {
 	// --all includes it.
 	env2, out2 := testEnv(dir, output.ModeHuman)
 	c2 := &psCommand{all: true}
-	c2.newCluster = func(string) lister { return f }
+	c2.newCluster = func(clusterRef) (lister, error) { return f, nil }
 	if err := c2.Run(context.Background(), env2, []string{"p43"}); err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +124,7 @@ func TestPsExplainsZeroReplicas(t *testing.T) {
 		"my-platform": {appDeployment("my-platform", "api", 0, 0, "app")},
 	}}
 	c := &psCommand{}
-	c.newCluster = func(string) lister { return f }
+	c.newCluster = func(clusterRef) (lister, error) { return f, nil }
 	if err := c.Run(context.Background(), env, []string{"p43"}); err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +148,7 @@ func TestPsSaysWhenItCouldNotSeeEverything(t *testing.T) {
 		errs:        map[string]error{"other": errors.New("forbidden")},
 	}
 	c := &psCommand{}
-	c.newCluster = func(string) lister { return f }
+	c.newCluster = func(clusterRef) (lister, error) { return f, nil }
 	if err := c.Run(context.Background(), env, []string{"p43"}); err != nil {
 		t.Fatal(err)
 	}
@@ -163,6 +165,33 @@ func TestPsSaysWhenItCouldNotSeeEverything(t *testing.T) {
 		if !strings.Contains(shown, want) {
 			t.Errorf("the listing does not say %q could not be read:\n%s", want, shown)
 		}
+	}
+}
+
+// ADR 0023 M2.4, A18-11: a listing in which no namespace could be read is a
+// failure, not an empty listing. ps returns the first namespace's error,
+// named, so the envelope carries its kind, and prints nothing.
+func TestPsFailsWhenNoNamespaceCouldBeRead(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	meteringInstance(t, dir, "p43", "my-platform")
+	env, out := testEnv(dir, output.ModeJSON)
+
+	first := fmt.Errorf("list farcast-system: %w", kube.ErrUnreachable)
+	f := &fakeReader{errs: map[string]error{
+		tcdeploy.DefaultNamespace: first,
+		"my-platform":             errors.New("list my-platform: refused"),
+	}}
+	c := &psCommand{}
+	c.newCluster = func(clusterRef) (lister, error) { return f, nil }
+	err := c.Run(context.Background(), env, []string{"p43"})
+	if want := tcdeploy.DefaultNamespace + ": " + first.Error(); err == nil || err.Error() != want {
+		t.Fatalf("ps = %v; want %q", err, want)
+	}
+	if !errors.Is(err, kube.ErrUnreachable) {
+		t.Errorf("%v does not carry the first namespace's error", err)
+	}
+	if out.Len() != 0 {
+		t.Errorf("ps printed a listing as well:\n%s", out.String())
 	}
 }
 
@@ -183,11 +212,48 @@ func TestPsShowsStatefulSetsAsWellAsDeployments(t *testing.T) {
 		},
 	}}
 	c := &psCommand{all: true}
-	c.newCluster = func(string) lister { return f }
+	c.newCluster = func(clusterRef) (lister, error) { return f, nil }
 	if err := c.Run(context.Background(), env, []string{"p43"}); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(out.String(), "datasphered") {
 		t.Errorf("the key holder is a StatefulSet and does not appear:\n%s", out.String())
+	}
+}
+
+// S-SEC-1: every column of ps's human listing the cluster named — a
+// workload's namespace and name — and every row it could not read goes
+// through terminalText: what would act on the terminal is printed as its Go
+// escape, and the rest of the line is unchanged.
+func TestPsHumanQuotesTheClustersText(t *testing.T) {
+	r := psResult{
+		Instance: "p43",
+		Apps:     []psApp{{Namespace: "shop\x1b[2J", Name: "api\u202eipa", Ready: 1, Desired: 1, Tier: "app", Age: "3h"}},
+		Unreadable: []string{
+			"other: kube: GET /apis/apps/v1/namespaces/other/deployments: 403 Forbidden: \x1b]52;c;cGF5bG9hZA==\x07\rnothing to see",
+		},
+	}
+	var b strings.Builder
+	if err := r.Human(&b); err != nil {
+		t.Fatal(err)
+	}
+	shown := b.String()
+	if !output.Printable(strings.ReplaceAll(shown, "\n", "")) {
+		t.Errorf("the listing carries a character that acts on the terminal: %q", shown)
+	}
+	for _, want := range []string{`"shop\x1b[2J"`, `"api\u202eipa"`, `\x1b]52;c;cGF5bG9hZA==\a\rnothing to see`, "1/1", "app", "3h"} {
+		if !strings.Contains(shown, want) {
+			t.Errorf("the listing lacks %q:\n%s", want, shown)
+		}
+	}
+	// Text that prints is printed as it is.
+	b.Reset()
+	r = psResult{Instance: "p43", Apps: []psApp{{Namespace: "shop", Name: "api", Ready: 1, Desired: 1, Tier: "app"}},
+		Unreadable: []string{"other: forbidden"}}
+	if err := r.Human(&b); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(b.String(), "Could not read other: forbidden\n") || strings.Contains(b.String(), `"`) {
+		t.Errorf("printable text was quoted:\n%s", b.String())
 	}
 }

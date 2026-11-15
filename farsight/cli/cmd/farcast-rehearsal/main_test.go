@@ -19,16 +19,12 @@ import (
 	"github.com/sofmon/farcast/farsight/cli/internal/rehearsal"
 )
 
-// The test binary stands in for two things. Linked as farcast, it is a stub
-// that records the argv and environment it was given beside itself, in
-// "seen", and prints a version document. Linked as a fake tool, it is that
-// tool, as the harness binary is.
+// Linked as farcast, the test binary is a stub that records the argv and
+// environment it was given beside itself, in "seen", and prints a version
+// document.
 func TestMain(m *testing.M) {
 	if filepath.Base(os.Args[0]) == "farcast" {
 		os.Exit(stubFarcast())
-	}
-	if code, ok := rehearsal.ToolMain(os.Args[0], os.Args[1:], os.Environ(), os.Stdout, os.Stderr); ok {
-		os.Exit(code)
 	}
 	os.Exit(m.Run())
 }
@@ -162,19 +158,33 @@ func TestStartPrintsTheSettingsAndStops(t *testing.T) {
 	if !strings.HasPrefix(lines[0], "FarCast rehearsal — commit ") || !strings.Contains(lines[0], "listens on 127.0.0.1") {
 		t.Errorf("banner: %q", lines[0])
 	}
+	// Two rows, titled as the app titles its fields (FarSightKit's
+	// CLISettings.Field.title), and nothing about a tool: farcast reads the
+	// cluster in-process.
+	var rows []string
+	for _, l := range lines {
+		if strings.HasPrefix(l, "  ") && len(l) > 34 {
+			rows = append(rows, strings.TrimSpace(l[2:34]))
+		}
+	}
+	if want := []string{"farcast", "farcast configuration directory"}; !slices.Equal(rows, want) {
+		t.Errorf("the settings rows start %q, want the farcast row and the farcast configuration directory's:\n%s", rows, out)
+	}
 	for _, want := range []string{
-		filepath.Join(dir, "kube", "bin", "kubectl"),
-		filepath.Join(dir, "sdk", "bin", "gke-gcloud-auth-plugin"),
-		filepath.Join(dir, "sdk", "bin", "gcloud"),
-		"farcast configuration directory " + filepath.Join(dir, "config"),
-		"gcloud configuration directory  " + filepath.Join(dir, "gcloud"),
-		"Instance: rehearsal · gcloud account pinned · scenario healthy",
+		"  farcast                         your ./bin/farcast built at commit ",
+		"  farcast configuration directory " + filepath.Join(dir, "config"),
+		"Instance: rehearsal · reader granted · scenario healthy",
 		filepath.Join(dir, "calls.log"),
 		"farcast-rehearsal scenario --dir " + dir,
 		"rm -rf " + dir,
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("the settings text lacks %q:\n%s", want, out)
+		}
+	}
+	for _, gone := range []string{"kubectl", "gcloud", "gke-gcloud-auth-plugin", "pinned"} {
+		if strings.Contains(out, gone) {
+			t.Errorf("the settings text still says %q:\n%s", gone, out)
 		}
 	}
 	code, rest := r.stop(t)
@@ -206,6 +216,34 @@ func TestScenarioCommandLine(t *testing.T) {
 	}
 	if code := run(ctx, []string{"--no-such-flag"}, nil, &out, &errb); code != 2 {
 		t.Errorf("an unknown flag exited %d, want 2", code)
+	}
+}
+
+// TestRetiredScenariosAreRefused: on the command line, --scenario, the
+// scenario command and a scenario name where a command goes each say what
+// replaced a retired scenario, exit 2, and write nothing.
+func TestRetiredScenariosAreRefused(t *testing.T) {
+	ctx := t.Context()
+	for _, name := range rehearsal.RetiredScenarios() {
+		want := fmt.Sprintf("scenario %q was retired with ADR 0023 M2; use token-refused or forbidden\n", name)
+		parent := t.TempDir()
+		dir := filepath.Join(parent, "r")
+		for _, args := range [][]string{
+			{"--dir", dir, "--scenario", name},
+			{"scenario", "--dir", dir, name},
+			{"--dir", dir, name},
+		} {
+			var out, errb bytes.Buffer
+			if code := run(ctx, args, nil, &out, &errb); code != 2 {
+				t.Errorf("%q: exit %d, want 2", args, code)
+			}
+			if !strings.HasSuffix(errb.String(), want) || out.Len() != 0 {
+				t.Errorf("%q: stdout %q, stderr %q; want it to end %q", args, out.String(), errb.String(), want)
+			}
+		}
+		if entries, err := os.ReadDir(parent); err != nil || len(entries) != 0 {
+			t.Errorf("%s: something was written: %v, %v", name, entries, err)
+		}
 	}
 }
 
@@ -258,7 +296,7 @@ func TestSummarizeCommand(t *testing.T) {
 	if code := run(t.Context(), []string{"summarize"}, bytes.NewReader(data), &out, &errb); code != 0 {
 		t.Fatalf("summarize exited %d: %s", code, errb.String())
 	}
-	if s := out.String(); !strings.Contains(s, "schema 1") || strings.Contains(s, "atlas") || strings.Contains(s, "stripe") {
+	if s := out.String(); !strings.Contains(s, "schema 2") || strings.Contains(s, "atlas") || strings.Contains(s, "stripe") {
 		t.Errorf("summary:\n%s", s)
 	}
 	if code := run(t.Context(), []string{"summarize", "extra"}, nil, &out, &errb); code != 2 {

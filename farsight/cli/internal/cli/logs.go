@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/sofmon/farcast/farsight/cli/internal/cluster"
+	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 )
 
 // logReader is the slice of the cluster client following logs needs.
@@ -22,7 +23,10 @@ type logsCommand struct {
 	follow    bool
 	previous  bool
 
-	newCluster func(kubeconfigPath string) logReader
+	// newCluster opens the cluster as the instance's reader (ADR 0023 M2.4).
+	// Its Warn is stderr, where the cluster's warnings and the --previous
+	// note go, never among the application's bytes.
+	newCluster func(clusterRef) (logReader, error)
 }
 
 func (*logsCommand) Name() string     { return "logs" }
@@ -60,7 +64,15 @@ func (c *logsCommand) SetFlags(fs *flag.FlagSet) {
 
 func (c *logsCommand) ensureDefaults() {
 	if c.newCluster == nil {
-		c.newCluster = func(kc string) logReader { return cluster.New(kc) }
+		c.newCluster = func(r clusterRef) (logReader, error) {
+			// A refusal returns a nil reader, never a nil *cluster.Client
+			// inside a non-nil one.
+			cl, err := openCluster(r)
+			if err != nil {
+				return nil, err
+			}
+			return cl, nil
+		}
 	}
 }
 
@@ -75,20 +87,26 @@ func (c *logsCommand) Run(ctx context.Context, env *Env, args []string) error {
 	if err != nil {
 		return fmt.Errorf("load instance %q: %w", name, err)
 	}
-	cl := c.newCluster(env.ConfigDir.InstanceKubeconfigPath(name))
+	if err := recordNamed(meta, name); err != nil {
+		return err
+	}
+	cl, err := c.newCluster(clusterRef{Dir: env.ConfigDir, Meta: meta, Identity: kube.Reader, Warn: env.Err})
+	if err != nil {
+		return err
+	}
 
 	// The kind matters as much as the namespace: the key holder is a
 	// StatefulSet, and "deployment/datasphered" names nothing.
 	found, err := findApp(ctx, cl, (&psCommand{all: true}).namespacesOf(meta), app, c.namespace)
 	if err != nil {
-		return err
+		return readerRefused(err, name)
 	}
 	namespace, kind := found.Namespace, found.Kind
 
 	// Logs go to stdout unformatted, whatever --output says: they are the
 	// application's bytes, and wrapping them in this CLI's envelope would make
 	// them something else.
-	return cl.Logs(ctx, env.Out, namespace, strings.ToLower(kind)+"/"+app, c.lines, c.follow, c.previous)
+	return readerRefused(cl.Logs(ctx, env.Out, namespace, strings.ToLower(kind)+"/"+app, c.lines, c.follow, c.previous), name)
 }
 
 // findApp locates a workload by name across the namespaces an instance meters,
@@ -102,11 +120,11 @@ func findApp(ctx context.Context, cl lister, namespaces []string, app, only stri
 		namespaces = []string{only}
 	}
 	var found []cluster.Workload
-	var unreadable []string
+	var unreadable namespaceErrors
 	for _, ns := range namespaces {
 		workloads, err := cl.Workloads(ctx, ns)
 		if err != nil {
-			unreadable = append(unreadable, fmt.Sprintf("%s: %v", ns, err))
+			unreadable = append(unreadable, fmt.Errorf("%s: %w", ns, err))
 			continue
 		}
 		for _, w := range workloads {
@@ -120,9 +138,9 @@ func findApp(ctx context.Context, cl lister, namespaces []string, app, only stri
 		return found[0], nil
 	case 0:
 		if len(unreadable) > 0 {
-			return cluster.Workload{}, fmt.Errorf("no application %q in %s, and %s could not be read (%s)",
+			return cluster.Workload{}, fmt.Errorf("no application %q in %s, and %s could not be read (%w)",
 				app, strings.Join(namespaces, ", "),
-				plural(len(unreadable), "namespace", "namespaces"), strings.Join(unreadable, "; "))
+				plural(len(unreadable), "namespace", "namespaces"), unreadable)
 		}
 		return cluster.Workload{}, fmt.Errorf("no application %q in %s", app, strings.Join(namespaces, ", "))
 	default:
@@ -133,3 +151,19 @@ func findApp(ctx context.Context, cl lister, namespaces []string, app, only stri
 		return cluster.Workload{}, fmt.Errorf("%q exists in %s; name one with --namespace", app, strings.Join(where, " and "))
 	}
 }
+
+// namespaceErrors is the failed reads of several namespaces, each "<ns>:
+// <error>". Its text joins them with "; ", and errors.Is and errors.As see
+// every one, so the envelope finds a cluster sentinel in any of them (ADR 0023
+// M2.4, A18-11).
+type namespaceErrors []error
+
+func (e namespaceErrors) Error() string {
+	texts := make([]string, len(e))
+	for i, err := range e {
+		texts[i] = err.Error()
+	}
+	return strings.Join(texts, "; ")
+}
+
+func (e namespaceErrors) Unwrap() []error { return e }

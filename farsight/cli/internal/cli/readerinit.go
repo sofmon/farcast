@@ -231,8 +231,8 @@ func loadReaderRecord(dir config.Dir, name string) (*config.InstanceMetadata, er
 	if _, _, _, err := checkedReader(meta); err != nil {
 		return nil, err
 	}
-	if meta.Name != name {
-		return nil, fmt.Errorf("instance %q's record names the instance %q; farcast renders nothing from it", name, meta.Name)
+	if err := recordNamed(meta, name); err != nil {
+		return nil, err
 	}
 	return meta, nil
 }

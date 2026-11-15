@@ -3,77 +3,37 @@ import Foundation
 /// The paths the app runs `farcast` with, as the operator confirmed them once
 /// in Settings (ADR 0021 decision 9, amended 2026-11-12). Nothing here is
 /// guessed: a guessed tool path is a place to plant a tool (decision 6).
+///
+/// Two paths since ADR 0023 M2.4: farcast reads each instance's cluster
+/// in-process, so it runs no kubectl, auth plugin or gcloud for the three
+/// commands the app runs. Settings saved with the four other paths load as
+/// these two, and the next save drops the rest.
 public struct CLISettings: Codable, Sendable, Equatable {
     public var farcast: String
-    public var kubectl: String
-    /// gke-gcloud-auth-plugin.
-    public var authPlugin: String
-    public var gcloud: String
     /// farcast's `--config`.
     public var configDirectory: String
-    /// `CLOUDSDK_CONFIG`.
-    public var gcloudDirectory: String
 
-    public init(
-        farcast: String = "",
-        kubectl: String = "",
-        authPlugin: String = "",
-        gcloud: String = "",
-        configDirectory: String = "",
-        gcloudDirectory: String = ""
-    ) {
+    public init(farcast: String = "", configDirectory: String = "") {
         self.farcast = farcast
-        self.kubectl = kubectl
-        self.authPlugin = authPlugin
-        self.gcloud = gcloud
         self.configDirectory = configDirectory
-        self.gcloudDirectory = gcloudDirectory
     }
 
     public enum Field: String, Sendable, CaseIterable {
-        case farcast, kubectl, authPlugin, gcloud, configDirectory, gcloudDirectory
+        case farcast, configDirectory
 
-        /// The Settings row's name, and the field's name in messages: "farcast", "kubectl",
-        /// "gke-gcloud-auth-plugin", "gcloud", "farcast configuration directory",
-        /// "gcloud configuration directory".
+        /// The Settings row's name, and the field's name in messages:
+        /// "farcast", "farcast configuration directory".
         public var title: String {
             switch self {
             case .farcast: "farcast"
-            case .kubectl: "kubectl"
-            case .authPlugin: "gke-gcloud-auth-plugin"
-            case .gcloud: "gcloud"
             case .configDirectory: "farcast configuration directory"
-            case .gcloudDirectory: "gcloud configuration directory"
-            }
-        }
-
-        /// The name a tool is run by, which its file must have; nil for
-        /// farcast, which is run by its path, and for the directories.
-        var runName: String? {
-            switch self {
-            case .kubectl: "kubectl"
-            case .authPlugin: "gke-gcloud-auth-plugin"
-            case .gcloud: "gcloud"
-            case .farcast, .configDirectory, .gcloudDirectory: nil
-            }
-        }
-
-        /// What runs the tool by `runName`: farcast runs kubectl (it runs
-        /// no other tool), the instance's kubeconfig has kubectl run the
-        /// plugin, and the plugin runs gcloud.
-        var runBy: String? {
-            switch self {
-            case .kubectl: "farcast"
-            case .authPlugin: "kubectl"
-            case .gcloud: "gke-gcloud-auth-plugin"
-            case .farcast, .configDirectory, .gcloudDirectory: nil
             }
         }
 
         var isTool: Bool {
             switch self {
-            case .farcast, .kubectl, .authPlugin, .gcloud: true
-            case .configDirectory, .gcloudDirectory: false
+            case .farcast: true
+            case .configDirectory: false
             }
         }
     }
@@ -81,38 +41,31 @@ public struct CLISettings: Codable, Sendable, Equatable {
     subscript(field: Field) -> String {
         switch field {
         case .farcast: farcast
-        case .kubectl: kubectl
-        case .authPlugin: authPlugin
-        case .gcloud: gcloud
         case .configDirectory: configDirectory
-        case .gcloudDirectory: gcloudDirectory
         }
     }
 
-    /// A blank form's suggestions, shown and never used until confirmed: the tools empty
-    /// (never guessed — a guessed path is a planting surface, ADR 0021 decision 6), the
-    /// directories at their defaults.
+    /// A blank form's suggestions, shown and never used until confirmed:
+    /// farcast empty (never guessed — a guessed path is a planting surface,
+    /// ADR 0021 decision 6), the directory at its default.
     public static func suggested(home: String) -> CLISettings {
         var base = home
         while base.hasSuffix("/") { base.removeLast() }
-        return CLISettings(
-            configDirectory: "\(base)/Library/Application Support/farcast",
-            gcloudDirectory: "\(base)/.config/gcloud"
-        )
+        return CLISettings(configDirectory: "\(base)/Library/Application Support/farcast")
     }
 
     /// What is wrong with each field, at most one problem per field, the
     /// first failing rule winning; empty when every path may be run.
     ///
-    /// Every field: set; canonical-absolute; carries only what PATH can;
-    /// not inside FarCast.app, as typed or resolved, against the bundle as
-    /// given or resolved. Tools: the name it is run by; an executable file
+    /// Both fields: set; canonical-absolute; no ":" and nothing that does
+    /// not print, so what Settings shows and a terminal command carries is
+    /// the path itself; not inside FarCast.app, as typed or resolved,
+    /// against the bundle as given or resolved. farcast: an executable file
     /// that only its owner can replace, in a directory only its owner can
-    /// write, both where it is typed and where its links lead. Directories:
-    /// a directory only its owner can write. Then, when kubectl, the plugin
-    /// and gcloud are each fine, none of them is shadowed on the PATH
-    /// farcast gets. Group-writable is not refused: Homebrew's own
-    /// directories are.
+    /// write, both where it is typed and where its links lead; it may have
+    /// any name, since it is run by its path. The directory: a directory
+    /// only its owner can write. Group-writable is not refused: Homebrew's
+    /// own directories are.
     public func problems(probe: any FileProbe, bundlePath: String) -> [SettingsProblem] {
         // Both forms of the bundle, so a path in either form is caught:
         // URL's symlink resolution drops a leading /private, and the
@@ -124,25 +77,7 @@ public struct CLISettings: Codable, Sendable, Equatable {
                 problems.append(SettingsProblem(field: field, message: message))
             }
         }
-        let tools: [Field] = [.kubectl, .authPlugin, .gcloud]
-        guard !problems.contains(where: { tools.contains($0.field) }) else { return problems }
-        let path = ChildEnvironment.path(for: self).split(separator: ":").map(String.init)
-        for field in tools {
-            guard let name = field.runName, let own = ChildEnvironment.directory(of: self[field]) else { continue }
-            let first = path.first { directory in
-                if case .file(executable: true, worldWritable: _) = probe.entry(at: Self.join(directory, name)) { return true }
-                return false
-            }
-            if let first, first != own {
-                problems.append(SettingsProblem(
-                    field: field,
-                    message: "\(Self.join(first, name)) comes first on the PATH farcast gets, so it would run instead of this one"
-                ))
-            }
-        }
-        return problems.sorted { a, b in
-            Field.allCases.firstIndex(of: a.field) ?? 0 < Field.allCases.firstIndex(of: b.field) ?? 0
-        }
+        return problems
     }
 
     private func problem(_ field: Field, probe: any FileProbe, bundles: [String]) -> String? {
@@ -152,7 +87,7 @@ public struct CLISettings: Codable, Sendable, Equatable {
             return "must be an absolute path, with no \"~\", \".\", \"..\", empty part or trailing \"/\""
         }
         if path.unicodeScalars.contains(where: { $0 == ":" || ($0 != " " && !Display.isPrintable($0)) }) {
-            return "holds a character PATH cannot carry"
+            return "holds a \":\" or a character that does not print"
         }
         let resolved = probe.resolved(path)
         let forms = [path, resolved].compactMap { $0 }
@@ -166,9 +101,6 @@ public struct CLISettings: Codable, Sendable, Equatable {
             case .directory(worldWritable: true): return "is writable by anyone on this Mac"
             case .missing, .other, .file: return "is not a directory"
             }
-        }
-        if let name = field.runName, let runner = field.runBy, Self.basename(path) != name {
-            return "\(runner) runs it by the name \"\(name)\", so the file must be called that"
         }
         switch entry {
         case .missing: return "nothing is at this path"
@@ -210,14 +142,6 @@ public struct CLISettings: Codable, Sendable, Equatable {
         while base.count > 1, base.hasSuffix("/") { base.removeLast() }
         if base == "/" { return path.hasPrefix("/") }
         return path == base || path.hasPrefix(base + "/")
-    }
-
-    static func basename(_ path: String) -> String {
-        path.split(separator: "/", omittingEmptySubsequences: true).last.map(String.init) ?? path
-    }
-
-    static func join(_ directory: String, _ name: String) -> String {
-        directory == "/" ? "/\(name)" : "\(directory)/\(name)"
     }
 }
 

@@ -15,6 +15,7 @@ import (
 
 	"github.com/sofmon/farcast/farsight/cli/internal/cluster"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
+	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 	fldeploy "github.com/sofmon/farcast/fatline/deploy"
 	"github.com/sofmon/farcast/fatline/identity"
 	"github.com/sofmon/farcast/shrike"
@@ -33,7 +34,8 @@ type usageReaderIface interface {
 }
 
 type usageCommand struct {
-	newCluster func(kubeconfigPath string) usageReaderIface
+	// newCluster opens the cluster as the instance's reader (ADR 0023 M2.4).
+	newCluster func(clusterRef) (usageReaderIface, error)
 	// newDialer opens the tunnel the network half is read through. It is a
 	// seam so the report can be tested without a cluster, and it is separate
 	// from newCluster because the two halves come from two places and either
@@ -84,7 +86,15 @@ func (c *usageCommand) SetFlags(fs *flag.FlagSet) {
 
 func (c *usageCommand) ensureDefaults() {
 	if c.newCluster == nil {
-		c.newCluster = func(kc string) usageReaderIface { return cluster.New(kc) }
+		c.newCluster = func(r clusterRef) (usageReaderIface, error) {
+			// A refusal returns a nil reader, never a nil *cluster.Client
+			// inside a non-nil one.
+			cl, err := openCluster(r)
+			if err != nil {
+				return nil, err
+			}
+			return cl, nil
+		}
 	}
 	if c.newDialer == nil {
 		c.newDialer = func(ctx context.Context, env *Env, instance string) (streamDialer, func(), error) {
@@ -108,14 +118,20 @@ func (c *usageCommand) Run(ctx context.Context, env *Env, args []string) error {
 	if err != nil {
 		return fmt.Errorf("load instance %q: %w", name, err)
 	}
+	if err := recordNamed(meta, name); err != nil {
+		return err
+	}
 	if meta.Kernel == nil || !meta.Kernel.Deployed {
 		return fmt.Errorf("instance %q has no kernel, so nothing is watching it; run 'farcast kernel deploy %s'", name, name)
 	}
 
-	cl := c.newCluster(env.ConfigDir.InstanceKubeconfigPath(name))
+	cl, err := c.newCluster(clusterRef{Dir: env.ConfigDir, Meta: meta, Identity: kube.Reader, Warn: env.Err})
+	if err != nil {
+		return err
+	}
 	raw, found, err := cl.ConfigMapValue(ctx, deploy.DefaultNamespace, kernel.DefaultProfilesName, kernel.ProfilesKey())
 	if err != nil {
-		return fmt.Errorf("read the kernel's usage profiles: %w", err)
+		return readerRefused(fmt.Errorf("read the kernel's usage profiles: %w", err), name)
 	}
 	if !found {
 		return fmt.Errorf("the kernel in %q has not written any usage profiles yet; it writes them on the same schedule as the ledger, within a few minutes of starting", name)

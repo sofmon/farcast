@@ -2497,6 +2497,138 @@ func TestRequestsRecordWhatWasSent(t *testing.T) {
 	}
 }
 
+// waitFor polls cond until it holds or 10 s pass. WithAnswered runs after an
+// answer is written, so a client can hold its answer a moment before f has
+// been called.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("waited 10 s for %s", what)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestWithAnsweredSeesEveryAnswer (ADR 0023 M2.4, A18-7): f is called once
+// for every request, after its answer, with the request as Requests records
+// it and the code the answer was sent with. The refused ones reach it too: an
+// assertion that does not verify, a GET of /token, a 401 with no token and
+// with an unknown one, an injected 403, a 404 and a 405. A request abandoned
+// during WithDelay's hold was answered nothing, and is passed with 0.
+func TestWithAnsweredSeesEveryAnswer(t *testing.T) {
+	type seen struct {
+		r      kubetest.Request
+		status int
+	}
+	var mu sync.Mutex
+	var got []seen
+	answered := func() []seen {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(got)
+	}
+	var hold atomic.Bool
+	const heldPath = "/api/v1/namespaces/web/pods"
+	f := newFixture(t,
+		kubetest.WithAnswered(func(r kubetest.Request, status int) {
+			mu.Lock()
+			defer mu.Unlock()
+			got = append(got, seen{r, status})
+		}),
+		kubetest.WithDelay(func(r kubetest.Request) time.Duration {
+			if hold.Load() && r.Path == heldPath {
+				return 10 * time.Second
+			}
+			return 0
+		}))
+	c := f.s.Credential("reader")
+	tok := f.mint(c)
+	badScope := goodClaims(f.s, c)
+	badScope["scope"] = "https://www.googleapis.com/auth/cloud-platform"
+	wantCode(t, f.tokenRequest(sign(t, privateKey(t, c), goodHeader(c), badScope)), http.StatusBadRequest)
+	wantCode(t, f.get("/token", ""), http.StatusMethodNotAllowed)
+	wantCode(t, f.get("/api/v1/namespaces", ""), http.StatusUnauthorized)
+	wantCode(t, f.send(call{method: http.MethodGet, path: "/api/v1/namespaces", authorization: "Bearer kubetest:reader:999"}), http.StatusUnauthorized)
+	f.s.Fail(http.MethodGet, "/api/v1/namespaces/web/configmaps/pin", http.StatusForbidden, kube.Status{})
+	wantCode(t, f.get("/api/v1/namespaces/web/configmaps/pin", tok), http.StatusForbidden)
+	wantCode(t, f.get("/api/v1/namespaces/web/configmaps/absent", tok), http.StatusNotFound)
+	f.s.Put(configMap("web", "pin", map[string]string{"k": "v"}))
+	wantCode(t, f.get("/api/v1/namespaces/web/configmaps/pin", tok), http.StatusOK)
+	wantCode(t, f.get("/version", tok), http.StatusMethodNotAllowed)
+	hold.Store(true)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if _, err := f.try(call{ctx: ctx, method: http.MethodGet, path: heldPath, token: tok}); err == nil {
+		t.Fatal("a request held for 10 s answered within its 200 ms deadline")
+	}
+
+	want := []struct {
+		method, path, as string
+		status           int
+	}{
+		{http.MethodPost, "/token", "reader", http.StatusOK},
+		{http.MethodPost, "/token", "", http.StatusBadRequest},
+		{http.MethodGet, "/token", "", http.StatusMethodNotAllowed},
+		{http.MethodGet, "/api/v1/namespaces", "", http.StatusUnauthorized},
+		{http.MethodGet, "/api/v1/namespaces", "?", http.StatusUnauthorized},
+		{http.MethodGet, "/api/v1/namespaces/web/configmaps/pin", "reader", http.StatusForbidden},
+		{http.MethodGet, "/api/v1/namespaces/web/configmaps/absent", "reader", http.StatusNotFound},
+		{http.MethodGet, "/api/v1/namespaces/web/configmaps/pin", "reader", http.StatusOK},
+		{http.MethodGet, "/version", "reader", http.StatusMethodNotAllowed},
+		{http.MethodGet, heldPath, "reader", 0},
+	}
+	waitFor(t, "every answer to reach WithAnswered", func() bool { return len(answered()) >= len(want) })
+	time.Sleep(50 * time.Millisecond) // a second call for any request would land here
+	seenAll, reqs := answered(), f.s.Requests()
+	if len(seenAll) != len(want) || len(reqs) != len(want) {
+		t.Fatalf("WithAnswered was called %d times and %d requests were recorded; want %d of each", len(seenAll), len(reqs), len(want))
+	}
+	for i, w := range want {
+		g := seenAll[i]
+		if g.r.Method != w.method || g.r.Path != w.path || g.r.As != w.as || g.status != w.status {
+			t.Errorf("answer %d = %s %s as %q, %d; want %s %s as %q, %d", i, g.r.Method, g.r.Path, g.r.As, g.status, w.method, w.path, w.as, w.status)
+		}
+		if !reflect.DeepEqual(g.r, reqs[i]) {
+			t.Errorf("answer %d (%s %s): WithAnswered's request is not the one Requests recorded", i, w.method, w.path)
+		}
+	}
+	for _, i := range []int{0, 1} {
+		if seenAll[i].r.KeyID != c.PrivateKeyID {
+			t.Errorf("/token answer %d carries KeyID %q, want the assertion's kid", i, seenAll[i].r.KeyID)
+		}
+	}
+	seenAll[0].r.Body[0] = 'X'
+	if again := f.s.Requests(); again[0].Body[0] == 'X' {
+		t.Error("WithAnswered's body is the server's record, not f's own copy")
+	}
+}
+
+// TestWithoutRecordingKeepsNoLog (ADR 0023 M2.4, A18-7): with
+// WithoutRecording, Requests is nil whatever was served, the server answers
+// as it always does, and WithAnswered still sees every request.
+func TestWithoutRecordingKeepsNoLog(t *testing.T) {
+	var answered atomic.Int32
+	f := newFixture(t, kubetest.WithoutRecording(), kubetest.WithAnswered(func(kubetest.Request, int) { answered.Add(1) }))
+	c := f.s.Credential("reader")
+	tok := f.mint(c)
+	wantCode(t, f.get("/api/v1/namespaces", tok), http.StatusOK)
+	wantStatus(t, f.get("/api/v1/namespaces", ""), http.StatusUnauthorized, "Unauthorized")
+	wantCode(t, f.tokenRequest("not.a.jwt"), http.StatusBadRequest)
+	if reqs := f.s.Requests(); reqs != nil {
+		t.Errorf("Requests() = %d requests, want nil", len(reqs))
+	}
+	waitFor(t, "four answers to reach WithAnswered", func() bool { return answered.Load() >= 4 })
+
+	g := newFixture(t, kubetest.WithoutRecording())
+	gt := g.mint(g.s.Credential("reader"))
+	wantCode(t, g.get("/api/v1/namespaces", gt), http.StatusOK)
+	if reqs := g.s.Requests(); reqs != nil {
+		t.Errorf("without WithAnswered: Requests() = %d requests, want nil", len(reqs))
+	}
+}
+
 // TestCredentialIsAFreshRegisteredKey: Credential and CredentialFor return a
 // new RSA-2048 PKCS#8 key each, with a Google-shaped key id, already
 // registered; a key file made of it parses and pairs as a loopback key.

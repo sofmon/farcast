@@ -7,7 +7,7 @@
 /// - `--` ends flag parsing before the instance name, so a name is never
 ///   read as a flag.
 ///
-/// No other flag exists in code: not `-v`, not `--help`, not `pin-gcloud`.
+/// No other flag exists in code: not `-v`, not `--help`, and no other command.
 enum CLICommand: Sendable, Equatable {
     case version
     case instances

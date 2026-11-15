@@ -18,7 +18,7 @@ struct SetupView: View {
                     .foregroundStyle(.secondary)
                 VStack(alignment: .leading, spacing: 12) {
                     step(1, "Build `farcast` and this app from one commit.")
-                    step(2, "Pin each instance's gcloud account from a terminal: `farcast instances pin-gcloud <instance> --account <account>`.")
+                    step(2, "Give each instance its reader from a terminal: `farcast reader init <instance>`, then the printed Cloud Shell script, `reader record` and `reader grant`.")
                     step(3, "Confirm the paths in Settings (⌘,).")
                 }
                 BuildCommitStatus(appCommit: app.appCommit)

@@ -2,21 +2,27 @@ package rehearsal_test
 
 import (
 	"bytes"
-	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
+	"maps"
 	"math/big"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -29,6 +35,7 @@ import (
 	"github.com/sofmon/farcast/farsight/cli/internal/cluster"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/keyholder"
+	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 	"github.com/sofmon/farcast/farsight/cli/internal/rehearsal"
 	fldeploy "github.com/sofmon/farcast/fatline/deploy"
 	"github.com/sofmon/farcast/fatline/identity"
@@ -36,45 +43,13 @@ import (
 	"github.com/sofmon/farcast/fatline/tunnel"
 	"github.com/sofmon/farcast/technocore/cost"
 	"github.com/sofmon/farcast/technocore/kernel"
+	tkube "github.com/sofmon/farcast/technocore/kube"
 )
-
-// The test binary is the fake tools too: linked as kubectl,
-// gke-gcloud-auth-plugin or gcloud, it runs as that tool, exactly as the
-// harness binary does.
-func TestMain(m *testing.M) {
-	if code, ok := rehearsal.ToolMain(os.Args[0], os.Args[1:], os.Environ(), os.Stdout, os.Stderr); ok {
-		os.Exit(code)
-	}
-	// A race-built binary that exits 0 sleeps a second first, for late race
-	// reports. Every read runs this binary as kubectl, the plugin and gcloud,
-	// a dozen and more times; the children inherit this. It changes nothing
-	// a test asserts: GORACE is no variable the fake kubectl refuses, and
-	// race reports still print. cluster.Env passes GORACE for exactly this
-	// reason: kubectl's environment is otherwise an allowlist (ADR 0023 M0),
-	// and without it every read here would sleep a second per tool.
-	if os.Getenv("GORACE") == "" {
-		if err := os.Setenv("GORACE", raceQuiet); err != nil {
-			panic(err)
-		}
-	}
-	os.Exit(m.Run())
-}
-
-const raceQuiet = "atexit_sleep_ms=0"
 
 const instance = rehearsal.DefaultInstance
 
-func testBinary(t *testing.T) string {
-	t.Helper()
-	exe, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
-	return exe
-}
-
-// startRig starts a rehearsal in a new directory under a fake home, linked to
-// this test binary, and stops it when the test ends.
+// startRig starts a rehearsal in a new directory under a fake home, and stops
+// it when the test ends.
 func startRig(t *testing.T, o rehearsal.Options) *rehearsal.Rig {
 	t.Helper()
 	if o.Dir == "" {
@@ -82,9 +57,6 @@ func startRig(t *testing.T, o rehearsal.Options) *rehearsal.Rig {
 	}
 	if o.Home == "" {
 		o.Home = t.TempDir()
-	}
-	if o.Tools == "" {
-		o.Tools = testBinary(t)
 	}
 	rig, err := rehearsal.Start(t.Context(), o)
 	if err != nil {
@@ -98,22 +70,22 @@ func startRig(t *testing.T, o rehearsal.Options) *rehearsal.Rig {
 	return rig
 }
 
-// shellNoise are variables a developer's shell may export that the fake
-// kubectl refuses on sight. farcast drops them itself now: kubectl's
-// environment is built from an allowlist (cluster.Env, ADR 0023 M0). The rig
-// still removes them, so that the environment rehearsed is the app's, not
-// whatever the developer's shell holds. cli.Main runs in process, with this
-// test's environment.
+// shellNoise are variables a developer's shell may export, none of which the
+// FarCast app passes on: its child environment is HOME, TMPDIR, LANG, LC_*
+// and a PATH of the system's directories (FarSightKit's ChildEnvironment).
+// cli.Main runs in process, with this test's environment, so the rig removes
+// them, and the environment rehearsed is the app's, not whatever the
+// developer's shell holds. plant then adds back what must make no difference.
 var shellNoise = []string{
 	"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
 	"http_proxy", "https_proxy", "all_proxy", "no_proxy",
-	"FARCAST_CONFIG_HOME",
+	"FARCAST_CONFIG_HOME", "CLOUDSDK_CONFIG", "KUBECONFIG",
 }
 
 // asTheApp gives this process the environment the FarCast app gives farcast
-// for these settings — PATH, HOME and CLOUDSDK_CONFIG — after removing what
-// a developer's shell may export. Every test that runs cli.Main calls it.
-// The variables must be absent, not empty.
+// — PATH and HOME, and no CLOUDSDK_CONFIG — after removing what a developer's
+// shell may export. Every test that runs cli.Main calls it. The variables
+// must be absent, not empty.
 //
 // cli.Main changes this process's environment for good: it sets
 // GOOGLE_API_USE_CLIENT_CERTIFICATE=false and unsets
@@ -135,7 +107,6 @@ func asTheApp(t *testing.T, rig *rehearsal.Rig) {
 	}
 	t.Setenv("PATH", rig.Path())
 	t.Setenv("HOME", t.TempDir())
-	t.Setenv("CLOUDSDK_CONFIG", rig.GCloudDir)
 }
 
 // appArgv is the FarCast app's own argv, from I1's vector: the CLI's
@@ -280,6 +251,14 @@ func (d worldDoc) sectionKind(name string) string {
 	return "not read"
 }
 
+// sectionMessage is a section's error message, "" when it has none.
+func (d worldDoc) sectionMessage(name string) string {
+	if s, ok := d.Sections[name]; ok && s.Error != nil {
+		return s.Error.Message
+	}
+	return ""
+}
+
 func (d worldDoc) hasAlert(kind string) bool {
 	return slices.ContainsFunc(d.Alerts, func(a alert) bool { return a.Kind == kind })
 }
@@ -291,6 +270,16 @@ func (d worldDoc) hasLine(kind, fromKey, from, toKey, to, evidence string) bool 
 		}
 	}
 	return false
+}
+
+// sections checks that each named section is what want says.
+func (d worldDoc) sections(t *testing.T, scenario, want string, names ...string) {
+	t.Helper()
+	for _, s := range names {
+		if got := d.sectionKind(s); got != want {
+			t.Errorf("%s: section %s is %s, want %s (%s)", scenario, s, got, want, d.sectionMessage(s))
+		}
+	}
 }
 
 func calls(t *testing.T, rig *rehearsal.Rig) []string {
@@ -308,23 +297,43 @@ func calls(t *testing.T, rig *rehearsal.Rig) []string {
 	return out
 }
 
-func kubectlCalls(lines []string) int {
-	n := 0
-	for _, l := range lines {
-		if f := strings.Fields(l); len(f) > 1 && f[1] == "kubectl" {
-			n++
+// callLine is one calls.log line of the cluster or its token endpoint:
+// "<time> <who> <METHOD> <target> as <identity> | <outcome>".
+type callLine struct {
+	who, method, target, as, outcome string
+}
+
+// parseCall reads a cluster or token line; ok is false for any other.
+func parseCall(l string) (callLine, bool) {
+	head, outcome, ok := strings.Cut(l, " | ")
+	if !ok {
+		return callLine{}, false
+	}
+	f := strings.Fields(head)
+	if len(f) != 6 || (f[1] != "cluster" && f[1] != "token") || f[4] != "as" {
+		return callLine{}, false
+	}
+	if _, err := time.Parse(time.RFC3339, f[0]); err != nil {
+		return callLine{}, false
+	}
+	return callLine{who: f[1], method: f[2], target: f[3], as: f[5], outcome: outcome}, true
+}
+
+// clusterCalls are calls.log's cluster lines (not the token endpoint's).
+func clusterCalls(t *testing.T, rig *rehearsal.Rig) []callLine {
+	t.Helper()
+	var out []callLine
+	for _, l := range calls(t, rig) {
+		if c, ok := parseCall(l); ok && c.who == "cluster" {
+			out = append(out, c)
 		}
 	}
-	return n
+	return out
 }
 
 func checkHealthy(t *testing.T, doc worldDoc) {
 	t.Helper()
-	for _, s := range []string{"spend", "apps", "policy", "network", "seal"} {
-		if got := doc.sectionKind(s); got != "read" {
-			t.Errorf("section %s: %s, want read", s, got)
-		}
-	}
+	doc.sections(t, "healthy", "read", "spend", "apps", "policy", "network", "seal")
 	if n := doc.Instance.Network; !n.Read || n.Replica == nil || *n.Replica != "fatline-rehearsal-0" ||
 		n.FatLineReplicas == nil || *n.FatLineReplicas != 1 {
 		t.Errorf("network: %+v, want replica fatline-rehearsal-0, 1 of 1", n)
@@ -360,8 +369,11 @@ func checkHealthy(t *testing.T, doc worldDoc) {
 }
 
 // planted are values the FarCast app's parent environment must never pass
-// on, and farcast's own kubectl environment must drop or override. If one
-// reached the fake kubectl it would refuse, and the read would fail.
+// on, and that must make no difference to how farcast reads: it mints the
+// reader's token itself, reads no gcloud or kube configuration, and its
+// transports take no proxy. HTTPS_PROXY proves nothing on loopback, which
+// Go's environment proxying never proxies; kube's TestTransportsHaveNoProxy
+// carries that guarantee.
 func plant(t *testing.T) []string {
 	t.Helper()
 	elsewhere := filepath.Join(t.TempDir(), "elsewhere")
@@ -369,18 +381,37 @@ func plant(t *testing.T) []string {
 		"CLOUDSDK_AUTH_ACCESS_TOKEN":     "planted-token",
 		"CLOUDSDK_CORE_ACCOUNT":          "someone@work.invalid",
 		"CLOUDSDK_ACTIVE_CONFIG_NAME":    "work",
+		"CLOUDSDK_CONFIG":                filepath.Join(elsewhere, "gcloud"),
 		"KUBECONFIG":                     filepath.Join(elsewhere, "kubeconfig"),
 		"GOOGLE_APPLICATION_CREDENTIALS": filepath.Join(elsewhere, "credentials.json"),
+		"HTTPS_PROXY":                    "http://127.0.0.1:9",
 	} {
 		t.Setenv(k, v)
 	}
-	return []string{"planted", "someone@work.invalid", "elsewhere", "CLOUDSDK_AUTH_ACCESS_TOKEN", "CLOUDSDK_CORE_ACCOUNT",
-		"GOOGLE_APPLICATION_CREDENTIALS"}
+	return []string{"planted", "someone@work.invalid", "elsewhere", "127.0.0.1:9", "CLOUDSDK_AUTH_ACCESS_TOKEN",
+		"CLOUDSDK_CORE_ACCOUNT", "GOOGLE_APPLICATION_CREDENTIALS"}
+}
+
+// worldsReads are the cluster reads one healthy 'world' makes, as calls.log
+// spells them.
+func worldsReads() []string {
+	cm := "/api/v1/namespaces/farcast-system/configmaps/"
+	return []string{
+		"/apis/apps/v1/namespaces/farcast-system/deployments?limit=500",
+		"/apis/apps/v1/namespaces/farcast-system/statefulsets?limit=500",
+		"/apis/apps/v1/namespaces/shop/deployments?limit=500",
+		"/apis/apps/v1/namespaces/shop/statefulsets?limit=500",
+		"/api/v1/namespaces?labelSelector=app.kubernetes.io%2Fmanaged-by%3Dfarcast&limit=500",
+		cm + kernel.DefaultNamespacesName,
+		cm + kernel.DefaultCheckpointName,
+		cm + fldeploy.PolicyConfigMap,
+	}
 }
 
 // TestWorldReadsTheRehearsalWhole is the rehearsal end to end: the real
 // 'farcast version', 'instances' and 'world', run with the app's own argv
-// and the app's environment, planted variables included, read every section.
+// and the app's environment, planted variables included, read every section;
+// and the cluster saw only world's reads, each as the reader.
 func TestWorldReadsTheRehearsalWhole(t *testing.T) {
 	rig := startRig(t, rehearsal.Options{})
 	argv := loadArgv(t)
@@ -403,16 +434,17 @@ func TestWorldReadsTheRehearsalWhole(t *testing.T) {
 	var list struct {
 		Schema    int `json:"schema"`
 		Instances []struct {
-			Name         string `json:"name"`
-			GCloudPinned bool   `json:"gcloud_pinned"`
-			Status       string `json:"status"`
+			Name     string `json:"name"`
+			Reader   string `json:"reader"`
+			Migrated bool   `json:"migrated"`
+			Status   string `json:"status"`
 		} `json:"instances"`
 	}
 	if err := json.Unmarshal(out, &list); err != nil {
 		t.Fatal(err)
 	}
-	if list.Schema != 1 || len(list.Instances) != 1 || list.Instances[0].Name != instance ||
-		!list.Instances[0].GCloudPinned || list.Instances[0].Status != "running" {
+	if list.Schema != 2 || len(list.Instances) != 1 || list.Instances[0].Name != instance ||
+		list.Instances[0].Reader != "granted" || !list.Instances[0].Migrated || list.Instances[0].Status != "running" {
 		t.Fatalf("instances: %s", out)
 	}
 	if n := len(calls(t, rig)); n != 0 {
@@ -421,32 +453,24 @@ func TestWorldReadsTheRehearsalWhole(t *testing.T) {
 
 	checkHealthy(t, world(t, rig, argv))
 
-	lines := calls(t, rig)
-	if kubectlCalls(lines) == 0 {
-		t.Fatal("world ran no kubectl")
-	}
-	for _, l := range lines {
-		if !strings.HasSuffix(l, " | ok") {
-			t.Errorf("calls.log line not ok: %s", l)
-		}
-		f := strings.Fields(strings.TrimSuffix(l, " | ok"))
+	reads, mints := 0, 0
+	for _, l := range calls(t, rig) {
+		c, ok := parseCall(l)
 		switch {
-		case len(f) < 2:
-			t.Errorf("calls.log line has no tool: %s", l)
-		case f[1] == "kubectl":
-			if len(f) < 5 || f[2] != "--kubeconfig" || f[4] != "get" {
-				t.Errorf("a kubectl call that is not a get: %s", l)
-			}
-		case f[1] == "gke-gcloud-auth-plugin":
-			if len(f) != 2 {
-				t.Errorf("the auth plugin was given arguments: %s", l)
-			}
-		case f[1] == "gcloud":
-			if strings.Join(f[2:], " ") != "config config-helper --format=json" {
-				t.Errorf("gcloud was asked something else: %s", l)
+		case !ok:
+			t.Errorf("a calls.log line that is neither the cluster's nor the token endpoint's: %s", l)
+		case c.as != "reader" || c.outcome != "ok":
+			t.Errorf("a call not made as the reader, or not answered: %s", l)
+		case c.who == "token":
+			mints++
+			if c.method != http.MethodPost || c.target != "/token" {
+				t.Errorf("a token call that is not a POST of /token: %s", l)
 			}
 		default:
-			t.Errorf("an unexpected caller: %s", l)
+			reads++
+			if c.method != http.MethodGet || !slices.Contains(worldsReads(), c.target) {
+				t.Errorf("a cluster call that is not one of world's reads: %s", l)
+			}
 		}
 		for _, p := range planted {
 			if strings.Contains(l, p) {
@@ -454,10 +478,91 @@ func TestWorldReadsTheRehearsalWhole(t *testing.T) {
 			}
 		}
 	}
+	if reads != len(worldsReads()) || mints != 1 {
+		t.Errorf("world made %d reads and %d mints; want each of its %d reads once, and one mint", reads, mints, len(worldsReads()))
+	}
+}
+
+// TestTheRecordIsTheLoopbackReaders: the instance record is what 'farcast
+// reader init', 'record' and 'grant' leave on a loopback cluster (§10.1): the
+// cluster's endpoint on 127.0.0.1 and the CA it is trusted on, the derived
+// loopback reader with a 40-hex key id, granted when the rehearsal started,
+// its key and certificate at 0600, server-side apply recorded, and a writer
+// credentials.yaml whose token_uri is the cluster's. Nothing of the gcloud
+// era is written: no kubeconfig, no gcloud directory, no tools.
+func TestTheRecordIsTheLoopbackReaders(t *testing.T) {
+	rig := startRig(t, rehearsal.Options{})
+	s, err := rehearsal.LoadSpec(rig.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta, err := config.Dir(rig.ConfigDir).LoadInstanceMetadata(instance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// farcast-reader- and the first 8 hex characters of the name's SHA-256,
+	// as cli's readerName derives it: 2bcd3e14 for "rehearsal".
+	if want := "farcast-reader-2bcd3e14@rehearsal.invalid"; meta.Reader == nil || meta.Reader.Email != want {
+		t.Fatalf("reader %+v, want %s", meta.Reader, want)
+	}
+	if r := meta.Reader; len(r.KeyID) != 40 || strings.Trim(r.KeyID, "0123456789abcdef") != "" || !r.GrantedAt.Equal(s.Started) {
+		t.Errorf("reader %+v: want a 40-hex key id, granted when the rehearsal started (%s)", r, s.Started)
+	}
+	if meta.Endpoint != rig.ClusterAddr || meta.Region != "rehearsal-local" || meta.Project != rehearsal.DefaultProject {
+		t.Errorf("endpoint %q, region %q, project %q", meta.Endpoint, meta.Region, meta.Project)
+	}
+	if ssa := meta.ServerSideApply; ssa == nil || !ssa.Since.Equal(s.Started) || ssa.Farcast != "rehearsal" {
+		t.Errorf("server_side_apply %+v", ssa)
+	}
+	for _, f := range []string{"reader.key", "reader.crt", "cluster-ca.crt", "credentials.yaml"} {
+		if info, err := os.Stat(instanceFile(rig, f)); err != nil || info.Mode().Perm() != 0o600 {
+			t.Errorf("%s: %v, %v; want it, 0600", f, info, err)
+		}
+	}
+	creds, err := config.Dir(rig.ConfigDir).LoadInstanceCredentials(instance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var key map[string]string
+	if err := json.Unmarshal([]byte(creds.ServiceAccountKey), &key); err != nil {
+		t.Fatal(err)
+	}
+	if len(key) != 4 || key["type"] != "service_account" || key["client_email"] != "writer@rehearsal.invalid" ||
+		key["token_uri"] != "https://"+rig.ClusterAddr+"/token" || !strings.Contains(key["private_key"], "PRIVATE KEY") {
+		t.Errorf("credentials.yaml's key has %d fields: type %q, client_email %q, token_uri %q", len(key), key["type"], key["client_email"], key["token_uri"])
+	}
+	for _, gone := range []string{"kube", "sdk", "gcloud", filepath.Join("config", "instances", instance, "kubeconfig.yaml")} {
+		if _, err := os.Lstat(filepath.Join(rig.Dir, gone)); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("%s: %v; a rehearsal writes none", gone, err)
+		}
+	}
+}
+
+// waitFor polls cond every 20 ms until it holds, for at most 10 seconds.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s did not happen within 10s", what)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// listening reports whether something accepts on addr.
+func listening(addr string) bool {
+	c, err := net.DialTimeout("tcp", addr, time.Second)
+	if err != nil {
+		return false
+	}
+	_ = c.Close()
+	return true
 }
 
 // TestScenariosShowInWorld switches each scenario and reads the very next
-// world, with no waiting.
+// world, with no waiting, except tunnel-down, which takes effect within a
+// moment: its read waits until the tunnel's port refuses.
 func TestScenariosShowInWorld(t *testing.T) {
 	rig := startRig(t, rehearsal.Options{})
 	argv := loadArgv(t)
@@ -469,6 +574,8 @@ func TestScenariosShowInWorld(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	cluster := []string{"spend", "apps", "policy"}
+	tunnelSections := []string{"network", "seal"}
 
 	set(rehearsal.ScenarioSealed)
 	if doc := world(t, rig, argv); !doc.hasAlert("sealed") || doc.sectionKind("seal") != "read" {
@@ -502,36 +609,51 @@ func TestScenariosShowInWorld(t *testing.T) {
 		t.Errorf("cost-reached: total %d cents against a limit of %v; a kernel at its limit is over it", s.TotalCents, s.LimitCents)
 	}
 
-	set(rehearsal.ScenarioSignedOut)
+	set(rehearsal.ScenarioTokenRefused)
 	doc = world(t, rig, argv)
-	for _, s := range []string{"spend", "apps", "policy"} {
-		if got := doc.sectionKind(s); got != "gcloud_signed_out" {
-			t.Errorf("signed-out: section %s is %s", s, got)
-		}
-	}
-	for _, s := range []string{"network", "seal"} {
-		if got := doc.sectionKind(s); got != "read" {
-			t.Errorf("signed-out: section %s is %s, want read", s, got)
+	doc.sections(t, "token-refused", "credential_refused", cluster...)
+	doc.sections(t, "token-refused", "read", tunnelSections...)
+
+	set(rehearsal.ScenarioUnauthorized)
+	doc = world(t, rig, argv)
+	doc.sections(t, "unauthorized", "unauthorized", cluster...)
+	doc.sections(t, "unauthorized", "read", tunnelSections...)
+
+	// Only the checkpoint and the policy are refused: the metered-namespace
+	// list still answers, so apps reads.
+	set(rehearsal.ScenarioForbidden)
+	doc = world(t, rig, argv)
+	doc.sections(t, "forbidden", "forbidden", "spend", "policy")
+	doc.sections(t, "forbidden", "read", "apps", "network", "seal")
+	for _, s := range []string{"spend", "policy"} {
+		if m := doc.sectionMessage(s); !strings.HasSuffix(m, "; run 'farcast reader grant "+instance+"'") {
+			t.Errorf("forbidden: section %s says %q; an RBAC refusal says to run 'farcast reader grant'", s, m)
 		}
 	}
 
-	set(rehearsal.ScenarioIdentityMismatch)
-	before := kubectlCalls(calls(t, rig))
-	code, out, errOut := farcast(t, rig, argv.World)
-	var env struct {
-		Error struct {
-			Kind string `json:"kind"`
-		} `json:"error"`
-	}
-	if code != 1 || json.Unmarshal(out, &env) != nil || env.Error.Kind != "gcloud_mismatch" || errOut != "" {
-		t.Errorf("identity-mismatch: exit %d, %s, stderr %q", code, out, errOut)
-	}
-	if after := kubectlCalls(calls(t, rig)); after != before {
-		t.Errorf("identity-mismatch: kubectl ran %d times; it must not run at all", after-before)
+	set(rehearsal.ScenarioReaderMissing)
+	doc = world(t, rig, argv)
+	doc.sections(t, "reader-missing", "credential_missing", cluster...)
+	doc.sections(t, "reader-missing", "read", tunnelSections...)
+	code, out, errOut := farcast(t, rig, argv.Instances)
+	if code != 0 || errOut != "" || !strings.Contains(string(out), `"reader":"key_missing"`) {
+		t.Errorf("reader-missing: instances exited %d: %s %s; want the reader's key missing", code, out, errOut)
 	}
 
-	// Every other scenario puts the project back, so this read is whole.
+	// Every other scenario puts the reader's key back: this read's cluster
+	// sections read. The tunnel stops within a moment.
+	set(rehearsal.ScenarioTunnelDown)
+	waitFor(t, "the tunnel stopping", func() bool { return !listening(rig.TunnelAddr) })
+	doc = world(t, rig, argv)
+	doc.sections(t, "tunnel-down", "tunnel_unreachable", tunnelSections...)
+	doc.sections(t, "tunnel-down", "read", cluster...)
+	if !listening(rig.ClusterAddr) {
+		t.Error("tunnel-down stopped the cluster too")
+	}
+
+	// And every other scenario brings the tunnel back.
 	set(rehearsal.ScenarioDenied)
+	waitFor(t, "the tunnel listening again", func() bool { return listening(rig.TunnelAddr) })
 	doc = world(t, rig, argv)
 	denied := false
 	for _, a := range doc.Alerts {
@@ -540,11 +662,37 @@ func TestScenariosShowInWorld(t *testing.T) {
 	if !denied || !doc.hasLine("egress", "app", "shop/web", "host", "tracker.invalid", "denied") {
 		t.Errorf("denied: alerts %+v, lines %+v", doc.Alerts, doc.Lines)
 	}
-	for _, s := range []string{"spend", "apps", "policy", "network", "seal"} {
-		if got := doc.sectionKind(s); got != "read" {
-			t.Errorf("denied: section %s is %s, want read", s, got)
+	doc.sections(t, "denied", "read", "spend", "apps", "policy", "network", "seal")
+}
+
+// TestAScenarioThatMovesSomethingStartsThatWay: a rehearsal started in
+// tunnel-down still brings its tunnel up for the keeper's start-up read, and
+// Start returns with it stopped; one started in reader-missing writes its
+// reader's key aside from the first.
+func TestAScenarioThatMovesSomethingStartsThatWay(t *testing.T) {
+	t.Run("tunnel-down", func(t *testing.T) {
+		rig := startRig(t, rehearsal.Options{Scenario: rehearsal.ScenarioTunnelDown})
+		if listening(rig.TunnelAddr) {
+			t.Error("Start returned with the tunnel listening in tunnel-down")
 		}
-	}
+		if err := rehearsal.SetScenario(rig.Dir, rehearsal.ScenarioHealthy); err != nil {
+			t.Fatal(err)
+		}
+		waitFor(t, "the tunnel listening", func() bool { return listening(rig.TunnelAddr) })
+		argv := loadArgv(t)
+		asTheApp(t, rig)
+		checkHealthy(t, world(t, rig, argv))
+	})
+	t.Run("reader-missing", func(t *testing.T) {
+		rig := startRig(t, rehearsal.Options{Scenario: rehearsal.ScenarioReaderMissing})
+		inst := filepath.Join(rig.ConfigDir, "instances", instance)
+		if _, err := os.Stat(filepath.Join(inst, "reader.key")); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("reader.key: %v; want it moved aside", err)
+		}
+		if info, err := os.Stat(filepath.Join(inst, "reader.key.away")); err != nil || info.Mode().Perm() != 0o600 {
+			t.Errorf("reader.key.away: %v, %v; want the key there, 0600", info, err)
+		}
+	})
 }
 
 // TestTheAtFloorScenarioShowsWhatTheKernelRecorded reads the scenario the
@@ -591,11 +739,7 @@ func TestTheAtFloorScenarioShowsWhatTheKernelRecorded(t *testing.T) {
 	if !floor || !costAlert {
 		t.Errorf("alerts %+v; want the critical at_floor alert on the kernel naming its levers, beside the cost alert", doc.Alerts)
 	}
-	for _, sec := range []string{"spend", "apps", "policy", "network", "seal"} {
-		if got := doc.sectionKind(sec); got != "read" {
-			t.Errorf("section %s is %s, want read", sec, got)
-		}
-	}
+	doc.sections(t, "at-floor", "read", "spend", "apps", "policy", "network", "seal")
 }
 
 // editSpec rewrites rehearsal.json, as a test seam.
@@ -615,184 +759,482 @@ func editSpec(t *testing.T, dir string, edit func(*rehearsal.Spec)) {
 	}
 }
 
-// kubectlEnv is the environment 'farcast world' gives kubectl for the rig:
-// what the tool tests pass explicitly, never the test's own.
-func kubectlEnv(t *testing.T, rig *rehearsal.Rig) []string {
+// instanceFile is a file in the rehearsal instance's config directory.
+func instanceFile(rig *rehearsal.Rig, name string) string {
+	return filepath.Join(rig.ConfigDir, "instances", instance, name)
+}
+
+func readFile(t *testing.T, path string) []byte {
 	t.Helper()
-	return []string{
-		"PATH=" + rig.Path(),
-		"HOME=" + t.TempDir(),
-		"KUBECONFIG=" + instanceKubeconfig(rig),
-		"CLOUDSDK_CONFIG=" + rig.GCloudDir,
-		"CLOUDSDK_ACTIVE_CONFIG_NAME=rehearsal",
-		"KUBERC=off",
-		"GORACE=" + os.Getenv("GORACE"), // see TestMain
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
 	}
+	return b
 }
 
-func instanceKubeconfig(rig *rehearsal.Rig) string {
-	return filepath.Join(rig.ConfigDir, "instances", instance, "kubeconfig.yaml")
+// clusterClient is an HTTPS client that trusts the rig's cluster on its
+// cluster-ca.crt, as farcast does, and takes no proxy.
+func clusterClient(t *testing.T, rig *rehearsal.Rig) *http.Client {
+	t.Helper()
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(readFile(t, instanceFile(rig, "cluster-ca.crt"))) {
+		t.Fatal("cluster-ca.crt holds no certificate")
+	}
+	return &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12},
+	}}
 }
 
-func kubectlArgs(rig *rehearsal.Rig, rest ...string) []string {
-	return append([]string{"--kubeconfig", instanceKubeconfig(rig)}, rest...)
-}
-
-var namespaceRead = []string{"get", "namespace", "-l", "app.kubernetes.io/managed-by=farcast", "-o", "json"}
-
-func runTool(argv0 string, args, environ []string) (int, string, string) {
-	var out, errb bytes.Buffer
-	code, ok := rehearsal.ToolMain(argv0, args, environ, &out, &errb)
+// rsaKey is the first PKCS#8 RSA key in keyPEM.
+func rsaKey(t *testing.T, keyPEM []byte) *rsa.PrivateKey {
+	t.Helper()
+	block, _ := pem.Decode(keyPEM)
+	if block == nil {
+		t.Fatal("no PEM block")
+	}
+	k, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, ok := k.(*rsa.PrivateKey)
 	if !ok {
-		return -1, "", "not a tool"
+		t.Fatalf("a %T, not an RSA key", k)
 	}
-	return code, out.String(), errb.String()
+	return key
 }
 
-func without(env []string, key string) []string {
-	return slices.DeleteFunc(slices.Clone(env), func(kv string) bool { return strings.HasPrefix(kv, key+"=") })
+// theReader is the rehearsal instance's reader: its key and its email, as
+// the record holds them.
+func theReader(t *testing.T, rig *rehearsal.Rig) (*rsa.PrivateKey, string) {
+	t.Helper()
+	meta, err := config.Dir(rig.ConfigDir).LoadInstanceMetadata(instance)
+	if err != nil || meta.Reader == nil {
+		t.Fatalf("the rehearsal's reader: %+v, %v", meta, err)
+	}
+	return rsaKey(t, readFile(t, instanceFile(rig, "reader.key"))), meta.Reader.Email
 }
 
-func with(env []string, kv ...string) []string { return append(slices.Clone(env), kv...) }
+// theWriter is the writer credentials.yaml holds.
+func theWriter(t *testing.T, rig *rehearsal.Rig) kube.Credential {
+	t.Helper()
+	creds, err := config.Dir(rig.ConfigDir).LoadInstanceCredentials(instance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cred, err := kube.ParseServiceAccountJSON([]byte(creds.ServiceAccountKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cred
+}
 
-// TestSlowClusterSleeps proves slow-cluster makes kubectl wait before it
-// answers, with the sleep cut to 50 ms in the spec.
-func TestSlowClusterSleeps(t *testing.T) {
+// claimsFor are the claims of a 2LO assertion for iss, as the vendored
+// encoder writes them, aimed at the rig's token endpoint.
+func claimsFor(rig *rehearsal.Rig, iss string) map[string]any {
+	now := time.Now().Unix()
+	return map[string]any{
+		"iss": iss, "scope": kube.ScopeUserinfoEmail, "aud": "https://" + rig.ClusterAddr + "/token",
+		"iat": now - 10, "exp": now + 3590,
+	}
+}
+
+// assertion is a JWT the claims make, signed RS256 with key.
+func assertion(t *testing.T, key *rsa.PrivateKey, claims map[string]any) string {
+	t.Helper()
+	enc := base64.RawURLEncoding
+	header, err := json.Marshal(map[string]string{"alg": "RS256", "typ": "JWT"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signing := enc.EncodeToString(header) + "." + enc.EncodeToString(body)
+	sum := sha256.Sum256([]byte(signing))
+	sig, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, sum[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return signing + "." + enc.EncodeToString(sig)
+}
+
+// mint posts an assertion to the rig's token endpoint and returns the status,
+// the token minted, and the OAuth error when it refused.
+func mint(t *testing.T, rig *rehearsal.Rig, a string) (status int, token, refusal string) {
+	t.Helper()
+	resp, err := clusterClient(t, rig).PostForm("https://"+rig.ClusterAddr+"/token", url.Values{
+		"grant_type": {"urn:ietf:params:oauth:grant-type:jwt-bearer"}, "assertion": {a},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var answer struct {
+		AccessToken string `json:"access_token"`
+		Error       string `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&answer); err != nil {
+		t.Fatalf("the token endpoint's answer: %v", err)
+	}
+	return resp.StatusCode, answer.AccessToken, answer.Error
+}
+
+// readerToken is a token minted for the rehearsal's reader.
+func readerToken(t *testing.T, rig *rehearsal.Rig) string {
+	t.Helper()
+	key, email := theReader(t, rig)
+	code, token, refusal := mint(t, rig, assertion(t, key, claimsFor(rig, email)))
+	if code != http.StatusOK || token == "" {
+		t.Fatalf("the reader's mint: %d %s", code, refusal)
+	}
+	return token
+}
+
+// ask sends one request to the rig's cluster with a bearer token ("" for
+// none) and returns the status and the answer's kind ("Status" for a
+// refusal, the list's or object's kind otherwise).
+func ask(t *testing.T, rig *rehearsal.Rig, method, target, token string) (int, string) {
+	t.Helper()
+	var body io.Reader
+	if method != http.MethodGet && method != http.MethodDelete {
+		body = strings.NewReader("{}")
+	}
+	req, err := http.NewRequestWithContext(t.Context(), method, "https://"+rig.ClusterAddr+target, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := clusterClient(t, rig).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var answer struct {
+		Kind string `json:"kind"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&answer); err != nil {
+		t.Fatalf("%s %s: the answer is not JSON: %v", method, target, err)
+	}
+	return resp.StatusCode, answer.Kind
+}
+
+// TestTheRigAnswersOnlyWorldsReads: with the reader's token, world's reads
+// are answered, an absent farcast-system ConfigMap with a 404 Status; every
+// other request is 405 and a "refused: no answer" line. A request with no
+// token, or one the cluster never minted, is 401.
+func TestTheRigAnswersOnlyWorldsReads(t *testing.T) {
 	rig := startRig(t, rehearsal.Options{})
-	editSpec(t, rig.Dir, func(s *rehearsal.Spec) { s.Scenario, s.SlowSeconds = rehearsal.ScenarioSlowCluster, 0.05 })
-	start := time.Now()
-	code, out, errOut := runTool(filepath.Join(rig.KubeBin, "kubectl"), kubectlArgs(rig, namespaceRead...), kubectlEnv(t, rig))
-	if code != 0 || !strings.Contains(out, `"shop"`) {
-		t.Fatalf("slow kubectl: exit %d, %s, %s", code, out, errOut)
+	s, err := rehearsal.LoadSpec(rig.Dir)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if took := time.Since(start); took < 50*time.Millisecond {
-		t.Errorf("slow-cluster answered in %s; it sleeps first", took)
+	token := readerToken(t, rig)
+	for _, target := range worldsReads() {
+		if code, kind := ask(t, rig, http.MethodGet, target, token); code != http.StatusOK || kind == "Status" {
+			t.Errorf("GET %s: %d %s; want it answered", target, code, kind)
+		}
+	}
+	absent := "/api/v1/namespaces/farcast-system/configmaps/something-else"
+	if code, kind := ask(t, rig, http.MethodGet, absent, token); code != http.StatusNotFound || kind != "Status" {
+		t.Errorf("an absent ConfigMap: %d %s; want a 404 Status", code, kind)
+	}
+
+	cm := "/api/v1/namespaces/farcast-system/configmaps"
+	deployments := "/apis/apps/v1/namespaces/shop/deployments"
+	selector := "labelSelector=app.kubernetes.io%2Fmanaged-by%3Dfarcast"
+	refused := []struct{ method, target string }{
+		{http.MethodPost, cm + "?fieldManager=farcast"},
+		{http.MethodPatch, cm + "/" + kernel.DefaultCheckpointName + "?fieldManager=farcast"},
+		{http.MethodPut, cm + "/" + kernel.DefaultCheckpointName},
+		{http.MethodDelete, cm + "/" + kernel.DefaultCheckpointName},
+		{http.MethodGet, cm + "?limit=500"},
+		{http.MethodGet, cm + "/" + kernel.DefaultCheckpointName + "?resourceVersion=0"},
+		{http.MethodGet, "/api/v1/namespaces/shop/configmaps/" + kernel.DefaultCheckpointName},
+		{http.MethodGet, "/api/v1/namespaces/farcast-system/secrets?limit=500"},
+		{http.MethodGet, "/api/v1/secrets?limit=500"},
+		{http.MethodGet, "/api/v1/namespaces/shop/pods?limit=500"},
+		{http.MethodGet, "/api/v1/namespaces/shop/pods/api-0/log"},
+		{http.MethodGet, deployments + "?limit=500&continue=abc"},
+		{http.MethodGet, deployments + "?limit=500&watch=true"},
+		{http.MethodGet, deployments + "?limit=500&limit=1"},
+		{http.MethodGet, deployments + "/api"},
+		{http.MethodGet, "/apis/apps/v1/namespaces/shop/replicasets?limit=500"},
+		{http.MethodGet, "/apis/apps/v1/deployments?limit=500"},
+		{http.MethodGet, "/api/v1/namespaces?limit=500"},
+		{http.MethodGet, "/api/v1/namespaces?labelSelector=app.kubernetes.io%2Fmanaged-by%3Dsomeone&limit=500"},
+		{http.MethodGet, "/api/v1/namespaces?" + selector + "&" + selector},
+		{http.MethodGet, "/api/v1/namespaces?" + selector + "&continue=abc"},
+		{http.MethodGet, "/version"},
+	}
+	for _, r := range refused {
+		if code, kind := ask(t, rig, r.method, r.target, token); code != http.StatusMethodNotAllowed || kind != "Status" {
+			t.Errorf("%s %s: %d %s; want a 405 Status", r.method, r.target, code, kind)
+		}
+		u, err := url.Parse(r.target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if code, _ := rehearsal.ClusterAnswer(s, r.method, u.Path, u.RawQuery, time.Now()); code != http.StatusMethodNotAllowed {
+			t.Errorf("ClusterAnswer answered %s %s with %d", r.method, r.target, code)
+		}
+	}
+
+	if code, _ := ask(t, rig, http.MethodGet, worldsReads()[0], ""); code != http.StatusUnauthorized {
+		t.Errorf("no token: %d, want 401", code)
+	}
+	if code, _ := ask(t, rig, http.MethodGet, worldsReads()[0], "not-a-token-it-minted"); code != http.StatusUnauthorized {
+		t.Errorf("a token it never minted: %d, want 401", code)
+	}
+
+	got := map[string]int{}
+	for _, c := range clusterCalls(t, rig) {
+		got[c.as+" | "+c.outcome]++
+	}
+	want := map[string]int{
+		"reader | ok":                                    len(worldsReads()) + 1,
+		"reader | refused: no answer":                    len(refused),
+		"none | refused: no token the cluster minted":    1,
+		"unknown | refused: no token the cluster minted": 1,
+	}
+	if !maps.Equal(got, want) {
+		t.Errorf("calls.log's cluster lines, by identity and outcome: %v, want %v", got, want)
+	}
+	for _, l := range calls(t, rig) {
+		if strings.Contains(l, token) || strings.Contains(l, "not-a-token-it-minted") {
+			t.Errorf("calls.log holds a token: %s", l)
+		}
+	}
+}
+
+// TestTheRigRefusesAWriterTokenOnARead: the writer credentials.yaml holds
+// mints, and every request its token makes is refused with a 403 Status,
+// world's reads included and whatever else it asks: the writer is checked
+// before anything is answered.
+func TestTheRigRefusesAWriterTokenOnARead(t *testing.T) {
+	rig := startRig(t, rehearsal.Options{})
+	ep, err := kube.ParseEndpoint(rig.ClusterAddr, "", readFile(t, instanceFile(rig, "cluster-ca.crt")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer := theWriter(t, rig)
+	kc, err := kube.New(kube.Config{Endpoint: ep, Credential: writer, Identity: kube.Writer})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := t.Context()
+	forbidden := func(what string, err error) {
+		t.Helper()
+		var ae *kube.APIError
+		if !errors.Is(err, tkube.ErrForbidden) || !errors.As(err, &ae) || !ae.KubernetesStatus {
+			t.Errorf("%s as the writer: %v; want a 403 Kubernetes Status", what, err)
+		}
+	}
+	_, err = kc.GetConfigMap(ctx, fldeploy.DefaultNamespace, kernel.DefaultCheckpointName)
+	forbidden("the checkpoint", err)
+	_, err = kc.ListNamespaces(ctx, "app.kubernetes.io/managed-by=farcast")
+	forbidden("the namespaces", err)
+	_, err = kc.ListDeployments(ctx, "shop")
+	forbidden("shop's deployments", err)
+
+	// Whatever it asks: a request the reader would get 405 for is 403 too.
+	_, token, _ := mint(t, rig, assertion(t, rsaKey(t, writer.PrivateKeyPEM), claimsFor(rig, writer.Email)))
+	if code, kind := ask(t, rig, http.MethodPost, "/api/v1/namespaces/farcast-system/configmaps", token); code != http.StatusForbidden || kind != "Status" {
+		t.Errorf("a writer's POST: %d %s; want a 403 Status", code, kind)
+	}
+
+	writes := 0
+	for _, l := range calls(t, rig) {
+		c, ok := parseCall(l)
+		switch {
+		case !ok || c.as != "writer":
+			t.Errorf("a line that is not the writer's: %s", l)
+		case c.who == "token":
+			if c.outcome != "ok" {
+				t.Errorf("the writer's mint: %s", l)
+			}
+		case c.outcome != "refused: a writer token on a read":
+			t.Errorf("a writer's request not refused as one: %s", l)
+		default:
+			writes++
+		}
+	}
+	if writes != 4 {
+		t.Errorf("calls.log refuses %d of the writer's requests, want 4", writes)
+	}
+}
+
+// TestTheRigsTokenEndpointChecksTheAssertion: the token endpoint mints for an
+// assertion the reader's or the writer's key signed, aimed at it, with
+// userinfo.email's scope, and refuses every other with invalid_grant; in
+// token-refused it refuses the reader's too, and 'world' shows
+// credential_refused. No calls.log line holds an assertion or a token.
+func TestTheRigsTokenEndpointChecksTheAssertion(t *testing.T) {
+	rig := startRig(t, rehearsal.Options{})
+	readerKey, readerEmail := theReader(t, rig)
+	writer := theWriter(t, rig)
+	writerKey := rsaKey(t, writer.PrivateKeyPEM)
+	var sent []string
+	try := func(what string, key *rsa.PrivateKey, claims map[string]any, wantCode int) string {
+		t.Helper()
+		a := assertion(t, key, claims)
+		sent = append(sent, a)
+		code, token, refusal := mint(t, rig, a)
+		if code != wantCode {
+			t.Errorf("%s: %d %s, want %d", what, code, refusal, wantCode)
+		}
+		if code != http.StatusOK && refusal != "invalid_grant" {
+			t.Errorf("%s: refused with %q, want invalid_grant", what, refusal)
+		}
+		return token
+	}
+
+	token := try("the reader", readerKey, claimsFor(rig, readerEmail), http.StatusOK)
+	if code, _ := ask(t, rig, http.MethodGet, worldsReads()[0], token); code != http.StatusOK {
+		t.Errorf("the reader's token reads: %d", code)
+	}
+	try("the writer", writerKey, claimsFor(rig, writer.Email), http.StatusOK)
+	with := func(iss, key string, value any) map[string]any {
+		c := claimsFor(rig, iss)
+		c[key] = value
+		return c
+	}
+	try("an unregistered iss", readerKey, claimsFor(rig, "someone@rehearsal.invalid"), http.StatusBadRequest)
+	try("the reader's iss under the writer's key", writerKey, claimsFor(rig, readerEmail), http.StatusBadRequest)
+	try("another aud", readerKey, with(readerEmail, "aud", "https://oauth2.googleapis.com/token"), http.StatusBadRequest)
+	try("another scope", readerKey, with(readerEmail, "scope", "https://www.googleapis.com/auth/cloud-platform"), http.StatusBadRequest)
+	past := time.Now().Add(-2 * time.Hour).Unix()
+	expired := claimsFor(rig, readerEmail)
+	expired["iat"], expired["exp"] = past, past+3600
+	try("an expired assertion", readerKey, expired, http.StatusBadRequest)
+
+	if err := rehearsal.SetScenario(rig.Dir, rehearsal.ScenarioTokenRefused); err != nil {
+		t.Fatal(err)
+	}
+	try("the reader in token-refused", readerKey, claimsFor(rig, readerEmail), http.StatusBadRequest)
+	argv := loadArgv(t)
+	asTheApp(t, rig)
+	world(t, rig, argv).sections(t, "token-refused", "credential_refused", "spend", "apps", "policy")
+
+	got := map[string]int{}
+	for _, l := range calls(t, rig) {
+		for _, a := range sent {
+			if strings.Contains(l, a) || strings.Contains(l, strings.SplitN(a, ".", 2)[0]) {
+				t.Errorf("calls.log holds an assertion: %s", l)
+			}
+		}
+		if strings.Contains(l, token) {
+			t.Errorf("calls.log holds a token: %s", l)
+		}
+		if c, ok := parseCall(l); ok && c.who == "token" {
+			got[c.method+" "+c.target+" as "+c.as+" | "+c.outcome]++
+		}
+	}
+	want := map[string]int{
+		"POST /token as reader | ok":                                             1,
+		"POST /token as writer | ok":                                             1,
+		"POST /token as unknown | refused: the assertion did not verify":         5,
+		"POST /token as reader | refused: token-refused refuses every assertion": 2,
+	}
+	if !maps.Equal(got, want) {
+		t.Errorf("calls.log's token lines: %v, want %v", got, want)
+	}
+}
+
+// TestRetiredScenariosAreRefused: signed-out and identity-mismatch went with
+// the gcloud identity. Start and SetScenario each refuse them, saying what
+// replaced them, and write nothing; any other name that is not a scenario
+// says what the scenarios are.
+func TestRetiredScenariosAreRefused(t *testing.T) {
+	if got := rehearsal.RetiredScenarios(); !slices.Equal(got, []string{"signed-out", "identity-mismatch"}) {
+		t.Fatalf("RetiredScenarios = %v", got)
+	}
+	rig := startRig(t, rehearsal.Options{})
+	before := readFile(t, filepath.Join(rig.Dir, "rehearsal.json"))
+	for _, name := range rehearsal.RetiredScenarios() {
+		if slices.Contains(rehearsal.Scenarios(), name) {
+			t.Errorf("%s is still a scenario", name)
+		}
+		want := fmt.Sprintf("scenario %q was retired with ADR 0023 M2; use token-refused or forbidden", name)
+		if err := rehearsal.CheckScenario(name); err == nil || err.Error() != want {
+			t.Errorf("CheckScenario(%q) = %v, want %q", name, err, want)
+		}
+		dir := filepath.Join(t.TempDir(), "r")
+		if r, err := rehearsal.Start(t.Context(), rehearsal.Options{Dir: dir, Home: t.TempDir(), Scenario: name}); err == nil {
+			_ = r.Close()
+			t.Errorf("Start in %s started", name)
+		} else if err.Error() != want {
+			t.Errorf("Start in %s: %v, want %q", name, err, want)
+		}
+		if _, err := os.Stat(dir); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("Start in %s made its directory: %v", name, err)
+		}
+		if err := rehearsal.SetScenario(rig.Dir, name); err == nil || err.Error() != want {
+			t.Errorf("SetScenario(%q) = %v, want %q", name, err, want)
+		}
+	}
+	if after := readFile(t, filepath.Join(rig.Dir, "rehearsal.json")); !bytes.Equal(after, before) {
+		t.Errorf("a refused scenario rewrote rehearsal.json:\n%s", after)
+	}
+	err := rehearsal.CheckScenario("no-such-scenario")
+	if err == nil || !strings.HasPrefix(err.Error(), `unknown scenario "no-such-scenario"; the scenarios are healthy, `) {
+		t.Errorf("an unknown name: %v", err)
+	}
+	for _, name := range rehearsal.Scenarios() {
+		if err := rehearsal.CheckScenario(name); err != nil {
+			t.Errorf("CheckScenario(%q) = %v", name, err)
+		}
+	}
+}
+
+// TestSlowClusterHoldsEveryAnswer: in slow-cluster the cluster holds an API
+// read and a /token mint each for SlowSeconds (cut to 50 ms here); in any
+// other scenario SlowSeconds holds nothing.
+func TestSlowClusterHoldsEveryAnswer(t *testing.T) {
+	rig := startRig(t, rehearsal.Options{})
+	key, email := theReader(t, rig)
+	timed := func(f func()) time.Duration {
+		start := time.Now()
+		f()
+		return time.Since(start)
+	}
+
+	editSpec(t, rig.Dir, func(s *rehearsal.Spec) { s.Scenario, s.SlowSeconds = rehearsal.ScenarioSlowCluster, 0.05 })
+	var token string
+	if took := timed(func() {
+		var code int
+		code, token, _ = mint(t, rig, assertion(t, key, claimsFor(rig, email)))
+		if code != http.StatusOK {
+			t.Fatalf("the slow mint: %d", code)
+		}
+	}); took < 50*time.Millisecond {
+		t.Errorf("slow-cluster minted in %s; it holds /token first", took)
+	}
+	if took := timed(func() {
+		if code, _ := ask(t, rig, http.MethodGet, worldsReads()[0], token); code != http.StatusOK {
+			t.Fatalf("the slow read: %d", code)
+		}
+	}); took < 50*time.Millisecond {
+		t.Errorf("slow-cluster answered in %s; it holds every read first", took)
 	}
 	if s, err := rehearsal.LoadSpec(rig.Dir); err != nil || s.SlowSeconds != 0.05 {
 		t.Fatalf("the spec's slow_seconds: %v, %v", s.SlowSeconds, err)
 	}
-}
 
-// TestFakeKubectlRefusesWhatMustNotReachIt runs the tools in process with an
-// environment given explicitly, never the test runner's own.
-func TestFakeKubectlRefusesWhatMustNotReachIt(t *testing.T) {
-	rig := startRig(t, rehearsal.Options{})
-	// Nothing on the test runner's PATH can stand in: every lookup must
-	// read the environment it is given.
-	t.Setenv("PATH", "/nonexistent-rehearsal-path")
-	kubectl := filepath.Join(rig.KubeBin, "kubectl")
-	base := kubectlEnv(t, rig)
-	args := kubectlArgs(rig, namespaceRead...)
-
-	if code, out, errOut := runTool(kubectl, args, base); code != 0 || !strings.Contains(out, `"shop"`) {
-		t.Fatalf("baseline: exit %d, %s, %s", code, out, errOut)
-	}
-
-	for _, c := range []struct {
-		name, names, value string
-		env                []string
-	}{
-		{"a planted access token", "CLOUDSDK_AUTH_ACCESS_TOKEN", "planted-token-value", with(base, "CLOUDSDK_AUTH_ACCESS_TOKEN=planted-token-value")},
-		{"a planted account", "CLOUDSDK_CORE_ACCOUNT", "someone@work.invalid", with(base, "CLOUDSDK_CORE_ACCOUNT=someone@work.invalid")},
-		{"a proxy", "HTTPS_PROXY", "127.0.0.1:9", with(base, "HTTPS_PROXY=http://127.0.0.1:9")},
-		{"a lower-case proxy", "https_proxy", "127.0.0.1:9", with(base, "https_proxy=http://127.0.0.1:9")},
-		{"FARCAST_CONFIG_HOME", "FARCAST_CONFIG_HOME", "/nonexistent-farcast-home", with(base, "FARCAST_CONFIG_HOME=/nonexistent-farcast-home")},
-		{"credentials", "GOOGLE_APPLICATION_CREDENTIALS", "/nonexistent-credentials", with(base, "GOOGLE_APPLICATION_CREDENTIALS=/nonexistent-credentials")},
-		{"no active configuration named", "CLOUDSDK_ACTIVE_CONFIG_NAME", "", without(base, "CLOUDSDK_ACTIVE_CONFIG_NAME")},
-		{"a relative PATH entry", "PATH", "", with(without(base, "PATH"), "PATH=bin:"+rig.Path())},
-		{"another kubeconfig", "KUBECONFIG", "", with(without(base, "KUBECONFIG"), "KUBECONFIG="+filepath.Join(t.TempDir(), "kubeconfig"))},
-		{"the decoy configuration", "another identity", "", with(without(base, "CLOUDSDK_ACTIVE_CONFIG_NAME"), "CLOUDSDK_ACTIVE_CONFIG_NAME=work")},
-		{"kuberc on", "KUBERC", "/nonexistent-kuberc", with(without(base, "KUBERC"), "KUBERC=/nonexistent-kuberc")},
-		{"no KUBERC", "KUBERC", "", without(base, "KUBERC")},
-	} {
-		code, out, errOut := runTool(kubectl, args, c.env)
-		if code != 1 || out != "" || !strings.Contains(errOut, c.names) || (c.value != "" && strings.Contains(errOut, c.value)) {
-			t.Errorf("%s: exit %d, stdout %q, stderr %q; want exit 1 naming %s and not its value", c.name, code, out, errOut, c.names)
+	editSpec(t, rig.Dir, func(s *rehearsal.Spec) { s.Scenario, s.SlowSeconds = rehearsal.ScenarioHealthy, 5 })
+	if took := timed(func() {
+		_, token, _ = mint(t, rig, assertion(t, key, claimsFor(rig, email)))
+		if code, _ := ask(t, rig, http.MethodGet, worldsReads()[0], token); code != http.StatusOK {
+			t.Fatalf("the read: %d", code)
 		}
-	}
-	for _, l := range calls(t, rig) {
-		for _, v := range []string{"planted-token-value", "someone@work.invalid", "127.0.0.1:9", "/nonexistent"} {
-			if strings.Contains(l, v) {
-				t.Errorf("calls.log holds a value: %s", l)
-			}
-		}
-	}
-
-	// The plugin and gcloud never fall back to a default directory, and
-	// never open one they were not given: the other directory is mode 000,
-	// so reading it would fail with a different message.
-	other := filepath.Join(t.TempDir(), "gcloud")
-	if err := os.Mkdir(other, 0); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(other, 0o700) })
-	for _, c := range []struct {
-		tool string
-		args []string
-	}{
-		{filepath.Join(rig.SDKBin, "gke-gcloud-auth-plugin"), nil},
-		{filepath.Join(rig.SDKBin, "gcloud"), []string{"config", "config-helper", "--format=json"}},
-	} {
-		for _, env := range [][]string{without(base, "CLOUDSDK_CONFIG"), with(without(base, "CLOUDSDK_CONFIG"), "CLOUDSDK_CONFIG="+other)} {
-			code, out, errOut := runTool(c.tool, c.args, env)
-			if code != 1 || out != "" || !strings.Contains(errOut, "CLOUDSDK_CONFIG") || strings.Contains(errOut, "permission") {
-				t.Errorf("%s with %v: exit %d, %q, %q", filepath.Base(c.tool), env, code, out, errOut)
-			}
-		}
-	}
-
-	// A relative argv0, and a link outside the rehearsal's own bin.
-	if code, _, errOut := runTool("kubectl", args, base); code != 1 || !strings.Contains(errOut, "relative") {
-		t.Errorf("relative argv0: exit %d, %q", code, errOut)
-	}
-	elsewhere := filepath.Join(t.TempDir(), "copy")
-	if err := os.MkdirAll(filepath.Join(elsewhere, "kube", "bin"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(testBinary(t), filepath.Join(elsewhere, "kube", "bin", "kubectl")); err != nil {
-		t.Fatal(err)
-	}
-	spec, err := os.ReadFile(filepath.Join(rig.Dir, "rehearsal.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(elsewhere, "rehearsal.json"), spec, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if code, out, errOut := runTool(filepath.Join(elsewhere, "kube", "bin", "kubectl"), args, base); code != 1 || out != "" ||
-		!strings.Contains(errOut, "not this rehearsal's own") {
-		t.Errorf("a copied link: exit %d, %q, %q", code, out, errOut)
-	}
-}
-
-// TestFakeKubectlAnswersOnlyReads: nothing but the reads world sends.
-func TestFakeKubectlAnswersOnlyReads(t *testing.T) {
-	rig := startRig(t, rehearsal.Options{})
-	kubectl := filepath.Join(rig.KubeBin, "kubectl")
-	env := kubectlEnv(t, rig)
-	for _, cmd := range [][]string{
-		{"apply", "-f", "-"},
-		{"delete", "ns", "shop"},
-		{"get", "secrets", "-A"},
-		{"get", "configmap", "x", "-n", "shop", "--ignore-not-found", "-o", "json"},
-		{"logs", "-n", "shop", "deployment/api"},
-	} {
-		code, out, errOut := runTool(kubectl, kubectlArgs(rig, cmd...), env)
-		if code != 1 || out != "" || !strings.Contains(errOut, "reads only") {
-			t.Errorf("%v: exit %d, %q, %q", cmd, code, out, errOut)
-		}
-		if _, ok := rehearsal.ClusterAnswer(spec(t), cmd, time.Now()); ok {
-			t.Errorf("ClusterAnswer answered %v", cmd)
-		}
-	}
-	refused := 0
-	for _, l := range calls(t, rig) {
-		if strings.Contains(l, " kubectl ") && strings.HasSuffix(l, "| refused: no answer to this command") {
-			refused++
-		}
-	}
-	if refused != 5 {
-		t.Errorf("calls.log records %d refusals, want 5", refused)
+	}); took >= 2500*time.Millisecond {
+		t.Errorf("healthy took %s with slow_seconds 5; only slow-cluster holds", took)
 	}
 }
 
@@ -801,12 +1243,9 @@ func spec(t *testing.T) rehearsal.Spec {
 	t.Helper()
 	root := t.TempDir()
 	return rehearsal.Spec{
-		Instance: instance, Account: rehearsal.DefaultAccount, Project: rehearsal.DefaultProject,
+		Instance: instance, Project: rehearsal.DefaultProject,
 		Scenario: rehearsal.ScenarioHealthy, Started: time.Now().UTC().Add(-time.Hour).Truncate(time.Second),
-		Dirs: rehearsal.Dirs{
-			Root: root, Config: filepath.Join(root, "config"), GCloud: filepath.Join(root, "gcloud"),
-			KubeBin: filepath.Join(root, "kube", "bin"), SDKBin: filepath.Join(root, "sdk", "bin"),
-		},
+		Dirs: rehearsal.Dirs{Root: root, Config: filepath.Join(root, "config")},
 		Images: map[string]string{
 			"fatline": "registry.rehearsal.invalid/farcast/fatline@sha256:" + strings.Repeat("1", 64),
 			"shrike":  "registry.rehearsal.invalid/farcast/shrike@sha256:" + strings.Repeat("2", 64),
@@ -815,26 +1254,31 @@ func spec(t *testing.T) rehearsal.Spec {
 	}
 }
 
-type answerRunner struct {
-	spec rehearsal.Spec
-	now  time.Time
-}
-
-func (a answerRunner) Run(_ context.Context, _ []byte, args ...string) ([]byte, error) {
-	out, ok := rehearsal.ClusterAnswer(a.spec, args, a.now)
-	if !ok {
-		return nil, fmt.Errorf("no answer to %v", args)
-	}
-	return out, nil
-}
-
-// TestClusterAnswersDecode reads the answers through farcast's own cluster
-// client, as world does.
+// TestClusterAnswersDecode reads the rig's own cluster through farcast's
+// cluster client, opened as the instance's reader from the rehearsal's record,
+// as world opens it.
 func TestClusterAnswersDecode(t *testing.T) {
-	s := spec(t)
-	now := time.Now().UTC()
-	cl := cluster.NewWithRunner(answerRunner{s, now})
+	rig := startRig(t, rehearsal.Options{})
+	s, err := rehearsal.LoadSpec(rig.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta, err := config.Dir(rig.ConfigDir).LoadInstanceMetadata(instance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ep, err := kube.ParseEndpoint(meta.Endpoint, meta.Region, readFile(t, instanceFile(rig, "cluster-ca.crt")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cl, err := cluster.Open(kube.Config{Endpoint: ep, Identity: kube.Reader, Credential: kube.Credential{
+		Email: meta.Reader.Email, PrivateKeyID: meta.Reader.KeyID, PrivateKeyPEM: readFile(t, instanceFile(rig, "reader.key")),
+	}}, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
 	ctx := t.Context()
+	now := time.Now().UTC()
 
 	sys, err := cl.Workloads(ctx, fldeploy.DefaultNamespace)
 	if err != nil {
@@ -844,13 +1288,13 @@ func TestClusterAnswersDecode(t *testing.T) {
 	for _, w := range sys {
 		got[w.Name] = w
 	}
-	if f := got["fatline"]; f.Desired != 1 || f.Ready != 1 || len(f.Images) != 2 || f.Images[0] != s.Images["fatline"] {
+	if f := got["fatline"]; f.Kind != "Deployment" || f.Desired != 1 || f.Ready != 1 || len(f.Images) != 2 || f.Images[0] != s.Images["fatline"] {
 		t.Errorf("fatline: %+v", f)
 	}
 	if k := got["datasphered"]; k.Kind != "StatefulSet" || k.Desired != 2 || k.Ready != 2 {
 		t.Errorf("datasphered: %+v", k)
 	}
-	if k := got["technocore"]; k.Desired != 1 || k.Ready != 1 {
+	if k := got["technocore"]; k.Kind != "Deployment" || k.Desired != 1 || k.Ready != 1 {
 		t.Errorf("technocore: %+v", k)
 	}
 	shop, err := cl.Workloads(ctx, "shop")
@@ -976,7 +1420,7 @@ func TestStartRefusesTheRealDirectories(t *testing.T) {
 			struct{ name, dir, want string }{"the default farcast directory through the data volume", filepath.Join(data, strings.TrimPrefix(userConfig, home), "farcast", "r"), "default farcast configuration directory"})
 	}
 	for _, c := range cases {
-		rig, err := rehearsal.Start(t.Context(), rehearsal.Options{Dir: c.dir, Home: home, Tools: testBinary(t)})
+		rig, err := rehearsal.Start(t.Context(), rehearsal.Options{Dir: c.dir, Home: home})
 		if err == nil {
 			_ = rig.Close()
 			t.Errorf("%s: Start accepted %s", c.name, c.dir)
@@ -1004,7 +1448,7 @@ func TestStartRefusesTheRealDirectories(t *testing.T) {
 		{"KUBECONFIG", filepath.Join(fresh, "config", "kubeconfig.yaml"), "$KUBECONFIG"},
 	} {
 		t.Setenv(c.key, c.value)
-		rig, err := rehearsal.Start(t.Context(), rehearsal.Options{Dir: fresh, Home: home, Tools: testBinary(t)})
+		rig, err := rehearsal.Start(t.Context(), rehearsal.Options{Dir: fresh, Home: home})
 		if err == nil {
 			_ = rig.Close()
 			t.Errorf("Start accepted %s with %s inside it", fresh, c.key)
@@ -1053,12 +1497,14 @@ func dataVolumeSpelling(t *testing.T, dir string) string {
 }
 
 // TestCAKeyAndKeyringAreUnreadable: both are mode 000, and the app's reads
-// never open them — the config package's read observer sees neither.
+// never open them — the config package's read observer sees neither, nor the
+// writer's credentials.yaml: 'world' reads as the reader alone.
 func TestCAKeyAndKeyringAreUnreadable(t *testing.T) {
 	rig := startRig(t, rehearsal.Options{})
 	inst := filepath.Join(rig.ConfigDir, "instances", instance)
 	caKey := filepath.Join(inst, "fatline", "ca.key")
 	keyring := filepath.Join(inst, "datasphere", "keys.yaml")
+	credentials := filepath.Join(inst, "credentials.yaml")
 	for _, p := range []string{caKey, keyring} {
 		info, err := os.Stat(p)
 		if err != nil {
@@ -1088,7 +1534,7 @@ func TestCAKeyAndKeyringAreUnreadable(t *testing.T) {
 		t.Fatal("the read observer saw nothing; it is not wired")
 	}
 	for _, p := range read {
-		if p == caKey || p == keyring {
+		if p == caKey || p == keyring || p == credentials {
 			t.Errorf("a read opened %s", p)
 		}
 	}
@@ -1127,6 +1573,12 @@ func TestSummarizeSaysNoNames(t *testing.T) {
 				Name    string   `json:"name"`
 				Caveats []string `json:"caveats"`
 			} `json:"instance"`
+			Groups []struct {
+				AppsError *struct {
+					Kind    string `json:"kind"`
+					Message string `json:"message"`
+				} `json:"apps_error"`
+			} `json:"groups"`
 			Sections map[string]struct {
 				Error *struct {
 					Kind    string `json:"kind"`
@@ -1152,6 +1604,12 @@ func TestSummarizeSaysNoNames(t *testing.T) {
 			forbidden = append(forbidden, a.Title)
 		}
 		forbidden = append(forbidden, doc.Instance.Caveats...)
+		for _, g := range doc.Groups {
+			if g.AppsError != nil {
+				forbidden = append(forbidden, g.AppsError.Message)
+				kinds = append(kinds, g.AppsError.Kind)
+			}
+		}
 		for _, sec := range doc.Sections {
 			if sec.Error != nil {
 				forbidden = append(forbidden, sec.Error.Message)
@@ -1182,12 +1640,45 @@ func TestSummarizeSaysNoNames(t *testing.T) {
 	}
 }
 
+// TestSummarizeKnowsEveryKind (A18-18, mutation O45): summarize's closed set
+// of error kinds is the CLI's 21, from the kinds vector the CLI's own test
+// pins: each prints as itself, and each kind ADR 0023 M2 retired as "other".
+// A kind missing from summarize's hand copy would print as "other" with
+// nothing else noticing.
+func TestSummarizeKnowsEveryKind(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "cli", "testdata", "kinds", "kinds.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var v struct {
+		Kinds []string `json:"kinds"`
+	}
+	if err := json.Unmarshal(data, &v); err != nil || len(v.Kinds) != 21 {
+		t.Fatalf("the kinds vector: %v, %d kinds", err, len(v.Kinds))
+	}
+	// The kinds cli's retiredKinds names (ADR 0023 M2), never emitted again.
+	retired := []string{"kubectl_missing", "kubectl_failed", "gcloud_mismatch", "gcloud_signed_out", "auth_tool_missing"}
+	for _, row := range append(slices.Clone(v.Kinds), retired...) {
+		want := row
+		if slices.Contains(retired, row) {
+			want = "other"
+		}
+		var out bytes.Buffer
+		if err := rehearsal.Summarize(strings.NewReader(`{"error":{"kind":"`+row+`","message":"m","code":1}}`), &out); err != nil {
+			t.Fatal(err)
+		}
+		if got := out.String(); got != "error: kind "+want+", exit 1\n" {
+			t.Errorf("the kind %s summarizes as %q, want the kind %s", row, got, want)
+		}
+	}
+}
+
 // TestCloseIsIdempotent: a second Close is nothing, and every listener is gone.
 func TestCloseIsIdempotent(t *testing.T) {
 	rig := startRig(t, rehearsal.Options{})
 	addrs := rig.Listeners()
-	if len(addrs) != 4 {
-		t.Fatalf("listeners %v, want the tunnel, Shrike and two keyholders", addrs)
+	if len(addrs) != 5 || addrs[0] != rig.TunnelAddr || addrs[1] != rig.ClusterAddr {
+		t.Fatalf("listeners %v, want the tunnel, the cluster, Shrike and two keyholders", addrs)
 	}
 	for _, a := range addrs {
 		if host, _, err := net.SplitHostPort(a); err != nil || host != "127.0.0.1" {
@@ -1201,8 +1692,7 @@ func TestCloseIsIdempotent(t *testing.T) {
 		t.Fatalf("second Close: %v", err)
 	}
 	for _, a := range addrs {
-		if c, err := net.DialTimeout("tcp", a, time.Second); err == nil {
-			_ = c.Close()
+		if listening(a) {
 			t.Errorf("%s still accepts after Close", a)
 		}
 	}
@@ -1212,13 +1702,15 @@ func TestCloseIsIdempotent(t *testing.T) {
 }
 
 // TestRestartReusesTheDirectory: a stopped rehearsal starts again on its own
-// directory, on its own tunnel port, with its own leaves, and changes nothing
-// the operator entered.
+// directory, on its own tunnel and cluster ports, with its own leaves and
+// keys, and changes nothing the operator entered; its cluster has a new CA,
+// so cluster-ca.crt is written anew. A restart never reads credentials.yaml,
+// and one in reader-missing knows its reader by reader.crt.
 func TestRestartReusesTheDirectory(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "r")
 	home := t.TempDir()
 	argv := loadArgv(t)
-	o := rehearsal.Options{Dir: dir, Home: home, Tools: testBinary(t)}
+	o := rehearsal.Options{Dir: dir, Home: home}
 	first, err := rehearsal.Start(t.Context(), o)
 	if err != nil {
 		t.Fatal(err)
@@ -1229,18 +1721,24 @@ func TestRestartReusesTheDirectory(t *testing.T) {
 	if err := first.Close(); err != nil {
 		t.Fatal(err)
 	}
-	meta := filepath.Join(first.ConfigDir, "instances", instance, "metadata.yaml")
-	recorded, err := os.ReadFile(meta)
-	if err != nil {
+	meta := instanceFile(first, "metadata.yaml")
+	recorded := readFile(t, meta)
+	firstCA := readFile(t, instanceFile(first, "cluster-ca.crt"))
+	credentials := instanceFile(first, "credentials.yaml")
+	if err := os.Chmod(credentials, 0); err != nil {
 		t.Fatal(err)
 	}
 
 	second := startRig(t, o)
-	if second.TunnelAddr != first.TunnelAddr || second.Dir != first.Dir {
-		t.Errorf("restart moved: %s %s, was %s %s", second.TunnelAddr, second.Dir, first.TunnelAddr, first.Dir)
+	if second.TunnelAddr != first.TunnelAddr || second.ClusterAddr != first.ClusterAddr || second.Dir != first.Dir {
+		t.Errorf("restart moved: %s %s %s, was %s %s %s", second.TunnelAddr, second.ClusterAddr, second.Dir,
+			first.TunnelAddr, first.ClusterAddr, first.Dir)
 	}
 	if now, err := os.ReadFile(meta); err != nil || !bytes.Equal(now, recorded) {
 		t.Errorf("a restart rewrote metadata.yaml (%v)", err)
+	}
+	if ca := readFile(t, instanceFile(second, "cluster-ca.crt")); bytes.Equal(ca, firstCA) {
+		t.Error("a restart kept cluster-ca.crt; its cluster has a new CA")
 	}
 	checkHealthy(t, world(t, second, argv))
 	if info, err := os.Stat(filepath.Join(first.ConfigDir, "instances", instance, "fatline", "ca.key")); err != nil || info.Mode().Perm() != 0 {
@@ -1256,34 +1754,108 @@ func TestRestartReusesTheDirectory(t *testing.T) {
 		t.Errorf("a restart with another scenario: %v", err)
 	}
 	other = o
-	other.Tools = "/usr/bin/true"
-	if _, err := rehearsal.Start(t.Context(), other); err == nil || !strings.Contains(err.Error(), "do not link to") {
-		t.Errorf("a restart with other tools: %v", err)
+	other.Project = "another-project"
+	if _, err := rehearsal.Start(t.Context(), other); err == nil || !strings.Contains(err.Error(), "another project") {
+		t.Errorf("a restart with another project: %v", err)
+	}
+	if err := second.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := rehearsal.SetScenario(dir, rehearsal.ScenarioReaderMissing); err != nil {
+		t.Fatal(err)
+	}
+	third := startRig(t, o)
+	world(t, third, argv).sections(t, "reader-missing after a restart", "credential_missing", "spend", "apps", "policy")
+	if err := rehearsal.SetScenario(dir, rehearsal.ScenarioHealthy); err != nil {
+		t.Fatal(err)
+	}
+	checkHealthy(t, world(t, third, argv))
+}
+
+// TestARehearsalMadeBeforeM24IsRefused: a directory a harness from before ADR
+// 0023 M2.4 made — fake tools and a gcloud directory, and no cluster CA — is
+// refused by Start and by SetScenario, whatever its scenario, and nothing in
+// it changes.
+func TestARehearsalMadeBeforeM24IsRefused(t *testing.T) {
+	parent, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(parent, "old")
+	for _, d := range []string{"kube/bin", "sdk/bin", "gcloud/configurations", "harness", "config/instances/" + instance} {
+		if err := os.MkdirAll(filepath.Join(dir, d), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const want = "this rehearsal was made before ADR 0023 M2.4 moved its cluster into the harness; start a new one in a new directory"
+	for _, scenario := range []string{"signed-out", rehearsal.ScenarioHealthy} {
+		old, err := json.Marshal(map[string]any{
+			"instance": instance, "account": "operator@rehearsal.invalid", "project": rehearsal.DefaultProject,
+			"scenario": scenario, "started": time.Now().UTC().Add(-time.Hour).Truncate(time.Second),
+			"dirs": map[string]string{
+				"root": dir, "config": filepath.Join(dir, "config"), "gcloud": filepath.Join(dir, "gcloud"),
+				"kube_bin": filepath.Join(dir, "kube", "bin"), "sdk_bin": filepath.Join(dir, "sdk", "bin"),
+			},
+			"images": map[string]string{}, "slow_seconds": 25,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "rehearsal.json"), old, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		before := snapshot(t, dir)
+		if rig, err := rehearsal.Start(t.Context(), rehearsal.Options{Dir: dir, Home: t.TempDir()}); err == nil {
+			_ = rig.Close()
+			t.Errorf("%s: a restart of a pre-M2.4 rehearsal started", scenario)
+		} else if err.Error() != want {
+			t.Errorf("%s: Start = %v, want %q", scenario, err, want)
+		}
+		if err := rehearsal.SetScenario(dir, rehearsal.ScenarioSealed); err == nil || err.Error() != want {
+			t.Errorf("%s: SetScenario = %v, want %q", scenario, err, want)
+		}
+		if after := snapshot(t, dir); !maps.Equal(after, before) {
+			t.Errorf("%s: the refusals changed the directory: %v, was %v", scenario, after, before)
+		}
+		if got := readFile(t, filepath.Join(dir, "rehearsal.json")); !bytes.Equal(got, old) {
+			t.Errorf("%s: rehearsal.json was rewritten", scenario)
+		}
 	}
 }
 
-// TestLedgerIgnoresTheCalendar: the first of a month still shows spending
-// split, and a rehearsal past its period refuses every read.
-func TestLedgerIgnoresTheCalendar(t *testing.T) {
-	s := spec(t)
-	now := time.Date(2026, 12, 1, 0, 30, 0, 0, time.UTC)
-	s.Started = now.Add(-time.Hour)
-	args := []string{"get", "configmap", kernel.DefaultCheckpointName, "-n", fldeploy.DefaultNamespace, "--ignore-not-found", "-o", "json"}
-	out, ok := rehearsal.ClusterAnswer(s, args, now)
-	if !ok {
-		t.Fatal("no checkpoint on the first of a month")
-	}
+// checkpointPath is the kernel's checkpoint, as world reads it.
+const checkpointPath = "/api/v1/namespaces/farcast-system/configmaps/" + kernel.DefaultCheckpointName
+
+// checkpointOf decodes a checkpoint ConfigMap's answer.
+func checkpointOf(t *testing.T, body []byte) kernel.Checkpoint {
+	t.Helper()
 	var cm struct {
+		Kind string            `json:"kind"`
 		Data map[string]string `json:"data"`
 	}
-	if err := json.Unmarshal(out, &cm); err != nil {
-		t.Fatal(err)
+	if err := json.Unmarshal(body, &cm); err != nil || cm.Kind != "ConfigMap" {
+		t.Fatalf("not a ConfigMap (%v): %s", err, body)
 	}
 	var cp kernel.Checkpoint
 	if err := json.Unmarshal([]byte(cm.Data[kernel.CheckpointKey()]), &cp); err != nil {
 		t.Fatal(err)
 	}
-	ledger, err := cost.Restore(cp.Ledger)
+	return cp
+}
+
+// TestLedgerIgnoresTheCalendar: the first of a month still shows spending
+// split, and a rehearsal past its period refuses every read with a 500 that
+// says so, never a 503, which the client would retry.
+func TestLedgerIgnoresTheCalendar(t *testing.T) {
+	s := spec(t)
+	now := time.Date(2026, 12, 1, 0, 30, 0, 0, time.UTC)
+	s.Started = now.Add(-time.Hour)
+	code, body := rehearsal.ClusterAnswer(s, http.MethodGet, checkpointPath, "", now)
+	if code != http.StatusOK {
+		t.Fatalf("no checkpoint on the first of a month: %d %s", code, body)
+	}
+	ledger, err := cost.Restore(checkpointOf(t, body).Ledger)
 	if err != nil {
 		t.Fatalf("cost.Restore: %v", err)
 	}
@@ -1294,21 +1866,45 @@ func TestLedgerIgnoresTheCalendar(t *testing.T) {
 		t.Errorf("accrual on the first of a month: %+v", a)
 	}
 	late := s.Started.Add(25*24*time.Hour + time.Hour)
-	if _, ok := rehearsal.ClusterAnswer(s, args, late); ok {
-		t.Error("a checkpoint past the period")
+	for _, target := range worldsReads() {
+		u, err := url.Parse(target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		code, body := rehearsal.ClusterAnswer(s, http.MethodGet, u.Path, u.RawQuery, late)
+		var st struct {
+			Kind    string `json:"kind"`
+			Message string `json:"message"`
+		}
+		if code != http.StatusInternalServerError || json.Unmarshal(body, &st) != nil || st.Kind != "Status" ||
+			!strings.Contains(st.Message, "older than its 30-day period") {
+			t.Errorf("%s past the period: %d %s", target, code, body)
+		}
 	}
 
 	home := t.TempDir()
 	rig := startRig(t, rehearsal.Options{Home: home})
 	editSpec(t, rig.Dir, func(s *rehearsal.Spec) { s.Started = time.Now().UTC().Add(-25*24*time.Hour - time.Hour) })
-	code, stdout, errOut := runTool(filepath.Join(rig.KubeBin, "kubectl"), kubectlArgs(rig, namespaceRead...), kubectlEnv(t, rig))
-	if code != 1 || stdout != "" || !strings.Contains(errOut, "older than its 30-day period") {
-		t.Errorf("an expired rehearsal: exit %d, %q, %q", code, stdout, errOut)
+	argv := loadArgv(t)
+	asTheApp(t, rig)
+	doc := world(t, rig, argv)
+	doc.sections(t, "expired", "cluster_rejected", "spend", "apps", "policy")
+	if m := doc.sectionMessage("spend"); !strings.Contains(m, "older than its 30-day period") {
+		t.Errorf("an expired rehearsal's spend says %q", m)
+	}
+	refused := 0
+	for _, c := range clusterCalls(t, rig) {
+		if c.outcome == "refused: this rehearsal is older than its 30-day period; start a new one" {
+			refused++
+		}
+	}
+	if refused == 0 {
+		t.Errorf("calls.log records no expired read: %v", calls(t, rig))
 	}
 	if err := rig.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := rehearsal.Start(t.Context(), rehearsal.Options{Dir: rig.Dir, Home: home, Tools: testBinary(t)}); err == nil ||
+	if _, err := rehearsal.Start(t.Context(), rehearsal.Options{Dir: rig.Dir, Home: home}); err == nil ||
 		!strings.Contains(err.Error(), "older than its 30-day period") {
 		t.Errorf("a restart of an expired rehearsal: %v", err)
 	}
@@ -1319,29 +1915,32 @@ func TestLedgerIgnoresTheCalendar(t *testing.T) {
 // never a level set beside a total that contradicts it (phase 7, F6). The
 // scenarios at the limit are over it from their first read to their last,
 // with the calibration still exactly one; every other scenario is well under.
+// unauthorized and forbidden serve no checkpoint at all.
 func TestTheLevelIsTheLedgersOwn(t *testing.T) {
 	s := spec(t)
-	args := []string{"get", "configmap", kernel.DefaultCheckpointName, "-n", fldeploy.DefaultNamespace, "--ignore-not-found", "-o", "json"}
 	for _, name := range rehearsal.Scenarios() {
 		s.Scenario = name
 		// A rehearsal lives between 24 and 25 days: its period starts at the
 		// midnight five days before it did.
 		for _, after := range []time.Duration{0, time.Hour, 12 * 24 * time.Hour, 24 * 24 * time.Hour} {
 			now := s.Started.Add(after)
-			out, ok := rehearsal.ClusterAnswer(s, args, now)
-			if !ok {
-				t.Fatalf("%s, %s in: no checkpoint", name, after)
+			code, body := rehearsal.ClusterAnswer(s, http.MethodGet, checkpointPath, "", now)
+			switch name {
+			case rehearsal.ScenarioUnauthorized:
+				if code != http.StatusUnauthorized {
+					t.Errorf("%s: %d, want 401", name, code)
+				}
+				continue
+			case rehearsal.ScenarioForbidden:
+				if code != http.StatusForbidden {
+					t.Errorf("%s: %d, want 403", name, code)
+				}
+				continue
 			}
-			var cm struct {
-				Data map[string]string `json:"data"`
+			if code != http.StatusOK {
+				t.Fatalf("%s, %s in: no checkpoint: %d %s", name, after, code, body)
 			}
-			var cp kernel.Checkpoint
-			if err := json.Unmarshal(out, &cm); err != nil {
-				t.Fatal(err)
-			}
-			if err := json.Unmarshal([]byte(cm.Data[kernel.CheckpointKey()]), &cp); err != nil {
-				t.Fatal(err)
-			}
+			cp := checkpointOf(t, body)
 			ledger, err := cost.Restore(cp.Ledger)
 			if err != nil {
 				t.Fatal(err)
@@ -1430,7 +2029,7 @@ func TestKeyholdersAnswerStateOnly(t *testing.T) {
 // is refused.
 func TestTheRehearsalKeeperIsEnrolledByRequest(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "r")
-	o := rehearsal.Options{Dir: dir, Home: t.TempDir(), Tools: testBinary(t)}
+	o := rehearsal.Options{Dir: dir, Home: t.TempDir()}
 	rig, err := rehearsal.Start(t.Context(), o)
 	if err != nil {
 		t.Fatal(err)

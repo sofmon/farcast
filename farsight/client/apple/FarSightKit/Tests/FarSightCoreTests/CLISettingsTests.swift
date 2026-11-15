@@ -32,91 +32,77 @@ struct CLISettingsTests {
     }
 
     @Test("a path that is not canonical and absolute is refused", arguments: [
-        "~/bin/kubectl", "bin/kubectl", "/usr//local/bin/kubectl", "/usr/local/bin/kubectl/", "/usr/./local/bin/kubectl",
-        "/usr/../local/bin/kubectl", "./kubectl",
+        "~/bin/farcast", "bin/farcast", "/usr//local/bin/farcast", "/usr/local/bin/farcast/", "/usr/./local/bin/farcast",
+        "/usr/../local/bin/farcast", "./farcast",
     ])
     func notCanonical(path: String) {
         var settings = Fixture.settings
-        settings.kubectl = path
-        #expect(Self.problem(.kubectl, settings) == "must be an absolute path, with no \"~\", \".\", \"..\", empty part or trailing \"/\"")
+        settings.farcast = path
+        settings.configDirectory = path
+        let message = "must be an absolute path, with no \"~\", \".\", \"..\", empty part or trailing \"/\""
+        #expect(Self.problem(.farcast, settings) == message)
+        #expect(Self.problem(.configDirectory, settings) == message)
     }
 
-    @Test("a character PATH cannot carry is refused; a space is not", arguments: [
-        "/usr/local/b:in/kubectl", "/usr/local/b\u{202E}in/kubectl", "/usr/local/b\nin/kubectl", "/usr/local/b\u{9B}in/kubectl",
+    @Test("a ':' or a character that does not print is refused, in either path", arguments: [
+        "/usr/local/b:in/farcast", "/usr/local/b\u{202E}in/farcast", "/usr/local/b\nin/farcast", "/usr/local/b\u{9B}in/farcast",
     ])
     func unprintable(path: String) {
         var settings = Fixture.settings
-        settings.kubectl = path
-        #expect(Self.problem(.kubectl, settings) == "holds a character PATH cannot carry")
+        settings.farcast = path
+        settings.configDirectory = path
+        #expect(Self.problem(.farcast, settings) == "holds a \":\" or a character that does not print")
+        #expect(Self.problem(.configDirectory, settings) == "holds a \":\" or a character that does not print")
     }
 
-    @Test("a space is a character PATH carries")
+    @Test("a space is no such character")
     func space() {
         var settings = Fixture.settings
-        settings.kubectl = "/Users/op/my tools/kubectl"
-        #expect(Self.problem(.kubectl, settings) == nil)
+        settings.farcast = "/Users/op/my tools/farcast"
+        settings.configDirectory = "/Users/op/Library/Application Support/farcast"
+        #expect(Self.problems(settings).isEmpty)
     }
 
     @Test("a path inside FarCast.app is refused, and so is one that resolves into it")
     func insideTheBundle() {
         var settings = Fixture.settings
-        settings.kubectl = "/Applications/FarCast.app/Contents/MacOS/kubectl"
-        #expect(Self.problem(.kubectl, settings) == "is inside FarCast.app")
+        settings.farcast = "/Applications/FarCast.app/Contents/MacOS/farcast"
+        #expect(Self.problem(.farcast, settings) == "is inside FarCast.app")
         settings.configDirectory = Self.bundle
         #expect(Self.problem(.configDirectory, settings) == "is inside FarCast.app")
 
         var probe = Fixture.probe()
-        probe.links[Fixture.settings.kubectl] = "/Applications/FarCast.app/Contents/Resources/kubectl"
-        probe.entries["/Applications/FarCast.app/Contents/Resources/kubectl"] = Fixture.executable
-        #expect(Self.problem(.kubectl, Fixture.settings, probe) == "is inside FarCast.app")
+        probe.links[Fixture.settings.farcast] = "/Applications/FarCast.app/Contents/Resources/farcast"
+        probe.entries["/Applications/FarCast.app/Contents/Resources/farcast"] = Fixture.executable
+        #expect(Self.problem(.farcast, Fixture.settings, probe) == "is inside FarCast.app")
 
         settings = Fixture.settings
         settings.farcast = "/Applications/FarCast.application/farcast"
         #expect(Self.problem(.farcast, settings) == nil)
     }
 
-    @Test("a tool must have the name it is run by; farcast may have any")
-    func basename() {
+    @Test("farcast may have any name: it is run by its path")
+    func anyName() {
         var settings = Fixture.settings
-        settings.kubectl = "/usr/local/bin/kubectl-1.33"
-        settings.authPlugin = "/opt/homebrew/bin/auth-plugin"
-        settings.gcloud = "/opt/homebrew/bin/gcloud.sh"
         settings.farcast = "/Users/op/src/farcast/bin/farcast-dev"
-        let problems = Self.problems(settings)
-        #expect(problems.map(\.field) == [.kubectl, .authPlugin, .gcloud])
-        #expect(Self.problem(.kubectl, settings) == "farcast runs it by the name \"kubectl\", so the file must be called that")
-        #expect(Self.problem(.authPlugin, settings)?.contains("\"gke-gcloud-auth-plugin\"") == true)
-        #expect(Self.problem(.gcloud, settings)?.contains("\"gcloud\"") == true)
-    }
-
-    @Test("a tool's name is said with what runs it by that name")
-    func basenameNamesTheRunner() {
-        var settings = Fixture.settings
-        settings.kubectl = "/usr/local/bin/kubectl-1.33"
-        settings.authPlugin = "/opt/homebrew/bin/auth-plugin"
-        settings.gcloud = "/opt/homebrew/bin/gcloud.sh"
-        // farcast runs only kubectl; kubectl runs the plugin the instance's
-        // kubeconfig names; the plugin runs gcloud.
-        #expect(Self.problem(.kubectl, settings) == "farcast runs it by the name \"kubectl\", so the file must be called that")
-        #expect(Self.problem(.authPlugin, settings) == "kubectl runs it by the name \"gke-gcloud-auth-plugin\", so the file must be called that")
-        #expect(Self.problem(.gcloud, settings) == "gke-gcloud-auth-plugin runs it by the name \"gcloud\", so the file must be called that")
+        #expect(Self.problems(settings).isEmpty)
     }
 
     @Test("a link into a directory anyone can write is refused; one into a closed directory is not")
     func linkIntoAnOpenDirectory() {
         var probe = Fixture.probe()
-        probe.links[Fixture.settings.kubectl] = "/shared/kubectl"
-        probe.entries["/shared/kubectl"] = Fixture.executable
+        probe.links[Fixture.settings.farcast] = "/shared/farcast"
+        probe.entries["/shared/farcast"] = Fixture.executable
         probe.entries["/shared"] = .directory(worldWritable: true)
-        #expect(Self.problem(.kubectl, Fixture.settings, probe) == "it links to a file in a directory anyone on this Mac can write")
+        #expect(Self.problem(.farcast, Fixture.settings, probe) == "it links to a file in a directory anyone on this Mac can write")
 
         probe.entries["/shared"] = Fixture.directory
-        #expect(Self.problem(.kubectl, Fixture.settings, probe) == nil)
+        #expect(Self.problem(.farcast, Fixture.settings, probe) == nil)
 
         // A link into an open directory is said as the directory it is typed in, when that is open too.
         probe.entries["/shared"] = .directory(worldWritable: true)
-        probe.entries["/usr/local/bin"] = .directory(worldWritable: true)
-        #expect(Self.problem(.kubectl, Fixture.settings, probe) == "its directory is writable by anyone on this Mac")
+        probe.entries["/Users/op/src/farcast/bin"] = .directory(worldWritable: true)
+        #expect(Self.problem(.farcast, Fixture.settings, probe) == "its directory is writable by anyone on this Mac")
     }
 
     @Test("a path into the bundle is refused whichever form either is given in")
@@ -126,12 +112,12 @@ struct CLISettingsTests {
         let given = "/private/var/folders/xy/T/AppTranslocation/0A/d/FarCast.app"
         let resolved = "/var/folders/xy/T/AppTranslocation/0A/d/FarCast.app"
         var settings = Fixture.settings
-        settings.kubectl = "\(resolved)/Contents/MacOS/kubectl"
+        settings.farcast = "\(resolved)/Contents/MacOS/farcast"
         var probe = Fixture.probe(for: settings)
         probe.links[given] = resolved
         probe.entries[resolved] = Fixture.directory
         let problems = settings.problems(probe: probe, bundlePath: given)
-        #expect(problems == [SettingsProblem(field: .kubectl, message: "is inside FarCast.app")])
+        #expect(problems == [SettingsProblem(field: .farcast, message: "is inside FarCast.app")])
     }
 
     @Test("the bundle itself is inside it, though its path ends with a slash")
@@ -146,7 +132,7 @@ struct CLISettingsTests {
         #expect(settings.problems(probe: probe, bundlePath: "/Applications/FarCast.application/").isEmpty)
     }
 
-    @Test("a tool is an executable file only its owner can replace", arguments: [
+    @Test("farcast is an executable file only its owner can replace", arguments: [
         (FileEntry.missing, "nothing is at this path"),
         (.directory(worldWritable: false), "is not a file"),
         (.other, "is not a file"),
@@ -155,20 +141,19 @@ struct CLISettingsTests {
     ])
     func toolEntry(entry: FileEntry, message: String) {
         var probe = Fixture.probe()
-        probe.entries[Fixture.settings.gcloud] = entry
-        #expect(Self.problem(.gcloud, Fixture.settings, probe) == message)
+        probe.entries[Fixture.settings.farcast] = entry
+        #expect(Self.problem(.farcast, Fixture.settings, probe) == message)
     }
 
-    @Test("a tool in a directory anyone can write is refused; group-writable is not")
+    @Test("farcast in a directory anyone can write is refused; group-writable is not")
     func toolDirectory() {
         var probe = Fixture.probe()
-        probe.entries["/opt/homebrew/bin"] = .directory(worldWritable: true)
-        #expect(Self.problem(.gcloud, Fixture.settings, probe) == "its directory is writable by anyone on this Mac")
-        #expect(Self.problem(.authPlugin, Fixture.settings, probe) == "its directory is writable by anyone on this Mac")
-        #expect(Self.problem(.kubectl, Fixture.settings, probe) == nil)
+        probe.entries["/Users/op/src/farcast/bin"] = .directory(worldWritable: true)
+        #expect(Self.problem(.farcast, Fixture.settings, probe) == "its directory is writable by anyone on this Mac")
+        #expect(Self.problem(.configDirectory, Fixture.settings, probe) == nil)
     }
 
-    @Test("a configuration directory is a directory only its owner can write", arguments: [
+    @Test("the configuration directory is a directory only its owner can write", arguments: [
         (FileEntry.missing, "is not a directory"),
         (.file(executable: false, worldWritable: false), "is not a directory"),
         (.other, "is not a directory"),
@@ -177,53 +162,21 @@ struct CLISettingsTests {
     func directories(entry: FileEntry, message: String) {
         var probe = Fixture.probe()
         probe.entries[Fixture.settings.configDirectory] = entry
-        probe.entries[Fixture.settings.gcloudDirectory] = entry
         #expect(Self.problem(.configDirectory, Fixture.settings, probe) == message)
-        #expect(Self.problem(.gcloudDirectory, Fixture.settings, probe) == message)
+        #expect(Self.problem(.farcast, Fixture.settings, probe) == nil)
     }
 
-    @Test("a tool shadowed on farcast's PATH is refused, on that tool's row")
-    func shadowing() {
-        var probe = Fixture.probe()
-        probe.entries["/usr/local/bin/gcloud"] = Fixture.executable  // in kubectl's directory, which comes first
-        let problems = Self.problems(Fixture.settings, probe)
-        #expect(problems == [SettingsProblem(
-            field: .gcloud,
-            message: "/usr/local/bin/gcloud comes first on the PATH farcast gets, so it would run instead of this one"
-        )])
-
-        // A system directory comes last, so one there shadows nothing.
-        var system = Fixture.probe()
-        system.entries["/usr/bin/kubectl"] = Fixture.executable
-        #expect(Self.problems(Fixture.settings, system).isEmpty)
-
-        // One that is not executable shadows nothing either.
-        var inert = Fixture.probe()
-        inert.entries["/usr/local/bin/gcloud"] = .file(executable: false, worldWritable: false)
-        #expect(Self.problems(Fixture.settings, inert).isEmpty)
-
-        // And shadowing is not checked while a tool has a problem of its own.
-        probe.entries[Fixture.settings.kubectl] = .missing
-        #expect(Self.problems(Fixture.settings, probe).map(\.field) == [.kubectl])
-    }
-
-    @Test("a blank form suggests the two directories and no tool")
+    @Test("a blank form suggests the configuration directory and no farcast")
     func suggested() {
         let suggested = CLISettings.suggested(home: "/Users/op")
-        #expect(suggested == CLISettings(
-            configDirectory: "/Users/op/Library/Application Support/farcast",
-            gcloudDirectory: "/Users/op/.config/gcloud"
-        ))
+        #expect(suggested == CLISettings(configDirectory: "/Users/op/Library/Application Support/farcast"))
         #expect(CLISettings.suggested(home: "/Users/op/") == suggested)
-        #expect(suggested.farcast.isEmpty && suggested.kubectl.isEmpty && suggested.authPlugin.isEmpty && suggested.gcloud.isEmpty)
+        #expect(suggested.farcast.isEmpty)
     }
 
-    @Test("each row's title")
+    @Test("each row's title: two rows")
     func titles() {
-        #expect(CLISettings.Field.allCases.map(\.title) == [
-            "farcast", "kubectl", "gke-gcloud-auth-plugin", "gcloud",
-            "farcast configuration directory", "gcloud configuration directory",
-        ])
+        #expect(CLISettings.Field.allCases.map(\.title) == ["farcast", "farcast configuration directory"])
     }
 
     @Test("the store keeps confirmed settings, forgets them, and reads nothing from garbage")
@@ -247,5 +200,30 @@ struct CLISettingsTests {
         #expect(store.load() == nil)
         defaults.set("a string", forKey: CLISettingsStore.key)
         #expect(store.load() == nil)
+    }
+
+    @Test("settings saved with six paths load as the two, and the next save keeps only those")
+    func storeSixKeys() throws {
+        let suite = "farsight.tests.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        // As a build before ADR 0023 M2.4 saved them, under the same key.
+        let saved = """
+            {"confirmedAt":1794477600.5,"settings":{"authPlugin":"/opt/homebrew/bin/gke-gcloud-auth-plugin",\
+            "configDirectory":"/Users/op/Library/Application Support/farcast","farcast":"/Users/op/src/farcast/bin/farcast",\
+            "gcloud":"/opt/homebrew/bin/gcloud","gcloudDirectory":"/Users/op/.config/gcloud","kubectl":"/usr/local/bin/kubectl"}}
+            """
+        defaults.set(Data(saved.utf8), forKey: CLISettingsStore.key)
+        let store = CLISettingsStore(defaults: defaults)
+        let loaded = try #require(store.load())
+        #expect(loaded == ConfirmedCLISettings(settings: Fixture.settings, confirmedAt: Date(timeIntervalSince1970: 1_794_477_600.5)))
+
+        store.save(loaded)
+        let written = try #require(defaults.data(forKey: CLISettingsStore.key))
+        let object = try #require(try JSONSerialization.jsonObject(with: written) as? [String: Any])
+        let settings = try #require(object["settings"] as? [String: Any])
+        #expect(Set(settings.keys) == ["farcast", "configDirectory"])
+        #expect(Set(object.keys) == ["settings", "confirmedAt"])
+        #expect(store.load() == loaded)
     }
 }

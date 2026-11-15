@@ -12,9 +12,11 @@ import (
 	"time"
 )
 
-// The pinned gcloud account and the per-namespace provenance survive a write
-// and a read, and a record written before either loads with both empty.
-func TestGCloudAccountAndDeploymentsRoundTrip(t *testing.T) {
+// The per-namespace provenance survives a write and a read, and a record
+// written before it loads with none. A record that still carries the
+// gcloud_account an older farcast pinned (retired by ADR 0023 M2.4) loads as
+// before, and the key is gone at its next save.
+func TestARetiredGCloudAccountLoadsAndDeploymentsRoundTrip(t *testing.T) {
 	d := testDir(t)
 	if err := d.CreateInstance("atlas"); err != nil {
 		t.Fatal(err)
@@ -22,7 +24,7 @@ func TestGCloudAccountAndDeploymentsRoundTrip(t *testing.T) {
 	at := time.Date(2026, 11, 12, 9, 30, 0, 0, time.UTC)
 	in := &InstanceMetadata{
 		Name: "atlas", Provider: "gke", Project: "proj-atlas", Region: "europe-west4",
-		Status: InstanceRunning, GCloudAccount: "operator@example.org",
+		Status: InstanceRunning,
 		Deployments: map[string]Deployment{
 			"shop": {Repository: "https://github.com/example/shop", Ref: "refs/heads/main",
 				Commit: "4f2a9c1e", ManifestDigest: "sha256:ab", DeployedAt: at, StorageWired: true},
@@ -31,23 +33,31 @@ func TestGCloudAccountAndDeploymentsRoundTrip(t *testing.T) {
 	if err := d.SaveInstanceMetadata("atlas", in); err != nil {
 		t.Fatal(err)
 	}
-	got, err := d.LoadInstanceMetadata("atlas")
+	path := filepath.Join(d.InstancePath("atlas"), "metadata.yaml")
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.GCloudAccount != in.GCloudAccount {
-		t.Errorf("gcloud account = %q", got.GCloudAccount)
+	if !strings.Contains(string(raw), "deployments:") {
+		t.Errorf("the record does not carry the deployments:\n%s", raw)
+	}
+	// As an older farcast left it: the pinned account among the fields.
+	if err := os.WriteFile(path, append(raw, []byte("gcloud_account: operator@example.org\n")...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := d.LoadInstanceMetadata("atlas")
+	if err != nil {
+		t.Fatalf("a record with the retired gcloud_account no longer loads: %v", err)
 	}
 	if dep := got.Deployments["shop"]; dep.Repository != "https://github.com/example/shop" || !dep.DeployedAt.Equal(at) || !dep.StorageWired || dep.Commit != "4f2a9c1e" {
 		t.Errorf("deployment = %+v", dep)
 	}
-
-	raw, err := os.ReadFile(filepath.Join(d.InstancePath("atlas"), "metadata.yaml"))
-	if err != nil {
+	if _, err := d.UpdateInstanceMetadata("atlas", func(*InstanceMetadata) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(raw), "gcloud_account: operator@example.org") || !strings.Contains(string(raw), "deployments:") {
-		t.Errorf("the record does not carry the new fields:\n%s", raw)
+	raw, _ = os.ReadFile(path)
+	if strings.Contains(string(raw), "gcloud_account") || !strings.Contains(string(raw), "deployments:") {
+		t.Errorf("the next save kept the retired key, or lost the deployments:\n%s", raw)
 	}
 
 	old := &InstanceMetadata{Name: "old", Provider: "gke", Region: "us-central1", Status: InstanceRunning}
@@ -58,8 +68,8 @@ func TestGCloudAccountAndDeploymentsRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	raw, _ = os.ReadFile(filepath.Join(d.InstancePath("old"), "metadata.yaml"))
-	if strings.Contains(string(raw), "gcloud_account") || strings.Contains(string(raw), "deployments") {
-		t.Errorf("an unpinned record with no deployments writes the fields anyway:\n%s", raw)
+	if strings.Contains(string(raw), "deployments") {
+		t.Errorf("a record with no deployments writes the field anyway:\n%s", raw)
 	}
 }
 
@@ -138,7 +148,7 @@ func TestLoadDialIdentityNeverOpensTheCAKey(t *testing.T) {
 // A record that does not parse is described by the kind of fault and its
 // line, never in the parser's words: those quote the lines around the fault,
 // and some of them quote a value, and a record holds the project, the
-// endpoints and the pinned account.
+// endpoints and the reader's account.
 func TestParseFaultNeverQuotesTheRecord(t *testing.T) {
 	d := testDir(t)
 	if err := d.CreateInstance("atlas"); err != nil {
@@ -146,7 +156,8 @@ func TestParseFaultNeverQuotesTheRecord(t *testing.T) {
 	}
 	full := &InstanceMetadata{
 		Name: "atlas", Provider: "gke", Project: "proj-secret-7", Region: "europe-west4",
-		Endpoint: "gke-9z8y.europe-west4.gke.goog", Status: InstanceRunning, GCloudAccount: "operator@example.org",
+		Endpoint: "gke-9z8y.europe-west4.gke.goog", Status: InstanceRunning,
+		Reader:  &Reader{Email: "operator@example.org"},
 		Carrier: &Carrier{Type: "nlb", Endpoint: "203.0.113.9:443", ServerName: "fatline.atlas.farcast"},
 	}
 	if err := d.SaveInstanceMetadata("atlas", full); err != nil {
@@ -164,10 +175,10 @@ func TestParseFaultNeverQuotesTheRecord(t *testing.T) {
 		broken string
 		says   string
 	}{
-		// A syntax error right after the account: the parser's own text
-		// shows the lines around it, the account and the project among them.
-		{"syntax", strings.Replace(string(good), "gcloud_account: operator@example.org\n",
-			"gcloud_account: operator@example.org\nbroken: [unclosed\n", 1), "a YAML syntax error at line "},
+		// A syntax error right after the reader's account: the parser's own
+		// text shows the lines around it, the account among them.
+		{"syntax", strings.Replace(string(good), "email: operator@example.org\n",
+			"email: operator@example.org\nbroken: [unclosed\n", 1), "a YAML syntax error at line "},
 		// A value of the wrong type: the parser's own text quotes the line
 		// that holds it, and the lines before.
 		{"wrong type", string(good) + "fatline_deployed: operator@example.org\n", "a value of the wrong type at line "},

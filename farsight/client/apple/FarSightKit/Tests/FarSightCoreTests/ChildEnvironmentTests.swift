@@ -6,7 +6,7 @@ import Testing
 /// app's own (ADR 0021 decision 9 and Verification 5).
 @Suite("The child's environment")
 struct ChildEnvironmentTests {
-    @Test("only the allowlist reaches farcast; CLOUDSDK_CONFIG is the confirmed directory, never the app's")
+    @Test("only the allowlist reaches farcast; no CLOUDSDK_ variable, the app's CLOUDSDK_CONFIG among them")
     func buildsOnlyTheAllowlist() throws {
         let parent = [
             "PATH": "/Users/op/bin:/usr/bin:/bin",
@@ -26,52 +26,51 @@ struct ChildEnvironmentTests {
             "CLOUDSDK_ACTIVE_CONFIG_NAME": "work",
             "CLOUDSDK_PYTHON": "/usr/bin/python3",
             "GOOGLE_APPLICATION_CREDENTIALS": "/Users/op/key.json",
+            "GODEBUG": "http2debug=2",
             "DYLD_INSERT_LIBRARIES": "/tmp/x.dylib",
             "GOFLAGS": "-mod=mod",
             "PYTHONPATH": "/tmp",
             "SSH_AUTH_SOCK": "/tmp/agent",
             "LC_bad": "x",
         ]
-        let settings = Fixture.settings
-        let child = try ChildEnvironment.build(parent: parent, settings: settings)
-        #expect(Set(child.keys) == ["HOME", "TMPDIR", "LANG", "LC_ALL", "PATH", "CLOUDSDK_CONFIG"])
+        let child = try ChildEnvironment.build(parent: parent)
+        #expect(Set(child.keys) == ["HOME", "TMPDIR", "LANG", "LC_ALL", "PATH"])
         #expect(child["HOME"] == "/Users/op")
         #expect(child["TMPDIR"] == "/tmp/x")
         #expect(child["LANG"] == "en_US.UTF-8" && child["LC_ALL"] == "en_US.UTF-8")
-        #expect(child["PATH"] == ChildEnvironment.path(for: settings))
-        #expect(child["CLOUDSDK_CONFIG"] == settings.gcloudDirectory)
-        #expect(child["CLOUDSDK_CONFIG"] != parent["CLOUDSDK_CONFIG"])
+        #expect(child["PATH"] == "/usr/bin:/bin:/usr/sbin:/sbin")
+        #expect(child["CLOUDSDK_CONFIG"] == nil)
+        #expect(!child.keys.contains { $0.hasPrefix("CLOUDSDK") || $0.hasPrefix("GO") })
     }
 
-    @Test("PATH is the tools' directories in order, once each, then the system's; never farcast's")
-    func pathOrder() {
+    @Test("PATH is the system's own directories and nothing else, whatever Settings hold; never farcast's")
+    func pathIsTheSystemDirectories() async throws {
         #expect(ChildEnvironment.systemDirectories == ["/usr/bin", "/bin", "/usr/sbin", "/sbin"])
-        let settings = Fixture.settings
-        #expect(ChildEnvironment.path(for: settings) == "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin")
-        #expect(!ChildEnvironment.path(for: settings).contains("/Users/op/src/farcast/bin"))
-
-        var system = settings
-        system.kubectl = "/usr/bin/kubectl"
-        #expect(ChildEnvironment.path(for: system) == "/usr/bin:/opt/homebrew/bin:/bin:/usr/sbin:/sbin")
-
-        var spread = settings
-        spread.authPlugin = "/opt/google/bin/gke-gcloud-auth-plugin"
-        spread.gcloud = "/opt/google/sdk/bin/gcloud"
-        #expect(ChildEnvironment.path(for: spread) == "/usr/local/bin:/opt/google/bin:/opt/google/sdk/bin:/usr/bin:/bin:/usr/sbin:/sbin")
-
-        #expect(ChildEnvironment.path(for: CLISettings()) == "/usr/bin:/bin:/usr/sbin:/sbin")
+        #expect(ChildEnvironment.path == "/usr/bin:/bin:/usr/sbin:/sbin")
+        // Settings are no input to it: what a reader runs farcast with
+        // carries the same PATH whichever paths were confirmed.
+        for settings in [Fixture.settings, CLISettings(farcast: "/opt/homebrew/bin/farcast", configDirectory: "/Users/op/c")] {
+            let executor = try Fixture.executor(settings: settings)
+            _ = try await Fixture.reader(executor, settings: settings).listing()
+            #expect(executor.invocations.count == 2)
+            for invocation in executor.invocations {
+                #expect(invocation.environment["PATH"] == "/usr/bin:/bin:/usr/sbin:/sbin")
+                #expect(!(invocation.environment["PATH"] ?? "").contains("/opt/homebrew/bin"))
+                #expect(!(invocation.environment["PATH"] ?? "").contains("/Users/op/src/farcast/bin"))
+            }
+        }
     }
 
     @Test("a TMPDIR that is not absolute is dropped")
     func relativeTmpdirIsDropped() throws {
-        let child = try ChildEnvironment.build(parent: ["HOME": "/Users/op", "TMPDIR": "tmp"], settings: Fixture.settings)
+        let child = try ChildEnvironment.build(parent: ["HOME": "/Users/op", "TMPDIR": "tmp"])
         #expect(child["TMPDIR"] == nil)
-        #expect(Set(child.keys) == ["HOME", "PATH", "CLOUDSDK_CONFIG"])
+        #expect(Set(child.keys) == ["HOME", "PATH"])
     }
 
     @Test("without an absolute home directory, nothing is built", arguments: [[:], ["HOME": ""], ["HOME": "Users/op"]])
     func missingHomeThrows(parent: [String: String]) {
-        let refusal = failure { _ = try ChildEnvironment.build(parent: parent, settings: Fixture.settings) }
+        let refusal = failure { _ = try ChildEnvironment.build(parent: parent) }
         #expect(refusal == ReadFailure(kind: .internal, message: "FarCast has no home directory to give farcast"))
     }
 

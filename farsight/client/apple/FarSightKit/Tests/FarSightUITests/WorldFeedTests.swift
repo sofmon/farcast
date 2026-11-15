@@ -93,13 +93,13 @@ struct WorldFeedTests {
         #expect(!feed.hasListed)
 
         reader.set(listing: .instances([Worlds.listing("atlas")]))
-        reader.set("atlas", .failure(ReadFailure(kind: .gcloudMismatch, message: "no configuration matches")))
+        reader.set("atlas", .failure(ReadFailure(kind: .versionSkew, message: "farcast wrote schema 3 and this FarCast reads schema 2; build both from the same commit")))
         await feed.refresh()?.value
         #expect(feed.listingProblem == nil)
         let atlas = try #require(feed.world.instances.first)
         #expect(atlas.groups.map(\.id) == ["atlas/farcast-system"])
         #expect(Set(feed.world.instances.flatMap(\.groups).map(\.id)).isDisjoint(with: fixtureGroups.subtracting(["atlas/farcast-system"])))
-        #expect(atlas.problems.map(\.kind) == [.gcloudMismatch])
+        #expect(atlas.problems.map(\.kind) == [.versionSkew])
         #expect(feed.world.hosts.isEmpty && feed.world.connections.isEmpty && feed.world.alerts.isEmpty)
         try feed.world.validate()
     }
@@ -373,9 +373,9 @@ struct WorldFeedTests {
         let answer = await withDeadline(.seconds(1), on: ManualClock()) { () async throws(ReadFailure) -> Int in 42 }
         #expect(try answer?.get() == 42)
         let failure = await withDeadline(.seconds(1), on: ManualClock()) { () async throws(ReadFailure) -> Int in
-            throw ReadFailure(kind: .kubectlMissing, message: "no kubectl")
+            throw ReadFailure(kind: .credentialMissing, message: "no reader")
         }
-        #expect(throws: ReadFailure(kind: .kubectlMissing, message: "no kubectl")) { try failure?.get() }
+        #expect(throws: ReadFailure(kind: .credentialMissing, message: "no reader")) { try failure?.get() }
     }
 }
 

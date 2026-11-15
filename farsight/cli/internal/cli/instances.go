@@ -2,10 +2,12 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"os"
+	"io/fs"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -13,15 +15,18 @@ import (
 )
 
 // instancesCommand lists the instances this machine holds, from their local
-// records alone, and pins the gcloud account each is read as.
+// records alone.
 type instancesCommand struct {
-	account string
+	// accountGiven is whether the retired pin-gcloud's flag was given, with
+	// any value, an empty one included. The flag stays registered until ADR
+	// 0023 M2.9 only so that the documented form 'instances pin-gcloud
+	// <instance> --account <email>' reaches the retirement text rather than
+	// the flag parser's refusal (A18-12).
+	accountGiven bool
 
-	// Seams: the clock, the build stamp and the environment gcloud's
-	// configuration directory is resolved from.
-	now     func() time.Time
-	stamp   func() buildStamp
-	environ func() []string
+	// Seams: the clock and the build stamp.
+	now   func() time.Time
+	stamp func() buildStamp
 }
 
 func newInstancesCommand() *instancesCommand { return &instancesCommand{} }
@@ -32,25 +37,25 @@ func (*instancesCommand) Synopsis() string { return "List the instances this mac
 func (*instancesCommand) Usage() string {
 	return strings.TrimSpace(`
 Usage: farcast instances
-       farcast instances pin-gcloud <instance> --account <email>
 
 List every instance this machine holds, from each one's local record alone:
 its status, region, cost limit, which of FarCast's components the record says
-were deployed, how many keepers are enrolled, and whether a gcloud account is
-pinned. It opens no credential, no kubeconfig, no CA key and no keyring, and
-touches no network.
-
-pin-gcloud records the gcloud account an instance's cluster is read as. 'farcast
-world' then reads only under a gcloud configuration whose account is that one
-and whose project is the instance's, and refuses otherwise — so a read never
-runs as whichever configuration happens to be active. The pin is refused unless
-such a configuration exists in gcloud's configuration directory
-($CLOUDSDK_CONFIG, or ~/.config/gcloud). It is run from a terminal; the FarCast
-app shows the pin for the operator to confirm and never writes it.`)
+were deployed, how many keepers are enrolled, whether a reader identity is
+recorded and how far it is set up ('farcast reader'), and whether the instance
+has been migrated to server-side apply. It opens no credential, no kubeconfig,
+no CA key, no reader key and no keyring, and touches no network: whether the
+reader's key is on this machine is told from the file's presence alone.`)
 }
 
+// msgPinGCloudRetired is what 'instances pin-gcloud' says since ADR 0023 M2
+// (design §7.4): a usage error, exit 2.
+const msgPinGCloudRetired = "pin-gcloud was retired by ADR 0023 M2: farcast reads each instance's cluster as its own read-only service account ('farcast reader init'), so there is no gcloud account to pin."
+
 func (c *instancesCommand) SetFlags(fs *flag.FlagSet) {
-	fs.StringVar(&c.account, "account", "", "pin-gcloud: the gcloud account to read this instance as")
+	fs.Func("account", "retired with pin-gcloud (ADR 0023 M2)", func(string) error {
+		c.accountGiven = true
+		return nil
+	})
 }
 
 func (c *instancesCommand) ensureDefaults() {
@@ -60,21 +65,16 @@ func (c *instancesCommand) ensureDefaults() {
 	if c.stamp == nil {
 		c.stamp = currentStamp
 	}
-	if c.environ == nil {
-		c.environ = os.Environ
-	}
 }
 
 func (c *instancesCommand) Run(_ context.Context, env *Env, args []string) error {
 	c.ensureDefaults()
-	if len(args) > 0 && args[0] == "pin-gcloud" {
-		return c.pin(env, args[1:])
+	// The retired pin, in any of its forms, writes nothing and says why.
+	if (len(args) > 0 && args[0] == "pin-gcloud") || c.accountGiven {
+		return usagef("%s", msgPinGCloudRetired)
 	}
 	if len(args) > 0 {
-		return usagef("instances takes no arguments, or 'pin-gcloud <instance> --account <email>'; got %q", args[0])
-	}
-	if c.account != "" {
-		return usagef("--account belongs to 'farcast instances pin-gcloud <instance> --account <email>'")
+		return usagef("instances takes no arguments; got %q", args[0])
 	}
 	names, err := env.ConfigDir.ListInstances()
 	if err != nil {
@@ -95,6 +95,10 @@ func instanceEntryOf(dir config.Dir, name string) instanceEntry {
 	if err != nil {
 		return instanceEntry{Name: name, Error: &sectionProblem{Kind: kindRecordUnreadable, Message: recordError(name, err).Error()}}
 	}
+	reader, err := readerStateOf(dir, name, meta)
+	if err != nil {
+		return instanceEntry{Name: name, Error: &sectionProblem{Kind: kindRecordUnreadable, Message: err.Error()}}
+	}
 	e := instanceEntry{
 		Name: name, Provider: meta.Provider, Region: meta.Region, Status: meta.Status,
 		CostLimit: &costLimitEntry{
@@ -106,7 +110,8 @@ func instanceEntryOf(dir config.Dir, name string) instanceEntry {
 			Kernel:    meta.Kernel != nil && meta.Kernel.Deployed,
 			Keyholder: meta.Keyholder != nil && meta.Keyholder.Deployed,
 		},
-		GCloudPinned: strings.TrimSpace(meta.GCloudAccount) != "",
+		Reader:   reader,
+		Migrated: meta.ServerSideApply != nil,
 	}
 	for _, k := range meta.Keepers {
 		if !k.Revoked {
@@ -116,9 +121,47 @@ func instanceEntryOf(dir config.Dir, name string) instanceEntry {
 	return e
 }
 
-// instancesResult is 'farcast instances -o json', schema 1. Project ids,
-// cluster names, endpoints, addresses and the pinned account itself are never
-// in it.
+// The reader states 'instances' reports (design §8.2): how far an instance's
+// read-only identity is set up, each step 'farcast reader' takes.
+const (
+	readerNone        = "none"         // no reader recorded: 'reader init'
+	readerKeyMissing  = "key_missing"  // recorded, and reader.key is not on this machine
+	readerNotUploaded = "not_uploaded" // no key id recorded: the Cloud Shell script, then 'reader record'
+	readerNotGranted  = "not_granted"  // not verified read-only: 'reader grant'
+	readerGranted     = "granted"      // the read commands read as it
+)
+
+// readerStateOf is how far an instance's reader is set up, from its record
+// and whether reader.key exists, which is told by a stat and never by opening
+// the file. A key file whose presence cannot be told is an error naming it
+// relative to the config directory, as an unreadable record is.
+func readerStateOf(dir config.Dir, name string, meta *config.InstanceMetadata) (string, error) {
+	if meta.Reader == nil {
+		return readerNone, nil
+	}
+	exists, err := dir.ReaderKeyExists(name)
+	if err != nil {
+		// The stat's own words, without the absolute path they carry.
+		var pe *fs.PathError
+		if errors.As(err, &pe) {
+			err = pe.Err
+		}
+		return "", fmt.Errorf("%s could not be checked: %v", filepath.Join("instances", name, "reader.key"), err)
+	}
+	switch {
+	case !exists:
+		return readerKeyMissing, nil
+	case meta.Reader.KeyID == "":
+		return readerNotUploaded, nil
+	case meta.Reader.GrantedAt.IsZero():
+		return readerNotGranted, nil
+	}
+	return readerGranted, nil
+}
+
+// instancesResult is 'farcast instances -o json', schema 2. Project ids,
+// cluster names, endpoints, addresses and the reader's account itself are
+// never in it.
 type instancesResult struct {
 	Schema      int             `json:"schema"`
 	GeneratedAt wireTime        `json:"generated_at"`
@@ -135,7 +178,8 @@ type instanceEntry struct {
 	CloudLogging string           `json:"cloud_logging,omitempty"`
 	Components   *componentsEntry `json:"components,omitempty"`
 	Keepers      int              `json:"keepers"`
-	GCloudPinned bool             `json:"gcloud_pinned"`
+	Reader       string           `json:"reader"`
+	Migrated     bool             `json:"migrated"`
 	Error        *sectionProblem  `json:"error,omitempty"`
 }
 
@@ -177,84 +221,18 @@ func (r instancesResult) Human(w io.Writer) error {
 		}
 		return "no"
 	}
-	fprintf(w, "%-18s %-12s %-16s %-18s %-8s %-8s %-8s %-8s %s\n",
-		"NAME", "STATUS", "REGION", "LIMIT", "FATLINE", "KERNEL", "STORAGE", "KEEPERS", "GCLOUD")
+	fprintf(w, "%-18s %-12s %-16s %-18s %-8s %-8s %-8s %-8s %-13s %s\n",
+		"NAME", "STATUS", "REGION", "LIMIT", "FATLINE", "KERNEL", "STORAGE", "KEEPERS", "READER", "MIGRATED")
 	for _, e := range r.Instances {
 		if e.Error != nil {
 			fprintf(w, "%-18s %s: %s\n", terminalText(e.Name), e.Error.Kind, terminalText(e.Error.Message))
 			continue
 		}
 		limit := fmt.Sprintf("%s %.0f/%s", e.CostLimit.Currency, float64(e.CostLimit.Cents)/100, e.CostLimit.Period)
-		gcloud := "not pinned"
-		if e.GCloudPinned {
-			gcloud = "pinned"
-		}
-		fprintf(w, "%-18s %-12s %-16s %-18s %-8s %-8s %-8s %-8d %s\n",
+		fprintf(w, "%-18s %-12s %-16s %-18s %-8s %-8s %-8s %-8d %-13s %s\n",
 			terminalText(e.Name), terminalText(e.Status), terminalText(e.Region), terminalText(limit),
-			yes(e.Components.FatLine), yes(e.Components.Kernel), yes(e.Components.Keyholder), e.Keepers, gcloud)
+			yes(e.Components.FatLine), yes(e.Components.Kernel), yes(e.Components.Keyholder), e.Keepers,
+			strings.ReplaceAll(e.Reader, "_", " "), yes(e.Migrated))
 	}
-	return nil
-}
-
-// pin records the gcloud account an instance is read as.
-//
-// It refuses an account that no configuration in gcloud's directory has
-// together with the instance's project: a pin must never name an identity
-// that cannot read the instance, or 'world' would refuse every read and the
-// operator would not know why.
-func (c *instancesCommand) pin(env *Env, args []string) error {
-	if len(args) != 1 {
-		return usagef("pin-gcloud takes one instance argument: farcast instances pin-gcloud <instance> --account <email>")
-	}
-	name := args[0]
-	account := strings.TrimSpace(c.account)
-	if account == "" || strings.ContainsAny(account, " \t\n") {
-		return usagef("pin-gcloud needs --account <email>, the gcloud account to read %q as", name)
-	}
-	meta, err := loadRecord(env.ConfigDir, name)
-	if err != nil {
-		return err
-	}
-	if meta.Project == "" {
-		return withKind(kindGCloudMismatch, fmt.Errorf(
-			"instance %q records no cloud project, so no gcloud configuration can be checked against it; nothing was pinned", name))
-	}
-	dir, source, err := gcloudDirFrom(c.environ())
-	if err != nil {
-		return err
-	}
-	configs, err := readGCloudConfigs(dir, source)
-	if err != nil {
-		return err
-	}
-	match := matchingConfigs(configs, account, meta.Project)
-	if len(match) == 0 {
-		return withKind(kindGCloudMismatch, fmt.Errorf(
-			"no gcloud configuration in %s has that account together with %q's project %q (%s); nothing was pinned. "+
-				"Create one first: gcloud config configurations create <name>, then set its account and project",
-			source, name, meta.Project, consideredText(configs, account)))
-	}
-	if _, err := env.ConfigDir.UpdateInstanceMetadata(name, func(m *config.InstanceMetadata) error {
-		m.GCloudAccount = account
-		m.UpdatedAt = time.Now().UTC()
-		return nil
-	}); err != nil {
-		return fmt.Errorf("record the pinned gcloud account for %q: %w", name, err)
-	}
-	return env.Printer.Print(pinResult{Instance: name, GCloudPinned: true, Configuration: match[0].Name})
-}
-
-// pinResult says the pin landed and which configuration a read will use. It
-// does not repeat the account: the operator typed it, and a result that
-// travels further than the terminal has no need of it.
-type pinResult struct {
-	Instance      string `json:"instance"`
-	GCloudPinned  bool   `json:"gcloud_pinned"`
-	Configuration string `json:"configuration"`
-}
-
-func (r pinResult) Human(w io.Writer) error {
-	fprintf(w, "Pinned %q to the account you gave. 'farcast world %s' reads through gcloud configuration %q.\n",
-		r.Instance, r.Instance, r.Configuration)
 	return nil
 }

@@ -13,7 +13,9 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/keyholder"
+	"github.com/sofmon/farcast/farsight/cli/internal/kube/kubetest"
 	"github.com/sofmon/farcast/fatline"
 	fldeploy "github.com/sofmon/farcast/fatline/deploy"
 	"github.com/sofmon/farcast/fatline/event"
@@ -23,8 +25,8 @@ import (
 	"github.com/sofmon/farcast/shrike"
 )
 
-// FatLine, Shrike and the keyholders, all on 127.0.0.1 (D5), and the traffic
-// that gives the map something counted (D6).
+// The cluster, FatLine, Shrike and the keyholders, all on 127.0.0.1 (D5), and
+// the traffic that gives the map something counted (D6).
 
 const (
 	// replicaName stands in for the Pod name Shrike stamps on its picture:
@@ -41,6 +43,11 @@ const (
 	startupWait = 5 * time.Second
 	egressTick  = time.Minute
 	keeperTick  = 10 * time.Minute
+	// tunnelWatch is how often the tunnel's watcher reads the scenario, so
+	// tunnel-down takes effect within a moment of the switch.
+	tunnelWatch = 100 * time.Millisecond
+	// tokenPath is where the cluster's token endpoint answers (kubetest's).
+	tokenPath = "/token"
 )
 
 // declared is what the shop's api declares, which Shrike and the policy
@@ -64,6 +71,10 @@ func (r *Rig) serve(ctx context.Context) error {
 	}
 	r.keeperID = token
 	r.mon = shrike.New(shrike.Config{Declared: declared(), Alerter: discard{}})
+
+	if err := r.serveCluster(); err != nil {
+		return err
+	}
 
 	// Shrike's status route.
 	sl, err := net.Listen("tcp", "127.0.0.1:0")
@@ -104,7 +115,7 @@ func (r *Rig) serve(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("FatLine's leaf: %w", err)
 	}
-	srv, err := fatline.New(fatline.Config{
+	r.fatlineConfig = fatline.Config{
 		TunnelListen: r.TunnelAddr, Instance: r.spec.Instance,
 		ServerCert: serverLeaf, ClientCA: pool,
 		StreamRoutes: []fatline.StreamRoute{
@@ -114,17 +125,17 @@ func (r *Rig) serve(ctx context.Context) error {
 		KeeperRoutes: []string{keyholder.StreamRoute},
 		Events:       r.mon, Endpoint: r.TunnelAddr, Node: "rehearsal",
 		Logger: slog.New(slog.NewTextHandler(r.log, &slog.HandlerOptions{Level: slog.LevelWarn})),
-	})
+	}
+	served, err := r.startTunnel()
 	if err != nil {
 		return err
 	}
-	served := make(chan error, 1)
-	r.wg.Go(func() { served <- srv.Serve(rctx) })
 
 	// The start-up traffic, then wait until the monitor holds it. The
 	// keeper's read is also what shows the tunnel answering: it is tried
 	// until FatLine listens, and a bare TCP probe would leave FatLine a
-	// handshake that never finished to log.
+	// handshake that never finished to log. The tunnel comes up for it even
+	// in tunnel-down, and only then follows the scenario.
 	r.emitEgress(true)
 	if err := r.untilKeeperReads(ctx, served); err != nil {
 		return err
@@ -132,8 +143,266 @@ func (r *Rig) serve(ctx context.Context) error {
 	if err := r.waitMonitor(ctx); err != nil {
 		return err
 	}
+	r.syncTunnel()
 	r.wg.Go(func() { r.traffic(rctx) })
+	r.wg.Go(func() { r.watchTunnel(rctx) })
 	return nil
+}
+
+// closerFunc is an io.Closer that runs a function.
+type closerFunc func() error
+
+func (f closerFunc) Close() error { return f() }
+
+// serveCluster starts the rehearsal's cluster: one fake API server and token
+// endpoint (kubetest) on the recorded address, knowing the instance's reader
+// and writer by their public keys, answering through clusterHandler, and
+// keeping no request log of its own: a rehearsal serves for weeks, and every
+// /token body holds a signed assertion. calls.log is written from what it
+// answered, never with a body. Each start makes a new CA, so cluster-ca.crt
+// is written anew.
+func (r *Rig) serveCluster() error {
+	srv, err := kubetest.Start(
+		kubetest.WithAddr(r.ClusterAddr),
+		kubetest.WithIdentity(readerID, readerEmail(r.spec.Instance), r.m.readerPub),
+		kubetest.WithIdentity(writerID, writerEmail, r.m.writerPub),
+		kubetest.WithHandler(r.clusterHandler),
+		kubetest.WithTokenAnswer(r.tokenAnswer),
+		kubetest.WithDelay(r.clusterDelay),
+		kubetest.WithAnswered(r.clusterAnswered),
+		kubetest.WithoutRecording(),
+	)
+	if err != nil {
+		return fmt.Errorf("the rehearsal's cluster did not start on %s: %w", r.ClusterAddr, err)
+	}
+	r.cluster = srv
+	r.servers = append(r.servers, closerFunc(func() error { srv.Close(); return nil }))
+	if err := config.Dir(r.ConfigDir).SaveClusterCA(r.spec.Instance, srv.CAPEM()); err != nil {
+		return fmt.Errorf("write the rehearsal instance's %s: %w", clusterCAFile, err)
+	}
+	return nil
+}
+
+// clusterHandler answers every request the cluster authenticated. A writer's
+// token is refused first, whatever it asks for: the writer never reads. Then
+// the reader's reads are answered as the scenario says (ClusterAnswer), and
+// anything else is 405. Nothing falls through to kubetest's own emulation.
+func (r *Rig) clusterHandler(req kubetest.Request) (int, []byte, bool) {
+	if req.As == writerID {
+		return http.StatusForbidden, statusJSON(http.StatusForbidden, "Forbidden",
+			"forbidden: the rehearsal's cluster answers the instance's reader alone, and a writer token never reads", nil), true
+	}
+	s, err := LoadSpec(r.Dir)
+	if err != nil {
+		return http.StatusInternalServerError, statusJSON(http.StatusInternalServerError, "InternalError",
+			"the rehearsal's state could not be read", nil), true
+	}
+	code, body := ClusterAnswer(s, req.Method, req.Path, req.RawQuery, time.Now())
+	return code, body, true
+}
+
+// tokenAnswer is the token endpoint for an assertion that verified: in
+// token-refused, Google's refusal; otherwise kubetest mints.
+func (r *Rig) tokenAnswer(string) (int, []byte, bool) {
+	if s, err := LoadSpec(r.Dir); err != nil || s.Scenario != ScenarioTokenRefused {
+		return 0, nil, false
+	}
+	return http.StatusBadRequest, marshal(map[string]string{
+		"error": "invalid_grant", "error_description": "the rehearsal refuses every assertion in token-refused",
+	}), true
+}
+
+// clusterDelay holds every answer, a /token's included, for SlowSeconds in
+// slow-cluster, and nothing otherwise.
+func (r *Rig) clusterDelay(kubetest.Request) time.Duration {
+	s, err := LoadSpec(r.Dir)
+	if err != nil || s.Scenario != ScenarioSlowCluster {
+		return 0
+	}
+	return time.Duration(s.SlowSeconds * float64(time.Second))
+}
+
+// clusterAnswered writes one calls.log line for every request the cluster
+// answered or refused:
+//
+//	<time> cluster <METHOD> <path>[?<query>] as <reader|writer|none|unknown> | <outcome>
+//	<time> token <METHOD> /token as <reader|writer|unknown> | <outcome>
+//
+// "none" is a request with no token, and "unknown" a token the cluster did
+// not mint, or, on /token, an assertion that verified against no registered
+// key. A line never holds a body, an assertion or a token.
+func (r *Rig) clusterAnswered(req kubetest.Request, status int) {
+	target := req.Path
+	if req.RawQuery != "" {
+		target += "?" + req.RawQuery
+	}
+	if req.Path == tokenPath {
+		as := req.As
+		if as == "" {
+			as = "unknown"
+		}
+		appendCall(r.Dir, "token", []string{req.Method, target, "as", as}, tokenOutcome(req, status))
+		return
+	}
+	as := req.As
+	switch as {
+	case "":
+		as = "none"
+	case "?":
+		as = "unknown"
+	}
+	appendCall(r.Dir, "cluster", []string{req.Method, target, "as", as}, r.clusterOutcome(req, status))
+}
+
+// tokenOutcome is a /token answer's calls.log outcome.
+func tokenOutcome(req kubetest.Request, status int) string {
+	switch {
+	case status == 0:
+		return "refused: the caller left while the answer was held"
+	case status == http.StatusOK:
+		return "ok"
+	case status == http.StatusBadRequest && req.As != "":
+		return "refused: token-refused refuses every assertion"
+	case status == http.StatusBadRequest:
+		return "refused: the assertion did not verify"
+	}
+	return refusedStatus(status)
+}
+
+// clusterOutcome is an API answer's calls.log outcome. An absent ConfigMap's
+// 404 is an answer, and ok.
+func (r *Rig) clusterOutcome(req kubetest.Request, status int) string {
+	switch status {
+	case 0:
+		return "refused: the caller left while the answer was held"
+	case http.StatusOK, http.StatusNotFound:
+		return "ok"
+	case http.StatusUnauthorized:
+		if req.As == "" || req.As == "?" {
+			return "refused: no token the cluster minted"
+		}
+		return "refused: unauthorized answers every read"
+	case http.StatusForbidden:
+		if req.As == writerID {
+			return "refused: a writer token on a read"
+		}
+		return "refused: forbidden answers this read"
+	case http.StatusMethodNotAllowed:
+		return "refused: no answer"
+	case http.StatusInternalServerError:
+		s, err := LoadSpec(r.Dir)
+		switch {
+		case err != nil:
+			return "refused: the rehearsal's state could not be read"
+		case s.expired(time.Now()):
+			return "refused: " + errExpired
+		}
+		return "refused: the rehearsal could not build its answer"
+	}
+	return refusedStatus(status)
+}
+
+func refusedStatus(status int) string {
+	return fmt.Sprintf("refused: %d %s", status, http.StatusText(status))
+}
+
+// errStopping is startTunnel's refusal once Close has begun.
+var errStopping = errors.New("the rehearsal is stopping")
+
+// startTunnel starts a FatLine on the tunnel's address, under its own stop,
+// unless one runs or the rig is closing. served gets what its Serve returned.
+func (r *Rig) startTunnel() (served <-chan error, err error) {
+	r.tunnelMu.Lock()
+	defer r.tunnelMu.Unlock()
+	if r.tunnelClosed {
+		return nil, errStopping
+	}
+	if r.tunnelUpLocked() {
+		return nil, nil
+	}
+	// A new Server each time: Serve runs once, and a new one over the same
+	// monitor keeps every row the monitor holds.
+	srv, err := fatline.New(r.fatlineConfig)
+	if err != nil {
+		return nil, err
+	}
+	tctx, cancel := context.WithCancel(context.Background())
+	ch := make(chan error, 1)
+	done := make(chan struct{})
+	r.wg.Go(func() {
+		defer close(done)
+		err := srv.Serve(tctx)
+		if err != nil && tctx.Err() == nil {
+			r.logf("FatLine's tunnel stopped: %v", err)
+		}
+		ch <- err
+	})
+	r.tunnelStop = func() { cancel(); <-done }
+	r.tunnelDone = done
+	return ch, nil
+}
+
+// tunnelUpLocked reports whether a FatLine started and has not stopped. The
+// caller holds tunnelMu.
+func (r *Rig) tunnelUpLocked() bool {
+	if r.tunnelDone == nil {
+		return false
+	}
+	select {
+	case <-r.tunnelDone:
+		return false
+	default:
+		return true
+	}
+}
+
+// stopTunnel stops the FatLine running now, if any, and waits for it; its
+// listener closes first, so the port refuses from then on. closing also keeps
+// any from starting again.
+func (r *Rig) stopTunnel(closing bool) {
+	r.tunnelMu.Lock()
+	stop := r.tunnelStop
+	r.tunnelStop, r.tunnelDone = nil, nil
+	if closing {
+		r.tunnelClosed = true
+	}
+	r.tunnelMu.Unlock()
+	if stop != nil {
+		stop()
+	}
+}
+
+// syncTunnel makes the tunnel what the scenario says: down in tunnel-down,
+// up otherwise, a FatLine that stopped on its own included. A spec that
+// cannot be read changes nothing.
+func (r *Rig) syncTunnel() {
+	s, err := LoadSpec(r.Dir)
+	if err != nil {
+		return
+	}
+	if s.Scenario == ScenarioTunnelDown {
+		r.stopTunnel(false)
+		return
+	}
+	if _, err := r.startTunnel(); err != nil && !errors.Is(err, errStopping) {
+		r.logf("FatLine's tunnel did not start again: %v", err)
+	}
+}
+
+// watchTunnel reads the scenario every tunnelWatch until ctx ends, and stops
+// or starts the tunnel to follow it: SetScenario usually runs in another
+// process, and nothing else would tell this one.
+func (r *Rig) watchTunnel(ctx context.Context) {
+	t := time.NewTicker(tunnelWatch)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			r.syncTunnel()
+		}
+	}
 }
 
 // goServe runs one HTTP server on a listener until Close.

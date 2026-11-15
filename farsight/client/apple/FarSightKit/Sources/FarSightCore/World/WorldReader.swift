@@ -43,10 +43,15 @@ public struct InstanceListing: Sendable, Equatable, Identifiable {
     public var components: [SystemRole: Bool]
     /// Set when the record itself could not be read.
     public var problem: SectionProblem?
-    /// Whether the record pins the gcloud account the instance is read as;
-    /// nil when the record could not be read. `farcast world` reads nothing
-    /// without a pin.
-    public var gcloudPinned: Bool?
+    /// The instance's reader identity, which `farcast world` reads the
+    /// cluster as (ADR 0023 M2.4); nil when the record could not be read, or
+    /// farcast did not say. `farcast world` reads no cluster section until
+    /// it is `granted`.
+    public var reader: ReaderState?
+    /// Whether the instance was last written with server-side apply
+    /// (`farcast instances`' `migrated`); nil when the record could not be
+    /// read. The app runs no command that writes, so nothing draws it.
+    public var migrated: Bool?
 
     public var id: String { name }
 
@@ -82,7 +87,8 @@ public struct InstanceListing: Sendable, Equatable, Identifiable {
         recordedLimitCents: Int? = nil,
         components: [SystemRole: Bool] = [:],
         problem: SectionProblem? = nil,
-        gcloudPinned: Bool? = nil
+        reader: ReaderState? = nil,
+        migrated: Bool? = nil
     ) {
         self.name = name
         self.status = status
@@ -90,8 +96,30 @@ public struct InstanceListing: Sendable, Equatable, Identifiable {
         self.recordedLimitCents = recordedLimitCents
         self.components = components
         self.problem = problem
-        self.gcloudPinned = gcloudPinned
+        self.reader = reader
+        self.migrated = migrated
     }
+}
+
+/// Where an instance's reader identity stands, as `farcast instances` says
+/// it (`reader`), in the order its steps are taken: `farcast reader init`
+/// makes the key, the printed Cloud Shell script uploads it, `farcast reader
+/// record` records its id, and `farcast reader grant` checks that it only
+/// reads. Mapped from the wire's words by an explicit table
+/// (`CLIDocuments.readerState`), never carried raw.
+public enum ReaderState: Sendable, Equatable, Hashable, CaseIterable {
+    /// No reader is recorded.
+    case none
+    /// A reader is recorded, and its key is not on this Mac.
+    case keyMissing
+    /// No key id is recorded: the key was not uploaded, or not recorded.
+    case notUploaded
+    /// Not yet checked read-only by `farcast reader grant`.
+    case notGranted
+    /// The read commands read as it.
+    case granted
+    /// A word this build does not know.
+    case unknown
 }
 
 extension Instance {

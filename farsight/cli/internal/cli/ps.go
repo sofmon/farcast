@@ -11,6 +11,7 @@ import (
 
 	"github.com/sofmon/farcast/farsight/cli/internal/cluster"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
+	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 	"github.com/sofmon/farcast/planck/translate"
 	"github.com/sofmon/farcast/technocore/deploy"
 	"github.com/sofmon/farcast/technocore/pricing"
@@ -26,7 +27,8 @@ type psCommand struct {
 	all       bool
 	namespace string
 
-	newCluster func(kubeconfigPath string) lister
+	// newCluster opens the cluster as the instance's reader (ADR 0023 M2.4).
+	newCluster func(clusterRef) (lister, error)
 }
 
 func (*psCommand) Name() string     { return "ps" }
@@ -53,7 +55,15 @@ func (c *psCommand) SetFlags(fs *flag.FlagSet) {
 
 func (c *psCommand) ensureDefaults() {
 	if c.newCluster == nil {
-		c.newCluster = func(kc string) lister { return cluster.New(kc) }
+		c.newCluster = func(r clusterRef) (lister, error) {
+			// A refusal returns a nil lister, never a nil *cluster.Client
+			// inside a non-nil one.
+			cl, err := openCluster(r)
+			if err != nil {
+				return nil, err
+			}
+			return cl, nil
+		}
 	}
 }
 
@@ -68,13 +78,20 @@ func (c *psCommand) Run(ctx context.Context, env *Env, args []string) error {
 	if err != nil {
 		return fmt.Errorf("load instance %q: %w", name, err)
 	}
+	if err := recordNamed(meta, name); err != nil {
+		return err
+	}
 	namespaces := c.namespacesOf(meta)
 	if len(namespaces) == 0 {
 		return fmt.Errorf("instance %q meters no namespaces; 'farcast run %s <repo>' deploys one", name, name)
 	}
 
-	cl := c.newCluster(env.ConfigDir.InstanceKubeconfigPath(name))
+	cl, err := c.newCluster(clusterRef{Dir: env.ConfigDir, Meta: meta, Identity: kube.Reader, Warn: env.Err})
+	if err != nil {
+		return err
+	}
 	res := psResult{Instance: name, Currency: currencyOf(meta)}
+	var first error
 	for _, ns := range namespaces {
 		workloads, err := cl.Workloads(ctx, ns)
 		if err != nil {
@@ -82,7 +99,11 @@ func (c *psCommand) Run(ctx context.Context, env *Env, args []string) error {
 			// reason the kernel's own meter tolerates it — but the report has
 			// to say the picture is partial, because the namespace it could
 			// not read may hold the thing the operator is looking for.
-			res.Unreadable = append(res.Unreadable, fmt.Sprintf("%s: %v", ns, err))
+			err = readerRefused(fmt.Errorf("%s: %w", ns, err), name)
+			res.Unreadable = append(res.Unreadable, err.Error())
+			if first == nil {
+				first = err
+			}
 			continue
 		}
 		for _, w := range workloads {
@@ -97,6 +118,12 @@ func (c *psCommand) Run(ctx context.Context, env *Env, args []string) error {
 				Age: since(w.CreatedAt),
 			})
 		}
+	}
+	// Nothing read at all is a failure, not an empty listing: its envelope
+	// carries the first namespace's error, and so its kind (A18-11). A
+	// partial read stays a listing that says it is partial.
+	if len(res.Unreadable) == len(namespaces) {
+		return first
 	}
 	sort.Slice(res.Apps, func(i, j int) bool {
 		if res.Apps[i].Namespace != res.Apps[j].Namespace {
@@ -185,6 +212,11 @@ func (r psResult) replicas() int {
 	return n
 }
 
+// Human is the listing for a terminal. A workload's namespace and name, and
+// each namespace it could not read, are the cluster's words, the last its
+// API server's own refusal: each goes through terminalText, as world's and
+// instances' rows do, and --json carries them as they came. The tier is a
+// closed set, and the age this machine's.
 func (r psResult) Human(w io.Writer) error {
 	if len(r.Apps) == 0 {
 		fprintf(w, "Nothing is running in %q.\n", r.Instance)
@@ -192,7 +224,7 @@ func (r psResult) Human(w io.Writer) error {
 		fprintf(w, "%-22s %-18s %-7s %-8s %s\n", "NAMESPACE", "NAME", "READY", "TIER", "AGE")
 		for _, a := range r.Apps {
 			ready := fmt.Sprintf("%d/%d", a.Ready, a.Desired)
-			fprintf(w, "%-22s %-18s %-7s %-8s %s\n", a.Namespace, a.Name, ready, a.Tier, a.Age)
+			fprintf(w, "%-22s %-18s %-7s %-8s %s\n", terminalText(a.Namespace), terminalText(a.Name), ready, a.Tier, a.Age)
 		}
 		var stopped int
 		for _, a := range r.Apps {
@@ -207,7 +239,7 @@ func (r psResult) Human(w io.Writer) error {
 		}
 	}
 	for _, u := range r.Unreadable {
-		fprintf(w, "\nCould not read %s\n", u)
+		fprintf(w, "\nCould not read %s\n", terminalText(u))
 	}
 	if len(r.Unreadable) > 0 {
 		fprintf(w, "This listing is partial.\n")

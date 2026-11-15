@@ -7,8 +7,9 @@ import FarSightCore
 /// Settings: the paths the Connected view runs `farcast` with, confirmed
 /// once (ADR 0021 decision 9, amended 2026-11-12).
 ///
-/// The form starts from the confirmed paths, or from blank tools and the
-/// two directories at their standard places: a tool path is never guessed.
+/// The form starts from the confirmed paths, or from a blank farcast path and
+/// the configuration directory at its standard place: farcast's path is
+/// never guessed.
 /// Check runs `farcast version` and `farcast instances` on exactly this form,
 /// with a reader of it; Confirm keeps the form only once that Check has
 /// succeeded, and any edit after it takes Confirm away again.
@@ -47,7 +48,7 @@ struct CLISettingsView: View {
             Section {
                 Text("FarCast runs only `farcast version`, `farcast instances` and `farcast world <instance>`, with flags fixed in code.")
                 Text("The first two read only files on this Mac and run at launch and on Check. `world` runs only when you press Refresh.")
-                Text("Each `world` reaches your instance's API server through kubectl, as the gcloud account pinned for that instance, and its FatLine tunnel, which the provider sees as traffic and none of its content.")
+                Text("Each `world` reads your instance's cluster from its API server as that instance's own read-only service account, with a token `farcast` mints in memory at Google's token endpoint (so Google can time each read), and its FatLine tunnel, which the provider sees as traffic and none of its content.")
                 Text("Nothing runs on a timer.")
             }
             .foregroundStyle(.secondary)
@@ -149,18 +150,14 @@ struct CLISettingsView: View {
     private static func path(_ field: CLISettings.Field) -> WritableKeyPath<CLISettings, String> {
         switch field {
         case .farcast: \.farcast
-        case .kubectl: \.kubectl
-        case .authPlugin: \.authPlugin
-        case .gcloud: \.gcloud
         case .configDirectory: \.configDirectory
-        case .gcloudDirectory: \.gcloudDirectory
         }
     }
 
     private static func isDirectory(_ field: CLISettings.Field) -> Bool {
         switch field {
-        case .configDirectory, .gcloudDirectory: true
-        case .farcast, .kubectl, .authPlugin, .gcloud: false
+        case .configDirectory: true
+        case .farcast: false
         }
     }
 
@@ -222,7 +219,7 @@ struct CLISettingsView: View {
                             Text(verbatim: Display.name(instance.name))
                                 .font(.body.monospaced())
                             Text(verbatim: "—").foregroundStyle(.secondary)
-                            pinState(instance)
+                            readerState(instance)
                         }
                     }
                 }
@@ -231,27 +228,57 @@ struct CLISettingsView: View {
         }
     }
 
+    /// Where the instance's reader identity stands (ADR 0023 M2.4), which
+    /// every `world` reads its cluster as: the state, and for any state but
+    /// granted the next command, for a terminal. The reader's email is not
+    /// in the listing, and is never shown here.
     @ViewBuilder
-    private func pinState(_ instance: InstanceListing) -> some View {
+    private func readerState(_ instance: InstanceListing) -> some View {
+        let name = Display.name(instance.name)
         if let problem = instance.problem {
             Text(verbatim: "\(problem.kind.label): \(Display.message(problem.message))")
                 .foregroundStyle(.orange)
         } else {
-            switch instance.gcloudPinned {
-            case true?:
-                Text("gcloud account pinned")
-            case false?:
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("no gcloud account pinned — in a terminal:")
-                        .foregroundStyle(.orange)
-                    Text(verbatim: "farcast instances pin-gcloud \(Display.name(instance.name)) --account <email>")
-                        .font(.callout.monospaced())
-                        .textSelection(.enabled)
-                }
+            switch instance.reader {
+            case .granted?:
+                Text("reader granted")
+            case .notGranted?:
+                nextStep("reader recorded, not yet granted — in a terminal:", "farcast reader grant \(name)")
+            case .notUploaded?:
+                nextStep(
+                    "its key id is not recorded — after the Cloud Shell script farcast reader init printed, in a terminal:",
+                    "farcast reader record \(name) --key-id <id>"
+                )
+            case .keyMissing?:
+                // farcast reports a missing key before it looks at the key
+                // id, and reader init refuses a recorded key id without
+                // --rotate, which itself refuses when none is recorded.
+                nextStep(
+                    "reader key missing, not on this Mac — copy reader.key from the Mac that made it, or in a terminal (without --rotate if its key id was never recorded):",
+                    "farcast reader init \(name) --rotate"
+                )
+            case .none?:
+                nextStep(
+                    "no reader — in a terminal, then the Cloud Shell script it prints, reader record and reader grant:",
+                    "farcast reader init \(name)"
+                )
+            case .unknown?:
+                Text("farcast names a reader state this FarCast does not know")
+                    .foregroundStyle(.secondary)
             case nil:
-                Text("farcast did not say whether a gcloud account is pinned")
+                Text("farcast did not say whether the instance has a reader")
                     .foregroundStyle(.secondary)
             }
+        }
+    }
+
+    private func nextStep(_ note: String, _ command: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(verbatim: note)
+                .foregroundStyle(.orange)
+            Text(verbatim: command)
+                .font(.callout.monospaced())
+                .textSelection(.enabled)
         }
     }
 

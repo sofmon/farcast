@@ -14,7 +14,7 @@ import FarSightCore
 /// It runs only with FARSIGHT_RENDERS set to a directory outside the
 /// repository, which it writes into; nothing under `farsight/` may hold an
 /// image. FARSIGHT_RENDER_DOCS may name a directory of world documents a
-/// rehearsal printed (`signed-out.json`), read in place of the vector
+/// rehearsal printed (`reader-missing.json`), read in place of the vector
 /// nearest to it. Offscreen drawing composites no Liquid Glass; these are
 /// for layout and wording.
 @Suite("Renders")
@@ -31,21 +31,27 @@ struct RenderHarness {
         // (1) Healthy, then (3) the same instance refused on its next read,
         // its snapshot kept: the feed does what the app does.
         let healthy = try await Self.feedWorld("atlas", read: .world(Self.vector("healthy")))
-        let refusal = try #require(CLIDocuments.failure(Self.vectorData("error_gcloud_mismatch")))
+        // The read refused as a whole is a farcast of another schema: no
+        // vector holds it, since the CLI never writes one.
+        let refusal = ReadFailure(
+            kind: .versionSkew,
+            message: "farcast wrote schema 3 and this FarCast reads schema 2; build both from the same commit"
+        )
         let refused = try await Self.feedWorld("atlas", read: .world(Self.vector("healthy")), then: .failure(refusal))
-        // (2) Signed out: spend, apps and policy failed, network read.
-        let signedOut: World
+        // (2) No reader: spend, apps and policy not read, network read.
+        let readerMissing: World
         if let documents = Self.documents {
-            let data = try Data(contentsOf: URL(fileURLWithPath: documents).appending(path: "signed-out.json"))
-            signedOut = try await Self.feedWorld("rehearsal", read: .world(CLIDocuments.world(data, asReadOf: "rehearsal").world))
+            let data = try Data(contentsOf: URL(fileURLWithPath: documents).appending(path: "reader-missing.json"))
+            readerMissing = try await Self.feedWorld("rehearsal", read: .world(CLIDocuments.world(data, asReadOf: "rehearsal").world))
         } else {
-            signedOut = try await Self.feedWorld("atlas", read: .world(Self.vector("account_in_message")))
+            readerMissing = try await Self.feedWorld("atlas", read: .world(Self.vector("reader_missing")))
         }
         let floor = try await Self.feedWorld("atlas", read: .world(Self.vector("at_floor")))
         let tunnelDown = try await Self.feedWorld("atlas", read: .world(Self.vector("tunnel_down")))
+        let namespaceUnread = try await Self.feedWorld("atlas", read: .world(Self.vector("namespace_unread")))
 
         let components = ["technocore", "fatline", "datasphere", "shrike"]
-        for (name, world) in [("healthy", healthy), ("signed-out", signedOut), ("refused", refused), ("floor", floor), ("tunnel-down", tunnelDown)] {
+        for (name, world) in [("healthy", healthy), ("reader-missing", readerMissing), ("refused", refused), ("floor", floor), ("tunnel-down", tunnelDown)] {
             let model = Self.model(world)
             let instance = try #require(world.instances.first).id
             // The system group framed, as the operator sees all four; and the
@@ -97,8 +103,33 @@ struct RenderHarness {
             OutsideLayer(model: down, camera: camera, viewport: size).frame(width: size.width, height: size.height).background(Theme.ground),
             to: out, "tunnel-down-host-card.png"
         )
+        // (6) A group the reader may not read, beside one it read: the
+        // frames and headers as the map draws them.
+        let unread = Self.model(namespaceUnread)
+        let groups = ["atlas/lab", "atlas/shop"].compactMap { unread.geometry.groups[$0] }
+        try #require(groups.count == 2)
+        let both = groups.reduce(CGRect.null) { $0.union($1.frame) }
+        let area = CGSize(width: 1100, height: 420)
+        let view = Camera.fitting(both, in: area, margin: 24)
+        try Self.write(
+            ZStack(alignment: .topLeading) {
+                TerritoryLayer(geometry: unread.geometry, index: unread.index, tunnelled: [], camera: view, viewport: area)
+                ForEach(unread.groupOrder.filter { !$0.isSystem }) { group in
+                    if let frame = unread.geometry.groups[group.id] {
+                        GroupHeader(
+                            group: group, rect: view.screen(frame.header, in: area), frame: view.screen(frame.frame, in: area),
+                            scale: view.scale, model: unread
+                        )
+                    }
+                }
+            }
+            .frame(width: area.width, height: area.height)
+            .background(Theme.ground),
+            to: out, "namespace-unread-groups.png"
+        )
+
         // The smallest a panel is drawn whole anywhere: a phone on its side.
-        for (name, world) in [("signed-out", signedOut), ("floor", floor)] {
+        for (name, world) in [("reader-missing", readerMissing), ("floor", floor)] {
             let phone = WorldModel(world: world, store: nil)
             phone.layoutChanged(compact: true, short: true)
             phone.viewportChanged(to: CGSize(width: 667, height: 375))
@@ -134,7 +165,7 @@ struct RenderHarness {
     static func feedWorld(_ name: String, read: FakeReader.Answer, then next: FakeReader.Answer? = nil) async throws -> World {
         let listing = InstanceListing(
             name: name, status: .running, cloudLogging: .systemOnly, recordedLimitCents: 5000,
-            components: [.kernel: true, .monitor: true, .boundary: true, .storage: true], gcloudPinned: true
+            components: [.kernel: true, .monitor: true, .boundary: true, .storage: true], reader: .granted, migrated: true
         )
         let reader = FakeReader(listing: [listing], worlds: [name: read])
         let feed = WorldFeed(reader: reader)

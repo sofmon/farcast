@@ -18,8 +18,8 @@ import (
 
 // Vectors made by running the commands themselves, against a config directory
 // written for the test: 'instances', 'version', and the whole-command error
-// envelope 'world' prints when its guard refuses. Every path in them is
-// relative, so they are the same bytes on every machine.
+// envelope 'world' prints for an instance this machine does not hold. Every
+// path in them is relative, so they are the same bytes on every machine.
 
 func vectorConfigDir(t *testing.T) config.Dir {
 	t.Helper()
@@ -43,9 +43,8 @@ func writeRecord(t *testing.T, dir config.Dir, meta *config.InstanceMetadata) {
 
 func instancesVectorCommand() *instancesCommand {
 	return &instancesCommand{
-		now:     func() time.Time { return vectorNow.Add(123456789) },
-		stamp:   func() buildStamp { return vectorStamp },
-		environ: func() []string { return nil },
+		now:   func() time.Time { return vectorNow.Add(123456789) },
+		stamp: func() buildStamp { return vectorStamp },
 	}
 }
 
@@ -67,6 +66,11 @@ func TestInstancesVectors(t *testing.T) {
 		meta := vectorMeta()
 		meta.Keepers = append(meta.Keepers, config.Keeper{Device: "old-laptop", Revoked: true})
 		writeRecord(t, dir, meta)
+		// atlas's reader is granted, so its key is on this machine; instances
+		// tells that by the file's presence, and never reads it.
+		if err := dir.SaveReaderKey(meta.Name, []byte("not read"), []byte("not read")); err != nil {
+			t.Fatal(err)
+		}
 		plain := &config.InstanceMetadata{Name: "lab", Provider: "gke", Project: "proj-lab", Region: "us-central1",
 			Cluster: "farcast-lab", Status: config.InstanceProvisioning,
 			CostLimit: config.CostLimit{Amount: 12.5, Currency: "USD", Period: "monthly"}}
@@ -84,7 +88,7 @@ func TestInstancesVectors(t *testing.T) {
 		if bytes.Contains(got, []byte(dir.Path())) {
 			t.Fatalf("the listing names the config directory's absolute path:\n%s", got)
 		}
-		for _, secret := range []string{"proj-atlas", "proj-lab", "farcast-atlas", "203.0.113.7", "gke.goog", "operator@example.org"} {
+		for _, secret := range []string{"proj-atlas", "proj-lab", "farcast-atlas", "203.0.113.7", "gke.goog", meta.Reader.Email, meta.Reader.KeyID} {
 			if bytes.Contains(got, []byte(secret)) {
 				t.Errorf("the listing carries %q:\n%s", secret, got)
 			}
@@ -122,44 +126,6 @@ type versionStamp struct {
 
 func (versionStamp) Human(w io.Writer) error { return nil }
 
-// fakeGCloudDir writes gcloud's configuration files into a fresh directory:
-// one configurations/config_<name> per entry, and active_config naming active.
-func fakeGCloudDir(t *testing.T, active string, configs ...gcloudConfig) string {
-	t.Helper()
-	dir := filepath.Join(t.TempDir(), "gcloud")
-	writeGCloudDir(t, dir, active, configs...)
-	return dir
-}
-
-func writeGCloudDir(t *testing.T, dir, active string, configs ...gcloudConfig) {
-	t.Helper()
-	if err := os.MkdirAll(filepath.Join(dir, "configurations"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	for _, c := range configs {
-		var b strings.Builder
-		b.WriteString("[core]\n")
-		if c.Account != "" {
-			b.WriteString("account = " + c.Account + "\n")
-		}
-		if c.Project != "" {
-			b.WriteString("project = " + c.Project + "\n")
-		}
-		b.WriteString("disable_usage_reporting = True\n\n[compute]\nregion = europe-west4\n")
-		if c.Override != "" {
-			b.WriteString("\n[auth]\n" + c.Override + " = robot@work-prod.iam.gserviceaccount.com\n")
-		}
-		if err := os.WriteFile(filepath.Join(dir, "configurations", "config_"+c.Name), []byte(b.String()), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if active != "" {
-		if err := os.WriteFile(filepath.Join(dir, "active_config"), []byte(active), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-}
-
 // runRouter runs the whole CLI the way a process does, and returns stdout and
 // the exit code.
 func runRouter(t *testing.T, args ...string) ([]byte, int) {
@@ -170,24 +136,6 @@ func runRouter(t *testing.T, args ...string) ([]byte, int) {
 }
 
 func TestWorldErrorVectors(t *testing.T) {
-	t.Run("gcloud_mismatch", func(t *testing.T) {
-		dir := vectorConfigDir(t)
-		writeRecord(t, dir, vectorMeta())
-		t.Setenv("CLOUDSDK_CONFIG", fakeGCloudDir(t, "work",
-			gcloudConfig{Name: "work", Account: "someone@work.example", Project: "work-prod"},
-			gcloudConfig{Name: "personal", Account: "operator@example.org", Project: "proj-old"},
-		))
-		got, code := runRouter(t, "--config", dir.Path(), "-o", "json", "world", "atlas")
-		if code != 1 {
-			t.Fatalf("exit %d, want 1:\n%s", code, got)
-		}
-		for _, leak := range []string{"someone@work.example", "operator@example.org", dir.Path()} {
-			if bytes.Contains(got, []byte(leak)) {
-				t.Errorf("the refusal carries %q:\n%s", leak, got)
-			}
-		}
-		checkVector(t, "world", "error_gcloud_mismatch", got)
-	})
 	t.Run("not_found", func(t *testing.T) {
 		got, code := runRouter(t, "--config", vectorConfigDir(t).Path(), "-o", "json", "world", "nowhere")
 		if code != 1 {

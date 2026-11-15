@@ -73,10 +73,11 @@ func readEgressPolicy(ctx context.Context, cl policyReader) (*policy.Document, e
 		if !found {
 			return nil, fmt.Errorf("read the instance's egress policy: %w", err)
 		}
-		// Present but missing its key — the same hazard as an unparseable one.
-		return nil, fmt.Errorf("the egress policy in %s/%s has no %q; refusing to replace it, because "+
+		// Present but missing its key — the same hazard as an unparseable one,
+		// and the same kind: the cluster holds a document that does not read.
+		return nil, withKind(kindDocumentUnreadable, fmt.Errorf("the egress policy in %s/%s has no %q; refusing to replace it, because "+
 			"rewriting it from scratch would revoke every application already running",
-			fldeploy.DefaultNamespace, fldeploy.PolicyConfigMap, fldeploy.PolicyKey)
+			fldeploy.DefaultNamespace, fldeploy.PolicyConfigMap, fldeploy.PolicyKey))
 	}
 	if !found {
 		return &policy.Document{Version: policy.Version}, nil
@@ -94,7 +95,7 @@ func readEgressPolicy(ctx context.Context, cl policyReader) (*policy.Document, e
 		if json.Unmarshal([]byte(raw), &head) == nil && head.Version != nil && *head.Version != policy.Version {
 			return nil, withKind(kindVersionSkew, err)
 		}
-		return nil, withKind(kindKubectlFailed, err)
+		return nil, withKind(kindDocumentUnreadable, err)
 	}
 	return doc, nil
 }

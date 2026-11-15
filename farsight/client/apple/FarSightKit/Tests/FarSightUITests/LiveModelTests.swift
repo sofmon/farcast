@@ -296,8 +296,8 @@ struct LiveModelTests {
         var world = Worlds.slice("a", readAt: Date(timeIntervalSince1970: 1_794_477_600))
         world.instances[0].problems = [
             SectionProblem(section: .network, kind: .tunnelUnreachable, message: "dial tcp: i/o timeout"),
-            SectionProblem(section: .policy, kind: .kubectlFailed, message: "forbidden"),
-            SectionProblem(section: .apps, kind: .kubectlFailed, message: "forbidden"),
+            SectionProblem(section: .policy, kind: .forbidden, message: "forbidden"),
+            SectionProblem(section: .apps, kind: .forbidden, message: "forbidden"),
         ]
         model.update(world: world)
         let boundary = try PanelFacts.of(model, "a/farcast-system/fatline")

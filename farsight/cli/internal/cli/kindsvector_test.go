@@ -31,12 +31,11 @@ func TestKindsVector(t *testing.T) {
 // document this CLI no longer prints.
 func TestEveryVectorFileIsProduced(t *testing.T) {
 	produced := map[string]bool{
-		"instances/empty.json":             true, // TestInstancesVectors
-		"instances/unreadable.json":        true,
-		"version/version.json":             true, // TestVersionVector
-		"kinds/kinds.json":                 true, // TestKindsVector
-		"world/error_gcloud_mismatch.json": true, // TestWorldErrorVectors
-		"world/error_not_found.json":       true,
+		"instances/empty.json":       true, // TestInstancesVectors
+		"instances/unreadable.json":  true,
+		"version/version.json":       true, // TestVersionVector
+		"kinds/kinds.json":           true, // TestKindsVector
+		"world/error_not_found.json": true, // TestWorldErrorVectors
 	}
 	for _, v := range worldVectors() { // TestWorldVectors
 		produced["world/"+v.name+".json"] = true

@@ -10,11 +10,11 @@ import (
 )
 
 // The reader identity (ADR 0023 M2.3, design §7.2): a per-instance Google
-// service account the cluster reads are to run as (ADR 0023 M2.4), so a read
-// never mints a token for the installer, which can write; until then only
-// 'reader grant' reads as it. The human creates the account and
-// uploads its key's certificate in Cloud Shell; farcast makes the key and
-// applies the account's Kubernetes RBAC.
+// service account the cluster reads of 'world', 'ps', 'costs', 'usage' and
+// 'logs' run as (ADR 0023 M2.4), so those reads never mint a token for the
+// installer, which can write. The human creates the account and uploads its
+// key's certificate in Cloud Shell; farcast makes the key and applies the
+// account's Kubernetes RBAC.
 
 // readerName is the reader service account's ID for an instance:
 // "farcast-reader-" and the first 8 hex characters of the name's SHA-256. It
@@ -55,19 +55,23 @@ const msgUnsafeRecord = "instance %q's record holds a %s that is not one Google 
 // project, readerEmail(name, project), and the recorded one is not read: a
 // caller that must refuse a hand-edited email compares meta.Reader.Email
 // itself. keyID is "" when no reader or no key id is recorded.
+//
+// Its refusals match errCredentialMissing, kind credential_missing (ADR 0023
+// M2.4, A18-8): a reader record whose values farcast does not accept is no
+// usable credential.
 func checkedReader(meta *config.InstanceMetadata) (project, email, keyID string, err error) {
 	if meta == nil {
 		return "", "", "", fmt.Errorf("cli: checkedReader needs the instance's record")
 	}
 	if validateInstanceName(meta.Name) != nil {
-		return "", "", "", fmt.Errorf(msgUnsafeRecord, meta.Name, "name", meta.Name)
+		return "", "", "", refuse(errCredentialMissing, msgUnsafeRecord, meta.Name, "name", meta.Name)
 	}
 	if !projectIDShape.MatchString(meta.Project) {
-		return "", "", "", fmt.Errorf(msgUnsafeRecord, meta.Name, "project ID", meta.Project)
+		return "", "", "", refuse(errCredentialMissing, msgUnsafeRecord, meta.Name, "project ID", meta.Project)
 	}
 	if meta.Reader != nil && meta.Reader.KeyID != "" {
 		if !keyIDShape.MatchString(meta.Reader.KeyID) {
-			return "", "", "", fmt.Errorf(msgUnsafeRecord, meta.Name, "key id", meta.Reader.KeyID)
+			return "", "", "", refuse(errCredentialMissing, msgUnsafeRecord, meta.Name, "key id", meta.Reader.KeyID)
 		}
 		keyID = meta.Reader.KeyID
 	}
@@ -92,9 +96,11 @@ Usage: farcast reader <init|record|grant> <instance> [flags]
 
 An instance's read-only identity (ADR 0023 M2): a Google service account of
 its own, farcast-reader- and 8 hex characters of the instance name's SHA-256.
-From ADR 0023 M2.4 farcast's cluster reads run as it, so a read never mints a
-token for the installer, which can write; until then only 'reader grant'
-reads as it.
+The cluster reads of 'world', 'ps', 'costs', 'usage' and 'logs' run as it, so
+they never mint a token for the installer, which can write; without a reader
+that 'reader grant' has verified read-only they read nothing. The commands
+that write still run kubectl as the active gcloud configuration, for their
+reads too, and the 'storage' and 'secret' reads use the installer's key.
 
 Setting it up takes four steps, one of them yours in Cloud Shell:
 

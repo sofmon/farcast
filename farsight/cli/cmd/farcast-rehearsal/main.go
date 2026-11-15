@@ -1,7 +1,8 @@
 // Command farcast-rehearsal runs the Connected view's no-cost rehearsal: an
-// instance on 127.0.0.1 — a real FatLine, Shrike and two keyholder replicas,
-// and fake kubectl, gke-gcloud-auth-plugin and gcloud — for the FarCast app
-// to read from Finder before it reads a live one. See
+// instance on 127.0.0.1 — a fake Kubernetes API server and token endpoint,
+// which farcast reads in-process as the instance's reader, and a real
+// FatLine, Shrike and two keyholder replicas — for the FarCast app to read
+// from Finder before it reads a live one. See
 // docs/runbooks/phase-7-connected-view.md.
 //
 // It is never part of farcast. Build it as ./bin/farcast-rehearsal.
@@ -19,6 +20,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -28,12 +30,6 @@ import (
 )
 
 func main() {
-	// Linked as kubectl, gke-gcloud-auth-plugin or gcloud, this binary is
-	// that fake tool, and this is the only place a tool reads the process's
-	// own environment.
-	if code, ok := rehearsal.ToolMain(os.Args[0], os.Args[1:], os.Environ(), os.Stdout, os.Stderr); ok {
-		os.Exit(code)
-	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	code := run(ctx, os.Args[1:], os.Stdin, os.Stdout, os.Stderr)
 	stop()
@@ -45,7 +41,8 @@ const usage = `Usage:
       Start a rehearsal, or restart the stopped one in <dir>, and run it until Ctrl-C.
       <dir> is new, empty, or one a stopped harness left; without it, a temporary one.
   farcast-rehearsal scenario --dir <dir> <name>
-      Change what the instance shows from its next read. The scenarios:
+      Change what the instance shows from its next read (tunnel-down within a
+      moment). The scenarios:
       ` + "%s" + `
   farcast-rehearsal summarize < world.json
       Print only the shape of a world document or an error envelope: no name,
@@ -97,20 +94,26 @@ func runStart(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		return 2
 	}
 	if fs.NArg() > 0 {
-		if name := fs.Arg(0); rehearsal.ValidScenario(name) {
+		name := fs.Arg(0)
+		switch err := rehearsal.CheckScenario(name); {
+		case err == nil:
 			// A scenario name where a command goes: say the command that
 			// switches to it, with the directory filled in when it was given.
 			_, _ = io.WriteString(stderr, scenarioHint(name, *dir))
-			return 2
+		case slices.Contains(rehearsal.RetiredScenarios(), name):
+			// A retired one says what replaced it.
+			_, _ = fmt.Fprintf(stderr, "farcast-rehearsal: %v\n", err)
+		default:
+			_, _ = fmt.Fprintf(stderr, "farcast-rehearsal: unknown command %q\n", name)
+			printUsage(stderr)
 		}
-		_, _ = fmt.Fprintf(stderr, "farcast-rehearsal: unknown command %q\n", fs.Arg(0))
-		printUsage(stderr)
 		return 2
 	}
-	if *scenario != "" && !rehearsal.ValidScenario(*scenario) {
-		_, _ = fmt.Fprintf(stderr, "farcast-rehearsal: unknown scenario %q; the scenarios are %s\n",
-			*scenario, strings.Join(rehearsal.Scenarios(), ", "))
-		return 2
+	if *scenario != "" {
+		if err := rehearsal.CheckScenario(*scenario); err != nil {
+			_, _ = fmt.Fprintf(stderr, "farcast-rehearsal: %v\n", err)
+			return 2
+		}
 	}
 	commit := buildinfo.Get().Commit
 
@@ -241,15 +244,19 @@ func runScenario(args []string, stdout, stderr io.Writer) int {
 		printUsage(stderr)
 		return 2
 	}
-	if !rehearsal.ValidScenario(names[0]) {
-		_, _ = fmt.Fprintf(stderr, "farcast-rehearsal scenario: unknown scenario %q; the scenarios are %s\n",
-			names[0], strings.Join(rehearsal.Scenarios(), ", "))
+	if err := rehearsal.CheckScenario(names[0]); err != nil {
+		_, _ = fmt.Fprintf(stderr, "farcast-rehearsal scenario: %v\n", err)
 		return 2
 	}
 	if err := rehearsal.SetScenario(*dir, names[0]); err != nil {
 		_, _ = fmt.Fprintf(stderr, "farcast-rehearsal scenario: %v\n", err)
 		return 1
 	}
-	_, _ = fmt.Fprintf(stdout, "scenario %s: the instance shows it from its next read\n", names[0])
+	when := "from its next read"
+	if names[0] == rehearsal.ScenarioTunnelDown {
+		// The harness's watcher, not a read, moves the tunnel.
+		when = "within a moment"
+	}
+	_, _ = fmt.Fprintf(stdout, "scenario %s: the instance shows it %s\n", names[0], when)
 	return 0
 }

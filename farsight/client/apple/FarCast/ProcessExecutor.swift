@@ -13,7 +13,7 @@ import FarSightCore
 ///   Stdout past its limit stops the child and is `.outputTooLarge`; stderr
 ///   past its limit is cut, which is not a failure.
 /// - A child that outlives its timeout, or whose read is cancelled, is asked
-///   to stop with SIGTERM — farcast then cancels its own kubectl — and is
+///   to stop with SIGTERM — farcast then cancels its own reads — and is
 ///   killed `grace` later if it has not exited.
 /// - `run` returns only once the child has exited, its output has ended (or a
 ///   second has passed since it exited), and it has left the registry of

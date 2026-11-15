@@ -7,16 +7,6 @@ import (
 	"strings"
 )
 
-// GCloud pins the gcloud configuration kubectl's auth plugin acts as. The zero value is
-// unpinned: the parent's CLOUDSDK_CONFIG and CLOUDSDK_ACTIVE_CONFIG_NAME, if set, pass through.
-type GCloud struct {
-	Dir    string // CLOUDSDK_CONFIG
-	Config string // CLOUDSDK_ACTIVE_CONFIG_NAME; non-empty means pinned
-}
-
-// pinned reports whether g names a configuration.
-func (g GCloud) pinned() bool { return g.Config != "" }
-
 // windowsKeys pass through on Windows only: what a Windows process needs to
 // start at all and to find its user's directories. Untested until ADR 0023 M4.
 var windowsKeys = []string{"SYSTEMROOT", "USERPROFILE", "TEMP", "TMP", "LOCALAPPDATA", "APPDATA", "PATHEXT", "COMSPEC"}
@@ -29,26 +19,24 @@ var windowsKeys = []string{"SYSTEMROOT", "USERPROFILE", "TEMP", "TMP", "LOCALAPP
 //     auth plugin its kubeconfig names and the gcloud the plugin runs are all found by
 //     bare name, and a binary planted in the working directory must never be one of them.
 //   - HOME and TMPDIR, only when absolute; LANG and LC_*.
-//   - KUBECONFIG. Pinned, it names kubeconfig. Unpinned, it is the parent's, unchanged, or
-//     absent. kubectl is always given --kubeconfig, so KUBECONFIG reaches only the auth
-//     plugin, which keys its one token-cache entry by the current context of the file
-//     KUBECONFIG names. An unpinned command that named the instance's kubeconfig there
-//     would fill the very entry 'world' reads, under whichever identity is active; so only
-//     'world', which is pinned, names it (ADR 0021 decision 9).
+//   - KUBECONFIG, the parent's, unchanged, or absent. kubectl is always given
+//     --kubeconfig, so KUBECONFIG reaches only the auth plugin, which keys its one
+//     token-cache entry by the current context of the file KUBECONFIG names.
 //   - KUBERC=off: no kuberc file can add flags or aliases to a call.
-//   - CLOUDSDK_CONFIG and CLOUDSDK_ACTIVE_CONFIG_NAME: from gcloud when it is pinned, else
-//     the parent's. They choose the gcloud configuration, which is today's identity for
-//     every command but 'world' until ADR 0023's M2.
+//   - CLOUDSDK_CONFIG and CLOUDSDK_ACTIVE_CONFIG_NAME, the parent's: they choose the
+//     gcloud configuration, which is the identity every writing command's kubectl acts as
+//     until ADR 0023 M2.7. No read of world, ps, costs, usage or logs runs kubectl since
+//     M2.4: those run in-process as the instance's reader. The writing commands' reads
+//     still do, until M2.5.
 //   - GORACE: only race-instrumented Go binaries read it. A released kubectl or plugin is
-//     not one; the rehearsal's fakes are, and without it each of their exits sleeps a
-//     second.
+//     not one; a test's fakes are, and without it each of their exits sleeps a second.
 //   - On Windows, the variables a process needs there (windowsKeys).
 //
 // Everything else is dropped: KUBECTL_* and KUBECACHEDIR, every other CLOUDSDK_*
 // (CLOUDSDK_AUTH_ACCESS_TOKEN, CLOUDSDK_CORE_ACCOUNT and CLOUDSDK_PYTHON among them),
 // GOOGLE_*, the proxies in either case, FARCAST_CONFIG_HOME, DYLD_*, LD_*, PYTHON*,
 // BASH_ENV, ENV, SSL_CERT_* and REQUESTS_CA_BUNDLE.
-func Env(parent []string, kubeconfig string, gcloud GCloud) []string {
+func Env(parent []string) []string {
 	windows := runtime.GOOS == "windows"
 	// The last value a key has is the one a process reading its environment
 	// sees. Windows keys are case-insensitive, so they are compared upper-cased
@@ -88,17 +76,9 @@ func Env(parent []string, kubeconfig string, gcloud GCloud) []string {
 	if v, ok := last["GORACE"]; ok {
 		out["GORACE"] = v
 	}
-	if gcloud.pinned() {
-		out["KUBECONFIG"] = kubeconfig
-		out["CLOUDSDK_ACTIVE_CONFIG_NAME"] = gcloud.Config
-		if gcloud.Dir != "" {
-			out["CLOUDSDK_CONFIG"] = gcloud.Dir
-		}
-	} else {
-		for _, k := range []string{"KUBECONFIG", "CLOUDSDK_CONFIG", "CLOUDSDK_ACTIVE_CONFIG_NAME"} {
-			if v, ok := last[k]; ok {
-				out[k] = v
-			}
+	for _, k := range []string{"KUBECONFIG", "CLOUDSDK_CONFIG", "CLOUDSDK_ACTIVE_CONFIG_NAME"} {
+		if v, ok := last[k]; ok {
+			out[k] = v
 		}
 	}
 	if windows {
@@ -136,7 +116,7 @@ func absoluteEntries(path string) string {
 
 // withKubercOff is env with any KUBERC entry removed and KUBERC=off appended
 // last. Env already sets it; this enforces it in the one place every kubectl
-// call passes through, whatever environment a caller handed NewWithEnv.
+// call passes through, whatever environment a caller handed newWithEnv.
 func withKubercOff(env []string) []string {
 	out := make([]string, 0, len(env)+1)
 	for _, kv := range env {

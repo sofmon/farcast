@@ -12,7 +12,11 @@ import FarSightCore
 @Suite("Panel wording")
 struct PanelWordingTests {
     static let readAt = Date(timeIntervalSince1970: 1_794_477_600)
-    static let raw = "kubectl get deployments -n farcast-system -o json: ERROR: (gcloud.auth) RAW-CLI-MESSAGE"
+    static let raw = "kube: GET /apis/apps/v1/namespaces/farcast-system/deployments: 401 Unauthorized: RAW-CLI-MESSAGE"
+    /// What a section not read for want of a reader says after its name.
+    static let noReaderWhy = "credential missing — set up the instance's reader in a terminal: farcast reader init <instance>, "
+        + "the printed Cloud Shell script, reader record and reader grant; farcast instances shows the reader's state"
+    static let skew = "the read was refused · version skew — build farcast and FarCast from one commit"
     let system = "a/farcast-system"
 
     func model(_ world: World) -> WorldModel {
@@ -28,8 +32,8 @@ struct PanelWordingTests {
         return world
     }
 
-    func signedOut(_ section: SectionProblem.Section) -> SectionProblem {
-        SectionProblem(section: section, kind: .gcloudSignedOut, message: Self.raw)
+    func noReader(_ section: SectionProblem.Section) -> SectionProblem {
+        SectionProblem(section: section, kind: .credentialMissing, message: Self.raw)
     }
 
     func setShrike(_ state: AppState, in world: inout World) {
@@ -41,7 +45,7 @@ struct PanelWordingTests {
 
     @Test("a current watch the read observed is the evidence: Shrike watches, though the apps section failed")
     func watchIsEvidence() throws {
-        let world = read([signedOut(.apps)]) { setShrike(.unknown, in: &$0) }
+        let world = read([noReader(.apps)]) { setShrike(.unknown, in: &$0) }
         let facts = try PanelFacts.of(model(world), "\(system)/shrike")
         #expect(facts["line watched"] == "1" && facts["refusals seen"] == "0")
         #expect(!facts.values.contains("not watching") && !facts.values.contains("not read"))
@@ -49,13 +53,13 @@ struct PanelWordingTests {
 
     @Test("with no watch and its state not read, Shrike is not read, never not watching")
     func noEvidenceIsNotRead() throws {
-        let world = read([signedOut(.apps)]) { world in
+        let world = read([noReader(.apps)]) { world in
             setShrike(.unknown, in: &world)
             world.connections.removeAll { $0.kind == .watch }
         }
         let model = model(world)
         #expect(try PanelFacts.of(model, "\(system)/shrike") == ["Shrike's watch on FatLine": "not read"])
-        #expect(try PanelFacts.note(model, "\(system)/shrike").contains("apps not read · signed out of gcloud — run gcloud auth login"))
+        #expect(try PanelFacts.note(model, "\(system)/shrike").contains("apps not read · \(Self.noReaderWhy)"))
 
         // A watch that faded is no evidence either.
         var stale = world
@@ -87,17 +91,17 @@ struct PanelWordingTests {
 
     @Test("each panel says its own failed sections in one sentence each, and none repeats the CLI's message")
     func sentencesNotMessages() throws {
-        let model = model(read([signedOut(.spend), signedOut(.apps), signedOut(.policy)]))
+        let model = model(read([noReader(.spend), noReader(.apps), noReader(.policy)]))
         let notes = try ["technocore", "fatline", "datasphere", "shrike"].map { try PanelFacts.note(model, "\(system)/\($0)") }
-        #expect(!notes.contains { $0.contains("RAW-CLI-MESSAGE") || $0.contains("kubectl get") })
+        #expect(!notes.contains { $0.contains("RAW-CLI-MESSAGE") || $0.contains("kube: GET") })
         let kernel = try #require(model.index.apps["\(system)/technocore"])
         #expect(SystemSummary(app: kernel, model: model).problems == [
-            "spending not read · signed out of gcloud — run gcloud auth login",
-            "apps not read · signed out of gcloud — run gcloud auth login",
+            "spending not read · \(Self.noReaderWhy)",
+            "apps not read · \(Self.noReaderWhy)",
         ])
-        #expect(notes[1].hasPrefix("egress policy not read · signed out of gcloud — run gcloud auth login\n"))
+        #expect(notes[1].hasPrefix("egress policy not read · \(Self.noReaderWhy)\n"))
         #expect(!notes[1].contains("spending not read"))
-        #expect(notes[2].hasPrefix("apps not read · signed out of gcloud"))
+        #expect(notes[2].hasPrefix("apps not read · credential missing"))
         // Shrike's watch was read: nothing failed that is its.
         let shrike = try #require(model.index.apps["\(system)/shrike"])
         #expect(SystemSummary(app: shrike, model: model).problems.isEmpty)
@@ -105,11 +109,11 @@ struct PanelWordingTests {
 
     @Test("a refused read says it was refused, in every panel, and never 'read not read'")
     func refusedRead() throws {
-        let refused = SectionProblem(section: .read, kind: .gcloudMismatch, message: Self.raw)
+        let refused = SectionProblem(section: .read, kind: .versionSkew, message: Self.raw)
         let model = model(read([refused]))
         for component in ["technocore", "fatline", "datasphere", "shrike"] {
             let note = try PanelFacts.note(model, "\(system)/\(component)")
-            #expect(note.components(separatedBy: "the read was refused · gcloud identity does not match — farcast instances pin-gcloud").count == 2, "\(component)")
+            #expect(note.components(separatedBy: Self.skew).count == 2, "\(component)")
             #expect(!note.contains("read not read") && !note.contains("RAW-CLI-MESSAGE"), "\(component)")
         }
     }
@@ -217,18 +221,46 @@ struct PanelWordingTests {
         #expect(try PanelFacts.of(model(world([])), "\(system)/fatline")["declared, never used"] == "1")
         let unread = try PanelFacts.of(model(world([SectionProblem(section: .network, kind: .tunnelUnreachable, message: "x")])), "\(system)/fatline")
         #expect(unread["declared, use not read"] == "1" && unread["declared, never used"] == nil)
-        let noPolicy = try PanelFacts.of(model(world([SectionProblem(section: .policy, kind: .kubectlFailed, message: "x")])), "\(system)/fatline")
+        let noPolicy = try PanelFacts.of(model(world([SectionProblem(section: .policy, kind: .forbidden, message: "x")])), "\(system)/fatline")
         #expect(noPolicy["declared, never used"] == "not read")
     }
 
     @Test("with neither the policy nor the network read, the declared figure claims no use either way")
     func declaredUseNothingRead() throws {
         let world = read([
-            SectionProblem(section: .policy, kind: .gcloudSignedOut, message: "x"),
+            SectionProblem(section: .policy, kind: .credentialMissing, message: "x"),
             SectionProblem(section: .network, kind: .tunnelUnreachable, message: "x"),
         ])
         let facts = try PanelFacts.of(model(world), "\(system)/fatline")
         #expect(facts["declared, use not read"] == "not read" && facts["declared, never used"] == nil)
+    }
+
+    // MARK: - A group the reader may not read (ADR 0023 M2.4, P5)
+
+    @Test("a group the reader may not read is drawn as not read, with the kind's label; the groups it read are not")
+    func groupNotRead() async throws {
+        let world = try await RenderHarness.feedWorld("atlas", read: .world(RenderHarness.vector("namespace_unread")))
+        let model = model(world)
+        let lab = try #require(model.index.groups["atlas/lab"])
+        let shop = try #require(model.index.groups["atlas/shop"])
+        #expect(lab.appsProblem?.kind == .forbidden && lab.apps.isEmpty)
+        #expect(GroupHeader.notRead(lab) == "applications not read · forbidden")
+        #expect(GroupHeader.notRead(shop) == nil)
+        #expect(model.groupOrder.filter { GroupHeader.notRead($0) != nil }.map(\.id) == ["atlas/lab"])
+        // The chip says nothing of it: the apps section was read.
+        #expect(Format.readState(try #require(world.instances.first), brief: true) == nil)
+        // Its frame and header draw, at the map's own scale.
+        let frame = try #require(model.geometry.groups["atlas/lab"])
+        let area = CGSize(width: 900, height: 400)
+        let camera = Camera.fitting(frame.frame, in: area)
+        let layer = ImageRenderer(content: ZStack(alignment: .topLeading) {
+            TerritoryLayer(geometry: model.geometry, index: model.index, tunnelled: [], camera: camera, viewport: area)
+            GroupHeader(
+                group: lab, rect: camera.screen(frame.header, in: area), frame: camera.screen(frame.frame, in: area),
+                scale: camera.scale, model: model
+            )
+        }.frame(width: area.width, height: area.height))
+        #expect(layer.cgImage != nil)
     }
 
     // MARK: - F4: the chip
@@ -236,11 +268,11 @@ struct PanelWordingTests {
     @Test("the chip summarises what failed: counted, with why, never one entry a section")
     func chipSummary() {
         let time = "read \(Format.time(Self.readAt))"
-        let signed = read([signedOut(.spend), signedOut(.apps), signedOut(.policy)]).instances[0]
-        #expect(Format.readState(signed) == "\(time) · 3 sections not read · signed out of gcloud")
-        #expect(Format.readState(signed, brief: true) == "3 sections not read · signed out of gcloud")
-        let refused = read([SectionProblem(section: .read, kind: .gcloudMismatch, message: Self.raw)]).instances[0]
-        #expect(Format.readState(refused) == "\(time) · read refused · gcloud identity does not match")
+        let unread = read([noReader(.spend), noReader(.apps), noReader(.policy)]).instances[0]
+        #expect(Format.readState(unread) == "\(time) · 3 sections not read · credential missing")
+        #expect(Format.readState(unread, brief: true) == "3 sections not read · credential missing")
+        let refused = read([SectionProblem(section: .read, kind: .versionSkew, message: Self.raw)]).instances[0]
+        #expect(Format.readState(refused) == "\(time) · read refused · version skew")
         let healthy = read().instances[0]
         #expect(Format.readState(healthy) == time)
         #expect(Format.readState(healthy, brief: true) == nil)
@@ -251,14 +283,14 @@ struct PanelWordingTests {
 
     @Test("what failed outlives the spending on a narrow chip, and is said at its shortest before the name stands alone")
     func chipVariants() throws {
-        let refused = read([SectionProblem(section: .read, kind: .gcloudMismatch, message: Self.raw)]).instances[0]
+        let refused = read([SectionProblem(section: .read, kind: .versionSkew, message: Self.raw)]).instances[0]
         let variants = TerritoryLabel.variants(refused, showsReadState: true)
         let time = "read \(Format.time(Self.readAt))"
         #expect(variants.map(\.readState) == [
-            "\(time) · read refused · gcloud identity does not match",
-            "\(time) · read refused · gcloud identity does not match",
-            "read refused · gcloud identity does not match",
-            "read refused · gcloud identity does not match",
+            "\(time) · read refused · version skew",
+            "\(time) · read refused · version skew",
+            "read refused · version skew",
+            "read refused · version skew",
             "read refused",
             nil,
         ])
@@ -270,14 +302,14 @@ struct PanelWordingTests {
         #expect(healthy.map { $0.spending == nil } == [false, false, false, true])
         // The fixture says no read state at all.
         #expect(TerritoryLabel.variants(read().instances[0], showsReadState: false).map(\.readState) == [nil, nil, nil])
-        #expect(Format.readHeadline(read([signedOut(.spend), signedOut(.apps)]).instances[0]) == "2 sections not read")
+        #expect(Format.readHeadline(read([noReader(.spend), noReader(.apps)]).instances[0]) == "2 sections not read")
         #expect(Format.readHeadline(read().instances[0]) == nil)
     }
 
     @Test("in a 540-point band the refused chip still says the read was refused, and the name alone never runs past its band")
     func chipFitsItsBand() throws {
         var world = Worlds.slice("rehearsal", readAt: Self.readAt)
-        world.instances[0].problems = [SectionProblem(section: .read, kind: .gcloudMismatch, message: Self.raw)]
+        world.instances[0].problems = [SectionProblem(section: .read, kind: .versionSkew, message: Self.raw)]
         let model = model(world)
         let instance = model.world.instances[0]
         let scale = try #require(model.fitted(.group("rehearsal/farcast-system"))).scale
@@ -335,7 +367,7 @@ struct PanelWordingTests {
 
     @Test("the chip's disclosure says each message once, under every sentence it explains")
     func disclosureGroups() {
-        let problems = [signedOut(.spend), signedOut(.apps), SectionProblem(section: .network, kind: .tunnelUnreachable, message: "dial tcp: i/o timeout"), signedOut(.policy)]
+        let problems = [noReader(.spend), noReader(.apps), SectionProblem(section: .network, kind: .tunnelUnreachable, message: "dial tcp: i/o timeout"), noReader(.policy)]
         let groups = ReadDetailsContent.groups(problems)
         #expect(groups.map(\.message) == [Self.raw, "dial tcp: i/o timeout"])
         #expect(groups[0].sentences.count == 3 && groups[1].sentences == ["network not read · tunnel unreachable"])
@@ -348,7 +380,7 @@ struct PanelWordingTests {
     @Test("no screen draws a panel whole narrower than the least width, and a Mac window no smaller than its minimum draws a focused app whole")
     func leastWholeWidth() throws {
         // As figuresFit's: TechnoCore with every figure it can have.
-        var world = read([signedOut(.policy)])
+        var world = read([noReader(.policy)])
         world.instances[0].spending = Spending(
             expectedCents: 1805, confirmedCents: 464, totalCents: 2269, limitCents: 2000, recordedLimitCents: 2000,
             hasConfirmation: true, confirmedThrough: Self.readAt, level: .reached,
@@ -384,7 +416,7 @@ struct PanelWordingTests {
 
     @Test("VoiceOver hears every figure and every word of a FarCast panel, what its 'more' opens included")
     func spokenSurface() throws {
-        var world = read([signedOut(.apps)])
+        var world = read([noReader(.apps)])
         world.instances[0].spending.notMetered = ["data through the carrier", "bucket storage and operations"]
         let model = model(world)
         let kernel = try #require(model.index.apps["\(system)/technocore"])
@@ -393,14 +425,14 @@ struct PanelWordingTests {
         for fact in summary.facts {
             #expect(spoken.contains("\(fact.value) \(fact.label)"), "\(fact.label)")
         }
-        #expect(spoken.contains("apps not read · signed out of gcloud — run gcloud auth login"))
+        #expect(spoken.contains("apps not read · \(Self.noReaderWhy)"))
         #expect(spoken.contains("Not metered: data through the carrier; bucket storage and operations."))
         #expect(spoken.hasSuffix(summary.text))
     }
 
     @Test("at the smallest a panel is drawn whole, a phone on its side, the tightest arrangement leaves every figure whole and room for the notes")
     func figuresFit() throws {
-        var world = read([signedOut(.policy)])
+        var world = read([noReader(.policy)])
         world.instances[0].spending = Spending(
             expectedCents: 1805, confirmedCents: 464, totalCents: 2269, limitCents: 2000, recordedLimitCents: 2000,
             hasConfirmation: true, confirmedThrough: Self.readAt, level: .reached,

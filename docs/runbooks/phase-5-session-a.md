@@ -54,6 +54,8 @@ Its header ([`walkprobe_test.go`](../../farsight/cli/internal/cli/walkprobe_test
 
 ## S0. Before the session
 
+*(2026-11-15, [ADR 0023](../adr/0023-one-download-farcast.md) M2.4: `farcast costs`, `usage` and `logs` now read the cluster in-process as the instance's reader, and read nothing until [phase 1's step 7b](phase-1-validation.md#7b-the-instances-reader-identity--not-yet-walked) has set one up and `farcast reader grant` has verified it. Step 7b is not yet walked, so a re-walk runs it first, once the instance is connected. The owed re-walk for ADR 0020 (PLAN.md) meets this too. The results below were walked with kubectl, and are not rewritten.)*
+
 1. `./check.sh --model` passes at the commit being walked. Record the commit and the check's summary line.
 2. The commit is pushed. `farcast run` clones the repository from GitHub, so a fixture or Containerfile change reaches the walk only once pushed (or with `--ref <pushed sha>`).
 3. Build the binary from that clean checkout, check it is that commit, and make it the `farcast` every later step runs:

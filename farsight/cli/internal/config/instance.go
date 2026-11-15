@@ -388,18 +388,18 @@ type InstanceMetadata struct {
 	CreatedAt time.Time `yaml:"created_at"`
 	UpdatedAt time.Time `yaml:"updated_at"`
 
-	// GCloudAccount is the gcloud account this instance's cluster is read as
-	// (ADR 0021 decision 9, amended 2026-11-12). The operator pins it from a
-	// terminal ('farcast instances pin-gcloud'); it is never taken from
-	// whatever configuration happens to be active. Empty means unpinned, and
-	// 'farcast world' refuses to read until it is set.
-	GCloudAccount string `yaml:"gcloud_account,omitempty"`
-
 	// Reader is the instance's read-only identity (ADR 0023 M2.3): a
 	// per-instance service account whose key this machine made. Nil until
 	// 'farcast reader init'. Pointer-typed like Registry, so a record written
 	// before readers existed still loads.
 	Reader *Reader `yaml:"reader,omitempty"`
+
+	// ServerSideApply records that the instance's objects are written with
+	// server-side apply (ADR 0023 M2.7): since when, and by which farcast.
+	// Nil means they were last written with kubectl's client-side apply.
+	// Declared in M2.4 so 'farcast instances' can report it; 'farcast
+	// migrate' and 'farcast install' write it from M2.7.
+	ServerSideApply *ServerSideApply `yaml:"server_side_apply,omitempty"`
 
 	// CloudLogging is the provider's logging configuration for the cluster, as
 	// the provider read it back at install (ADR 0019). CloudLoggingSystem means
@@ -456,6 +456,13 @@ type InstanceMetadata struct {
 	loaded    bool
 	loadedSum [sha256.Size]byte
 	loadedRaw []byte
+}
+
+// ServerSideApply is when an instance moved to server-side apply, and the
+// version of the farcast that moved it (ADR 0023 M2, design §6.5).
+type ServerSideApply struct {
+	Since   time.Time `yaml:"since"`
+	Farcast string    `yaml:"farcast"`
 }
 
 // Toolchain is the pair of digest-pinned third-party images an instance uses
@@ -751,7 +758,7 @@ func (d Dir) LoadInstanceMetadata(name string) (*InstanceMetadata, error) {
 // terminal ('instances' and 'world', which the FarCast app runs). The YAML
 // parser's own text quotes the lines around the fault, and some of its
 // messages quote a value; a record holds the project, the endpoints and the
-// pinned gcloud account. The error LoadInstanceMetadata returns still reads
+// reader's account. The error LoadInstanceMetadata returns still reads
 // as it always has: the operator at a terminal gets the whole of it.
 func ParseFault(err error) (fault string, ok bool) {
 	var ye yaml.Error

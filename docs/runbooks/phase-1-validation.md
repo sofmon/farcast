@@ -193,9 +193,15 @@ the full description for `autopilot`, `controlPlaneEndpointsConfig`, and
 *(Added 2026-11-14 for [ADR 0023](../adr/0023-one-download-farcast.md) M2.3. No part
 of this step has been run against Google. It is the once-per-instance privileged setup
 of ADR 0023 decision 3: a read-only service account of the instance's own, whose key
-this machine makes. No read command uses the reader until M2.4, and none of the success
-criteria below depends on it. What a reader can and cannot do is in the
+this machine makes. None of the success criteria below depends on it. What a reader can
+and cannot do is in the
 [CLI README](../../farsight/cli/README.md#farcast-reader--the-reader-identity-adr-0023-m23).)*
+
+*(2026-11-15, ADR 0023 M2.4: `farcast world`, `ps`, `costs`, `usage` and `logs` now read
+the cluster as this reader, and read nothing until step 4 has verified it. So every later
+runbook that runs them against a live instance needs this step first. It is still not
+walked. `farcast instances` shows how far it is set up, in its `reader` field, without
+opening `reader.key`.)*
 
 1. Make the key and the script:
 

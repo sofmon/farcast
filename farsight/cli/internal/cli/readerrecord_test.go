@@ -186,7 +186,7 @@ func TestReaderRecordAfterRotate(t *testing.T) {
 		t.Fatalf("exit %d: %s", code, errOut)
 	}
 	want := fmt.Sprintf("✓ instance \"atlas\"'s reader %s now signs with key %s\n", email, newID) +
-		fmt.Sprintf("The previous key %s still works. Once 'farcast reader grant atlas' has read with the new key, delete it from Cloud Shell: gcloud iam service-accounts keys delete '%s' --iam-account '%s' --project 'proj-test1'\n", readerTestKeyID, readerTestKeyID, email)
+		fmt.Sprintf("The previous key %s still works. Once 'farcast world atlas' reads, delete it from Cloud Shell: gcloud iam service-accounts keys delete '%s' --iam-account '%s' --project 'proj-test1'\n", readerTestKeyID, readerTestKeyID, email)
 	if out != want {
 		t.Errorf("stdout\n%q\nwant\n%q", out, want)
 	}

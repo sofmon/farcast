@@ -19,17 +19,19 @@ import (
 	"github.com/sofmon/farcast/farsight/cli/internal/cluster"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/keyholder"
+	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 	"github.com/sofmon/farcast/fatline/identity"
 	"github.com/sofmon/farcast/fatline/tunnel"
 	tcdeploy "github.com/sofmon/farcast/technocore/deploy"
 	"github.com/sofmon/farcast/technocore/kernel"
+	tkube "github.com/sofmon/farcast/technocore/kube"
 )
 
 // Every remote read 'world' makes has its own deadline, and the whole command
 // has a ceiling: a Refresh in the app must come back, whatever answered.
 const (
 	worldCeiling         = 60 * time.Second
-	kubectlReadTimeout   = 20 * time.Second
+	clusterReadTimeout   = 20 * time.Second
 	tunnelConnectTimeout = 15 * time.Second
 	sealReadTimeout      = 10 * time.Second
 )
@@ -38,11 +40,11 @@ const (
 // than the constants alone so a test can make a silent control plane cost
 // milliseconds instead of the seconds it costs an operator.
 type worldTimeouts struct {
-	ceiling, kubectl, connect, seal time.Duration
+	ceiling, cluster, connect, seal time.Duration
 }
 
 var defaultWorldTimeouts = worldTimeouts{
-	ceiling: worldCeiling, kubectl: kubectlReadTimeout, connect: tunnelConnectTimeout, seal: sealReadTimeout,
+	ceiling: worldCeiling, cluster: clusterReadTimeout, connect: tunnelConnectTimeout, seal: sealReadTimeout,
 }
 
 // worldCluster is the slice of the cluster client the read needs: workloads,
@@ -68,13 +70,13 @@ type sealReader interface {
 
 type worldCommand struct {
 	// Seams. The clock and the build stamp are inputs so a document is a
-	// function of what was read; the rest reach the cluster and the tunnel.
+	// function of what was read; the environment says where home is, so a
+	// message never names it; the rest reach the cluster and the tunnel.
 	now     func() time.Time
 	stamp   func() buildStamp
 	environ func() []string
-	// newCluster builds the kubectl client with the environment the guard
-	// built. It is never handed the process's own environment.
-	newCluster func(kubeconfigPath string, env []string) worldCluster
+	// newCluster opens the cluster as the instance's reader (ADR 0023 M2.4).
+	newCluster func(clusterRef) (worldCluster, error)
 	// connect is the final dial, and only that: the identity it is handed
 	// was loaded by the narrow loader, which never opens ca.key.
 	connect func(ctx context.Context, endpoint string, id tunnel.ClientIdentity) (worldTunnel, error)
@@ -105,12 +107,13 @@ It reads in five sections — spend, apps, policy, network, seal — each on its
 own. A section that cannot be read says why, with a kind, and the rest still
 come back; what it would have told is marked unknown, never left out.
 
-The cluster reads run kubectl as the gcloud account this instance pins
-('farcast instances pin-gcloud'), under a gcloud configuration whose account is
-that account and whose project is the instance's — never as whichever
-configuration happens to be active. Without a pin, or without such a
-configuration, nothing is read. Each kubectl read reaches the provider's API
-server, which may log who, when and from where (ADR 0019).
+The cluster reads run in-process as the instance's own read-only service
+account ('farcast reader'), and never without a reader that 'farcast reader
+grant' has verified read-only: without one, the cluster sections say why and
+nothing is sent. Each run mints a token for that account at
+oauth2.googleapis.com, which tells Google the account and the time. Each read
+then reaches the provider's API server, which may log who, when and from
+where (ADR 0019).
 
 The network and seal reads ride one FatLine tunnel. The provider sees its
 source address, timing, sizes and the server name that names the instance —
@@ -133,7 +136,15 @@ func (c *worldCommand) ensureDefaults() {
 		c.environ = os.Environ
 	}
 	if c.newCluster == nil {
-		c.newCluster = func(kc string, env []string) worldCluster { return cluster.NewWithEnv(kc, env) }
+		c.newCluster = func(r clusterRef) (worldCluster, error) {
+			// A refusal returns a nil cluster, never a nil *cluster.Client
+			// inside a non-nil one.
+			cl, err := openCluster(r)
+			if err != nil {
+				return nil, err
+			}
+			return cl, nil
+		}
 	}
 	if c.connect == nil {
 		c.connect = func(ctx context.Context, endpoint string, id tunnel.ClientIdentity) (worldTunnel, error) {
@@ -163,18 +174,18 @@ func (c *worldCommand) Run(ctx context.Context, env *Env, args []string) error {
 	if err != nil {
 		return err
 	}
-	// The guard runs before anything reaches a cluster: a read that would
-	// run as the wrong identity does not run at all.
-	environ := c.environ()
-	choice, err := chooseGCloud(environ, name, meta)
-	if err != nil {
-		return err
-	}
-	kubeconfig := env.ConfigDir.InstanceKubeconfigPath(name)
-	g := &gatherer{
-		cl:       c.newCluster(kubeconfig, cluster.Env(environ, kubeconfig, cluster.GCloud{Dir: choice.Dir, Config: choice.Config})),
-		timeouts: c.timeouts,
-		paths:    localPaths(env.ConfigDir, choice, environ),
+	g := &gatherer{name: name, timeouts: c.timeouts, paths: localPaths(env.ConfigDir, c.environ())}
+	// The cluster is read as the instance's reader, and only as it (ADR 0023
+	// M2.4). A record that names another instance, or a reader that cannot
+	// read, is no refusal of the whole command: the cluster sections carry
+	// it, and the tunnel sections read on their own. openCluster builds
+	// paths from the recorded name, so it must be the name given first.
+	if err := recordNamed(meta, name); err != nil {
+		g.refused(err)
+	} else if cl, err := c.newCluster(clusterRef{Dir: env.ConfigDir, Meta: meta, Identity: kube.Reader, Warn: env.Err}); err != nil {
+		g.refused(err)
+	} else {
+		g.cl = cl
 	}
 
 	// The cluster and the tunnel are read side by side. Neither waits on the
@@ -208,12 +219,11 @@ type localPath struct {
 	say string
 }
 
-// localPaths are this machine's own directories: the config directory, the
-// gcloud directory the guard read, and the home directory. kubectl and its
-// auth plugin name files under them in their errors — a kubeconfig that will
-// not load, a credential store — and a section message never carries a home
-// directory's path.
-func localPaths(dir config.Dir, choice gcloudChoice, environ []string) []localPath {
+// localPaths are this machine's own directories: the config directory and
+// the home directory. A failure to open the cluster can name a file under
+// them — a key or a CA file that will not load — and a section message never
+// carries a home directory's path.
+func localPaths(dir config.Dir, environ []string) []localPath {
 	type sub struct{ path, say string }
 	var subs []sub
 	add := func(path, say string) {
@@ -222,7 +232,6 @@ func localPaths(dir config.Dir, choice gcloudChoice, environ []string) []localPa
 		}
 	}
 	add(dir.Path(), "<config>")
-	add(choice.Dir, choice.Source)
 	home := envValueOf(environ, "HOME")
 	if home == "" {
 		home, _ = os.UserHomeDir()
@@ -237,6 +246,17 @@ func localPaths(dir config.Dir, choice gcloudChoice, environ []string) []localPa
 		out = append(out, localPath{dir: regexp.MustCompile(regexp.QuoteMeta(s.path) + `($|[^A-Za-z0-9._-])`), say: s.say})
 	}
 	return out
+}
+
+// envValueOf is the last value environ gives key, the one a process sees.
+func envValueOf(environ []string, key string) string {
+	v := ""
+	for _, kv := range environ {
+		if k, val, ok := strings.Cut(kv, "="); ok && k == key {
+			v = val
+		}
+	}
+	return v
 }
 
 // validInstanceName refuses a name that is not one directory under the
@@ -269,7 +289,7 @@ func loadRecord(dir config.Dir, name string) (*config.InstanceMetadata, error) {
 //
 // A record that does not parse is told by the kind of fault and its line,
 // never in the parser's words: those quote the lines around the fault, and a
-// record holds the project, the endpoints and the pinned gcloud account. This
+// record holds the project, the endpoints and the reader's account. This
 // message reaches the app and every document a read prints; the operator
 // opens the file to see the rest.
 func recordError(name string, err error) error {
@@ -287,11 +307,13 @@ func recordError(name string, err error) error {
 }
 
 // gatherer makes the cluster reads, each with its own deadline. A failure
-// that every later read would meet the same way — no kubectl, no auth tool,
-// gcloud signed out, a control plane that did not answer, the ceiling
-// reached — is remembered, and the later reads report it without asking
-// again.
+// that every later read would meet the same way — no usable reader, its key
+// refused, its token refused, a control plane that could not be reached or did
+// not answer, the ceiling reached — is remembered, and the later reads report
+// it without asking again.
 type gatherer struct {
+	// name is the instance's, for the sentence a refused read appends.
+	name     string
 	cl       worldCluster
 	timeouts worldTimeouts
 	// paths are this machine's directories and what a message says instead.
@@ -299,7 +321,31 @@ type gatherer struct {
 	fatal *sectionProblem
 }
 
-// scrub is a kubectl message with this machine's paths replaced.
+// worldFatal are the kinds every later cluster read would meet the same way
+// (design §8.1, A18-9): the reader cannot be opened or authenticated, or the
+// cluster cannot be reached. forbidden is not among them: RBAC is per object,
+// so one refusal says nothing of the next read.
+var worldFatal = map[string]bool{
+	kindCredentialMissing: true, kindCredentialRefused: true, kindUnsafeEnvironment: true,
+	kindEndpointRefused: true, kindUnauthorized: true, kindClusterUnreachable: true,
+}
+
+// refused is the cluster not opened at all: every cluster section carries
+// why, and nothing is sent.
+func (g *gatherer) refused(err error) {
+	g.fatal = &sectionProblem{Kind: kindOfCluster(err), Message: g.scrub(err.Error())}
+}
+
+// kindOfCluster is clusterKind, or internal for a failure it does not know:
+// a section error always names a kind.
+func kindOfCluster(err error) string {
+	if k := clusterKind(err); k != "" {
+		return k
+	}
+	return kindInternal
+}
+
+// scrub is a cluster message with this machine's paths replaced.
 func (g *gatherer) scrub(msg string) string {
 	for _, p := range g.paths {
 		msg = p.dir.ReplaceAllString(msg, strings.ReplaceAll(p.say, "$", "$$")+"${1}")
@@ -308,9 +354,12 @@ func (g *gatherer) scrub(msg string) string {
 }
 
 func (g *gatherer) problemOf(ctx context.Context, err error) *sectionProblem {
-	p := &sectionProblem{Kind: kubectlKind(err), Message: g.scrub(err.Error())}
+	// A 403 says what the reader needs (A18-10); every other failure reads
+	// as it came.
+	err = readerRefused(err, g.name)
+	p := &sectionProblem{Kind: kindOfCluster(err), Message: g.scrub(err.Error())}
 	switch {
-	case p.Kind == kindKubectlMissing, p.Kind == kindAuthToolMissing, p.Kind == kindGCloudSignedOut:
+	case worldFatal[p.Kind]:
 		g.fatal = p
 	case ctx.Err() != nil:
 		g.fatal = &sectionProblem{Kind: kindTimeout, Message: "not asked: the read reached its ceiling of " + g.timeouts.ceiling.String()}
@@ -319,7 +368,7 @@ func (g *gatherer) problemOf(ctx context.Context, err error) *sectionProblem {
 		// again: every later read would wait out its own, and three of them
 		// are the whole ceiling.
 		g.fatal = &sectionProblem{Kind: kindTimeout, Message: fmt.Sprintf(
-			"not asked: the cluster did not answer an earlier read within %s", g.timeouts.kubectl)}
+			"not asked: the cluster did not answer an earlier read within %s", g.timeouts.cluster)}
 	}
 	return p
 }
@@ -328,7 +377,7 @@ func (g *gatherer) call(ctx context.Context, read func(context.Context) error) *
 	if g.fatal != nil {
 		return g.fatal
 	}
-	rctx, cancel := context.WithTimeout(ctx, g.timeouts.kubectl)
+	rctx, cancel := context.WithTimeout(ctx, g.timeouts.cluster)
 	defer cancel()
 	if err := read(rctx); err != nil {
 		return g.problemOf(ctx, err)
@@ -338,6 +387,13 @@ func (g *gatherer) call(ctx context.Context, read func(context.Context) error) *
 
 // apps is the apps section: FarCast's own workloads, the namespaces Planck
 // labelled, the kernel's metered list, and each namespace's workloads.
+//
+// The reader is bound in farcast-system and the metered namespaces only (ADR
+// 0023 M2.3, P3), so a namespace outside them answers forbidden. That
+// namespace is marked, its workloads unknown, and the rest are still read
+// (P5, A18-1): it is still grouped, so the alert that it is not metered is
+// still raised. A forbidden farcast-system, a failed namespace list, and
+// every other failure fail the section as a whole.
 func (g *gatherer) apps(ctx context.Context, meta *config.InstanceMetadata) appsInput {
 	var in appsInput
 	if p := g.call(ctx, func(ctx context.Context) (err error) {
@@ -379,12 +435,25 @@ func (g *gatherer) apps(ctx context.Context, meta *config.InstanceMetadata) apps
 	in.Workloads = map[string][]cluster.Workload{}
 	for _, ns := range keysSorted(set) {
 		var ws []cluster.Workload
+		var werr error
 		if p := g.call(ctx, func(ctx context.Context) (err error) {
 			ws, err = g.cl.Workloads(ctx, ns)
+			werr = err
 			return err
 		}); p != nil {
+			if werr != nil && errors.Is(werr, tkube.ErrForbidden) {
+				if in.Unread == nil {
+					in.Unread = map[string]*sectionProblem{}
+				}
+				// The mark says the remedy for this namespace, once: not
+				// p's, whose 'reader grant' cannot bind a namespace this
+				// machine does not record as metered.
+				in.Unread[ns] = &sectionProblem{Kind: kindForbidden, Message: fmt.Sprintf("the workloads in %s: %s",
+					ns, g.scrub(namespaceRefused(werr, g.name, ns, meta).Error()))}
+				continue
+			}
 			in.Problem = &sectionProblem{Kind: p.Kind, Message: fmt.Sprintf("the workloads in %s: %s", ns, p.Message)}
-			in.Workloads = nil
+			in.Workloads, in.Unread = nil, nil
 			return in
 		}
 		in.Workloads[ns] = ws
@@ -416,7 +485,7 @@ func (g *gatherer) meter(ctx context.Context) meterInput {
 	}
 	var doc kernel.Namespaces
 	if err := json.Unmarshal([]byte(raw), &doc); err != nil {
-		m.Problem = &sectionProblem{Kind: kindKubectlFailed, Message: "decode the kernel's metered namespaces: " + err.Error()}
+		m.Problem = &sectionProblem{Kind: kindDocumentUnreadable, Message: "decode the kernel's metered namespaces: " + err.Error()}
 		return m
 	}
 	if doc.Version != kernel.NamespacesVersion {

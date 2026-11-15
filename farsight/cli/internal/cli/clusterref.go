@@ -5,18 +5,22 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net/http"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/sofmon/farcast/farsight/cli/internal/cluster"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/kube"
+	tkube "github.com/sofmon/farcast/technocore/kube"
 )
 
 // errCredentialMissing marks a refusal for want of a credential the call
 // can use: no reader recorded or uploaded, a reader not yet verified
-// read-only, a reader email that is not the derived one, or a missing key
-// file. ADR 0023 M2.4 gives it the kind credential_missing.
+// read-only, a reader email that is not the derived one, a missing key file,
+// or a reader record whose values farcast does not accept (checkedReader, or
+// a record that names another instance). It is the kind credential_missing.
 var errCredentialMissing = errors.New("no usable stored credential")
 
 // clusterRef is what every command hands its cluster seam (ADR 0023 M2,
@@ -47,11 +51,25 @@ func refuse(sentinel error, format string, a ...any) error {
 	return &refusal{msg: fmt.Sprintf(format, a...), sentinel: sentinel}
 }
 
+// recordNamed refuses a record whose name is not the one the command was
+// given (ADR 0023 M2.4, A18-8). Every file a command touches is under the name
+// given, and openCluster builds its paths and its messages from the recorded
+// one, so the two must be the same before either is used.
+func recordNamed(meta *config.InstanceMetadata, name string) error {
+	if meta.Name != name {
+		return refuse(errCredentialMissing, "instance %q's record names the instance %q; farcast renders nothing from it", name, meta.Name)
+	}
+	return nil
+}
+
 // openCluster is the one place an instance's cluster client is built (ADR
 // 0023 M2, design §3.5). Its steps, in order:
 //
-//  1. the record must name an endpoint;
-//  2. cluster-ca.crt is read, if it exists;
+//  1. the record must name an endpoint; for the reader, the record's values
+//     must then pass checkedReader, before any path is built from them or any
+//     of them is printed (A18-8);
+//  2. cluster-ca.crt is read, if it exists; one that exists and cannot be
+//     read is refused as the endpoint;
 //  3. the endpoint is classified against the region and that CA
 //     (kube.ParseEndpoint), refusing anything the endpoint rule does not
 //     accept;
@@ -71,15 +89,23 @@ func openCluster(r clusterRef) (*cluster.Client, error) {
 	meta := r.Meta
 	name := meta.Name
 
-	// 1. ADR 0023 M2.4 gives this the kind endpoint_refused, never
-	// not_connected, which means no FatLine is recorded.
+	// 1. This is endpoint_refused, never not_connected, which means no
+	// FatLine is recorded.
 	if meta.Endpoint == "" {
 		return nil, refuse(kube.ErrEndpointRefused, "instance %q records no cluster endpoint; 'farcast install' records one; nothing was sent", name)
+	}
+	// A read command calls this with the record as it was read, so a hostile
+	// name, project or key id is refused here, quoted, before the name
+	// becomes a path or anything recorded is printed.
+	if r.Identity == kube.Reader {
+		if _, _, _, err := checkedReader(meta); err != nil {
+			return nil, err
+		}
 	}
 	// 2.
 	ca, ok, err := r.Dir.LoadClusterCA(name)
 	if err != nil {
-		return nil, err
+		return nil, refuse(kube.ErrEndpointRefused, "instance %q's cluster-ca.crt exists and cannot be read (%v); nothing was sent", name, err)
 	}
 	if !ok {
 		ca = nil
@@ -116,7 +142,7 @@ func readerCredential(r clusterRef, ep kube.Endpoint) (kube.Credential, error) {
 	// A certificate uploaded to the installer's account, or a hand-edited
 	// email, never makes a "reader" read an admin read.
 	if derived, ok := derivedReader(meta.Reader.Email, name, meta.Project, ep.Mode); !ok {
-		return kube.Credential{}, refuse(errCredentialMissing, "instance %q records the reader %s, which is not the reader farcast derives for it (%s); nothing was sent", name, meta.Reader.Email, derived)
+		return kube.Credential{}, refuse(errCredentialMissing, "instance %q records the reader %q, which is not the reader farcast derives for it (%s); nothing was sent", name, meta.Reader.Email, derived)
 	}
 	if meta.Reader.KeyID == "" {
 		return kube.Credential{}, refuse(errCredentialMissing, "instance %q's reader key is not yet uploaded; run the printed Cloud Shell script, then 'farcast reader record %s --key-id <id>'", name, name)
@@ -161,4 +187,66 @@ func derivedReader(email, name, project string, mode kube.Mode) (derived string,
 	derived = readerName(name) + "@<a name under .invalid>"
 	local, domain, found := strings.Cut(email, "@")
 	return derived, found && local == readerName(name) && loopbackReaderDomainShape.MatchString(domain)
+}
+
+// msgReaderIAMRefused is what a 403 the reader met at the cluster's endpoint,
+// rather than in Kubernetes' RBAC, says to do (design §8.1). What an IAM
+// refusal looks like on the wire is not walked; the probe walk pins it.
+const msgReaderIAMRefused = "the cluster's endpoint refused the identity (IAM); if the reader was just set up, IAM changes can take 7 minutes or longer, otherwise check the Cloud Shell step"
+
+// readerRefused is err with one sentence appended when the cluster refused
+// the instance's reader (403, tkube.ErrForbidden; design §8.1, A18-10): an
+// RBAC refusal, a 403 whose body is a Kubernetes Status, says to run 'farcast
+// reader grant'; any other 403 is the endpoint's IAM. Every other error, nil
+// included, is returned as it is, and the result still matches everything err
+// did. Only the read commands call it, which read as the reader and know the
+// instance's name; a writer's 403 is worded in ADR 0023 M2.5.
+func readerRefused(err error, name string) error {
+	if !errors.Is(err, tkube.ErrForbidden) {
+		return err
+	}
+	if forbiddenByRBAC(err) {
+		return fmt.Errorf("%w; run 'farcast reader grant %s'", err, name)
+	}
+	return fmt.Errorf("%w; %s", err, msgReaderIAMRefused)
+}
+
+// namespaceRefused is readerRefused for a namespace world marks as one the
+// reader may not read (P5, A18-1), with the remedy that works for it. The
+// reader is bound in farcast-system and the namespaces this machine records
+// as metered only (P3), so for an RBAC 403 in any other namespace 'reader
+// grant' binds nothing; 'kernel meter', which meters it and binds the reader
+// beside the kernel once 'reader grant' recorded its scope, does. A recorded
+// namespace refused by RBAC lost or never got its binding, which 'reader
+// grant' applies again, and any other 403 is the endpoint's IAM, whatever
+// the namespace: both are readerRefused's.
+func namespaceRefused(err error, name, ns string, meta *config.InstanceMetadata) error {
+	if forbiddenByRBAC(err) && (meta.Kernel == nil || !slices.Contains(meta.Kernel.Namespaces, ns)) {
+		return fmt.Errorf("%w; the reader may read only farcast-system and the namespaces this machine records as metered: "+
+			"run 'farcast kernel meter %s %s', which meters %s and binds the reader there", err, name, ns, ns)
+	}
+	return readerRefused(err, name)
+}
+
+// forbiddenByRBAC reports whether any error in err's tree is a 403 whose body
+// was a Kubernetes Status (kube.APIError.KubernetesStatus): the API server's
+// RBAC refused it, not the endpoint in front of it. It walks the whole tree,
+// so a 403 among several namespaces' failures is found whatever came first.
+func forbiddenByRBAC(err error) bool {
+	if ae, ok := err.(*kube.APIError); ok && ae.Status.Code == http.StatusForbidden && ae.KubernetesStatus {
+		return true
+	}
+	switch u := err.(type) {
+	case interface{ Unwrap() error }:
+		if inner := u.Unwrap(); inner != nil {
+			return forbiddenByRBAC(inner)
+		}
+	case interface{ Unwrap() []error }:
+		for _, inner := range u.Unwrap() {
+			if forbiddenByRBAC(inner) {
+				return true
+			}
+		}
+	}
+	return false
 }

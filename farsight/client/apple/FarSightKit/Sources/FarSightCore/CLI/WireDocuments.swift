@@ -1,6 +1,6 @@
 import Foundation
 
-// The CLI's JSON documents as the wire carries them, schema 1: mirrors of
+// The CLI's JSON documents as the wire carries them, schema 2: mirrors of
 // the Go types in farsight/cli/internal/cli (worlddoc.go, instances.go,
 // version.go), decoded as they are and mapped into the model by
 // `CLIDocuments`, never used by anything else.
@@ -51,14 +51,16 @@ struct WireListing: Decodable {
 }
 
 /// `instanceEntry`: only the name is required. An entry with an error
-/// carries its name and its error and nothing else.
+/// carries its name and its error and nothing else. `reader` is one of a
+/// closed set of words (`CLIDocuments.readerState`).
 struct WireListingEntry: Decodable {
     let name: String
     let status: String?
     let costLimit: WireCostLimit?
     let cloudLogging: String?
     let components: WireRecordedComponents?
-    let gcloudPinned: Bool?
+    let reader: String?
+    let migrated: Bool?
     let error: WireProblem?
 
     enum CodingKeys: String, CodingKey {
@@ -66,7 +68,7 @@ struct WireListingEntry: Decodable {
         case costLimit = "cost_limit"
         case cloudLogging = "cloud_logging"
         case components
-        case gcloudPinned = "gcloud_pinned"
+        case reader, migrated
         case error
     }
 }
@@ -271,8 +273,14 @@ struct WireGroup: Decodable {
     let metered: Bool?
     let provenance: WireProvenance?
     let apps: [WireApp]
+    /// Why the namespace's workloads were not read, while the rest of the
+    /// apps section was; null when they were read (`worldGroup.AppsError`).
+    let appsError: WireProblem?
 
-    enum CodingKeys: String, CodingKey { case namespace, metered, provenance, apps }
+    enum CodingKeys: String, CodingKey {
+        case namespace, metered, provenance, apps
+        case appsError = "apps_error"
+    }
 
     init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -280,6 +288,7 @@ struct WireGroup: Decodable {
         metered = try c.decodeIfPresent(Bool.self, forKey: .metered)
         provenance = try c.decodeIfPresent(WireProvenance.self, forKey: .provenance)
         apps = try c.decodeIfPresent([WireApp].self, forKey: .apps) ?? []
+        appsError = try c.decodeIfPresent(WireProblem.self, forKey: .appsError)
     }
 }
 

@@ -202,7 +202,7 @@ public struct SectionProblem: Codable, Sendable, Equatable, Hashable {
     }
 
     /// Which part failed: one of the world document's sections, the local
-    /// record, or the read as a whole (a timeout, a refused identity) — or,
+    /// record, or the read as a whole (a timeout, a farcast of another commit) — or,
     /// as `figures`, a spending figure a section that was read gave and the
     /// map cannot draw. That one is the map's own, never the CLI's: its
     /// section was read, and says so.
@@ -219,8 +219,10 @@ public struct SectionProblem: Codable, Sendable, Equatable, Hashable {
     }
 
     /// The CLI's stable error kinds, so the map tells "no tunnel", "no
-    /// kernel", "version skew" and "signed out of gcloud" apart without
-    /// reading prose.
+    /// kernel", "version skew" and "credential missing" apart without
+    /// reading prose. The five kinds ADR 0023 M2 retired (the kubectl and
+    /// gcloud ones) are not cases: a farcast that still sent one would read
+    /// as `unknown`, and one built from this app's commit never does.
     public enum Kind: String, Codable, Sendable, Equatable, Hashable, CaseIterable, UnknownDecodable {
         case recordUnreadable
         case notFound
@@ -230,11 +232,28 @@ public struct SectionProblem: Codable, Sendable, Equatable, Hashable {
         case kernelAbsent
         case notCheckpointed
         case versionSkew
-        case kubectlMissing
-        case kubectlFailed
-        case gcloudMismatch
-        case gcloudSignedOut
-        case authToolMissing
+        /// No usable reader identity on this Mac: none recorded, uploaded or
+        /// granted, or its key missing.
+        case credentialMissing
+        /// Google's token endpoint refused to mint a token from the reader's key.
+        case credentialRefused
+        /// farcast's process environment would have made it print a
+        /// credential, so it sent nothing. The app's child environment never
+        /// carries the variable that does this.
+        case unsafeEnvironment
+        /// The recorded endpoint, its CA and the credential do not pair, or
+        /// no endpoint is recorded; nothing was sent.
+        case endpointRefused
+        case clusterUnreachable
+        /// The API server refused the reader's token.
+        case unauthorized
+        /// The API server refused the reader this read.
+        case forbidden
+        case clusterRejected
+        case documentUnreadable
+        case rolloutStalled
+        case notMigrated
+        case planChanged
         case timeout
         case `internal`
         case unknown
@@ -248,11 +267,18 @@ public struct SectionProblem: Codable, Sendable, Equatable, Hashable {
             case .kernelAbsent: "no kernel"
             case .notCheckpointed: "not checkpointed yet"
             case .versionSkew: "version skew"
-            case .kubectlMissing: "kubectl missing"
-            case .kubectlFailed: "kubectl failed"
-            case .gcloudMismatch: "gcloud identity does not match"
-            case .gcloudSignedOut: "signed out of gcloud"
-            case .authToolMissing: "auth plugin missing"
+            case .credentialMissing: "credential missing"
+            case .credentialRefused: "credential refused"
+            case .unsafeEnvironment: "environment refused"
+            case .endpointRefused: "endpoint refused"
+            case .clusterUnreachable: "cluster unreachable"
+            case .unauthorized: "unauthorized"
+            case .forbidden: "forbidden"
+            case .clusterRejected: "cluster rejected"
+            case .documentUnreadable: "document unreadable"
+            case .rolloutStalled: "rollout stalled"
+            case .notMigrated: "not migrated"
+            case .planChanged: "plan changed"
             case .timeout: "timed out"
             case .internal: "internal error"
             case .unknown: "unknown error"
@@ -443,6 +469,12 @@ public struct AppGroup: Codable, Sendable, Equatable, Identifiable {
     /// deployment; the map marks it so, and a live world never has one.
     public var isIllustrative: Bool
     public var apps: [Application]
+    /// Why this group's applications were not read, when they were not: the
+    /// reader may not read the namespace (`apps_error`, ADR 0023 M2.4), while
+    /// the other groups read. Its section is `apps`; nil when they were
+    /// read. While it is set, `apps` holds only what a line names, never a
+    /// reading of the namespace.
+    public var appsProblem: SectionProblem?
 
     public init(
         id: String,
@@ -450,7 +482,8 @@ public struct AppGroup: Codable, Sendable, Equatable, Identifiable {
         source: String,
         isSystem: Bool = false,
         isIllustrative: Bool = false,
-        apps: [Application]
+        apps: [Application],
+        appsProblem: SectionProblem? = nil
     ) {
         self.id = id
         self.namespace = namespace
@@ -458,6 +491,7 @@ public struct AppGroup: Codable, Sendable, Equatable, Identifiable {
         self.isSystem = isSystem
         self.isIllustrative = isIllustrative
         self.apps = apps
+        self.appsProblem = appsProblem
     }
 }
 

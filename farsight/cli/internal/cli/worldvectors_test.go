@@ -119,9 +119,13 @@ func vectorMeta() *config.InstanceMetadata {
 	return &config.InstanceMetadata{
 		Name: "atlas", Provider: "gke", Project: "proj-atlas", Region: "europe-west4",
 		Cluster: "farcast-atlas", Endpoint: "gke-1a2b3c.europe-west4.gke.goog", Status: config.InstanceRunning,
-		CostLimit:    config.CostLimit{Amount: 50, Currency: "USD", Period: "monthly"},
-		CloudLogging: config.CloudLoggingSystem, GCloudAccount: "operator@example.org",
+		CostLimit:       config.CostLimit{Amount: 50, Currency: "USD", Period: "monthly"},
+		CloudLogging:    config.CloudLoggingSystem,
 		FatLineDeployed: true,
+		// The reader 'world' reads as (ADR 0023 M2.4), granted.
+		Reader: &config.Reader{Email: readerEmail("atlas", "proj-atlas"), KeyID: strings.Repeat("c0", 20),
+			GrantedAt: time.Date(2026, 11, 14, 9, 30, 0, 0, time.UTC), Scope: "metered"},
+		ServerSideApply: &config.ServerSideApply{Since: time.Date(2026, 11, 14, 9, 0, 0, 0, time.UTC), Farcast: "v0.0.0-vector"},
 		Carrier:         &config.Carrier{Type: "nlb", Endpoint: "203.0.113.7:443", ServerName: "fatline.atlas.farcast"},
 		Registry:        &config.Registry{Prefix: vecRegistry, FatLineDigest: vecFatLineImage},
 		Storage:         &config.Storage{Bucket: "farcast-atlas-5f3a9c21"},
@@ -448,8 +452,10 @@ func worldVectors() []worldVector {
 		{"release_incomplete", func(t *testing.T) worldInputs {
 			in := healthyInputs(t)
 			in.Meta.Status = config.InstanceDeleting
-			p := &sectionProblem{Kind: kindKubectlFailed, Message: "kubectl get deployments,statefulsets -n farcast-system -o json: " +
-				"Unable to connect to the server: dial tcp: lookup gke-1a2b3c.europe-west4.gke.goog: no such host"}
+			// The control plane's name no longer resolves: the first read
+			// says so, and the later ones are not asked.
+			p := &sectionProblem{Kind: kindClusterUnreachable, Message: "kube: GET /apis/apps/v1/namespaces/farcast-system/deployments: " +
+				"the API server could not be reached: dial tcp: lookup gke-1a2b3c.europe-west4.gke.goog: no such host"}
 			in.Apps = appsInput{Problem: p, Meter: meterInput{Problem: p}}
 			in.Spend = spendInput{Problem: p}
 			in.Policy = policyInput{Problem: p}
@@ -460,8 +466,10 @@ func worldVectors() []worldVector {
 		}},
 		{"nothing_read", func(t *testing.T) worldInputs {
 			in := healthyInputs(t)
-			p := &sectionProblem{Kind: kindGCloudSignedOut, Message: "kubectl get deployments,statefulsets -n farcast-system -o json: " +
-				"ERROR: (gcloud.auth.print-access-token) There was a problem refreshing your current auth tokens: Reauthentication failed."}
+			// Google refused to mint the reader's token (its key deleted,
+			// say): no cluster read is asked, and the tunnel refuses too.
+			p := &sectionProblem{Kind: kindCredentialRefused,
+				Message: "Google refused to mint a token for the proj-atlas.iam.gserviceaccount.com service account (400 Bad Request)"}
 			in.Apps = appsInput{Problem: p, Meter: meterInput{Problem: p}}
 			in.Spend = spendInput{Problem: p}
 			in.Policy = policyInput{Problem: p}
@@ -491,20 +499,47 @@ func worldVectors() []worldVector {
 		}},
 		{"account_in_message", func(t *testing.T) worldInputs {
 			in := healthyInputs(t)
-			// GKE's refusal names the caller as its token spells it; gcloud's
-			// credential error names the account it tried — the pinned one,
-			// or a work identity whose token was cached for this instance's
-			// context; a service account's address carries the project.
-			forbidden := &sectionProblem{Kind: kindKubectlFailed, Message: "kubectl get deployments,statefulsets -n farcast-system -o json: " +
-				`Error from server (Forbidden): deployments.apps is forbidden: User "Operator@Example.org" cannot list resource "deployments" ` +
-				`in API group "apps" in the namespace "farcast-system": requires one of ["container.deployments.list"] permission(s).`}
+			// The endpoint's IAM refusal names the caller as its token spells
+			// it; the API server's other errors can name the account they
+			// were made as, and a refused token the account it was minted
+			// for; a service account's address carries the project. The
+			// document names none of them.
+			forbidden := &sectionProblem{Kind: kindForbidden, Message: "kube: GET /apis/apps/v1/namespaces/farcast-system/deployments: " +
+				"403 Forbidden: Permission 'container.deployments.list' denied for Farcast-Reader-1A2B3C4D@Proj-Atlas.iam.gserviceaccount.com " +
+				"on resource projects/proj-atlas/locations/europe-west4/clusters/farcast-atlas; " + msgReaderIAMRefused}
 			in.Apps = appsInput{Problem: forbidden, Meter: meterInput{Problem: forbidden}}
-			in.Spend = spendInput{Problem: &sectionProblem{Kind: kindKubectlFailed, Message: "kubectl get configmap technocore-checkpoint " +
-				`-n farcast-system --ignore-not-found -o json: Error from server (Forbidden): configmaps "technocore-checkpoint" is forbidden: ` +
-				`User "reader@proj-atlas.iam.gserviceaccount.com" cannot get resource "configmaps" in the namespace "farcast-system"`}}
-			in.Policy = policyInput{Problem: &sectionProblem{Kind: kindGCloudSignedOut, Message: "read the instance's egress policy: " +
-				"kubectl get configmap fatline-policy -n farcast-system --ignore-not-found -o json: ERROR: (gcloud.auth.print-access-token) " +
-				"Your current active account [someone@work.example] does not have any valid credentials\nPlease run:\n\n  $ gcloud auth login"}}
+			in.Spend = spendInput{Problem: &sectionProblem{Kind: kindClusterRejected, Message: "kube: GET " +
+				"/api/v1/namespaces/farcast-system/configmaps/technocore-checkpoint: 500 Internal Server Error: an error on the server " +
+				`("unable to authorize ` + readerEmail("atlas", "proj-atlas") + `: context deadline exceeded") has prevented the request from succeeding`}}
+			in.Policy = policyInput{Problem: &sectionProblem{Kind: kindUnauthorized, Message: "read the instance's egress policy: " +
+				"kube: GET /api/v1/namespaces/farcast-system/configmaps/fatline-policy: 401 Unauthorized: Unauthorized\n" +
+				"the token presented for someone@work.example was refused"}}
+			return in
+		}},
+		{"reader_missing", func(t *testing.T) worldInputs {
+			// A connected instance with no reader: the cluster is not read,
+			// and nothing is sent to it, while the tunnel sections read.
+			in := healthyInputs(t)
+			in.Meta.Reader = nil
+			p := &sectionProblem{Kind: kindCredentialMissing, Message: `instance "atlas" has no reader identity; run 'farcast reader init atlas'`}
+			in.Apps = appsInput{Problem: p, Meter: meterInput{Problem: p}}
+			in.Spend = spendInput{Problem: p}
+			in.Policy = policyInput{Problem: p}
+			return in
+		}},
+		{"namespace_unread", func(t *testing.T) worldInputs {
+			// A namespace Planck labelled that the kernel does not meter, so
+			// the reader, bound only where the kernel meters (P3), may not
+			// read it (P5): its group is marked, still alerted as unmetered,
+			// and every other group is read. The mark names the remedy that
+			// binds the reader there, metering it (namespaceRefused).
+			in := healthyInputs(t)
+			in.Apps.Namespaces = append(in.Apps.Namespaces, "lab")
+			in.Apps.Unread = map[string]*sectionProblem{"lab": {Kind: kindForbidden, Message: "the workloads in lab: " +
+				"kube: GET /apis/apps/v1/namespaces/lab/deployments: 403 Forbidden: deployments.apps is forbidden: User " +
+				`"` + readerEmail("atlas", "proj-atlas") + `" cannot list resource "deployments" in API group "apps" in the namespace "lab"; ` +
+				"the reader may read only farcast-system and the namespaces this machine records as metered: " +
+				"run 'farcast kernel meter atlas lab', which meters lab and binds the reader there"}}
 			return in
 		}},
 		{"removed_app_violation", func(t *testing.T) worldInputs {

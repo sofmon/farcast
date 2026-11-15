@@ -14,7 +14,7 @@ import (
 // answer does FatLine's workload say what it can, and unknown is left for a
 // monitor neither read can speak for.
 func TestTheMonitorIsRunningWhenItAnswered(t *testing.T) {
-	appsFailed := &sectionProblem{Kind: kindGCloudSignedOut, Message: "signed out"}
+	appsFailed := &sectionProblem{Kind: kindCredentialRefused, Message: "the reader's token was refused"}
 	networkFailed := &sectionProblem{Kind: kindTunnelUnreachable, Message: "the FatLine tunnel did not open"}
 	cases := []struct {
 		name           string
@@ -141,7 +141,7 @@ func TestTheHumanAppsLineSaysWhetherTheWorkloadsWereRead(t *testing.T) {
 	}
 
 	in := healthyInputs(t)
-	in.Apps.Meter = meterInput{Problem: &sectionProblem{Kind: kindKubectlFailed, Message: "no list"}}
+	in.Apps.Meter = meterInput{Problem: &sectionProblem{Kind: kindDocumentUnreadable, Message: "no list"}}
 	doc := buildWorld(in)
 	if doc.Sections.Apps.Read {
 		t.Fatal("guard: the apps section reads as read with its metered list failed")

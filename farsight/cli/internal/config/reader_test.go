@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -268,6 +269,51 @@ func TestLoadClusterCA(t *testing.T) {
 	}
 }
 
+// ADR 0023 M2.4 (A18-6): SaveClusterCA writes cluster-ca.crt owner-only and
+// whole, replacing one that was readable by others, and LoadClusterCA reads
+// it back. An empty PEM is refused and writes nothing, so a refused save
+// leaves the CA that was there, and an absent one absent.
+func TestSaveClusterCA(t *testing.T) {
+	d := readerDir(t)
+	path := filepath.Join(d.InstancePath("atlas"), clusterCAFile)
+
+	for _, empty := range [][]byte{nil, {}} {
+		if err := d.SaveClusterCA("atlas", empty); err == nil {
+			t.Errorf("SaveClusterCA(%q) wrote an empty CA", empty)
+		}
+	}
+	if _, ok, err := d.LoadClusterCA("atlas"); ok || err != nil {
+		t.Fatalf("after refused saves: ok %v, %v; want still absent", ok, err)
+	}
+
+	if err := os.WriteFile(path, []byte("OLD CA"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SaveClusterCA("atlas", []byte("CA PEM")); err != nil {
+		t.Fatal(err)
+	}
+	assertPerm(t, path, 0o600)
+	if pem, ok, err := d.LoadClusterCA("atlas"); string(pem) != "CA PEM" || !ok || err != nil {
+		t.Errorf("after the save: %q, %v, %v", pem, ok, err)
+	}
+	if err := d.SaveClusterCA("atlas", nil); err == nil {
+		t.Error("SaveClusterCA(nil) replaced a CA")
+	}
+	if pem, _, _ := d.LoadClusterCA("atlas"); string(pem) != "CA PEM" {
+		t.Errorf("a refused save changed the CA to %q", pem)
+	}
+	// Whole or not at all: no temporary file is left beside it.
+	entries, err := os.ReadDir(d.InstancePath("atlas"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Name() != clusterCAFile && filepath.Ext(e.Name()) != ".yaml" {
+			t.Errorf("SaveClusterCA left %s behind", e.Name())
+		}
+	}
+}
+
 // The reader block round-trips, and a write merges onto a newer record the
 // way every other field does: a change to the reader and a change elsewhere
 // both survive, and two different changes to the reader are refused.
@@ -355,5 +401,49 @@ func TestReaderRoundTripsAndMerges(t *testing.T) {
 	}
 	if got.Reader.KeyID != want.KeyID || !got.Reader.GrantedAt.IsZero() {
 		t.Errorf("the refused write changed the reader: %+v", got.Reader)
+	}
+}
+
+// Mutation 65b: the Exists helpers stat and never open, whatever an open
+// would do with its error. A mode-000 key cannot see an open whose error is
+// dropped; a FIFO can: it stats as present, and any open of it for reading
+// blocks until a writer comes, so an open is a hang.
+func TestReaderKeyExistsNeverOpensAFIFO(t *testing.T) {
+	d := readerDir(t)
+	for _, row := range []struct {
+		name   string
+		file   string
+		exists func(string) (bool, error)
+	}{
+		{"ReaderKeyExists", readerKeyFile, d.ReaderKeyExists},
+		{"NextReaderKeyExists", nextReaderKeyFile, d.NextReaderKeyExists},
+	} {
+		p := filepath.Join(d.InstancePath("atlas"), row.file)
+		if err := syscall.Mkfifo(p, 0o600); err != nil {
+			t.Skipf("no FIFO on this system: %v", err)
+		}
+		type answer struct {
+			ok  bool
+			err error
+		}
+		done := make(chan answer, 1)
+		go func() {
+			ok, err := row.exists("atlas")
+			done <- answer{ok, err}
+		}()
+		select {
+		case a := <-done:
+			if !a.ok || a.err != nil {
+				t.Errorf("%s on a FIFO = %v, %v; want true from a stat alone", row.name, a.ok, a.err)
+			}
+		case <-time.After(5 * time.Second):
+			// A writer's open, which does not block with a reader waiting,
+			// releases the blocked open, and its close ends the read.
+			if f, err := os.OpenFile(p, os.O_WRONLY|syscall.O_NONBLOCK, 0); err == nil {
+				_ = f.Close()
+			}
+			<-done
+			t.Errorf("%s opened %s: it blocked on a FIFO", row.name, row.file)
+		}
 	}
 }

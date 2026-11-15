@@ -34,8 +34,11 @@ func (d worldDoc) Human(w io.Writer) error {
 	}
 	fprintf(w, "  system     %s\n", strings.Join(parts, " · "))
 
-	apps, notReady, guarded := 0, 0, 0
+	apps, notReady, guarded, unreadGroups := 0, 0, 0, 0
 	for _, g := range d.Groups {
+		if g.AppsError != nil {
+			unreadGroups++
+		}
 		apps += len(g.Apps)
 		for _, a := range g.Apps {
 			if a.State == stateStarting {
@@ -57,12 +60,20 @@ func (d worldDoc) Human(w io.Writer) error {
 		if guarded > 0 {
 			fprintf(w, ", %d stopped by the cost guard", guarded)
 		}
+		if unreadGroups > 0 {
+			fprintf(w, "; %s not read", plural(unreadGroups, "namespace", "namespaces"))
+		}
 		fprintln(w)
 	}
 	for _, g := range d.Groups {
 		label := "repository not recorded on this machine"
 		if g.Provenance != nil {
 			label = g.Provenance.Repository
+		}
+		if g.AppsError != nil {
+			// Its workloads were not read: what it runs is unknown, which
+			// is not the same as nothing.
+			label += " — applications not read (" + g.AppsError.Kind + ")"
 		}
 		fprintf(w, "    %-20s %s\n", terminalText(g.Namespace), terminalText(label))
 	}

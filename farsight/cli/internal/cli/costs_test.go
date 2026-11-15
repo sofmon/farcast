@@ -62,7 +62,7 @@ func TestCostsReportsBothFiguresAndTheDistanceToTheLimit(t *testing.T) {
 
 	f := costsReader(t, checkpointFor(t, 100, 0.0304, map[string]float64{"api": 20, "web": 10}, nil))
 	c := &costsCommand{}
-	c.newCluster = func(string) configMapReader { return f }
+	c.newCluster = func(clusterRef) (configMapReader, error) { return f, nil }
 	if err := c.Run(context.Background(), env, []string{"p43"}); err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +90,7 @@ func TestCostsSaysAttributionIsLocalOnly(t *testing.T) {
 
 	f := costsReader(t, checkpointFor(t, 100, 0.03, map[string]float64{"api": 20}, nil))
 	c := &costsCommand{}
-	c.newCluster = func(string) configMapReader { return f }
+	c.newCluster = func(clusterRef) (configMapReader, error) { return f, nil }
 	if err := c.Run(context.Background(), env, []string{"p43"}); err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +109,7 @@ func TestCostsAssessesAgainstTheLimitTheKernelHolds(t *testing.T) {
 
 	f := costsReader(t, checkpointFor(t, 40, 0.03, map[string]float64{"api": 30}, nil))
 	c := &costsCommand{}
-	c.newCluster = func(string) configMapReader { return f }
+	c.newCluster = func(clusterRef) (configMapReader, error) { return f, nil }
 	if err := c.Run(context.Background(), env, []string{"p43"}); err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +130,7 @@ func TestCostsWithoutACheckpointSaysSo(t *testing.T) {
 	f := costsReader(t, "")
 	f.cmMissing = true
 	c := &costsCommand{}
-	c.newCluster = func(string) configMapReader { return f }
+	c.newCluster = func(clusterRef) (configMapReader, error) { return f, nil }
 	err := c.Run(context.Background(), env, []string{"p43"})
 	if err == nil || !strings.Contains(err.Error(), "not checkpointed") {
 		t.Fatalf("a kernel that has not checkpointed was not reported clearly: %v", err)
@@ -143,7 +143,7 @@ func TestCostsWithoutAKernelRefuses(t *testing.T) {
 	env, _ := testEnv(dir, output.ModeHuman)
 
 	c := &costsCommand{}
-	c.newCluster = func(string) configMapReader { return costsReader(t, "") }
+	c.newCluster = func(clusterRef) (configMapReader, error) { return costsReader(t, ""), nil }
 	err := c.Run(context.Background(), env, []string{"p43"})
 	if err == nil || !strings.Contains(err.Error(), "kernel deploy") {
 		t.Fatalf("costs without a kernel did not say what to do: %v", err)
@@ -186,7 +186,7 @@ func runCosts(t *testing.T, body string, mode output.Mode) string {
 	env, out := testEnv(dir, mode)
 	f := costsReader(t, body)
 	c := &costsCommand{}
-	c.newCluster = func(string) configMapReader { return f }
+	c.newCluster = func(clusterRef) (configMapReader, error) { return f, nil }
 	if err := c.Run(context.Background(), env, []string{"p43"}); err != nil {
 		t.Fatal(err)
 	}
@@ -393,7 +393,7 @@ func TestCostsRefusesACheckpointFromANewerKernel(t *testing.T) {
 	env, _ := testEnv(dir, output.ModeHuman)
 	f := costsReader(t, stopsCheckpoint(t, kernel.CheckpointVersion+1))
 	c := &costsCommand{}
-	c.newCluster = func(string) configMapReader { return f }
+	c.newCluster = func(clusterRef) (configMapReader, error) { return f, nil }
 	err := c.Run(context.Background(), env, []string{"p43"})
 	if kindOf(err) != kindVersionSkew || !strings.Contains(err.Error(), "older than the other") {
 		t.Fatalf("a newer kernel's checkpoint: %v (%s)", err, kindOf(err))

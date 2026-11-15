@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/sofmon/farcast/farsight/cli/internal/cluster"
+	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 	"github.com/sofmon/farcast/technocore/cost"
 	"github.com/sofmon/farcast/technocore/deploy"
 	"github.com/sofmon/farcast/technocore/kernel"
@@ -22,7 +22,8 @@ type configMapReader interface {
 }
 
 type costsCommand struct {
-	newCluster func(kubeconfigPath string) configMapReader
+	// newCluster opens the cluster as the instance's reader (ADR 0023 M2.4).
+	newCluster func(clusterRef) (configMapReader, error)
 }
 
 func (*costsCommand) Name() string { return "costs" }
@@ -66,7 +67,15 @@ func (c *costsCommand) SetFlags(*flag.FlagSet) {}
 
 func (c *costsCommand) ensureDefaults() {
 	if c.newCluster == nil {
-		c.newCluster = func(kc string) configMapReader { return cluster.New(kc) }
+		c.newCluster = func(r clusterRef) (configMapReader, error) {
+			// A refusal returns a nil reader, never a nil *cluster.Client
+			// inside a non-nil one.
+			cl, err := openCluster(r)
+			if err != nil {
+				return nil, err
+			}
+			return cl, nil
+		}
 	}
 }
 
@@ -81,14 +90,20 @@ func (c *costsCommand) Run(ctx context.Context, env *Env, args []string) error {
 	if err != nil {
 		return fmt.Errorf("load instance %q: %w", name, err)
 	}
+	if err := recordNamed(meta, name); err != nil {
+		return err
+	}
 	if meta.Kernel == nil || !meta.Kernel.Deployed {
 		return fmt.Errorf("instance %q has no kernel, so nothing is metering it; run 'farcast kernel deploy %s'", name, name)
 	}
 
-	cl := c.newCluster(env.ConfigDir.InstanceKubeconfigPath(name))
+	cl, err := c.newCluster(clusterRef{Dir: env.ConfigDir, Meta: meta, Identity: kube.Reader, Warn: env.Err})
+	if err != nil {
+		return err
+	}
 	raw, found, err := cl.ConfigMapValue(ctx, deploy.DefaultNamespace, kernel.DefaultCheckpointName, kernel.CheckpointKey())
 	if err != nil {
-		return fmt.Errorf("read the kernel's ledger: %w", err)
+		return readerRefused(fmt.Errorf("read the kernel's ledger: %w", err), name)
 	}
 	if !found {
 		return fmt.Errorf("the kernel in %q has not checkpointed yet; it writes one within a few minutes of starting", name)
@@ -138,8 +153,8 @@ func (c *costsCommand) Run(ctx context.Context, env *Env, args []string) error {
 // through the validating path.
 //
 // A version this build does not read is marked version_skew, and a value that
-// is not a checkpoint at all kubectl_failed — the read returned something, and
-// it was not what the kernel writes. An older kernel's checkpoint is read:
+// is not a checkpoint at all document_unreadable — the read returned
+// something, and it was not what the kernel writes. An older kernel's checkpoint is read:
 // its spending is keyed by bare name, and it records no stops.
 func decodeCheckpoint(raw string) (kernel.Checkpoint, *cost.Ledger, error) {
 	cp, err := kernel.DecodeCheckpoint([]byte(raw))
@@ -149,7 +164,7 @@ func decodeCheckpoint(raw string) (kernel.Checkpoint, *cost.Ledger, error) {
 			cp.Version, kernel.OldestCheckpointVersion, kernel.CheckpointVersion))
 	}
 	if err != nil {
-		return cp, nil, withKind(kindKubectlFailed, fmt.Errorf("decode the kernel's ledger: %w", err))
+		return cp, nil, withKind(kindDocumentUnreadable, fmt.Errorf("decode the kernel's ledger: %w", err))
 	}
 	ledger, err := cost.Restore(cp.Ledger)
 	if err != nil {

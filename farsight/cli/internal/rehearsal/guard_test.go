@@ -1,11 +1,11 @@
 package rehearsal
 
 import (
-	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 )
@@ -191,33 +191,49 @@ func TestProtectedDirsHoldTheDefaultFarcastDirectory(t *testing.T) {
 	}
 }
 
-func TestToolMainLeavesOtherNamesAlone(t *testing.T) {
-	var out, errb bytes.Buffer
-	for _, argv0 := range []string{"/usr/local/bin/farcast", "farcast-rehearsal", "/x/kubectl.exe", ""} {
-		if code, ok := ToolMain(argv0, nil, nil, &out, &errb); ok || code != 0 {
-			t.Errorf("ToolMain(%q) ran as a tool", argv0)
+// TestSpecHoldsTheReadersProjectShape: the project is held to the shape
+// farcast's reader checks (checkedReader) at creation and on every load, so a
+// rehearsal never records one its own reads would refuse; the instance name
+// to the rule 'farcast install' applies.
+func TestSpecHoldsTheReadersProjectShape(t *testing.T) {
+	for _, p := range []string{"", "rehea", "Rehearsal-project", "1rehearsal", "rehearsal-", "re_hearsal",
+		"rehearsal project", "rehearsal\nproject", "abcdefghijklmnopqrstuvwxyz01234"} {
+		if validProject(p) == nil {
+			t.Errorf("validProject accepted %q", p)
 		}
 	}
-	if out.Len() != 0 || errb.Len() != 0 {
-		t.Errorf("ToolMain wrote %q %q", out.String(), errb.String())
-	}
-}
-
-// TestSpecRefusesWhatAGCloudFileCannotCarry: the account and project are
-// written into a gcloud configuration file, so neither may add a line or a
-// section to it.
-func TestSpecRefusesWhatAGCloudFileCannotCarry(t *testing.T) {
-	for _, v := range []string{"", "a\nproject = x", "[auth]", "a=b", "x\x00y"} {
-		if err := validINIValue("account", v); err == nil {
-			t.Errorf("validINIValue accepted %q", v)
+	for _, p := range []string{DefaultProject, "abcdef", "proj-123", "abcdefghijklmnopqrstuvwxyz0123"} {
+		if err := validProject(p); err != nil {
+			t.Error(err)
 		}
-	}
-	if err := validINIValue("account", "operator@rehearsal.invalid"); err != nil {
-		t.Error(err)
 	}
 	for _, n := range []string{"", "Rehearsal", "-a", "a-", "a/b", "a_b", "abcdefghijklmnopqrstuvwxyz0123456"} {
 		if validInstance(n) == nil {
 			t.Errorf("validInstance accepted %q", n)
 		}
+	}
+	dir := filepath.Join(t.TempDir(), "r")
+	if r, err := Start(t.Context(), Options{Dir: dir, Home: t.TempDir(), Project: "Not_A_Project"}); err == nil {
+		_ = r.Close()
+		t.Error("Start accepted a project farcast's reader refuses")
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Errorf("Start made its directory before refusing the project: %v", err)
+	}
+	s := Spec{Instance: DefaultInstance, Project: "Not_A_Project", Scenario: ScenarioHealthy, Started: time.Now(), Dirs: dirsUnder("/r")}
+	if s.validate() == nil {
+		t.Error("a spec with a project farcast's reader refuses validated")
+	}
+}
+
+// TestACallLineStaysOneLine: a calls.log line holds a path and its query
+// as they are, and Go-quotes any argument that could end or split a line.
+func TestACallLineStaysOneLine(t *testing.T) {
+	if got, want := quoteArgs([]string{"GET", "/api/v1/namespaces?labelSelector=a%2Fb%3Dc&limit=500", "as", "reader"}),
+		"GET /api/v1/namespaces?labelSelector=a%2Fb%3Dc&limit=500 as reader"; got != want {
+		t.Errorf("quoteArgs = %q, want %q", got, want)
+	}
+	if got, want := quoteArgs([]string{"GET", "/a b\nc", ""}), `GET "/a b\nc" ""`; got != want {
+		t.Errorf("quoteArgs = %q, want %q", got, want)
 	}
 }

@@ -128,7 +128,7 @@ public actor CLIReader: WorldReader {
         if let problem = settings.problems(probe: probe, bundlePath: bundlePath).first {
             throw ReadFailure(kind: .internal, message: "Settings need attention: \(problem.field.title): \(problem.message)")
         }
-        let environment = try ChildEnvironment.build(parent: parentEnvironment, settings: settings)
+        let environment = try ChildEnvironment.build(parent: parentEnvironment)
         guard let appCommit else {
             throw ReadFailure(
                 kind: .versionSkew,

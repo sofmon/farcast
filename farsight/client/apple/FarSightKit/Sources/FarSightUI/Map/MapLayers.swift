@@ -58,9 +58,27 @@ struct TerritoryLayer: View {
                 let frame = RoundedRectangle(cornerRadius: max(3, 44 * scale), style: .continuous).path(in: rect)
                 context.fill(frame, with: .color(Theme.groupSurface))
                 let illustrative = info?.isIllustrative ?? false
+                let unread = info?.appsProblem != nil
                 let stroke = illustrative ? Theme.illustrative.opacity(0.7)
+                    : unread ? Theme.warning.opacity(0.6)
                     : (info?.isSystem ?? false) ? Theme.systemGroupStroke : Theme.groupStroke
-                context.stroke(frame, with: .color(stroke), style: StrokeStyle(lineWidth: 1.5, dash: illustrative ? [7, 5] : []))
+                context.stroke(frame, with: .color(stroke), style: StrokeStyle(lineWidth: 1.5, dash: illustrative || unread ? [7, 5] : []))
+                // A group whose applications were not read and that holds
+                // none a line names says so where its panels would be; one
+                // that holds some says it on its header (GroupHeader).
+                if let info, info.apps.isEmpty, let said = GroupHeader.notRead(info) {
+                    let top = camera.screen(group.header, in: viewport).maxY
+                    let size = min(max(54 * scale, 11), 22) * 0.8
+                    let text = context.resolve(
+                        Text(verbatim: said)
+                            .font(.system(size: size, weight: .semibold))
+                            .foregroundStyle(Theme.warning)
+                    )
+                    let measured = text.measure(in: CGSize(width: 2000, height: 200))
+                    if measured.width + 24 < rect.width, top + measured.height < rect.maxY {
+                        context.draw(text, at: CGPoint(x: rect.midX, y: (top + rect.maxY) / 2), anchor: .center)
+                    }
+                }
             }
         }
     }
@@ -324,8 +342,8 @@ struct ReadDetailsContent: View {
     let instance: Instance
 
     /// The problems by what farcast said, in the order it first said it:
-    /// sections that failed for one reason — a sign-out stops every read
-    /// after it — share one message, said once under their sentences.
+    /// sections that failed for one reason — a refused token stops every
+    /// read after it — share one message, said once under their sentences.
     static func groups(_ problems: [SectionProblem]) -> [(sentences: [String], message: String)] {
         var groups: [(sentences: [String], message: String)] = []
         for problem in problems {
@@ -399,6 +417,11 @@ struct GroupHeader: View {
             Text(group.isSystem ? "FarCast" : Display.name(group.namespace))
                 .font(.system(size: size, weight: .semibold))
                 .foregroundStyle(Theme.text)
+            if let said = Self.notRead(group) {
+                Text(verbatim: said)
+                    .font(.system(size: size * 0.72, weight: .semibold))
+                    .foregroundStyle(Theme.warning)
+            }
             if rect.width > 300 {
                 Text(group.isSystem ? "the OS itself, shown as apps" : Display.name(group.source))
                     .font(.system(size: size * 0.72))
@@ -427,5 +450,12 @@ struct GroupHeader: View {
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(.isButton)
         .accessibilityHint("Drag to move the group")
+    }
+
+    /// What the map says of a group whose applications the reader could not
+    /// read (`AppGroup.appsProblem`, ADR 0023 M2.4): that they were not
+    /// read, with the kind's label. Nil when they were read.
+    nonisolated static func notRead(_ group: AppGroup) -> String? {
+        group.appsProblem.map(ProblemText.groupNotRead)
     }
 }

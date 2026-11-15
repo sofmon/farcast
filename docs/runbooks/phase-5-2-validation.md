@@ -16,6 +16,8 @@ The walk found **two defects that no unit test could have found**, both about th
 
 An instance installed, connected, toolchain mirrored, kernel deployed, and an application running — the state [the 5.1 runbook](phase-5-1-validation.md) leaves behind. Apply the builder's push grant **before** the first build; [the 4.2 runbook](phase-4-2-validation.md) says so and the 5.1b walk proved what happens otherwise. Mirroring the toolchain is [the 4.3 runbook's step 1a](phase-4-3-validation.md#1a-mirror-the-toolchain). The kernel must be deployed before the application, because `farcast run` refuses an instance without one.
 
+*(2026-11-15, [ADR 0023](../adr/0023-one-download-farcast.md) M2.4: `farcast usage` (section 1) now reads the cluster in-process as the instance's reader, and read nothing until [phase 1's step 7b](phase-1-validation.md#7b-the-instances-reader-identity--not-yet-walked) has set one up and `farcast reader grant` has verified it. Step 7b is not yet walked, so a re-walk runs it first, once the instance is connected. The results below were walked with kubectl, and are not rewritten.)*
+
 Set `APPS` to the application's namespace before section 1.
 
 Sampling is bounded by metrics-server's ~30-second refresh, not by the kernel's tick, so one pod needs about an hour to reach the threshold. This walk scaled the application to three replicas instead, which reaches it in twenty minutes and exercises the per-pod-not-summed property at the same time.

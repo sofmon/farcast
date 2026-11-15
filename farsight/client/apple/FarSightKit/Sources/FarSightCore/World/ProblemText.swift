@@ -3,20 +3,20 @@
 /// never from its prose. A section's sentence names what was not read, why,
 /// and the remedy where there is one:
 ///
-///     spending not read · signed out of gcloud — run gcloud auth login
-///     the read was refused · gcloud identity does not match — farcast instances pin-gcloud
+///     spending not read · cluster unreachable — check the network
+///     the read was refused · version skew — build farcast and FarCast from one commit
 ///     network not read · tunnel unreachable
 ///
-/// The CLI's own message, which can run to a whole kubectl or gcloud error,
-/// is shown once per instance, behind the instance chip's disclosure, and
-/// never repeated in the panels.
+/// The CLI's own message, which can run to a whole API server error, is
+/// shown once per instance, behind the instance chip's disclosure, and never
+/// repeated in the panels.
 public enum ProblemText {
     /// What was not read, or what happened to the read as a whole.
     public static func what(_ section: SectionProblem.Section, _ kind: SectionProblem.Kind) -> String {
         switch section {
         case .read:
             switch kind {
-            case .gcloudMismatch, .versionSkew: "the read was refused"
+            case .versionSkew: "the read was refused"
             case .timeout: "the read timed out"
             default: "the read failed"
             }
@@ -57,17 +57,34 @@ public enum ProblemText {
     public static func remedy(_ section: SectionProblem.Section, _ kind: SectionProblem.Kind) -> String? {
         guard section != .figures else { return nil }
         return switch kind {
-        case .gcloudSignedOut: "run gcloud auth login"
-        case .gcloudMismatch: "farcast instances pin-gcloud"
         case .notConnected: "farcast connect opens one"
         case .kernelAbsent: "farcast kernel deploy starts one"
         case .notCheckpointed: "the kernel writes one within minutes of starting"
-        case .kubectlMissing: "set kubectl in Settings"
-        case .authToolMissing: "set gke-gcloud-auth-plugin in Settings"
         // Only the read as a whole is refused for skew between this app and
         // its farcast; a section's skew is the cluster's, with no one fix.
         case .versionSkew: section == .read ? "build farcast and FarCast from one commit" : nil
-        case .recordUnreadable, .notFound, .tunnelUnreachable, .kubectlFailed, .timeout, .internal, .unknown: nil
+        // Every step, since the kind also covers a reader uploaded and not
+        // yet granted, for which reader init refuses.
+        case .credentialMissing:
+            "set up the instance's reader in a terminal: farcast reader init <instance>, the printed Cloud Shell script, "
+                + "reader record and reader grant; farcast instances shows the reader's state"
+        // Rotation is the last remedy, not the first.
+        case .credentialRefused:
+            "check this machine's clock; then the key id (farcast reader record); "
+                + "a reader key expires with its certificate: farcast reader init <instance> --rotate"
+        // An authentication failure, which reader grant, an RBAC fix, cannot fix.
+        case .unauthorized:
+            "the cluster refused the reader's token: check that the Cloud Shell step granted "
+                + "roles/container.clusterViewer; farcast instances shows the reader's state"
+        case .forbidden:
+            "the reader may not read this: farcast reader grant <instance>; "
+                + "if the reader was just set up, IAM changes can take 7 minutes or longer"
+        case .clusterUnreachable: "check the network"
+        // The app's child environment never carries what unsafe_environment
+        // refuses, and in a terminal the CLI's message says what to unset.
+        case .unsafeEnvironment, .endpointRefused, .clusterRejected, .documentUnreadable,
+             .rolloutStalled, .notMigrated, .planChanged: nil
+        case .recordUnreadable, .notFound, .tunnelUnreachable, .timeout, .internal, .unknown: nil
         }
     }
 
@@ -76,6 +93,15 @@ public enum ProblemText {
         what(section, kind)
             + (why(section, kind).map { " · \($0)" } ?? "")
             + (remedy(section, kind).map { " — \($0)" } ?? "")
+    }
+
+    /// What a group whose applications were not read says on the map,
+    /// while the rest of the apps section was (`AppGroup.appsProblem`): that
+    /// they were not read, and why, as the kind's label.
+    ///
+    ///     applications not read · forbidden
+    public static func groupNotRead(_ problem: SectionProblem) -> String {
+        "applications not read · \(why(.apps, problem.kind) ?? problem.kind.label)"
     }
 
     /// A section as a sentence names it.
@@ -98,15 +124,15 @@ public enum ProblemText {
     /// never listed one by one, with why, then the figures not drawn. Empty
     /// when nothing failed.
     ///
-    ///     read refused · gcloud identity does not match
-    ///     3 sections not read · signed out of gcloud
+    ///     read refused · version skew
+    ///     3 sections not read · credential missing
     ///     network not read · tunnel unreachable
     ///     1 spending figure not drawn
     public static func summary(_ problems: [SectionProblem]) -> [String] {
         var parts: [String] = []
         if let read = problems.first(where: { $0.section == .read }) {
             switch read.kind {
-            case .gcloudMismatch, .versionSkew: parts.append("read refused · \(read.kind.label)")
+            case .versionSkew: parts.append("read refused · \(read.kind.label)")
             // The read that timed out is the latest; the time the chip
             // shows beside it is the kept snapshot's.
             case .timeout: parts.append("read timed out")

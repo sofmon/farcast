@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -673,5 +674,82 @@ func TestSystemImagesMergePerKey(t *testing.T) {
 	err = d.SaveInstanceMetadata("prod", mine)
 	if !errors.Is(err, ErrMetadataConflict) || !strings.Contains(err.Error(), "SystemImages[technocore]") {
 		t.Fatalf("colliding save = %v, want ErrMetadataConflict naming SystemImages[technocore]", err)
+	}
+}
+
+// ADR 0023 M2.4 (A18-6): server_side_apply round-trips, is absent from a
+// record that never moved, and merges onto a newer record as every other
+// field does: a change to it and a change elsewhere both survive, and two
+// different changes to it are refused.
+func TestServerSideApplyRoundTripsAndMerges(t *testing.T) {
+	d := testDir(t)
+	if err := d.CreateInstance("prod"); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SaveInstanceMetadata("prod", &InstanceMetadata{Name: "prod", Provider: "gke"}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(d.InstancePath("prod"), metadataFile)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, []byte("server_side_apply")) {
+		t.Errorf("a record that never moved names server_side_apply:\n%s", raw)
+	}
+	if m, err := d.LoadInstanceMetadata("prod"); err != nil || m.ServerSideApply != nil {
+		t.Fatalf("a record that never moved: %+v, %v", m.ServerSideApply, err)
+	}
+
+	// A command holds the record while 'migrate' records the move.
+	stale, err := d.LoadInstanceMetadata("prod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	since := time.Date(2026, 11, 20, 8, 15, 0, 0, time.UTC)
+	if _, err := d.UpdateInstanceMetadata("prod", func(m *InstanceMetadata) error {
+		m.ServerSideApply = &ServerSideApply{Since: since, Farcast: "v0.2.0"}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"server_side_apply:", "since: 2026-11-20T08:15:00Z", "farcast: v0.2.0"} {
+		if !bytes.Contains(raw, []byte(want)) {
+			t.Errorf("the record does not carry %q:\n%s", want, raw)
+		}
+	}
+	stale.Carrier = &Carrier{Type: "nlb", Endpoint: "34.0.0.5:443", ServerName: "fatline"}
+	if err := d.SaveInstanceMetadata("prod", stale); err != nil {
+		t.Fatalf("save over a newer server_side_apply: %v", err)
+	}
+	got, err := d.LoadInstanceMetadata("prod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ServerSideApply == nil || !got.ServerSideApply.Since.Equal(since) || got.ServerSideApply.Farcast != "v0.2.0" {
+		t.Errorf("server_side_apply after the merge = %+v", got.ServerSideApply)
+	}
+	if got.Carrier == nil || got.Carrier.Endpoint != "34.0.0.5:443" {
+		t.Errorf("the stale command's own change was lost: carrier = %+v", got.Carrier)
+	}
+
+	// Two commands recording different moves is refused.
+	mine, err := d.LoadInstanceMetadata("prod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.UpdateInstanceMetadata("prod", func(m *InstanceMetadata) error {
+		m.ServerSideApply = &ServerSideApply{Since: since.Add(time.Hour), Farcast: "v0.3.0"}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	mine.ServerSideApply = &ServerSideApply{Since: since.Add(2 * time.Hour), Farcast: "v0.4.0"}
+	if err := d.SaveInstanceMetadata("prod", mine); !errors.Is(err, ErrMetadataConflict) || !strings.Contains(err.Error(), "ServerSideApply") {
+		t.Errorf("colliding save = %v, want ErrMetadataConflict naming ServerSideApply", err)
 	}
 }

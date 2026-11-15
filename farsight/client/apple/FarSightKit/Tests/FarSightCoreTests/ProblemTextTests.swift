@@ -8,10 +8,10 @@ import Testing
 struct ProblemTextTests {
     @Test("the operator's three sentences, word for word")
     func examples() {
-        #expect(SectionProblem(section: .spend, kind: .gcloudSignedOut, message: "x").sentence
-            == "spending not read · signed out of gcloud — run gcloud auth login")
-        #expect(SectionProblem(section: .read, kind: .gcloudMismatch, message: "x").sentence
-            == "the read was refused · gcloud identity does not match — farcast instances pin-gcloud")
+        #expect(SectionProblem(section: .spend, kind: .clusterUnreachable, message: "x").sentence
+            == "spending not read · cluster unreachable — check the network")
+        #expect(SectionProblem(section: .read, kind: .versionSkew, message: "x").sentence
+            == "the read was refused · version skew — build farcast and FarCast from one commit")
         #expect(SectionProblem(section: .network, kind: .tunnelUnreachable, message: "x").sentence
             == "network not read · tunnel unreachable")
     }
@@ -25,11 +25,23 @@ struct ProblemTextTests {
         .kernelAbsent: "network not read · no kernel — farcast kernel deploy starts one",
         .notCheckpointed: "network not read · not checkpointed yet — the kernel writes one within minutes of starting",
         .versionSkew: "network not read · version skew",
-        .kubectlMissing: "network not read · kubectl missing — set kubectl in Settings",
-        .kubectlFailed: "network not read · kubectl failed",
-        .gcloudMismatch: "network not read · gcloud identity does not match — farcast instances pin-gcloud",
-        .gcloudSignedOut: "network not read · signed out of gcloud — run gcloud auth login",
-        .authToolMissing: "network not read · auth plugin missing — set gke-gcloud-auth-plugin in Settings",
+        .credentialMissing: "network not read · credential missing — set up the instance's reader in a terminal: "
+            + "farcast reader init <instance>, the printed Cloud Shell script, reader record and reader grant; "
+            + "farcast instances shows the reader's state",
+        .credentialRefused: "network not read · credential refused — check this machine's clock; then the key id "
+            + "(farcast reader record); a reader key expires with its certificate: farcast reader init <instance> --rotate",
+        .unsafeEnvironment: "network not read · environment refused",
+        .endpointRefused: "network not read · endpoint refused",
+        .clusterUnreachable: "network not read · cluster unreachable — check the network",
+        .unauthorized: "network not read · unauthorized — the cluster refused the reader's token: check that the "
+            + "Cloud Shell step granted roles/container.clusterViewer; farcast instances shows the reader's state",
+        .forbidden: "network not read · forbidden — the reader may not read this: farcast reader grant <instance>; "
+            + "if the reader was just set up, IAM changes can take 7 minutes or longer",
+        .clusterRejected: "network not read · cluster rejected",
+        .documentUnreadable: "network not read · document unreadable",
+        .rolloutStalled: "network not read · rollout stalled",
+        .notMigrated: "network not read · not migrated",
+        .planChanged: "network not read · plan changed",
         .timeout: "network not read · timed out",
         .internal: "network not read · internal error",
         .unknown: "network not read · no reason given",
@@ -38,17 +50,27 @@ struct ProblemTextTests {
     @Test("every kind, in a section, says what was not read, why, and the remedy where there is one")
     func everyKindInASection() {
         #expect(Set(Self.sectionSentences.keys) == Set(SectionProblem.Kind.allCases))
+        #expect(SectionProblem.Kind.allCases.count == 22)
         for kind in SectionProblem.Kind.allCases {
             #expect(ProblemText.sentence(.network, kind) == Self.sectionSentences[kind], "\(kind)")
         }
     }
 
-    @Test("every kind, for the read as a whole: refused, timed out, or failed")
+    @Test("each remedy has one ' — ' and no quoted command, as the app's remedies are written")
+    func remediesHaveOneSeparator() {
+        for kind in SectionProblem.Kind.allCases {
+            let sentence = ProblemText.sentence(.spend, kind)
+            #expect(sentence.components(separatedBy: " — ").count <= 2, "\(kind)")
+            #expect(!sentence.contains("'farcast"), "\(kind)")
+        }
+    }
+
+    @Test("every kind, for the read as a whole: only version skew is refused; timed out, or failed")
     func everyKindForTheRead() {
         for kind in SectionProblem.Kind.allCases {
             let sentence = ProblemText.sentence(.read, kind)
             switch kind {
-            case .gcloudMismatch, .versionSkew:
+            case .versionSkew:
                 #expect(sentence.hasPrefix("the read was refused · \(kind.label) — "), "\(kind)")
             case .timeout:
                 #expect(sentence == "the read timed out")
@@ -60,6 +82,7 @@ struct ProblemTextTests {
         #expect(ProblemText.sentence(.read, .versionSkew)
             == "the read was refused · version skew — build farcast and FarCast from one commit")
         #expect(ProblemText.sentence(.read, .tunnelUnreachable) == "the read failed · tunnel unreachable")
+        #expect(ProblemText.sentence(.read, .credentialMissing).hasPrefix("the read failed · credential missing — "))
     }
 
     @Test("the record says what is wrong with it, and nothing it cannot know")
@@ -76,7 +99,7 @@ struct ProblemTextTests {
             .network: "network not read", .seal: "seal not read", .unknown: "part of the read failed",
         ]
         for (section, what) in names {
-            #expect(ProblemText.what(section, .kubectlFailed) == what)
+            #expect(ProblemText.what(section, .clusterRejected) == what)
         }
         for section in SectionProblem.Section.allCases {
             for kind in SectionProblem.Kind.allCases {
@@ -102,20 +125,21 @@ struct ProblemTextTests {
     @Test("the chip counts the sections not read and says why, never listing them")
     func summary() {
         func problem(_ section: SectionProblem.Section, _ kind: SectionProblem.Kind) -> SectionProblem {
-            SectionProblem(section: section, kind: kind, message: "a long message from kubectl")
+            SectionProblem(section: section, kind: kind, message: "a long message from the API server")
         }
         #expect(ProblemText.summary([]).isEmpty)
-        #expect(ProblemText.summary([problem(.spend, .gcloudSignedOut), problem(.apps, .gcloudSignedOut), problem(.policy, .gcloudSignedOut)])
-            == ["3 sections not read · signed out of gcloud"])
-        #expect(ProblemText.summary([problem(.read, .gcloudMismatch)]) == ["read refused · gcloud identity does not match"])
+        #expect(ProblemText.summary([problem(.spend, .credentialMissing), problem(.apps, .credentialMissing), problem(.policy, .credentialMissing)])
+            == ["3 sections not read · credential missing"])
+        #expect(ProblemText.summary([problem(.read, .versionSkew)]) == ["read refused · version skew"])
+        #expect(ProblemText.summary([problem(.read, .credentialRefused)]) == ["read failed · credential refused"])
         #expect(ProblemText.summary([problem(.network, .tunnelUnreachable)]) == ["network not read · tunnel unreachable"])
         #expect(ProblemText.summary([problem(.network, .tunnelUnreachable), problem(.seal, .tunnelUnreachable)])
             == ["2 sections not read · tunnel unreachable"])
         // A section is counted once, however many problems name it.
-        #expect(ProblemText.summary([problem(.spend, .kubectlFailed), problem(.spend, .internal)])
-            == ["spending not read · kubectl failed, internal error"])
-        #expect(ProblemText.summary([problem(.spend, .kubectlFailed), problem(.apps, .gcloudSignedOut), problem(.network, .tunnelUnreachable)])
-            == ["3 sections not read · kubectl failed, signed out of gcloud and more"])
+        #expect(ProblemText.summary([problem(.spend, .forbidden), problem(.spend, .internal)])
+            == ["spending not read · forbidden, internal error"])
+        #expect(ProblemText.summary([problem(.spend, .forbidden), problem(.apps, .unauthorized), problem(.network, .tunnelUnreachable)])
+            == ["3 sections not read · forbidden, unauthorized and more"])
         // The read, then the record, then the sections.
         #expect(ProblemText.summary([problem(.network, .tunnelUnreachable), problem(.record, .internal), problem(.read, .timeout)])
             == ["read timed out", "record incomplete", "network not read · tunnel unreachable"])
@@ -129,13 +153,28 @@ struct ProblemTextTests {
             let world = try CLIDocuments.world(try Vectors.data("world/\(name).json"), asReadOf: "atlas").world
             return ProblemText.summary(try #require(world.instances.first).problems)
         }
-        #expect(try summary("account_in_message") == ["3 sections not read · kubectl failed, signed out of gcloud"])
-        #expect(try summary("nothing_read") == ["5 sections not read · signed out of gcloud, tunnel unreachable"])
+        #expect(try summary("account_in_message") == ["3 sections not read · cluster rejected, forbidden and more"])
+        #expect(try summary("nothing_read") == ["5 sections not read · credential refused, tunnel unreachable"])
+        #expect(try summary("reader_missing") == ["3 sections not read · credential missing"])
+        #expect(try summary("release_incomplete") == ["5 sections not read · cluster unreachable, timed out"])
         #expect(try summary("tunnel_down") == ["2 sections not read · tunnel unreachable"])
         #expect(try summary("healthy").isEmpty)
-        let refused = try #require(CLIDocuments.failure(try Vectors.data("world/error_gcloud_mismatch.json")))
+        // A group the reader may not read is no section not read: the chip says nothing of it.
+        #expect(try summary("namespace_unread").isEmpty)
+        // The read refused as a whole: version skew, the only kind that refuses it.
+        let refused = ReadFailure(kind: .versionSkew, message: "farcast wrote schema 3 and this FarCast reads schema 2; build both from the same commit")
         #expect(ProblemText.summary([SectionProblem(section: .read, kind: refused.kind, message: refused.message)])
-            == ["read refused · gcloud identity does not match"])
+            == ["read refused · version skew"])
+    }
+
+    @Test("a group whose applications were not read says so with the kind's label, and no remedy")
+    func groupNotRead() {
+        #expect(ProblemText.groupNotRead(SectionProblem(section: .apps, kind: .forbidden, message: "x")) == "applications not read · forbidden")
+        #expect(ProblemText.groupNotRead(SectionProblem(section: .apps, kind: .unknown, message: "x")) == "applications not read · no reason given")
+        for kind in SectionProblem.Kind.allCases {
+            let text = ProblemText.groupNotRead(SectionProblem(section: .apps, kind: kind, message: "x"))
+            #expect(text.hasPrefix("applications not read · ") && !text.contains(" — "), "\(kind)")
+        }
     }
 }
 

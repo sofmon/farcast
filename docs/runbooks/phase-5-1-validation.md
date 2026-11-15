@@ -12,6 +12,8 @@ Designed by [ADR 0014](../adr/0014-observed-usage.md) (compute) and [ADR 0015](.
 
 An instance installed and connected, with the kernel deployed and the build toolchain mirrored — the state [the 4.3 runbook](phase-4-3-validation.md) leaves behind. "Mirrored" means [the 4.3 runbook's step 1a](phase-4-3-validation.md#1a-mirror-the-toolchain): `farcast toolchain "$INSTANCE" --builder gcr.io/kaniko-project/executor:v1.23.2 --fetcher cgr.dev/chainguard/git:latest-dev`, refused with the digests, then re-run with the `@sha256:` references it printed. The kernel has to be deployed before the first `farcast run`, which since 2026-10-08 refuses an instance without one.
 
+*(2026-11-15, [ADR 0023](../adr/0023-one-download-farcast.md) M2.4: `farcast usage` (steps 4 and 6) now reads the cluster in-process as the instance's reader, and read nothing until [phase 1's step 7b](phase-1-validation.md#7b-the-instances-reader-identity--not-yet-walked) has set one up and `farcast reader grant` has verified it. Step 7b is not yet walked, so a re-walk runs it first, once the instance is connected. The results below were walked with kubectl, and are not rewritten.)*
+
 ---
 
 ## 1. Does the cluster serve the metrics API at all?
