@@ -1,9 +1,17 @@
-// Package cluster is a minimal kubectl-subprocess wrapper: apply a manifest
-// stream, await a rollout, read a Service's external IP, read the kernel's
-// checkpoint, and create or compare-and-replace the keyholder's key pin. It deliberately shells to kubectl rather than vendoring
-// a Kubernetes client — the CLI holds cloud credentials, so its dependency
-// surface is a security concern (ADR 0006), and the stored kubeconfig already
-// drives the control plane through the gke-gcloud-auth-plugin exec credential.
+// Package cluster is FarCast's operations on an instance's cluster: apply a
+// manifest stream, await a rollout, read a Service's external IP, read the
+// kernel's checkpoint, and create or compare-and-replace the keyholder's key
+// pin.
+//
+// It is moving from kubectl to the in-process client in internal/kube (ADR
+// 0023 decision 2), in the stages of ADR 0023 M2. A Client built by New,
+// NewWithEnv or NewWithRunner shells to kubectl for every method, as it always
+// has — the CLI holds cloud credentials, so its dependency surface is a
+// security concern (ADR 0006), and the stored kubeconfig drives the control
+// plane through the gke-gcloud-auth-plugin exec credential. A Client built by
+// Open (M2.3) is the instance's reader, in-process: it answers
+// NamespacesLabelled and CanI, starts no program, and refuses every other
+// method until M2.4 moves the reads.
 //
 // kubectl never inherits this process's environment. Every call runs with one
 // built from an allowlist (Env, ADR 0023 M0), with KUBERC=off, and finds
@@ -26,7 +34,10 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 )
 
 // Runner executes one kubectl invocation (with optional stdin) and returns its
@@ -205,9 +216,20 @@ func lookPathIn(name, pathValue string) (string, bool) {
 	return "", false
 }
 
-// Client applies workloads to a cluster over a kubeconfig.
+// Client applies workloads to a cluster: over a kubeconfig, through kubectl
+// (New, NewWithEnv, NewWithRunner), or in-process as the instance's reader
+// (Open).
 type Client struct {
 	runner Runner
+
+	// kube is the in-process client of an Open'd Client, and nil for a
+	// kubectl one. An Open'd Client has no runner.
+	kube *kube.Client
+	// warnings receives the kube client's Warning texts (Open); warned is
+	// how many of them have been written, under warnMu.
+	warnings io.Writer
+	warnMu   sync.Mutex
+	warned   int
 }
 
 // New returns a Client that shells to kubectl using the kubeconfig at the given
@@ -250,6 +272,9 @@ func NewWithRunner(r Runner) *Client { return &Client{runner: r} }
 // Apply pipes a multi-document manifest to `kubectl apply -f -`. It is
 // idempotent: re-applying an unchanged workload is a no-op.
 func (c *Client) Apply(ctx context.Context, manifests []byte) error {
+	if err := c.kubectlOnly("Apply"); err != nil {
+		return err
+	}
 	_, err := c.runner.Run(ctx, manifests, "apply", "-f", "-")
 	return err
 }
@@ -257,6 +282,9 @@ func (c *Client) Apply(ctx context.Context, manifests []byte) error {
 // RolloutStatus blocks until the named Deployment is rolled out or the timeout
 // elapses.
 func (c *Client) RolloutStatus(ctx context.Context, namespace, name string, timeout time.Duration) error {
+	if err := c.kubectlOnly("RolloutStatus"); err != nil {
+		return err
+	}
 	_, err := c.runner.Run(ctx, nil, "rollout", "status",
 		"deployment/"+name, "-n", namespace, "--timeout", durArg(timeout))
 	return err
@@ -265,6 +293,9 @@ func (c *Client) RolloutStatus(ctx context.Context, namespace, name string, time
 // WaitExternalIP polls the named Service until its load-balancer ingress IP is
 // assigned or the timeout elapses.
 func (c *Client) WaitExternalIP(ctx context.Context, namespace, name string, timeout time.Duration) (string, error) {
+	if err := c.kubectlOnly("WaitExternalIP"); err != nil {
+		return "", err
+	}
 	deadline := time.Now().Add(timeout)
 	for {
 		ip, err := c.serviceExternalIP(ctx, namespace, name)
@@ -315,6 +346,9 @@ type JobResult struct {
 // there until the timeout and be reported as a timeout, which is the wrong
 // diagnosis for a Containerfile that does not compile.
 func (c *Client) WaitJob(ctx context.Context, namespace, name string, timeout time.Duration) (JobResult, error) {
+	if err := c.kubectlOnly("WaitJob"); err != nil {
+		return JobResult{}, err
+	}
 	deadline := time.Now().Add(timeout)
 	for {
 		out, err := c.runner.Run(ctx, nil, "get", "job", name, "-n", namespace,
@@ -364,6 +398,9 @@ func (c *Client) jobMessage(ctx context.Context, namespace, job string) (string,
 // fetch's stdout IS the manifest, and a tail of it is a manifest that parses
 // and is missing its first applications.
 func (c *Client) JobLogs(ctx context.Context, namespace, job string, lines int) (string, error) {
+	if err := c.kubectlOnly("JobLogs"); err != nil {
+		return "", err
+	}
 	tail := "-1"
 	if lines > 0 {
 		tail = fmt.Sprintf("%d", lines)
@@ -435,6 +472,9 @@ type Workload struct {
 // cluster's answer by position — a column that moves becomes silently wrong
 // data rather than an error.
 func (c *Client) Workloads(ctx context.Context, namespace string) ([]Workload, error) {
+	if err := c.kubectlOnly("Workloads"); err != nil {
+		return nil, err
+	}
 	out, err := c.runner.Run(ctx, nil, "get", "deployments,statefulsets", "-n", namespace, "-o", "json")
 	if err != nil {
 		return nil, err
@@ -509,6 +549,9 @@ func (c *Client) Workloads(ctx context.Context, namespace string) ([]Workload, e
 // asks for something that does not exist and returns empty rather than
 // failing, and empty reads as "the kernel has never checkpointed".
 func (c *Client) ConfigMapValue(ctx context.Context, namespace, name, key string) (string, bool, error) {
+	if err := c.kubectlOnly("ConfigMapValue"); err != nil {
+		return "", false, err
+	}
 	out, err := c.runner.Run(ctx, nil, "get", "configmap", name, "-n", namespace,
 		"--ignore-not-found", "-o", "json")
 	if err != nil {
@@ -534,6 +577,9 @@ func (c *Client) ConfigMapValue(ctx context.Context, namespace, name, key string
 // reports whether it exists. The resourceVersion is what ReplaceConfigMap
 // compares against: a write only over what was read.
 func (c *Client) ConfigMapData(ctx context.Context, namespace, name string) (map[string]string, string, bool, error) {
+	if err := c.kubectlOnly("ConfigMapData"); err != nil {
+		return nil, "", false, err
+	}
 	out, err := c.runner.Run(ctx, nil, "get", "configmap", name, "-n", namespace,
 		"--ignore-not-found", "-o", "json")
 	if err != nil {
@@ -561,6 +607,9 @@ func (c *Client) ConfigMapData(ctx context.Context, namespace, name string) (map
 // Apply it never overwrites: the caller read "absent" and writes only over
 // that.
 func (c *Client) CreateConfigMap(ctx context.Context, manifest []byte) error {
+	if err := c.kubectlOnly("CreateConfigMap"); err != nil {
+		return err
+	}
 	_, err := c.runner.Run(ctx, manifest, "create", "-f", "-")
 	return err
 }
@@ -569,6 +618,9 @@ func (c *Client) CreateConfigMap(ctx context.Context, manifest []byte) error {
 // resourceVersion it was read at; the API server refuses it with a conflict
 // if anything has written since.
 func (c *Client) ReplaceConfigMap(ctx context.Context, manifest []byte) error {
+	if err := c.kubectlOnly("ReplaceConfigMap"); err != nil {
+		return err
+	}
 	_, err := c.runner.Run(ctx, manifest, "replace", "-f", "-")
 	return err
 }
@@ -579,6 +631,9 @@ func (c *Client) ReplaceConfigMap(ctx context.Context, manifest []byte) error {
 // refuse before doing expensive work, and an operator who mistyped two names
 // should be told about both in one go.
 func (c *Client) Namespaces(ctx context.Context) ([]string, error) {
+	if err := c.kubectlOnly("Namespaces"); err != nil {
+		return nil, err
+	}
 	out, err := c.runner.Run(ctx, nil, "get", "namespace", "-o", "name")
 	if err != nil {
 		return nil, err
@@ -597,9 +652,14 @@ func (c *Client) Namespaces(ctx context.Context) ([]string, error) {
 // NamespacesLabelled lists the namespaces that carry a label selector, by name,
 // sorted.
 //
-// JSON, for the reason Workloads reads JSON: a namespace listing parsed by
-// position is one column move away from silently wrong data.
+// An Open'd client lists them in-process, paged (ADR 0023 M2.3: the
+// verifying read of reader grant). A kubectl client reads JSON, for the reason
+// Workloads reads JSON: a namespace listing parsed by position is one column
+// move away from silently wrong data.
 func (c *Client) NamespacesLabelled(ctx context.Context, selector string) ([]string, error) {
+	if c.kube != nil {
+		return c.namespacesInProcess(ctx, selector)
+	}
 	out, err := c.runner.Run(ctx, nil, "get", "namespace", "-l", selector, "-o", "json")
 	if err != nil {
 		return nil, err
@@ -629,6 +689,9 @@ func (c *Client) NamespacesLabelled(ctx context.Context, selector string) ([]str
 
 // Logs writes a workload's logs to w, optionally following them.
 func (c *Client) Logs(ctx context.Context, out io.Writer, namespace, target string, lines int, follow, previous bool) error {
+	if err := c.kubectlOnly("Logs"); err != nil {
+		return err
+	}
 	args := []string{"logs", "-n", namespace, target, fmt.Sprintf("--tail=%d", lines), "--all-containers=true"}
 	if follow {
 		args = append(args, "--follow")

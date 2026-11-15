@@ -489,11 +489,11 @@ func TestReleaseConfirmRetypeName(t *testing.T) {
 	meta := &config.InstanceMetadata{Name: "prod"}
 	cmd := &releaseCommand{}
 
-	ok, err := cmd.confirm(true, newPrompter(strings.NewReader("prod\n"), io.Discard), io.Discard, meta, datasphere.Usage{}, nil)
+	ok, err := cmd.confirm(true, newPrompter(strings.NewReader("prod\n"), io.Discard), io.Discard, meta, datasphere.Usage{}, nil, nil)
 	if err != nil || !ok {
 		t.Fatalf("confirm(correct name) = %v,%v; want true,nil", ok, err)
 	}
-	ok, err = cmd.confirm(true, newPrompter(strings.NewReader("nope\n"), io.Discard), io.Discard, meta, datasphere.Usage{}, nil)
+	ok, err = cmd.confirm(true, newPrompter(strings.NewReader("nope\n"), io.Discard), io.Discard, meta, datasphere.Usage{}, nil, nil)
 	if err != nil || ok {
 		t.Fatalf("confirm(wrong name) = %v,%v; want false,nil", ok, err)
 	}
@@ -1030,7 +1030,7 @@ func TestReleaseConfirmationNamesTheStoredData(t *testing.T) {
 
 	var buf strings.Builder
 	ok, err := cmd.confirm(true, newPrompter(strings.NewReader("prod\n"), io.Discard), &buf,
-		meta, datasphere.Usage{Objects: 3, StoredBytes: 4096}, nil)
+		meta, datasphere.Usage{Objects: 3, StoredBytes: 4096}, nil, nil)
 	if err != nil || !ok {
 		t.Fatalf("confirm = %v,%v; want true,nil", ok, err)
 	}
@@ -1043,7 +1043,7 @@ func TestReleaseConfirmationNamesTheStoredData(t *testing.T) {
 	// An empty bucket produces no extra line, so a routine teardown reads
 	// exactly as it did before the gate existed.
 	buf.Reset()
-	if _, err := cmd.confirm(true, newPrompter(strings.NewReader("prod\n"), io.Discard), &buf, meta, datasphere.Usage{}, nil); err != nil {
+	if _, err := cmd.confirm(true, newPrompter(strings.NewReader("prod\n"), io.Discard), &buf, meta, datasphere.Usage{}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(buf.String(), "storage:") {

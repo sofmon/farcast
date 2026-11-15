@@ -38,11 +38,15 @@ import (
 // the command calls. A rendered stringData, an unknown kind, a missing
 // namespace or a YAML anchor fails the build.
 //
-// Twelve places apply a stream today, and this table covers each:
+// Thirteen places apply a stream today, and this table covers each:
 //   - connect and redeploy: renderWorkload, on both carriers, with and
 //     without Shrike;
-//   - kernel deploy: kernelManifests, TechnoCore's workload and the seed;
-//   - kernel meter and run: meterManifest;
+//   - kernel deploy: kernelManifests, TechnoCore's workload and the seed,
+//     with and without a granted reader's bindings;
+//   - kernel meter and run: meterManifest, with and without a granted
+//     reader's bindings;
+//   - reader grant: renderReaderRBAC, with no metered namespace and with two,
+//     and renderReaderBinding, the binding the three commands above add;
 //   - kernel confirm: the confirmations ConfigMap;
 //   - storage deploy: the keyholder's workload;
 //   - run: the egress policy, then the workloads with and without storage;
@@ -119,7 +123,7 @@ func renderedStreams(t *testing.T) []renderedStream {
 
 	// kernel deploy, with adapting off and on.
 	for _, adapt := range []bool{false, true} {
-		b, err := kernelManifests(kernelConfig(instance, adapt, []string{"farcast-system", "my-platform"}))
+		b, err := kernelManifests(kernelConfig(instance, adapt, []string{"farcast-system", "my-platform"}), "")
 		add(fmt.Sprintf("kernelManifests adapt=%t", adapt), b, err,
 			"Deployment "+tcdeploy.DefaultNamespace+"/"+tcdeploy.DefaultName,
 			"RoleBinding my-platform/"+tcdeploy.DefaultName,
@@ -127,12 +131,39 @@ func renderedStreams(t *testing.T) []renderedStream {
 	}
 
 	// kernel meter and run.
-	b, err := meterManifest([]string{"farcast-system", "alpha", "beta"}, []string{"alpha", "beta"})
+	b, err := meterManifest([]string{"farcast-system", "alpha", "beta"}, []string{"alpha", "beta"}, "")
 	add("meterManifest two added", b, err,
 		"RoleBinding alpha/"+tcdeploy.DefaultName, "RoleBinding beta/"+tcdeploy.DefaultName,
 		"ConfigMap "+tcdeploy.DefaultNamespace+"/"+kernel.DefaultNamespacesName)
-	b, err = meterManifest([]string{"farcast-system"}, nil)
+	b, err = meterManifest([]string{"farcast-system"}, nil, "")
 	add("meterManifest none added", b, err, "ConfigMap "+tcdeploy.DefaultNamespace+"/"+kernel.DefaultNamespacesName)
+
+	// reader grant, and the reader's bindings the three commands above add
+	// once it recorded the metered scope; in Google mode and in loopback mode.
+	reader := readerEmail(instance, "proj-test1")
+	loopback := readerName(instance) + "@kubetest.invalid"
+	readerRBAC := []string{
+		"ClusterRole /" + readerNamespacesRole, "ClusterRoleBinding /" + readerNamespacesRole,
+		"ClusterRole /" + readerRole, "RoleBinding " + tcdeploy.DefaultNamespace + "/" + readerRole,
+	}
+	b, err = renderReaderRBAC(reader, nil)
+	add("renderReaderRBAC no namespaces", b, err, readerRBAC...)
+	b, err = renderReaderRBAC(loopback, []string{"farcast-system", "alpha", "beta"})
+	add("renderReaderRBAC two namespaces", b, err,
+		append(slices.Clone(readerRBAC), "RoleBinding alpha/"+readerRole, "RoleBinding beta/"+readerRole)...)
+	b, err = renderReaderBinding(reader, "alpha")
+	add("renderReaderBinding", b, err, "RoleBinding alpha/"+readerRole)
+	b, err = meterManifest([]string{"farcast-system", "alpha", "beta"}, []string{"alpha", "beta"}, reader)
+	add("meterManifest two added with a reader", b, err,
+		"RoleBinding alpha/"+tcdeploy.DefaultName, "RoleBinding alpha/"+readerRole,
+		"RoleBinding beta/"+tcdeploy.DefaultName, "RoleBinding beta/"+readerRole,
+		"ConfigMap "+tcdeploy.DefaultNamespace+"/"+kernel.DefaultNamespacesName)
+	b, err = kernelManifests(kernelConfig(instance, true, []string{"farcast-system", "my-platform"}), reader)
+	add("kernelManifests with a reader", b, err,
+		"Deployment "+tcdeploy.DefaultNamespace+"/"+tcdeploy.DefaultName,
+		"RoleBinding my-platform/"+tcdeploy.DefaultName,
+		"RoleBinding "+tcdeploy.DefaultNamespace+"/"+readerRole, "RoleBinding my-platform/"+readerRole,
+		"ConfigMap "+tcdeploy.DefaultNamespace+"/"+kernel.DefaultNamespacesName)
 
 	// kernel confirm, empty and holding a figure.
 	day := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
@@ -227,24 +258,32 @@ func kernelConfig(instance string, adapt bool, meter []string) tcdeploy.Config {
 // write it; before them, a stream stopped between the two would tell the
 // kernel to meter a namespace it cannot read (kernelmeter.go's meterManifest,
 // kernel.go's kernelManifests).
+//
+// The same holds for a granted reader's bindings, which both streams carry
+// once 'reader grant' recorded the metered scope: world reads the list as the
+// reader, so the list comes after the reader's binding in every namespace it
+// names too.
 func TestTheMeteredListIsAppliedAfterItsBindings(t *testing.T) {
 	list := "ConfigMap " + tcdeploy.DefaultNamespace + "/" + kernel.DefaultNamespacesName
 	all := []string{"farcast-system", "alpha", "beta"}
-	deployed, err := kernelManifests(kernelConfig("p42", true, all))
-	if err != nil {
-		t.Fatal(err)
-	}
-	metered, err := meterManifest(all, []string{"alpha", "beta"})
-	if err != nil {
-		t.Fatal(err)
+	reader := readerEmail("p42", "proj-test1")
+	stream := func(b []byte, err error) []byte {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
 	}
 	for _, s := range []struct {
 		name   string
 		stream []byte
 		bound  []string
+		reader []string // the namespaces whose reader binding must come first
 	}{
-		{"kernelManifests", deployed, all},
-		{"meterManifest", metered, []string{"alpha", "beta"}},
+		{"kernelManifests", stream(kernelManifests(kernelConfig("p42", true, all), "")), all, nil},
+		{"meterManifest", stream(meterManifest(all, []string{"alpha", "beta"}, "")), []string{"alpha", "beta"}, nil},
+		{"kernelManifests with a reader", stream(kernelManifests(kernelConfig("p42", true, all), reader)), all, all},
+		{"meterManifest with a reader", stream(meterManifest(all, []string{"alpha", "beta"}, reader)), []string{"alpha", "beta"}, []string{"alpha", "beta"}},
 	} {
 		docs, err := kube.SplitStream(s.stream)
 		if err != nil {
@@ -265,6 +304,19 @@ func TestTheMeteredListIsAppliedAfterItsBindings(t *testing.T) {
 			binding := "RoleBinding " + ns + "/" + tcdeploy.DefaultName
 			if i, ok := at[binding]; !ok || i > at[list] {
 				t.Errorf("%s: %s does not come before the list; the order is %v", s.name, binding, ids)
+			}
+		}
+		for _, ns := range s.reader {
+			binding := "RoleBinding " + ns + "/" + readerRole
+			if i, ok := at[binding]; !ok || i > at[list] {
+				t.Errorf("%s: %s does not come before the list; the order is %v", s.name, binding, ids)
+			}
+		}
+		if s.reader == nil {
+			for _, id := range ids {
+				if strings.HasSuffix(id, "/"+readerRole) {
+					t.Errorf("%s: with no reader the stream binds one: %v", s.name, ids)
+				}
 			}
 		}
 	}

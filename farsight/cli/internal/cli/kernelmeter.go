@@ -48,9 +48,16 @@ Metering a namespace is what makes the applications in it count against the
 instance's cost limit. A namespace nobody meters holds workloads that run,
 bill, and are attributed to nothing.
 
---remove stops metering a namespace. The RoleBinding is left in place: this
-command does not delete cluster objects, and the grant is harmless without
-the listing. Removing the namespace removes it too.`)
+--remove stops metering a namespace. The kernel's RoleBinding is left in
+place: this command does not delete cluster objects, and the kernel's grant
+reads nothing without the listing. If 'farcast reader grant' bound the
+reader there, its farcast-reader RoleBinding stays too, and still lets the
+reader read that namespace's workloads, pods and logs. Removing the
+namespace removes both.
+
+Once 'farcast reader grant' has recorded its scope, each namespace this
+command starts metering also gets a farcast-reader RoleBinding, and the
+result names it ('farcast reader grant' explains).`)
 }
 
 func (c *kernelMeterCommand) SetFlags(fs *flag.FlagSet) {
@@ -101,7 +108,13 @@ func (c *kernelMeterCommand) Run(ctx context.Context, env *Env, args []string) e
 		return env.Printer.Print(meterResult{Instance: name, Metered: next})
 	}
 
-	manifest, err := meterManifest(next, added)
+	// The reader is bound beside the kernel in each namespace metered from
+	// now on, when 'reader grant' recorded that scope (design §7.2).
+	reader := ""
+	if len(added) > 0 {
+		reader = meteredReader(env, name, meta)
+	}
+	manifest, err := meterManifest(next, added, reader)
 	if err != nil {
 		return err
 	}
@@ -127,6 +140,10 @@ func (c *kernelMeterCommand) Run(ctx context.Context, env *Env, args []string) e
 	return env.Printer.Print(meterResult{
 		Instance: name, Metered: next, Added: added, Removed: removedFrom(previous, next),
 		BindingsLeft: c.remove,
+		// No record says where a reader binding was added, so with a reader
+		// recorded the result says one may stay.
+		ReaderBindingMayStay: c.remove && meta.Reader != nil,
+		Reader:               reader, ReaderBindings: readerBindingsFor(reader, added),
 	})
 }
 
@@ -134,7 +151,14 @@ func (c *kernelMeterCommand) Run(ctx context.Context, env *Env, args []string) e
 // namespace, then the list the kernel reads. They go together on purpose —
 // applied separately, a failure between them leaves the kernel told to meter a
 // namespace it has no permission to read.
-func meterManifest(all, added []string) ([]byte, error) {
+//
+// With a readerEmail, each added namespace's kernel binding is followed by a
+// binding of the reader's rule set there (renderReaderBinding), still before
+// the list: world reads the list as the reader, so a stream stopped between
+// the two must not name a namespace the reader cannot read either. An empty
+// readerEmail, an instance whose reader was never granted the metered scope,
+// adds none.
+func meterManifest(all, added []string, readerEmail string) ([]byte, error) {
 	var buf bytes.Buffer
 	for _, ns := range added {
 		b, err := tcdeploy.RenderNamespaceBinding(ns, "", "")
@@ -142,6 +166,15 @@ func meterManifest(all, added []string) ([]byte, error) {
 			return nil, err
 		}
 		buf.Write(b)
+		buf.WriteString("---\n")
+		if readerEmail == "" {
+			continue
+		}
+		rb, err := renderReaderBinding(readerEmail, ns)
+		if err != nil {
+			return nil, err
+		}
+		buf.Write(rb)
 		buf.WriteString("---\n")
 	}
 	cm, err := kernel.RenderNamespacesConfigMap(tcdeploy.DefaultNamespace, kernel.DefaultNamespacesName, all)
@@ -238,6 +271,15 @@ type meterResult struct {
 	Added        []string `json:"added,omitempty"`
 	Removed      []string `json:"removed,omitempty"`
 	BindingsLeft bool     `json:"-"`
+	// ReaderBindingMayStay is set on a removal from an instance that records
+	// a reader: a farcast-reader RoleBinding added there earlier stays too,
+	// and unlike the kernel's it still grants reads without the listing.
+	ReaderBindingMayStay bool `json:"-"`
+	// Reader is the reader bound in ReaderBindings, the namespaces where this
+	// run added its binding; both are empty unless 'reader grant' recorded
+	// the metered scope.
+	Reader         string   `json:"reader,omitempty"`
+	ReaderBindings []string `json:"reader_bindings_created,omitempty"`
 }
 
 func (r meterResult) Human(w io.Writer) error {
@@ -261,11 +303,38 @@ func (r meterResult) Human(w io.Writer) error {
 		fprintf(w, "\nThe kernel's RoleBinding is still present in %s. It grants nothing that is\n",
 			strings.Join(r.Removed, ", "))
 		fprintf(w, "read any more, and deleting the namespace removes it.\n")
+		if r.ReaderBindingMayStay {
+			fprintf(w, "If 'reader grant' bound the reader there, its farcast-reader RoleBinding stays\n")
+			fprintf(w, "too, and still lets the reader read that namespace's workloads, pods and logs\n")
+			fprintf(w, "until the namespace is deleted.\n")
+		}
 	}
 	if len(r.Added) > 0 {
 		fprintf(w, "\nThe kernel picks these up on its next reconcile. It was not restarted.\n")
 	}
+	printReaderBindings(w, r.Reader, r.ReaderBindings)
 	return nil
+}
+
+// readerBindingsFor is the namespaces a stream bound the reader in: every one
+// of namespaces when it carried a reader, none otherwise.
+func readerBindingsFor(readerEmail string, namespaces []string) []string {
+	if readerEmail == "" || len(namespaces) == 0 {
+		return nil
+	}
+	return append([]string(nil), namespaces...)
+}
+
+// printReaderBindings names each reader binding a command added, one line
+// each after a blank one, so a binding that the reader's recorded scope
+// consented to is never added silently.
+func printReaderBindings(w io.Writer, reader string, namespaces []string) {
+	if len(namespaces) > 0 {
+		fprintln(w)
+	}
+	for _, ns := range namespaces {
+		fprintf(w, msgReaderBinding+"\n", reader, ns)
+	}
 }
 
 func meteredContains(list []string, s string) bool {

@@ -302,7 +302,7 @@ func (c *runCommand) Run(ctx context.Context, env *Env, args []string) error {
 	// 6. Meter it. An application the kernel does not count is an application
 	// the cost limit does not protect against — and the limit is the pillar,
 	// not the feature.
-	metered, meterErr := c.meter(ctx, env, cl, meta, name, namespace)
+	metered, readerBound, meterErr := c.meter(ctx, env, cl, meta, name, namespace)
 
 	// Recorded before the wait: the workloads exist whether or not they come
 	// up, and an instance whose local state has not heard of them is one
@@ -326,6 +326,7 @@ func (c *runCommand) Run(ctx context.Context, env *Env, args []string) error {
 		Egress:         summarise(doc, namespace),
 		Metered:        metered, MeterError: errString(meterErr),
 		NotReady: slow,
+		Reader:   readerBound, ReaderBindings: readerBindingsFor(readerBound, []string{namespace}),
 	})
 }
 
@@ -681,40 +682,43 @@ func (c *runCommand) sealedNotice(env *Env, instance string, minted []string, wh
 }
 
 // meter adds the new namespace to what the kernel counts, reusing the same
-// manifest `farcast kernel meter` applies.
+// manifest `farcast kernel meter` applies. When 'reader grant' recorded the
+// metered scope, the reader is bound there too, and reader is its email; it is
+// "" when no reader binding was applied.
 //
 // A failure here is reported and does not undo the deployment: the workloads
 // are already running and billing, and unmetering them is not a fix for not
 // being able to meter them.
-func (c *runCommand) meter(ctx context.Context, env *Env, cl jobWaiter, meta *config.InstanceMetadata, name, namespace string) (bool, error) {
+func (c *runCommand) meter(ctx context.Context, env *Env, cl jobWaiter, meta *config.InstanceMetadata, name, namespace string) (metered bool, reader string, err error) {
 	// Unreachable from Run, which refuses an instance with no kernel before
 	// anything is read; kept because the line below dereferences Kernel.
 	if meta.Kernel == nil || !meta.Kernel.Deployed {
-		return false, fmt.Errorf("instance %q has no kernel, so %q is not counted against the cost limit; "+
+		return false, "", fmt.Errorf("instance %q has no kernel, so %q is not counted against the cost limit; "+
 			"run 'farcast kernel deploy %s'", name, namespace, name)
 	}
 	previous := append([]string(nil), meta.Kernel.Namespaces...)
 	next, added := applyMeterChange(previous, []string{namespace}, false)
 	if len(added) == 0 {
-		return true, nil
+		return true, "", nil
 	}
-	manifest, err := meterManifest(next, added)
+	reader = meteredReader(env, name, meta)
+	manifest, err := meterManifest(next, added, reader)
 	if err != nil {
-		return false, err
+		return false, "", err
 	}
 	meta.Kernel.Namespaces = next
 	meta.UpdatedAt = time.Now().UTC()
 	if err := env.ConfigDir.SaveInstanceMetadata(name, meta); err != nil {
-		return false, fmt.Errorf("record the metered namespaces before applying them: %w", err)
+		return false, "", fmt.Errorf("record the metered namespaces before applying them: %w", err)
 	}
 	if err := cl.Apply(ctx, manifest); err != nil {
 		meta.Kernel.Namespaces = previous
 		if saveErr := env.ConfigDir.SaveInstanceMetadata(name, meta); saveErr != nil {
-			return false, fmt.Errorf("meter %q: %w (and local state could not be rolled back: %v)", namespace, err, saveErr)
+			return false, "", fmt.Errorf("meter %q: %w (and local state could not be rolled back: %v)", namespace, err, saveErr)
 		}
-		return false, fmt.Errorf("meter %q: %w", namespace, err)
+		return false, "", fmt.Errorf("meter %q: %w", namespace, err)
 	}
-	return true, nil
+	return true, reader, nil
 }
 
 // record writes down the two reviewed images so the next run need not be told
@@ -894,6 +898,11 @@ type runResult struct {
 	Metered        bool          `json:"metered"`
 	MeterError     string        `json:"meter_error,omitempty"`
 	NotReady       []string      `json:"not_ready,omitempty"`
+	// Reader is the reader bound in ReaderBindings, the namespace this run
+	// started metering; both are empty unless 'reader grant' recorded the
+	// metered scope.
+	Reader         string   `json:"reader,omitempty"`
+	ReaderBindings []string `json:"reader_bindings_created,omitempty"`
 }
 
 func (r runResult) Human(w io.Writer) error {
@@ -932,6 +941,7 @@ func (r runResult) Human(w io.Writer) error {
 		fprintf(w, "These applications are running and are not counted against the cost limit.\n")
 		fprintf(w, "Run 'farcast kernel meter %s %s' to count them.\n", r.Instance, r.Namespace)
 	}
+	printReaderBindings(w, r.Reader, r.ReaderBindings)
 
 	// The commit and the digest are the whole of what a device that cannot
 	// reach the repository can check later (ADR 0010 decision 6), so they are

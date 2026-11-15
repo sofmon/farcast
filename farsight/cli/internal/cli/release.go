@@ -122,9 +122,12 @@ func (c *releaseCommand) Run(ctx context.Context, env *Env, args []string) error
 	}
 
 	plan := planKeeper(env, name, meta)
+	// The reader's account outlives the instance in Google, and what to
+	// delete is decided before anything is.
+	reader := releaseReaderOf(name, meta)
 
 	interactive := env.Printer.Mode == output.ModeHuman && isTerminal(env.In)
-	ok, err := c.confirm(interactive, newPrompter(env.In, env.Err), env.Err, meta, stored, plan)
+	ok, err := c.confirm(interactive, newPrompter(env.In, env.Err), env.Err, meta, stored, plan, reader)
 	if err != nil {
 		return err
 	}
@@ -232,8 +235,76 @@ func (c *releaseCommand) Run(ctx context.Context, env *Env, args []string) error
 		Keeper:      keeperDone,
 		Elsewhere:   elsewhere,
 		CloudLogs:   cloudLogsAfterRelease(meta, now()),
+		Reader:      reader,
 		Status:      "released",
 	})
+}
+
+// msgReaderUnprintable is what release says of a reader record that
+// checkedReader refuses, in place of the account and the lines that delete
+// it: the instance name as given, and readerName of it, which is
+// farcast-reader- and 8 hex characters and never a record value.
+const msgReaderUnprintable = "the reader service account recorded for %q cannot be printed safely; in Cloud Shell, list the project's service accounts and delete %s, after removing its roles/container.clusterViewer binding"
+
+// releaseReader is the reader service account a release leaves in Google
+// (ADR 0023 M2.3, design §7.2): release deletes reader.key with the instance
+// directory, but the account, its uploaded keys and its project-level
+// clusterViewer binding stay until the human deletes them.
+type releaseReader struct {
+	// Email is the account, rebuilt by checkedReader from the record's checked
+	// name and project, never the recorded email's bytes. Empty when the
+	// record cannot be printed safely.
+	Email string `json:"email,omitempty"`
+	// CloudShell is the two commands that delete it, the binding first,
+	// every value single-quoted.
+	CloudShell []string `json:"cloud_shell,omitempty"`
+	// Unprintable is said instead of Email and CloudShell when checkedReader
+	// refuses the record. release never refuses on it.
+	Unprintable string `json:"unprintable,omitempty"`
+
+	project string // for the human rendering of the binding command
+}
+
+// releaseReaderOf is what release says about the instance's reader, or nil
+// when none is recorded.
+func releaseReaderOf(name string, meta *config.InstanceMetadata) *releaseReader {
+	if meta.Reader == nil {
+		return nil
+	}
+	project, email, _, err := checkedReader(meta)
+	if err != nil {
+		return &releaseReader{Unprintable: fmt.Sprintf(msgReaderUnprintable, name, readerName(name))}
+	}
+	return &releaseReader{
+		Email: email,
+		CloudShell: []string{
+			fmt.Sprintf("gcloud projects remove-iam-policy-binding '%s' --condition=None --member 'serviceAccount:%s' --role 'roles/container.clusterViewer'", project, email),
+			fmt.Sprintf("gcloud iam service-accounts delete '%s' --project '%s' --quiet", email, project),
+		},
+		project: project,
+	}
+}
+
+// gateLine is the release gate's line for the reader.
+func (r *releaseReader) gateLine() string {
+	if r.Unprintable != "" {
+		return r.Unprintable
+	}
+	return fmt.Sprintf("the reader service account %s, which stays in Google until you delete it", r.Email)
+}
+
+// human writes the result's reader lines: the account and, for Cloud Shell,
+// the binding's removal (wrapped as design §7.2 prints it) and then the
+// account's deletion.
+func (r *releaseReader) human(w io.Writer) {
+	if r.Unprintable != "" {
+		fprintf(w, "  reader:      %s\n", r.Unprintable)
+		return
+	}
+	fprintf(w, "  reader:      %s stays in Google; delete it from Cloud Shell, the binding first:\n", r.Email)
+	fprintf(w, "                 gcloud projects remove-iam-policy-binding '%s' --condition=None \\\n", r.project)
+	fprintf(w, "                   --member 'serviceAccount:%s' --role 'roles/container.clusterViewer'\n", r.Email)
+	fprintf(w, "                 %s\n", r.CloudShell[1])
 }
 
 // logRetention is how long a provider keeps what it logged or measured about
@@ -413,7 +484,7 @@ func deleteRegistry(ctx context.Context, p planck.Provider, meta *config.Instanc
 // silently. Otherwise it requires an interactive session and asks the operator
 // to retype the instance name (stronger than a y/N, because release is
 // destructive); a non-interactive session without --yes is a usage error.
-func (c *releaseCommand) confirm(interactive bool, p *prompter, errw io.Writer, meta *config.InstanceMetadata, stored datasphere.Usage, plan *keeperPlan) (bool, error) {
+func (c *releaseCommand) confirm(interactive bool, p *prompter, errw io.Writer, meta *config.InstanceMetadata, stored datasphere.Usage, plan *keeperPlan, reader *releaseReader) (bool, error) {
 	if c.assumeYes {
 		return true, nil
 	}
@@ -430,6 +501,9 @@ func (c *releaseCommand) confirm(interactive bool, p *prompter, errw io.Writer, 
 	}
 	if others := keepersElsewhere(meta.Keepers, plan); len(others) > 0 {
 		fprintf(errw, "  keepers:     %d other device(s) hold this instance's bundle; release cannot reach them\n", len(others))
+	}
+	if reader != nil {
+		fprintf(errw, "  reader:      %s\n", reader.gateLine())
 	}
 	typed, err := p.line(fmt.Sprintf("Retype the instance name %q to confirm destruction", meta.Name))
 	if err != nil {
@@ -470,7 +544,10 @@ type releaseResult struct {
 	// CloudLogs is what the provider keeps about the instance after it is
 	// gone (ADR 0019).
 	CloudLogs *releaseCloudLogs `json:"cloud_logs,omitempty"`
-	Status    string            `json:"status"`
+	// Reader is the reader service account the instance leaves in Google,
+	// when one was recorded.
+	Reader *releaseReader `json:"reader,omitempty"`
+	Status string         `json:"status"`
 }
 
 func (r releaseResult) Human(w io.Writer) error {
@@ -518,6 +595,9 @@ func (r releaseResult) Human(w io.Writer) error {
 		if l.WorkloadLogs {
 			fprintln(w, "               this instance was not verified as system-only logging: its applications' output may be among them")
 		}
+	}
+	if r.Reader != nil {
+		r.Reader.human(w)
 	}
 	fprintln(w, "  state:       removed")
 	return nil

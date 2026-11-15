@@ -34,9 +34,22 @@ func main() {
 // links the same Google libraries as farcast, so it turns both off in its own
 // process before anything else runs.
 //
+// First it unsets what farcast unsets since ADR 0023 M2.3 (design §3.6):
+// GOOGLE_SDK_GO_LOGGING_LEVEL, which makes the Google libraries' default
+// logger write requests and responses, token bodies among them, to stderr;
+// and SSL_CERT_FILE and SSL_CERT_DIR, which replace the system roots Google's
+// endpoints, and the key's tokens sent to them, are trusted on (always on
+// Linux; on macOS and Windows under GODEBUG=x509sslcertoverrideplatform=1).
+// The roots are loaded at their first use, after this.
+//
 // It is a copy of hardenEnvironment in farsight/cli/internal/cli/cli.go, its
-// twin: two calls, which do not earn a package both could import.
+// twin: a few calls, which do not earn a package both could import.
 func hardenEnvironment() error {
+	for _, k := range []string{"GOOGLE_SDK_GO_LOGGING_LEVEL", "SSL_CERT_FILE", "SSL_CERT_DIR"} {
+		if err := os.Unsetenv(k); err != nil {
+			return err
+		}
+	}
 	if err := os.Setenv("GOOGLE_API_USE_CLIENT_CERTIFICATE", "false"); err != nil {
 		return err
 	}

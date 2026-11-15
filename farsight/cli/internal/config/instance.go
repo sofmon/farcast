@@ -395,6 +395,12 @@ type InstanceMetadata struct {
 	// 'farcast world' refuses to read until it is set.
 	GCloudAccount string `yaml:"gcloud_account,omitempty"`
 
+	// Reader is the instance's read-only identity (ADR 0023 M2.3): a
+	// per-instance service account whose key this machine made. Nil until
+	// 'farcast reader init'. Pointer-typed like Registry, so a record written
+	// before readers existed still loads.
+	Reader *Reader `yaml:"reader,omitempty"`
+
 	// CloudLogging is the provider's logging configuration for the cluster, as
 	// the provider read it back at install (ADR 0019). CloudLoggingSystem means
 	// configured to collect its mandatory system logs only — not the

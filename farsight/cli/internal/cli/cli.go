@@ -29,19 +29,41 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	return run(ctx, args, stdin, stdout, stderr)
 }
 
-// hardenEnvironment closes the two routes by which vendored Google code starts programs
-// nobody asked for (ADR 0023 decision 1). Process-wide, before anything else runs.
+// hardenEnvironment removes what the environment could do to farcast's own
+// network calls, process-wide, before anything else runs.
 //
-// GOOGLE_API_USE_CLIENT_CERTIFICATE=false keeps the Google client libraries from
-// running a certificate provider to present a client certificate.
-// GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES unset keeps an external-account
-// credential file from naming an executable to run for a token. The cost: an
-// organization that enforces certificate-based access refuses this CLI.
+// First, three variables that would decide what a call trusts or prints
+// (ADR 0023 M2.3, with the first in-process cluster call):
+//   - GOOGLE_SDK_GO_LOGGING_LEVEL unset: a Google client library built with no
+//     logger of its own, as the registry and storage token sources are, reads
+//     it and logs request and response bodies (a signed assertion, an access
+//     token) to stderr.
+//   - SSL_CERT_FILE and SSL_CERT_DIR unset: they replace the system roots that
+//     *.gke.goog, and the bearer token sent to it, are trusted on. On Linux
+//     they always do; on macOS and Windows a GODEBUG of
+//     x509sslcertoverrideplatform=1 makes them. The roots are loaded at their
+//     first use, after this, so unsetting them here is enough. kubectl never
+//     saw them either (cluster.Env drops them).
+//
+// Then the two routes by which vendored Google code starts programs nobody
+// asked for (ADR 0023 decision 1). GOOGLE_API_USE_CLIENT_CERTIFICATE=false
+// keeps the Google client libraries from running a certificate provider to
+// present a client certificate. GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES
+// unset keeps an external-account credential file from naming an executable
+// to run for a token. The cost: an organization that enforces
+// certificate-based access refuses this CLI, and an operator whose machine
+// trusts a private root through SSL_CERT_FILE (a corporate proxy's) does not
+// reach Google through it.
 //
 // It runs here and not in a package init, so the unit tests, which call run,
 // keep their environment. The planck harness keeps its own copy
 // (planck/cmd/planck).
 func hardenEnvironment() error {
+	for _, k := range []string{"GOOGLE_SDK_GO_LOGGING_LEVEL", "SSL_CERT_FILE", "SSL_CERT_DIR"} {
+		if err := os.Unsetenv(k); err != nil {
+			return err
+		}
+	}
 	if err := os.Setenv("GOOGLE_API_USE_CLIENT_CERTIFICATE", "false"); err != nil {
 		return err
 	}
@@ -203,6 +225,7 @@ func defaultRegistry() *Registry {
 	reg.Register(newSecretCommand())
 	reg.Register(newKeeperCommand())
 	reg.Register(newKernelCommand())
+	reg.Register(newReaderCommand())
 	reg.Register(newStub("chat", "Terminal AI chat through AllThing", "6.2"))
 
 	return reg

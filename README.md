@@ -277,7 +277,7 @@ DataSphere is the storage abstraction layer. It proxies all file storage and ret
 FatLine is the networking layer for a FarCast instance's applications. Instance-to-instance and instance-to-internet traffic, and the operator's tunnel, flow through it. It acts as router, proxy, and encryption boundary in one. By default, all connections are denied. FatLine only permits outbound traffic to external endpoints that are explicitly declared in an application's `./farcast` manifest. Nothing an application sends leaves the instance without passing through it.
 
 Three things do not pass through FatLine ([ADR 0019](docs/adr/0019-what-the-cluster-tells-its-provider.md)):
-- the operator's control-plane calls, which go to the provider's API server through kubectl, which [ADR 0023](docs/adr/0023-one-download-farcast.md)'s M2, not yet built, is to replace with an in-process client;
+- the operator's control-plane calls, which go to the provider's API server through kubectl, which [ADR 0023](docs/adr/0023-one-download-farcast.md)'s M2 is to replace with an in-process client. M2 is begun, and so far only `farcast reader grant`'s verifying read and reviews are in-process (M2.3, built 2026-11-14);
 - what the cluster reports about itself (above);
 - image pulls, which are node egress.
 

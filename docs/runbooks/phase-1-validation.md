@@ -115,6 +115,8 @@ go run ./planck/cmd/planck validate --provider gke --project "$PROJECT_ID" --cre
 
 *(2026-11-13: since [ADR 0023](../adr/0023-one-download-farcast.md) M0 the harness sets `GOOGLE_API_USE_CLIENT_CERTIFICATE=false` and unsets `GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES` in its own process before anything else runs, as `farcast` does, so the Google libraries it links never start a certificate provider or an executable credential source. Nothing to set by hand.)*
 
+*(2026-11-14, ADR 0023 M2.3: it also unsets `GOOGLE_SDK_GO_LOGGING_LEVEL`, `SSL_CERT_FILE` and `SSL_CERT_DIR` first, as `farcast` does, so the environment cannot turn on the Google libraries' default logger, which would print token bodies to stderr, and Google's endpoints are trusted on the system roots alone. A private root added only through those two variables, such as a TLS-inspecting proxy's, is not trusted by the harness either.)*
+
 ✅ Expect: `credentials OK`. A permissions or API error here means stop and fix
 Step 1/2 before continuing.
 
@@ -185,6 +187,80 @@ the **DNS endpoint present** and the **public/external IP endpoint disabled**
 fields come back empty on your gcloud version, drop the `--format` flag and eyeball
 the full description for `autopilot`, `controlPlaneEndpointsConfig`, and
 `privateClusterConfig`.
+
+## 7b. The instance's reader identity — not yet walked
+
+*(Added 2026-11-14 for [ADR 0023](../adr/0023-one-download-farcast.md) M2.3. No part
+of this step has been run against Google. It is the once-per-instance privileged setup
+of ADR 0023 decision 3: a read-only service account of the instance's own, whose key
+this machine makes. No read command uses the reader until M2.4, and none of the success
+criteria below depends on it. What a reader can and cannot do is in the
+[CLI README](../../farsight/cli/README.md#farcast-reader--the-reader-identity-adr-0023-m23).)*
+
+1. Make the key and the script:
+
+   ```bash
+   ./farcast reader init "$INSTANCE"
+   ```
+
+   ✅ Expect, on stderr, `Paste this into Cloud Shell as a project Owner (sha256 …)`,
+   and on stdout a script whose first line is `sh -s <<'FARCAST_READER'` and whose last
+   is `FARCAST_READER`. `instances/$INSTANCE/` gains `reader.key` and `reader.crt`, both
+   `0600`, and `metadata.yaml` gains `reader:` with
+   `email: farcast-reader-<8 hex>@<project>.iam.gserviceaccount.com`.
+
+   Where the organization enforces `iam.serviceAccountKeyExpiryHours`, run it with a
+   `--days` no greater than the constraint's days, and at most 90. At `1h` or `8h` stop
+   here: no reader key can be made.
+
+2. Paste the whole script into Cloud Shell, signed in as an Owner of the project.
+   ✅ Expect it to end with `farcast reader record validate --key-id <40 hex>`.
+   If it says the project blocks service-account key upload, the reader cannot be set
+   up in this project, and nothing was changed.
+
+   Record what it printed. The spelling of its two policy checks and the output format
+   it reads the key id from are unverified, and this is their first run: note whether
+   either check printed an error, and whether the key id is 40 lowercase hex characters.
+
+3. Record the id:
+
+   ```bash
+   ./farcast reader record "$INSTANCE" --key-id <id>
+   ```
+
+   ✅ Expect `metadata.yaml`'s `reader:` to gain `key_id`.
+
+4. Grant and verify, **once the instance is connected** (Phase 2): the reader's RBAC
+   has a RoleBinding in `farcast-system`, which `connect` creates and `install` does
+   not. It asks in a terminal (`--yes` is refused), applies with kubectl as your active
+   gcloud configuration, then reads as the reader:
+
+   ```bash
+   ./farcast reader grant "$INSTANCE"
+   ```
+
+   ✅ Expect a prompt naming the account and what it may read. After `y`, possibly
+   `IAM changes typically take 2 minutes, and can take 7 minutes or longer; checking
+   again until …`, then `✓ instance "validate"'s reader … reads the cluster, and was
+   verified read-only` and `the reader … may now read farcast-system`.
+   `metadata.yaml`'s `reader:` gains `granted_at` and `scope: metered`.
+
+   Record how long the first read waited, and whether it was refused with a 401 or a
+   403 while it waited. A refusal that says the reader `may` do something means it is
+   not read-only, or that it reads beyond its RBAC: record which of the five questions was
+   answered yes, and what role the paste granted.
+
+5. At release (step 8), the result gains a `reader:` line naming the account and two
+   Cloud Shell commands, the binding's removal first. Run both in Cloud Shell, then:
+
+   ```bash
+   gcloud iam service-accounts list --project "$PROJECT_ID" --format 'value(email)' | grep farcast-reader-
+   ```
+
+   ✅ Expect this instance's reader absent (another instance in the project may have
+   its own). Record whether the binding's removal succeeded, and what
+   `gcloud iam service-accounts keys list --iam-account <email>` says after the delete:
+   that deleting an account deletes its keys is not verified.
 
 ## 8. Release — destroy the instance
 

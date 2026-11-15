@@ -314,6 +314,9 @@ func (c *kernelDeployCommand) Run(ctx context.Context, env *Env, args []string) 
 	}
 	img := resolved.Ref
 
+	// The reader is bound in every metered namespace too, when 'reader grant'
+	// recorded that scope (design §7.2).
+	reader := meteredReader(env, name, meta)
 	manifests, err := kernelManifests(tcdeploy.Config{
 		Image:        img,
 		Instance:     name,
@@ -326,7 +329,7 @@ func (c *kernelDeployCommand) Run(ctx context.Context, env *Env, args []string) 
 		// either way, rendered only then.
 		AdaptCooldown: adaptOnly(knobs),
 		Interval:      knobs.Interval,
-	})
+	}, reader)
 	if err != nil {
 		return err
 	}
@@ -388,6 +391,8 @@ func (c *kernelDeployCommand) Run(ctx context.Context, env *Env, args []string) 
 		Adapt:          knobs.Adapt,
 		Interval:       effective(knobs.Interval, kernel.DefaultInterval),
 		AdaptCooldown:  effective(knobs.AdaptCooldown, kernel.DefaultCooldown),
+		Reader:         reader,
+		ReaderBindings: readerBindingsFor(reader, namespaces),
 	})
 }
 
@@ -403,10 +408,27 @@ func (c *kernelDeployCommand) Run(ctx context.Context, env *Env, args []string) 
 // workload still bound farcast-system. Without it the two views start disagreeing: the workload can list them and
 // the kernel has not been told they exist, so nothing in them is counted until
 // the first 'kernel meter'.
-func kernelManifests(cfg tcdeploy.Config) ([]byte, error) {
+//
+// With a readerEmail, a binding of the reader's rule set in every metered
+// namespace (renderReaderBinding) follows the workload, and the seed still
+// comes after them: world reads the list as the reader, so a stream stopped
+// between them must not name a namespace the reader cannot read either. An
+// empty readerEmail, an instance whose reader was never granted the metered
+// scope, adds none.
+func kernelManifests(cfg tcdeploy.Config, readerEmail string) ([]byte, error) {
 	manifests, err := tcdeploy.Render(cfg)
 	if err != nil {
 		return nil, err
+	}
+	if readerEmail != "" {
+		for _, ns := range cfg.Meter {
+			b, err := renderReaderBinding(readerEmail, ns)
+			if err != nil {
+				return nil, err
+			}
+			manifests = append(manifests, []byte("---\n")...)
+			manifests = append(manifests, b...)
+		}
 	}
 	seed, err := kernel.RenderNamespacesConfigMap(tcdeploy.DefaultNamespace, kernel.DefaultNamespacesName, cfg.Meter)
 	if err != nil {
@@ -530,6 +552,10 @@ type kernelDeployResult struct {
 	Adapt          bool            `json:"adapt"`
 	Interval       string          `json:"interval"`
 	AdaptCooldown  string          `json:"adapt_cooldown"`
+	// Reader is the reader bound in ReaderBindings, every metered namespace;
+	// both are empty unless 'reader grant' recorded the metered scope.
+	Reader         string   `json:"reader,omitempty"`
+	ReaderBindings []string `json:"reader_bindings_created,omitempty"`
 }
 
 func (r kernelDeployResult) Human(w io.Writer) error {
@@ -544,6 +570,7 @@ func (r kernelDeployResult) Human(w io.Writer) error {
 	} else {
 		fprintf(w, "  adapting   off\n")
 	}
+	printReaderBindings(w, r.Reader, r.ReaderBindings)
 	fprintf(w, "\nIt stops applications only. The tunnel and the key holder are last-to-die:\n")
 	fprintf(w, "stopping them would make storage impossible to unseal while the instance kept\n")
 	fprintf(w, "billing.\n")

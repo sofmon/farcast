@@ -37,6 +37,11 @@ import (
 // whichever account minted it. No cloud, no real tool.
 
 func TestMain(m *testing.M) {
+	// TestCertFileVariablesCannotAddARoot's children (harden_test.go) run
+	// before anything else, so their first load of the system roots is theirs.
+	if mode := os.Getenv(certChildEnv); mode != "" {
+		os.Exit(certChildMain(mode))
+	}
 	if filepath.Base(os.Args[0]) == "kubectl" {
 		os.Exit(fakeKubectlMain(os.Args[1:]))
 	}
