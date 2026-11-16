@@ -19,8 +19,9 @@
 //     grant's own verifying read does, before 'reader grant' has verified it;
 //   - for a key file, openCluster's endpoint steps, then kube.New's pairing;
 //   - the vendored 2LO provider, with the token URL fixed in code
-//     (Endpoint.TokenURL, never the key file's token_uri), the one scope
-//     userinfo.email, and a logger that discards;
+//     (Endpoint.TokenURL, never the key file's token_uri), farcast's own
+//     scopes (kube.TokenScopes: cloud-platform and userinfo.email) unless
+//     FARCAST_WALK_SCOPE names others, and a logger that discards;
 //   - a transport with no proxy and no redirect, User-Agent farcast, and the
 //     bearer only on the one request built for the endpoint's own origin.
 //
@@ -186,18 +187,24 @@ func (w *walk) target() walkTarget {
 }
 
 // walkMint mints one token for cred with kid as the assertion's key id, as
-// kube's twoLegged does: the vendored 2LO provider, ep.TokenURL(), the one
-// scope userinfo.email, Expires left zero, and a logger that discards. A nil
+// kube's twoLegged does: the vendored 2LO provider, ep.TokenURL(), the scopes
+// FARCAST_WALK_SCOPE names (walkScopes, in the untagged walkscopes_test.go:
+// farcast's own, kube.TokenScopes, unless it says otherwise), Expires left
+// zero, and a logger that discards. A nil
 // Logger would let GOOGLE_SDK_GO_LOGGING_LEVEL log the assertion and the token
 // (vendor/github.com/googleapis/gax-go/v2/internallog/internallog.go).
 func walkMint(ctx context.Context, ep kube.Endpoint, cred kube.Credential, kid string) (*auth.Token, error) {
+	scopes, _, err := walkScopes(os.Getenv("FARCAST_WALK_SCOPE"))
+	if err != nil {
+		return nil, err
+	}
 	key := slices.Clone(cred.PrivateKeyPEM)
 	defer clear(key)
 	tp, err := auth.New2LOTokenProvider(&auth.Options2LO{
 		Email:        cred.Email,
 		PrivateKey:   key,
 		PrivateKeyID: kid,
-		Scopes:       []string{kube.ScopeUserinfoEmail},
+		Scopes:       scopes,
 		TokenURL:     ep.TokenURL(),
 		Client:       walkHTTPClient(ep),
 		Logger:       slog.New(slog.DiscardHandler),
@@ -281,11 +288,24 @@ func oauthErrorCode(body []byte) string {
 	return "none (the answer names no OAuth error code)"
 }
 
-// mintEmptyKid mints once with the reader's key and "kid":"" (probe walk
-// item 5). The reader must be recorded with its uploaded key's id, as
-// openCluster requires, and that id is replaced by "" for this one mint: a
-// refusal then says the empty id is refused, not that no key is uploaded.
+// mintEmptyKid mints once with "kid":"" as FARCAST_WALK_IDENTITY when it is
+// set, and otherwise as the reader (probe walk item 5). The reader must be
+// recorded with its uploaded key's id, as openCluster requires, and that id is
+// replaced by "" for this one mint: a refusal then says the empty id is
+// refused, not that no key is uploaded. FARCAST_WALK_IDENTITY's writer, reader
+// or key file is opened as review and forbidden-body open it (target), and its
+// key id is replaced the same way.
 func (w *walk) mintEmptyKid() {
+	if os.Getenv("FARCAST_WALK_IDENTITY") != "" {
+		// Another key Google knows, when the reader's cannot be uploaded
+		// (the 2026-11-16 probe walk's project blocks key upload).
+		tg := w.target()
+		w.say("mint-empty-kid: one mint with %s, its key id replaced by \"kid\":\"\"", tg.who)
+		w.sayScope(tg.scrub)
+		tok, err := walkMint(w.ctx, tg.ep, tg.cred, "")
+		w.mintReport(tg.scrub, tok, err)
+		return
+	}
 	meta, sc := w.record()
 	r := clusterRef{Dir: w.env.ConfigDir, Meta: meta, Identity: kube.Reader, Warn: io.Discard, Verifying: true}
 	if _, err := openCluster(r); err != nil {
@@ -298,8 +318,20 @@ func (w *walk) mintEmptyKid() {
 	}
 	defer clear(cred.PrivateKeyPEM)
 	w.say("mint-empty-kid: one mint with the reader's key, its recorded key id replaced by \"kid\":\"\"")
+	w.sayScope(sc)
 	tok, err := walkMint(w.ctx, ep, cred, "")
 	w.mintReport(sc, tok, err)
+}
+
+// sayScope prints the scopes the probe mints with, or stops on a
+// FARCAST_WALK_SCOPE it does not know.
+func (w *walk) sayScope(sc walkScrubber) {
+	w.t.Helper()
+	_, name, err := walkScopes(os.Getenv("FARCAST_WALK_SCOPE"))
+	if err != nil {
+		w.stop(sc, "%v", err)
+	}
+	w.say("  scope %s", name)
 }
 
 // send makes one request as tg: it mints, as farcast does, under the
@@ -308,6 +340,7 @@ func (w *walk) mintEmptyKid() {
 // at most walkMaxBody of the body. A mint that gives no token ends the probe.
 func (w *walk) send(tg walkTarget, method, path string, q url.Values, body []byte) (int, string, []byte) {
 	w.t.Helper()
+	w.sayScope(tg.scrub)
 	tok, err := walkMint(w.ctx, tg.ep, tg.cred, tg.cred.PrivateKeyID)
 	if err != nil || tok == nil || tok.Value == "" {
 		w.say("the token endpoint minted no token for %s:", tg.who)

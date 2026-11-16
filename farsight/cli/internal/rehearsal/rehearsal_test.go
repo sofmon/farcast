@@ -830,11 +830,12 @@ func theWriter(t *testing.T, rig *rehearsal.Rig) kube.Credential {
 }
 
 // claimsFor are the claims of a 2LO assertion for iss, as the vendored
-// encoder writes them, aimed at the rig's token endpoint.
+// encoder writes them for kube's client (kube.TokenScopes, space-separated),
+// aimed at the rig's token endpoint.
 func claimsFor(rig *rehearsal.Rig, iss string) map[string]any {
 	now := time.Now().Unix()
 	return map[string]any{
-		"iss": iss, "scope": kube.ScopeUserinfoEmail, "aud": "https://" + rig.ClusterAddr + "/token",
+		"iss": iss, "scope": strings.Join(kube.TokenScopes(), " "), "aud": "https://" + rig.ClusterAddr + "/token",
 		"iat": now - 10, "exp": now + 3590,
 	}
 }
@@ -1072,7 +1073,8 @@ func TestTheRigRefusesAWriterTokenOnARead(t *testing.T) {
 
 // TestTheRigsTokenEndpointChecksTheAssertion: the token endpoint mints for an
 // assertion the reader's or the writer's key signed, aimed at it, with
-// userinfo.email's scope, and refuses every other with invalid_grant; in
+// kube.TokenScopes' two scopes (cloud-platform then userinfo.email), and
+// refuses every other with invalid_grant, userinfo.email alone included; in
 // token-refused it refuses the reader's too, and 'world' shows
 // credential_refused. No calls.log line holds an assertion or a token.
 func TestTheRigsTokenEndpointChecksTheAssertion(t *testing.T) {
@@ -1108,7 +1110,10 @@ func TestTheRigsTokenEndpointChecksTheAssertion(t *testing.T) {
 	try("an unregistered iss", readerKey, claimsFor(rig, "someone@rehearsal.invalid"), http.StatusBadRequest)
 	try("the reader's iss under the writer's key", writerKey, claimsFor(rig, readerEmail), http.StatusBadRequest)
 	try("another aud", readerKey, with(readerEmail, "aud", "https://oauth2.googleapis.com/token"), http.StatusBadRequest)
-	try("another scope", readerKey, with(readerEmail, "scope", "https://www.googleapis.com/auth/cloud-platform"), http.StatusBadRequest)
+	try("userinfo.email alone", readerKey, with(readerEmail, "scope", kube.ScopeUserinfoEmail), http.StatusBadRequest)
+	try("cloud-platform alone", readerKey, with(readerEmail, "scope", kube.ScopeCloudPlatform), http.StatusBadRequest)
+	try("the two scopes in the reverse order", readerKey,
+		with(readerEmail, "scope", kube.ScopeUserinfoEmail+" "+kube.ScopeCloudPlatform), http.StatusBadRequest)
 	past := time.Now().Add(-2 * time.Hour).Unix()
 	expired := claimsFor(rig, readerEmail)
 	expired["iat"], expired["exp"] = past, past+3600
@@ -1139,7 +1144,7 @@ func TestTheRigsTokenEndpointChecksTheAssertion(t *testing.T) {
 	want := map[string]int{
 		"POST /token as reader | ok":                                             1,
 		"POST /token as writer | ok":                                             1,
-		"POST /token as unknown | refused: the assertion did not verify":         5,
+		"POST /token as unknown | refused: the assertion did not verify":         7,
 		"POST /token as reader | refused: token-refused refuses every assertion": 2,
 	}
 	if !maps.Equal(got, want) {

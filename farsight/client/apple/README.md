@@ -8,7 +8,7 @@ One Swift/SwiftUI codebase for macOS, iPadOS, iOS and visionOS ([ADR 0021](../..
   - `farcast version` and `farcast instances`, at launch, which read only files on the Mac;
   - `farcast world <instance>`, only when the operator presses Refresh.
 - That `farcast` reaches an instance as a terminal `farcast` does:
-  - its API server in-process, as the instance's own read-only service account (its reader, [ADR 0023](../../../docs/adr/0023-one-download-farcast.md) M2.4), with a token it first mints in memory at Google's token endpoint, so Google can time each read (inferred), and the API server sees and may log each one. None of it is walked against Google yet;
+  - its API server in-process, as the instance's own read-only service account (its reader, [ADR 0023](../../../docs/adr/0023-one-download-farcast.md) M2.4), with a token it first mints in memory at Google's token endpoint, so Google can time each read (inferred), and the API server sees and may log each one. None of it is walked against Google yet *(2026-11-16: ADR 0023's [probe walk](../../../docs/runbooks/adr-0023-m2-probe-walk.md) found that GKE's DNS endpoint refuses that token as built at 2482810, scoped to `userinfo.email` alone, so there a Refresh reads no cluster section from GKE. A fix built later that day, and not walked, mints it with `cloud-platform` and `userinfo.email`, so a leaked token works for every Google API the reader's IAM allows, not only the cluster.)*;
   - through the instance's FatLine tunnel, which shows the provider its source address, timing, sizes and server name and none of its content.
 - No tile shows a real app yet. Tiles wait for the bridge (decision 5) and the tile-ingress ADR.
 

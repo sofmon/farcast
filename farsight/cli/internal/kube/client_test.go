@@ -23,13 +23,30 @@ func TestFixedRequestValues(t *testing.T) {
 		{"FieldManager", FieldManager, "farcast"},
 		{"UserAgent", UserAgent, "farcast"},
 		{"GoogleTokenURL", GoogleTokenURL, "https://oauth2.googleapis.com/token"},
+		{"ScopeCloudPlatform", ScopeCloudPlatform, "https://www.googleapis.com/auth/cloud-platform"},
 		{"ScopeUserinfoEmail", ScopeUserinfoEmail, "https://www.googleapis.com/auth/userinfo.email"},
+		{"TokenScopes", strings.Join(TokenScopes(), " "),
+			"https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email"},
 		{"Writer", string(Writer), "writer"},
 		{"Reader", string(Reader), "reader"},
 	} {
 		if c.got != c.want {
 			t.Errorf("%s = %q, want %q", c.name, c.got, c.want)
 		}
+	}
+}
+
+// TestTokenScopesIsAFreshPair: TokenScopes is the endpoint's two scopes,
+// cloud-platform then userinfo.email (design A22-7), and a caller that
+// changes the slice it got changes no later call's.
+func TestTokenScopesIsAFreshPair(t *testing.T) {
+	got := TokenScopes()
+	if len(got) != 2 || got[0] != ScopeCloudPlatform || got[1] != ScopeUserinfoEmail {
+		t.Fatalf("TokenScopes() = %q, want [%s %s]", got, ScopeCloudPlatform, ScopeUserinfoEmail)
+	}
+	got[0], got[1] = "changed", "changed"
+	if again := TokenScopes(); again[0] != ScopeCloudPlatform || again[1] != ScopeUserinfoEmail {
+		t.Errorf("TokenScopes() after a caller changed its copy = %q", again)
 	}
 }
 

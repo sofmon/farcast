@@ -1,8 +1,13 @@
 # ADR 0023 M2 — the probe walk: what Google's pages do not settle
 
-Since [ADR 0023](../adr/0023-one-download-farcast.md) M2.4, `world`, `ps`, `costs`, `usage` and `logs` read the cluster in-process as the instance's reader. Since M2.5, every writing command that reads the cluster reads it in-process as the installer service account, the writer, and the storage key pin is written the same way; `kernel meter`, `kernel confirm` and `reader grant` make no call as the writer. Both mint their own token, in memory, from a key, with the one scope `userinfo.email`. Google documents that GKE's DNS endpoint accepts a token minted from a service-account key by `gke-gcloud-auth-plugin` ([GKE auth](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/api-server-authentication)). It does not document farcast's own token with `userinfo.email` alone, nor a reader holding `roles/container.clusterViewer` plus RBAC. This walk tests those first, on one short-lived instance, before ADR 0023 M2.9's billable walk depends on them.
+Since [ADR 0023](../adr/0023-one-download-farcast.md) M2.4, `world`, `ps`, `costs`, `usage` and `logs` read the cluster in-process as the instance's reader. Since M2.5, every writing command that reads the cluster reads it in-process as the installer service account, the writer, and the storage key pin is written the same way; `kernel meter`, `kernel confirm` and `reader grant` make no call as the writer. Both mint their own token, in memory, from a key, with the one scope `userinfo.email` *(2026-11-16: at 2482810, the code this walk ran; since the fix later that day, `cloud-platform` and `userinfo.email`, as the Status says)*. Google documents that GKE's DNS endpoint accepts a token minted from a service-account key by `gke-gcloud-auth-plugin` ([GKE auth](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/api-server-authentication)). It does not document farcast's own token with `userinfo.email` alone, nor a reader holding `roles/container.clusterViewer` plus RBAC. This walk tests those first, on one short-lived instance, before ADR 0023 M2.9's billable walk depends on them.
 
-**Status.** *Written 2026-11-15 against the code as built. Not walked.* Nothing below has run against Google. The [Results](#results) are empty.
+**Status.** *Written 2026-11-15 against the code as built. Walked 2026-11-16 at 2482810 (M2.5). The scope fix was built after it, the same day, and is not walked.* The probe was rebuilt during the walk with two options, now in the tree and in [`walkprobe_test.go`](../../farsight/cli/internal/cli/walkprobe_test.go)'s header: `FARCAST_WALK_SCOPE`, and `mint-empty-kid`'s `FARCAST_WALK_IDENTITY`. The [Results](#results) hold what it recorded.
+- **Answered:** items 1, 3, 4, 5, 6 and 7. Item 3 only in part: the script stopped at its first policy check, before its retries, its upload and its key id. Item 5 only for a key Google created, not an uploaded one.
+- **Item 1's answer is a hard stop.** GKE's DNS endpoint refuses a token scoped to `userinfo.email` alone (401, an HTML page). It accepts the same key's token with `cloud-platform` (200). At 2482810 farcast minted every in-process cluster token with `userinfo.email` alone. So there the endpoint refuses its in-process cluster calls: the five read commands and `reader grant`'s check since M2.4, and the writing commands' reads and the storage key pin since M2.5. The fix is to restore `cloud-platform` ([ADR 0023](../adr/0023-one-download-farcast.md) decision 3's dated notes).
+- **The fix, built later on 2026-11-16, not walked.** farcast now mints every cluster token with `cloud-platform` and `userinfo.email`, in that order, the order this walk's probe sent them in. `cloud-platform` is what the endpoint's IAM check needs. `userinfo.email` keeps the account's email in the identity GKE derives from the token, which the reader's RoleBindings name; that is inferred, not walked. The trade-off: a leaked cluster token works for every Google API the account's IAM allows, not only the cluster: `roles/container.clusterViewer` for the reader, everything the installer holds for the writer. The fix is built and tested against a local API server (`kube/kubetest`) only. For the writer, this walk's 200 to exactly this pair, sent by the probe in P1.4 and not by farcast, is the evidence. For the reader there is none: item 2 was not walked, and where key upload is blocked no reader can be set up. From now on the probe's default is farcast's pair; `FARCAST_WALK_SCOPE=userinfo.email` reproduces this walk's 401.
+- **Not answered:** item 2. The project's organization enforces `iam.disableServiceAccountKeyUpload`, so P2.2 created no reader. P1.5 was not run, after P1.4's hard stop. P2.3 to P2.6 were not run, because there was no reader.
+- **Teardown:** the instance is released, the throwaway account is deleted, the Org Policy API the walk enabled is off again, and the project is back to P0.8's counts.
 
 **It records seven things:**
 1. whether the DNS endpoint accepts the **writer's** token scoped to `userinfo.email` alone, which every writing command's reads need since M2.5. If it refuses, `cloud-platform` comes back, with a dated note in ADR 0023;
@@ -57,6 +62,7 @@ Throughout:
    - `$WALK/bin/farcast`: Google's APIs, the registry's `<region>-docker.pkg.dev`, and `gcr.io` for the base image, as on the M1 walk. New since M2.4 and M2.5: the cluster's `*.gke.goog:443` and `oauth2.googleapis.com:443`, for its in-process reads and the tokens it mints. Add the carrier's address on port 8443 after P1.
    - `$WALK/walkprobe.test`: `*.gke.goog:443` and `oauth2.googleapis.com:443`, and nothing else.
    - `kubectl`, the GKE auth plugin and gcloud keep the rules they had. Until M2.7 every apply still runs kubectl as the active gcloud configuration.
+   - *(2026-11-16: a firewall that has not yet allowed `walkprobe.test` does not show as a refusal. The probe prints `NOT ANSWERED: EOF` from the token endpoint, after about 16 s. Allow it for its two destinations, and run the probe again.)*
 6. **Three tools for the applies.** Link `kubectl`, the GKE auth plugin and `gcloud` one by one into `$WALK/tools`, never a whole tool directory:
    ```bash
    for t in kubectl gke-gcloud-auth-plugin gcloud; do ln -s "$(command -v "$t")" "$WALK/tools/$t"; done
@@ -86,6 +92,8 @@ Throughout:
    export CLOUDSDK_ACTIVE_CONFIG_NAME=<your FarCast gcloud configuration>
    ```
    Record the counts of clusters, registries, buckets, forwarding rules, addresses, target pools, disks and VMs in the project now, for P7 to compare with. Record counts only.
+
+   *(2026-11-16: count the buckets in Cloud Shell, with P0.9's `PROJECT`. `gcloud storage` still crashes on the operator's Mac, so this walk counted them there. An expired gcloud session fails every list, with "Reauthentication failed", so a list that failed counts nothing. Check that each list ran before recording its count, and sign in again if it did not.)*
 9. **Cloud Shell**, signed in as an Owner of the instance's project. Set the project and the instance there, typed and never recorded: `PROJECT=<the project id>` and `INSTANCE=<name>`. P6 and P7 use both.
 
 ---
@@ -122,9 +130,11 @@ Throughout:
    ```bash
    probe FARCAST_WALK_PROBE=forbidden-body FARCAST_WALK_IDENTITY=writer
    ```
-   *Expect* `status 200 OK` and `not a refusal`: the DNS endpoint accepts the writer's token with `userinfo.email` alone. Record the status line. For anything else, also record the lines it printed: the Content-Type, whether the body is a Kubernetes Status, the reason and code, and the scrubbed message.
+   *Expect* `status 200 OK` and `not a refusal`: the DNS endpoint accepts the writer's token with `userinfo.email` alone *(2026-11-16: since the fix, with farcast's pair, `cloud-platform` and `userinfo.email`; P1.4's notes below)*. Record the status line. For anything else, also record the lines it printed: the Content-Type, whether the body is a Kubernetes Status, the reason and code, and the scrubbed message.
 
    **Hard stop on a 401 or a 403.** Then every writing command would refuse at its own preflight read, so `connect` would refuse before it creates the load balancer, and nothing about it is learned by running it. Skip step 5, and P2's grant and `world`. Go on with P2's init, paste and record, then P2.4, which needs no connected instance and is then item 2's answer: a 403 whose body is a Kubernetes Status means the endpoint accepted the reader's token and RBAC refused it, as it should before a grant; a 401 means the endpoint refused the token; the endpoint's IAM refusal is no answer yet, so run it again after a few minutes, as P2.4 says. Then go on with P3 to P6, which do not need a connected instance either. Adding `cloud-platform` back is a code change with its own dated note in ADR 0023, not a walk step.
+
+   *(2026-11-16: the probe now takes `FARCAST_WALK_SCOPE`, added during the walk. It sets the scope every cluster mode mints with: `userinfo.email`, farcast's own and the default then; `cloud-platform`; or `cloud-platform+userinfo.email`, what gcloud asks for. On this walk the writer's read answered 401 Unauthorized, `text/html`, not a Kubernetes Status, with `userinfo.email`. It answered 200 OK with each of the other two. So the hard stop held, and the cause is farcast's scope, not the writer: the same key reads with `cloud-platform`. Running this step with each scope tells the two apart. A firewall that has not yet allowed `walkprobe.test` shows here as `NOT ANSWERED: EOF` after about 16 s, not as a refusal (P0.5).)* *(2026-11-16, after the fix: the probe's default is now farcast's own pair, `cloud-platform` and `userinfo.email`, the same as `FARCAST_WALK_SCOPE=cloud-platform+userinfo.email`. So *expect* 200 with the default. `FARCAST_WALK_SCOPE=userinfo.email` reproduces this walk's 401, and `cloud-platform` alone stays an option.)* *(2026-11-16, after the fix: "what gcloud asks for" above is not right, and the walk did not observe gcloud's request. gcloud's own scope list, as its installed source on the dev Mac sets it, puts `userinfo.email` before `cloud-platform` and asks for more scopes besides. `cloud-platform+userinfo.email` is the probe's own pair, in the probe's order.)*
 5. **`connect`.** In the walk shell:
    ```bash
    farcast -o json connect "$INSTANCE" --yes > "$WALK/connect.json"; echo "exit $?"
@@ -148,6 +158,8 @@ Throughout:
    ```
    Where the organization enforces `iam.serviceAccountKeyExpiryHours`, pass a `--days` no greater than its days, and at most 90 ([phase-1-validation.md](phase-1-validation.md) step 7b). *Expect* `Paste this into Cloud Shell as a project Owner (sha256 …)` on stderr, and `reader.key` and `reader.crt` in the instance's directory.
 2. **The paste.** Paste the script into Cloud Shell. Keep what it prints on the screen for P3; do not copy it anywhere. *Expect* it to end with `farcast reader record $INSTANCE --key-id <40 hex>`.
+
+   *(2026-11-16: where the organization enforces `iam.disableServiceAccountKeyUpload`, as this walk's did, the script stops at its first policy check. It prints farcast's own refusal and changes nothing. There is then no reader in the project, and item 2 cannot be walked there. Skip P2.3 to P2.6 and P4.6's reader review, go on with P3, and run P5 with another key (P5's note).)*
 3. **The record.** In the walk shell: `farcast reader record "$INSTANCE" --key-id <the id>`. *Expect* `metadata.yaml`'s `reader:` to gain `key_id`.
 4. **Optional, no extra cost: an RBAC refusal from the real API server.** Before `reader grant`, the reader has its IAM role and no RBAC yet:
    ```bash
@@ -170,7 +182,7 @@ Throughout:
    grep -o '"error":{"kind":"[a-z_]*"' "$WALK/world.json" | sort | uniq -c
    grep -o '"read":[a-z]*\(,"skipped":"[a-z_]*"\)\{0,1\}' "$WALK/world.json" | sort | uniq -c
    ```
-   This walk deploys no kernel and no keyholder. So *expect* one error kind only, `kernel_absent`, for the spend section, which reads nothing from the cluster without a kernel; and the seal section `"read":false` with `"skipped"`. Every other section reads. Record the exit status and the two counts. This is item 2's answer: the DNS endpoint accepts the reader's token with `userinfo.email` alone, and `clusterViewer` plus farcast's RBAC reads what `world` reads. A `credential_refused`, `unauthorized`, `forbidden` or `endpoint_refused` is the answer the other way.
+   This walk deploys no kernel and no keyholder. So *expect* one error kind only, `kernel_absent`, for the spend section, which reads nothing from the cluster without a kernel; and the seal section `"read":false` with `"skipped"`. Every other section reads. Record the exit status and the two counts. This is item 2's answer: the DNS endpoint accepts the reader's token with `userinfo.email` alone *(2026-11-16: since the fix, with farcast's pair, `cloud-platform` and `userinfo.email`)*, and `clusterViewer` plus farcast's RBAC reads what `world` reads. A `credential_refused`, `unauthorized`, `forbidden` or `endpoint_refused` is the answer the other way.
 
 ## P3. Item 3: what the init script printed
 
@@ -189,6 +201,8 @@ gcloud org-policies describe iam.managed.disableServiceAccountKeyUpload \
   --effective --project "$PROJECT" --format 'value(spec.rules[0].enforce)'; echo "exit $?"
 ```
 For each, record the exit status, and whether it printed nothing, `True`, `False`, or an error. For an error, record its command group and first words only, such as an unknown command, an unrecognized argument or `NOT_FOUND`.
+
+*(2026-11-16: the managed check needs the Org Policy API, `orgpolicy.googleapis.com`, on the project. Where it is off, gcloud asks whether to enable it. If the walk enables it, record that, and P7.6 turns it off again. In the script the check is silenced and has no terminal, so gcloud cannot ask: with the API off it prints nothing, which the script reads as "not enforced". On this walk the legacy check printed `True`, and the managed one, once the API was on, `False`, each with exit 0.)*
 
 ## P4. Items 6 and 4: a throwaway account
 
@@ -224,6 +238,8 @@ The account has no role at first, so the endpoint's IAM check refuses it (item 6
    - the scrubbed message.
 
    farcast tells an RBAC refusal from the endpoint's IAM refusal by whether the body is a Kubernetes Status, so these lines settle that rule.
+
+   *(2026-11-16: while the probe's default scope is `userinfo.email` alone, farcast's own as built, run this step twice: as written, and again with `FARCAST_WALK_SCOPE=cloud-platform`. On this walk the default scope got the endpoint's 401 for an account with a role and for one with none: the writer in P1.4, and this account here, before its role. With `cloud-platform` this step got the endpoint's IAM refusal, the 403 it looks for. So run step 5's review and step 6's controls with `FARCAST_WALK_SCOPE=cloud-platform`, as this walk did. With the default scope step 5 would get only 401s, and item 4 no answer (inferred). Run P2.4 both ways too, for the same reason. This walk did not run P2.4.)* *(2026-11-16, after the fix: the probe's default is now farcast's own pair, so the condition above no longer holds. Run this step, step 5 and step 6 with the default, which carries `cloud-platform`; that the pair gets the same 403 as `cloud-platform` alone did is inferred. `FARCAST_WALK_SCOPE=userinfo.email` still reproduces the 401.)*
 4. **The role**, in Cloud Shell. The command prints the project's whole IAM policy, so it is discarded:
    ```bash
    gcloud projects add-iam-policy-binding "$PROJECT" --condition=None \
@@ -252,6 +268,8 @@ It mints once with the reader's key, sending `"kid":""` in place of the recorded
 
 A refusal changes nothing today, because every key farcast mints with carries its id: the reader's is recorded by `reader record`, and the installer's key file names its own. It is still a finding for the token source, which sends whatever id is recorded.
 
+*(2026-11-16: where the reader cannot be uploaded, `mint-empty-kid` takes `FARCAST_WALK_IDENTITY` in place of its default, the reader, as `review` and `forbidden-body` do. With `FARCAST_WALK_IDENTITY=key` and `FARCAST_WALK_KEY_JSON=probe/key.json` it mints with the throwaway account's key, so it runs before P7.1 deletes that key. This walk used that key. It was created by Google, not uploaded. The control is then the same key under its own id, which minted in P4.3.)*
+
 ## P6. Item 7: the cluster's version
 
 The endpoint's form was read in P1.3. The cluster's version, in Cloud Shell:
@@ -278,34 +296,50 @@ Record the version and the location. Its minor version is the one ADR 0023 M2.7'
    gcloud iam service-accounts list --project "$PROJECT" --format 'value(email)' | grep -c -e "^$READER_SA@" -e '^farcast-walk-probe@'
    ```
    *Expect* `0`. Record whether each printed command succeeded, and the count.
-4. **The cloud**, in the observing shell: verify against the cloud, not local state, that clusters, registries, buckets, forwarding rules, addresses, target pools, disks and VMs are back to P0.8's counts.
+
+   *(2026-11-16, steps 2 and 3: `release` can print the reader's two lines for an account that was never created. On this walk P2.2 created no account, and `release` printed them all the same: the record held the reader's email from `reader init`, with no key id. Run then, they are expected to fail with `not found`, which is harmless. The count is still the check.)*
+4. **The cloud**, in the observing shell: verify against the cloud, not local state, that clusters, registries, buckets, forwarding rules, addresses, target pools, disks and VMs are back to P0.8's counts. *(2026-11-16: count the buckets in Cloud Shell, as P0.8's note says.)*
 5. `rm -rf "$WALK"`. It holds the release, the probe, the reader's script and the JSON results.
+6. *(Added 2026-11-16.)* **The Org Policy API**, only if P3's managed check enabled it, in Cloud Shell:
+   ```bash
+   gcloud services disable orgpolicy.googleapis.com --project "$PROJECT"; echo "exit $?"
+   ```
+   Record the exit status. It can run any time after P3; the 2026-11-16 walk ran it after step 3.
 
 ---
 
 ## Results
 
-Not walked.
+Walked 2026-11-16 at 2482810, in us-central1. Every value is scrubbed. The agent ran farcast and the probe in P0.7's walk shell, and the operator ran every Cloud Shell step. The operator approved the full gate first: the cost, the duration, the two service accounts, the project-wide `container.developer` grant and the teardown. The instance lived 83 minutes: about USD 0.15 by the floor model, plus cents. The throwaway account held its project-wide grant for about 15 minutes.
 
 | Step | Result | Notes |
 |---|---|---|
-| Commit, `./check.sh` | | |
-| P0 release build: `OK`, tags, revision, `vcs.modified=false` | | |
-| P1.1 install without `--credentials`, and with `/dev/null`: exit 2 each, no envelope, nothing created | | |
-| P1.2 install | | |
-| Item 7, P1.3: the endpoint's form | | |
-| Item 1, P1.4: the writer's preflight read before `connect` | | |
-| Item 1, P1.5: `connect`: exit, kind, carrier recorded, firewall log, `--status` | | |
-| Item 2, P2.4 (optional): the reader before its RBAC | | |
-| Item 2, P2.5: `reader grant`: elapsed minutes, the IAM line, reviews | | |
-| Item 2, P2.6: `world` as the reader: error kinds, sections read | | |
-| Item 3: the paste: policy checks, retries, upload, key id shape | | |
-| Item 3: the two policy checks unsilenced | | |
-| Item 6, P4.3: the endpoint's IAM refusal, every printed line | | |
-| Item 4, P4.5: the review: verdict, reason, minutes to settle | | |
-| P4.6 controls (optional): writer, reader, key with its role | | |
-| Item 5, P5: `"kid":""` | | |
-| Item 7, P6: the cluster's version and location | | |
-| P7 throwaway account, key and binding deleted | | |
-| P7 `release`, the reader lines run, accounts absent | | |
-| P7 the cloud back to P0's counts | | |
+| Commit, `./check.sh` | 2482810 (M2.5). `./check.sh` passed on the same tree content, run just before the commit. | The probe was built from 2482810 first. It was rebuilt twice during the walk, from 2482810 plus walk-time changes to `walkcluster_test.go` and `walkprobe_test.go`, uncommitted then: `FARCAST_WALK_SCOPE`, and `mint-empty-kid`'s `FARCAST_WALK_IDENTITY`. |
+| P0 release build: `OK`, tags, revision, `vcs.modified=false` | 11 checksums `OK`, `-tags=farcast_embedded`, `vcs.revision` 2482810, `vcs.modified=false`. | `farcast-release build -targets darwin/arm64`. P0.7: `farcast version` listed four components, and the walk shell carried no `GODEBUG`, proxy or `GOOGLE_APPLICATION_CREDENTIALS`. |
+| P0.5 the firewall (added) | The probe's first run printed `NOT ANSWERED: EOF` from the token endpoint, after about 16 s. Once Little Snitch allowed `walkprobe.test`, the same run was answered. | A firewall that holds or denies the probe shows as this EOF (P0.5's note). |
+| P0.8 the baseline (added) | 0 clusters, 0 registries (us-central1), 0 buckets, 0 forwarding rules, 0 addresses, 0 target pools, 0 disks, 0 VMs, 2 service accounts. | The gcloud session had expired: every call failed with "Reauthentication failed", and the first attempt counted nothing. The operator signed in again and the counts were retaken. Buckets were counted in Cloud Shell, because `gcloud storage` crashes on the operator's Mac. |
+| P1.1 install without `--credentials`, and with `/dev/null`: exit 2 each, no envelope, nothing created | Each exited 2, with 0 bytes on stdout and the refusal on stderr. | Nothing was recorded. |
+| P1.2 install | Exit 0 after about 4 minutes. Status `running`, cloud logging `system`. | |
+| Item 7, P1.3: the endpoint's form | `<51 characters>.<the region>.gke.goog` | The region label, not a zone, so farcast's endpoint rule accepts it. |
+| Item 1, P1.4: the writer's preflight read before `connect` | **401 Unauthorized**, `text/html`, not a Kubernetes Status (1452 bytes), with farcast's own scope, `userinfo.email` alone. **Hard stop.** | GKE's DNS endpoint refuses farcast's own token, as it was at 2482810. Every writing command's preflight read, and every read command, would refuse the same way. The fix, `cloud-platform` back, was built later that day, with its trade-off, and is not walked (Status). |
+| Item 1, P1.4 with `FARCAST_WALK_SCOPE` (added) | `cloud-platform`: **200 OK**, `application/json`. `cloud-platform+userinfo.email`, what gcloud asks for: **200 OK**. | The same request with the same installer key. So the refusal is the scope's, not the writer's. `cloud-platform+userinfo.email` is exactly the pair farcast mints with since the fix: the writer's evidence for it, sent by the probe, not by farcast (Status). *(2026-11-16, after the fix: "what gcloud asks for" is not right; the walk did not observe gcloud's request, and gcloud's own list puts `userinfo.email` first and asks for more. The pair is the probe's, P1.4's notes.)* |
+| Item 1, P1.5: `connect`: exit, kind, carrier recorded, firewall log, `--status` | Not run, after P1.4's hard stop. | |
+| P2.1 `reader init` (added) | Exit 0. The script was 66 lines and held no private key. `reader.key` was 0600. | |
+| P2.2 the paste (added) | Stopped at its first policy check: the project's organization enforces `iam.disableServiceAccountKeyUpload`. It printed farcast's own refusal: the reader cannot be set up until an organization administrator allows upload, and nothing was changed. | No reader account was created. In an organization that blocks key upload (Google enforces it by default in newer organizations), `world`, `ps`, `costs`, `usage` and `logs` cannot read the cluster at all. |
+| Item 2, P2.3: `reader record` (added) | Not run: P2.2 printed no key id. | Item 2 is not walkable in this project. |
+| Item 2, P2.4 (optional): the reader before its RBAC | Not run: no reader. | |
+| Item 2, P2.5: `reader grant`: elapsed minutes, the IAM line, reviews | Not run: no reader. | |
+| Item 2, P2.6: `world` as the reader: error kinds, sections read | Not run: no reader. | Not walked for the reader. Its token at 2482810 carried `userinfo.email` alone, which item 1's answer says the endpoint refuses. So there the reader's reads are refused too (inferred). The fix, built later that day, gives it `cloud-platform` and `userinfo.email`; there is no evidence yet for the reader with them (Status). |
+| Item 3: the paste: policy checks, retries, upload, key id shape | No policy check printed anything; both are silenced. The script stopped at the legacy check, with its clean message. | The retries, the upload and the key id's shape were not reached. |
+| Item 3: the two policy checks unsilenced | Legacy (`resource-manager org-policies describe … --effective`, `value(booleanPolicy.enforced)`): `True`, exit 0. The spelling works. Managed (`org-policies describe … --effective`, `value(spec.rules[0].enforce)`): the Org Policy API was off, and gcloud asked whether to enable it. The operator enabled it, and the check printed `False`, exit 0. The spelling works once that API is on. | **Finding.** In the script the managed check is silenced and has no terminal, so gcloud cannot ask. With the API off it prints nothing, which the script reads as "not enforced". An enforced managed policy in such a project would then fail at the upload with gcloud's own error, not farcast's message. P7.6 turned the API off again. |
+| P4.1, P4.2 the throwaway account and its key (added) | Account created, exit 0. Key created, exit 0, mode 0600, in the walk directory only. | Key creation is allowed in this project (`iam.disableServiceAccountKeyCreation` is not enforced), though key upload is not. An earlier attempt failed locally, before any key was created, because a helper file of the agent's sat at `$WALK/probe`. That is not a runbook defect: the runbook's `probe` is a shell function. |
+| Item 6, P4.3: the endpoint's IAM refusal, every printed line | `userinfo.email`: 401 Unauthorized, `text/html`, not a Status (1452 bytes). `cloud-platform`: **403 Forbidden, `text/html`, not a Kubernetes Status** (1449 bytes). | **Settles farcast's rule:** a 403 whose body is not a Status is the endpoint's IAM, not RBAC (`forbiddenByRBAC`). The probe printed the byte count only, not the HTML's first line. How many tries the new key took was not recorded. |
+| P4.4 the role (added) | `roles/container.developer` granted on the project, exit 0. | Held about 15 minutes, until P7.1. |
+| Item 4, P4.5: the review: verdict, reason, minutes to settle | At about +0 min the review itself was refused: 403, `text/html`, not a Status (1449 bytes), a second sample for item 6. From about +1.5 min to +15 min, 10 answers: **ALLOWED**, reason "access granted by IAM permissions." | As the throwaway key with `cloud-platform`, asked every 90 s. **Settled: GKE's SelfSubjectAccessReviews consult IAM.** So `reader grant`'s five reviews see an IAM role stronger than `clusterViewer`, as the CLI README infers. |
+| P4.6 controls (optional): writer, reader, key with its role | The writer's review (`cloud-platform`): ALLOWED, "access granted by IAM permissions." The reader's review: not run, no reader. `forbidden-body` as the throwaway key holding its role (`cloud-platform`): 200 OK. | The installer has no RBAC binding, so the writer's ALLOWED is IAM too. |
+| Item 5, P5: `"kid":""` | **ACCEPTED**, with scope `userinfo.email`. Google minted a token, which was not printed. | With the throwaway account's Google-created key (`FARCAST_WALK_IDENTITY=key`), not an uploaded one: the reader could not be uploaded here. The control was the same key under its own id, which minted in P4.3. |
+| Item 7, P6: the cluster's version and location | `1.36.4-gke.2377000`, location `us-central1`. | A regional cluster. The minor version is 1.36. |
+| P7 throwaway account, key and binding deleted | The binding was removed (exit 0) and the account deleted (exit 0). `keys list` then exited 1, as expected. The key file was deleted. | |
+| P7 `release`, the reader lines run, accounts absent | `release` exited 0 after about 5 minutes. The cluster and the registry were deleted, and the local record removed. The count of reader and probe accounts was 0. | `release` printed the reader's two Cloud Shell lines, though the reader's account was never created: the record held the reader's email from `reader init`, with no key id. Running them was not reported. With no account they are expected to fail with `not found` (P7.3's note). |
+| P7.6 the Org Policy API (added) | Disabled, exit 0. | The walk had enabled it in P3. |
+| P7 the cloud back to P0's counts | Every count matches P0.8 exactly, buckets included (0). The walk directory was deleted. | |

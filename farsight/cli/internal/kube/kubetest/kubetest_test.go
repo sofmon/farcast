@@ -281,10 +281,15 @@ func goodHeader(c kube.Credential) map[string]any {
 	return map[string]any{"alg": "RS256", "typ": "JWT", "kid": c.PrivateKeyID}
 }
 
-// goodClaims are what the vendored encoder sends: iat now − 10 s, exp iat + 3600.
+// tokenScope is the scope claim kube's client sends and kubetest requires:
+// cloud-platform then userinfo.email, space-separated (design A22-7).
+var tokenScope = strings.Join(kube.TokenScopes(), " ")
+
+// goodClaims are what the vendored encoder sends: iat now − 10 s, exp iat +
+// 3600, and kube.TokenScopes as the scope.
 func goodClaims(s *kubetest.Server, c kube.Credential) claims {
 	iat := time.Now().Add(-10 * time.Second).Unix()
-	return claims{"iss": c.Email, "scope": kube.ScopeUserinfoEmail, "aud": "https://" + s.Endpoint() + "/token", "iat": iat, "exp": iat + 3600}
+	return claims{"iss": c.Email, "scope": tokenScope, "aud": "https://" + s.Endpoint() + "/token", "iat": iat, "exp": iat + 3600}
 }
 
 func (f *fixture) tokenForm(form url.Values) answer {
@@ -536,10 +541,28 @@ func TestTokenRefusesEveryOtherAssertion(t *testing.T) {
 		{name: "aud is Google's", claims: func(c claims) { c["aud"] = kube.GoogleTokenURL }},
 		{name: "aud without its port", claims: func(c claims) { c["aud"] = "https://127.0.0.1/token" }},
 		{name: "no aud", claims: func(c claims) { delete(c, "aud") }},
-		{name: "cloud-platform added to the scope", claims: func(c claims) {
-			c["scope"] = kube.ScopeUserinfoEmail + " https://www.googleapis.com/auth/cloud-platform"
+		{name: "userinfo.email alone", claims: func(c claims) { c["scope"] = kube.ScopeUserinfoEmail }},
+		{name: "cloud-platform alone", claims: func(c claims) { c["scope"] = kube.ScopeCloudPlatform }},
+		{name: "the two scopes in the reverse order", claims: func(c claims) {
+			c["scope"] = kube.ScopeUserinfoEmail + " " + kube.ScopeCloudPlatform
 		}},
-		{name: "cloud-platform alone", claims: func(c claims) { c["scope"] = "https://www.googleapis.com/auth/cloud-platform" }},
+		{name: "an extra scope", claims: func(c claims) {
+			c["scope"] = tokenScope + " https://www.googleapis.com/auth/compute"
+		}},
+		// Exactly the pair, as verifyAssertion's contract says: no other
+		// whitespace and no other letter case passes for it.
+		{name: "the two scopes two spaces apart", claims: func(c claims) {
+			c["scope"] = kube.ScopeCloudPlatform + "  " + kube.ScopeUserinfoEmail
+		}},
+		{name: "the two scopes a tab apart", claims: func(c claims) {
+			c["scope"] = kube.ScopeCloudPlatform + "\t" + kube.ScopeUserinfoEmail
+		}},
+		{name: "the two scopes and a trailing space", claims: func(c claims) { c["scope"] = tokenScope + " " }},
+		{name: "a leading space and the two scopes", claims: func(c claims) { c["scope"] = " " + tokenScope }},
+		{name: "the two scopes upper-cased", claims: func(c claims) { c["scope"] = strings.ToUpper(tokenScope) }},
+		{name: "one scope's host upper-cased", claims: func(c claims) {
+			c["scope"] = strings.Replace(tokenScope, "www.googleapis.com", "WWW.GOOGLEAPIS.COM", 1)
+		}},
 		{name: "no scope", claims: func(c claims) { delete(c, "scope") }},
 		{name: "no iat", claims: func(c claims) { delete(c, "iat") }},
 		{name: "no exp", claims: func(c claims) { delete(c, "exp") }},
@@ -2546,7 +2569,7 @@ func TestWithAnsweredSeesEveryAnswer(t *testing.T) {
 	c := f.s.Credential("reader")
 	tok := f.mint(c)
 	badScope := goodClaims(f.s, c)
-	badScope["scope"] = "https://www.googleapis.com/auth/cloud-platform"
+	badScope["scope"] = kube.ScopeUserinfoEmail
 	wantCode(t, f.tokenRequest(sign(t, privateKey(t, c), goodHeader(c), badScope)), http.StatusBadRequest)
 	wantCode(t, f.get("/token", ""), http.StatusMethodNotAllowed)
 	wantCode(t, f.get("/api/v1/namespaces", ""), http.StatusUnauthorized)
@@ -2766,7 +2789,7 @@ func (f *fixture) mintErr(c kube.Credential) (string, error) {
 	}
 	iat := time.Now().Add(-10 * time.Second).Unix()
 	h, _ := json.Marshal(goodHeader(c))
-	cl, _ := json.Marshal(claims{"iss": c.Email, "scope": kube.ScopeUserinfoEmail, "aud": "https://" + f.s.Endpoint() + "/token", "iat": iat, "exp": iat + 3600})
+	cl, _ := json.Marshal(claims{"iss": c.Email, "scope": tokenScope, "aud": "https://" + f.s.Endpoint() + "/token", "iat": iat, "exp": iat + 3600})
 	signing := b64(h) + "." + b64(cl)
 	digest := sha256.Sum256([]byte(signing))
 	sig, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, digest[:])

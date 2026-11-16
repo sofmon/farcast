@@ -56,6 +56,8 @@ Its header ([`walkprobe_test.go`](../../farsight/cli/internal/cli/walkprobe_test
 
 *(2026-11-15, [ADR 0023](../adr/0023-one-download-farcast.md) M2.4: `farcast costs`, `usage` and `logs` now read the cluster in-process as the instance's reader, and read nothing until [phase 1's step 7b](phase-1-validation.md#7b-the-instances-reader-identity--not-yet-walked) has set one up and `farcast reader grant` has verified it. Step 7b is not yet walked, so a re-walk runs it first, once the instance is connected. The owed re-walk for ADR 0020 (PLAN.md) meets this too. The results below were walked with kubectl, and are not rewritten.)*
 
+*(2026-11-16: ADR 0023's [M2 probe walk](adr-0023-m2-probe-walk.md) found that GKE's DNS endpoint refuses farcast's cluster token, scoped to `userinfo.email` alone. So at 2482810 `costs`, `usage` and `logs` are refused against GKE. So is every in-process cluster call this session's writing commands make since M2.5: their reads, and the storage key pin's writes. A re-walk could not pass until `cloud-platform` came back. That fix was built later on 2026-11-16 and is not walked: every cluster token now carries `cloud-platform` and `userinfo.email`, so a leaked one works for every Google API the account's IAM allows, not only the cluster.)*
+
 1. `./check.sh --model` passes at the commit being walked. Record the commit and the check's summary line.
 2. The commit is pushed. `farcast run` clones the repository from GitHub, so a fixture or Containerfile change reaches the walk only once pushed (or with `--ref <pushed sha>`).
 3. Build the binary from that clean checkout, check it is that commit, and make it the `farcast` every later step runs:

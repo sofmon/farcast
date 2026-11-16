@@ -203,6 +203,20 @@ runbook that runs them against a live instance needs this step first. It is stil
 walked. `farcast instances` shows how far it is set up, in its `reader` field, without
 opening `reader.key`.)*
 
+*(2026-11-16: ADR 0023's [M2 probe walk](adr-0023-m2-probe-walk.md) ran `reader init` and
+the paste, this step's 1 and 2, in a project whose organization enforces
+`iam.disableServiceAccountKeyUpload`. `reader init` exited 0. The paste stopped at its
+first policy check, printed farcast's own refusal and changed nothing, as step 2 below
+says. Run unsilenced, the legacy check's spelling works. The managed one's works once
+the Org Policy API, `orgpolicy.googleapis.com`, is on; where it is off, gcloud asks to
+enable it, which the silenced script cannot. Steps 3 to 5 were not reached, and the key
+id's format is still unverified. The same walk found that GKE's DNS endpoint refuses
+farcast's cluster token, scoped to `userinfo.email` alone. So at 2482810 step 4's check,
+and every read this reader serves, is refused against GKE. A fix built later that day
+mints the reader's token with `cloud-platform` and `userinfo.email`, so a leaked one
+works for every Google API the reader's IAM allows, not only the cluster. It is tested
+against a local API server only. This step is still not walked.)*
+
 1. Make the key and the script:
 
    ```bash

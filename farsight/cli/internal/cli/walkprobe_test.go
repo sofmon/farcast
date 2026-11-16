@@ -56,9 +56,10 @@
 //	tunnel        present any certificate at the public carrier and report what
 //	              the handshake, Status and each stream route do
 //	open          read a stored object with a packet's scope keys
-//	mint-empty-kid  mint once with the reader's key and "kid":"", through the
-//	              vendored 2LO provider: whether Google accepted it and, if
-//	              not, the OAuth error code (probe walk item 5)
+//	mint-empty-kid  mint once with "kid":"", as FARCAST_WALK_IDENTITY when it
+//	              is set and otherwise as the reader, through the vendored 2LO
+//	              provider: whether Google accepted it and, if not, the OAuth
+//	              error code (probe walk item 5)
 //	review        one SelfSubjectAccessReview as FARCAST_WALK_IDENTITY:
 //	              allowed, denied or no opinion, and the reason (item 4)
 //	forbidden-body  one GET as FARCAST_WALK_IDENTITY, the writing commands'
@@ -84,15 +85,24 @@
 //	FARCAST_WALK_CERT, FARCAST_WALK_KEY   PEM files for 'tunnel'; without them,
 //	                      'tunnel' presents FARCAST_WALK_LEAF
 //	FARCAST_WALK_OBJECT   the logical key for 'open'
-//	FARCAST_WALK_IDENTITY   writer | reader | key, for review and forbidden-body
-//	                      (no default): the installer's key in credentials.yaml,
-//	                      reader.key under its recorded key id, or the key file
-//	                      FARCAST_WALK_KEY_JSON names
+//	FARCAST_WALK_IDENTITY   writer (the installer's key in credentials.yaml) |
+//	                      reader (reader.key under its recorded key id) | key
+//	                      (the file FARCAST_WALK_KEY_JSON names); required for
+//	                      review and forbidden-body; for mint-empty-kid it
+//	                      replaces the default, the reader
 //	FARCAST_WALK_KEY_JSON   a service-account key file, for FARCAST_WALK_IDENTITY=key
 //	FARCAST_WALK_VERB, FARCAST_WALK_RESOURCE   review's verb and resource
 //	                      (resource or resource/subresource), both required
 //	FARCAST_WALK_GROUP    review's API group; empty is the core group
 //	FARCAST_WALK_NAMESPACE   review's namespace; empty is every namespace
+//	FARCAST_WALK_SCOPE    the cluster probes' token scopes: empty (the
+//	                      default) or cloud-platform+userinfo.email is
+//	                      farcast's own pair, kube.TokenScopes;
+//	                      userinfo.email alone, the scope farcast minted with
+//	                      until 2026-11-16, reproduces the DNS endpoint's 401;
+//	                      cloud-platform alone is the other half (added on the
+//	                      2026-11-16 probe walk, when the DNS endpoint answered
+//	                      401 to userinfo.email alone)
 package cli
 
 import (

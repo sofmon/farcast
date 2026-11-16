@@ -85,7 +85,9 @@ func wallNow() time.Time { return time.Now().Round(0) }
 
 // twoLegged is the token source of §3.3: the vendored 2LO provider, with the
 // token URL fixed in code (Endpoint.TokenURL, never the key file's token_uri),
-// the one scope userinfo.email, and a logger that discards. Expires is left
+// the scopes TokenScopes names (cloud-platform, which the DNS endpoint's IAM
+// check needs, and userinfo.email; design A22-7, with its trade-off on
+// TokenScopes), and a logger that discards. Expires is left
 // zero, so the vendored encoder sends iat = now − 10 s and exp = iat + 3600,
 // within Google's hour (vendor/cloud.google.com/go/auth/internal/jwt/jwt.go,
 // Claims.encode). Its errors are classified here, so none carries the token
@@ -99,7 +101,7 @@ func twoLegged(cfg Config, client *http.Client, domain string) (tokenFunc, error
 		Email:        cred.Email,
 		PrivateKey:   append([]byte(nil), cred.PrivateKeyPEM...),
 		PrivateKeyID: cred.PrivateKeyID,
-		Scopes:       []string{ScopeUserinfoEmail},
+		Scopes:       TokenScopes(),
 		TokenURL:     cfg.Endpoint.TokenURL(),
 		Client:       client,
 		// A nil Logger makes the library read GOOGLE_SDK_GO_LOGGING_LEVEL and

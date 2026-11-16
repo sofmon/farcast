@@ -64,10 +64,12 @@ func claimInt(t *testing.T, claims map[string]any, name string) int64 {
 }
 
 // TestTokenAssertionClaims: the 2LO assertion a client signs is kubetest's
-// to verify (one scope, exp − iat ≤ 3600), and this test pins it exactly: iss
-// is the credential's email, aud the endpoint's own token URL, scope
-// userinfo.email alone, exp − iat exactly 3600 (Expires left zero), kid the
-// recorded key id, RS256, and no subject.
+// to verify (the two scopes, exp − iat ≤ 3600), and this test pins it
+// exactly: iss is the credential's email, aud the endpoint's own token URL,
+// scope exactly cloud-platform then userinfo.email, space-separated (design
+// A22-7: the DNS endpoint answered 401 to userinfo.email alone), exp − iat
+// exactly 3600 (Expires left zero), kid the recorded key id, RS256, and no
+// subject.
 func TestTokenAssertionClaims(t *testing.T) {
 	s := kubetest.New(t)
 	ep, err := kube.ParseEndpoint(s.Endpoint(), "", s.CAPEM())
@@ -104,8 +106,9 @@ func TestTokenAssertionClaims(t *testing.T) {
 	if claims["aud"] != ep.TokenURL() || ep.TokenURL() != "https://"+s.Endpoint()+"/token" {
 		t.Errorf("aud = %v, want %s", claims["aud"], ep.TokenURL())
 	}
-	if claims["scope"] != kube.ScopeUserinfoEmail {
-		t.Errorf("scope = %v, want exactly %s", claims["scope"], kube.ScopeUserinfoEmail)
+	const wantScope = "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email"
+	if claims["scope"] != wantScope {
+		t.Errorf("scope = %v, want exactly %s", claims["scope"], wantScope)
 	}
 	if _, ok := claims["sub"]; ok {
 		t.Errorf("the assertion names a subject %v", claims["sub"])

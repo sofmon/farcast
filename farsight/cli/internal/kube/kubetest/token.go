@@ -112,7 +112,9 @@ func (s *Server) answerToken(w http.ResponseWriter, r *http.Request, req Request
 // POST whose grant_type is the JWT bearer grant and whose assertion is an
 // RS256 JWT; its iss a registered email whose key verifies the signature; its
 // aud "https://"+Endpoint()+"/token"; its scope exactly
-// kube.ScopeUserinfoEmail; iat and exp both present, 0 < exp − iat ≤ 3600,
+// strings.Join(kube.TokenScopes(), " "), cloud-platform then userinfo.email
+// (design A22-7), so either scope alone, the reverse order or any extra
+// scope is refused; iat and exp both present, 0 < exp − iat ≤ 3600,
 // and iat within five minutes of the server's clock. The vendored encoder
 // sends iat = now − 10 s and exp = iat + 3600
 // (vendor/cloud.google.com/go/auth/internal/jwt/jwt.go, Claims.encode).
@@ -187,8 +189,9 @@ func (s *Server) verifyAssertion(method, contentType string, body []byte) verifi
 	if aud, ok := claimString(claims, "aud"); !ok || aud != wantAud {
 		return fail("aud is not %s", wantAud)
 	}
-	if scope, ok := claimString(claims, "scope"); !ok || scope != kube.ScopeUserinfoEmail {
-		return fail("scope is not exactly %s", kube.ScopeUserinfoEmail)
+	wantScope := strings.Join(kube.TokenScopes(), " ")
+	if scope, ok := claimString(claims, "scope"); !ok || scope != wantScope {
+		return fail("scope is not exactly %q, cloud-platform then userinfo.email", wantScope)
 	}
 	iat, okIat := claimInt(claims, "iat")
 	exp, okExp := claimInt(claims, "exp")

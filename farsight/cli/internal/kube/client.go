@@ -19,10 +19,31 @@ const (
 	// GoogleTokenURL is the only token endpoint a Google-mode client uses. It
 	// is fixed in code and never read from a key file.
 	GoogleTokenURL = "https://oauth2.googleapis.com/token"
-	// ScopeUserinfoEmail is the one scope a cluster token carries, so a leaked
-	// cluster token reaches no other Google API.
+	// ScopeCloudPlatform is the first of a cluster token's two scopes
+	// (TokenScopes). GKE's DNS endpoint checks IAM, and that check needs it:
+	// the 2026-11-16 probe walk got 401 for a token scoped to userinfo.email
+	// alone, and 200 with this one added (design A22-7).
+	ScopeCloudPlatform = "https://www.googleapis.com/auth/cloud-platform"
+	// ScopeUserinfoEmail is the second of a cluster token's two scopes
+	// (TokenScopes). It keeps the account's email in the identity GKE derives
+	// from the token, which is the name the reader's RoleBindings use. That is
+	// inferred, not walked: the probe walk could set up no reader.
 	ScopeUserinfoEmail = "https://www.googleapis.com/auth/userinfo.email"
 )
+
+// TokenScopes is what every cluster token is minted with: cloud-platform,
+// then userinfo.email, the order the probe walk's probe sent them in when the
+// DNS endpoint answered 200 (design A22-7). Each call returns a fresh slice.
+//
+// The trade-off: with cloud-platform, a leaked cluster token works for every
+// Google API the account's IAM allows, not only the cluster. For the reader
+// that is roles/container.clusterViewer; for the writer, everything the
+// installer holds. The token is held in memory only, one per client, and is
+// sent as a bearer only to the endpoint's own host (apiTransport,
+// TestAuthorizationOnlyToTheEndpointHost); the token endpoint is sent none.
+func TokenScopes() []string {
+	return []string{ScopeCloudPlatform, ScopeUserinfoEmail}
+}
 
 // Identity is which of an instance's two service accounts a client acts as.
 type Identity string
@@ -70,8 +91,8 @@ type Client struct {
 // transports and the token cache. It dials nothing and mints nothing.
 //
 // Its token is the credential's own 2LO token (§3.3): minted in memory from
-// the key, scoped to userinfo.email alone, from Endpoint.TokenURL and never
-// from a URL a key file names.
+// the key, scoped to TokenScopes (cloud-platform and userinfo.email), from
+// Endpoint.TokenURL and never from a URL a key file names.
 func New(cfg Config) (*Client, error) {
 	return newClient(cfg, nil)
 }

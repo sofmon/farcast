@@ -18,6 +18,8 @@ An instance installed, connected, toolchain mirrored, kernel deployed, and an ap
 
 *(2026-11-15, [ADR 0023](../adr/0023-one-download-farcast.md) M2.4: `farcast usage` (section 1) now reads the cluster in-process as the instance's reader, and read nothing until [phase 1's step 7b](phase-1-validation.md#7b-the-instances-reader-identity--not-yet-walked) has set one up and `farcast reader grant` has verified it. Step 7b is not yet walked, so a re-walk runs it first, once the instance is connected. The results below were walked with kubectl, and are not rewritten.)*
 
+*(2026-11-16: ADR 0023's [M2 probe walk](adr-0023-m2-probe-walk.md) found that GKE's DNS endpoint refuses farcast's cluster token, scoped to `userinfo.email` alone. So at 2482810 `usage` is refused against GKE, and so is every in-process cluster call `run` and `kernel deploy` make since M2.5. A re-walk could not pass until `cloud-platform` came back. That fix was built later on 2026-11-16 and is not walked: every cluster token now carries `cloud-platform` and `userinfo.email`, so a leaked one works for every Google API the account's IAM allows, not only the cluster.)*
+
 Set `APPS` to the application's namespace before section 1.
 
 Sampling is bounded by metrics-server's ~30-second refresh, not by the kernel's tick, so one pod needs about an hour to reach the threshold. This walk scaled the application to three replicas instead, which reaches it in twenty minutes and exercises the per-pod-not-summed property at the same time.
