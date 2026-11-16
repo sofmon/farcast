@@ -13,6 +13,7 @@ import (
 
 	"github.com/sofmon/farcast/farsight/cli/internal/components"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
+	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 	tcdeploy "github.com/sofmon/farcast/technocore/deploy"
 	"github.com/sofmon/farcast/technocore/kernel"
 )
@@ -184,7 +185,10 @@ func partitionByExistence(present map[string]bool, names []string) (have, missin
 	return have, missing
 }
 
-func (c *kernelDeployCommand) Run(ctx context.Context, env *Env, args []string) error {
+func (c *kernelDeployCommand) Run(ctx context.Context, env *Env, args []string) (err error) {
+	// A 403 the writer met says whose it was, once (A20-9).
+	var meta *config.InstanceMetadata
+	defer func() { err = writerRefused(err, meta) }()
 	if len(args) != 1 {
 		return usagef("kernel deploy takes one instance argument")
 	}
@@ -201,9 +205,12 @@ func (c *kernelDeployCommand) Run(ctx context.Context, env *Env, args []string) 
 		return err
 	}
 
-	meta, err := env.ConfigDir.LoadInstanceMetadata(name)
+	meta, err = env.ConfigDir.LoadInstanceMetadata(name)
 	if err != nil {
 		return fmt.Errorf("load instance %q: %w", name, err)
+	}
+	if err := recordNamed(meta, name); err != nil {
+		return err
 	}
 	// The kernel needs no tunnel of its own — it talks to the API server, not
 	// through FatLine. But an instance with no FatLine has no workloads worth
@@ -225,8 +232,18 @@ func (c *kernelDeployCommand) Run(ctx context.Context, env *Env, args []string) 
 	// it at the apply, which is after the kernel's image has been compiled and
 	// pushed into the instance's registry. On the Phase 4.4 walk a namespace
 	// that did not exist yet cost a build and a registry write before anything
-	// said so. One API call settles it here instead.
-	cl := c.deployer.newCluster(env.ConfigDir.InstanceKubeconfigPath(name))
+	// said so. One API call settles it here instead, as the writer (ADR 0023
+	// M2.5): the first in-process call, before anything is asked or built.
+	cl, err := c.deployer.newCluster(clusterRef{Dir: env.ConfigDir, Meta: meta, Identity: kube.Writer, Warn: env.Err})
+	if err != nil {
+		return err
+	}
+	// And before that read, the local check that this machine can run the
+	// apply at the end, kubectl until ADR 0023 M2.7 (S-F2): no cost is asked,
+	// image pushed or kernel recorded for a deploy that could not land.
+	if err := applyReady(cl); err != nil {
+		return err
+	}
 	present, err := existingNamespaces(ctx, cl)
 	if err != nil {
 		return err
@@ -379,7 +396,7 @@ func (c *kernelDeployCommand) Run(ctx context.Context, env *Env, args []string) 
 	if err := cl.RolloutStatus(ctx, tcdeploy.DefaultNamespace, tcdeploy.DefaultName, fatlineRolloutTimeout); err != nil {
 		// The workload is applied and recorded; a rollout that has not settled
 		// yet is not a reason to make the operator think nothing happened.
-		fprintf(env.Err, "Warning: the kernel did not report ready in time: %v\n", err)
+		fprintf(env.Err, "Warning: the kernel did not report ready in time: %s\n", terminalText(err.Error()))
 	}
 
 	return env.Printer.Print(kernelDeployResult{

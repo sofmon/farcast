@@ -84,7 +84,7 @@ func redeployProd(t *testing.T, mode output.Mode, fb *fakeBuilder, setup func(*c
 	fc, fp := &fakeCluster{}, &fakeProvider{}
 	c := testRedeploy(fp, fb)
 	c.assumeYes = true
-	c.newCluster = func(string) clusterApplier { return fc }
+	c.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 	if configure != nil {
 		configure(c)
 	}
@@ -346,7 +346,7 @@ func TestNonReleaseIsRefusedBeforeAnythingIsAsked(t *testing.T) {
 		connectedInstance(t, dir, prodName)
 		c := testConnect(&fakeProvider{}, &fakeBuilder{})
 		c.build = devBuild
-		c.newCluster = func(string) clusterApplier { return &fakeCluster{} }
+		c.newCluster = func(clusterRef) (clusterApplier, error) { return &fakeCluster{}, nil }
 		c.dial = connectedDial()
 		env, _ := testEnv(dir, output.ModeHuman)
 		if err := c.Run(context.Background(), env, []string{prodName}); err != nil {
@@ -401,7 +401,7 @@ func TestSourceBuildIsRecordedAsOperatorBuilt(t *testing.T) {
 		c := testConnect(&fakeProvider{}, fb)
 		c.assumeYes, c.sourceDir = true, source
 		c.findSource = func(d string) (string, error) { return d, nil }
-		c.newCluster = func(string) clusterApplier { return &fakeCluster{ip: "34.0.0.1"} }
+		c.newCluster = func(clusterRef) (clusterApplier, error) { return &fakeCluster{ip: "34.0.0.1"}, nil }
 		c.dial = connectedDial()
 		env, _ := testEnv(dir, output.ModeHuman)
 		if err := c.Run(context.Background(), env, []string{prodName}); err != nil {
@@ -441,7 +441,7 @@ func TestSourceBuildIsRecordedAsOperatorBuilt(t *testing.T) {
 		fb := &fakeBuilder{}
 		c := testStorageDeploy(&fakeProvider{}, fb)
 		c.deployer.assumeYes, c.deployer.sourceDir = true, source
-		c.deployer.newCluster = func(string) clusterApplier { return &fakeCluster{} }
+		c.deployer.newCluster = func(clusterRef) (clusterApplier, error) { return &fakeCluster{}, nil }
 		env, _ := testEnv(dir, output.ModeHuman)
 		if err := c.Run(context.Background(), env, []string{prodName}); err != nil {
 			t.Fatal(err)
@@ -1067,7 +1067,7 @@ func TestEmbeddedWithFatlineImageGovernsShrikeOnly(t *testing.T) {
 		c := testConnect(fp, fb)
 		c.assumeYes = true
 		c.fatlineImage, c.embedded = given, embedded
-		c.newCluster = func(string) clusterApplier { return fc }
+		c.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 		c.dial = connectedDial()
 		env, out, errb := testEnvBoth(dir, output.ModeHuman)
 		err := c.Run(context.Background(), env, []string{prodName})
@@ -1213,7 +1213,7 @@ func TestShrikeImageIsRecorded(t *testing.T) {
 		fc := &fakeCluster{ip: "34.0.0.1"}
 		c := testConnect(&fakeProvider{}, &fakeBuilder{})
 		c.assumeYes = true
-		c.newCluster = func(string) clusterApplier { return fc }
+		c.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 		c.dial = connectedDial()
 		env, _ := testEnv(dir, output.ModeHuman)
 		if err := c.Run(context.Background(), env, []string{prodName}); err != nil {

@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sofmon/farcast/farsight/cli/internal/config"
+	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 	tcdeploy "github.com/sofmon/farcast/technocore/deploy"
 	"github.com/sofmon/farcast/technocore/kernel"
 )
@@ -65,16 +67,22 @@ func (c *kernelMeterCommand) SetFlags(fs *flag.FlagSet) {
 	c.deployer.setYesFlag(fs, "unused; accepted so scripts can pass it uniformly")
 }
 
-func (c *kernelMeterCommand) Run(ctx context.Context, env *Env, args []string) error {
+func (c *kernelMeterCommand) Run(ctx context.Context, env *Env, args []string) (err error) {
+	// A 403 the writer met says whose it was, once (A20-9).
+	var meta *config.InstanceMetadata
+	defer func() { err = writerRefused(err, meta) }()
 	if len(args) == 0 {
 		return usagef("kernel meter takes an instance, then any namespaces to add or remove")
 	}
 	name := args[0]
 	c.deployer.ensureDefaults()
 
-	meta, err := env.ConfigDir.LoadInstanceMetadata(name)
+	meta, err = env.ConfigDir.LoadInstanceMetadata(name)
 	if err != nil {
 		return fmt.Errorf("load instance %q: %w", name, err)
+	}
+	if err := recordNamed(meta, name); err != nil {
+		return err
 	}
 	if meta.Kernel == nil || !meta.Kernel.Deployed {
 		return fmt.Errorf("instance %q has no kernel; run 'farcast kernel deploy %s' first", name, name)
@@ -119,6 +127,18 @@ func (c *kernelMeterCommand) Run(ctx context.Context, env *Env, args []string) e
 		return err
 	}
 
+	// The writer is opened before the record changes (ADR 0023 M2.5,
+	// A20-10): opening sends nothing, so an instance this machine cannot
+	// write as is refused with its record as it was, and never left naming
+	// namespaces the cluster was not told to meter.
+	cl, err := c.deployer.newCluster(clusterRef{Dir: env.ConfigDir, Meta: meta, Identity: kube.Writer, Warn: env.Err})
+	if err != nil {
+		return err
+	}
+	if err := applyReady(cl); err != nil {
+		return err
+	}
+
 	// Recorded before the apply, like every other thing this CLI changes in a
 	// cluster: a namespace the cluster meters and local state does not know
 	// about is one the next change would silently drop.
@@ -128,7 +148,6 @@ func (c *kernelMeterCommand) Run(ctx context.Context, env *Env, args []string) e
 		return fmt.Errorf("record the metered namespaces before applying them: %w", err)
 	}
 
-	cl := c.deployer.newCluster(env.ConfigDir.InstanceKubeconfigPath(name))
 	if err := cl.Apply(ctx, manifest); err != nil {
 		meta.Kernel.Namespaces = previous
 		if saveErr := env.ConfigDir.SaveInstanceMetadata(name, meta); saveErr != nil {

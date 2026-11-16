@@ -6,16 +6,15 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"os"
 	"slices"
 	"strings"
 
 	"github.com/sofmon/farcast/datasphere"
 	dsdeploy "github.com/sofmon/farcast/datasphere/deploy"
 	dskeyholder "github.com/sofmon/farcast/datasphere/keyholder"
-	"github.com/sofmon/farcast/farsight/cli/internal/cluster"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/keyholder"
+	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
 )
 
@@ -51,20 +50,23 @@ type pinStore interface {
 	ReplaceConfigMap(ctx context.Context, manifest []byte) error
 }
 
-// pinStoreOpener reaches an instance's pin. A seam, so no test shells out.
-type pinStoreOpener func(kubeconfigPath string) (pinStore, error)
+// pinStoreOpener reaches an instance's pin. A seam, so a test reaches a fake.
+type pinStoreOpener func(clusterRef) (pinStore, error)
 
 // defaultPinStore is what a command without its own seam uses. Tests replace
-// it, so that no test can shell out to kubectl.
+// it, so that no test reaches a cluster it did not set up.
 var defaultPinStore pinStoreOpener = openPinStore
 
-// openPinStore refuses before running anything when there is no kubeconfig,
-// so a command without one fails here rather than in kubectl.
-func openPinStore(kubeconfigPath string) (pinStore, error) {
-	if _, err := os.Stat(kubeconfigPath); err != nil {
-		return nil, fmt.Errorf("this machine has no kubeconfig for the instance (%v)", err)
+// openPinStore reaches the pin in-process as the instance's writer, the
+// installer's stored service-account key (ADR 0023 M2.5): its read, create
+// and replace need no kubectl. Every refusal openCluster makes is local and
+// sends nothing.
+func openPinStore(r clusterRef) (pinStore, error) {
+	cl, err := openWriter(r)
+	if err != nil {
+		return nil, err
 	}
-	return cluster.New(kubeconfigPath), nil
+	return cl, nil
 }
 
 // pinFor is the pin a keyring implies. Require is every key-encryption key of
@@ -328,9 +330,10 @@ behind the instance. --replace lowers the pin to this keyring's, for when the
 keys it requires are gone from every machine; it asks first, and says what it
 lowers.
 
-Reaching the pin needs kubectl and this instance's cloud credentials, like
-'farcast run'. Unseal never touches it: 'farcast storage unseal --below-pin'
-is the way past a pin that cannot be met, with no cloud access at all.`)
+The pin is reached in-process, as the instance's installer service account,
+with the key 'farcast install --credentials' stored; it needs no kubectl.
+Unseal never touches it: 'farcast storage unseal --below-pin' is the way past
+a pin that cannot be met, with no cloud access at all.`)
 }
 
 func (c *keyPinCommand) SetFlags(fs *flag.FlagSet) {
@@ -339,14 +342,20 @@ func (c *keyPinCommand) SetFlags(fs *flag.FlagSet) {
 	fs.BoolVar(&c.assumeYes, "y", false, "skip the confirmation --replace asks for")
 }
 
-func (c *keyPinCommand) Run(ctx context.Context, env *Env, args []string) error {
+func (c *keyPinCommand) Run(ctx context.Context, env *Env, args []string) (err error) {
+	// A 403 the writer met says whose it was, once (A20-9).
+	var meta *config.InstanceMetadata
+	defer func() { err = writerRefused(err, meta) }()
 	instance, err := oneInstance("pin", args)
 	if err != nil {
 		return err
 	}
-	meta, err := env.ConfigDir.LoadInstanceMetadata(instance)
+	meta, err = env.ConfigDir.LoadInstanceMetadata(instance)
 	if err != nil {
 		return fmt.Errorf("load instance %q: %w", instance, err)
+	}
+	if err := recordNamed(meta, instance); err != nil {
+		return err
 	}
 	if meta.Keyholder == nil || !meta.Keyholder.Deployed {
 		return fmt.Errorf("instance %q has no keyholder deployed; 'farcast storage deploy %s' writes the pin with it", instance, instance)
@@ -359,7 +368,7 @@ func (c *keyPinCommand) Run(ctx context.Context, env *Env, args []string) error 
 	if open == nil {
 		open = defaultPinStore
 	}
-	ps, err := open(env.ConfigDir.InstanceKubeconfigPath(instance))
+	ps, err := open(clusterRef{Dir: env.ConfigDir, Meta: meta, Identity: kube.Writer, Warn: env.Err})
 	if err != nil {
 		return fmt.Errorf("the key pin could not be reached: %w", err)
 	}

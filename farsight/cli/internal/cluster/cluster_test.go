@@ -3,32 +3,35 @@ package cluster
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	dsdeploy "github.com/sofmon/farcast/datasphere/deploy"
 	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 	"github.com/sofmon/farcast/farsight/cli/internal/kube/kubetest"
 	tkube "github.com/sofmon/farcast/technocore/kube"
 )
 
 // The read tests below run each method in-process, on an Open'd reader
-// against kubetest (ADR 0023 M2.4). The methods the writing commands still
-// call through kubectl until ADR 0023 M2.5 (RolloutStatus, WaitExternalIP,
-// WaitJob, JobLogs, ConfigMapValue, ConfigMapData and Namespaces) keep a
-// "kubectl" half on a fake Runner, so the branch a command still runs stays
-// tested.
+// against kubetest (ADR 0023 M2.4); the writes, on an Open'd writer (M2.5).
+// Since ADR 0023 M2.5 no method but Apply runs kubectl, so no read keeps a
+// kubectl half. Apply alone is tested on a fake Runner, until ADR 0023 M2.7.
 
+// fakeRunner records each kubectl call and its stdin, and answers each with
+// err.
 type fakeRunner struct {
 	calls  [][]string
 	stdins [][]byte
-	out    map[string][]byte // keyed by args[0]
 	err    error
 }
 
@@ -38,21 +41,7 @@ func (f *fakeRunner) Run(_ context.Context, stdin []byte, args ...string) ([]byt
 	if f.err != nil {
 		return nil, f.err
 	}
-	if f.out != nil {
-		return f.out[args[0]], nil
-	}
 	return nil, nil
-}
-
-// funcRunner answers each kubectl call with f, and records the calls.
-type funcRunner struct {
-	calls [][]string
-	f     func(args []string) []byte
-}
-
-func (r *funcRunner) Run(_ context.Context, _ []byte, args ...string) ([]byte, error) {
-	r.calls = append(r.calls, args)
-	return r.f(args), nil
 }
 
 // safeBuffer is a buffer a followed Logs writes to while the test reads it.
@@ -199,40 +188,27 @@ func rolloutState(generation, observed, desired, replicas, updated, available in
 const fatlineDeployment = "/apis/apps/v1/namespaces/farcast-system/deployments/fatline"
 
 // An Open'd reader waits on the Deployment itself: it reads it until the
-// rollout rules say done, as the reader. A kubectl client asks kubectl to.
+// rollout rules say done, as the reader.
 func TestRolloutStatusArgs(t *testing.T) {
-	t.Run("in-process", func(t *testing.T) {
-		s := kubetest.New(t)
-		s.Script(fatlineDeployment,
-			rolloutState(2, 1, 2, 2, 2, 2, ""), // the spec update not yet observed
-			rolloutState(2, 2, 2, 2, 1, 1, ""), // 1 of 2 updated
-			rolloutState(2, 2, 2, 2, 2, 2, ""), // done
-		)
-		c := quick(openReader(t, s, nil))
-		if err := c.RolloutStatus(t.Context(), "farcast-system", "fatline", time.Minute); err != nil {
-			t.Fatal(err)
+	s := kubetest.New(t)
+	s.Script(fatlineDeployment,
+		rolloutState(2, 1, 2, 2, 2, 2, ""), // the spec update not yet observed
+		rolloutState(2, 2, 2, 2, 1, 1, ""), // 1 of 2 updated
+		rolloutState(2, 2, 2, 2, 2, 2, ""), // done
+	)
+	c := quick(openReader(t, s, nil))
+	if err := c.RolloutStatus(t.Context(), "farcast-system", "fatline", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	reqs := apiRequests(s)
+	if len(reqs) != 3 {
+		t.Fatalf("%d requests, want three reads: %v", len(reqs), apiPaths(s))
+	}
+	for _, r := range reqs {
+		if r.Method != http.MethodGet || r.Path != fatlineDeployment || r.As != "reader" {
+			t.Errorf("request %s %s as %q", r.Method, r.Path, r.As)
 		}
-		reqs := apiRequests(s)
-		if len(reqs) != 3 {
-			t.Fatalf("%d requests, want three reads: %v", len(reqs), apiPaths(s))
-		}
-		for _, r := range reqs {
-			if r.Method != http.MethodGet || r.Path != fatlineDeployment || r.As != "reader" {
-				t.Errorf("request %s %s as %q", r.Method, r.Path, r.As)
-			}
-		}
-	})
-	t.Run("kubectl", func(t *testing.T) {
-		fr := &fakeRunner{}
-		c := newWithRunner(fr)
-		if err := c.RolloutStatus(context.Background(), "farcast-system", "fatline", 90*time.Second); err != nil {
-			t.Fatal(err)
-		}
-		want := []string{"rollout", "status", "deployment/fatline", "-n", "farcast-system", "--timeout", "90s"}
-		if len(fr.calls) != 1 || !slices.Equal(fr.calls[0], want) {
-			t.Fatalf("calls=%v, want %v", fr.calls, want)
-		}
-	})
+	}
 }
 
 // A rollout past its progress deadline is stalled, not a timeout; one still
@@ -293,58 +269,36 @@ func serviceWith(ingress ...map[string]any) map[string]any {
 const fatlineService = "/api/v1/namespaces/farcast-system/services/fatline"
 
 func TestWaitExternalIPReturnsIP(t *testing.T) {
-	t.Run("in-process", func(t *testing.T) {
-		s := kubetest.New(t)
-		s.Script(fatlineService, serviceWith(), serviceWith(map[string]any{"hostname": ""}), serviceWith(map[string]any{"ip": "34.0.0.5"}))
-		c := quick(openReader(t, s, nil))
-		ip, err := c.WaitExternalIP(t.Context(), "farcast-system", "fatline", time.Minute)
-		if err != nil || ip != "34.0.0.5" {
-			t.Fatalf("ip = %q, %v", ip, err)
-		}
-		if got := apiPaths(s); len(got) != 3 || got[0] != "GET "+fatlineService {
-			t.Errorf("requests = %v, want three reads of the Service", got)
-		}
+	s := kubetest.New(t)
+	s.Script(fatlineService, serviceWith(), serviceWith(map[string]any{"hostname": ""}), serviceWith(map[string]any{"ip": "34.0.0.5"}))
+	c := quick(openReader(t, s, nil))
+	ip, err := c.WaitExternalIP(t.Context(), "farcast-system", "fatline", time.Minute)
+	if err != nil || ip != "34.0.0.5" {
+		t.Fatalf("ip = %q, %v", ip, err)
+	}
+	if got := apiPaths(s); len(got) != 3 || got[0] != "GET "+fatlineService {
+		t.Errorf("requests = %v, want three reads of the Service", got)
+	}
 
-		// An address that is not one never becomes an endpoint.
-		for _, bad := range []string{"34.0.0.256", "fe80::1%eth0", "fatline.example"} {
-			s.Script(fatlineService, serviceWith(map[string]any{"ip": bad}))
-			if ip, err := c.WaitExternalIP(t.Context(), "farcast-system", "fatline", time.Minute); err == nil || ip != "" {
-				t.Errorf("ingress IP %q = %q, %v; want an error", bad, ip, err)
-			}
+	// An address that is not one never becomes an endpoint.
+	for _, bad := range []string{"34.0.0.256", "fe80::1%eth0", "fatline.example"} {
+		s.Script(fatlineService, serviceWith(map[string]any{"ip": bad}))
+		if ip, err := c.WaitExternalIP(t.Context(), "farcast-system", "fatline", time.Minute); err == nil || ip != "" {
+			t.Errorf("ingress IP %q = %q, %v; want an error", bad, ip, err)
 		}
-	})
-	t.Run("kubectl", func(t *testing.T) {
-		fr := &fakeRunner{out: map[string][]byte{"get": []byte("34.0.0.5\n")}}
-		c := newWithRunner(fr)
-		ip, err := c.WaitExternalIP(context.Background(), "farcast-system", "fatline", time.Second)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if ip != "34.0.0.5" {
-			t.Fatalf("ip=%q, want 34.0.0.5 (trimmed)", ip)
-		}
-	})
+	}
 }
 
 func TestWaitExternalIPTimesOut(t *testing.T) {
 	const want = "cluster: service farcast-system/fatline had no external IP after 0s"
-	t.Run("in-process", func(t *testing.T) {
-		s := kubetest.New(t)
-		s.Put(serviceWith())
-		c := openReader(t, s, nil)
-		// Zero timeout: the first empty read is already past the deadline.
-		ip, err := c.WaitExternalIP(t.Context(), "farcast-system", "fatline", 0)
-		if ip != "" || !errors.Is(err, kube.ErrTimedOut) || err.Error() != want {
-			t.Fatalf("= %q, %v; want %q wrapping kube.ErrTimedOut", ip, err, want)
-		}
-	})
-	t.Run("kubectl", func(t *testing.T) {
-		fr := &fakeRunner{out: map[string][]byte{"get": []byte("")}} // never assigned
-		c := newWithRunner(fr)
-		if _, err := c.WaitExternalIP(context.Background(), "farcast-system", "fatline", 0); err == nil || err.Error() != want {
-			t.Fatalf("err = %v, want %q", err, want)
-		}
-	})
+	s := kubetest.New(t)
+	s.Put(serviceWith())
+	c := openReader(t, s, nil)
+	// Zero timeout: the first empty read is already past the deadline.
+	ip, err := c.WaitExternalIP(t.Context(), "farcast-system", "fatline", 0)
+	if ip != "" || !errors.Is(err, kube.ErrTimedOut) || err.Error() != want {
+		t.Fatalf("= %q, %v; want %q wrapping kube.ErrTimedOut", ip, err, want)
+	}
 }
 
 func TestRunnerErrorPropagates(t *testing.T) {
@@ -375,59 +329,34 @@ func jobObject(name string, containers []string, status map[string]any) map[stri
 // must mean all of them. kubectl's own default is a tail, which is why this is
 // a behaviour rather than an omission.
 func TestJobLogsAsksForEverythingUnlessGivenALimit(t *testing.T) {
-	t.Run("in-process", func(t *testing.T) {
-		s := kubetest.New(t)
-		s.Put(jobObject("fetch", []string{"git"}, nil))
-		s.Put(podObject("farcast-system", "fetch-abc", map[string]string{"job-name": "fetch"}, []string{"git"},
-			map[string]string{kubetest.LogAnnotationPrefix + "git": "first\nsecond\nthird\n"}))
-		s.Put(podObject("farcast-system", "other-xyz", map[string]string{"job-name": "other"}, []string{"git"},
-			map[string]string{kubetest.LogAnnotationPrefix + "git": "not this job's\n"}))
-		c := openReader(t, s, nil)
-		for _, row := range []struct {
-			name  string
-			lines int
-			tail  string // "" is no tailLines at all
-			out   string
-		}{
-			{"no limit", 0, "", "first\nsecond\nthird\n"},
-			{"negative limit", -1, "", "first\nsecond\nthird\n"},
-			{"a limit", 40, "40", "first\nsecond\nthird\n"},
-			{"one line", 1, "1", "third\n"},
-		} {
-			out, err := c.JobLogs(t.Context(), "farcast-system", "fetch", row.lines)
-			if err != nil || out != row.out {
-				t.Errorf("%s: %q, %v; want %q", row.name, out, err, row.out)
-			}
-			qs := logQueries(t, s)
-			q := qs[len(qs)-1]
-			if q.Get("container") != "git" || q.Has("tailLines") != (row.tail != "") || q.Get("tailLines") != row.tail || q.Has("follow") || q.Has("previous") {
-				t.Errorf("%s: the log request asked %v", row.name, q)
-			}
+	s := kubetest.New(t)
+	s.Put(jobObject("fetch", []string{"git"}, nil))
+	s.Put(podObject("farcast-system", "fetch-abc", map[string]string{"job-name": "fetch"}, []string{"git"},
+		map[string]string{kubetest.LogAnnotationPrefix + "git": "first\nsecond\nthird\n"}))
+	s.Put(podObject("farcast-system", "other-xyz", map[string]string{"job-name": "other"}, []string{"git"},
+		map[string]string{kubetest.LogAnnotationPrefix + "git": "not this job's\n"}))
+	c := openReader(t, s, nil)
+	for _, row := range []struct {
+		name  string
+		lines int
+		tail  string // "" is no tailLines at all
+		out   string
+	}{
+		{"no limit", 0, "", "first\nsecond\nthird\n"},
+		{"negative limit", -1, "", "first\nsecond\nthird\n"},
+		{"a limit", 40, "40", "first\nsecond\nthird\n"},
+		{"one line", 1, "1", "third\n"},
+	} {
+		out, err := c.JobLogs(t.Context(), "farcast-system", "fetch", row.lines)
+		if err != nil || out != row.out {
+			t.Errorf("%s: %q, %v; want %q", row.name, out, err, row.out)
 		}
-	})
-	t.Run("kubectl", func(t *testing.T) {
-		for name, tc := range map[string]struct {
-			lines int
-			want  string
-		}{
-			"no limit":       {0, "--tail=-1"},
-			"negative limit": {-1, "--tail=-1"},
-			"a limit":        {40, "--tail=40"},
-			"one line":       {1, "--tail=1"},
-		} {
-			fr := &fakeRunner{}
-			c := newWithRunner(fr)
-			if _, err := c.JobLogs(context.Background(), "ns", "job", tc.lines); err != nil {
-				t.Fatal(err)
-			}
-			if len(fr.calls) != 1 {
-				t.Fatalf("%s: calls=%v, want one", name, fr.calls)
-			}
-			if !slices.Contains(fr.calls[0], tc.want) {
-				t.Errorf("%s: calls[0]=%v, want it to contain %q", name, fr.calls[0], tc.want)
-			}
+		qs := logQueries(t, s)
+		q := qs[len(qs)-1]
+		if q.Get("container") != "git" || q.Has("tailLines") != (row.tail != "") || q.Get("tailLines") != row.tail || q.Has("follow") || q.Has("previous") {
+			t.Errorf("%s: the log request asked %v", row.name, q)
 		}
-	})
+	}
 }
 
 // An Open'd client reads a Job's one container, from a pod its own selector
@@ -493,89 +422,54 @@ func running() map[string]any {
 // newest pod's first terminated container's, trimmed; a Job that has not
 // ended by the deadline is a timeout.
 func TestWaitJobReadsTheOutcomeAndTheNewestPodsMessage(t *testing.T) {
-	t.Run("in-process", func(t *testing.T) {
-		for _, row := range []struct {
-			name      string
-			status    map[string]any
-			succeeded bool
-		}{
-			{"succeeded", map[string]any{"succeeded": 1}, true},
-			{"complete", map[string]any{"conditions": []any{map[string]any{"type": "Complete", "status": "True"}}}, true},
-			{"failed", map[string]any{"failed": 1}, false},
-			{"failed condition", map[string]any{"conditions": []any{map[string]any{"type": "Failed", "status": "True"}}}, false},
-		} {
-			s := kubetest.New(t)
-			s.Put(jobObject("build", []string{"kaniko"}, row.status))
-			s.Put(buildPod("build-old", "2026-11-15T10:00:00Z", terminated("sha256:old")))
-			s.Put(buildPod("build-new", "2026-11-15T10:05:00Z", running(), terminated("  sha256:new\n")))
-			s.Put(buildPod("build-mid", "2026-11-15T10:02:00Z", terminated("sha256:mid")))
-			res, err := openReader(t, s, nil).WaitJob(t.Context(), "farcast-system", "build", time.Minute)
-			if err != nil || res.Succeeded != row.succeeded || res.Message != "sha256:new" {
-				t.Errorf("%s: %+v, %v; want succeeded %v with the newest pod's message", row.name, res, err, row.succeeded)
-			}
-		}
-
+	for _, row := range []struct {
+		name      string
+		status    map[string]any
+		succeeded bool
+	}{
+		{"succeeded", map[string]any{"succeeded": 1}, true},
+		{"complete", map[string]any{"conditions": []any{map[string]any{"type": "Complete", "status": "True"}}}, true},
+		{"failed", map[string]any{"failed": 1}, false},
+		{"failed condition", map[string]any{"conditions": []any{map[string]any{"type": "Failed", "status": "True"}}}, false},
+	} {
 		s := kubetest.New(t)
-		s.Script(buildJob,
-			jobObject("build", []string{"kaniko"}, map[string]any{"active": 1}),
-			jobObject("build", []string{"kaniko"}, map[string]any{"conditions": []any{map[string]any{"type": "Complete", "status": "False"}}}),
-			jobObject("build", []string{"kaniko"}, map[string]any{"succeeded": 1}),
-		)
-		c := quick(openReader(t, s, nil))
-		res, err := c.WaitJob(t.Context(), "farcast-system", "build", time.Minute)
-		if err != nil || !res.Succeeded || res.Message != "" {
-			t.Errorf("after polling, with no pod: %+v, %v; want succeeded with no message", res, err)
+		s.Put(jobObject("build", []string{"kaniko"}, row.status))
+		s.Put(buildPod("build-old", "2026-11-15T10:00:00Z", terminated("sha256:old")))
+		s.Put(buildPod("build-new", "2026-11-15T10:05:00Z", running(), terminated("  sha256:new\n")))
+		s.Put(buildPod("build-mid", "2026-11-15T10:02:00Z", terminated("sha256:mid")))
+		res, err := openReader(t, s, nil).WaitJob(t.Context(), "farcast-system", "build", time.Minute)
+		if err != nil || res.Succeeded != row.succeeded || res.Message != "sha256:new" {
+			t.Errorf("%s: %+v, %v; want succeeded %v with the newest pod's message", row.name, res, err, row.succeeded)
 		}
-		reads := 0
-		for _, p := range apiPaths(s) {
-			if p == "GET "+buildJob {
-				reads++
-			}
-		}
-		if reads != 4 {
-			t.Errorf("the Job was read %d times; want three polls and the message's own read", reads)
-		}
+	}
 
-		s.Script(buildJob, jobObject("build", []string{"kaniko"}, map[string]any{"active": 1}))
-		res, err = c.WaitJob(t.Context(), "farcast-system", "build", 0)
-		const want = "cluster: job farcast-system/build neither succeeded nor failed after 0s"
-		if res != (JobResult{}) || !errors.Is(err, kube.ErrTimedOut) || err.Error() != want {
-			t.Errorf("at the deadline: %+v, %v; want %q wrapping kube.ErrTimedOut", res, err, want)
+	s := kubetest.New(t)
+	s.Script(buildJob,
+		jobObject("build", []string{"kaniko"}, map[string]any{"active": 1}),
+		jobObject("build", []string{"kaniko"}, map[string]any{"conditions": []any{map[string]any{"type": "Complete", "status": "False"}}}),
+		jobObject("build", []string{"kaniko"}, map[string]any{"succeeded": 1}),
+	)
+	c := quick(openReader(t, s, nil))
+	res, err := c.WaitJob(t.Context(), "farcast-system", "build", time.Minute)
+	if err != nil || !res.Succeeded || res.Message != "" {
+		t.Errorf("after polling, with no pod: %+v, %v; want succeeded with no message", res, err)
+	}
+	reads := 0
+	for _, p := range apiPaths(s) {
+		if p == "GET "+buildJob {
+			reads++
 		}
-	})
-	t.Run("kubectl", func(t *testing.T) {
-		state := []string{"0/0", "/", "1/"}
-		r := &funcRunner{f: func(args []string) []byte {
-			if args[1] == "pods" {
-				return []byte("  sha256:x\n")
-			}
-			out := state[0]
-			if len(state) > 1 {
-				state = state[1:]
-			}
-			return []byte(out)
-		}}
-		c := newWithRunner(r)
-		c.poll = time.Millisecond
-		res, err := c.WaitJob(context.Background(), "ns", "build", time.Minute)
-		if err != nil || !res.Succeeded || res.Message != "sha256:x" {
-			t.Fatalf("= %+v, %v", res, err)
-		}
-		wantJob := []string{"get", "job", "build", "-n", "ns", "-o", "jsonpath={.status.succeeded}/{.status.failed}"}
-		wantPods := []string{"get", "pods", "-n", "ns", "-l", "job-name=build", "-o", "jsonpath={.items[0].status.containerStatuses[0].state.terminated.message}"}
-		if len(r.calls) != 4 || !slices.Equal(r.calls[0], wantJob) || !slices.Equal(r.calls[3], wantPods) {
-			t.Errorf("calls = %v", r.calls)
-		}
+	}
+	if reads != 4 {
+		t.Errorf("the Job was read %d times; want three polls and the message's own read", reads)
+	}
 
-		state = []string{"/1"}
-		if res, err := c.WaitJob(context.Background(), "ns", "build", time.Minute); err != nil || res.Succeeded {
-			t.Errorf("a failed Job = %+v, %v", res, err)
-		}
-		state = []string{""}
-		if _, err := c.WaitJob(context.Background(), "ns", "build", 0); err == nil || err.Error() != "cluster: job ns/build neither succeeded nor failed after 0s" {
-			t.Errorf("at the deadline: %v", err)
-		}
-	})
+	s.Script(buildJob, jobObject("build", []string{"kaniko"}, map[string]any{"active": 1}))
+	res, err = c.WaitJob(t.Context(), "farcast-system", "build", 0)
+	const want = "cluster: job farcast-system/build neither succeeded nor failed after 0s"
+	if res != (JobResult{}) || !errors.Is(err, kube.ErrTimedOut) || err.Error() != want {
+		t.Errorf("at the deadline: %+v, %v; want %q wrapping kube.ErrTimedOut", res, err, want)
+	}
 }
 
 // A Deployment with no explicit replicas runs one. Decoding that as zero would
@@ -609,43 +503,39 @@ func TestWorkloadsWithoutExplicitReplicasRunOne(t *testing.T) {
 			t.Errorf("api = %+v", got[0])
 		}
 	}
-	t.Run("in-process", func(t *testing.T) {
-		s := kubetest.New(t)
-		s.Put(object("apps/v1", "Deployment", "apps", "api", map[string]any{
-			"metadata": map[string]any{"creationTimestamp": "2026-09-01T10:00:00Z", "labels": map[string]any{"farcast.sofmon.com/tier": "app"}},
-			"spec":     map[string]any{"template": map[string]any{"spec": map[string]any{"containers": []any{map[string]any{"name": "api", "image": "reg.example/api@sha256:abc"}}}}},
-			"status":   map[string]any{"readyReplicas": 1},
-		}))
-		s.Put(object("apps/v1", "Deployment", "apps", "web", map[string]any{
-			"spec": map[string]any{"replicas": 0, "template": map[string]any{"spec": map[string]any{"containers": []any{map[string]any{"name": "web", "image": "reg.example/web@sha256:def"}}}}},
-		}))
-		got, err := openReader(t, s, nil).Workloads(t.Context(), "apps")
-		check(t, got, err)
-	})
+	s := kubetest.New(t)
+	s.Put(object("apps/v1", "Deployment", "apps", "api", map[string]any{
+		"metadata": map[string]any{"creationTimestamp": "2026-09-01T10:00:00Z", "labels": map[string]any{"farcast.sofmon.com/tier": "app"}},
+		"spec":     map[string]any{"template": map[string]any{"spec": map[string]any{"containers": []any{map[string]any{"name": "api", "image": "reg.example/api@sha256:abc"}}}}},
+		"status":   map[string]any{"readyReplicas": 1},
+	}))
+	s.Put(object("apps/v1", "Deployment", "apps", "web", map[string]any{
+		"spec": map[string]any{"replicas": 0, "template": map[string]any{"spec": map[string]any{"containers": []any{map[string]any{"name": "web", "image": "reg.example/web@sha256:def"}}}}},
+	}))
+	got, err := openReader(t, s, nil).Workloads(t.Context(), "apps")
+	check(t, got, err)
 }
 
 // An empty answer is a namespace with no workloads, not a parse failure. An
 // Open'd client refuses no namespace at all before sending anything: kube
 // would read it as every namespace.
 func TestWorkloadsHandlesAnEmptyAnswer(t *testing.T) {
-	t.Run("in-process", func(t *testing.T) {
-		s := kubetest.New(t)
-		c := openReader(t, s, nil)
-		got, err := c.Workloads(t.Context(), "apps")
-		if err != nil || len(got) != 0 {
-			t.Errorf("an empty namespace = %v, %v; want nothing", got, err)
-		}
+	s := kubetest.New(t)
+	c := openReader(t, s, nil)
+	got, err := c.Workloads(t.Context(), "apps")
+	if err != nil || len(got) != 0 {
+		t.Errorf("an empty namespace = %v, %v; want nothing", got, err)
+	}
 
-		empty := kubetest.New(t)
-		empty.Put(workloadObject("Deployment", "apps", "api"))
-		got, err = openReader(t, empty, nil).Workloads(t.Context(), "")
-		if err == nil || got != nil || !strings.Contains(err.Error(), "nothing was sent") {
-			t.Errorf("no namespace = %v, %v; want a refusal", got, err)
-		}
-		if reqs := empty.Requests(); len(reqs) != 0 {
-			t.Errorf("no namespace sent %d requests", len(reqs))
-		}
-	})
+	empty := kubetest.New(t)
+	empty.Put(workloadObject("Deployment", "apps", "api"))
+	got, err = openReader(t, empty, nil).Workloads(t.Context(), "")
+	if err == nil || got != nil || !strings.Contains(err.Error(), "nothing was sent") {
+		t.Errorf("no namespace = %v, %v; want a refusal", got, err)
+	}
+	if reqs := empty.Requests(); len(reqs) != 0 {
+		t.Errorf("no namespace sent %d requests", len(reqs))
+	}
 }
 
 // FarCast runs Deployments and StatefulSets — the key holder is the latter —
@@ -659,47 +549,45 @@ func TestWorkloadsAsksForBothKindsAndKeepsThem(t *testing.T) {
 		}
 		return kinds
 	}
-	t.Run("in-process", func(t *testing.T) {
-		s := kubetest.New(t)
-		s.Put(workloadObject("Deployment", "farcast-system", "fatline"))
-		s.Put(workloadObject("StatefulSet", "farcast-system", "datasphered"))
-		c := openReader(t, s, nil)
-		got, err := c.Workloads(t.Context(), "farcast-system")
-		if err != nil {
-			t.Fatal(err)
+	s := kubetest.New(t)
+	s.Put(workloadObject("Deployment", "farcast-system", "fatline"))
+	s.Put(workloadObject("StatefulSet", "farcast-system", "datasphered"))
+	c := openReader(t, s, nil)
+	got, err := c.Workloads(t.Context(), "farcast-system")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if k := kindsOf(got); k["datasphered"] != "StatefulSet" || k["fatline"] != "Deployment" || len(got) != 2 || got[0].Name != "fatline" {
+		t.Errorf("workloads = %+v; Deployments first, each with its own kind", got)
+	}
+	// The request itself: asking only for deployments is how storage
+	// vanished. Each kind is its own paged list.
+	reqs := apiRequests(s)
+	if len(reqs) != 2 {
+		t.Fatalf("requests = %v, want two lists", apiPaths(s))
+	}
+	for i, path := range []string{"/apis/apps/v1/namespaces/farcast-system/deployments", "/apis/apps/v1/namespaces/farcast-system/statefulsets"} {
+		if reqs[i].Path != path || reqs[i].RawQuery != "limit=500" || reqs[i].As != "reader" {
+			t.Errorf("request %d = %s?%s as %q, want %s?limit=500", i, reqs[i].Path, reqs[i].RawQuery, reqs[i].As, path)
 		}
-		if k := kindsOf(got); k["datasphered"] != "StatefulSet" || k["fatline"] != "Deployment" || len(got) != 2 || got[0].Name != "fatline" {
-			t.Errorf("workloads = %+v; Deployments first, each with its own kind", got)
-		}
-		// The request itself: asking only for deployments is how storage
-		// vanished. Each kind is its own paged list.
-		reqs := apiRequests(s)
-		if len(reqs) != 2 {
-			t.Fatalf("requests = %v, want two lists", apiPaths(s))
-		}
-		for i, path := range []string{"/apis/apps/v1/namespaces/farcast-system/deployments", "/apis/apps/v1/namespaces/farcast-system/statefulsets"} {
-			if reqs[i].Path != path || reqs[i].RawQuery != "limit=500" || reqs[i].As != "reader" {
-				t.Errorf("request %d = %s?%s as %q, want %s?limit=500", i, reqs[i].Path, reqs[i].RawQuery, reqs[i].As, path)
-			}
-		}
+	}
 
-		// The kind comes from the list, never from an item: one that names
-		// another kind, or none, is stamped by the list it came in.
-		s.Script("/apis/apps/v1/namespaces/farcast-system/deployments",
-			[]byte(`{"items":[{"kind":"StatefulSet","metadata":{"name":"liar"}}]}`))
-		s.Script("/apis/apps/v1/namespaces/farcast-system/statefulsets",
-			[]byte(`{"items":[{"kind":"Deployment","metadata":{"name":"keys"}},{"metadata":{"name":"bare"}}]}`))
-		got, err = c.Workloads(t.Context(), "farcast-system")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if k := kindsOf(got); k["liar"] != "Deployment" || k["keys"] != "StatefulSet" || k["bare"] != "StatefulSet" {
-			t.Errorf("kinds = %v; each must be its list's", k)
-		}
-		if got[0].Namespace != "farcast-system" {
-			t.Errorf("an item without a namespace = %q, want the namespace asked for", got[0].Namespace)
-		}
-	})
+	// The kind comes from the list, never from an item: one that names
+	// another kind, or none, is stamped by the list it came in.
+	s.Script("/apis/apps/v1/namespaces/farcast-system/deployments",
+		[]byte(`{"items":[{"kind":"StatefulSet","metadata":{"name":"liar"}}]}`))
+	s.Script("/apis/apps/v1/namespaces/farcast-system/statefulsets",
+		[]byte(`{"items":[{"kind":"Deployment","metadata":{"name":"keys"}},{"metadata":{"name":"bare"}}]}`))
+	got, err = c.Workloads(t.Context(), "farcast-system")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if k := kindsOf(got); k["liar"] != "Deployment" || k["keys"] != "StatefulSet" || k["bare"] != "StatefulSet" {
+		t.Errorf("kinds = %v; each must be its list's", k)
+	}
+	if got[0].Namespace != "farcast-system" {
+		t.Errorf("an item without a namespace = %q, want the namespace asked for", got[0].Namespace)
+	}
 }
 
 // The keys FarCast stores contain dots, and jsonpath reads a dot as a path
@@ -713,57 +601,29 @@ func TestConfigMapValueReadsADottedKey(t *testing.T) {
 			t.Errorf("= %q, %v, %v", got, found, err)
 		}
 	}
-	t.Run("in-process", func(t *testing.T) {
-		s := kubetest.New(t)
-		s.Put(object("v1", "ConfigMap", "farcast-system", "technocore-ledger", map[string]any{"data": map[string]any{"checkpoint.json": `{"version":1}`}}))
-		got, found, err := openReader(t, s, nil).ConfigMapValue(t.Context(), "farcast-system", "technocore-ledger", "checkpoint.json")
-		check(t, got, found, err)
-		if p := apiPaths(s); !slices.Equal(p, []string{"GET /api/v1/namespaces/farcast-system/configmaps/technocore-ledger"}) {
-			t.Errorf("requests = %v", p)
-		}
-	})
-	t.Run("kubectl", func(t *testing.T) {
-		const body = `{"data":{"checkpoint.json":"{\"version\":1}"}}`
-		fr := &fakeRunner{out: map[string][]byte{"get": []byte(body)}}
-		got, found, err := newWithRunner(fr).ConfigMapValue(context.Background(), "farcast-system", "technocore-ledger", "checkpoint.json")
-		check(t, got, found, err)
-	})
+	s := kubetest.New(t)
+	s.Put(object("v1", "ConfigMap", "farcast-system", "technocore-ledger", map[string]any{"data": map[string]any{"checkpoint.json": `{"version":1}`}}))
+	got, found, err := openReader(t, s, nil).ConfigMapValue(t.Context(), "farcast-system", "technocore-ledger", "checkpoint.json")
+	check(t, got, found, err)
+	if p := apiPaths(s); !slices.Equal(p, []string{"GET /api/v1/namespaces/farcast-system/configmaps/technocore-ledger"}) {
+		t.Errorf("requests = %v", p)
+	}
 }
 
 func TestConfigMapValueDistinguishesMissingFromEmpty(t *testing.T) {
-	t.Run("in-process", func(t *testing.T) {
-		s := kubetest.New(t)
-		c := openReader(t, s, nil)
-		ctx := t.Context()
-		if v, found, err := c.ConfigMapValue(ctx, "ns", "name", "key"); v != "" || found || err != nil {
-			t.Errorf("absent = %q, %v, %v; want not found and no error", v, found, err)
-		}
-		s.Put(object("v1", "ConfigMap", "ns", "name", map[string]any{"data": map[string]any{"other": "x", "blank": ""}}))
-		if _, found, err := c.ConfigMapValue(ctx, "ns", "name", "key"); !found || err == nil {
-			t.Errorf("present without the key = found %v, %v; want found and an error", found, err)
-		}
-		if v, found, err := c.ConfigMapValue(ctx, "ns", "name", "blank"); v != "" || !found || err != nil {
-			t.Errorf("an empty value = %q, %v, %v; want found, empty", v, found, err)
-		}
-	})
-	t.Run("kubectl", func(t *testing.T) {
-		fr := &fakeRunner{}
-		_, found, err := newWithRunner(fr).ConfigMapValue(context.Background(), "ns", "name", "key")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if found {
-			t.Error("found = true for a ConfigMap kubectl returned nothing for")
-		}
-		fr = &fakeRunner{out: map[string][]byte{"get": []byte(`{"data":{"other":"x"}}`)}}
-		_, found, err = newWithRunner(fr).ConfigMapValue(context.Background(), "ns", "name", "key")
-		if !found {
-			t.Error("found = false for a ConfigMap that exists but lacks the key")
-		}
-		if err == nil {
-			t.Error("a present ConfigMap missing its key was not reported")
-		}
-	})
+	s := kubetest.New(t)
+	c := openReader(t, s, nil)
+	ctx := t.Context()
+	if v, found, err := c.ConfigMapValue(ctx, "ns", "name", "key"); v != "" || found || err != nil {
+		t.Errorf("absent = %q, %v, %v; want not found and no error", v, found, err)
+	}
+	s.Put(object("v1", "ConfigMap", "ns", "name", map[string]any{"data": map[string]any{"other": "x", "blank": ""}}))
+	if _, found, err := c.ConfigMapValue(ctx, "ns", "name", "key"); !found || err == nil {
+		t.Errorf("present without the key = found %v, %v; want found and an error", found, err)
+	}
+	if v, found, err := c.ConfigMapValue(ctx, "ns", "name", "blank"); v != "" || !found || err != nil {
+		t.Errorf("an empty value = %q, %v, %v; want found, empty", v, found, err)
+	}
 }
 
 // ADR 0023 M2.4, mutation 62: a ConfigMap is absent only when the API server
@@ -813,99 +673,245 @@ func TestConfigMapForbiddenIsNeverAbsent(t *testing.T) {
 
 func TestConfigMapDataCarriesTheVersionItWasReadAt(t *testing.T) {
 	const path = "/api/v1/namespaces/farcast-system/configmaps/datasphered-pin"
-	t.Run("in-process", func(t *testing.T) {
-		s := kubetest.New(t)
-		s.Put(object("v1", "ConfigMap", "farcast-system", "datasphered-pin", map[string]any{
-			"metadata": map[string]any{"resourceVersion": "42"}, "data": map[string]any{"pin": "x"},
-		}))
-		c := openReader(t, s, nil)
-		ctx := t.Context()
-		data, rv, found, err := c.ConfigMapData(ctx, "farcast-system", "datasphered-pin")
-		if err != nil || !found || rv != "42" || data["pin"] != "x" {
-			t.Fatalf("= %v, %q, %v, %v", data, rv, found, err)
-		}
-		if p := apiPaths(s); !slices.Equal(p, []string{"GET " + path}) {
-			t.Errorf("requests = %v", p)
-		}
-		if _, _, found, err := c.ConfigMapData(ctx, "ns", "name"); found || err != nil {
-			t.Errorf("an absent ConfigMap = found %v, %v", found, err)
-		}
-		// Without a version there is nothing to compare a replace against, and
-		// a replace without one is last-writer-wins.
-		s.Script(path, object("v1", "ConfigMap", "farcast-system", "datasphered-pin", map[string]any{"data": map[string]any{"pin": "x"}}))
-		if _, _, found, err := c.ConfigMapData(ctx, "farcast-system", "datasphered-pin"); found || err == nil ||
-			err.Error() != "cluster: farcast-system/datasphered-pin carries no resourceVersion" {
-			t.Errorf("no resourceVersion = found %v, %v", found, err)
-		}
-	})
-	t.Run("kubectl", func(t *testing.T) {
-		ctx := context.Background()
-		fr := &fakeRunner{out: map[string][]byte{"get": []byte(`{"metadata":{"resourceVersion":"42"},"data":{"pin":"x"}}`)}}
-		data, rv, found, err := newWithRunner(fr).ConfigMapData(ctx, "farcast-system", "datasphered-pin")
-		if err != nil || !found || rv != "42" || data["pin"] != "x" {
-			t.Fatalf("= %v, %q, %v, %v", data, rv, found, err)
-		}
-		want := []string{"get", "configmap", "datasphered-pin", "-n", "farcast-system", "--ignore-not-found", "-o", "json"}
-		if !slices.Equal(fr.calls[0], want) {
-			t.Errorf("argv = %v, want %v", fr.calls[0], want)
-		}
-		if _, _, found, err := newWithRunner(&fakeRunner{}).ConfigMapData(ctx, "ns", "name"); found || err != nil {
-			t.Errorf("an absent ConfigMap = found %v, %v", found, err)
-		}
-		fr = &fakeRunner{out: map[string][]byte{"get": []byte(`{"data":{"pin":"x"}}`)}}
-		if _, _, _, err := newWithRunner(fr).ConfigMapData(ctx, "ns", "name"); err == nil {
-			t.Error("a ConfigMap with no resourceVersion was read as comparable")
-		}
-	})
+	s := kubetest.New(t)
+	s.Put(object("v1", "ConfigMap", "farcast-system", "datasphered-pin", map[string]any{
+		"metadata": map[string]any{"resourceVersion": "42"}, "data": map[string]any{"pin": "x"},
+	}))
+	c := openReader(t, s, nil)
+	ctx := t.Context()
+	data, rv, found, err := c.ConfigMapData(ctx, "farcast-system", "datasphered-pin")
+	if err != nil || !found || rv != "42" || data["pin"] != "x" {
+		t.Fatalf("= %v, %q, %v, %v", data, rv, found, err)
+	}
+	if p := apiPaths(s); !slices.Equal(p, []string{"GET " + path}) {
+		t.Errorf("requests = %v", p)
+	}
+	if _, _, found, err := c.ConfigMapData(ctx, "ns", "name"); found || err != nil {
+		t.Errorf("an absent ConfigMap = found %v, %v", found, err)
+	}
+	// Without a version there is nothing to compare a replace against, and
+	// a replace without one is last-writer-wins.
+	s.Script(path, object("v1", "ConfigMap", "farcast-system", "datasphered-pin", map[string]any{"data": map[string]any{"pin": "x"}}))
+	if _, _, found, err := c.ConfigMapData(ctx, "farcast-system", "datasphered-pin"); found || err == nil ||
+		err.Error() != "cluster: farcast-system/datasphered-pin carries no resourceVersion" {
+		t.Errorf("no resourceVersion = found %v, %v", found, err)
+	}
 }
 
-// Create never overwrites and replace is refused on a stale version: neither
-// is apply, which is last-writer-wins and could move the pin backwards.
+// pinPath is the storage key pin's ConfigMap, as dsdeploy.RenderPin names it.
+const pinPath = "/api/v1/namespaces/farcast-system/configmaps/datasphered-pin"
+
+// renderPin is the storage key pin's ConfigMap as the writing commands render
+// it (dsdeploy.RenderPin), holding value, at resourceVersion rv ("" for none).
+func renderPin(t *testing.T, value, rv string) []byte {
+	t.Helper()
+	b, err := dsdeploy.RenderPin(dsdeploy.DefaultNamespace, dsdeploy.DefaultName, value, rv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// writeRequests is every request s saw that is neither a read nor the token's.
+func writeRequests(s *kubetest.Server) []kubetest.Request {
+	var out []kubetest.Request
+	for _, r := range apiRequests(s) {
+		if r.Method != http.MethodGet {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// ADR 0023 M2.5 (A20-7), mutation 70: create never overwrites and replace is
+// refused on a stale version: neither is apply, which is last-writer-wins and
+// could move the pin backwards. A writer creates the pin with a POST and
+// replaces it with a PUT, in-process as the writer, each sending the body it
+// was given byte for byte under farcast's field manager and strict field
+// validation; a create over a pin that exists is AlreadyExists, a conflict.
+// Nothing is patched or applied, and no kubectl runs.
 func TestConfigMapWritesNeverApply(t *testing.T) {
-	ctx := context.Background()
-	fr := &fakeRunner{}
-	c := newWithRunner(fr)
-	if err := c.CreateConfigMap(ctx, []byte("a")); err != nil {
+	bin, saw := recordingKubectl(t)
+	t.Setenv("PATH", bin)
+	s := kubetest.New(t)
+	c := openWriter(t, s, "/cfg/instances/atlas/kubeconfig.yaml", nil)
+	ctx := t.Context()
+
+	created := renderPin(t, `{"pin":1}`, "")
+	if err := c.CreateConfigMap(ctx, created); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.ReplaceConfigMap(ctx, []byte("b")); err != nil {
+	_, rv, found, err := c.ConfigMapData(ctx, dsdeploy.DefaultNamespace, dsdeploy.PinConfigMapName(""))
+	if err != nil || !found {
+		t.Fatalf("reading the created pin = %v, %v", found, err)
+	}
+	replaced := renderPin(t, `{"pin":2}`, rv)
+	if err := c.ReplaceConfigMap(ctx, replaced); err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(fr.calls[0], []string{"create", "-f", "-"}) || string(fr.stdins[0]) != "a" {
-		t.Errorf("create = %v %q", fr.calls[0], fr.stdins[0])
+	err = c.CreateConfigMap(ctx, created)
+	var ae *kube.APIError
+	if !errors.Is(err, tkube.ErrConflict) || !errors.As(err, &ae) || ae.Status.Reason != "AlreadyExists" {
+		t.Errorf("a create over the pin = %v; want AlreadyExists, unwrapping to tkube.ErrConflict", err)
 	}
-	if !slices.Equal(fr.calls[1], []string{"replace", "-f", "-"}) || string(fr.stdins[1]) != "b" {
-		t.Errorf("replace = %v %q", fr.calls[1], fr.stdins[1])
+	if v, _, err := c.ConfigMapValue(ctx, dsdeploy.DefaultNamespace, dsdeploy.PinConfigMapName(""), dsdeploy.PinKey); v != `{"pin":2}` || err != nil {
+		t.Errorf("the pin after the refused create = %q, %v; want the replaced value", v, err)
+	}
+
+	writes := writeRequests(s)
+	if len(writes) != 3 {
+		t.Fatalf("%d writes, want a POST, a PUT and the refused POST: %v", len(writes), apiPaths(s))
+	}
+	for i, want := range []struct {
+		method, path string
+		body         []byte
+	}{
+		{http.MethodPost, "/api/v1/namespaces/farcast-system/configmaps", created},
+		{http.MethodPut, pinPath, replaced},
+		{http.MethodPost, "/api/v1/namespaces/farcast-system/configmaps", created},
+	} {
+		r := writes[i]
+		if r.Method != want.method || r.Path != want.path || r.RawQuery != "fieldManager=farcast&fieldValidation=Strict" ||
+			r.ContentType != "application/json" || r.As != "writer" {
+			t.Errorf("write %d = %s %s?%s (%s) as %q; want %s %s?fieldManager=farcast&fieldValidation=Strict (application/json) as the writer",
+				i, r.Method, r.Path, r.RawQuery, r.ContentType, r.As, want.method, want.path)
+		}
+		if !bytes.Equal(r.Body, want.body) {
+			t.Errorf("write %d sent %q, want the body it was given, %q", i, r.Body, want.body)
+		}
+	}
+	for _, r := range apiRequests(s) {
+		if r.Method == http.MethodPatch || strings.Contains(r.ContentType, "apply-patch") {
+			t.Errorf("%s %s (%s): the pin is never patched or applied", r.Method, r.Path, r.ContentType)
+		}
+	}
+	if _, _, ran := kubectlRecord(t, saw); ran {
+		t.Error("a writer's ConfigMap write ran kubectl")
 	}
 }
 
-// Namespaces lists every namespace, with no selector: an Open'd client paged
-// and sorted, a kubectl client in the server's order.
+// ADR 0023 M2.5 (A20-7), mutation 71: a writer's replace is guarded on the
+// resourceVersion that was read. The PUT carries it, byte for byte as the
+// body was given; a replace at a version that is no longer current is a
+// conflict and leaves the pin as it was; and a body that names no version is
+// refused before anything is sent, because a replace without one is
+// last-writer-wins.
+func TestReplaceConfigMapCarriesTheResourceVersion(t *testing.T) {
+	s := kubetest.New(t)
+	s.Put(object("v1", "ConfigMap", "farcast-system", "datasphered-pin", map[string]any{
+		"metadata": map[string]any{"resourceVersion": "41"}, "data": map[string]any{"pin": `{"pin":1}`},
+	}))
+	c := openWriter(t, s, "", nil)
+	ctx := t.Context()
+	_, rv, found, err := c.ConfigMapData(ctx, dsdeploy.DefaultNamespace, dsdeploy.PinConfigMapName(""))
+	if err != nil || !found || rv != "41" {
+		t.Fatalf("the pin was read at %q (%v, %v), want 41", rv, found, err)
+	}
+
+	body := renderPin(t, `{"pin":2}`, rv)
+	if err := c.ReplaceConfigMap(ctx, body); err != nil {
+		t.Fatal(err)
+	}
+	writes := writeRequests(s)
+	if len(writes) != 1 || writes[0].Method != http.MethodPut || writes[0].Path != pinPath || !bytes.Equal(writes[0].Body, body) {
+		t.Fatalf("writes = %d (%v); want one PUT of the body as given", len(writes), apiPaths(s))
+	}
+	var sent struct {
+		Metadata struct {
+			ResourceVersion string `json:"resourceVersion"`
+		} `json:"metadata"`
+	}
+	if err := json.Unmarshal(writes[0].Body, &sent); err != nil || sent.Metadata.ResourceVersion != rv ||
+		!bytes.Contains(writes[0].Body, []byte(`"resourceVersion":"41"`)) {
+		t.Errorf("the PUT carried the resourceVersion %q (%v), want the one read, %q", sent.Metadata.ResourceVersion, err, rv)
+	}
+
+	// The replace moved the pin on, so the version read is stale now.
+	err = c.ReplaceConfigMap(ctx, renderPin(t, `{"pin":3}`, rv))
+	if !errors.Is(err, tkube.ErrConflict) {
+		t.Errorf("a replace at a stale resourceVersion = %v, want tkube.ErrConflict", err)
+	}
+	if v, _, err := c.ConfigMapValue(ctx, dsdeploy.DefaultNamespace, dsdeploy.PinConfigMapName(""), dsdeploy.PinKey); v != `{"pin":2}` || err != nil {
+		t.Errorf("the pin after a stale replace = %q, %v; want it unchanged", v, err)
+	}
+
+	before := len(s.Requests())
+	err = c.ReplaceConfigMap(ctx, renderPin(t, `{"pin":4}`, ""))
+	if !errors.Is(err, kube.ErrRefusedDocument) {
+		t.Errorf("a replace that names no resourceVersion = %v, want kube.ErrRefusedDocument", err)
+	}
+	if got := len(s.Requests()); got != before {
+		t.Errorf("a replace with no resourceVersion sent %d requests; it sends nothing", got-before)
+	}
+}
+
+// ADR 0023 M2.5 (A20-4): NamespaceUID is one namespace's uid, read with the
+// list verb and a field selector, "" for a namespace that does not exist, and
+// an error, never "", for a refused read. Each answer's warnings are written
+// after it. The reader reads it too: a plan binds farcast-system's uid.
+func TestNamespaceUIDIsThatNamespacesUID(t *testing.T) {
+	var n atomic.Int32
+	s := kubetest.New(t, kubetest.WithWarnings(func(r kubetest.Request) []string {
+		if r.Path == "/api/v1/namespaces" {
+			return []string{fmt.Sprintf("read %d", n.Add(1))}
+		}
+		return nil
+	}))
+	s.Put(object("v1", "Namespace", "", "farcast-system", map[string]any{"metadata": map[string]any{"uid": "uid-of-farcast-system"}}))
+	s.Put(namespace("web", nil))
+	var w bytes.Buffer
+	c := openWriter(t, s, "", &w)
+	ctx := t.Context()
+
+	if uid, err := c.NamespaceUID(ctx, "farcast-system"); uid != "uid-of-farcast-system" || err != nil {
+		t.Errorf("farcast-system's uid = %q, %v", uid, err)
+	}
+	if got := w.String(); got != "Warning (cluster): read 1\n" {
+		t.Errorf("after the read, warnings = %q", got)
+	}
+	if uid, err := c.NamespaceUID(ctx, "absent"); uid != "" || err != nil {
+		t.Errorf("an absent namespace's uid = %q, %v; want \"\" and no error", uid, err)
+	}
+	s.Fail(http.MethodGet, "/api/v1/namespaces", http.StatusForbidden, kube.Status{})
+	if uid, err := c.NamespaceUID(ctx, "farcast-system"); uid != "" || !errors.Is(err, tkube.ErrForbidden) {
+		t.Errorf("a refused read = %q, %v; want an error that unwraps to tkube.ErrForbidden", uid, err)
+	}
+	if got := w.String(); got != "Warning (cluster): read 1\nWarning (cluster): read 2\nWarning (cluster): read 3\n" {
+		t.Errorf("after an absent and a refused read, warnings = %q", got)
+	}
+	reqs := apiRequests(s)
+	if len(reqs) != 3 {
+		t.Fatalf("%d requests, want three reads: %v", len(reqs), apiPaths(s))
+	}
+	for i, name := range []string{"farcast-system", "absent", "farcast-system"} {
+		q, err := url.ParseQuery(reqs[i].RawQuery)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r := reqs[i]; r.Method != http.MethodGet || r.Path != "/api/v1/namespaces" || r.As != "writer" || q.Get("fieldSelector") != "metadata.name="+name {
+			t.Errorf("read %d = %s %s?%s as %q; want a list of %s alone, as the writer", i, r.Method, r.Path, r.RawQuery, r.As, name)
+		}
+	}
+
+	if uid, err := openReader(t, s, nil).NamespaceUID(ctx, "farcast-system"); uid != "uid-of-farcast-system" || err != nil {
+		t.Errorf("as the reader, farcast-system's uid = %q, %v", uid, err)
+	}
+}
+
+// Namespaces lists every namespace, with no selector, paged and sorted.
 func TestNamespacesListsEveryNamespace(t *testing.T) {
-	t.Run("in-process", func(t *testing.T) {
-		s := kubetest.New(t)
-		for _, ns := range []string{"web", "kube-system", "api"} {
-			s.Put(namespace(ns, nil))
-		}
-		got, err := openReader(t, s, nil).Namespaces(t.Context())
-		if err != nil || !slices.Equal(got, []string{"api", "kube-system", "web"}) {
-			t.Errorf("= %q, %v", got, err)
-		}
-		reqs := apiRequests(s)
-		if len(reqs) != 1 || reqs[0].Path != "/api/v1/namespaces" || reqs[0].RawQuery != "limit=500" {
-			t.Errorf("requests = %v; want one list with no selector", apiPaths(s))
-		}
-	})
-	t.Run("kubectl", func(t *testing.T) {
-		fr := &fakeRunner{out: map[string][]byte{"get": []byte("namespace/web\nnamespace/api\n\n")}}
-		got, err := newWithRunner(fr).Namespaces(context.Background())
-		if err != nil || !slices.Equal(got, []string{"web", "api"}) {
-			t.Errorf("= %q, %v", got, err)
-		}
-		if want := []string{"get", "namespace", "-o", "name"}; len(fr.calls) != 1 || !slices.Equal(fr.calls[0], want) {
-			t.Errorf("calls = %v, want %v", fr.calls, want)
-		}
-	})
+	s := kubetest.New(t)
+	for _, ns := range []string{"web", "kube-system", "api"} {
+		s.Put(namespace(ns, nil))
+	}
+	got, err := openReader(t, s, nil).Namespaces(t.Context())
+	if err != nil || !slices.Equal(got, []string{"api", "kube-system", "web"}) {
+		t.Errorf("= %q, %v", got, err)
+	}
+	reqs := apiRequests(s)
+	if len(reqs) != 1 || reqs[0].Path != "/api/v1/namespaces" || reqs[0].RawQuery != "limit=500" {
+		t.Errorf("requests = %v; want one list with no selector", apiPaths(s))
+	}
 }
 
 // logServer serves the Deployment apps/api and the StatefulSet apps/keys, and

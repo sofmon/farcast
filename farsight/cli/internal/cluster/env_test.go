@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/sofmon/farcast/farsight/cli/internal/kube/kubetest"
 )
 
 // TestMain lets this test binary stand in for kubectl: linked as kubectl
@@ -120,7 +122,10 @@ func TestEnvIsBuiltFromAnAllowlist(t *testing.T) {
 }
 
 // Whatever environment a client was built with, kubectl runs with exactly
-// one KUBERC, and it is off: no kuberc file can change a call.
+// one KUBERC, and it is off: no kuberc file can change a call. That holds for
+// an Open'd writer's Apply, whose kubectl gets this process's environment
+// through Env (ADR 0023 M2.5 to M2.7), and for newWithEnv, whatever it is
+// handed.
 func TestEveryKubectlRunsWithKubercOff(t *testing.T) {
 	bin := selfAsKubectl(t)
 	kuberc := func(env []string) []string {
@@ -136,9 +141,10 @@ func TestEveryKubectlRunsWithKubercOff(t *testing.T) {
 	t.Setenv("PATH", bin)
 	t.Setenv("GORACE", "atexit_sleep_ms=0")
 	t.Setenv("KUBERC", "/evil")
-	_, env := kubectlSaw(t, New("/kc"))
+	s := kubetest.New(t)
+	_, env := kubectlSaw(t, openWriter(t, s, "/kc", nil))
 	if got := kuberc(env); !slices.Equal(got, []string{"KUBERC=off"}) {
-		t.Errorf("through New, kubectl saw %q", got)
+		t.Errorf("through an Open'd writer, kubectl saw %q", got)
 	}
 
 	_, env = kubectlSaw(t, newWithEnv("/kc", []string{"PATH=" + bin, raceQuiet, "KUBERC=/x"}))
@@ -147,36 +153,71 @@ func TestEveryKubectlRunsWithKubercOff(t *testing.T) {
 	}
 }
 
-// New no longer hands kubectl this process's environment: what the parent
-// exported reaches it only through Env's allowlist.
-func TestNewDoesNotInheritTheParentEnvironment(t *testing.T) {
+// ADR 0023 M2.5 (A20-6), mutation 70b: an Open'd writer's Apply never hands
+// kubectl this process's environment. What the parent exported reaches it
+// only through Env's allowlist, and the writer is built now, from this
+// process's environment as the test has set it.
+func TestAWritersKubectlDoesNotInheritTheParentEnvironment(t *testing.T) {
 	bin := selfAsKubectl(t)
 	t.Setenv("PATH", bin)
 	t.Setenv("GORACE", "atexit_sleep_ms=0")
 	t.Setenv("CLOUDSDK_AUTH_ACCESS_TOKEN", "planted-token")
 	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:9")
 	t.Setenv("DYLD_INSERT_LIBRARIES", "/nonexistent/x.dylib")
-	_, env := kubectlSaw(t, New("/kc"))
+	s := kubetest.New(t)
+	_, env := kubectlSaw(t, openWriter(t, s, "/kc", nil))
 	if len(env) == 0 {
 		t.Fatal("kubectl printed no environment")
 	}
 	for _, kv := range env {
 		for _, k := range []string{"CLOUDSDK_AUTH_ACCESS_TOKEN=", "HTTPS_PROXY=", "DYLD_INSERT_LIBRARIES="} {
 			if strings.HasPrefix(kv, k) {
-				t.Errorf("the parent's %s reached kubectl", strings.TrimSuffix(k, "="))
+				t.Errorf("the parent's %s reached the writer's kubectl", strings.TrimSuffix(k, "="))
 			}
 		}
 	}
 	if !slices.Contains(env, "PATH="+bin) {
-		t.Errorf("kubectl's PATH is not the parent's: %q", env)
+		t.Errorf("the writer's kubectl's PATH is not the parent's: %q", env)
+	}
+	if got := s.Requests(); len(got) != 0 {
+		t.Errorf("the writer's kubectl sent %d requests in-process", len(got))
+	}
+}
+
+// ADR 0023 M2.5 (A20-18, M-F2): until M2.7 a writing command's applies act
+// as the active gcloud configuration, the one the operator selected. An
+// Open'd writer's kubectl gets the parent's CLOUDSDK_CONFIG and
+// CLOUDSDK_ACTIVE_CONFIG_NAME unchanged, and no other CLOUDSDK_* (an account
+// the parent names is not a selection kubectl may act on).
+func TestAWritersKubectlKeepsTheParentsGcloudSelection(t *testing.T) {
+	bin := selfAsKubectl(t)
+	t.Setenv("PATH", bin)
+	t.Setenv("GORACE", "atexit_sleep_ms=0")
+	t.Setenv("CLOUDSDK_CONFIG", "/Users/op/.config/gcloud")
+	t.Setenv("CLOUDSDK_ACTIVE_CONFIG_NAME", "sofmon")
+	t.Setenv("CLOUDSDK_CORE_ACCOUNT", "someone@work.example")
+	s := kubetest.New(t)
+	_, env := kubectlSaw(t, openWriter(t, s, "/kc", nil))
+	var got []string
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "CLOUDSDK_") {
+			got = append(got, kv)
+		}
+	}
+	slices.Sort(got)
+	if want := []string{"CLOUDSDK_ACTIVE_CONFIG_NAME=sofmon", "CLOUDSDK_CONFIG=/Users/op/.config/gcloud"}; !slices.Equal(got, want) {
+		t.Errorf("the writer's kubectl saw %q; want %q", got, want)
+	}
+	if got := s.Requests(); len(got) != 0 {
+		t.Errorf("the writer's kubectl sent %d requests in-process", len(got))
 	}
 }
 
 // The auth plugin keys its one token-cache entry by the current context of
-// the file KUBECONFIG names. New keeps the parent's KUBECONFIG, or none,
-// and never names the instance's there: that entry belongs to 'world' (ADR
-// 0021 decision 9). kubectl itself always gets the instance's with --kubeconfig.
-func TestNewKeepsTheParentsTokenCacheKey(t *testing.T) {
+// the file KUBECONFIG names. An Open'd writer's Apply keeps the parent's
+// KUBECONFIG, or none, and never names the instance's there (ADR 0021
+// decision 9). kubectl itself always gets the instance's with --kubeconfig.
+func TestAWritersKubectlKeepsTheParentsTokenCacheKey(t *testing.T) {
 	bin := selfAsKubectl(t)
 	t.Setenv("PATH", bin)
 	t.Setenv("GORACE", "atexit_sleep_ms=0")
@@ -191,8 +232,10 @@ func TestNewKeepsTheParentsTokenCacheKey(t *testing.T) {
 		return out
 	}
 
+	s := kubetest.New(t)
+
 	t.Setenv("KUBECONFIG", "/Users/op/.kube/work")
-	args, env := kubectlSaw(t, New(instanceKC))
+	args, env := kubectlSaw(t, openWriter(t, s, instanceKC, nil))
 	if !slices.Equal(args[:2], []string{"--kubeconfig", instanceKC}) {
 		t.Errorf("kubectl's arguments: %q", args)
 	}
@@ -203,7 +246,7 @@ func TestNewKeepsTheParentsTokenCacheKey(t *testing.T) {
 	if err := os.Unsetenv("KUBECONFIG"); err != nil {
 		t.Fatal(err)
 	}
-	args, env = kubectlSaw(t, New(instanceKC))
+	args, env = kubectlSaw(t, openWriter(t, s, instanceKC, nil))
 	if !slices.Equal(args[:2], []string{"--kubeconfig", instanceKC}) {
 		t.Errorf("kubectl's arguments: %q", args)
 	}

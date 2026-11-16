@@ -10,6 +10,7 @@ import (
 
 	"github.com/sofmon/farcast/farsight/cli/internal/components"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
+	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
 	"github.com/sofmon/farcast/fatline"
 	"github.com/sofmon/farcast/fatline/deploy"
@@ -170,7 +171,10 @@ func (c *connectCommand) SetFlags(fs *flag.FlagSet) {
 	c.setImageFlags(fs)
 }
 
-func (c *connectCommand) Run(ctx context.Context, env *Env, args []string) error {
+func (c *connectCommand) Run(ctx context.Context, env *Env, args []string) (err error) {
+	// A 403 the writer met says whose it was, once (A20-9).
+	var meta *config.InstanceMetadata
+	defer func() { err = writerRefused(err, meta) }()
 	c.ensureDefaults()
 	if len(args) == 0 {
 		return usagef("connect requires an instance name")
@@ -188,9 +192,12 @@ func (c *connectCommand) Run(ctx context.Context, env *Env, args []string) error
 	}
 	name := args[0]
 
-	meta, err := env.ConfigDir.LoadInstanceMetadata(name)
+	meta, err = env.ConfigDir.LoadInstanceMetadata(name)
 	if err != nil {
 		return fmt.Errorf("no such instance %q (run 'farcast install' first): %w", name, err)
+	}
+	if err := recordNamed(meta, name); err != nil {
+		return err
 	}
 	if meta.Status == config.InstanceDeleting {
 		return fmt.Errorf("instance %q is being released", name)
@@ -229,8 +236,27 @@ func (c *connectCommand) Run(ctx context.Context, env *Env, args []string) error
 	// first moment connect knows it will deploy, and before it mints anything,
 	// asks the cost question or ensures the registry. A reconnect and --status
 	// deploy nothing, so they are never refused for it.
+	//
+	// The writer is opened then too, and read once (ADR 0023 M2.5, A20-10 and
+	// A20-11): opening sends nothing, so an instance this machine cannot write
+	// as — one installed with Application Default Credentials, say — is
+	// refused before the CA is minted, the registry is ensured, the
+	// load-balancer cost is asked or an image is pushed; and the read makes
+	// the writer's first in-process call before kubectl applies anything,
+	// so an endpoint that refuses the installer's key refuses it before a
+	// billable load balancer exists. A reconnect and --status need neither.
+	var cl clusterApplier
 	if !c.statusOnly && !connected {
 		if err := c.precheck(); err != nil {
+			return err
+		}
+		if cl, err = c.newCluster(clusterRef{Dir: env.ConfigDir, Meta: meta, Identity: kube.Writer, Warn: env.Err}); err != nil {
+			return err
+		}
+		if err := applyReady(cl); err != nil {
+			return err
+		}
+		if err := preflightNamespace(ctx, cl); err != nil {
 			return err
 		}
 	}
@@ -268,7 +294,7 @@ func (c *connectCommand) Run(ctx context.Context, env *Env, args []string) error
 
 	// 3) Bootstrap FatLine + bind the carrier, unless that is already done.
 	if !c.statusOnly && !connected {
-		if err := c.bootstrap(ctx, env, name, meta, mtls, reg); err != nil {
+		if err := c.bootstrap(ctx, env, cl, name, meta, mtls, reg); err != nil {
 			return err
 		}
 	}
@@ -374,10 +400,11 @@ func ensureIdentity(env *Env, name string, connected bool) (config.MTLSMaterial,
 	return m, nil
 }
 
-// bootstrap deploys FatLine and provisions its public carrier. It records the
-// (billable) load balancer before waiting for its IP, so an interrupted wait
-// never strands an unrecorded cost — the same cost-pillar ordering as install.
-func (c *connectCommand) bootstrap(ctx context.Context, env *Env, name string, meta *config.InstanceMetadata, mtls config.MTLSMaterial, reg *registryAccess) error {
+// bootstrap deploys FatLine and provisions its public carrier, through cl, the
+// writer Run opened. It records the (billable) load balancer before waiting
+// for its IP, so an interrupted wait never strands an unrecorded cost — the
+// same cost-pillar ordering as install.
+func (c *connectCommand) bootstrap(ctx context.Context, env *Env, cl clusterApplier, name string, meta *config.InstanceMetadata, mtls config.MTLSMaterial, reg *registryAccess) error {
 	if !meta.FatLineDeployed { // only gate the first, billable deploy
 		ok, err := c.confirmCost(env, meta)
 		if err != nil {
@@ -406,7 +433,6 @@ func (c *connectCommand) bootstrap(ctx context.Context, env *Env, name string, m
 		return err
 	}
 
-	cl := c.newCluster(env.ConfigDir.InstanceKubeconfigPath(name))
 	if isInteractive(env) || env.Verbose {
 		fprintf(env.Err, "Deploying FatLine to %q…\n", name)
 	}

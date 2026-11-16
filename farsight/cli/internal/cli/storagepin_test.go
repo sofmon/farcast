@@ -19,32 +19,46 @@ import (
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/keeper"
 	"github.com/sofmon/farcast/farsight/cli/internal/keyholder"
+	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
 )
 
 // Every test that does not bring its own pin store gets one in memory, per
-// instance, so no test can shell out to kubectl for the pin.
+// instance (its config directory and name), so no test reaches a cluster for
+// the pin. The pin is the writer's (ADR 0023 M2.5), so a command that opens
+// it as anything else is refused here too.
 var testPinStores = struct {
 	sync.Mutex
 	by map[string]*fakePinStore
 }{by: map[string]*fakePinStore{}}
 
-func init() {
-	defaultPinStore = func(kubeconfig string) (pinStore, error) {
-		testPinStores.Lock()
-		defer testPinStores.Unlock()
-		ps, ok := testPinStores.by[kubeconfig]
-		if !ok {
-			ps = &fakePinStore{}
-			testPinStores.by[kubeconfig] = ps
-		}
-		return ps, nil
+// testDefaultPinStore is the default the tests install in place of
+// openPinStore.
+func testDefaultPinStore(r clusterRef) (pinStore, error) {
+	if r.Meta == nil || r.Identity != kube.Writer {
+		return nil, fmt.Errorf("test pin store: the pin opens as the instance's writer, not %q", r.Identity)
 	}
+	key := string(r.Dir) + "/" + r.Meta.Name
+	testPinStores.Lock()
+	defer testPinStores.Unlock()
+	ps, ok := testPinStores.by[key]
+	if !ok {
+		ps = &fakePinStore{}
+		testPinStores.by[key] = ps
+	}
+	return ps, nil
+}
+
+func init() {
+	defaultPinStore = testDefaultPinStore
 }
 
 // pinStoreOf is the in-memory pin a test's instance got by default.
 func pinStoreOf(dir config.Dir, instance string) *fakePinStore {
-	ps, _ := defaultPinStore(dir.InstanceKubeconfigPath(instance))
+	ps, err := testDefaultPinStore(clusterRef{Dir: dir, Meta: &config.InstanceMetadata{Name: instance}, Identity: kube.Writer})
+	if err != nil {
+		panic(err)
+	}
 	return ps.(*fakePinStore)
 }
 
@@ -575,7 +589,7 @@ func TestARotationWhosePinCannotBeWrittenFailsAndSaysSo(t *testing.T) {
 	base := servingFleet(t, env, meta, dir)
 	broken := &fakePinStore{failRead: errors.New("the credentials have expired")}
 	err := (&keyRotateCommand{assumeYes: true, newKeyholder: openerFor(base),
-		newPinStore: func(string) (pinStore, error) { return broken, nil }}).Run(context.Background(), env, []string{"p303"})
+		newPinStore: func(clusterRef) (pinStore, error) { return broken, nil }}).Run(context.Background(), env, []string{"p303"})
 	if err == nil || !strings.Contains(err.Error(), "farcast storage key pin p303") {
 		t.Fatalf("rotate = %v; want a failure naming 'farcast storage key pin'", err)
 	}
@@ -657,7 +671,7 @@ func TestRunThatCannotRaiseThePinWarnsAndDeploys(t *testing.T) {
 	env, _, errBuf := testEnvBoth(dir, output.ModeHuman)
 	c := runCmd(newFakeRun(twoAppManifest))
 	c.newKeyholder = openerFor(&fakeStateKeyholder{phase: "unsealed"})
-	c.newPinStore = func(string) (pinStore, error) { return &fakePinStore{failWrite: errors.New("forbidden")}, nil }
+	c.newPinStore = func(clusterRef) (pinStore, error) { return &fakePinStore{failWrite: errors.New("forbidden")}, nil }
 	if err := c.Run(context.Background(), env, []string{"p306", "github.com/example/my-platform"}); err != nil {
 		t.Fatalf("run failed on the pin: %v", err)
 	}
@@ -675,7 +689,7 @@ func TestStorageDeployWritesThePinBeforeApplying(t *testing.T) {
 	fc := &fakeCluster{}
 	c := testStorageDeploy(&fakeProvider{}, &fakeBuilder{})
 	c.deployer.assumeYes = true
-	c.deployer.newCluster = func(string) clusterApplier { return fc }
+	c.deployer.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 	env, _ := testEnv(dir, output.ModeHuman)
 	if err := c.Run(context.Background(), env, []string{"prod"}); err != nil {
 		t.Fatal(err)
@@ -689,8 +703,8 @@ func TestStorageDeployWritesThePinBeforeApplying(t *testing.T) {
 	fc = &fakeCluster{}
 	c = testStorageDeploy(&fakeProvider{}, &fakeBuilder{})
 	c.deployer.assumeYes = true
-	c.deployer.newCluster = func(string) clusterApplier { return fc }
-	c.newPinStore = func(string) (pinStore, error) { return &fakePinStore{failWrite: errors.New("forbidden")}, nil }
+	c.deployer.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
+	c.newPinStore = func(clusterRef) (pinStore, error) { return &fakePinStore{failWrite: errors.New("forbidden")}, nil }
 	env, _ = testEnv(dir, output.ModeHuman)
 	if err := c.Run(context.Background(), env, []string{"prod"}); err == nil || !strings.Contains(err.Error(), "nothing was deployed") {
 		t.Fatalf("deploy with an unwritable pin = %v", err)
@@ -713,7 +727,7 @@ func TestStorageDeployFromBehindThePinRefusesBeforeSpending(t *testing.T) {
 	pinStoreOf(dir, "prod").set(pinFor(elsewhere).Marshal())
 	fc := &fakeCluster{}
 	c := testStorageDeploy(&fakeProvider{}, &fakeBuilder{}) // no --yes: the cost gate would refuse too
-	c.deployer.newCluster = func(string) clusterApplier { return fc }
+	c.deployer.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 	env, _ := testEnv(dir, output.ModeHuman)
 	err = c.Run(context.Background(), env, []string{"prod"})
 	if err == nil || !strings.Contains(err.Error(), "behind the instance's key pin") {

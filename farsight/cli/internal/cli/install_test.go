@@ -3,11 +3,16 @@ package cli
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -143,6 +148,40 @@ func newInstallEnv(t *testing.T, mode output.Mode) (*Env, *bytes.Buffer, *bytes.
 	return env, &out, &errb, dir
 }
 
+// installKeyJSON is a service-account key file's JSON, made once per test
+// binary: a Google key's shape with an RSA key in PKCS#8 PEM, which is what
+// install now parses (as the instance's writer will) before anything else.
+var installKeyJSON = sync.OnceValues(func() ([]byte, error) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return nil, err
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(map[string]string{
+		"type": "service_account", "client_email": "installer@proj-1.iam.gserviceaccount.com",
+		"private_key_id": "install-test", "private_key": string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})),
+	})
+})
+
+// installKey is a --credentials file for a test install: a service-account
+// key, in a file of its own. The provider is a fake, so nothing reads it but
+// install.
+func installKey(t *testing.T) string {
+	t.Helper()
+	b, err := installKeyJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "key.json")
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
 func assertPerm(t *testing.T, path string, want os.FileMode) {
 	t.Helper()
 	info, err := os.Stat(path)
@@ -158,7 +197,7 @@ func TestInstallSuccess(t *testing.T) {
 	f := &fakeProvider{}
 	prov := registerFake(t, f)
 	env, out, _, dir := newInstallEnv(t, output.ModeHuman)
-	cmd := &installCommand{name: "prod", provider: prov, project: "proj-1", region: "us-central1", costLimit: 50, assumeYes: true}
+	cmd := &installCommand{credentials: installKey(t), name: "prod", provider: prov, project: "proj-1", region: "us-central1", costLimit: 50, assumeYes: true}
 
 	if err := cmd.Run(context.Background(), env, nil); err != nil {
 		t.Fatalf("Run: %v", err)
@@ -189,7 +228,7 @@ func TestInstallRequiresCostLimit(t *testing.T) {
 	f := &fakeProvider{}
 	prov := registerFake(t, f)
 	env, _, _, _ := newInstallEnv(t, output.ModeHuman)
-	cmd := &installCommand{name: "x", provider: prov, project: "p", costLimit: 0, assumeYes: true}
+	cmd := &installCommand{credentials: installKey(t), name: "x", provider: prov, project: "p", costLimit: 0, assumeYes: true}
 
 	err := cmd.Run(context.Background(), env, nil)
 	if _, ok := errors.AsType[*usageError](err); !ok {
@@ -201,7 +240,7 @@ func TestInstallRequiresName(t *testing.T) {
 	f := &fakeProvider{}
 	prov := registerFake(t, f)
 	env, _, _, _ := newInstallEnv(t, output.ModeHuman)
-	cmd := &installCommand{provider: prov, project: "p", costLimit: 10, assumeYes: true}
+	cmd := &installCommand{credentials: installKey(t), provider: prov, project: "p", costLimit: 10, assumeYes: true}
 
 	err := cmd.Run(context.Background(), env, nil)
 	if _, ok := errors.AsType[*usageError](err); !ok {
@@ -213,7 +252,7 @@ func TestInstallNonInteractiveRequiresYes(t *testing.T) {
 	f := &fakeProvider{}
 	prov := registerFake(t, f)
 	env, _, _, dir := newInstallEnv(t, output.ModeHuman)
-	cmd := &installCommand{name: "x", provider: prov, project: "p", costLimit: 10, assumeYes: false}
+	cmd := &installCommand{credentials: installKey(t), name: "x", provider: prov, project: "p", costLimit: 10, assumeYes: false}
 
 	err := cmd.Run(context.Background(), env, nil)
 	if _, ok := errors.AsType[*usageError](err); !ok {
@@ -228,7 +267,7 @@ func TestInstallValidateFailureRecordsNothing(t *testing.T) {
 	f := &fakeProvider{validateErr: errors.New("bad creds")}
 	prov := registerFake(t, f)
 	env, _, _, dir := newInstallEnv(t, output.ModeHuman)
-	cmd := &installCommand{name: "x", provider: prov, project: "p", costLimit: 10, assumeYes: true}
+	cmd := &installCommand{credentials: installKey(t), name: "x", provider: prov, project: "p", costLimit: 10, assumeYes: true}
 
 	err := cmd.Run(context.Background(), env, nil)
 	if err == nil || !strings.Contains(err.Error(), "validate credentials") {
@@ -249,7 +288,7 @@ func TestInstallRefusesExistingInstance(t *testing.T) {
 	if err := dir.CreateInstance("dup"); err != nil {
 		t.Fatal(err)
 	}
-	cmd := &installCommand{name: "dup", provider: prov, project: "p", costLimit: 10, assumeYes: true}
+	cmd := &installCommand{credentials: installKey(t), name: "dup", provider: prov, project: "p", costLimit: 10, assumeYes: true}
 
 	err := cmd.Run(context.Background(), env, nil)
 	if err == nil || !strings.Contains(err.Error(), "already exists") {
@@ -264,7 +303,7 @@ func TestInstallCreateClusterFailureRecordsError(t *testing.T) {
 	f := &fakeProvider{createErr: errors.New("quota exceeded")}
 	prov := registerFake(t, f)
 	env, _, _, dir := newInstallEnv(t, output.ModeHuman)
-	cmd := &installCommand{name: "boom", provider: prov, project: "p", costLimit: 10, assumeYes: true}
+	cmd := &installCommand{credentials: installKey(t), name: "boom", provider: prov, project: "p", costLimit: 10, assumeYes: true}
 
 	err := cmd.Run(context.Background(), env, nil)
 	if err == nil || !strings.Contains(err.Error(), "release") {
@@ -292,7 +331,7 @@ func TestInstallRecordsSystemOnlyLogging(t *testing.T) {
 	f := &fakeProvider{}
 	prov := registerFake(t, f)
 	env, out, _, dir := newInstallEnv(t, output.ModeHuman)
-	cmd := &installCommand{name: "prod", provider: prov, project: "p", costLimit: 10, assumeYes: true}
+	cmd := &installCommand{credentials: installKey(t), name: "prod", provider: prov, project: "p", costLimit: 10, assumeYes: true}
 	if err := cmd.Run(context.Background(), env, nil); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -324,7 +363,7 @@ func TestInstallDoesNotClaimUnverifiedLogging(t *testing.T) {
 	}}
 	prov := registerFake(t, f)
 	env, out, _, dir := newInstallEnv(t, output.ModeJSON)
-	cmd := &installCommand{name: "prod", provider: prov, project: "p", costLimit: 10, assumeYes: true}
+	cmd := &installCommand{credentials: installKey(t), name: "prod", provider: prov, project: "p", costLimit: 10, assumeYes: true}
 	if err := cmd.Run(context.Background(), env, nil); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -356,7 +395,7 @@ func TestInstallUnreachableRecordsStatus(t *testing.T) {
 	f := &fakeProvider{status: planck.StatusError} // health check sees non-running
 	prov := registerFake(t, f)
 	env, _, _, dir := newInstallEnv(t, output.ModeHuman)
-	cmd := &installCommand{name: "sick", provider: prov, project: "p", costLimit: 10, assumeYes: true}
+	cmd := &installCommand{credentials: installKey(t), name: "sick", provider: prov, project: "p", costLimit: 10, assumeYes: true}
 
 	err := cmd.Run(context.Background(), env, nil)
 	if err == nil || !strings.Contains(err.Error(), "not reachable") {
@@ -372,7 +411,7 @@ func TestInstallRejectsBadName(t *testing.T) {
 	f := &fakeProvider{}
 	prov := registerFake(t, f)
 	env, _, _, _ := newInstallEnv(t, output.ModeHuman)
-	cmd := &installCommand{name: "Bad_Name", provider: prov, project: "p", costLimit: 10, assumeYes: true}
+	cmd := &installCommand{credentials: installKey(t), name: "Bad_Name", provider: prov, project: "p", costLimit: 10, assumeYes: true}
 
 	err := cmd.Run(context.Background(), env, nil)
 	if _, ok := errors.AsType[*usageError](err); !ok {
@@ -384,7 +423,7 @@ func TestInstallEnsuresTheInstanceRegistry(t *testing.T) {
 	f := &fakeProvider{}
 	prov := registerFake(t, f)
 	env, out, _, dir := newInstallEnv(t, output.ModeHuman)
-	cmd := &installCommand{name: "prod", provider: prov, project: "proj-1", region: "us-central1", costLimit: 50, assumeYes: true}
+	cmd := &installCommand{credentials: installKey(t), name: "prod", provider: prov, project: "proj-1", region: "us-central1", costLimit: 50, assumeYes: true}
 
 	if err := cmd.Run(context.Background(), env, nil); err != nil {
 		t.Fatalf("Run: %v", err)
@@ -422,7 +461,7 @@ func TestInstallRegistryFailureLeavesTheInstanceUsable(t *testing.T) {
 	f := &fakeProvider{ensureErr: errors.New("permission denied on artifactregistry.repositories.create")}
 	prov := registerFake(t, f)
 	env, _, errb, dir := newInstallEnv(t, output.ModeHuman)
-	cmd := &installCommand{name: "prod", provider: prov, project: "proj-1", costLimit: 10, assumeYes: true}
+	cmd := &installCommand{credentials: installKey(t), name: "prod", provider: prov, project: "proj-1", costLimit: 10, assumeYes: true}
 
 	// The cluster is already created and billable, so a registry failure must
 	// not abort the install.
@@ -448,7 +487,7 @@ func TestInstallWithoutRegistryCapabilitySkipsSilently(t *testing.T) {
 	f := &fakeProvider{}
 	prov := registerProvider(t, clusterOnlyProvider{f})
 	env, out, errb, dir := newInstallEnv(t, output.ModeHuman)
-	cmd := &installCommand{name: "prod", provider: prov, project: "proj-1", costLimit: 10, assumeYes: true}
+	cmd := &installCommand{credentials: installKey(t), name: "prod", provider: prov, project: "proj-1", costLimit: 10, assumeYes: true}
 
 	if err := cmd.Run(context.Background(), env, nil); err != nil {
 		t.Fatalf("Run: %v", err)
@@ -472,7 +511,7 @@ func TestInstallJSONOutput(t *testing.T) {
 	f := &fakeProvider{}
 	prov := registerFake(t, f)
 	env, out, _, _ := newInstallEnv(t, output.ModeJSON)
-	cmd := &installCommand{name: "p", provider: prov, project: "proj", costLimit: 25, assumeYes: true}
+	cmd := &installCommand{credentials: installKey(t), name: "p", provider: prov, project: "proj", costLimit: 25, assumeYes: true}
 
 	if err := cmd.Run(context.Background(), env, nil); err != nil {
 		t.Fatalf("Run: %v", err)
@@ -486,5 +525,125 @@ func TestInstallJSONOutput(t *testing.T) {
 	}
 	if m["cloud_logging"] != config.CloudLoggingSystem {
 		t.Errorf("cloud_logging = %v, want %q", m["cloud_logging"], config.CloudLoggingSystem)
+	}
+}
+
+// ADR 0023 M2.5 (A20-1), mutation 71e: install refuses to provision without
+// a service-account key. From M2.5 every cluster-writing command reads the
+// cluster as the installer's stored key, so an instance installed with
+// Application Default Credentials could only ever be released. The flag
+// absent from a non-interactive run, a blank answer at the prompt, and a
+// --credentials file holding no key the writer could open (empty, /dev/null,
+// white space, or not a service-account key), are each a usage error naming
+// why, before the provider is opened or anything is recorded; and neither the
+// usage nor the prompt offers ADC any more.
+func TestInstallRefusesAMissingCredentials(t *testing.T) {
+	f := &fakeProvider{}
+	prov := registerFake(t, f)
+	for _, mode := range []output.Mode{output.ModeHuman, output.ModeJSON} {
+		env, _, _, dir := newInstallEnv(t, mode)
+		cmd := &installCommand{name: "prod", provider: prov, project: "proj-1", costLimit: 50, assumeYes: true}
+		err := cmd.Run(context.Background(), env, nil)
+		if _, ok := errors.AsType[*usageError](err); !ok || err.Error() != msgCredentialsRequired {
+			t.Errorf("mode %v, no --credentials: err = %v; want the usage error %q", mode, err, msgCredentialsRequired)
+		}
+		if exists, _ := dir.InstanceExists("prod"); exists || f.created != nil {
+			t.Errorf("mode %v: an install without a key recorded an instance or created a cluster", mode)
+		}
+	}
+	if want := "--credentials is required: since ADR 0023 M2.5 farcast reads an instance's cluster, and writes its storage key pin, " +
+		"as the service account whose key --credentials names, never as Application Default Credentials"; msgCredentialsRequired != want {
+		t.Errorf("the refusal is %q; want %q", msgCredentialsRequired, want)
+	}
+
+	// Each layer refuses on its own: the inputs, with no prompt when nobody
+	// is there to answer, and the read of the key file.
+	var quiet bytes.Buffer
+	c := &installCommand{name: "prod", provider: prov, project: "proj-1", region: "us-central1", costLimit: 50}
+	if err := c.resolveInputs(false, newPrompter(strings.NewReader(""), &quiet)); err == nil || err.Error() != msgCredentialsRequired || quiet.Len() != 0 {
+		t.Errorf("non-interactive inputs with no --credentials: err = %v, prompted %q", err, quiet.String())
+	}
+	if key, err := readCredentials(""); key != nil || err == nil || err.Error() != msgCredentialsRequired {
+		t.Errorf("readCredentials(\"\") = %q, %v; want the refusal", key, err)
+	}
+
+	// A --credentials that names a file holding no key the writer could open
+	// (S-F1): empty, /dev/null, only white space, or not a service-account
+	// key farcast uses. Planck reads an empty key as Application Default
+	// Credentials, so without this an install would create a cluster as this
+	// machine's ADC and record an instance every writing command refuses.
+	// Each is a usage error before the provider is opened, with nothing
+	// recorded and no cluster created, and none echoes the file.
+	dir := t.TempDir()
+	keyFile := func(name, body string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	for _, row := range []struct {
+		name, path, want string
+	}{
+		{"a zero-byte file", keyFile("empty.json", ""), msgCredentialsEmpty},
+		{"/dev/null", os.DevNull, msgCredentialsEmpty},
+		{"white space", keyFile("blank.json", "  \n\t\n"), msgCredentialsEmpty},
+		{"not a service-account key", keyFile("user.json", `{"type":"authorized_user","client_id":"c","refresh_token":"planted-refresh-token"}`),
+			"--credentials does not hold a key the instance's writer could open, so nothing was created: " +
+				"the stored service-account key is not a service-account key farcast uses (type)"},
+		{"no private key", keyFile("nokey.json", `{"type":"service_account","client_email":"installer@proj-1.iam.gserviceaccount.com"}`),
+			"--credentials does not hold a key the instance's writer could open, so nothing was created: " +
+				"the stored service-account key is not a service-account key farcast uses (private_key)"},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			f := &fakeProvider{}
+			opened := 0
+			prov := "fake-" + strings.ReplaceAll(t.Name(), "/", "-")
+			planck.Register(prov, func(planck.Config) (planck.Provider, error) { opened++; return f, nil })
+			for _, mode := range []output.Mode{output.ModeHuman, output.ModeJSON} {
+				env, out, errb, cfg := newInstallEnv(t, mode)
+				cmd := &installCommand{credentials: row.path, name: "prod", provider: prov, project: "proj-1", costLimit: 50, assumeYes: true}
+				err := cmd.Run(context.Background(), env, nil)
+				if _, ok := errors.AsType[*usageError](err); !ok || err.Error() != row.want {
+					t.Errorf("mode %v: err = %v; want the usage error %q", mode, err, row.want)
+				}
+				if exists, _ := cfg.InstanceExists("prod"); exists || f.created != nil || opened != 0 {
+					t.Errorf("mode %v: recorded %v, created %+v, opened the provider %d times", mode, exists, f.created, opened)
+				}
+				if strings.Contains(out.String()+errb.String()+err.Error(), "planted-refresh-token") {
+					t.Errorf("mode %v: the refusal echoes the file", mode)
+				}
+			}
+			if key, err := readCredentials(row.path); key != nil || err == nil || err.Error() != row.want {
+				t.Errorf("readCredentials(%s) = %q, %v; want %q", row.name, key, err, row.want)
+			}
+		})
+	}
+	if want := "--credentials names an empty file: since ADR 0023 M2.5 farcast reads an instance's cluster, and writes its storage key pin, " +
+		"as the service account whose key --credentials names, never as Application Default Credentials"; msgCredentialsEmpty != want {
+		t.Errorf("the empty-file refusal is %q; want %q", msgCredentialsEmpty, want)
+	}
+
+	// At the prompt: a blank answer is refused, never read as ADC.
+	for _, answer := range []string{"\n", "   \n"} {
+		var errb bytes.Buffer
+		c := &installCommand{name: "prod", provider: prov, project: "proj-1", region: "us-central1", costLimit: 50}
+		err := c.resolveInputs(true, newPrompter(strings.NewReader(answer), &errb))
+		if _, ok := errors.AsType[*usageError](err); !ok || err.Error() != msgCredentialsRequired {
+			t.Errorf("answer %q: err = %v; want the usage error %q", answer, err, msgCredentialsRequired)
+		}
+		if got := errb.String(); got != "Path to service-account key JSON: " {
+			t.Errorf("answer %q: the prompt was %q", answer, got)
+		}
+	}
+	// A path given at the prompt is taken.
+	c = &installCommand{name: "prod", provider: prov, project: "proj-1", region: "us-central1", costLimit: 50}
+	if err := c.resolveInputs(true, newPrompter(strings.NewReader("/keys/installer.json\n"), &bytes.Buffer{})); err != nil || c.credentials != "/keys/installer.json" {
+		t.Errorf("a path at the prompt: err = %v, credentials = %q", err, c.credentials)
+	}
+
+	usage := (&installCommand{}).Usage()
+	if !strings.Contains(usage, "--credentials <path>   Path to a service-account key JSON (required)") || strings.Contains(usage, "ADC") {
+		t.Errorf("install's usage does not say --credentials is required, or still offers ADC:\n%s", usage)
 	}
 }

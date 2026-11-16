@@ -44,6 +44,16 @@ type fakeCluster struct {
 	// let kernel deploy build an image for a namespace that was not there.
 	namespaces    []string
 	namespacesErr error
+
+	// uidReads counts the writer's preflight reads (A20-11), and uidErr
+	// answers them.
+	uidReads int
+	uidErr   error
+}
+
+func (f *fakeCluster) NamespaceUID(context.Context, string) (string, error) {
+	f.uidReads++
+	return "", f.uidErr
 }
 
 func (f *fakeCluster) Apply(_ context.Context, m []byte) error {
@@ -416,7 +426,7 @@ func TestConnectBootstrapsAndReports(t *testing.T) {
 	c := testConnect(&fakeProvider{}, fb)
 	c.assumeYes = true
 	c.fatlineImage = testNamedImage // an explicit override: deployed as given
-	c.newCluster = func(string) clusterApplier { return fc }
+	c.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 	c.dial = func(_ context.Context, endpoint string, id tunnel.ClientIdentity) (tunnelConn, error) {
 		dialed = endpoint
 		if id.ServerName != "prod.fatline.farcast" {
@@ -471,7 +481,7 @@ func TestConnectCostGateRequiresYes(t *testing.T) {
 
 	fc := &fakeCluster{ip: "1.2.3.4"}
 	c := testConnect(&fakeProvider{}, &fakeBuilder{}) // assumeYes stays false; env is non-interactive
-	c.newCluster = func(string) clusterApplier { return fc }
+	c.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 	c.dial = func(context.Context, string, tunnel.ClientIdentity) (tunnelConn, error) {
 		t.Fatal("must not dial without cost confirmation")
 		return nil, nil
@@ -499,7 +509,7 @@ func TestConnectStatusOnlyBeforeBootstrap(t *testing.T) {
 	fc := &fakeCluster{}
 	c := testConnect(&fakeProvider{}, &fakeBuilder{})
 	c.statusOnly = true
-	c.newCluster = func(string) clusterApplier { return fc }
+	c.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 	c.dial = func(context.Context, string, tunnel.ClientIdentity) (tunnelConn, error) {
 		t.Fatal("must not dial when not yet connected")
 		return nil, nil
@@ -524,7 +534,7 @@ func TestConnectReconnectSkipsBootstrap(t *testing.T) {
 	fb := &fakeBuilder{}
 	var dialed string
 	c := testConnect(fp, fb)
-	c.newCluster = func(string) clusterApplier { return fc }
+	c.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 	c.dial = func(_ context.Context, endpoint string, _ tunnel.ClientIdentity) (tunnelConn, error) {
 		dialed = endpoint
 		return &fakeConn{st: fatline.ConnStatus{Connected: true}}, nil
@@ -570,7 +580,7 @@ func TestConnectDeploysShrikeBesideFatLine(t *testing.T) {
 	fb := &fakeBuilder{}
 	c := testConnect(&fakeProvider{token: planck.RegistryToken{Username: "oauth2accesstoken", Password: "tok"}}, fb)
 	c.assumeYes = true
-	c.newCluster = func(string) clusterApplier { return fc }
+	c.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 	c.dial = connectedDial()
 
 	if err := c.Run(context.Background(), env, []string{name}); err != nil {
@@ -602,7 +612,7 @@ func TestConnectDefaultsImageToTheInstanceRegistry(t *testing.T) {
 	fb := &fakeBuilder{}
 	c := testConnect(fp, fb)
 	c.assumeYes = true
-	c.newCluster = func(string) clusterApplier { return fc }
+	c.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 	c.dial = connectedDial()
 
 	env, out := testEnv(dir, output.ModeHuman)
@@ -646,7 +656,7 @@ func TestConnectBuildsTheImageWhenTheRegistryHasNone(t *testing.T) {
 	c.assumeYes = true
 	c.sourceDir = "/checkouts/farcast"
 	c.findSource = func(dir string) (string, error) { askedFor = dir; return "/checkouts/farcast", nil }
-	c.newCluster = func(string) clusterApplier { return fc }
+	c.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 	c.dial = connectedDial()
 
 	env, _ := testEnv(dir, output.ModeHuman)
@@ -689,7 +699,7 @@ func TestConnectMissingImageWithoutCheckoutFails(t *testing.T) {
 	c := testConnect(&fakeProvider{}, fb) // findSource fails by default
 	asSourceBuild(&c.fatlineDeployer, "dev")
 	c.assumeYes = true
-	c.newCluster = func(string) clusterApplier { return fc }
+	c.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 	c.dial = func(context.Context, string, tunnel.ClientIdentity) (tunnelConn, error) {
 		t.Fatal("must not dial when there is no image to deploy")
 		return nil, nil
@@ -728,7 +738,7 @@ func TestConnectMissingImageNonInteractiveRequiresYes(t *testing.T) {
 	c := testConnect(&fakeProvider{}, fb) // assumeYes stays false; env is non-interactive
 	asSourceBuild(&c.fatlineDeployer, "dev")
 	c.findSource = func(string) (string, error) { return "/checkouts/farcast", nil }
-	c.newCluster = func(string) clusterApplier { return fc }
+	c.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 
 	env, _ := testEnv(dir, output.ModeHuman)
 	err := c.Run(context.Background(), env, []string{name})
@@ -752,7 +762,7 @@ func TestConnectStatusDoesNoRegistryWork(t *testing.T) {
 	fc := &fakeCluster{}
 	c := newConnectCommand()
 	c.statusOnly = true
-	c.newCluster = func(string) clusterApplier { return fc }
+	c.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 	c.dial = connectedDial()
 	// A status probe must work with no registry access at all: no provider is
 	// opened, so no credential is read and no cloud API is called.
@@ -782,7 +792,7 @@ func TestConnectStatusNamesTheRelayingReplicasNode(t *testing.T) {
 		connectedInstance(t, dir, "prod")
 		c := newConnectCommand()
 		c.statusOnly = true
-		c.newCluster = func(string) clusterApplier { return &fakeCluster{} }
+		c.newCluster = func(clusterRef) (clusterApplier, error) { return &fakeCluster{}, nil }
 		c.dial = func(context.Context, string, tunnel.ClientIdentity) (tunnelConn, error) {
 			return &fakeConn{st: fatline.ConnStatus{Connected: true, Node: node}}, nil
 		}
@@ -810,7 +820,7 @@ func TestConnectRegistryFailureDoesNotBreakReconnect(t *testing.T) {
 	fp := &fakeProvider{ensureErr: errors.New("permission denied on artifactregistry.repositories.create")}
 	fc := &fakeCluster{}
 	c := testConnect(fp, &fakeBuilder{})
-	c.newCluster = func(string) clusterApplier { return fc }
+	c.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 	c.dial = connectedDial()
 
 	env, out := testEnv(dir, output.ModeHuman)
@@ -838,7 +848,7 @@ func TestConnectRegistryFailureStopsBootstrap(t *testing.T) {
 	fc := &fakeCluster{ip: "34.0.0.1"}
 	c := testConnect(fp, &fakeBuilder{})
 	c.assumeYes = true
-	c.newCluster = func(string) clusterApplier { return fc }
+	c.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 	c.dial = func(context.Context, string, tunnel.ClientIdentity) (tunnelConn, error) {
 		t.Fatal("must not dial when the bootstrap has no image source")
 		return nil, nil
@@ -868,7 +878,7 @@ func TestConnectExplicitImageSurvivesRegistryFailure(t *testing.T) {
 	c := testConnect(fp, &fakeBuilder{})
 	c.assumeYes = true
 	c.fatlineImage = "registry.example/fatline@sha256:" + strings.Repeat("c", 64)
-	c.newCluster = func(string) clusterApplier { return fc }
+	c.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 	c.dial = connectedDial()
 
 	env, _ := testEnv(dir, output.ModeHuman)
@@ -912,7 +922,7 @@ func TestConnectJSONOutput(t *testing.T) {
 	fc := &fakeCluster{ip: "34.0.0.2"}
 	c := testConnect(&fakeProvider{}, &fakeBuilder{})
 	c.assumeYes = true
-	c.newCluster = func(string) clusterApplier { return fc }
+	c.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 	c.dial = connectedDial("api.x")
 
 	env, out := testEnv(dir, output.ModeJSON)
@@ -960,7 +970,7 @@ func TestConnectRejectsImageFlagsOnReconnect(t *testing.T) {
 
 			fc := &fakeCluster{}
 			c := testConnect(&fakeProvider{}, &fakeBuilder{})
-			c.newCluster = func(string) clusterApplier { return fc }
+			c.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 			c.dial = connectedDial()
 			tc.apply(c)
 
@@ -1098,7 +1108,7 @@ func TestConnectRejectsBothImageFlags(t *testing.T) {
 
 	fc := &fakeCluster{ip: "34.0.0.1"}
 	c := testConnect(&fakeProvider{}, &fakeBuilder{})
-	c.newCluster = func(string) clusterApplier { return fc }
+	c.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 	c.dial = connectedDial()
 	c.assumeYes = true
 	c.fatlineImage = "example.test/repo/fatline:2"
@@ -1127,7 +1137,7 @@ func TestABootstrapWaitsForTheCarrierToStartForwarding(t *testing.T) {
 	c := testConnect(&fakeProvider{}, &fakeBuilder{})
 	c.assumeYes = true
 	c.fatlineImage = testNamedImage
-	c.newCluster = func(string) clusterApplier { return &fakeCluster{ip: "34.0.0.9"} }
+	c.newCluster = func(clusterRef) (clusterApplier, error) { return &fakeCluster{ip: "34.0.0.9"}, nil }
 	c.warmupRetry, c.warmupWindow = time.Millisecond, time.Second
 
 	var attempts int
@@ -1158,7 +1168,7 @@ func TestStatusDoesNotWaitOutATimeout(t *testing.T) {
 
 	c := testConnect(&fakeProvider{}, &fakeBuilder{})
 	c.statusOnly = true
-	c.newCluster = func(string) clusterApplier { return &fakeCluster{ip: "34.0.0.9"} }
+	c.newCluster = func(clusterRef) (clusterApplier, error) { return &fakeCluster{ip: "34.0.0.9"}, nil }
 	var attempts int
 	c.dial = func(context.Context, string, tunnel.ClientIdentity) (tunnelConn, error) {
 		attempts++
@@ -1206,7 +1216,7 @@ func TestConnectRefusesAnEd25519Store(t *testing.T) {
 		fc := &fakeCluster{}
 		c := testConnect(&fakeProvider{}, &fakeBuilder{})
 		c.statusOnly = statusOnly
-		c.newCluster = func(string) clusterApplier { return fc }
+		c.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 		c.dial = func(context.Context, string, tunnel.ClientIdentity) (tunnelConn, error) {
 			dialled++
 			return &fakeConn{st: fatline.ConnStatus{Connected: true}}, nil

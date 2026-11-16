@@ -51,9 +51,11 @@ func (routedTunnel) Close() error { return nil }
 // the cluster as "writer", beside the reader's key, registered as "reader".
 // world never opens credentials.yaml, reads reader.key, is answered only as
 // the reader, never signs an assertion with the writer's key, and reads
-// spend, apps and policy: a writer that refuses to open sends nothing, so the
-// reads succeeding is what shows the reader read. instances and world also
-// open neither the CA key nor the keyring (ADR 0021 decision 9).
+// spend, apps and policy. Since ADR 0023 M2.5 the fixture's writer opens
+// too, and could read all of it, so a world that read as the writer would
+// now reach the server and fail the As checks: the test is stronger than
+// when a writer refused to open. instances and world also open neither the
+// CA key nor the keyring (ADR 0021 decision 9).
 func TestWorldNeverOpensAWriterCredential(t *testing.T) {
 	f := newWorldReaderFixture(t) // a connected instance whose fatline/ holds ca.key
 	keys, err := datasphere.NewKeyring()

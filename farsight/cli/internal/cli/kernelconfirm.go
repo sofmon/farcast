@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
+	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 	"github.com/sofmon/farcast/technocore/cost"
 	tcdeploy "github.com/sofmon/farcast/technocore/deploy"
 	"github.com/sofmon/farcast/technocore/kernel"
@@ -82,16 +83,22 @@ func (c *kernelConfirmCommand) SetFlags(fs *flag.FlagSet) {
 	c.deployer.setYesFlag(fs, "unused; accepted so scripts can pass it uniformly")
 }
 
-func (c *kernelConfirmCommand) Run(ctx context.Context, env *Env, args []string) error {
+func (c *kernelConfirmCommand) Run(ctx context.Context, env *Env, args []string) (err error) {
+	// A 403 the writer met says whose it was, once (A20-9).
+	var meta *config.InstanceMetadata
+	defer func() { err = writerRefused(err, meta) }()
 	if len(args) != 1 {
 		return usagef("kernel confirm takes one instance argument")
 	}
 	name := args[0]
 	c.deployer.ensureDefaults()
 
-	meta, err := env.ConfigDir.LoadInstanceMetadata(name)
+	meta, err = env.ConfigDir.LoadInstanceMetadata(name)
 	if err != nil {
 		return fmt.Errorf("load instance %q: %w", name, err)
+	}
+	if err := recordNamed(meta, name); err != nil {
+		return err
 	}
 	if meta.Kernel == nil || !meta.Kernel.Deployed {
 		return fmt.Errorf("instance %q has no kernel; run 'farcast kernel deploy %s' first", name, name)
@@ -138,6 +145,18 @@ func (c *kernelConfirmCommand) Run(ctx context.Context, env *Env, args []string)
 		return err
 	}
 
+	// The writer is opened before the record changes (ADR 0023 M2.5,
+	// A20-10): opening sends nothing, so an instance this machine cannot
+	// write as is refused with its record as it was, and never left holding
+	// a confirmation the cluster never got, which the next push would skip.
+	cl, err := c.deployer.newCluster(clusterRef{Dir: env.ConfigDir, Meta: meta, Identity: kube.Writer, Warn: env.Err})
+	if err != nil {
+		return err
+	}
+	if err := applyReady(cl); err != nil {
+		return err
+	}
+
 	// Recorded before the apply, like every other thing this CLI changes in a
 	// cluster: a confirmation the cluster has and local state does not is one
 	// the next push would try to add again.
@@ -152,7 +171,6 @@ func (c *kernelConfirmCommand) Run(ctx context.Context, env *Env, args []string)
 	if err != nil {
 		return err
 	}
-	cl := c.deployer.newCluster(env.ConfigDir.InstanceKubeconfigPath(name))
 	if err := cl.Apply(ctx, manifest); err != nil {
 		// Put local state back: a recorded confirmation the cluster never
 		// received would silently be skipped by the next push, and the window

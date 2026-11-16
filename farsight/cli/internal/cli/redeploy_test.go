@@ -58,7 +58,7 @@ func TestRedeployRefusesAnInstanceThatWasNeverConnected(t *testing.T) {
 	fc := &fakeCluster{}
 	c := testRedeploy(&fakeProvider{}, &fakeBuilder{})
 	c.assumeYes = true
-	c.newCluster = func(string) clusterApplier { return fc }
+	c.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 
 	env, _ := testEnv(dir, output.ModeHuman)
 	err := c.Run(context.Background(), env, []string{name})
@@ -90,7 +90,7 @@ func TestRedeployRefusesADeletingInstance(t *testing.T) {
 	fc := &fakeCluster{}
 	c := testRedeploy(&fakeProvider{}, &fakeBuilder{})
 	c.assumeYes = true
-	c.newCluster = func(string) clusterApplier { return fc }
+	c.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 
 	env, _ := testEnv(dir, output.ModeHuman)
 	err := c.Run(context.Background(), env, []string{name})
@@ -116,7 +116,7 @@ func TestRedeployDeploysAnExplicitImageAsGiven(t *testing.T) {
 	c := testRedeploy(&fakeProvider{}, fb)
 	c.assumeYes = true
 	c.fatlineImage = explicit
-	c.newCluster = func(string) clusterApplier { return fc }
+	c.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 
 	env, _ := testEnv(dir, output.ModeHuman)
 	if err := c.Run(context.Background(), env, []string{name}); err != nil {
@@ -155,7 +155,7 @@ func TestRedeployDeploysThePreflightedDigest(t *testing.T) {
 	fb := &fakeBuilder{}
 	c := testRedeploy(fp, fb)
 	c.assumeYes = true
-	c.newCluster = func(string) clusterApplier { return fc }
+	c.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 
 	env, out := testEnv(dir, output.ModeHuman)
 	if err := c.Run(context.Background(), env, []string{name}); err != nil {
@@ -215,7 +215,7 @@ func TestRedeployBuildsTheImageWhenTheRegistryHasNone(t *testing.T) {
 	c.assumeYes = true
 	c.sourceDir = "/checkouts/farcast"
 	c.findSource = func(dir string) (string, error) { askedFor = dir; return "/checkouts/farcast", nil }
-	c.newCluster = func(string) clusterApplier { return fc }
+	c.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 
 	env, _ := testEnv(dir, output.ModeHuman)
 	if err := c.Run(context.Background(), env, []string{name}); err != nil {
@@ -260,7 +260,7 @@ func TestRedeployReappliesAnUnchangedImage(t *testing.T) {
 	fc := &fakeCluster{}
 	c := testRedeploy(&fakeProvider{}, &fakeBuilder{})
 	c.assumeYes = true
-	c.newCluster = func(string) clusterApplier { return fc }
+	c.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 
 	env, out := testEnv(dir, output.ModeHuman)
 	if err := c.Run(context.Background(), env, []string{name}); err != nil {
@@ -294,7 +294,7 @@ func TestRedeployNonInteractiveRequiresYes(t *testing.T) {
 
 	fc := &fakeCluster{}
 	c := testRedeploy(&fakeProvider{}, &fakeBuilder{}) // assumeYes stays false; env is non-interactive
-	c.newCluster = func(string) clusterApplier { return fc }
+	c.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 
 	env, _ := testEnv(dir, output.ModeHuman)
 	err := c.Run(context.Background(), env, []string{name})
@@ -327,7 +327,7 @@ func TestRedeployJSONOutput(t *testing.T) {
 	fc := &fakeCluster{}
 	c := testRedeploy(&fakeProvider{}, &fakeBuilder{})
 	c.assumeYes = true
-	c.newCluster = func(string) clusterApplier { return fc }
+	c.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 
 	env, out := testEnv(dir, output.ModeJSON)
 	if err := c.Run(context.Background(), env, []string{name}); err != nil {
@@ -379,7 +379,7 @@ func TestRedeployNeverMintsIdentity(t *testing.T) {
 	fc := &fakeCluster{}
 	c := testRedeploy(&fakeProvider{}, &fakeBuilder{})
 	c.assumeYes = true
-	c.newCluster = func(string) clusterApplier { return fc }
+	c.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 
 	env, _ := testEnv(dir, output.ModeHuman)
 	err := c.Run(context.Background(), env, []string{name})
@@ -410,7 +410,7 @@ func TestRedeploySourceForcesARebuild(t *testing.T) {
 	fc := &fakeCluster{}
 	fb := &fakeBuilder{} // Resolve would succeed — the stale image is present
 	c := testRedeploy(&fakeProvider{}, fb)
-	c.newCluster = func(string) clusterApplier { return fc }
+	c.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 	c.sourceDir = t.TempDir()
 	c.findSource = func(d string) (string, error) { return d, nil }
 	c.assumeYes = true
@@ -460,7 +460,7 @@ func TestRedeployRejectsBothImageFlags(t *testing.T) {
 
 	fc := &fakeCluster{}
 	c := testRedeploy(&fakeProvider{}, &fakeBuilder{})
-	c.newCluster = func(string) clusterApplier { return fc }
+	c.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 	c.fatlineImage = "example.test/repo/fatline:2"
 	c.sourceDir = t.TempDir()
 	c.assumeYes = true
@@ -488,7 +488,7 @@ func TestRedeployKeepsTheRecordWhenTheRolloutFails(t *testing.T) {
 
 	fc := &fakeCluster{rolloutErr: errors.New("timed out waiting for the rollout")}
 	c := testRedeploy(&fakeProvider{}, &fakeBuilder{})
-	c.newCluster = func(string) clusterApplier { return fc }
+	c.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 	c.fatlineImage = "example.test/repo/fatline@sha256:" + strings.Repeat("b", 64)
 	c.assumeYes = true
 

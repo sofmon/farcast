@@ -23,6 +23,15 @@ type fakeJobs struct {
 	applyErr error
 	logs     string
 	waited   []string
+	// uidReads counts the writer's preflight reads (A20-11), and uidErr
+	// answers them.
+	uidReads int
+	uidErr   error
+}
+
+func (f *fakeJobs) NamespaceUID(context.Context, string) (string, error) {
+	f.uidReads++
+	return "", f.uidErr
 }
 
 func (f *fakeJobs) Apply(_ context.Context, m []byte) error {
@@ -52,7 +61,7 @@ func buildableInstance(t *testing.T, dir config.Dir, name string) *config.Instan
 
 func buildCmd(fj *fakeJobs) *buildCommand {
 	c := &buildCommand{assumeYes: true}
-	c.newCluster = func(string) jobWaiter { return fj }
+	c.newCluster = func(clusterRef) (jobWaiter, error) { return fj, nil }
 	c.newBuilder = func(func(string)) imageBuilder { return &fakeBuilder{} }
 	return c
 }

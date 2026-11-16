@@ -222,9 +222,10 @@ func PinConfigMapName(name string) string {
 	return name + "-pin"
 }
 
-// RenderPin renders the pin ConfigMap as JSON for `kubectl create -f -`, or,
-// with the resourceVersion it was read at, for `kubectl replace -f -` — which
-// the API server refuses if anything wrote in between. The value is the pin as
+// RenderPin renders the pin ConfigMap as JSON: the body of a create (a POST),
+// or, with the resourceVersion it was read at, of a replace (a PUT), which the
+// API server refuses if anything wrote in between. farcast sends both
+// in-process as the instance's writer (ADR 0023 M2.5). The value is the pin as
 // datasphere/keyholder marshals it; it is JSON inside JSON, so the document is
 // built by encoding/json rather than a template.
 //

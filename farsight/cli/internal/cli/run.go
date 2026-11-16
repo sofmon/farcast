@@ -10,10 +10,10 @@ import (
 	"time"
 
 	"github.com/sofmon/farcast/datasphere"
-	"github.com/sofmon/farcast/farsight/cli/internal/cluster"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/image"
 	"github.com/sofmon/farcast/farsight/cli/internal/keyholder"
+	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 	fldeploy "github.com/sofmon/farcast/fatline/deploy"
 	"github.com/sofmon/farcast/fatline/identity"
 	"github.com/sofmon/farcast/fatline/policy"
@@ -51,7 +51,7 @@ type runCommand struct {
 	replaceRepository bool
 
 	// Seams, overridable in tests.
-	newCluster func(kubeconfigPath string) runCluster
+	newCluster func(clusterRef) (runCluster, error)
 	newBuilder func(progress func(string)) imageBuilder
 	// newKeyholder opens the session that hands new scopes to a running
 	// keyholder. It is a seam because the decision it guards — never unseal a
@@ -130,7 +130,15 @@ func (c *runCommand) SetFlags(fs *flag.FlagSet) {
 
 func (c *runCommand) ensureDefaults() {
 	if c.newCluster == nil {
-		c.newCluster = func(kc string) runCluster { return cluster.New(kc) }
+		c.newCluster = func(r clusterRef) (runCluster, error) {
+			// A refusal returns a nil cluster, never a nil *cluster.Client
+			// inside a non-nil one.
+			cl, err := openWriter(r)
+			if err != nil {
+				return nil, err
+			}
+			return cl, nil
+		}
 	}
 	if c.newBuilder == nil {
 		c.newBuilder = func(progress func(string)) imageBuilder {
@@ -139,7 +147,10 @@ func (c *runCommand) ensureDefaults() {
 	}
 }
 
-func (c *runCommand) Run(ctx context.Context, env *Env, args []string) error {
+func (c *runCommand) Run(ctx context.Context, env *Env, args []string) (err error) {
+	// A 403 the writer met says whose it was, once (A20-9).
+	var meta *config.InstanceMetadata
+	defer func() { err = writerRefused(err, meta) }()
 	if len(args) != 2 {
 		return usagef("run takes an instance and a repository, e.g. 'farcast run prod github.com/user/repo'")
 	}
@@ -150,9 +161,12 @@ func (c *runCommand) Run(ctx context.Context, env *Env, args []string) error {
 	if err != nil {
 		return err
 	}
-	meta, err := env.ConfigDir.LoadInstanceMetadata(name)
+	meta, err = env.ConfigDir.LoadInstanceMetadata(name)
 	if err != nil {
 		return fmt.Errorf("load instance %q: %w", name, err)
+	}
+	if err := recordNamed(meta, name); err != nil {
+		return err
 	}
 	if meta.Registry == nil || meta.Registry.Prefix == "" {
 		return fmt.Errorf("instance %q has no image registry recorded; run 'farcast connect %s' first", name, name)
@@ -183,6 +197,22 @@ func (c *runCommand) Run(ctx context.Context, env *Env, args []string) error {
 		}
 	}
 
+	// The writer is opened, and read once, before any toolchain image is
+	// resolved or pushed, anything is fetched or asked (ADR 0023 M2.5, A20-10
+	// and A20-11): an instance this machine cannot write as is refused with
+	// nothing spent, and an endpoint that refuses the installer's key
+	// refuses it before kubectl applies the fetch.
+	cl, err := c.newCluster(clusterRef{Dir: env.ConfigDir, Meta: meta, Identity: kube.Writer, Warn: env.Err})
+	if err != nil {
+		return err
+	}
+	if err := applyReady(cl); err != nil {
+		return err
+	}
+	if err := preflightNamespace(ctx, cl); err != nil {
+		return err
+	}
+
 	fetcher, err := resolveToolchainImage(ctx, env, meta, fetcherKind, c.fetcherImage, c.newBuilder)
 	if err != nil {
 		return err
@@ -191,8 +221,6 @@ func (c *runCommand) Run(ctx context.Context, env *Env, args []string) error {
 	if err != nil {
 		return err
 	}
-
-	cl := c.newCluster(env.ConfigDir.InstanceKubeconfigPath(name))
 
 	// 1. The instance reads the manifest and reports what it read.
 	read, err := readManifest(ctx, env, cl, pfetch.Config{
@@ -293,7 +321,7 @@ func (c *runCommand) Run(ctx context.Context, env *Env, args []string) error {
 		return err
 	}
 	if len(minted) > 0 {
-		c.handScopesToTheKeyholder(ctx, env, meta, minted)
+		c.handScopesToTheKeyholder(ctx, env, meta, minted, cl)
 	}
 	if err := cl.Apply(ctx, workloads); err != nil {
 		return fmt.Errorf("deploy %q: %w", namespace, err)
@@ -314,7 +342,7 @@ func (c *runCommand) Run(ctx context.Context, env *Env, args []string) error {
 	for _, app := range m.Apps {
 		if err := cl.RolloutStatus(ctx, namespace, app.Name, rolloutTimeout); err != nil {
 			slow = append(slow, app.Name)
-			fprintf(env.Err, "%s did not roll out: %v\n", app.Name, err)
+			fprintf(env.Err, "%s did not roll out: %s\n", app.Name, terminalText(err.Error()))
 		}
 	}
 
@@ -530,19 +558,19 @@ func (c *runCommand) ensureAppScopes(env *Env, instance, namespace string, m par
 // Not before the check: a pin raised from a keyring the fleet then refuses as
 // behind would lock out the machine whose keys the fleet serves. And like the
 // hand-over, nothing here fails the deploy.
-func (c *runCommand) pinScopes(ctx context.Context, env *Env, meta *config.InstanceMetadata, keys datasphere.Keyring) func(sealStateClient) error {
+//
+// cl is the writer run opened: the pin is reached through it (pinStoreFor),
+// so a run that raises the pin mints the installer's token once, not once
+// more for a second writer (C-F1).
+func (c *runCommand) pinScopes(ctx context.Context, env *Env, meta *config.InstanceMetadata, keys datasphere.Keyring, cl any) func(sealStateClient) error {
 	return func(client sealStateClient) error {
-		c.raiseScopePin(ctx, env, meta, keys, client)
+		c.raiseScopePin(ctx, env, meta, keys, client, cl)
 		return nil
 	}
 }
 
-func (c *runCommand) raiseScopePin(ctx context.Context, env *Env, meta *config.InstanceMetadata, keys datasphere.Keyring, client sealStateClient) {
-	open := c.newPinStore
-	if open == nil {
-		open = defaultPinStore
-	}
-	ps, err := open(env.ConfigDir.InstanceKubeconfigPath(meta.Name))
+func (c *runCommand) raiseScopePin(ctx context.Context, env *Env, meta *config.InstanceMetadata, keys datasphere.Keyring, client sealStateClient, cl any) {
+	ps, err := pinStoreFor(c.newPinStore, clusterRef{Dir: env.ConfigDir, Meta: meta, Identity: kube.Writer, Warn: env.Err}, cl)
 	var w pinWrite
 	if err == nil {
 		w, err = writePin(ctx, ps, keys, false, false)
@@ -553,8 +581,8 @@ func (c *runCommand) raiseScopePin(ctx context.Context, env *Env, meta *config.I
 		fprintf(env.Err, "warning: %v; the keyholder will refuse the hand-over.\n", behind)
 		return
 	case err != nil:
-		fprintf(env.Err, "warning: the instance's key pin was not raised (%v): a replica that restarts still admits a keeper's bundle without "+
-			"the new scope. %s raises it.\n", err, pinRemedy(meta.Name))
+		fprintf(env.Err, "warning: the instance's key pin was not raised (%s): a replica that restarts still admits a keeper's bundle without "+
+			"the new scope. %s raises it.\n", terminalText(err.Error()), pinRemedy(meta.Name))
 		return
 	case !w.Changed:
 		return
@@ -605,14 +633,14 @@ func refuseSharedAppScope(instance string, k datasphere.Keyring) error {
 // for, and an application that starts into ErrStorageSealed is in a
 // documented, recoverable state that one command fixes — where a deploy
 // abandoned halfway is not.
-func (c *runCommand) handScopesToTheKeyholder(ctx context.Context, env *Env, meta *config.InstanceMetadata, minted []string) {
+func (c *runCommand) handScopesToTheKeyholder(ctx context.Context, env *Env, meta *config.InstanceMetadata, minted []string, cl any) {
 	apps := strings.Join(minted, ", ")
 	keys, err := keyringOf(env, meta.Name)
 	if err != nil {
 		c.sealedNotice(env, meta.Name, minted, err.Error())
 		return
 	}
-	res := handOverKeys(ctx, env, meta, keyholderOpener(c.newKeyholder), keys, handOverOptions{beforePush: c.pinScopes(ctx, env, meta, keys)})
+	res := handOverKeys(ctx, env, meta, keyholderOpener(c.newKeyholder), keys, handOverOptions{beforePush: c.pinScopes(ctx, env, meta, keys, cl)})
 	switch {
 	case res.Unsafe:
 		// Not a seal, and an unseal now would refuse for the same reason: the

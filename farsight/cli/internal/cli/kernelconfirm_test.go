@@ -27,7 +27,7 @@ func kernelInstance(t *testing.T, dir config.Dir, name string) *config.InstanceM
 
 func confirmCmd(fc *fakeCluster) *kernelConfirmCommand {
 	c := &kernelConfirmCommand{}
-	c.deployer.newCluster = func(string) clusterApplier { return fc }
+	c.deployer.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 	return c
 }
 

@@ -19,6 +19,7 @@ import (
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/image"
 	"github.com/sofmon/farcast/farsight/cli/internal/keyholder"
+	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 	"github.com/sofmon/farcast/farsight/cli/internal/oci"
 	"github.com/sofmon/farcast/fatline/deploy"
 	"github.com/sofmon/farcast/planck"
@@ -41,6 +42,83 @@ type clusterApplier interface {
 	// Namespaces is here so a command can check what it is about to render
 	// into before it builds anything (see kernel deploy).
 	Namespaces(ctx context.Context) ([]string, error)
+	preflighter
+}
+
+// preflighter is the one read a writing command makes as the writer before
+// anything it does costs, is asked or is applied (ADR 0023 M2.5, A20-11).
+type preflighter interface {
+	NamespaceUID(ctx context.Context, name string) (string, error)
+}
+
+// preflightNamespace is that read: farcast-system's uid, discarded. It makes
+// the first in-process call as the writer, the installer's key, before a
+// command's first kubectl Apply could land, so an endpoint or a cluster that
+// refuses the writer refuses it before anything was written, asked, minted
+// or pushed. "" (no farcast-system yet, a first connect) is no failure.
+func preflightNamespace(ctx context.Context, cl preflighter) error {
+	if _, err := cl.NamespaceUID(ctx, deploy.DefaultNamespace); err != nil {
+		return fmt.Errorf("before changing anything, read the instance's cluster as its installer service account: %w", err)
+	}
+	return nil
+}
+
+// openWriter is every writing seam's default: openCluster as the instance's
+// writer, the installer's service-account key (ADR 0023 M2.5). Its reads,
+// and the storage key pin's create and replace, run in-process as that key;
+// until ADR 0023 M2.7 its Apply runs kubectl as the active gcloud
+// configuration.
+func openWriter(r clusterRef) (*cluster.Client, error) {
+	r.Identity, r.Verifying = kube.Writer, false
+	return openCluster(r)
+}
+
+// applyReadier is a writer that can say, running nothing and sending
+// nothing, whether its Apply could start: cluster.Client.ApplyReady.
+type applyReadier interface {
+	ApplyReady() error
+}
+
+// The cluster client is what every writing seam opens by default, so the
+// checks below that find a method by its interface never silently stop
+// finding it.
+var (
+	_ applyReadier = (*cluster.Client)(nil)
+	_ pinStore     = (*cluster.Client)(nil)
+)
+
+// applyReady is the local check every command that applies makes right after
+// it opens its writer, before it reads, asks, mints, pushes, writes or
+// records anything (ADR 0023 M2.5, S-F2). Until ADR 0023 M2.7 its Apply runs
+// kubectl over the instance's kubeconfig; before M2.5 a missing kubectl or
+// kubeconfig was found at the command's first read, which ran kubectl, and
+// since M2.5 that read is in-process, so this finds them there instead. It
+// cannot find a missing auth plugin or a signed-out gcloud: only kubectl's
+// run does. A writer that cannot say (a test's fake) is taken as ready.
+func applyReady(cl any) error {
+	r, ok := cl.(applyReadier)
+	if !ok {
+		return nil
+	}
+	if err := r.ApplyReady(); err != nil {
+		return fmt.Errorf("this machine cannot apply to the instance's cluster, so nothing was changed: %w", err)
+	}
+	return nil
+}
+
+// pinStoreFor is the pin a writing command reads and writes: its own seam
+// when a test set one; otherwise the writer it already opened, when that
+// writer reaches the pin too (the cluster client does), so one writer, one
+// read of credentials.yaml and one token serve the whole command (A20-10);
+// otherwise the default opener.
+func pinStoreFor(seam pinStoreOpener, ref clusterRef, cl any) (pinStore, error) {
+	if seam != nil {
+		return seam(ref)
+	}
+	if ps, ok := cl.(pinStore); ok {
+		return ps, nil
+	}
+	return defaultPinStore(ref)
 }
 
 // imageBuilder is the slice of *image.Builder these commands need (injectable):
@@ -141,7 +219,7 @@ type fatlineDeployer struct {
 	embedded bool
 
 	// Seams, overridable in tests; defaulted by ensureDefaults.
-	newCluster   func(kubeconfigPath string) clusterApplier
+	newCluster   func(clusterRef) (clusterApplier, error)
 	openProvider providerOpener
 	newBuilder   func(progress func(string)) imageBuilder
 	findSource   func(dir string) (string, error)
@@ -155,7 +233,15 @@ func (d *fatlineDeployer) ensureDefaults() {
 		d.component = components.FatLine
 	}
 	if d.newCluster == nil {
-		d.newCluster = func(kc string) clusterApplier { return cluster.New(kc) }
+		d.newCluster = func(r clusterRef) (clusterApplier, error) {
+			// A refusal returns a nil applier, never a nil *cluster.Client
+			// inside a non-nil one.
+			cl, err := openWriter(r)
+			if err != nil {
+				return nil, err
+			}
+			return cl, nil
+		}
 	}
 	if d.openProvider == nil {
 		d.openProvider = defaultProviderOpener

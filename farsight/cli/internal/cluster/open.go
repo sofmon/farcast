@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/netip"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,24 +18,37 @@ import (
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
 )
 
-// errReaderOnly is Open's refusal until ADR 0023 M2.5, when it accepts the
-// writer too.
-var errReaderOnly = errors.New("cluster: until ADR 0023 M2.5 Open builds a reader only")
+// errReaderKubeconfig is Open's refusal of a reader given a kubeconfig: only
+// a writer's transitional Apply runs kubectl (ADR 0023 M2.5 to M2.7).
+var errReaderKubeconfig = errors.New("cluster: a reader client runs no kubectl, so Open takes no kubeconfig for it")
 
-// errNeverWrites is every write of an Open'd client, which until ADR 0023
-// M2.5 is always the reader: refused before anything is sent.
+// errNeverWrites is every write of a reader client: refused before anything
+// is sent.
 var errNeverWrites = errors.New("cluster: a reader client never writes")
 
+// errNoKubeconfig is the Apply of a writer opened without a kubeconfig: until
+// ADR 0023 M2.7 Apply is the one method that still runs kubectl, and kubectl
+// needs one. Nothing is run and nothing is sent.
+var errNoKubeconfig = errors.New("cluster: this client was opened without a kubeconfig, and Apply still runs kubectl until ADR 0023 M2.7")
+
 // Open builds a Client that reaches the cluster in-process, through
-// internal/kube (ADR 0023 decision 2), as one of the instance's identities. It
-// starts no program, dials nothing and mints nothing until a method is called.
+// internal/kube (ADR 0023 decision 2), as one of the instance's two
+// identities: kube.Reader or kube.Writer. It starts no program, dials nothing
+// and mints nothing until a method is called. Any other identity, and a
+// reader given a legacyKubeconfig, are refused before the client is built,
+// with nothing sent.
 //
-// Until ADR 0023 M2.5 it builds a reader only: it refuses any identity but
-// kube.Reader, and any legacyKubeconfig, which only a writer's transitional
-// kubectl Apply will use. An Open'd client answers every read and CanI
-// in-process, refuses Apply, CreateConfigMap and ReplaceConfigMap before
-// anything is sent, and never runs kubectl. Since ADR 0023 M2.4 it is how
-// 'world', 'ps', 'costs', 'usage' and 'logs' read the cluster.
+// Either identity answers every read, CanI and NamespaceUID in-process. A
+// reader refuses Apply, CreateConfigMap and ReplaceConfigMap before anything
+// is sent, and never runs kubectl; since ADR 0023 M2.4 it is how 'world',
+// 'ps', 'costs', 'usage' and 'logs' read the cluster. A writer creates and
+// replaces a ConfigMap in-process too (the storage key pin), and its Apply
+// alone still runs kubectl, until ADR 0023 M2.7: over legacyKubeconfig, with
+// Env(os.Environ()), so the apply acts as the active gcloud configuration
+// while everything else the writer does acts as cfg's credential, the
+// instance's stored installer key. A writer
+// opened with an empty legacyKubeconfig opens, and its Apply fails with
+// errNoKubeconfig's text, running nothing.
 //
 // warnings receives each distinct API Warning header text, once, as
 // "Warning (cluster): <text>\n", after the call whose answer carried it, and
@@ -42,20 +56,34 @@ var errNeverWrites = errors.New("cluster: a reader client never writes")
 // character, a bidi override, invalid UTF-8) is written Go-quoted instead,
 // because it comes from the server. A nil warnings discards them.
 func Open(cfg kube.Config, warnings io.Writer, legacyKubeconfig string) (*Client, error) {
-	if cfg.Identity != kube.Reader || legacyKubeconfig != "" {
-		return nil, errReaderOnly
+	switch cfg.Identity {
+	case kube.Reader:
+		if legacyKubeconfig != "" {
+			return nil, errReaderKubeconfig
+		}
+	case kube.Writer:
+	default:
+		return nil, fmt.Errorf("cluster: Open builds an instance's reader or writer, and %q is neither", cfg.Identity)
 	}
 	kc, err := kube.New(cfg)
 	if err != nil {
 		return nil, err
 	}
-	return &Client{kube: kc, warnings: warnings}, nil
+	c := &Client{kube: kc, warnings: warnings}
+	if cfg.Identity == kube.Writer && legacyKubeconfig != "" {
+		// Env(os.Environ()) is built from an allowlist: kubectl acts as
+		// whichever gcloud configuration the parent selects (ADR 0023 M0
+		// changes what reaches kubectl, not who it acts as), and keeps the
+		// parent's KUBECONFIG, never the instance's. A missing kubectl says
+		// that deploying needs it (execRunner's own text).
+		c.runner = execRunner{kubeconfig: legacyKubeconfig, env: Env(os.Environ())}
+	}
+	return c, nil
 }
 
 // CanI asks the API server whether this client's identity may do one thing:
 // kube.Client.SelfSubjectAccessReview, for the proof 'farcast reader grant'
-// makes that the reader cannot write (ADR 0023 §7.2). It is in-process only:
-// a kubectl client refuses it and runs nothing.
+// makes that the reader cannot write (ADR 0023 §7.2).
 func (c *Client) CanI(ctx context.Context, a kube.ResourceAttributes) (bool, error) {
 	if c.kube == nil {
 		return false, inProcessOnly("CanI")
@@ -68,17 +96,40 @@ func (c *Client) CanI(ctx context.Context, a kube.ResourceAttributes) (bool, err
 	return allowed, nil
 }
 
-// inProcessOnly is a kubectl client's refusal of a method it does not have,
-// naming the method: CanI, Logs, Workloads and NamespacesLabelled, which only
-// the reader calls. Nothing is run.
+// NamespaceUID is one namespace's uid, "" when there is no such namespace:
+// kube.Client.NamespaceUID, read with the list verb, which the reader holds
+// too (a plan binds farcast-system's uid, ADR 0023 M2.6). A refused read is an
+// error and never "". In ADR 0023 M2.5 its one caller is the writing
+// commands' preflight read.
+func (c *Client) NamespaceUID(ctx context.Context, name string) (string, error) {
+	if c.kube == nil {
+		return "", inProcessOnly("NamespaceUID")
+	}
+	uid, err := c.kube.NamespaceUID(ctx, name)
+	c.flushWarnings()
+	if err != nil {
+		return "", err
+	}
+	return uid, nil
+}
+
+// inProcessOnly is the refusal, naming the method, of every exported method
+// but Apply on a Client that has no in-process client: nothing is run and
+// nothing is sent. Each of them begins with that check. Open always builds an
+// in-process client; since ADR 0023 M2.5 a Client without one is built only
+// by this package's tests (newWithEnv, newWithRunner), until kubectl goes in
+// ADR 0023 M2.7, and the check makes such a client refuse rather than
+// dereference a nil kube.
 func inProcessOnly(method string) error {
 	return fmt.Errorf("cluster: %s is in-process only, and this client runs kubectl", method)
 }
 
-// neverWrites refuses a write on an Open'd client, which is the reader, before
-// anything is sent. A kubectl client writes.
+// neverWrites refuses a write on a reader client before anything is sent. It
+// keys on the identity the client was opened as: a writer writes. A test-built
+// client has no in-process identity and passes it, so that its Apply runs its
+// runner; its ConfigMap writes are refused by inProcessOnly first.
 func (c *Client) neverWrites() error {
-	if c.kube != nil {
+	if c.kube != nil && c.kube.Identity() != kube.Writer {
 		return errNeverWrites
 	}
 	return nil

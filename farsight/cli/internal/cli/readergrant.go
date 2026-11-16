@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/sofmon/farcast/farsight/cli/internal/cluster"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 	tcdeploy "github.com/sofmon/farcast/technocore/deploy"
@@ -106,12 +105,13 @@ var readerReviews = []readerReview{
 // never covers it.
 //
 // Until ADR 0023 M2.7 the RBAC is applied by kubectl, as the active gcloud
-// configuration, through newApplier; the verifying read and reviews are the
-// first in-process calls, as the reader, through newReader.
+// configuration, through newApplier, a writer client that makes no
+// in-process call; the verifying read and reviews are the first in-process
+// calls, as the reader, through newReader.
 type readerGrantCommand struct {
 	yes bool
 
-	newApplier  func(kubeconfigPath string) clusterApplier
+	newApplier  func(clusterRef) (clusterApplier, error)
 	newReader   func(clusterRef) (readerVerifier, error)
 	interactive func(*Env) bool
 	now         func() time.Time
@@ -171,7 +171,15 @@ func (c *readerGrantCommand) SetFlags(fs *flag.FlagSet) {
 
 func (c *readerGrantCommand) ensureDefaults() {
 	if c.newApplier == nil {
-		c.newApplier = func(kc string) clusterApplier { return cluster.New(kc) }
+		c.newApplier = func(r clusterRef) (clusterApplier, error) {
+			// A refusal returns a nil applier, never a nil *cluster.Client
+			// inside a non-nil one.
+			cl, err := openWriter(r)
+			if err != nil {
+				return nil, err
+			}
+			return cl, nil
+		}
 	}
 	if c.newReader == nil {
 		c.newReader = openReaderVerifier
@@ -259,6 +267,16 @@ func (c *readerGrantCommand) Run(ctx context.Context, env *Env, args []string) e
 	if err != nil {
 		return err
 	}
+	// So is the writer that applies the RBAC (ADR 0023 M2.5, A20-10): its
+	// refusals are local too, and an instance this machine cannot write as
+	// is refused before anything is asked.
+	applier, err := c.newApplier(clusterRef{Dir: env.ConfigDir, Meta: meta, Identity: kube.Writer, Warn: env.Err})
+	if err != nil {
+		return err
+	}
+	if err := applyReady(applier); err != nil {
+		return err
+	}
 	ok, err := newPrompter(env.In, env.Err).yesNo(fmt.Sprintf(msgReaderGrantPrompt,
 		email, name, strings.Join(bound, ", "), strings.Join(readerConfigMaps, ", ")))
 	if err != nil {
@@ -271,7 +289,7 @@ func (c *readerGrantCommand) Run(ctx context.Context, env *Env, args []string) e
 
 	// 5. The apply, through kubectl as the active gcloud configuration until
 	// ADR 0023 M2.7.
-	if err := c.newApplier(env.ConfigDir.InstanceKubeconfigPath(name)).Apply(ctx, stream); err != nil {
+	if err := applier.Apply(ctx, stream); err != nil {
 		return fmt.Errorf("apply instance %q's reader RBAC: %w; nothing was recorded", name, err)
 	}
 

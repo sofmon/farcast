@@ -328,6 +328,8 @@ func TestDeployMintsTheBucketItNeeds(t *testing.T) {
 
 	var minted []string
 	c := &storageDeployCommand{}
+	// The writer opens first (ADR 0023 M2.5); a fake, as no cluster is here.
+	c.deployer.newCluster = func(clusterRef) (clusterApplier, error) { return &fakeCluster{}, nil }
 	// Consent first: since the Phase 4.4 walk the cost gate sits above the
 	// bucket, so a deploy that never gets past it creates nothing at all.
 	c.deployer.assumeYes = true
@@ -454,7 +456,10 @@ func TestDeployRequiresConsentForStandingCost(t *testing.T) {
 	}
 	env, _ := testEnv(dir, output.ModeHuman)
 
-	err := (&storageDeployCommand{}).Run(context.Background(), env, []string{"prod"})
+	c := &storageDeployCommand{}
+	// The writer opens first (ADR 0023 M2.5); a fake, as no cluster is here.
+	c.deployer.newCluster = func(clusterRef) (clusterApplier, error) { return &fakeCluster{}, nil }
+	err := c.Run(context.Background(), env, []string{"prod"})
 	if err == nil {
 		t.Fatal("deploy provisioned standing compute with no confirmation")
 	}
@@ -517,7 +522,7 @@ func TestDeployRecordsTheKeyholderBeforeApplying(t *testing.T) {
 	fc := &fakeCluster{applyErr: errors.New("the API server said no")}
 	c := testStorageDeploy(&fakeProvider{}, &fakeBuilder{})
 	c.deployer.assumeYes = true
-	c.deployer.newCluster = func(string) clusterApplier { return fc }
+	c.deployer.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 
 	env, _ := testEnv(dir, output.ModeHuman)
 	if err := c.Run(context.Background(), env, []string{name}); err == nil {
@@ -572,7 +577,7 @@ func TestTheBucketGrantIsPrintedBeforeTheDeployNeedsIt(t *testing.T) {
 	fc := &fakeCluster{applyErr: errors.New("the API server said no")}
 	c := testStorageDeploy(&fakeProvider{}, &fakeBuilder{})
 	c.deployer.assumeYes = true
-	c.deployer.newCluster = func(string) clusterApplier { return fc }
+	c.deployer.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 
 	env, _, errOut := testEnvBoth(dir, output.ModeHuman)
 	if err := c.Run(context.Background(), env, []string{name}); err == nil {
@@ -598,7 +603,7 @@ func TestTheBucketGrantSurvivesJSONOutput(t *testing.T) {
 
 	c := testStorageDeploy(&fakeProvider{}, &fakeBuilder{})
 	c.deployer.assumeYes = true
-	c.deployer.newCluster = func(string) clusterApplier { return &fakeCluster{} }
+	c.deployer.newCluster = func(clusterRef) (clusterApplier, error) { return &fakeCluster{}, nil }
 
 	env, out, errOut := testEnvBoth(dir, output.ModeJSON)
 	if err := c.Run(context.Background(), env, []string{name}); err != nil {
@@ -623,7 +628,7 @@ func TestDeployDoesNotWaitForReadiness(t *testing.T) {
 	fc := &fakeCluster{}
 	c := testStorageDeploy(&fakeProvider{}, &fakeBuilder{})
 	c.deployer.assumeYes = true
-	c.deployer.newCluster = func(string) clusterApplier { return fc }
+	c.deployer.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 
 	env, out := testEnv(dir, output.ModeHuman)
 	if err := c.Run(context.Background(), env, []string{name}); err != nil {
@@ -670,6 +675,8 @@ func TestDeployReallyMintsTheBucket(t *testing.T) {
 
 	c := &storageDeployCommand{}
 	c.deployer.assumeYes = true
+	// The writer opens first (ADR 0023 M2.5); a fake, as no cluster is here.
+	c.deployer.newCluster = func(clusterRef) (clusterApplier, error) { return &fakeCluster{}, nil }
 	// It will fail later, at the registry, with no cloud to reach. What
 	// matters is what exists by then.
 	_ = c.Run(context.Background(), env, []string{"prod"})

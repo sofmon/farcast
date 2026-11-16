@@ -11,6 +11,7 @@ import (
 
 	"github.com/sofmon/farcast/farsight/cli/internal/components"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
+	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 	"github.com/sofmon/farcast/fatline/deploy"
 )
 
@@ -103,7 +104,10 @@ func (c *redeployCommand) SetFlags(fs *flag.FlagSet) {
 	c.setImageFlags(fs)
 }
 
-func (c *redeployCommand) Run(ctx context.Context, env *Env, args []string) error {
+func (c *redeployCommand) Run(ctx context.Context, env *Env, args []string) (err error) {
+	// A 403 the writer met says whose it was, once (A20-9).
+	var meta *config.InstanceMetadata
+	defer func() { err = writerRefused(err, meta) }()
 	c.ensureDefaults()
 	// The image flags are opposed intents — "deploy exactly this", "build from
 	// here and deploy that", "deploy what this farcast carries" — so accepting
@@ -126,9 +130,12 @@ func (c *redeployCommand) Run(ctx context.Context, env *Env, args []string) erro
 		return err
 	}
 
-	meta, err := env.ConfigDir.LoadInstanceMetadata(name)
+	meta, err = env.ConfigDir.LoadInstanceMetadata(name)
 	if err != nil {
 		return fmt.Errorf("no such instance %q (run 'farcast install' first): %w", name, err)
+	}
+	if err := recordNamed(meta, name); err != nil {
+		return err
 	}
 	if meta.Status == config.InstanceDeleting {
 		return fmt.Errorf("instance %q is being released", name)
@@ -142,6 +149,22 @@ func (c *redeployCommand) Run(ctx context.Context, env *Env, args []string) erro
 	}
 	carrier, err := deployCarrier(meta.Carrier)
 	if err != nil {
+		return err
+	}
+
+	// The writer is opened, and read once, before anything is ensured,
+	// pushed or asked (ADR 0023 M2.5, A20-10 and A20-11): an instance this
+	// machine cannot write as is refused with nothing changed, and an
+	// endpoint that refuses the installer's key refuses it before kubectl
+	// applies anything.
+	cl, err := c.newCluster(clusterRef{Dir: env.ConfigDir, Meta: meta, Identity: kube.Writer, Warn: env.Err})
+	if err != nil {
+		return err
+	}
+	if err := applyReady(cl); err != nil {
+		return err
+	}
+	if err := preflightNamespace(ctx, cl); err != nil {
 		return err
 	}
 
@@ -200,7 +223,6 @@ func (c *redeployCommand) Run(ctx context.Context, env *Env, args []string) erro
 		return err
 	}
 
-	cl := c.newCluster(env.ConfigDir.InstanceKubeconfigPath(name))
 	if isInteractive(env) || env.Verbose {
 		fprintf(env.Err, "Re-applying FatLine's workload to %q…\n", name)
 	}

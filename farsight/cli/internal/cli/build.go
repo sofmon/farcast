@@ -11,6 +11,7 @@ import (
 	"github.com/sofmon/farcast/farsight/cli/internal/cluster"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/image"
+	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 	pbuild "github.com/sofmon/farcast/planck/build"
 )
 
@@ -25,6 +26,7 @@ type jobWaiter interface {
 	Apply(ctx context.Context, manifests []byte) error
 	WaitJob(ctx context.Context, namespace, name string, timeout time.Duration) (cluster.JobResult, error)
 	JobLogs(ctx context.Context, namespace, job string, lines int) (string, error)
+	preflighter
 }
 
 type buildCommand struct {
@@ -39,7 +41,7 @@ type buildCommand struct {
 	assumeYes     bool
 
 	// Seams, overridable in tests.
-	newCluster func(kubeconfigPath string) jobWaiter
+	newCluster func(clusterRef) (jobWaiter, error)
 	newBuilder func(progress func(string)) imageBuilder
 }
 
@@ -89,7 +91,15 @@ func (c *buildCommand) SetFlags(fs *flag.FlagSet) {
 
 func (c *buildCommand) ensureDefaults() {
 	if c.newCluster == nil {
-		c.newCluster = func(kc string) jobWaiter { return cluster.New(kc) }
+		c.newCluster = func(r clusterRef) (jobWaiter, error) {
+			// A refusal returns a nil cluster, never a nil *cluster.Client
+			// inside a non-nil one.
+			cl, err := openWriter(r)
+			if err != nil {
+				return nil, err
+			}
+			return cl, nil
+		}
 	}
 	if c.newBuilder == nil {
 		c.newBuilder = func(progress func(string)) imageBuilder {
@@ -98,16 +108,22 @@ func (c *buildCommand) ensureDefaults() {
 	}
 }
 
-func (c *buildCommand) Run(ctx context.Context, env *Env, args []string) error {
+func (c *buildCommand) Run(ctx context.Context, env *Env, args []string) (err error) {
+	// A 403 the writer met says whose it was, once (A20-9).
+	var meta *config.InstanceMetadata
+	defer func() { err = writerRefused(err, meta) }()
 	if len(args) != 1 {
 		return usagef("build takes one instance argument")
 	}
 	name := args[0]
 	c.ensureDefaults()
 
-	meta, err := env.ConfigDir.LoadInstanceMetadata(name)
+	meta, err = env.ConfigDir.LoadInstanceMetadata(name)
 	if err != nil {
 		return fmt.Errorf("load instance %q: %w", name, err)
+	}
+	if err := recordNamed(meta, name); err != nil {
+		return err
 	}
 	if c.repo == "" || c.app == "" {
 		return usagef("--repo and --app are required")
@@ -118,6 +134,22 @@ func (c *buildCommand) Run(ctx context.Context, env *Env, args []string) error {
 	// Before the builder is resolved: the build is a billed Job in
 	// farcast-system, which only a kernel meters.
 	if err := requireKernel(name, meta, "this build"); err != nil {
+		return err
+	}
+
+	// The writer is opened, and read once, before the builder image is
+	// resolved or pushed and before anything is asked (ADR 0023 M2.5, A20-10
+	// and A20-11): an instance this machine cannot write as is refused with
+	// nothing spent, and an endpoint that refuses the installer's key
+	// refuses it before kubectl applies the build.
+	cl, err := c.newCluster(clusterRef{Dir: env.ConfigDir, Meta: meta, Identity: kube.Writer, Warn: env.Err})
+	if err != nil {
+		return err
+	}
+	if err := applyReady(cl); err != nil {
+		return err
+	}
+	if err := preflightNamespace(ctx, cl); err != nil {
 		return err
 	}
 
@@ -159,7 +191,6 @@ func (c *buildCommand) Run(ctx context.Context, env *Env, args []string) error {
 		return nil
 	}
 
-	cl := c.newCluster(env.ConfigDir.InstanceKubeconfigPath(name))
 	if err := cl.Apply(ctx, manifest); err != nil {
 		return fmt.Errorf("start the build: %w", err)
 	}

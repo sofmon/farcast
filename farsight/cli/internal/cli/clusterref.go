@@ -17,10 +17,13 @@ import (
 )
 
 // errCredentialMissing marks a refusal for want of a credential the call
-// can use: no reader recorded or uploaded, a reader not yet verified
-// read-only, a reader email that is not the derived one, a missing key file,
-// or a reader record whose values farcast does not accept (checkedReader, or
-// a record that names another instance). It is the kind credential_missing.
+// can use: no installer key (an instance installed with Application Default
+// Credentials), a credentials.yaml that is missing, unreadable or does not
+// parse, a stored key that is not a service-account key, no reader recorded
+// or uploaded, a reader not yet verified read-only, a reader email that is
+// not the derived one, a missing key file, or a record whose values farcast
+// does not accept (checkedReader, a writer's unsafe name, or a record that
+// names another instance). It is the kind credential_missing.
 var errCredentialMissing = errors.New("no usable stored credential")
 
 // clusterRef is what every command hands its cluster seam (ADR 0023 M2,
@@ -66,8 +69,9 @@ func recordNamed(meta *config.InstanceMetadata, name string) error {
 // 0023 M2, design §3.5). Its steps, in order:
 //
 //  1. the record must name an endpoint; for the reader, the record's values
-//     must then pass checkedReader, before any path is built from them or any
-//     of them is printed (A18-8);
+//     must then pass checkedReader, and for the writer its name must pass
+//     validateInstanceName, before any path is built from them or any of
+//     them is printed (A18-8, A20-8);
 //  2. cluster-ca.crt is read, if it exists; one that exists and cannot be
 //     read is refused as the endpoint;
 //  3. the endpoint is classified against the region and that CA
@@ -76,12 +80,15 @@ func recordNamed(meta *config.InstanceMetadata, name string) error {
 //  4. the identity's credential is loaded: for the reader, only once the
 //     record names the reader farcast derives for this instance, its key is
 //     uploaded, and 'reader grant' has verified it read-only (unless
-//     r.Verifying), and then reader.key;
+//     r.Verifying), and then reader.key; for the writer, the installer's
+//     service-account key in credentials.yaml (writerCredential);
 //  5. cluster.Open pairs the endpoint and the credential and builds the
 //     client. Nothing is sent before a method is called.
 //
-// Every refusal before step 5 sends nothing. The writer opens in-process
-// from ADR 0023 M2.5; until then this refuses it.
+// Every refusal before step 5 sends nothing. Until ADR 0023 M2.7 a writer's
+// Apply still runs kubectl, over the instance's kubeconfig.yaml and as the
+// active gcloud configuration; everything else the writer does runs
+// in-process as the installer's key.
 func openCluster(r clusterRef) (*cluster.Client, error) {
 	if r.Meta == nil {
 		return nil, errors.New("cli: openCluster needs the instance's record")
@@ -97,9 +104,18 @@ func openCluster(r clusterRef) (*cluster.Client, error) {
 	// A read command calls this with the record as it was read, so a hostile
 	// name, project or key id is refused here, quoted, before the name
 	// becomes a path or anything recorded is printed.
-	if r.Identity == kube.Reader {
+	switch r.Identity {
+	case kube.Reader:
 		if _, _, _, err := checkedReader(meta); err != nil {
 			return nil, err
+		}
+	case kube.Writer:
+		// The writer reads credentials.yaml, and hands kubectl
+		// kubeconfig.yaml, under the recorded name: one that is not a name
+		// install accepts ("../other", a control character) never becomes
+		// a path, and is printed only quoted.
+		if validateInstanceName(name) != nil {
+			return nil, refuse(errCredentialMissing, msgUnsafeRecord, name, "name", name)
 		}
 	}
 	// 2.
@@ -117,19 +133,61 @@ func openCluster(r clusterRef) (*cluster.Client, error) {
 	}
 	// 4.
 	var cred kube.Credential
+	legacy := ""
 	switch r.Identity {
 	case kube.Reader:
 		if cred, err = readerCredential(r, ep); err != nil {
 			return nil, err
 		}
 	case kube.Writer:
-		return nil, errors.New("cli: the writer opens in-process from ADR 0023 M2.5")
+		if cred, err = writerCredential(r); err != nil {
+			return nil, err
+		}
+		// 5, the writer's half: only its transitional kubectl Apply reads
+		// a kubeconfig (ADR 0023 M2.5 to M2.7). The reader passes none.
+		legacy = r.Dir.InstanceKubeconfigPath(name)
 	default:
 		return nil, fmt.Errorf("cli: %q is not one of an instance's identities", r.Identity)
 	}
-	// 5. The reader passes no legacy kubeconfig: only the writer's
-	// transitional kubectl Apply reads one (ADR 0023 M2.5 to M2.7).
-	return cluster.Open(kube.Config{Endpoint: ep, Credential: cred, Identity: r.Identity}, r.Warn, "")
+	// 5.
+	return cluster.Open(kube.Config{Endpoint: ep, Credential: cred, Identity: r.Identity}, r.Warn, legacy)
+}
+
+// writerCredential is openCluster's step 4 for the writer: the installer's
+// service-account key from credentials.yaml (design §3.5, A20-8). That file
+// holds the private key and nothing else of note, so no refusal quotes it: a
+// file that does not parse is named by config.ParseFault's fault and
+// position, never by the YAML library's text, which can echo the source
+// lines; and a key that is not a service-account key keeps kube's text,
+// which names the field and never its value. Each refusal matches
+// errCredentialMissing and sends nothing.
+func writerCredential(r clusterRef) (kube.Credential, error) {
+	name := r.Meta.Name
+	creds, err := r.Dir.LoadInstanceCredentials(name)
+	if err != nil {
+		var pe *fs.PathError
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+			return kube.Credential{}, refuse(errCredentialMissing, "instances/%s/credentials.yaml is missing; this machine holds no installer key for instance %q; nothing was sent", name, name)
+		case errors.As(err, &pe):
+			// The system's error alone: the path is the instance's own.
+			return kube.Credential{}, refuse(errCredentialMissing, "instance %q's credentials.yaml cannot be read (%v); nothing was sent", name, pe.Err)
+		}
+		fault, ok := config.ParseFault(err)
+		if !ok {
+			fault = "a YAML error"
+		}
+		return kube.Credential{}, refuse(errCredentialMissing, "instance %q's credentials.yaml does not parse (%s); nothing was sent", name, fault)
+	}
+	if strings.TrimSpace(creds.ServiceAccountKey) == "" {
+		return kube.Credential{}, refuse(errCredentialMissing, "instance %q was installed without a service-account key (Application Default Credentials), "+
+			"which farcast no longer uses for its cluster (ADR 0023 M2); release it ('farcast release %s') and install a new instance with --credentials", name, name)
+	}
+	cred, err := kube.ParseServiceAccountJSON([]byte(creds.ServiceAccountKey))
+	if err != nil {
+		return kube.Credential{}, refuse(errCredentialMissing, "%s", err)
+	}
+	return cred, nil
 }
 
 // readerCredential is openCluster's step 4 for the reader.
@@ -200,7 +258,7 @@ const msgReaderIAMRefused = "the cluster's endpoint refused the identity (IAM); 
 // reader grant'; any other 403 is the endpoint's IAM. Every other error, nil
 // included, is returned as it is, and the result still matches everything err
 // did. Only the read commands call it, which read as the reader and know the
-// instance's name; a writer's 403 is worded in ADR 0023 M2.5.
+// instance's name; a writer's 403 is writerRefused's.
 func readerRefused(err error, name string) error {
 	if !errors.Is(err, tkube.ErrForbidden) {
 		return err
@@ -209,6 +267,26 @@ func readerRefused(err error, name string) error {
 		return fmt.Errorf("%w; run 'farcast reader grant %s'", err, name)
 	}
 	return fmt.Errorf("%w; %s", err, msgReaderIAMRefused)
+}
+
+// writerRefused is err with one sentence appended when the cluster refused
+// the instance's installer service account, the writer (403,
+// tkube.ErrForbidden; ADR 0023 M2.5, A20-9): an RBAC refusal, a 403 whose
+// body is a Kubernetes Status, or any other 403, which is the endpoint's IAM.
+// Each writing command applies it once, to the error its Run returns; nothing
+// else does, and classified never appends it. Every other error, nil
+// included, is returned as it is, and so is any error when meta is nil (a
+// command that failed before it read the record reached no cluster). What an
+// IAM refusal looks like on the wire is not walked; the probe walk pins it.
+// The transitional kubectl Apply's errors never carry tkube.ErrForbidden.
+func writerRefused(err error, meta *config.InstanceMetadata) error {
+	if meta == nil || !errors.Is(err, tkube.ErrForbidden) {
+		return err
+	}
+	if forbiddenByRBAC(err) {
+		return fmt.Errorf("%w; the cluster refused instance %q's installer service account (RBAC); check that it still holds roles/container.admin in project %q", err, meta.Name, meta.Project)
+	}
+	return fmt.Errorf("%w; the cluster's endpoint refused instance %q's installer service account (IAM); check that it still holds roles/container.admin in project %q", err, meta.Name, meta.Project)
 }
 
 // namespaceRefused is readerRefused for a namespace world marks as one the

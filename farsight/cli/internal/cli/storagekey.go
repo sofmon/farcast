@@ -14,6 +14,7 @@ import (
 
 	"github.com/sofmon/farcast/datasphere"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
+	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
 	"github.com/sofmon/farcast/farsight/cli/internal/storage"
 )
@@ -396,9 +397,11 @@ The in-cluster key pin follows the rotation: it requires the new keys as soon
 as every replica is about to hold them, and retires the old ones once the new
 ones are in use. From then on a replica that restarts refuses any bundle from
 before the rotation — a keeper's included — even with no serving replica left
-to compare it against. Writing the pin needs kubectl and this instance's cloud
-credentials; if it cannot be written the rotation still happens, this exits
-non-zero, and 'farcast storage key pin' writes it afterwards.
+to compare it against. The pin is written in-process, as the instance's
+installer service account, with the key 'farcast install --credentials'
+stored, and needs no kubectl; if it cannot be written the rotation still
+happens, this exits non-zero, and 'farcast storage key pin' writes it
+afterwards.
 
 Once the new keys are in use, run 'farcast storage key rekey' to move existing
 objects onto them. Then re-enrol every keeper: each one's bundle predates the
@@ -410,7 +413,10 @@ func (c *keyRotateCommand) SetFlags(fs *flag.FlagSet) {
 	fs.BoolVar(&c.assumeYes, "y", false, "skip the confirmation")
 }
 
-func (c *keyRotateCommand) Run(ctx context.Context, env *Env, args []string) error {
+func (c *keyRotateCommand) Run(ctx context.Context, env *Env, args []string) (err error) {
+	// A 403 the writer met says whose it was, once (A20-9).
+	var meta *config.InstanceMetadata
+	defer func() { err = writerRefused(err, meta) }()
 	instance, err := oneInstance("rotate", args)
 	if err != nil {
 		return err
@@ -446,14 +452,24 @@ func (c *keyRotateCommand) Run(ctx context.Context, env *Env, args []string) err
 	// onto "the newest key the pin does not retire" here: that can be a key an
 	// unfinished rotation left held on one machine only, which no replica
 	// holds — the randomized model found exactly that split.
+	//
+	// The pin is reached as the instance's writer (ADR 0023 M2.5). A writer
+	// that cannot open — no installer key on this machine, say — is a pin
+	// not reached, and the rotation goes on without it, as documented.
 	var ps pinStore
 	var pinErr error
-	if m, err := env.ConfigDir.LoadInstanceMetadata(instance); err == nil && pinMeta(m) {
+	m, lerr := env.ConfigDir.LoadInstanceMetadata(instance)
+	if lerr == nil {
+		if err := recordNamed(m, instance); err != nil {
+			return err
+		}
+	}
+	if lerr == nil && pinMeta(m) {
 		open := c.newPinStore
 		if open == nil {
 			open = defaultPinStore
 		}
-		if ps, pinErr = open(env.ConfigDir.InstanceKubeconfigPath(instance)); pinErr == nil {
+		if ps, pinErr = open(clusterRef{Dir: env.ConfigDir, Meta: m, Identity: kube.Writer, Warn: env.Err}); pinErr == nil {
 			cur, present, _, invalid, err := readPin(ctx, ps)
 			switch {
 			case err != nil:
@@ -693,8 +709,8 @@ func (c *keyRotateCommand) finishPin(ctx context.Context, env *Env, meta *config
 			line := fmt.Sprintf("NOT moved: %v. %s", behind, behindRemedy(behind, meta.Name))
 			return line, rotationUnfinished("the key pin is ahead of this keyring; " + behindRemedy(behind, meta.Name))
 		}
-		line := fmt.Sprintf("NOT written (%v): a replica that restarts may still admit a bundle from before this rotation. Run %s, then 'farcast storage key rekey %s'",
-			err, pinRemedy(meta.Name), meta.Name)
+		line := fmt.Sprintf("NOT written (%s): a replica that restarts may still admit a bundle from before this rotation. Run %s, then 'farcast storage key rekey %s'",
+			terminalText(err.Error()), pinRemedy(meta.Name), meta.Name)
 		return line, rotationUnfinished("the key pin was not written; " + pinRemedy(meta.Name) + " writes it")
 	}
 	if ps == nil || pinErr != nil {

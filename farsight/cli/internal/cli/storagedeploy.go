@@ -12,6 +12,7 @@ import (
 	dsdeploy "github.com/sofmon/farcast/datasphere/deploy"
 	"github.com/sofmon/farcast/farsight/cli/internal/components"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
+	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 	"github.com/sofmon/farcast/fatline/identity"
 	"github.com/sofmon/farcast/technocore/pricing"
 )
@@ -99,7 +100,10 @@ func (c *storageDeployCommand) SetFlags(fs *flag.FlagSet) {
 	c.deployer.setYesFlag(fs, "skip the cost confirmation and, for --source or a source build, the build confirmation")
 }
 
-func (c *storageDeployCommand) Run(ctx context.Context, env *Env, args []string) error {
+func (c *storageDeployCommand) Run(ctx context.Context, env *Env, args []string) (err error) {
+	// A 403 the writer met says whose it was, once (A20-9).
+	var meta *config.InstanceMetadata
+	defer func() { err = writerRefused(err, meta) }()
 	if len(args) != 1 {
 		return usagef("storage deploy takes one instance argument")
 	}
@@ -117,9 +121,12 @@ func (c *storageDeployCommand) Run(ctx context.Context, env *Env, args []string)
 		return err
 	}
 
-	meta, err := env.ConfigDir.LoadInstanceMetadata(name)
+	meta, err = env.ConfigDir.LoadInstanceMetadata(name)
 	if err != nil {
 		return fmt.Errorf("load instance %q: %w", name, err)
+	}
+	if err := recordNamed(meta, name); err != nil {
+		return err
 	}
 	if !meta.FatLineDeployed {
 		// The keyholder is only reachable through the tunnel, so deploying it
@@ -131,11 +138,24 @@ func (c *storageDeployCommand) Run(ctx context.Context, env *Env, args []string)
 	// The key pin is read before anything is spent. A deploy restarts every
 	// replica, and each one comes back enforcing the pin: from a keyring the
 	// pin already refuses, nothing here could unseal them afterwards.
-	openPin := c.newPinStore
-	if openPin == nil {
-		openPin = defaultPinStore
+	//
+	// One writer serves the pin and the apply (ADR 0023 M2.5, A20-10). It is
+	// opened here, before the cost is asked or anything is created or
+	// recorded, so an instance this machine cannot write as is refused with
+	// nothing changed; and no second open after the keyholder is recorded
+	// can fail.
+	ref := clusterRef{Dir: env.ConfigDir, Meta: meta, Identity: kube.Writer, Warn: env.Err}
+	cl, err := c.deployer.newCluster(ref)
+	if err != nil {
+		return fmt.Errorf("the key pin could not be reached, so nothing was deployed: %w", err)
 	}
-	ps, err := openPin(env.ConfigDir.InstanceKubeconfigPath(name))
+	// Before the pin is read or written: until ADR 0023 M2.7 the deploy's
+	// apply runs kubectl, and a machine that cannot run it is refused before
+	// the pin is created or the keyholder recorded (S-F2).
+	if err := applyReady(cl); err != nil {
+		return err
+	}
+	ps, err := c.pinStoreOf(ref, cl)
 	if err != nil {
 		return fmt.Errorf("the key pin could not be reached, so nothing was deployed: %w", err)
 	}
@@ -272,7 +292,6 @@ func (c *storageDeployCommand) Run(ctx context.Context, env *Env, args []string)
 	// survives --output json, where the human result is never rendered.
 	writeBucketGrant(env.Err, meta.Project, meta.Storage.Bucket, dsdeploy.DefaultNamespace, dsdeploy.DefaultName)
 
-	cl := c.deployer.newCluster(env.ConfigDir.InstanceKubeconfigPath(name))
 	if isInteractive(env) || env.Verbose {
 		fprintf(env.Err, "Deploying the keyholder to %q…\n", name)
 	}
@@ -289,6 +308,12 @@ func (c *storageDeployCommand) Run(ctx context.Context, env *Env, args []string)
 		Project: meta.Project, Bucket: meta.Storage.Bucket,
 		Namespace: dsdeploy.DefaultNamespace, ServiceAccount: dsdeploy.DefaultName,
 	})
+}
+
+// pinStoreOf is the pin storage deploy reads and writes: pinStoreFor, so the
+// writer the deploy opened serves the pin and the apply (A20-10).
+func (c *storageDeployCommand) pinStoreOf(ref clusterRef, cl clusterApplier) (pinStore, error) {
+	return pinStoreFor(c.newPinStore, ref, cl)
 }
 
 func (c *storageDeployCommand) confirmCost(env *Env, meta *config.InstanceMetadata) (bool, error) {

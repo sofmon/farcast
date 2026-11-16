@@ -25,9 +25,9 @@ var windowsKeys = []string{"SYSTEMROOT", "USERPROFILE", "TEMP", "TMP", "LOCALAPP
 //   - KUBERC=off: no kuberc file can add flags or aliases to a call.
 //   - CLOUDSDK_CONFIG and CLOUDSDK_ACTIVE_CONFIG_NAME, the parent's: they choose the
 //     gcloud configuration, which is the identity every writing command's kubectl acts as
-//     until ADR 0023 M2.7. No read of world, ps, costs, usage or logs runs kubectl since
-//     M2.4: those run in-process as the instance's reader. The writing commands' reads
-//     still do, until M2.5.
+//     until ADR 0023 M2.7. No read runs kubectl since M2.5: world, ps, costs, usage and
+//     logs read in-process as the instance's reader (M2.4), and the writing commands as
+//     the stored installer key, through an Open'd writer whose kubectl runs Apply alone.
 //   - GORACE: only race-instrumented Go binaries read it. A released kubectl or plugin is
 //     not one; a test's fakes are, and without it each of their exits sleeps a second.
 //   - On Windows, the variables a process needs there (windowsKeys).

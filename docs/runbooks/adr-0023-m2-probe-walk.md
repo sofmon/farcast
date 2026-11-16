@@ -1,0 +1,311 @@
+# ADR 0023 M2 — the probe walk: what Google's pages do not settle
+
+Since [ADR 0023](../adr/0023-one-download-farcast.md) M2.4, `world`, `ps`, `costs`, `usage` and `logs` read the cluster in-process as the instance's reader. Since M2.5, every writing command that reads the cluster reads it in-process as the installer service account, the writer, and the storage key pin is written the same way; `kernel meter`, `kernel confirm` and `reader grant` make no call as the writer. Both mint their own token, in memory, from a key, with the one scope `userinfo.email`. Google documents that GKE's DNS endpoint accepts a token minted from a service-account key by `gke-gcloud-auth-plugin` ([GKE auth](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/api-server-authentication)). It does not document farcast's own token with `userinfo.email` alone, nor a reader holding `roles/container.clusterViewer` plus RBAC. This walk tests those first, on one short-lived instance, before ADR 0023 M2.9's billable walk depends on them.
+
+**Status.** *Written 2026-11-15 against the code as built. Not walked.* Nothing below has run against Google. The [Results](#results) are empty.
+
+**It records seven things:**
+1. whether the DNS endpoint accepts the **writer's** token scoped to `userinfo.email` alone, which every writing command's reads need since M2.5. If it refuses, `cloud-platform` comes back, with a dated note in ADR 0023;
+2. the same for the **reader**, end to end: `reader init`, the Cloud Shell paste, `reader record`, `reader grant` and `world`;
+3. what the reader's init script printed: the spelling and output of its two policy checks, the retry against a fresh account, and whether the upload needs a key usage on the certificate;
+4. whether GKE's SelfSubjectAccessReviews consult IAM. A throwaway account with `roles/container.developer` and no RBAC asks whether it may create Deployments;
+5. whether Google's token endpoint accepts an assertion whose key id is empty, `"kid":""`;
+6. the body of a 403 from the endpoint's IAM check, compared with a Kubernetes Status;
+7. the recorded endpoint's form, and whether its location label is the region or a zone; and the cluster's Kubernetes version.
+
+The steps take them in this order, except items 6 and 7. Item 6 needs the throwaway account before it has a role, so it is measured inside P4, before item 4's grant. Item 7's endpoint form costs nothing and is read right after the install (P1.3), because a zone label there would stop every in-process step after it. The walk ends with `release` and the reader lines it prints.
+
+**It is billable.** One Autopilot instance, installed with `--cost-limit 100` (USD a month), for about 2 hours. By the repository's floor model the standing cost is about USD 0.11 an hour ([phase-5-session-a.md](phase-5-session-a.md)): the modelled cluster line, the five system Pods and the carrier. That is about USD 0.25 for the walk, plus cents for the registry's storage and the carrier's traffic: under USD 1 in all. The walk also creates, in the instance's project, the reader's service account with one uploaded key, and a throwaway service account with one downloaded key. IAM objects cost nothing, and P7 deletes them all.
+
+**Do not start P1 until the operator has approved this walk for this session.** Approval does not carry over from another walk, the M1 walk and M2.9's included. Present the cost, the duration, the two service accounts, the walk's one privileged grant and the teardown (P7), and wait for a yes. The grant is `roles/container.developer` on the project for the throwaway account (P4.4), from P4.4 until P7.1, at least 10 minutes: it can write workloads in every cluster in the project, not only this instance's, and its key sits on this Mac in `$WALK/probe/` all that time.
+
+Throughout:
+- **The operator's own gcloud configuration only,** never a work one. `--credentials <service-account-key.json>` on every `farcast` command that takes it, which is `install`. No Application Default Credentials: since M2.5 `install` refuses a missing `--credentials`, and P1 checks that.
+- **Never paste raw output** of a live command anywhere: not into the transcript, an issue or the repository, and no screenshots. Record only what each step says to record, with `$INSTANCE` and placeholders such as `$PROJECT`. Never record a project id, a project number, an account email, a key id, an address, a home-directory path or a time of day.
+- **Never print a token.** Never run `gcloud auth print-access-token`, even with its output redirected: zsh's MULTIOS still sends it to the pipe. The walk probe prints no token, key, assertion, email, project id or address, and scrubs what the cluster or Google sent before it prints it. Read a scrubbed message before recording it all the same. If anything identifying survived the scrubber, record "withheld", and note it as a finding against the probe.
+- **`KUBECONFIG` is the instance's own kubeconfig** in every shell that runs `kubectl` or `farcast`. The operator's default kubeconfig can hold other clusters.
+- **No `GODEBUG` and no `GOOGLE_SDK_GO_LOGGING_LEVEL`** in any shell that runs `farcast` or the probe. farcast and the probe both refuse an `http2debug` setting, which would print the bearer; the walk shell below starts with neither.
+- **The throwaway account's key** lives only in `$WALK/probe/`: never in the checkout, `~/Downloads` or Cloud Shell's home. P7 deletes it with the account.
+- **Cloud Shell steps are the operator's.** An agent never types into Cloud Shell. `reader grant` needs a terminal and a typed `y`, so it is the operator's too.
+
+---
+
+## P0. Setup on the dev Mac (no cloud)
+
+1. `./check.sh` passes at the commit being walked, from a clean tree. Record the commit and the check's summary line. Nothing in this walk clones from GitHub, so the commit need not be pushed.
+2. **The walk directory**, outside any checkout:
+   ```bash
+   INSTANCE=<name>
+   REPO=<the checkout, at that commit>
+   WALK=$(mktemp -d)                  # 0700; every scratch file of this walk lives here, never in the checkout
+   mkdir -p "$WALK/bin" "$WALK/tools"
+   ```
+3. **The farcast**, a release build for this Mac, so that `connect` pushes the FatLine and Shrike images it carries and builds nothing:
+   ```bash
+   (cd "$REPO" && GOTOOLCHAIN=go1.27.4 go run ./farsight/cli/cmd/farcast-release build -targets darwin/arm64 -out "$WALK/rel")
+   (cd "$WALK/rel" && shasum -a 256 -c SHA256SUMS)
+   go version -m "$WALK/rel/farcast-darwin-arm64" | grep -E -- '-tags=|vcs\.(revision|modified)'
+   cp "$WALK/rel/farcast-darwin-arm64" "$WALK/bin/farcast"
+   ```
+   *Expect* every line `OK`, `-tags=farcast_embedded`, step 1's commit as `vcs.revision`, and `vcs.modified=false`.
+4. **The walk probe, built once** at a fixed path, from the same checkout. `go test` would link a new binary at a new temporary path on every run, and an outbound firewall that makes its rules per binary would hold each one ([phase-5-session-a.md](phase-5-session-a.md), "Build the probe once"):
+   ```bash
+   (cd "$REPO" && go test -mod=vendor -tags walk -c -o "$WALK/walkprobe.test" ./farsight/cli/internal/cli/)
+   ```
+   Its cluster modes are `forbidden-body`, `review` and `mint-empty-kid`, and the header of [`walkprobe_test.go`](../../farsight/cli/internal/cli/walkprobe_test.go) lists their inputs. They read the instance's record and keys from farcast's own config directory, by farcast's own rules. `forbidden-body` and `review` each mint one token and send one request; `mint-empty-kid` only mints.
+5. **The outbound firewall** (Little Snitch, on the walk Mac). Make these rules before P1, each for its destination only:
+   - `$WALK/bin/farcast`: Google's APIs, the registry's `<region>-docker.pkg.dev`, and `gcr.io` for the base image, as on the M1 walk. New since M2.4 and M2.5: the cluster's `*.gke.goog:443` and `oauth2.googleapis.com:443`, for its in-process reads and the tokens it mints. Add the carrier's address on port 8443 after P1.
+   - `$WALK/walkprobe.test`: `*.gke.goog:443` and `oauth2.googleapis.com:443`, and nothing else.
+   - `kubectl`, the GKE auth plugin and gcloud keep the rules they had. Until M2.7 every apply still runs kubectl as the active gcloud configuration.
+6. **Three tools for the applies.** Link `kubectl`, the GKE auth plugin and `gcloud` one by one into `$WALK/tools`, never a whole tool directory:
+   ```bash
+   for t in kubectl gke-gcloud-auth-plugin gcloud; do ln -s "$(command -v "$t")" "$WALK/tools/$t"; done
+   ```
+7. **The walk shell**, with nothing inherited but what is named:
+   ```bash
+   env -i HOME="$HOME" TMPDIR="$TMPDIR" WALK="$WALK" INSTANCE="$INSTANCE" \
+     CLOUDSDK_ACTIVE_CONFIG_NAME=<your FarCast gcloud configuration> \
+     PATH="$WALK/bin:$WALK/tools:/usr/bin:/bin" zsh -f
+   ```
+   Then, inside it:
+   ```bash
+   STATE="$HOME/Library/Application Support/farcast"
+   export KUBECONFIG="$STATE/instances/$INSTANCE/kubeconfig.yaml"   # P1 writes it
+   cd "$WALK"
+   env | grep -E '^(GODEBUG|GOOGLE_SDK_GO_LOGGING_LEVEL|HTTPS?_PROXY|ALL_PROXY)=' && echo "STOP: unset these"
+   probe() { (cd "$WALK" && env FARCAST_WALK=1 FARCAST_WALK_INSTANCE="$INSTANCE" FARCAST_WALK_CWD="$WALK" "$@" \
+     "$WALK/walkprobe.test" -test.run '^TestWalkProbe$' -test.v -test.count=1); }
+   farcast version
+   ```
+   *Expect* the `grep` to print nothing, and `farcast version` to list four components.
+8. **The observing shell.** A second, ordinary terminal, with gcloud on the FarCast configuration:
+   ```bash
+   INSTANCE=<name>; WALK=<the same directory>
+   STATE="$HOME/Library/Application Support/farcast"
+   export KUBECONFIG="$STATE/instances/$INSTANCE/kubeconfig.yaml"
+   export CLOUDSDK_ACTIVE_CONFIG_NAME=<your FarCast gcloud configuration>
+   ```
+   Record the counts of clusters, registries, buckets, forwarding rules, addresses, target pools, disks and VMs in the project now, for P7 to compare with. Record counts only.
+9. **Cloud Shell**, signed in as an Owner of the instance's project. Set the project and the instance there, typed and never recorded: `PROJECT=<the project id>` and `INSTANCE=<name>`. P6 and P7 use both.
+
+---
+
+## P1. Install, and item 1: a writing command's reads run as the writer (billable from here)
+
+1. **No cost: `install` refuses Application Default Credentials.** In the walk shell, twice: with no `--credentials`, and with `--credentials /dev/null`, an empty file. `install` refuses both before it opens the provider or records anything. Nothing could be created even if it did not: with no `--yes` and no terminal on stdin it stops before its confirmation. The project is a made-up one, and `GOOGLE_APPLICATION_CREDENTIALS` names a file that does not exist, so not even a regression could validate the machine's Application Default Credentials against the instance's project. Each refusal is a usage error: exit status 2, its prose on stderr, nothing on stdout and no JSON envelope (there is no `usage` kind). Each run writes to files, never through a `2>&1 >/dev/null` pipe, which zsh's MULTIOS would break:
+   ```bash
+   GOOGLE_APPLICATION_CREDENTIALS="$WALK/none.json" farcast -o json install --name "$INSTANCE" --cost-limit 100 \
+     --region us-central1 --project farcast-walk-unused </dev/null >"$WALK/p1-1.out" 2>"$WALK/p1-1.err"; echo "exit $?"
+   wc -c < "$WALK/p1-1.out"; grep -c 'credentials is required' "$WALK/p1-1.err"
+   GOOGLE_APPLICATION_CREDENTIALS="$WALK/none.json" farcast -o json install --name "$INSTANCE" --cost-limit 100 \
+     --region us-central1 --project farcast-walk-unused --credentials /dev/null </dev/null >"$WALK/p1-1b.out" 2>"$WALK/p1-1b.err"; echo "exit $?"
+   wc -c < "$WALK/p1-1b.out"; grep -c 'credentials names an empty file' "$WALK/p1-1b.err"
+   ```
+   *Expect*, for each, `exit 2`, a count of `0` bytes on stdout, and `1`. Record them. Anything else is a finding: stop, and do not go on to step 2.
+2. **The install.** In the walk shell:
+   ```bash
+   farcast install --name "$INSTANCE" --cost-limit 100 --region us-central1 --project <the project id> --credentials <service-account-key.json>
+   ```
+   Answer its confirmation. *Expect* it to finish as on the M1 walk. `credentials.yaml` now holds the installer's key.
+3. **No cost: the endpoint's form (item 7).** In the observing shell, from `metadata.yaml`, which step 2 wrote. It prints each label's shape, never the endpoint itself:
+   ```bash
+   M="$STATE/instances/$INSTANCE/metadata.yaml"
+   REGION=$(awk '/^region:/{print $2}' "$M")
+   awk '/^endpoint:/{print $2}' "$M" | awk -F. -v r="$REGION" '{
+     for (i = 1; i <= NF; i++) { l = $i
+       if (l == r) s = "<the region>"; else if (index(l, r "-") == 1) s = "<a zone of the region: " l ">"
+       else if (l == "gke" || l == "goog") s = l; else s = "<" length(l) " characters>"
+       printf "%s%s", s, (i < NF ? "." : "\n") } }'
+   ```
+   Record the line it printed. farcast's endpoint rule (`kube.ParseEndpoint`) accepts a `gke.goog` name only when one of its labels after the first is the recorded region. A zone label in its place, as in Google's one published example, fails closed before anything is sent: every in-process call after this step, farcast's and the probe's, would stop at that rule, and `connect` and `world` would fail with `endpoint_refused`. **So a zone label is a stop.** Record it as item 7's answer and as a finding against the rule. Skip every step that reaches the cluster in-process (steps 4 and 5, P2.4 to P2.6, P4 and P5), and go on with P2.1 to P2.3, P3, P6 and P7.
+4. **Before `connect`: one read as the writer.** The probe sends the writing commands' preflight read, the list of `farcast-system`, once, as the installer's key:
+   ```bash
+   probe FARCAST_WALK_PROBE=forbidden-body FARCAST_WALK_IDENTITY=writer
+   ```
+   *Expect* `status 200 OK` and `not a refusal`: the DNS endpoint accepts the writer's token with `userinfo.email` alone. Record the status line. For anything else, also record the lines it printed: the Content-Type, whether the body is a Kubernetes Status, the reason and code, and the scrubbed message.
+
+   **Hard stop on a 401 or a 403.** Then every writing command would refuse at its own preflight read, so `connect` would refuse before it creates the load balancer, and nothing about it is learned by running it. Skip step 5, and P2's grant and `world`. Go on with P2's init, paste and record, then P2.4, which needs no connected instance and is then item 2's answer: a 403 whose body is a Kubernetes Status means the endpoint accepted the reader's token and RBAC refused it, as it should before a grant; a 401 means the endpoint refused the token; the endpoint's IAM refusal is no answer yet, so run it again after a few minutes, as P2.4 says. Then go on with P3 to P6, which do not need a connected instance either. Adding `cloud-platform` back is a code change with its own dated note in ADR 0023, not a walk step.
+5. **`connect`.** In the walk shell:
+   ```bash
+   farcast -o json connect "$INSTANCE" --yes > "$WALK/connect.json"; echo "exit $?"
+   grep -o '"kind":"[a-z_]*"}}' "$WALK/connect.json"
+   grep -c '^carrier:' "$STATE/instances/$INSTANCE/metadata.yaml"
+   ```
+   `--yes` answers the load balancer's cost confirmation, and only that. Since M2.5, `connect` reads `farcast-system` as the writer before that question, before it mints the instance's CA and before any push or apply. After its applies it reads the rollout and the carrier's IP as the writer too.
+
+   *Expect* exit 0, no kind, and one `carrier:` line. Then `farcast connect "$INSTANCE" --status` connects. Record:
+   - the exit status, and the error's kind if there was one;
+   - whether `metadata.yaml` records a carrier. A refusal with no carrier recorded came before the load balancer, so at the preflight read;
+   - from the firewall's log, whether `$WALK/bin/farcast` itself reached the cluster's `*.gke.goog` host and `oauth2.googleapis.com` (its in-process reads, as the writer), and whether kubectl reached the cluster (the applies);
+   - whether `connect --status` connected.
+
+## P2. Item 2: the reader, end to end
+
+1. **The key and the script.** In the walk shell:
+   ```bash
+   farcast reader init "$INSTANCE" > "$WALK/reader-init.sh"
+   pbcopy < "$WALK/reader-init.sh"
+   ```
+   Where the organization enforces `iam.serviceAccountKeyExpiryHours`, pass a `--days` no greater than its days, and at most 90 ([phase-1-validation.md](phase-1-validation.md) step 7b). *Expect* `Paste this into Cloud Shell as a project Owner (sha256 …)` on stderr, and `reader.key` and `reader.crt` in the instance's directory.
+2. **The paste.** Paste the script into Cloud Shell. Keep what it prints on the screen for P3; do not copy it anywhere. *Expect* it to end with `farcast reader record $INSTANCE --key-id <40 hex>`.
+3. **The record.** In the walk shell: `farcast reader record "$INSTANCE" --key-id <the id>`. *Expect* `metadata.yaml`'s `reader:` to gain `key_id`.
+4. **Optional, no extra cost: an RBAC refusal from the real API server.** Before `reader grant`, the reader has its IAM role and no RBAC yet:
+   ```bash
+   probe FARCAST_WALK_PROBE=forbidden-body FARCAST_WALK_IDENTITY=reader
+   ```
+   Record the lines it printed, as in P1.4. A 403 whose body is a Kubernetes Status is an RBAC refusal, the shape farcast's `forbidden` sentence for the reader assumes. While `clusterViewer` is still propagating, the answer may be the endpoint's IAM refusal, or a 401, instead: record which, and how many minutes after the paste.
+5. **The grant.** In the walk shell, which is a terminal, timed by zsh's `time`, which prints the elapsed time when the command ends:
+   ```bash
+   time farcast reader grant "$INSTANCE"
+   ```
+   Answer `y` at once: the elapsed time includes the prompt. It applies through kubectl, then reads as the reader, waiting up to 8 minutes for IAM, then asks five access reviews. If its first read is refused it prints `IAM changes typically take 2 minutes, and can take 7 minutes or longer; checking again until <a time of day>` once; the retries after it print nothing. *Expect* `✓ instance "$INSTANCE"'s reader … reads the cluster, and was verified read-only`. Record:
+   - the elapsed minutes `time` printed, rounded, never a time of day;
+   - whether the `IAM changes typically take 2 minutes` line appeared, which says the first read was refused. Never record the time it names;
+   - if a review answered that the reader `may` do something, which of the five.
+
+   Whether a refusal while it waited was a 401 or a 403 is not printed unless the 8 minutes run out. If that matters, run P2.4's probe just before the grant: its status line is the answer at that moment.
+6. **`world`, as the reader.** In the walk shell:
+   ```bash
+   farcast -o json world "$INSTANCE" > "$WALK/world.json"; echo "exit $?"
+   grep -o '"error":{"kind":"[a-z_]*"' "$WALK/world.json" | sort | uniq -c
+   grep -o '"read":[a-z]*\(,"skipped":"[a-z_]*"\)\{0,1\}' "$WALK/world.json" | sort | uniq -c
+   ```
+   This walk deploys no kernel and no keyholder. So *expect* one error kind only, `kernel_absent`, for the spend section, which reads nothing from the cluster without a kernel; and the seal section `"read":false` with `"skipped"`. Every other section reads. Record the exit status and the two counts. This is item 2's answer: the DNS endpoint accepts the reader's token with `userinfo.email` alone, and `clusterViewer` plus farcast's RBAC reads what `world` reads. A `credential_refused`, `unauthorized`, `forbidden` or `endpoint_refused` is the answer the other way.
+
+## P3. Item 3: what the init script printed
+
+From what the paste printed in P2.2, record:
+- whether either policy check printed anything. The script silences both (`2>/dev/null`), so nothing is expected;
+- whether the script stopped at a policy check;
+- the retry against a fresh account. Each failed try prints gcloud's own error, then the script waits 8, 16, 24, 32 and 40 seconds. Record, for the binding and for the upload, how many errors came before the command succeeded, or `FarCast: gave up after 6 tries`. Record each error's command group and its first words only, never a line that names the project or an account;
+- whether `keys upload` accepted the certificate. The certificate carries no key usage and no other extension. An error naming key usage, an extension or the certificate's form means the upload needs one;
+- whether the printed key id is 40 lowercase hex characters, which says `--format 'value(name.basename())'` printed the id alone.
+
+Then run the two checks unsilenced in Cloud Shell, to record their spelling and output:
+```bash
+gcloud resource-manager org-policies describe iam.disableServiceAccountKeyUpload \
+  --effective --project "$PROJECT" --format 'value(booleanPolicy.enforced)'; echo "exit $?"
+gcloud org-policies describe iam.managed.disableServiceAccountKeyUpload \
+  --effective --project "$PROJECT" --format 'value(spec.rules[0].enforce)'; echo "exit $?"
+```
+For each, record the exit status, and whether it printed nothing, `True`, `False`, or an error. For an error, record its command group and first words only, such as an unknown command, an unrecognized argument or `NOT_FOUND`.
+
+## P4. Items 6 and 4: a throwaway account
+
+The account has no role at first, so the endpoint's IAM check refuses it (item 6). Then it gets `roles/container.developer` and no RBAC, and asks for a review (item 4).
+
+1. **The account**, in Cloud Shell:
+   ```bash
+   PROBE_SA=farcast-walk-probe
+   gcloud iam service-accounts describe "$PROBE_SA@$PROJECT.iam.gserviceaccount.com" --project "$PROJECT" >/dev/null 2>&1 \
+     && echo "STOP: $PROBE_SA already exists"
+   gcloud iam service-accounts create "$PROBE_SA" --project "$PROJECT" --display-name 'FarCast probe walk; delete at teardown'
+   ```
+   No role is granted yet.
+2. **Its key, into the walk's scratch directory only.** In the observing shell, as the operator's own configuration:
+   ```bash
+   PROJECT=$(awk '/^project:/{print $2}' "$STATE/instances/$INSTANCE/metadata.yaml")   # never print it
+   mkdir -m 700 "$WALK/probe"
+   gcloud iam service-accounts keys create "$WALK/probe/key.json" \
+     --iam-account "farcast-walk-probe@$PROJECT.iam.gserviceaccount.com" --project "$PROJECT"; echo "exit $?"
+   chmod 600 "$WALK/probe/key.json"
+   ```
+   gcloud names the account and the file on stderr: do not record that line. If the project forbids key creation (`iam.disableServiceAccountKeyCreation` or its managed form), record that, delete the account (P7.1), and skip the rest of P4: items 4 and 6 are then not walked.
+
+   **From here, if the walk stops for any reason, run P7.1 before anything else.** The account has a key on this Mac, and from step 4 a role on the whole project.
+3. **Item 6: the endpoint's IAM refusal.** In the walk shell:
+   ```bash
+   probe FARCAST_WALK_PROBE=forbidden-body FARCAST_WALK_IDENTITY=key FARCAST_WALK_KEY_JSON=probe/key.json
+   ```
+   A new key can take a short while to work. If the probe says `the token endpoint minted no token`, wait a minute and run it again, and record how many tries it took. *Expect* a refusal. Record every line it printed after the first, all of them scrubbed:
+   - the status and the Content-Type;
+   - the body's keys;
+   - whether the body is a Kubernetes Status, with its reason and code; or Google's JSON error, with its status, its code, and each detail's `@type` and reason;
+   - the scrubbed message.
+
+   farcast tells an RBAC refusal from the endpoint's IAM refusal by whether the body is a Kubernetes Status, so these lines settle that rule.
+4. **The role**, in Cloud Shell. The command prints the project's whole IAM policy, so it is discarded:
+   ```bash
+   gcloud projects add-iam-policy-binding "$PROJECT" --condition=None \
+     --member "serviceAccount:$PROBE_SA@$PROJECT.iam.gserviceaccount.com" --role roles/container.developer >/dev/null; echo "exit $?"
+   ```
+5. **Item 4: the review.** In the walk shell, every one or two minutes:
+   ```bash
+   probe FARCAST_WALK_PROBE=review FARCAST_WALK_IDENTITY=key FARCAST_WALK_KEY_JSON=probe/key.json \
+     FARCAST_WALK_VERB=create FARCAST_WALK_RESOURCE=deployments FARCAST_WALK_GROUP=apps FARCAST_WALK_NAMESPACE=farcast-system
+   ```
+   IAM changes typically take 2 minutes, and can take 7 minutes or longer ([Google](https://docs.cloud.google.com/iam/docs/access-change-propagation)). Until the role is in force, the review itself may be refused at the endpoint: the probe then prints `the review itself was refused` and the refusal's lines, which are a second sample for item 6. Keep asking until two answers at least five minutes apart agree, the later one at least 10 minutes after step 4. Record:
+   - the verdict, `ALLOWED`, `DENIED` or `NO OPINION`, and the scrubbed reason;
+   - how many minutes after step 4 the answer settled;
+   - whether the review itself was refused before that, and how.
+
+   `ALLOWED` means GKE's reviews consult IAM: an account with an IAM role and no RBAC is allowed. `reader grant`'s five reviews then also see an IAM role stronger than `clusterViewer` edited into the paste, as the CLI README assumes. `DENIED` or `NO OPINION`, settled, means they consult RBAC alone. Record that as a finding against the [CLI README's `reader grant` section](../../farsight/cli/README.md#farcast-reader-grant--the-rbac-and-the-check), which states the inference.
+6. **Controls, optional and at no extra cost.** The same review as the writer (`FARCAST_WALK_IDENTITY=writer`; *expect* `ALLOWED`: the installer holds `roles/container.admin`) and as the reader (`FARCAST_WALK_IDENTITY=reader`; *expect* anything but `ALLOWED`: `reader grant` asked exactly this). Then `forbidden-body` as the key once more, now holding its role. Record the three verdicts or statuses.
+
+## P5. Item 5: an empty key id
+
+In the walk shell:
+```bash
+probe FARCAST_WALK_PROBE=mint-empty-kid
+```
+It mints once with the reader's key, sending `"kid":""` in place of the recorded key id, and requests nothing from the cluster. Record its one result line: `ACCEPTED`, `REFUSED: OAuth error …` with the code, `NOT ANSWERED: …`, `ANSWERED without a token`, or `the token endpoint's answer could not be read`. The last two are findings against the probe or the token source: record them as such. P2's `world` is the control: the same key, under its recorded id, minted there.
+
+A refusal changes nothing today, because every key farcast mints with carries its id: the reader's is recorded by `reader record`, and the installer's key file names its own. It is still a finding for the token source, which sends whatever id is recorded.
+
+## P6. Item 7: the cluster's version
+
+The endpoint's form was read in P1.3. The cluster's version, in Cloud Shell:
+```bash
+gcloud container clusters describe "farcast-$INSTANCE" --region us-central1 --project "$PROJECT" \
+  --format 'value(currentMasterVersion,location)'
+```
+Record the version and the location. Its minor version is the one ADR 0023 M2.7's no-cost test against a real API server pins.
+
+## P7. Teardown
+
+1. **The throwaway account**, in Cloud Shell, the binding first:
+   ```bash
+   gcloud projects remove-iam-policy-binding "$PROJECT" --condition=None \
+     --member "serviceAccount:$PROBE_SA@$PROJECT.iam.gserviceaccount.com" --role roles/container.developer >/dev/null; echo "exit $?"
+   gcloud iam service-accounts delete "$PROBE_SA@$PROJECT.iam.gserviceaccount.com" --project "$PROJECT" --quiet; echo "exit $?"
+   gcloud iam service-accounts keys list --iam-account "$PROBE_SA@$PROJECT.iam.gserviceaccount.com" --project "$PROJECT" >/dev/null 2>&1; echo "keys list exit $?"
+   ```
+   Record the three exit statuses. The last is expected to fail, because the account and its keys are gone. Then, in the observing shell: `rm -f "$WALK/probe/key.json"`.
+2. **`release`**, in the walk shell: `farcast release "$INSTANCE" --yes`. No `storage deploy` ran, so there is no bucket with objects, and `--delete-data` is not needed. *Expect* its result to end with a `reader:` line naming the reader and two Cloud Shell commands, the binding's removal first. Do not record them.
+3. **The reader's account**, in Cloud Shell: run the two printed commands, in order. Then, with P0.9's `INSTANCE`:
+   ```bash
+   READER_SA="farcast-reader-$(printf %s "$INSTANCE" | sha256sum | cut -c1-8)"
+   gcloud iam service-accounts list --project "$PROJECT" --format 'value(email)' | grep -c -e "^$READER_SA@" -e '^farcast-walk-probe@'
+   ```
+   *Expect* `0`. Record whether each printed command succeeded, and the count.
+4. **The cloud**, in the observing shell: verify against the cloud, not local state, that clusters, registries, buckets, forwarding rules, addresses, target pools, disks and VMs are back to P0.8's counts.
+5. `rm -rf "$WALK"`. It holds the release, the probe, the reader's script and the JSON results.
+
+---
+
+## Results
+
+Not walked.
+
+| Step | Result | Notes |
+|---|---|---|
+| Commit, `./check.sh` | | |
+| P0 release build: `OK`, tags, revision, `vcs.modified=false` | | |
+| P1.1 install without `--credentials`, and with `/dev/null`: exit 2 each, no envelope, nothing created | | |
+| P1.2 install | | |
+| Item 7, P1.3: the endpoint's form | | |
+| Item 1, P1.4: the writer's preflight read before `connect` | | |
+| Item 1, P1.5: `connect`: exit, kind, carrier recorded, firewall log, `--status` | | |
+| Item 2, P2.4 (optional): the reader before its RBAC | | |
+| Item 2, P2.5: `reader grant`: elapsed minutes, the IAM line, reviews | | |
+| Item 2, P2.6: `world` as the reader: error kinds, sections read | | |
+| Item 3: the paste: policy checks, retries, upload, key id shape | | |
+| Item 3: the two policy checks unsilenced | | |
+| Item 6, P4.3: the endpoint's IAM refusal, every printed line | | |
+| Item 4, P4.5: the review: verdict, reason, minutes to settle | | |
+| P4.6 controls (optional): writer, reader, key with its role | | |
+| Item 5, P5: `"kid":""` | | |
+| Item 7, P6: the cluster's version and location | | |
+| P7 throwaway account, key and binding deleted | | |
+| P7 `release`, the reader lines run, accounts absent | | |
+| P7 the cloud back to P0's counts | | |

@@ -18,7 +18,7 @@ import (
 
 func meterCmd(fc *fakeCluster) *kernelMeterCommand {
 	c := &kernelMeterCommand{}
-	c.deployer.newCluster = func(string) clusterApplier { return fc }
+	c.deployer.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 	return c
 }
 

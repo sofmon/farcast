@@ -181,9 +181,11 @@ func runRead(t *testing.T, dir config.Dir, rc readCommand) (out, errb []byte, er
 // as the instance's reader. The installer's credentials.yaml is never opened
 // (so neither the writer nor storage, which opens it, is), reader.key is,
 // every request the cluster saw carried the reader's token, no assertion was
-// signed with the writer's key, and each command returns what was seeded: a
-// writer that refuses to open sends nothing, so the reads succeeding is what
-// shows the reader read.
+// signed with the writer's key, and each command returns what was seeded.
+// Since ADR 0023 M2.5 the fixture's writer opens too, and could read all of
+// it, so a command that read as the writer would now reach the server and
+// fail the As checks: the test is stronger than when a writer refused to
+// open.
 func TestReadCommandsPresentOnlyTheReaderToken(t *testing.T) {
 	for _, rc := range readCommands() {
 		t.Run(rc.name, func(t *testing.T) {

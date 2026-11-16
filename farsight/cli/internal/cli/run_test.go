@@ -71,6 +71,18 @@ type fakeRunCluster struct {
 	// applyErrOn fails only an apply whose stream contains this.
 	applyErrOn string
 	rolloutErr error
+	// uidReads counts the writer's preflight reads (A20-11), and uidErr
+	// answers them.
+	uidReads int
+	uidErr   error
+	// waitErr fails every WaitJob after the Job was applied, as the cluster
+	// client does when it cannot read the Job.
+	waitErr error
+}
+
+func (f *fakeRunCluster) NamespaceUID(context.Context, string) (string, error) {
+	f.uidReads++
+	return "", f.uidErr
 }
 
 func (f *fakeRunCluster) Apply(_ context.Context, m []byte) error {
@@ -107,6 +119,9 @@ func (f *fakeRunCluster) WaitJob(_ context.Context, ns, name string, _ time.Dura
 	f.waited = append(f.waited, name)
 	if !f.jobs[name] {
 		return cluster.JobResult{}, fmt.Errorf("no Job %q was ever applied; applied: %v", name, f.jobs)
+	}
+	if f.waitErr != nil {
+		return cluster.JobResult{}, f.waitErr
 	}
 	if strings.HasPrefix(name, "fetch-") {
 		return cluster.JobResult{Succeeded: !f.fetchFails, Message: f.report}, nil
@@ -173,7 +188,7 @@ func runnableInstance(t *testing.T, dir config.Dir, name string) *config.Instanc
 
 func runCmd(f *fakeRunCluster) *runCommand {
 	c := &runCommand{assumeYes: true}
-	c.newCluster = func(string) runCluster { return f }
+	c.newCluster = func(clusterRef) (runCluster, error) { return f, nil }
 	c.newBuilder = func(func(string)) imageBuilder { return &fakeBuilder{} }
 	c.fetcherImage, c.builderImage = fetcherDigest, builderDigest
 	// No test dials a real tunnel. Without this the default seam reaches for
@@ -527,7 +542,7 @@ func TestRunRecordsTheReviewedImagesSoTheNextRunNeedNotBeTold(t *testing.T) {
 	// And a second run, told nothing, uses them.
 	f2 := newFakeRun(twoAppManifest)
 	c2 := &runCommand{assumeYes: true}
-	c2.newCluster = func(string) runCluster { return f2 }
+	c2.newCluster = func(clusterRef) (runCluster, error) { return f2, nil }
 	c2.newBuilder = func(func(string)) imageBuilder { return &fakeBuilder{} }
 	if err := c2.Run(context.Background(), env, []string{"p43", "github.com/example/my-platform"}); err != nil {
 		t.Fatalf("a second run had to be told the images again: %v", err)
@@ -1470,6 +1485,45 @@ func TestRunHandsNewScopesToAServingKeyholder(t *testing.T) {
 	}
 	if !deployed {
 		t.Error("a keyholder that could not be reached aborted the deploy")
+	}
+}
+
+// ADR 0023 M2.5 (C-F1): a run that mints a scope and hands it to a serving
+// keyholder raises the key pin through the writer it opened for the whole
+// run, never through a second opener, so the installer's token is minted
+// once per run. The writer here is a fake that also holds a pin; the
+// default opener's pin must stay untouched.
+func TestRunRaisesThePinThroughTheWriterItOpened(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	meta := runnableInstance(t, dir, "p43")
+	meta.Keyholder = &config.Keyholder{Deployed: true, Replicas: 1}
+	if err := dir.SaveInstanceMetadata("p43", meta); err != nil {
+		t.Fatal(err)
+	}
+	mintKeyring(t, dir, "p43")
+	env, _, errBuf := testEnvBoth(dir, output.ModeHuman)
+
+	f := newFakeRun(twoAppManifest)
+	writer := &fakePinStore{}
+	c := runCmd(f)
+	c.newCluster = func(clusterRef) (runCluster, error) {
+		return struct {
+			*fakeRunCluster
+			*fakePinStore
+		}{f, writer}, nil
+	}
+	c.newKeyholder = openerFor(&fakeStateKeyholder{phase: "unsealed"})
+	if err := c.Run(context.Background(), env, []string{"p43", "github.com/example/my-platform"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(errBuf.String(), "Minted a storage scope") {
+		t.Fatalf("guard: the run minted nothing, so it raised no pin:\n%s", errBuf)
+	}
+	if !writer.exists {
+		t.Errorf("the pin was not raised through the writer run opened:\n%s", errBuf)
+	}
+	if pinStoreOf(dir, "p43").exists {
+		t.Error("run raised the pin through a second opener")
 	}
 }
 

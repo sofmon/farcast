@@ -241,6 +241,11 @@ opening `reader.key`.)*
    not. It asks in a terminal (`--yes` is refused), applies with kubectl as your active
    gcloud configuration, then reads as the reader:
 
+   *(2026-11-15, ADR 0023 M2.5: it also needs step 2's installer key in the instance's
+   `credentials.yaml`, which step 5's `--credentials` stored. It opens the instance's
+   writer with that key, before it asks anything, to run the apply, though it makes no
+   in-process call as the writer. Not yet walked.)*
+
    ```bash
    ./farcast reader grant "$INSTANCE"
    ```
@@ -323,7 +328,7 @@ gcloud iam service-accounts keys list --iam-account "$SA"  # then delete keys if
 
 | Symptom | Cause & fix |
 |---|---|
-| `could not find default credentials` | You omitted `--credentials`. Pass `--credentials "$KEY"`. Do not reach for `gcloud auth application-default login`: this project never uses Application Default Credentials — FarCast gets the explicit service-account key, and `gcloud` runs under the operator's own configuration. *(Corrected 2026-10-08: this row used to suggest ADC.)* |
+| `could not find default credentials` | You omitted `--credentials`. Pass `--credentials "$KEY"`. Do not reach for `gcloud auth application-default login`: this project never uses Application Default Credentials — FarCast gets the explicit service-account key, and `gcloud` runs under the operator's own configuration. *(Corrected 2026-10-08: this row used to suggest ADC.)* *(2026-11-15, ADR 0023 M2.5: `farcast install` itself now refuses a missing `--credentials`, with `--credentials is required: …`, before anything is created.)* |
 | `PERMISSION_DENIED` on create | The installer SA lacks `roles/container.admin`. Re-check Step 2. |
 | `... does not have permission to act as ... compute@developer` | Missing `roles/iam.serviceAccountUser` (Step 2), or the **default compute SA is disabled** on the project (org-policy). Enable it or grant actAs on the node SA. |
 | `Kubernetes Engine API has not been used/enabled` | Step 1 not done (or still propagating — wait a minute). |

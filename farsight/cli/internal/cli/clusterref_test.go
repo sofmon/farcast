@@ -11,6 +11,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -452,10 +453,9 @@ func TestOnlyVerifyingOpensAnUnverifiedReader(t *testing.T) {
 	}
 }
 
-// Until ADR 0023 M2.5 the writer does not open in-process, and an identity
-// an instance does not have never opens. Neither sends anything or opens the
-// installer's key.
-func TestOpenClusterLeavesTheWriterToM25(t *testing.T) {
+// An identity an instance does not have never opens, and neither does a
+// call with no record. Neither sends anything or opens the installer's key.
+func TestOpenClusterRefusesAnIdentityAnInstanceDoesNotHave(t *testing.T) {
 	s := kubetest.New(t)
 	dir, meta := readerInstance(t, s, "atlas", true)
 	reads := observeConfigReads(t)
@@ -463,7 +463,6 @@ func TestOpenClusterLeavesTheWriterToM25(t *testing.T) {
 		identity kube.Identity
 		want     string
 	}{
-		{kube.Writer, "cli: the writer opens in-process from ADR 0023 M2.5"},
 		{"", `cli: "" is not one of an instance's identities`},
 		{"admin", `cli: "admin" is not one of an instance's identities`},
 	} {
@@ -473,12 +472,264 @@ func TestOpenClusterLeavesTheWriterToM25(t *testing.T) {
 		}
 	}
 	if slices.Contains(reads(), filepath.Join(dir.InstancePath("atlas"), "credentials.yaml")) {
-		t.Error("the refused writer opened credentials.yaml")
+		t.Error("a refused identity opened credentials.yaml")
 	}
 	if got := s.Requests(); len(got) != 0 {
 		t.Errorf("the refusals sent %d requests", len(got))
 	}
-	if c, err := openCluster(clusterRef{Dir: dir, Identity: kube.Reader}); c != nil || err == nil {
+	if c, err := openCluster(clusterRef{Dir: dir, Identity: kube.Writer}); c != nil || err == nil {
 		t.Errorf("no record: openCluster = %v, %v", c, err)
+	}
+}
+
+// writerKeyJSON is a service-account key file's JSON for cred, as Google's
+// key files are, with fields replaced or added from extra.
+func writerKeyJSON(t *testing.T, cred kube.Credential, extra map[string]string) string {
+	t.Helper()
+	fields := map[string]string{
+		"type": "service_account", "client_email": cred.Email,
+		"private_key_id": cred.PrivateKeyID, "private_key": string(cred.PrivateKeyPEM),
+	}
+	for k, v := range extra {
+		fields[k] = v
+	}
+	b, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// keyBytesIn reports whether msg holds any piece of a PEM key's body: every
+// base64 line is looked for by its first 16 characters, which no message
+// farcast writes could hold by chance.
+func keyBytesIn(msg string, keyPEM []byte) bool {
+	for _, line := range strings.Split(string(keyPEM), "\n") {
+		if strings.HasPrefix(line, "-----") || len(line) < 16 {
+			continue
+		}
+		if strings.Contains(msg, line[:16]) {
+			return true
+		}
+	}
+	return false
+}
+
+// ADR 0023 M2.5 (A20-8), mutations 71c and 71d: each of openCluster's
+// refusals of the writer fires in its step's order, with its own words, and
+// matches its sentinel: errCredentialMissing for the record's name and for
+// credentials.yaml, kube.ErrEndpointRefused for the endpoint and for a key
+// that does not pair with it. None sends anything, and no message holds a
+// byte of the private key credentials.yaml holds: a file that does not parse
+// is named by its fault and position, never by the YAML library's text,
+// which quotes the source lines; and a key that is not a service-account key
+// keeps kube's text, which names the field. A name install would refuse is
+// refused before any path is built from it, so nothing is read at all.
+func TestOpenClusterRefusesTheWriterInOrder(t *testing.T) {
+	s := kubetest.New(t)
+	const name = "atlas"
+	writer := s.Credential("writer")
+	google := kube.Credential{Email: "installer@proj-test1.iam.gserviceaccount.com", PrivateKeyID: writer.PrivateKeyID, PrivateKeyPEM: writer.PrivateKeyPEM}
+	valid := writerKeyJSON(t, writer, nil)
+	savedCreds := func(key string) func(t *testing.T, dir config.Dir) {
+		return func(t *testing.T, dir config.Dir) {
+			if err := dir.SaveInstanceCredentials(name, &config.InstanceCredentials{Provider: "gke", ServiceAccountKey: key}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	credsFile := func(dir config.Dir) string { return filepath.Join(dir.InstancePath(name), "credentials.yaml") }
+	// corrupt is a credentials.yaml holding the whole key, with a YAML
+	// syntax error on the line after it, so the YAML library's own message
+	// quotes the key's lines.
+	corrupt := func(t *testing.T, dir config.Dir) {
+		savedCreds(valid)(t, dir)
+		b, err := os.ReadFile(credsFile(dir))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(credsFile(dir), append(b, []byte("  - [unclosed\n")...), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		// The fixture is only worth its name if the library's text would
+		// have leaked the key.
+		if _, err := dir.LoadInstanceCredentials(name); err == nil || !keyBytesIn(err.Error(), writer.PrivateKeyPEM) {
+			t.Fatalf("the corrupt credentials.yaml's own parse error = %v; want one that quotes the key", err)
+		}
+	}
+	for _, row := range []struct {
+		step     string
+		endpoint string
+		creds    func(t *testing.T, dir config.Dir)
+		sentinel error
+		want     func(dir config.Dir) string
+	}{
+		{"1, no endpoint", "", savedCreds(""), kube.ErrEndpointRefused,
+			func(config.Dir) string {
+				return `instance "atlas" records no cluster endpoint; 'farcast install' records one; nothing was sent`
+			}},
+		{"4, no credentials.yaml", s.Endpoint(), nil, errCredentialMissing,
+			func(config.Dir) string {
+				return `instances/atlas/credentials.yaml is missing; this machine holds no installer key for instance "atlas"; nothing was sent`
+			}},
+		{"4, a credentials.yaml that cannot be read", s.Endpoint(), func(t *testing.T, dir config.Dir) {
+			if err := os.Mkdir(credsFile(dir), 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}, errCredentialMissing,
+			func(dir config.Dir) string {
+				_, err := os.ReadFile(credsFile(dir))
+				var pe *fs.PathError
+				if !errors.As(err, &pe) {
+					t.Fatalf("reading a directory = %v", err)
+				}
+				return fmt.Sprintf(`instance "atlas"'s credentials.yaml cannot be read (%v); nothing was sent`, pe.Err)
+			}},
+		{"4, a credentials.yaml that does not parse", s.Endpoint(), corrupt, errCredentialMissing,
+			func(dir config.Dir) string {
+				_, err := dir.LoadInstanceCredentials(name)
+				fault, ok := config.ParseFault(err)
+				if !ok {
+					t.Fatalf("ParseFault(%v) found no fault", err)
+				}
+				return fmt.Sprintf(`instance "atlas"'s credentials.yaml does not parse (%s); nothing was sent`, fault)
+			}},
+		{"4, a blank key (Application Default Credentials)", s.Endpoint(), savedCreds(""), errCredentialMissing,
+			func(config.Dir) string {
+				return `instance "atlas" was installed without a service-account key (Application Default Credentials), which farcast no longer uses for its cluster (ADR 0023 M2); ` +
+					`release it ('farcast release atlas') and install a new instance with --credentials`
+			}},
+		{"4, a key that is not a service account's", s.Endpoint(), savedCreds(writerKeyJSON(t, writer, map[string]string{"type": "authorized_user"})), errCredentialMissing,
+			func(config.Dir) string {
+				return "the stored service-account key is not a service-account key farcast uses (type)"
+			}},
+		{"4, a key whose private key is not RSA", s.Endpoint(), savedCreds(writerKeyJSON(t, writer, map[string]string{"private_key": "-----BEGIN PRIVATE KEY-----\n" + strings.Repeat("QUJD", 20) + "\n-----END PRIVATE KEY-----\n"})), errCredentialMissing,
+			func(config.Dir) string {
+				return "the stored service-account key is not a service-account key farcast uses (private_key)"
+			}},
+		{"5, a Google key to a loopback endpoint", s.Endpoint(), savedCreds(writerKeyJSON(t, google, nil)), kube.ErrEndpointRefused,
+			func(config.Dir) string {
+				return "a Google credential (proj-test1.iam.gserviceaccount.com) does not go to a loopback endpoint; nothing was sent"
+			}},
+	} {
+		dir := config.Dir(filepath.Join(t.TempDir(), "cfg"))
+		meta := &config.InstanceMetadata{Name: name, Provider: "gke", Project: "proj-test1", Region: "us-central1", Endpoint: row.endpoint}
+		writeRecord(t, dir, meta)
+		if err := os.WriteFile(filepath.Join(dir.InstancePath(name), "cluster-ca.crt"), s.CAPEM(), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if row.creds != nil {
+			row.creds(t, dir)
+		}
+		c, err := openCluster(clusterRef{Dir: dir, Meta: meta, Identity: kube.Writer, Warn: &bytes.Buffer{}})
+		if c != nil || err == nil {
+			t.Errorf("step %s: openCluster = %v, %v; want a refusal", row.step, c, err)
+			continue
+		}
+		if want := row.want(dir); err.Error() != want {
+			t.Errorf("step %s:\n got %q\nwant %q", row.step, err, want)
+		}
+		if !errors.Is(err, row.sentinel) {
+			t.Errorf("step %s: %v does not match its sentinel %v", row.step, err, row.sentinel)
+		}
+		if keyBytesIn(err.Error(), writer.PrivateKeyPEM) || strings.Contains(err.Error(), "PRIVATE KEY") {
+			t.Errorf("step %s: the refusal holds the key: %q", row.step, err)
+		}
+		if kind := kindOf(classified(err)); kind != map[error]string{errCredentialMissing: kindCredentialMissing, kube.ErrEndpointRefused: kindEndpointRefused}[row.sentinel] {
+			t.Errorf("step %s: kind %q", row.step, kind)
+		}
+	}
+
+	// 1b (A20-8): a recorded name install would refuse is refused, quoted,
+	// before any path is built from it: nothing is read, not even
+	// cluster-ca.crt. Each row's directory holds a usable writer under that
+	// name, so skipping the check would open it.
+	reads := observeConfigReads(t)
+	for _, bad := range []string{"atlas\x1b[2J", "../atlas", "Atlas", "atlas/x"} {
+		dir := config.Dir(filepath.Join(t.TempDir(), "cfg"))
+		inst := filepath.Join(string(dir), "instances", bad)
+		if err := os.MkdirAll(inst, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(inst, "cluster-ca.crt"), s.CAPEM(), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(inst, "credentials.yaml"), []byte("provider: gke\nservice_account_key: "+strconvQuote(valid)+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		meta := &config.InstanceMetadata{Name: bad, Provider: "gke", Project: "proj-test1", Region: "us-central1", Endpoint: s.Endpoint()}
+		c, err := openCluster(clusterRef{Dir: dir, Meta: meta, Identity: kube.Writer, Warn: &bytes.Buffer{}})
+		want := fmt.Sprintf(msgUnsafeRecord, bad, "name", bad)
+		if c != nil || err == nil || err.Error() != want || !errors.Is(err, errCredentialMissing) {
+			t.Errorf("the name %q: openCluster = %v, %v; want %q", bad, c, err, want)
+		}
+	}
+	if got := reads(); len(got) != 0 {
+		t.Errorf("the writer read %v from records whose name it refuses", got)
+	}
+	if got := s.Requests(); len(got) != 0 {
+		t.Errorf("the refusals sent %d requests", len(got))
+	}
+}
+
+// strconvQuote is a YAML double-quoted scalar for s: JSON's quoting, which
+// YAML reads.
+func strconvQuote(s string) string {
+	b, err := json.Marshal(s)
+	if err != nil {
+		panic(err)
+	}
+	return string(b)
+}
+
+// ADR 0023 M2.5 (A20-8): the writer opens as the installer's key from
+// credentials.yaml, in loopback mode against kubetest. Its reads go
+// in-process as the writer, minted with the stored key id, and reader.key is
+// never read; its Apply alone runs kubectl, given the instance's own
+// kubeconfig.yaml, and sends nothing to the API itself.
+func TestAWriterOpensAsTheInstallerKey(t *testing.T) {
+	saw := t.TempDir()
+	bin := t.TempDir()
+	script := "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > '" + saw + "/argv'\n/bin/cat > /dev/null\n"
+	if err := os.WriteFile(filepath.Join(bin, "kubectl"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
+	s := kubetest.New(t)
+	s.Put(map[string]any{"apiVersion": "v1", "kind": "Namespace", "metadata": map[string]any{"name": "farcast-system", "uid": "uid-1"}})
+	dir, meta := readerInstance(t, s, "atlas", true)
+	reads := observeConfigReads(t)
+
+	c, err := openCluster(clusterRef{Dir: dir, Meta: meta, Identity: kube.Writer, Warn: &bytes.Buffer{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uid, err := c.NamespaceUID(t.Context(), "farcast-system"); err != nil || uid == "" {
+		t.Fatalf("NamespaceUID = %q, %v", uid, err)
+	}
+	reqs := s.Requests()
+	if len(reqs) != 2 || reqs[0].Path != "/token" || reqs[0].As != "writer" || reqs[1].As != "writer" {
+		t.Fatalf("requests = %+v; want one mint and one read, as the writer", reqs)
+	}
+	got := reads()
+	if !slices.Contains(got, filepath.Join(dir.InstancePath("atlas"), "credentials.yaml")) {
+		t.Errorf("the writer never read credentials.yaml: %v", got)
+	}
+	if slices.Contains(got, filepath.Join(dir.InstancePath("atlas"), "reader.key")) {
+		t.Errorf("the writer read reader.key: %v", got)
+	}
+
+	if err := c.Apply(t.Context(), []byte("apiVersion: v1\nkind: Namespace\nmetadata:\n  name: x\n")); err != nil {
+		t.Fatal(err)
+	}
+	argv, err := os.ReadFile(filepath.Join(saw, "argv"))
+	if err != nil {
+		t.Fatalf("Apply ran no kubectl: %v", err)
+	}
+	if want := "--kubeconfig\n" + dir.InstanceKubeconfigPath("atlas") + "\napply\n-f\n-\n"; string(argv) != want {
+		t.Errorf("kubectl ran with %q; want %q", argv, want)
+	}
+	if got := len(s.Requests()); got != 2 {
+		t.Errorf("Apply sent %d requests to the API itself", got-2)
 	}
 }

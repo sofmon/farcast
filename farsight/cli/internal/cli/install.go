@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/sofmon/farcast/farsight/cli/internal/buildinfo"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
+	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
 	"github.com/sofmon/farcast/planck"
 	_ "github.com/sofmon/farcast/planck/providers" // register cloud adapters (gke)
@@ -53,7 +55,7 @@ Flags:
   --provider <id>        Cloud provider (default: gke)
   --project <id>         Cloud project (GCP project ID; required for gke)
   --region <region>      Cloud region (default: us-central1)
-  --credentials <path>   Path to a service-account key JSON; omit to use ADC
+  --credentials <path>   Path to a service-account key JSON (required)
   --cost-limit <amount>  Monthly spend ceiling in USD (REQUIRED, > 0; no default, no "unlimited")
   -y, --yes              Skip the confirmation prompt (required when non-interactive)
 
@@ -65,7 +67,7 @@ func (c *installCommand) SetFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.provider, "provider", "", "cloud provider")
 	fs.StringVar(&c.project, "project", "", "cloud project / GCP project ID")
 	fs.StringVar(&c.region, "region", "", "cloud region")
-	fs.StringVar(&c.credentials, "credentials", "", "path to a service-account key JSON")
+	fs.StringVar(&c.credentials, "credentials", "", "path to a service-account key JSON (required)")
 	fs.Float64Var(&c.costLimit, "cost-limit", 0, "monthly spend ceiling in USD (required, > 0)")
 	fs.BoolVar(&c.assumeYes, "yes", false, "skip the confirmation prompt")
 	fs.BoolVar(&c.assumeYes, "y", false, "skip the confirmation prompt")
@@ -301,12 +303,17 @@ func (c *installCommand) resolveInputs(interactive bool, p *prompter) error {
 		}
 		c.region = strings.TrimSpace(v)
 	}
-	if c.credentials == "" && interactive {
-		v, err := p.lineDefault("Path to service-account key JSON (blank = ADC)", "")
+	if c.credentials == "" {
+		if !interactive {
+			return usagef("%s", msgCredentialsRequired)
+		}
+		v, err := p.line("Path to service-account key JSON")
 		if err != nil {
 			return err
 		}
-		c.credentials = strings.TrimSpace(v)
+		if c.credentials = strings.TrimSpace(v); c.credentials == "" {
+			return usagef("%s", msgCredentialsRequired)
+		}
 	}
 	if c.costLimit <= 0 {
 		if !interactive {
@@ -344,15 +351,42 @@ func healthCheck(ctx context.Context, p planck.Provider, cluster *planck.Cluster
 	return err == nil && st == planck.StatusRunning
 }
 
-// readCredentials loads a credential file when a path is given; an empty path
-// means ambient / Application Default Credentials.
+// msgCredentialsRequired is install's refusal of a missing --credentials
+// (ADR 0023 M2.5, A20-1): every cluster-writing command reads the cluster as
+// the installer's stored key, so an instance installed without one could
+// never be connected or deployed into, only released.
+const msgCredentialsRequired = "--credentials is required: since ADR 0023 M2.5 farcast reads an instance's cluster, and writes its storage key pin, " +
+	"as the service account whose key --credentials names, never as Application Default Credentials"
+
+// msgCredentialsEmpty is install's refusal of a --credentials file that holds
+// nothing: /dev/null, an empty process substitution, a key whose download
+// failed. Planck reads an empty key as "use Application Default Credentials"
+// (planck.Config), so such an install would create, and bill, a cluster as
+// whatever this machine's ADC is, and record an instance every writing
+// command then refuses.
+const msgCredentialsEmpty = "--credentials names an empty file: since ADR 0023 M2.5 farcast reads an instance's cluster, and writes its storage key pin, " +
+	"as the service account whose key --credentials names, never as Application Default Credentials"
+
+// readCredentials loads the service-account key file --credentials names, and
+// refuses, before the provider is opened or anything is recorded, every key
+// the instance's writer could never open (openCluster's writerCredential): an
+// empty path, as resolveInputs refuses it; a file that is empty or holds only
+// white space; and one that is not a service-account key farcast uses, by the
+// writer's own parse. farcast no longer installs an instance with Application
+// Default Credentials. No refusal holds the file's bytes.
 func readCredentials(path string) ([]byte, error) {
 	if path == "" {
-		return nil, nil
+		return nil, usagef("%s", msgCredentialsRequired)
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read credentials file: %w", err)
+	}
+	if len(bytes.TrimSpace(data)) == 0 {
+		return nil, usagef("%s", msgCredentialsEmpty)
+	}
+	if _, err := kube.ParseServiceAccountJSON(data); err != nil {
+		return nil, usagef("--credentials does not hold a key the instance's writer could open, so nothing was created: %v", err)
 	}
 	return data, nil
 }

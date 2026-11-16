@@ -54,11 +54,12 @@ var grantMetered = []string{"farcast-system", "web"}
 // grant' whose kubectl apply is a fake, whose terminal answers "y", and whose
 // clock is fake. Its reader opens through the default newReader, openCluster.
 type grantFixture struct {
-	s           *kubetest.Server
-	dir         config.Dir
-	email       string
-	applier     *fakeCluster
-	kubeconfigs []string
+	s       *kubetest.Server
+	dir     config.Dir
+	email   string
+	applier *fakeCluster
+	// applierRefs is every clusterRef newApplier was handed.
+	applierRefs []clusterRef
 	clock       *grantClock
 	cmd         *readerGrantCommand
 	env         *Env
@@ -109,9 +110,9 @@ func newGrantFixture(t *testing.T, granted bool, opts ...kubetest.Option) *grant
 	}
 	f.dir = dir
 	f.cmd = &readerGrantCommand{
-		newApplier: func(kc string) clusterApplier {
-			f.kubeconfigs = append(f.kubeconfigs, kc)
-			return f.applier
+		newApplier: func(r clusterRef) (clusterApplier, error) {
+			f.applierRefs = append(f.applierRefs, r)
+			return f.applier, nil
 		},
 		interactive: func(*Env) bool { return true },
 		now:         f.clock.Now,
@@ -214,6 +215,12 @@ func TestReaderGrantVerifiesAsTheReader(t *testing.T) {
 		if err == nil || !errors.Is(err, tkube.ErrForbidden) || !strings.Contains(err.Error(), "still cannot read instance \"atlas\"'s cluster after 8m0s") ||
 			!strings.Contains(err.Error(), "nothing was recorded") {
 			t.Fatalf("grant = %v; want the 403 that outlasted 8 minutes", err)
+		}
+		// The 403 is the reader's: reader grant's writer makes no in-process
+		// call, so its error never names the installer service account
+		// (A20-9 is for the writer's own 403s; M-F8).
+		if strings.Contains(err.Error(), "installer service account") {
+			t.Errorf("reader grant's 403 names the installer: %q", err)
 		}
 		want := []time.Duration{5 * time.Second, 10 * time.Second, 20 * time.Second, 40 * time.Second,
 			time.Minute, time.Minute, time.Minute, time.Minute, time.Minute, time.Minute, 45 * time.Second}
@@ -638,7 +645,7 @@ func TestReaderGrantOpensTheReaderBeforeItAsks(t *testing.T) {
 	}
 }
 
-// The apply runs through newApplier, at the instance's kubeconfig, with
+// The apply runs through newApplier, opened as the instance's writer, with
 // exactly the stream renderReaderRBAC renders for the reader, farcast-system
 // and every metered namespace, before the reader reads anything. A failed
 // apply records nothing and sends nothing as the reader.
@@ -654,8 +661,9 @@ func TestReaderGrantAppliesTheRenderedRBAC(t *testing.T) {
 	if len(f.applier.applied) != 1 || !bytes.Equal(f.applier.applied[0], want) {
 		t.Errorf("applied %d streams; want exactly the rendered RBAC:\n%s", len(f.applier.applied), bytes.Join(f.applier.applied, []byte("\n=====\n")))
 	}
-	if want := []string{f.dir.InstanceKubeconfigPath(grantName)}; !slices.Equal(f.kubeconfigs, want) {
-		t.Errorf("newApplier was given %q; want %q", f.kubeconfigs, want)
+	if len(f.applierRefs) != 1 || f.applierRefs[0].Identity != kube.Writer || f.applierRefs[0].Meta == nil ||
+		f.applierRefs[0].Meta.Name != grantName || f.applierRefs[0].Dir != f.dir {
+		t.Errorf("newApplier was given %+v; want one writer of instance %q in %s", f.applierRefs, grantName, f.dir)
 	}
 
 	failed := newGrantFixture(t, false, grantRBAC(t))

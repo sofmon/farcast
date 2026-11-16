@@ -27,6 +27,11 @@
 // only. It reads the operator's config directory the way the CLI does
 // ($FARCAST_CONFIG_HOME, then the user config directory).
 //
+// The cluster probes (mint-empty-kid, review, forbidden-body; ADR 0023 M2's
+// probe walk, docs/runbooks/adr-0023-m2-probe-walk.md, in walkcluster_test.go)
+// print less: no key ID, and no token, key, assertion, email, project id or
+// address. What the cluster or Google sent is scrubbed before it is printed.
+//
 // go test runs the probe in the package's directory, not the caller's, so a
 // relative path is resolved against FARCAST_WALK_CWD, and refused without it
 // rather than looked for in the wrong place. The Session A runbook sets it to
@@ -51,6 +56,15 @@
 //	tunnel        present any certificate at the public carrier and report what
 //	              the handshake, Status and each stream route do
 //	open          read a stored object with a packet's scope keys
+//	mint-empty-kid  mint once with the reader's key and "kid":"", through the
+//	              vendored 2LO provider: whether Google accepted it and, if
+//	              not, the OAuth error code (probe walk item 5)
+//	review        one SelfSubjectAccessReview as FARCAST_WALK_IDENTITY:
+//	              allowed, denied or no opinion, and the reason (item 4)
+//	forbidden-body  one GET as FARCAST_WALK_IDENTITY, the writing commands'
+//	              preflight read of farcast-system: its status and
+//	              Content-Type, whether the body is a Kubernetes Status, its
+//	              reason and code, and its message scrubbed (items 6 and 1)
 //
 // Inputs:
 //
@@ -70,6 +84,15 @@
 //	FARCAST_WALK_CERT, FARCAST_WALK_KEY   PEM files for 'tunnel'; without them,
 //	                      'tunnel' presents FARCAST_WALK_LEAF
 //	FARCAST_WALK_OBJECT   the logical key for 'open'
+//	FARCAST_WALK_IDENTITY   writer | reader | key, for review and forbidden-body
+//	                      (no default): the installer's key in credentials.yaml,
+//	                      reader.key under its recorded key id, or the key file
+//	                      FARCAST_WALK_KEY_JSON names
+//	FARCAST_WALK_KEY_JSON   a service-account key file, for FARCAST_WALK_IDENTITY=key
+//	FARCAST_WALK_VERB, FARCAST_WALK_RESOURCE   review's verb and resource
+//	                      (resource or resource/subresource), both required
+//	FARCAST_WALK_GROUP    review's API group; empty is the core group
+//	FARCAST_WALK_NAMESPACE   review's namespace; empty is every namespace
 package cli
 
 import (
@@ -134,8 +157,14 @@ func TestWalkProbe(t *testing.T) {
 		w.open()
 	case "keyscan":
 		w.keyscan()
+	case "mint-empty-kid":
+		w.mintEmptyKid()
+	case "review":
+		w.review()
+	case "forbidden-body":
+		w.forbiddenBody()
 	default:
-		t.Fatalf("FARCAST_WALK_PROBE=%q: want packet, keyscan, state, push, seal, release-hold, tunnel or open", probe)
+		t.Fatalf("FARCAST_WALK_PROBE=%q: want packet, keyscan, state, push, seal, release-hold, tunnel, open, mint-empty-kid, review or forbidden-body", probe)
 	}
 }
 
