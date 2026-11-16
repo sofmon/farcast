@@ -166,6 +166,24 @@ func defaultProviderOpener(meta *config.InstanceMetadata, creds *config.Instance
 	})
 }
 
+// The defaults of the provider and image-builder seams, as package variables
+// (ADR 0023 M2.6, A23-49): a command whose seam is unset takes these, and the
+// package's tests replace both with fakes that refuse, so no test reaches a
+// real cloud provider or registry through these two seams by leaving one
+// unset. Other seams keep defaults that are real.
+//
+// deployerNowDefault is the deployer's clock, a variable for the same
+// reason: a test that runs a command through the router, where it cannot
+// set the command's own clock, fixes it here, so a plan bound to the UTC
+// day (kernel confirm's) is not made on one day and confirmed on the next.
+var (
+	openProviderDefault providerOpener = defaultProviderOpener
+	newBuilderDefault                  = func(progress func(string)) imageBuilder {
+		return &image.Builder{Progress: progress}
+	}
+	deployerNowDefault = time.Now
+)
+
 // registryAccess is the instance's ensured registry plus the ability to mint a
 // credential for it.
 //
@@ -210,6 +228,10 @@ type fatlineDeployer struct {
 	component components.Component
 
 	assumeYes bool
+	// consent is --plan and --confirm <digest> (ADR 0023 M2.6), registered
+	// by each command that has a plan, in its own SetFlags, and never by
+	// setYesFlag: a command that registers them must also call consent.mode.
+	consent consentFlags
 	// fatlineImage is the command's own image flag (--fatline-image,
 	// --technocore-image or --datasphered-image): an image deployed as given.
 	fatlineImage string
@@ -244,12 +266,10 @@ func (d *fatlineDeployer) ensureDefaults() {
 		}
 	}
 	if d.openProvider == nil {
-		d.openProvider = defaultProviderOpener
+		d.openProvider = openProviderDefault
 	}
 	if d.newBuilder == nil {
-		d.newBuilder = func(progress func(string)) imageBuilder {
-			return &image.Builder{Progress: progress}
-		}
+		d.newBuilder = newBuilderDefault
 	}
 	if d.findSource == nil {
 		d.findSource = image.FindSource
@@ -261,7 +281,7 @@ func (d *fatlineDeployer) ensureDefaults() {
 		d.build = buildinfo.Get
 	}
 	if d.now == nil {
-		d.now = time.Now
+		d.now = deployerNowDefault
 	}
 }
 

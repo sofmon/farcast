@@ -31,17 +31,21 @@ func TestKindsVector(t *testing.T) {
 // document this CLI no longer prints.
 func TestEveryVectorFileIsProduced(t *testing.T) {
 	produced := map[string]bool{
-		"instances/empty.json":       true, // TestInstancesVectors
-		"instances/unreadable.json":  true,
-		"version/version.json":       true, // TestVersionVector
-		"kinds/kinds.json":           true, // TestKindsVector
-		"world/error_not_found.json": true, // TestWorldErrorVectors
+		"instances/empty.json":         true, // TestInstancesVectors
+		"instances/unreadable.json":    true,
+		"version/version.json":         true, // TestVersionVector
+		"kinds/kinds.json":             true, // TestKindsVector
+		"world/error_not_found.json":   true, // TestWorldErrorVectors
+		"plan/error_plan_changed.json": true, // TestPlanErrorVectors
 	}
 	for _, v := range worldVectors() { // TestWorldVectors
 		produced["world/"+v.name+".json"] = true
 	}
+	for _, v := range planVectors() { // TestPlanVectors
+		produced["plan/"+v.name+".json"] = true
+	}
 	found := map[string]bool{}
-	for _, dir := range []string{"world", "instances", "version", "kinds"} {
+	for _, dir := range []string{"world", "instances", "version", "kinds", "plan"} {
 		entries, err := os.ReadDir(filepath.Join("testdata", dir))
 		if err != nil {
 			t.Fatal(err)

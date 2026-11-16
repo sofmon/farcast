@@ -10,7 +10,6 @@ import (
 
 	"github.com/sofmon/farcast/farsight/cli/internal/cluster"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
-	"github.com/sofmon/farcast/farsight/cli/internal/image"
 	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 	pbuild "github.com/sofmon/farcast/planck/build"
 )
@@ -102,9 +101,7 @@ func (c *buildCommand) ensureDefaults() {
 		}
 	}
 	if c.newBuilder == nil {
-		c.newBuilder = func(progress func(string)) imageBuilder {
-			return &image.Builder{Progress: progress}
-		}
+		c.newBuilder = newBuilderDefault
 	}
 }
 

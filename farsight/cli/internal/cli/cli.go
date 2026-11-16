@@ -164,6 +164,8 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		ConfigDir: dir,
 		Verbose:   opts.verbose,
 		Log:       logger,
+		Argv:      append([]string(nil), args[1:]...),
+		Flags:     cfs,
 	}
 
 	err = cmd.Run(ctx, env, cmdArgs)

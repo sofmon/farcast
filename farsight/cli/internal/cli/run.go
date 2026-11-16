@@ -11,7 +11,6 @@ import (
 
 	"github.com/sofmon/farcast/datasphere"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
-	"github.com/sofmon/farcast/farsight/cli/internal/image"
 	"github.com/sofmon/farcast/farsight/cli/internal/keyholder"
 	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 	fldeploy "github.com/sofmon/farcast/fatline/deploy"
@@ -141,9 +140,7 @@ func (c *runCommand) ensureDefaults() {
 		}
 	}
 	if c.newBuilder == nil {
-		c.newBuilder = func(progress func(string)) imageBuilder {
-			return &image.Builder{Progress: progress}
-		}
+		c.newBuilder = newBuilderDefault
 	}
 }
 

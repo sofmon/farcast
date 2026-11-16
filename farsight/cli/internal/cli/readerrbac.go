@@ -234,21 +234,42 @@ func readerSubject(dir config.Dir, meta *config.InstanceMetadata) (string, error
 	return meta.Reader.Email, checkReaderSubject(meta.Reader.Email)
 }
 
-// meteredReader is the reader email a command that starts metering a
+// readerIAMRole is the one IAM role the Cloud Shell script grants the reader,
+// which 'reader grant' asks consent to rely on and its plan binds.
+const readerIAMRole = "roles/container.clusterViewer"
+
+// readerResources is what the reader's rule set grants per namespace, in
+// readerRoleTemplate's rule order, the ConfigMaps aside (readerConfigMaps
+// names those): the reader fact's resources (design §9.4, A23-33;
+// TestReaderResourcesFollowTheRoleRuleOrder).
+var readerResources = []string{"deployments", "statefulsets", "pods", "pods/log", "jobs"}
+
+// meteredReaderNote is the reader email a command that starts metering a
 // namespace binds there beside the kernel (design §7.2, "Where each part is
 // applied"): only when 'reader grant' recorded the metered scope, the consent
 // to "every namespace the kernel meters, now and later". Otherwise, and when
 // the record cannot be rendered from, it is "" and no reader binding is
-// added; the second case is said on stderr, since 'reader grant' would
-// otherwise expect one.
-func meteredReader(env *Env, name string, meta *config.InstanceMetadata) string {
+// added. In the second case it also returns warning, the line its caller
+// prints (or, in a plan, carries as a notice; A23-26), since 'reader grant'
+// would otherwise lead the operator to expect a binding.
+func meteredReaderNote(env *Env, name string, meta *config.InstanceMetadata) (email, warning string) {
 	if meta.Reader == nil || meta.Reader.Scope != readerScopeMetered {
-		return ""
+		return "", ""
 	}
 	email, err := readerSubject(env.ConfigDir, meta)
 	if err != nil {
-		fprintf(env.Err, "Warning: no reader binding is added: %v. 'farcast reader grant %s' binds the reader in every metered namespace once the record is fixed.\n", err, name)
-		return ""
+		return "", fmt.Sprintf("Warning: no reader binding is added: %v. 'farcast reader grant %s' binds the reader in every metered namespace once the record is fixed.", err, name)
+	}
+	return email, ""
+}
+
+// meteredReader is meteredReaderNote for the callers that have no plan yet
+// (kernel deploy until ADR 0023 M2.6c, run until M2.6d): it prints the
+// warning on stderr and returns the email.
+func meteredReader(env *Env, name string, meta *config.InstanceMetadata) string {
+	email, warning := meteredReaderNote(env, name, meta)
+	if warning != "" {
+		fprintln(env.Err, warning)
 	}
 	return email
 }

@@ -19,6 +19,7 @@ import (
 	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 	"github.com/sofmon/farcast/farsight/cli/internal/kube/kubetest"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
+	"github.com/sofmon/farcast/farsight/cli/internal/plan"
 	tkube "github.com/sofmon/farcast/technocore/kube"
 )
 
@@ -460,16 +461,23 @@ func TestReaderGrantRecordsNothingWhenAReviewFails(t *testing.T) {
 }
 
 // ADR 0023 M2.3, mutation 53: --yes never grants. It is a usage error that
-// says to confirm in a terminal, before anything is read, asked, applied or
-// sent, even with a terminal that would answer yes.
+// says to confirm in a terminal, or to review the plan and confirm its
+// digest (A23-41), before anything is read, asked, applied or sent, even
+// with a terminal that would answer yes. A name that is not an instance's
+// is not repeated: the text names <instance>.
 func TestReaderGrantRefusesYes(t *testing.T) {
-	const want = "reader grant cannot be run with --yes: it gives a Google identity read access to the cluster; confirm it in a terminal"
+	const want = "reader grant cannot be run with --yes: it gives a Google identity read access to the cluster; confirm it in a terminal, " +
+		"or review 'farcast reader grant atlas --plan' and pass --confirm <digest>"
 	dir := readerRecordFor(t, grantName, "proj-test1")
 	before := instanceFiles(t, dir, grantName)
 	for _, flag := range []string{"--yes", "-y"} {
 		_, stderr, code := farcastIn(t, dir, "reader", "grant", grantName, flag)
 		if code != 2 || !strings.Contains(stderr, want) {
 			t.Errorf("reader grant %s: exit %d, %q; want exit 2 and %q", flag, code, stderr, want)
+		}
+		const named = "confirm it in a terminal, or review 'farcast reader grant <instance> --plan' and pass --confirm <digest>"
+		if _, stderr, code := farcastIn(t, dir, "reader", "grant", "Not;an instance", flag); code != 2 || !strings.Contains(stderr, named) {
+			t.Errorf("reader grant 'Not;an instance' %s: exit %d, %q; want exit 2 and %q", flag, code, stderr, named)
 		}
 	}
 	sameFiles(t, "reader grant --yes", before, instanceFiles(t, dir, grantName))
@@ -489,10 +497,11 @@ func TestReaderGrantRefusesYes(t *testing.T) {
 	}
 }
 
-// Without a terminal, and with no flag, 'reader grant' is a usage error
-// until ADR 0023 M2.6 gives it a plan: nothing is applied or sent.
+// Without a terminal, and with no flag, 'reader grant' is a usage error that
+// names the route without one, --plan and then --confirm (A23-41): nothing
+// is applied or sent.
 func TestReaderGrantNeedsATerminal(t *testing.T) {
-	const want = "reader grant needs a terminal to confirm"
+	const want = "reader grant needs a terminal to confirm, or --plan and then --confirm <digest>"
 	dir := readerRecordFor(t, grantName, "proj-test1")
 	if _, err := dir.UpdateInstanceMetadata(grantName, func(m *config.InstanceMetadata) error {
 		m.Reader = &config.Reader{Email: readerEmail(grantName, "proj-test1"), KeyID: readerTestKeyID}
@@ -721,4 +730,291 @@ func TestReaderGrantRefusesWithoutAGrantableReader(t *testing.T) {
 			sameFiles(t, "a refused grant", before, instanceFiles(t, f.dir, grantName))
 		})
 	}
+}
+
+// grantOpens wraps f's reader and applier seams to count their opens.
+func (f *grantFixture) grantOpens() (readers, appliers func() int) {
+	opened := 0
+	reader := f.cmd.newReader
+	if reader == nil {
+		reader = openReaderVerifier
+	}
+	f.cmd.newReader = func(r clusterRef) (readerVerifier, error) {
+		opened++
+		return reader(r)
+	}
+	return func() int { return opened }, func() int { return len(f.applierRefs) }
+}
+
+// ADR 0023 M2.6 (A23-41): reader grant's plan reads the record alone. It
+// never asks whether stdin is a terminal, opens neither the reader nor the
+// writer, sends nothing and writes nothing; it binds the reader, its role and
+// its grant, then a write for each document of the RBAC it would apply, in
+// order, each with the hash of exactly the bytes apply would send.
+func TestReaderGrantPlanReadsNoClusterAndNeedsNoTerminal(t *testing.T) {
+	for _, mode := range []output.Mode{output.ModeJSON, output.ModeHuman} {
+		t.Run(fmt.Sprintf("mode %d", mode), func(t *testing.T) {
+			f := newGrantFixture(t, false, grantRBAC(t))
+			asked := 0
+			f.cmd.interactive = func(*Env) bool { asked++; return false }
+			readers, appliers := f.grantOpens()
+			withFlags(t, f.cmd, "--plan")
+			f.env, f.out, f.errb = testEnvBoth(f.dir, mode)
+			before := treeFiles(t, string(f.dir))
+			if err := f.run(t); err != nil {
+				t.Fatalf("reader grant --plan: %v", err)
+			}
+			if asked != 0 || readers() != 0 || appliers() != 0 || len(f.s.Requests()) != 0 || f.errb.Len() != 0 {
+				t.Errorf("the plan asked the terminal %d times, opened %d readers and %d writers, sent %d requests, and printed %q",
+					asked, readers(), appliers(), len(f.s.Requests()), f.errb)
+			}
+			sameFiles(t, "reader grant --plan", before, treeFiles(t, string(f.dir)))
+
+			meta, err := f.dir.LoadInstanceMetadata(grantName)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stream, err := renderReaderRBAC(grantEmail, grantMetered)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := newBound("reader grant", meta, "none", "")
+			want.Facts = append([]plan.Fact{plan.ReaderFact{
+				Type: plan.TypeReader, Email: grantEmail, IAMRole: "roles/container.clusterViewer", Scope: "metered",
+				Namespaces: grantMetered, Resources: []string{"deployments", "statefulsets", "pods", "pods/log", "jobs"},
+				ConfigMaps: []string{"technocore-namespaces", "technocore-ledger", "technocore-profiles", "fatline-egress-policy", "datasphered-pin"},
+			}}, wantWrites(t, stream)...)
+			if mode == output.ModeHuman {
+				for _, line := range []string{
+					"farcast reader grant atlas, stage -, reading the cluster as none\n",
+					"reader: " + grantEmail + " (roles/container.clusterViewer), scope metered: deployments, statefulsets, pods, pods/log, jobs in farcast-system, web;",
+					"write: apply RoleBinding web/farcast-reader (rbac.authorization.k8s.io/v1), force: no, sha256 ",
+					"\ndigest: " + plan.DigestOf([]byte(mustCanonical(t, want))) + "\n",
+				} {
+					if !strings.Contains(f.out.String(), line) {
+						t.Errorf("the rendering does not say %q:\n%s", line, f.out)
+					}
+				}
+				return
+			}
+			doc := printedDocument(t, f.out.Bytes())
+			if got := string(doc.Bound); got != mustCanonical(t, want) {
+				t.Errorf("the plan binds\n%s\nwant\n%s", got, mustCanonical(t, want))
+			}
+			if got := writeTargets(decodedBound(t, doc)); !slices.Equal(got, []string{
+				"ClusterRole /farcast-reader-namespaces", "ClusterRoleBinding /farcast-reader-namespaces", "ClusterRole /farcast-reader",
+				"RoleBinding farcast-system/farcast-reader", "RoleBinding web/farcast-reader",
+			}) {
+				t.Errorf("the plan writes %q", got)
+			}
+		})
+	}
+}
+
+// ADR 0023 M2.6 (A23-41; M-M26A-MUT-05): the reader fact names the
+// namespaces the RBAC binds the reader in, farcast-system first, exactly as
+// its RoleBinding writes do, whatever the record meters and in whatever
+// order: never the record's list as it stands.
+func TestReaderGrantPlanNamesTheNamespacesItBinds(t *testing.T) {
+	for _, row := range []struct {
+		name          string
+		metered, want []string
+	}{
+		{"farcast-system not recorded", []string{"web"}, []string{"farcast-system", "web"}},
+		{"farcast-system recorded last", []string{"demo", "farcast-system"}, []string{"farcast-system", "demo"}},
+		{"nothing metered", nil, []string{"farcast-system"}},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			f := newGrantFixture(t, false, grantRBAC(t))
+			if _, err := f.dir.UpdateInstanceMetadata(grantName, func(m *config.InstanceMetadata) error {
+				m.Kernel.Namespaces = row.metered
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			withFlags(t, f.cmd, "--plan")
+			f.env, f.out, f.errb = testEnvBoth(f.dir, output.ModeJSON)
+			if err := f.run(t); err != nil {
+				t.Fatal(err)
+			}
+			b := decodedBound(t, printedDocument(t, f.out.Bytes()))
+			if r, ok := b.Facts[0].(plan.ReaderFact); !ok || !slices.Equal(r.Namespaces, row.want) {
+				t.Errorf("the reader fact is %+v; want the namespaces %q", b.Facts[0], row.want)
+			}
+			var bound []string
+			for _, fact := range b.Facts {
+				if w, ok := fact.(plan.WriteFact); ok && w.Kind == "RoleBinding" && w.Name == readerRole {
+					bound = append(bound, w.Namespace)
+				}
+			}
+			if !slices.Equal(bound, row.want) {
+				t.Errorf("the plan binds the reader in %q; want %q", bound, row.want)
+			}
+		})
+	}
+}
+
+// ADR 0023 M2.6 (A23-18, A23-41): a reader that is not recorded, not
+// uploaded, or not the one farcast derives blocks the plan: --plan prints it,
+// exit 0, with no fact and nothing read, sent or written; --confirm of it
+// refuses with the block's kind and words, before anything opens. A record
+// farcast cannot render from is refused before any plan, as it is today.
+func TestReaderGrantPlanBlocks(t *testing.T) {
+	for _, row := range []struct {
+		name string
+		edit func(m *config.InstanceMetadata)
+		want string
+	}{
+		{"no reader", func(m *config.InstanceMetadata) { m.Reader = nil },
+			`instance "atlas" has no reader identity; run 'farcast reader init atlas'`},
+		{"no key id", func(m *config.InstanceMetadata) { m.Reader.KeyID = "" },
+			`instance "atlas"'s reader key is not yet uploaded; run the printed Cloud Shell script, then 'farcast reader record atlas --key-id <id>'`},
+		{"not the derived reader", func(m *config.InstanceMetadata) { m.Reader.Email = "writer@kubetest.invalid" },
+			`instance "atlas" records the reader "writer@kubetest.invalid", which is not the reader farcast derives for it (` + readerName(grantName) + `@<a name under .invalid>); no RBAC was rendered for it`},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			f := newGrantFixture(t, false, grantRBAC(t))
+			if _, err := f.dir.UpdateInstanceMetadata(grantName, func(m *config.InstanceMetadata) error {
+				row.edit(m)
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			readers, appliers := f.grantOpens()
+			before := treeFiles(t, string(f.dir))
+
+			withFlags(t, f.cmd, "--plan")
+			f.env, f.out, f.errb = testEnvBoth(f.dir, output.ModeJSON)
+			if err := f.run(t); err != nil {
+				t.Fatalf("--plan of a blocked plan = %v; want it printed, exit 0", err)
+			}
+			doc := printedDocument(t, f.out.Bytes())
+			b := decodedBound(t, doc)
+			if len(b.Facts) != 0 || !slices.Equal(b.Blocked, []plan.Block{{Kind: kindCredentialMissing, Message: row.want}}) {
+				t.Errorf("the plan has facts %v and blocks %+v; want no fact and the one block", b.Facts, b.Blocked)
+			}
+			if b.Command != "reader grant" || b.Instance != grantName || b.ClusterIdentity != "none" || len(b.Options) != 0 {
+				t.Errorf("the blocked plan binds %+v", b)
+			}
+
+			withFlags(t, f.cmd, "--confirm", doc.Digest)
+			err := f.run(t)
+			if kindOf(classified(err)) != kindCredentialMissing || err.Error() != row.want || exitCodeOf(err) != 1 {
+				t.Errorf("--confirm of the blocked plan = %v (kind %s, exit %d); want its block", err, kindOf(classified(err)), exitCodeOf(err))
+			}
+			if readers() != 0 || appliers() != 0 || len(f.s.Requests()) != 0 {
+				t.Errorf("a blocked plan opened %d readers and %d writers and sent %d requests", readers(), appliers(), len(f.s.Requests()))
+			}
+			sameFiles(t, "a blocked reader grant", before, treeFiles(t, string(f.dir)))
+		})
+	}
+
+	t.Run("an unsafe project", func(t *testing.T) {
+		f := newGrantFixture(t, false, grantRBAC(t))
+		if _, err := f.dir.UpdateInstanceMetadata(grantName, func(m *config.InstanceMetadata) error {
+			m.Project = "proj'$(id)"
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		withFlags(t, f.cmd, "--plan")
+		err := f.run(t)
+		if want := fmt.Sprintf(msgUnsafeRecord, grantName, "project ID", "proj'$(id)"); err == nil || err.Error() != want || f.out.Len() != 0 {
+			t.Errorf("--plan of an unsafe record = %v, printing %q; want %q and no plan", err, f.out, want)
+		}
+	})
+}
+
+// ADR 0023 M2.6 (A23-41): under --confirm, reader grant recomputes its plan
+// and compares it before it opens anything. A plan that changed opens
+// neither the reader nor the writer, applies nothing and sends nothing. The
+// plan confirmed opens the reader and the writer, asks nothing, applies the
+// planned RBAC, then reads and reviews as the reader, and records the grant;
+// a review that answers yes records nothing.
+func TestReaderGrantConfirmVerifiesAsTheReaderAfterTheCompare(t *testing.T) {
+	planned := func(t *testing.T, f *grantFixture) string {
+		t.Helper()
+		withFlags(t, f.cmd, "--plan")
+		f.env, f.out, f.errb = testEnvBoth(f.dir, output.ModeJSON)
+		if err := f.run(t); err != nil {
+			t.Fatal(err)
+		}
+		return printedDocument(t, f.out.Bytes()).Digest
+	}
+
+	t.Run("a changed plan", func(t *testing.T) {
+		f := newGrantFixture(t, false, grantRBAC(t))
+		digest := planned(t, f)
+		if _, err := f.dir.UpdateInstanceMetadata(grantName, func(m *config.InstanceMetadata) error {
+			m.Kernel.Namespaces = append(m.Kernel.Namespaces, "api")
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		readers, appliers := f.grantOpens()
+		withFlags(t, f.cmd, "--confirm", digest)
+		f.env, f.out, f.errb = testEnvBoth(f.dir, output.ModeHuman)
+		err := f.run(t)
+		if kindOf(classified(err)) != kindPlanChanged || !strings.Contains(err.Error(), "not the "+digest+" given to --confirm") {
+			t.Fatalf("--confirm of a changed plan = %v; want plan_changed", err)
+		}
+		if readers() != 0 || appliers() != 0 || len(f.applier.applied) != 0 || len(f.s.Requests()) != 0 || f.errb.Len() != 0 {
+			t.Errorf("a changed plan opened %d readers and %d writers, applied %d streams, sent %d requests and printed %q",
+				readers(), appliers(), len(f.applier.applied), len(f.s.Requests()), f.errb)
+		}
+		if got := f.reader(t); !got.GrantedAt.IsZero() {
+			t.Errorf("a changed plan recorded %+v", got)
+		}
+	})
+
+	t.Run("the plan confirmed", func(t *testing.T) {
+		f := newGrantFixture(t, false, grantRBAC(t))
+		digest := planned(t, f)
+		readers, appliers := f.grantOpens()
+		// No terminal, and stdin that would answer no: --confirm asks nothing.
+		f.cmd.interactive = func(*Env) bool { return false }
+		withFlags(t, f.cmd, "--confirm", digest)
+		f.env, f.out, f.errb = testEnvBoth(f.dir, output.ModeHuman)
+		f.env.In = strings.NewReader("n\n")
+		if err := f.run(t); err != nil {
+			t.Fatalf("--confirm of the plan: %v", err)
+		}
+		if strings.Contains(f.errb.String(), "[y/N]") {
+			t.Errorf("--confirm asked:\n%s", f.errb)
+		}
+		want, err := renderReaderRBAC(grantEmail, grantMetered)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if readers() != 1 || appliers() != 1 || len(f.applier.applied) != 1 || !bytes.Equal(f.applier.applied[0], want) {
+			t.Fatalf("opened %d readers and %d writers and applied %d streams; want one each, the planned RBAC", readers(), appliers(), len(f.applier.applied))
+		}
+		reqs, lines := apiRequests(f.s)
+		if countMethod(reqs, http.MethodGet) != 1 || countMethod(reqs, http.MethodPost) != len(readerReviews) {
+			t.Errorf("the verification sent %q; want one read and the %d reviews", lines, len(readerReviews))
+		}
+		for _, r := range f.s.Requests() {
+			if r.As != "reader" {
+				t.Errorf("%s %s as %q; the verification is the reader's", r.Method, r.Path, r.As)
+			}
+		}
+		if got := f.reader(t); !got.GrantedAt.Equal(grantStart) || got.Scope != readerScopeMetered {
+			t.Errorf("recorded %+v; want the grant", got)
+		}
+	})
+
+	t.Run("a review that answers yes", func(t *testing.T) {
+		f := newGrantFixture(t, false, grantRBAC(t), kubetest.WithAccess(func(id string, a kube.ResourceAttributes) bool {
+			return id == "reader" && a.Verb == "get" && a.Resource == "secrets"
+		}))
+		digest := planned(t, f)
+		withFlags(t, f.cmd, "--confirm", digest)
+		err := f.run(t)
+		if err == nil || !strings.Contains(err.Error(), "may get secrets in farcast-system; it is not read-only, so nothing was recorded") {
+			t.Fatalf("--confirm with a reader that can read Secrets = %v", err)
+		}
+		if got := f.reader(t); !got.GrantedAt.IsZero() || got.Scope != "" {
+			t.Errorf("a reader that can read Secrets was recorded: %+v", got)
+		}
+	})
 }

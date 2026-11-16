@@ -3,23 +3,29 @@ package cli
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	dsdeploy "github.com/sofmon/farcast/datasphere/deploy"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 	"github.com/sofmon/farcast/farsight/cli/internal/kube/kubetest"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
+	"github.com/sofmon/farcast/farsight/cli/internal/plan"
 	"github.com/sofmon/farcast/fatline/identity"
 	"github.com/sofmon/farcast/planck"
 	tcdeploy "github.com/sofmon/farcast/technocore/deploy"
@@ -1126,5 +1132,423 @@ func TestRunRaisesThePinThroughItsOwnWriter(t *testing.T) {
 	}
 	if strings.Contains(errb.String(), "key pin was not raised") {
 		t.Errorf("the pin raise warned: %s", errb)
+	}
+}
+
+// ADR 0023 M2.6: the plans. planCommand is one --plan shape of a command
+// that has a plan, as these tests run it: fresh each time, its flags parsed
+// from flags and --plan, against writeInstance's fixture changed by edit, on
+// a kubetest server it must not reach unless it reads the cluster. Each part
+// of M2.6 adds the rows of the commands it wires (A23-14, A23-49).
+type planCommand struct {
+	name  string // the command, as writeCommands names it
+	shape string // which of its plans
+	args  []string
+	flags []string
+	// readsCluster: the plan reads the cluster, as the instance's reader.
+	readsCluster bool
+	cmd          func() Command
+	edit         func(meta *config.InstanceMetadata)
+}
+
+func (p planCommand) String() string { return p.name + "/" + p.shape }
+
+// planClock is the clock planCommands' kernel confirm reads, planNow, and
+// planMonth a day of its month: a plan bound to the UTC day must be made and
+// confirmed on one day, and the real clock can cross midnight, or a month,
+// between two readings.
+func planClock() time.Time { return planNow }
+
+func planMonth(day int) string {
+	return time.Date(planNow.Year(), planNow.Month(), day, 0, 0, 0, 0, time.UTC).Format(time.DateOnly)
+}
+
+// pinPlanClock fixes the deployer's default clock at planNow for the rest
+// of the test: for a test that runs planCommands through the router, which
+// builds its commands itself.
+func pinPlanClock(t *testing.T) {
+	t.Helper()
+	saved := deployerNowDefault
+	deployerNowDefault = planClock
+	t.Cleanup(func() { deployerNowDefault = saved })
+}
+
+// planCommands is every --plan shape of the commands wired so far: kernel
+// meter, kernel confirm and reader grant (ADR 0023 M2.6a), none of which
+// reads the cluster. kernel confirm reads planClock; through the router,
+// pinPlanClock fixes the same clock.
+func planCommands() []planCommand {
+	meter := func() Command { return &kernelMeterCommand{} }
+	confirm := func() Command {
+		c := &kernelConfirmCommand{}
+		c.deployer.now = planClock
+		return c
+	}
+	grant := func() Command { return &readerGrantCommand{} }
+	metering := func(m *config.InstanceMetadata) {
+		m.Kernel.Namespaces = append(m.Kernel.Namespaces, writeNewNamespace)
+	}
+	return []planCommand{
+		{"kernel meter", "add", []string{writeName, writeNewNamespace}, nil, false, meter, nil},
+		{"kernel meter", "remove", []string{writeName, writeNewNamespace}, []string{"--remove"}, false, meter, metering},
+		{"kernel meter", "already metered", []string{writeName, writeNewNamespace}, nil, false, meter, metering},
+		{"kernel confirm", "a window", []string{writeName}, []string{"--amount", "1.25", "--from", planMonth(1), "--to", planMonth(2)}, false, confirm, nil},
+		{"kernel confirm", "an empty window", []string{writeName}, []string{"--amount", "0", "--from", planMonth(2), "--to", planMonth(2)}, false, confirm, nil},
+		{"reader grant", "a recorded reader", []string{writeName}, nil, false, grant, nil},
+		{"reader grant", "no reader", []string{writeName}, nil, false, grant, func(m *config.InstanceMetadata) { m.Reader = nil }},
+	}
+}
+
+// planCommandNamed is the planCommands row of name and shape.
+func planCommandNamed(t *testing.T, name, shape string) planCommand {
+	t.Helper()
+	for _, p := range planCommands() {
+		if p.name == name && p.shape == shape {
+			return p
+		}
+	}
+	t.Fatalf("no plan %s/%s", name, shape)
+	return planCommand{}
+}
+
+// planFixture is writeInstance, keyed, changed by row's edit.
+func planFixture(t *testing.T, row planCommand) (*kubetest.Server, config.Dir) {
+	t.Helper()
+	s := kubetest.New(t)
+	dir, meta := writeInstance(t, s, true)
+	if row.edit != nil {
+		row.edit(meta)
+		if err := dir.SaveInstanceMetadata(writeName, meta); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return s, dir
+}
+
+// withFlags parses flags into cmd as the router does, and returns cmd. A
+// command's SetFlags resets what its flags hold, so a test sets its seams
+// after, never its flags before.
+func withFlags[C Command](t *testing.T, cmd C, flags ...string) C {
+	t.Helper()
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	cmd.SetFlags(fs)
+	if err := fs.Parse(flags); err != nil {
+		t.Fatalf("parse %q: %v", flags, err)
+	}
+	return cmd
+}
+
+// runPlan runs row's --plan against dir in mode, with no terminal, and
+// returns what it printed: the document (in JSON mode; its digest alone,
+// from the digest line, in human mode) and the text. A plan prints nothing
+// on stderr: its notices are facts (A23-26).
+func runPlan(t *testing.T, dir config.Dir, row planCommand, mode output.Mode) (plan.Document, string) {
+	t.Helper()
+	return runPlanIn(t, dir, row, mode, strings.NewReader(""))
+}
+
+// runPlanIn is runPlan reading stdin from in.
+func runPlanIn(t *testing.T, dir config.Dir, row planCommand, mode output.Mode, in io.Reader) (plan.Document, string) {
+	t.Helper()
+	cmd := withFlags(t, row.cmd(), append(slices.Clone(row.flags), "--plan")...)
+	env, out, errb := testEnvBoth(dir, mode)
+	env.In = in
+	if err := cmd.Run(t.Context(), env, row.args); err != nil {
+		t.Fatalf("%s --plan: %v", row, err)
+	}
+	if errb.Len() != 0 {
+		t.Errorf("%s --plan wrote on stderr: %q", row, errb)
+	}
+	if mode == output.ModeJSON {
+		return printedDocument(t, out.Bytes()), out.String()
+	}
+	return plan.Document{Digest: digestLine(t, out.String())}, out.String()
+}
+
+// printedDocument decodes a printed plan.
+func printedDocument(t *testing.T, out []byte) plan.Document {
+	t.Helper()
+	var doc plan.Document
+	if err := json.Unmarshal(out, &doc); err != nil || doc.Kind != plan.Kind {
+		t.Fatalf("not a plan (%v):\n%s", err, out)
+	}
+	return doc
+}
+
+// digestLine is the digest a plan's rendering prints.
+func digestLine(t *testing.T, text string) string {
+	t.Helper()
+	for line := range strings.Lines(text) {
+		if d, ok := strings.CutPrefix(line, "digest: "); ok {
+			return strings.TrimSuffix(d, "\n")
+		}
+	}
+	t.Fatalf("no digest line in:\n%s", text)
+	return ""
+}
+
+// factTypes is each fact type by its type word, for decoding a printed plan.
+var factTypes = map[string]reflect.Type{
+	plan.TypeCost: reflect.TypeFor[plan.CostFact](), plan.TypeImage: reflect.TypeFor[plan.ImageFact](),
+	plan.TypeWrite: reflect.TypeFor[plan.WriteFact](), plan.TypeMint: reflect.TypeFor[plan.MintFact](),
+	plan.TypeRestart: reflect.TypeFor[plan.RestartFact](), plan.TypeCloud: reflect.TypeFor[plan.CloudFact](),
+	plan.TypeKernelSettings: reflect.TypeFor[plan.KernelSettingsFact](), plan.TypeMeter: reflect.TypeFor[plan.MeterFact](),
+	plan.TypeConfirmation: reflect.TypeFor[plan.ConfirmationFact](), plan.TypePin: reflect.TypeFor[plan.PinFact](),
+	plan.TypeRotation: reflect.TypeFor[plan.RotationFact](), plan.TypeFetch: reflect.TypeFor[plan.FetchFact](),
+	plan.TypeRun: reflect.TypeFor[plan.RunFact](), plan.TypeBuild: reflect.TypeFor[plan.BuildFact](),
+	plan.TypeApplicationReset: reflect.TypeFor[plan.ApplicationResetFact](), plan.TypeReader: reflect.TypeFor[plan.ReaderFact](),
+	plan.TypeNotice: reflect.TypeFor[plan.NoticeFact](),
+}
+
+// decodedBound decodes a printed plan's bound member, its facts typed.
+func decodedBound(t *testing.T, doc plan.Document) plan.Bound {
+	t.Helper()
+	var raw struct {
+		plan.Bound
+		Facts []json.RawMessage `json:"facts"`
+	}
+	if err := json.Unmarshal(doc.Bound, &raw); err != nil {
+		t.Fatalf("the bound member does not decode: %v\n%s", err, doc.Bound)
+	}
+	b := raw.Bound
+	b.Facts = nil
+	for _, f := range raw.Facts {
+		var head struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(f, &head); err != nil {
+			t.Fatal(err)
+		}
+		typ, ok := factTypes[head.Type]
+		if !ok {
+			t.Fatalf("a fact of no known type: %s", f)
+		}
+		v := reflect.New(typ)
+		if err := json.Unmarshal(f, v.Interface()); err != nil {
+			t.Fatal(err)
+		}
+		b.Facts = append(b.Facts, v.Elem().Interface().(plan.Fact))
+	}
+	return b
+}
+
+// noticesOf is the text of every notice a plan carries.
+func noticesOf(b plan.Bound) []string {
+	var out []string
+	for _, f := range b.Facts {
+		if n, ok := f.(plan.NoticeFact); ok {
+			out = append(out, n.Text)
+		}
+	}
+	return out
+}
+
+// wantWrites is the write facts of an apply stream, as a plan binds them: a
+// test's own reading of the stream, against which applyFacts is checked.
+func wantWrites(t *testing.T, stream []byte) []plan.Fact {
+	t.Helper()
+	docs, err := kube.SplitStream(stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []plan.Fact
+	for _, d := range docs {
+		out = append(out, plan.WriteFact{Type: plan.TypeWrite, API: d.Kind.APIVersion, Kind: d.Kind.Kind,
+			Namespace: d.Namespace, Name: d.Name, Method: plan.WriteApply, SHA256: fmt.Sprintf("%x", sha256.Sum256(d.Raw))})
+	}
+	return out
+}
+
+// writeTargets is each write fact as kind namespace/name.
+func writeTargets(b plan.Bound) []string {
+	var out []string
+	for _, f := range b.Facts {
+		if w, ok := f.(plan.WriteFact); ok {
+			out = append(out, w.Kind+" "+w.Namespace+"/"+w.Name)
+		}
+	}
+	return out
+}
+
+// ADR 0023 M2.6 (rows 72, 73): --plan writes nothing. Every shape, in both
+// modes, leaves the config directory byte for byte as it was, reaches the
+// cluster only with GETs as its reader if it reads it at all (and not at all
+// if not), and runs no kubectl.
+func TestPlansWriteNothing(t *testing.T) {
+	ran := strayKubectl(t)
+	for _, row := range planCommands() {
+		t.Run(row.String(), func(t *testing.T) {
+			s, dir := planFixture(t, row)
+			before := treeFiles(t, string(dir))
+			runPlan(t, dir, row, output.ModeJSON)
+			runPlan(t, dir, row, output.ModeHuman)
+			sameFiles(t, row.String()+" --plan", before, treeFiles(t, string(dir)))
+			reqs := s.Requests()
+			if !row.readsCluster && len(reqs) != 0 {
+				t.Errorf("%s --plan reads no cluster, and sent %d requests", row, len(reqs))
+			}
+			for _, r := range reqs {
+				switch {
+				case r.Path == "/token" && r.As != "reader":
+					t.Errorf("%s --plan minted a token as %q", row, r.As)
+				case r.Path != "/token" && r.Method != http.MethodGet:
+					t.Errorf("%s --plan sent %s %s", row, r.Method, r.Path)
+				}
+			}
+		})
+	}
+	if ran() {
+		t.Error("a plan ran kubectl")
+	}
+}
+
+// ADR 0023 M2.6 (row 91): a plan does not depend on the terminal. Each is
+// printed in human mode with stdin a character device, which isTerminal
+// takes for a terminal, and with stdin a pipe; the digests are equal, and so
+// are the bound bytes of the two in JSON.
+func TestPlanIgnoresTheTerminal(t *testing.T) {
+	tty, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tty.Close() }()
+	if !isTerminal(tty) {
+		t.Fatalf("%s is not taken for a terminal here, so this test would prove nothing", os.DevNull)
+	}
+	for _, row := range planCommands() {
+		t.Run(row.String(), func(t *testing.T) {
+			_, dir := planFixture(t, row)
+			inTTY, _ := runPlanIn(t, dir, row, output.ModeHuman, tty)
+			inPipe, _ := runPlanIn(t, dir, row, output.ModeHuman, strings.NewReader(""))
+			if inTTY.Digest != inPipe.Digest {
+				t.Errorf("the plan in a terminal is %s, and in a pipe %s", inTTY.Digest, inPipe.Digest)
+			}
+			jsonTTY, _ := runPlanIn(t, dir, row, output.ModeJSON, tty)
+			jsonPipe, _ := runPlanIn(t, dir, row, output.ModeJSON, strings.NewReader(""))
+			if !bytes.Equal(jsonTTY.Bound, jsonPipe.Bound) || jsonTTY.Digest != inTTY.Digest {
+				t.Errorf("the plan's bytes differ by stdin, or from its rendering:\n%s\n%s", jsonTTY.Bound, jsonPipe.Bound)
+			}
+		})
+	}
+}
+
+// ADR 0023 M2.6 (row 79): a plan computed twice from the same state is the
+// same bytes, and kernel confirm's two clock readings on one UTC day bind the
+// same plan (design §9.4, the clock).
+func TestPlanIsDeterministic(t *testing.T) {
+	for _, row := range planCommands() {
+		t.Run(row.String(), func(t *testing.T) {
+			_, dir := planFixture(t, row)
+			first, _ := runPlan(t, dir, row, output.ModeJSON)
+			second, _ := runPlan(t, dir, row, output.ModeJSON)
+			if !bytes.Equal(first.Bound, second.Bound) || first.Digest != second.Digest {
+				t.Errorf("two plans from one state differ:\n%s\n%s", first.Bound, second.Bound)
+			}
+		})
+	}
+	t.Run("kernel confirm/two clock readings on one day", func(t *testing.T) {
+		dir := config.Dir(t.TempDir())
+		kernelInstance(t, dir, "p41")
+		var docs []plan.Document
+		for _, at := range []time.Time{
+			time.Date(2026, 11, 16, 0, 0, 1, 0, time.UTC),
+			// 23:59:59 UTC, read in a zone where it is already the 17th.
+			time.Date(2026, 11, 17, 4, 59, 59, 999, time.FixedZone("east", 5*3600)),
+		} {
+			c := withFlags(t, confirmCmd(&fakeCluster{}), "--amount", "3.5", "--plan")
+			c.deployer.now = func() time.Time { return at }
+			env, out := testEnv(dir, output.ModeJSON)
+			if err := c.Run(t.Context(), env, []string{"p41"}); err != nil {
+				t.Fatal(err)
+			}
+			docs = append(docs, printedDocument(t, out.Bytes()))
+		}
+		if !bytes.Equal(docs[0].Bound, docs[1].Bound) {
+			t.Errorf("two readings on 2026-11-16 bind different plans:\n%s\n%s", docs[0].Bound, docs[1].Bound)
+		}
+	})
+}
+
+// ADR 0023 M2.6 (A23-24, §7.3): which plans read the installer's key, the
+// one credential that writes. In M2.6 a plan reads it only for the registry,
+// and kernel meter's, kernel confirm's and reader grant's plans have none:
+// none reads credentials.yaml. The read group arrives with the commands that
+// push images (M2.6b).
+func TestPlansStillReadTheInstallerKeyForGoogle(t *testing.T) {
+	readsKey := map[string]bool{"kernel meter": false, "kernel confirm": false, "reader grant": false}
+	for _, row := range planCommands() {
+		t.Run(row.String(), func(t *testing.T) {
+			want, ok := readsKey[row.name]
+			if !ok {
+				t.Fatalf("%s is in no group: say whether its plan reads the installer's key", row.name)
+			}
+			_, dir := planFixture(t, row)
+			reads := observeConfigReads(t)
+			runPlan(t, dir, row, output.ModeJSON)
+			got := slices.ContainsFunc(reads(), func(p string) bool { return filepath.Base(p) == "credentials.yaml" })
+			if got != want {
+				t.Errorf("%s --plan read credentials.yaml: %v, want %v (%q)", row, got, want, reads())
+			}
+		})
+	}
+}
+
+// ADR 0023 M2.6 (A23-26): under --plan, a line a command prints while it
+// works is a notice fact and is not printed; outside a plan it is printed
+// once, in the same words. Rows for meteredReader's warning, kernel meter's
+// no-op and kernel confirm's empty window. (M2.6b and M2.6c add keepingNote
+// and rotationScopeWarning.)
+func TestPlanPrintsNoticesOnlyAsFacts(t *testing.T) {
+	for _, row := range []struct {
+		name  string
+		setup func(t *testing.T, dir config.Dir) (cmd func(flags ...string) Command, args []string)
+		want  string
+	}{
+		{"meteredReader's warning", func(t *testing.T, dir config.Dir) (func(...string) Command, []string) {
+			meteredInstance(t, dir, "p42", tcdeploy.DefaultNamespace)
+			withReader(t, dir, "p42", "edited")
+			return func(flags ...string) Command { return withFlags(t, meterCmd(&fakeCluster{}), flags...) }, []string{"p42", "demo"}
+		}, "Warning: no reader binding is added: instance \"p42\" records the reader \"farcast-installer@proj-test1.iam.gserviceaccount.com\", " +
+			"which is not the reader farcast derives for it (" + readerEmail("p42", "proj-test1") + "); no RBAC was rendered for it. " +
+			"'farcast reader grant p42' binds the reader in every metered namespace once the record is fixed."},
+		{"kernel meter's no-op", func(t *testing.T, dir config.Dir) (func(...string) Command, []string) {
+			meteredInstance(t, dir, "p42", tcdeploy.DefaultNamespace, "demo")
+			return func(flags ...string) Command { return withFlags(t, meterCmd(&fakeCluster{}), flags...) }, []string{"p42", "demo"}
+		}, "Already metering demo."},
+		{"kernel confirm's empty window", func(t *testing.T, dir config.Dir) (func(...string) Command, []string) {
+			kernelInstance(t, dir, "p41")
+			return func(flags ...string) Command {
+				return withFlags(t, confirmCmd(&fakeCluster{}), append([]string{"--amount", "1", "--from", thisMonth(3), "--to", thisMonth(3)}, flags...)...)
+			}, []string{"p41"}
+		}, "Nothing to confirm: the window from " + thisMonth(3) + " to " + thisMonth(3) + " is empty."},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			dir := config.Dir(t.TempDir())
+			cmd, args := row.setup(t, dir)
+			for _, mode := range []output.Mode{output.ModeJSON, output.ModeHuman} {
+				env, out, errb := testEnvBoth(dir, mode)
+				if err := cmd("--plan").Run(t.Context(), env, args); err != nil {
+					t.Fatal(err)
+				}
+				if errb.Len() != 0 {
+					t.Errorf("--plan printed %q on stderr", errb)
+				}
+				if mode == output.ModeJSON {
+					if got := noticesOf(decodedBound(t, printedDocument(t, out.Bytes()))); !slices.Contains(got, row.want) {
+						t.Errorf("the plan's notices are %q; want %q among them", got, row.want)
+					}
+				} else if !strings.Contains(out.String(), "notice: "+row.want+"\n") {
+					t.Errorf("the rendering does not show the notice %q:\n%s", row.want, out)
+				}
+			}
+			env, _, errb := testEnvBoth(dir, output.ModeHuman)
+			if err := cmd().Run(t.Context(), env, args); err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.Count(errb.String(), row.want+"\n"); got != 1 {
+				t.Errorf("outside a plan the line is printed %d times; want once:\n%s", got, errb)
+			}
+		})
 	}
 }

@@ -1,16 +1,23 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
+	"github.com/sofmon/farcast/farsight/cli/internal/plan"
 	"github.com/sofmon/farcast/technocore/cost"
 	"github.com/sofmon/farcast/technocore/kernel"
 )
@@ -311,5 +318,308 @@ func TestConfirmRejectsANegativeAmount(t *testing.T) {
 	c.amount, c.amountSet = -1, true
 	if err := c.Run(context.Background(), env, []string{"p41"}); err == nil {
 		t.Fatal("a negative confirmed amount must be refused")
+	}
+}
+
+// confirmAt is kernel confirm with flags, its writer fc, and its clock fixed
+// at now.
+func confirmAt(t *testing.T, fc *fakeCluster, now time.Time, flags ...string) *kernelConfirmCommand {
+	t.Helper()
+	c := withFlags(t, confirmCmd(fc), flags...)
+	c.deployer.now = func() time.Time { return now }
+	return c
+}
+
+// ADR 0023 M2.6 (A23-40, mutation 90a): a kernel confirm plan does not
+// outlive its UTC day: the window's default end and the confirmation's date
+// are that day. Confirmed the next day, it has changed; confirmed across the
+// end of a month, the recomputed window is empty, and still it has changed,
+// refused before the empty window says anything. Confirmed later the same
+// day, it is the same plan.
+func TestKernelConfirmPlanChangesAcrossUTCMidnight(t *testing.T) {
+	for _, row := range []struct {
+		name          string
+		plan, confirm time.Time
+		changed       bool
+	}{
+		{"later the same day", time.Date(2026, 11, 16, 0, 0, 1, 0, time.UTC), time.Date(2026, 11, 16, 23, 59, 59, 0, time.UTC), false},
+		{"a day boundary", time.Date(2026, 11, 16, 23, 59, 59, 0, time.UTC), time.Date(2026, 11, 17, 0, 0, 1, 0, time.UTC), true},
+		{"a month boundary, the window now empty", time.Date(2026, 11, 30, 23, 59, 59, 0, time.UTC), time.Date(2026, 12, 1, 0, 0, 1, 0, time.UTC), true},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			dir := config.Dir(t.TempDir())
+			kernelInstance(t, dir, "p41")
+			env, out := testEnv(dir, output.ModeJSON)
+			if err := confirmAt(t, &fakeCluster{}, row.plan, "--amount", "4", "--plan").Run(t.Context(), env, []string{"p41"}); err != nil {
+				t.Fatal(err)
+			}
+			digest := printedDocument(t, out.Bytes()).Digest
+			record := filepath.Join(dir.InstancePath("p41"), "metadata.yaml")
+			before, err := os.ReadFile(record)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			fc := &fakeCluster{}
+			env, out, errb := testEnvBoth(dir, output.ModeHuman)
+			err = confirmAt(t, fc, row.confirm, "--amount", "4", "--confirm", digest).Run(t.Context(), env, []string{"p41"})
+			if !row.changed {
+				if err != nil || len(fc.applied) != 1 {
+					t.Fatalf("--confirm later the same day = %v, applying %d streams; want the plan done", err, len(fc.applied))
+				}
+				return
+			}
+			if kindOf(classified(err)) != kindPlanChanged || exitCodeOf(err) != 1 {
+				t.Fatalf("--confirm across midnight = %v; want plan_changed", err)
+			}
+			if errb.Len() != 0 || out.Len() != 0 {
+				t.Errorf("a plan that changed printed %q %q before its comparison refused it", out, errb)
+			}
+			after, err := os.ReadFile(record)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(fc.applied) != 0 || !bytes.Equal(before, after) {
+				t.Errorf("a plan that changed applied %d streams, or changed the record", len(fc.applied))
+			}
+		})
+	}
+}
+
+// ADR 0023 M2.6 (A23-40, mutation 79a): a confirmation is dated the UTC day
+// it is made, in the record and in the ConfigMap the kernel reads, on every
+// path: interactive, and --confirm.
+func TestKernelConfirmAsOfIsTheUTCDay(t *testing.T) {
+	// 01:30 on the 17th east of Greenwich, 20:30 on the 16th in UTC.
+	now := time.Date(2026, 11, 17, 1, 30, 45, 123, time.FixedZone("east", 5*3600))
+	wantDay := time.Date(2026, 11, 16, 0, 0, 0, 0, time.UTC)
+	for _, path := range []string{"interactive", "--confirm"} {
+		t.Run(path, func(t *testing.T) {
+			dir := config.Dir(t.TempDir())
+			kernelInstance(t, dir, "p41")
+			flags := []string{"--amount", "6.5", "--from", "2026-11-01", "--to", "2026-11-03"}
+			if path == "--confirm" {
+				env, out := testEnv(dir, output.ModeJSON)
+				if err := confirmAt(t, &fakeCluster{}, now, append(flags, "--plan")...).Run(t.Context(), env, []string{"p41"}); err != nil {
+					t.Fatal(err)
+				}
+				b := decodedBound(t, printedDocument(t, out.Bytes()))
+				if c, ok := b.Facts[0].(plan.ConfirmationFact); !ok || c.AsOfDay != "2026-11-16" {
+					t.Errorf("the plan's confirmation is %+v; want as_of_day 2026-11-16", b.Facts[0])
+				}
+				flags = append(flags, "--confirm", printedDocument(t, out.Bytes()).Digest)
+			}
+			fc := &fakeCluster{}
+			env, _ := testEnv(dir, output.ModeHuman)
+			if err := confirmAt(t, fc, now, flags...).Run(t.Context(), env, []string{"p41"}); err != nil {
+				t.Fatal(err)
+			}
+			meta, err := dir.LoadInstanceMetadata("p41")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(meta.Kernel.Confirmations) != 1 || !meta.Kernel.Confirmations[0].AsOf.Equal(wantDay) {
+				t.Errorf("recorded %+v; want AsOf %s", meta.Kernel.Confirmations, wantDay)
+			}
+			if len(fc.applied) != 1 || !strings.Contains(string(fc.applied[0]), `"AsOf":"2026-11-16T00:00:00Z"`) {
+				t.Errorf("the ConfigMap does not date the confirmation 2026-11-16:\n%s", bytes.Join(fc.applied, nil))
+			}
+		})
+	}
+}
+
+// ADR 0023 M2.6 (A23-40, mutation 90b): --amount must be a number a bill can
+// hold. NaN and ±Inf are a usage error, under --plan too, before anything is
+// rendered, opened or recorded.
+func TestKernelConfirmRefusesANonFiniteAmount(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	kernelInstance(t, dir, "p41")
+	record := filepath.Join(dir.InstancePath("p41"), "metadata.yaml")
+	before, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for amount, shown := range map[string]string{"NaN": "NaN", "+Inf": "+Inf", "-Inf": "-Inf", "infinity": "+Inf"} {
+		for _, extra := range [][]string{nil, {"--plan"}} {
+			fc := &fakeCluster{}
+			c := confirmAt(t, fc, time.Date(2026, 11, 16, 10, 0, 0, 0, time.UTC), append([]string{"--amount", amount}, extra...)...)
+			env, out := testEnv(dir, output.ModeJSON)
+			err := c.Run(t.Context(), env, []string{"p41"})
+			var ue *usageError
+			if want := "--amount must be a finite number, got " + shown; !errors.As(err, &ue) || err.Error() != want {
+				t.Errorf("--amount %s %q = %v; want the usage error %q", amount, extra, err, want)
+			}
+			if len(fc.applied) != 0 || out.Len() != 0 {
+				t.Errorf("--amount %s %q applied %d streams and printed %q", amount, extra, len(fc.applied), out)
+			}
+		}
+	}
+	after, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Errorf("a non-finite amount changed the record:\n%s", after)
+	}
+}
+
+// S-R5-3: an amount a plan cannot state to the cent is refused. From
+// maxAmount up, --amount is a usage error, under --plan too, before anything
+// is rendered, opened or recorded: far above it cents() wraps, and the plan
+// would state one amount and push another. A recorded window at such an
+// amount is refused the same way, as the record's fault, whether the new
+// window is empty or not. The largest amount below the bound is stated
+// exactly.
+func TestKernelConfirmRefusesAnAmountItCannotState(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	kernelInstance(t, dir, "p41")
+	record := filepath.Join(dir.InstancePath("p41"), "metadata.yaml")
+	before, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	window := []string{"--from", "2026-11-01", "--to", "2026-11-02"}
+	for _, amount := range []string{"10000000000000", "1e17", "92233720368547758.07", "1e300"} {
+		for _, extra := range [][]string{nil, {"--plan"}} {
+			fc := &fakeCluster{}
+			c := confirmAt(t, fc, planNow, append(append([]string{"--amount", amount}, window...), extra...)...)
+			env, out := testEnv(dir, output.ModeJSON)
+			err := c.Run(t.Context(), env, []string{"p41"})
+			f, perr := strconv.ParseFloat(amount, 64)
+			if perr != nil {
+				t.Fatal(perr)
+			}
+			var ue *usageError
+			if want := fmt.Sprintf(msgAmountTooLarge, f); !errors.As(err, &ue) || err.Error() != want {
+				t.Errorf("--amount %s %q = %v; want the usage error %q", amount, extra, err, want)
+			}
+			if len(fc.applied) != 0 || out.Len() != 0 {
+				t.Errorf("--amount %s %q applied %d streams and printed %q", amount, extra, len(fc.applied), out)
+			}
+		}
+	}
+	after, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Errorf("an amount a plan cannot state changed the record:\n%s", after)
+	}
+
+	env, out := testEnv(dir, output.ModeHuman)
+	if err := confirmAt(t, &fakeCluster{}, planNow, append([]string{"--amount", "9999999999999.99", "--plan"}, window...)...).
+		Run(t.Context(), env, []string{"p41"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"--amount=9999999999999.99,", "the provider charged 9999999999999.99 for 2026-11-01..2026-11-02,"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("the largest amount below the bound is not stated as %q:\n%s", want, out)
+		}
+	}
+
+	for _, usd := range []float64{1e17, -1e300} {
+		for _, to := range []string{"2026-11-03", "2026-11-02"} {
+			dir := config.Dir(t.TempDir())
+			kernelInstance(t, dir, "p41")
+			if _, err := dir.UpdateInstanceMetadata("p41", func(m *config.InstanceMetadata) error {
+				m.Kernel.Confirmations = []config.KernelConfirmation{{Start: day("2026-11-01"), End: day("2026-11-02"), USD: usd}}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			want := fmt.Sprintf(msgWindowNotStated, "p41", "2026-11-01", "2026-11-02", usd)
+			for _, extra := range [][]string{nil, {"--plan"}} {
+				fc := &fakeCluster{}
+				c := confirmAt(t, fc, planNow, append([]string{"--amount", "1", "--to", to}, extra...)...)
+				env, out := testEnv(dir, output.ModeJSON)
+				err := c.Run(t.Context(), env, []string{"p41"})
+				if err == nil || err.Error() != want || kindOf(classified(err)) != kindInternal {
+					t.Errorf("a recorded window at %v, --to %s %q = %v; want %q", usd, to, extra, err, want)
+				}
+				if len(fc.applied) != 0 || out.Len() != 0 {
+					t.Errorf("a recorded window at %v, --to %s %q applied %d streams and printed %q", usd, to, extra, len(fc.applied), out)
+				}
+			}
+		}
+	}
+}
+
+// ADR 0023 M2.6 (A23-27, A23-28): the plan states the amount pushed. --amount
+// binds the number given exactly (FormatFloat's shortest form, never two
+// decimals), and the confirmation binds its cents rounded, never cut, so a
+// bill's sub-cent amount and an amount that is not exact in binary both
+// show as given and as pushed.
+func TestKernelConfirmPlanStatesTheAmountItPushes(t *testing.T) {
+	for _, row := range []struct {
+		amount string
+		cents  int64
+		shown  string
+	}{
+		{"2.715", 272, "2.72"},
+		{"1.15", 115, "1.15"},
+		{"0.29", 29, "0.29"},
+		{"9999999999999.99", 999999999999999, "9999999999999.99"},
+	} {
+		t.Run(row.amount, func(t *testing.T) {
+			dir := config.Dir(t.TempDir())
+			kernelInstance(t, dir, "p41")
+			flags := []string{"--amount", row.amount, "--from", "2026-11-01", "--to", "2026-11-02", "--plan"}
+			env, out := testEnv(dir, output.ModeJSON)
+			if err := confirmAt(t, &fakeCluster{}, planNow, flags...).Run(t.Context(), env, []string{"p41"}); err != nil {
+				t.Fatal(err)
+			}
+			b := decodedBound(t, printedDocument(t, out.Bytes()))
+			if len(b.Options) == 0 || b.Options[0] != (plan.Option{Flag: "amount", Value: row.amount}) {
+				t.Errorf("the plan binds the options %+v; want --amount as given, %s", b.Options, row.amount)
+			}
+			if c, ok := b.Facts[0].(plan.ConfirmationFact); !ok || c.AmountCents != row.cents {
+				t.Errorf("the confirmation is %+v; want %d cents", b.Facts[0], row.cents)
+			}
+			env, out = testEnv(dir, output.ModeHuman)
+			if err := confirmAt(t, &fakeCluster{}, planNow, flags...).Run(t.Context(), env, []string{"p41"}); err != nil {
+				t.Fatal(err)
+			}
+			for _, want := range []string{"--amount=" + row.amount + ",", "the provider charged " + row.shown + " for 2026-11-01..2026-11-02,"} {
+				if !strings.Contains(out.String(), want) {
+					t.Errorf("the rendering does not say %q:\n%s", want, out)
+				}
+			}
+		})
+	}
+}
+
+// ADR 0023 M2.6 (A23-8, A23-33): an empty window's plan writes nothing and
+// still binds the windows the record keeps, which stay confirmed: a daily
+// push run twice on one day says what is confirmed, never "none".
+func TestKernelConfirmEmptyWindowBindsTheRecordedWindows(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	kernelInstance(t, dir, "p41")
+	if _, err := dir.UpdateInstanceMetadata("p41", func(m *config.InstanceMetadata) error {
+		m.Kernel.Confirmations = []config.KernelConfirmation{{Start: day("2026-11-01"), End: day("2026-11-02"), USD: 1.5}}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// No --from: the window continues from the recorded one's end, and ends
+	// the same day, so it is empty.
+	flags := []string{"--amount", "0", "--to", "2026-11-02", "--plan"}
+	env, out := testEnv(dir, output.ModeJSON)
+	if err := confirmAt(t, &fakeCluster{}, planNow, flags...).Run(t.Context(), env, []string{"p41"}); err != nil {
+		t.Fatal(err)
+	}
+	b := decodedBound(t, printedDocument(t, out.Bytes()))
+	want := []plan.ConfirmationWindow{{From: "2026-11-01", To: "2026-11-02", AmountCents: 150}}
+	if c, ok := b.Facts[0].(plan.ConfirmationFact); !ok || !slices.Equal(c.WindowsAfter, want) {
+		t.Errorf("the empty window's confirmation is %+v; want the record's window, %+v", b.Facts[0], want)
+	}
+	if len(writeTargets(b)) != 0 {
+		t.Errorf("the empty window's plan writes %q", writeTargets(b))
+	}
+	env, out = testEnv(dir, output.ModeHuman)
+	if err := confirmAt(t, &fakeCluster{}, planNow, flags...).Run(t.Context(), env, []string{"p41"}); err != nil {
+		t.Fatal(err)
+	}
+	if line := "  confirmed windows afterwards: 2026-11-01..2026-11-02 1.50\n"; !strings.Contains(out.String(), line) {
+		t.Errorf("the rendering does not say %q:\n%s", line, out)
 	}
 }

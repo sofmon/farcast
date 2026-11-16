@@ -6,12 +6,15 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/kube"
+	"github.com/sofmon/farcast/farsight/cli/internal/plan"
 	tcdeploy "github.com/sofmon/farcast/technocore/deploy"
 	"github.com/sofmon/farcast/technocore/kernel"
 )
@@ -36,7 +39,7 @@ func (*kernelMeterCommand) Synopsis() string {
 
 func (*kernelMeterCommand) Usage() string {
 	return strings.TrimSpace(`
-Usage: farcast kernel meter <instance> [namespace...] [--remove]
+Usage: farcast kernel meter <instance> [namespace...] [--remove] [--plan | --confirm <digest>]
 
 With no namespace, report what the kernel is metering.
 
@@ -59,12 +62,43 @@ namespace removes both.
 
 Once 'farcast reader grant' has recorded its scope, each namespace this
 command starts metering also gets a farcast-reader RoleBinding, and the
-result names it ('farcast reader grant' explains).`)
+result names it ('farcast reader grant' explains).
+
+--plan prints what the command would change, and changes nothing: the
+namespaces it starts or stops metering, each document it would apply, and
+what it would print, with the plan's digest. It reads no cluster.
+--confirm <digest> does exactly the plan with that digest, and refuses,
+having written nothing, if anything the plan binds has changed since. Both
+need namespaces: with none, the command only reports.
+
+The command asks nothing, so --yes is unused. It is accepted so scripts can
+pass it uniformly, except beside --plan or --confirm, which are answers too.`)
 }
+
+// yesUnusedUsage is the help of the --yes that kernel meter and kernel
+// confirm accept and never read: they ask nothing (A23-9).
+const yesUnusedUsage = "unused; accepted so scripts can pass it uniformly, except beside --plan or --confirm"
+
+// The texts of kernel meter's plan (A23-8, A23-39).
+const (
+	msgMeterPlanNeedsNamespaces = "kernel meter --plan and --confirm need namespaces to add or remove; with none it only reports what is metered"
+	// msgMeterStopsCounting is --remove's notice, with the namespaces
+	// joined by ", ".
+	msgMeterStopsCounting = "the cost guard stops counting %s against the instance's cost limit"
+	// msgAlreadyMetering is the no-op's line, with the namespaces joined by
+	// ", ".
+	msgAlreadyMetering = "Already metering %s."
+	// msgReaderBindingStays is what a removal leaves behind on an instance
+	// that records a reader: the result's three lines, and a plan's notice.
+	msgReaderBindingStays = "If 'reader grant' bound the reader there, its farcast-reader RoleBinding stays\n" +
+		"too, and still lets the reader read that namespace's workloads, pods and logs\n" +
+		"until the namespace is deleted."
+)
 
 func (c *kernelMeterCommand) SetFlags(fs *flag.FlagSet) {
 	fs.BoolVar(&c.remove, "remove", false, "stop metering the named namespaces")
-	c.deployer.setYesFlag(fs, "unused; accepted so scripts can pass it uniformly")
+	c.deployer.setYesFlag(fs, yesUnusedUsage)
+	c.deployer.consent.register(fs)
 }
 
 func (c *kernelMeterCommand) Run(ctx context.Context, env *Env, args []string) (err error) {
@@ -73,6 +107,13 @@ func (c *kernelMeterCommand) Run(ctx context.Context, env *Env, args []string) (
 	defer func() { err = writerRefused(err, meta) }()
 	if len(args) == 0 {
 		return usagef("kernel meter takes an instance, then any namespaces to add or remove")
+	}
+	mode, digest, err := c.deployer.consent.mode(c.deployer.assumeYes)
+	if err != nil {
+		return err
+	}
+	if mode != consentNone && len(args) == 1 {
+		return usagef(msgMeterPlanNeedsNamespaces)
 	}
 	name := args[0]
 	c.deployer.ensureDefaults()
@@ -109,28 +150,33 @@ func (c *kernelMeterCommand) Run(ctx context.Context, env *Env, args []string) (
 		}
 	}
 
-	previous := append([]string(nil), meta.Kernel.Namespaces...)
-	next, added := applyMeterChange(previous, requested, c.remove)
-	if len(added) == 0 && !c.remove && sameSet(previous, next) {
-		fprintf(env.Err, "Already metering %s.\n", strings.Join(requested, ", "))
-		return env.Printer.Print(meterResult{Instance: name, Metered: next})
-	}
-
-	// The reader is bound beside the kernel in each namespace metered from
-	// now on, when 'reader grant' recorded that scope (design §7.2).
-	reader := ""
-	if len(added) > 0 {
-		reader = meteredReader(env, name, meta)
-	}
-	manifest, err := meterManifest(next, added, reader)
+	p, b, err := c.plan(ctx, env, meta, requested)
 	if err != nil {
 		return err
+	}
+	switch mode {
+	case consentPlan:
+		return printPlan(env, b, c.deployer.now())
+	case consentConfirm:
+		// The no-op is compared too, before it says anything (A23-8).
+		if err := confirmPlan(b, digest); err != nil {
+			return err
+		}
+	}
+	// What the command printed while it worked, once, from the plan
+	// (A23-26).
+	for _, line := range p.printed {
+		fprintln(env.Err, line)
+	}
+	if p.noop {
+		return env.Printer.Print(meterResult{Instance: name, Metered: p.next})
 	}
 
 	// The writer is opened before the record changes (ADR 0023 M2.5,
 	// A20-10): opening sends nothing, so an instance this machine cannot
 	// write as is refused with its record as it was, and never left naming
-	// namespaces the cluster was not told to meter.
+	// namespaces the cluster was not told to meter. Under --confirm it opens
+	// only after the comparison.
 	cl, err := c.deployer.newCluster(clusterRef{Dir: env.ConfigDir, Meta: meta, Identity: kube.Writer, Warn: env.Err})
 	if err != nil {
 		return err
@@ -142,14 +188,14 @@ func (c *kernelMeterCommand) Run(ctx context.Context, env *Env, args []string) (
 	// Recorded before the apply, like every other thing this CLI changes in a
 	// cluster: a namespace the cluster meters and local state does not know
 	// about is one the next change would silently drop.
-	meta.Kernel.Namespaces = next
+	meta.Kernel.Namespaces = p.next
 	meta.UpdatedAt = time.Now().UTC()
 	if err := env.ConfigDir.SaveInstanceMetadata(name, meta); err != nil {
 		return fmt.Errorf("record the metered namespaces before applying them: %w", err)
 	}
 
-	if err := cl.Apply(ctx, manifest); err != nil {
-		meta.Kernel.Namespaces = previous
+	if err := cl.Apply(ctx, p.manifest); err != nil {
+		meta.Kernel.Namespaces = p.previous
 		if saveErr := env.ConfigDir.SaveInstanceMetadata(name, meta); saveErr != nil {
 			return fmt.Errorf("apply the metered namespaces: %w (and local state could not be rolled back: %v)", err, saveErr)
 		}
@@ -157,13 +203,91 @@ func (c *kernelMeterCommand) Run(ctx context.Context, env *Env, args []string) (
 	}
 
 	return env.Printer.Print(meterResult{
-		Instance: name, Metered: next, Added: added, Removed: removedFrom(previous, next),
+		Instance: name, Metered: p.next, Added: p.added, Removed: removedFrom(p.previous, p.next),
 		BindingsLeft: c.remove,
 		// No record says where a reader binding was added, so with a reader
 		// recorded the result says one may stay.
 		ReaderBindingMayStay: c.remove && meta.Reader != nil,
-		Reader:               reader, ReaderBindings: readerBindingsFor(reader, added),
+		Reader:               p.reader, ReaderBindings: readerBindingsFor(p.reader, p.added),
 	})
+}
+
+// preparedKernelMeter is every decision kernel meter executes, made once by
+// its plan: interactive runs, --yes and --confirm all execute from it.
+type preparedKernelMeter struct {
+	// previous is what the record meters now, next what it meters after,
+	// and added the namespaces that need a binding.
+	previous, next, added []string
+	// noop is a request that changes nothing: the command says so and
+	// writes nothing.
+	noop bool
+	// reader is the reader bound beside the kernel in added, or "".
+	reader   string
+	manifest []byte
+	// printed is what the command prints on stderr outside a plan, in
+	// today's words: the no-op's line and the reader's warning. The plan's
+	// other notices restate the result, which says them itself.
+	printed []string
+}
+
+// plan is kernel meter's plan (design §9.4, A23-39): it reads the record
+// alone, never the cluster. Its facts are the meter fact, then a write for
+// each document of the stream, then its notices; a no-op has the meter fact
+// and its line, and no write (A23-8). kernel meter has no block.
+func (c *kernelMeterCommand) plan(_ context.Context, env *Env, meta *config.InstanceMetadata, requested []string) (preparedKernelMeter, plan.Bound, error) {
+	b := newBound("kernel meter", meta, "none", "")
+	b.Options = []plan.Option{{Flag: "remove", Value: strconv.FormatBool(c.remove)}}
+
+	var p preparedKernelMeter
+	p.previous = append([]string(nil), meta.Kernel.Namespaces...)
+	p.next, p.added = applyMeterChange(p.previous, requested, c.remove)
+	meter := plan.MeterFact{Type: plan.TypeMeter, BindingsCreated: p.added, MeteredAfter: p.next}
+	if c.remove {
+		meter.Remove = slices.Clone(requested)
+		meter.BindingsLeft = removedFrom(p.previous, p.next)
+	} else {
+		meter.Add = slices.Clone(requested)
+	}
+	joined := strings.Join(requested, ", ")
+
+	if len(p.added) == 0 && !c.remove && sameSet(p.previous, p.next) {
+		p.noop = true
+		already := fmt.Sprintf(msgAlreadyMetering, joined)
+		p.printed = []string{already}
+		b.Facts = []plan.Fact{meter, noticeFact(already)}
+		return p, b, nil
+	}
+
+	// The reader is bound beside the kernel in each namespace metered from
+	// now on, when 'reader grant' recorded that scope (design §7.2).
+	var warning string
+	if len(p.added) > 0 {
+		p.reader, warning = meteredReaderNote(env, meta.Name, meta)
+	}
+	meter.Reader = p.reader
+	meter.ReaderBindingsCreated = readerBindingsFor(p.reader, p.added)
+	manifest, err := meterManifest(p.next, p.added, p.reader)
+	if err != nil {
+		return preparedKernelMeter{}, plan.Bound{}, err
+	}
+	writes, err := applyFacts(manifest)
+	if err != nil {
+		return preparedKernelMeter{}, plan.Bound{}, err
+	}
+	p.manifest = manifest
+
+	b.Facts = append([]plan.Fact{meter}, writes...)
+	if c.remove {
+		b.Facts = append(b.Facts, noticeFact(fmt.Sprintf(msgMeterStopsCounting, joined)))
+		if meta.Reader != nil {
+			b.Facts = append(b.Facts, noticeFact(msgReaderBindingStays))
+		}
+	}
+	if warning != "" {
+		b.Facts = append(b.Facts, noticeFact(warning))
+		p.printed = append(p.printed, warning)
+	}
+	return p, b, nil
 }
 
 // meterManifest is one apply stream: a RoleBinding for each newly metered
@@ -323,9 +447,7 @@ func (r meterResult) Human(w io.Writer) error {
 			strings.Join(r.Removed, ", "))
 		fprintf(w, "read any more, and deleting the namespace removes it.\n")
 		if r.ReaderBindingMayStay {
-			fprintf(w, "If 'reader grant' bound the reader there, its farcast-reader RoleBinding stays\n")
-			fprintf(w, "too, and still lets the reader read that namespace's workloads, pods and logs\n")
-			fprintf(w, "until the namespace is deleted.\n")
+			fprintln(w, msgReaderBindingStays)
 		}
 	}
 	if len(r.Added) > 0 {

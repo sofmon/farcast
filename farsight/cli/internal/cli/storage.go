@@ -36,7 +36,21 @@ type group struct {
 	synopsis string
 	usage    string
 	subs     *Registry
+	// flagged is the subcommand whose flags SetSubFlags gave the router's
+	// flag set ("" when no word named one), and lined says SetSubFlags ran
+	// for this line: Run refuses a line whose subcommand is another.
+	flagged string
+	lined   bool
 }
+
+// msgGroupFlagsMismatch refuses a line whose first word naming a subcommand
+// was not its subcommand but a global flag's value (`kernel --config confirm
+// meter …`, with a config directory named confirm): the line's flags were
+// read as that sibling's, so a flag of the subcommand's own, --plan or
+// --confirm among them, could be read into the sibling and ignored. Its
+// values are the subcommand, the sibling (twice), and the group.
+const msgGroupFlagsMismatch = "the subcommand is %q, but %q came before it, so the line was read with %q's flags; " +
+	"put global flags before %q or after the subcommand"
 
 func (g *group) Name() string     { return g.name }
 func (g *group) Synopsis() string { return g.synopsis }
@@ -53,14 +67,20 @@ func (g *group) SetFlags(*flag.FlagSet) {}
 //
 // The subcommand is found by name rather than by position, so a global flag
 // placed before it (`farcast storage --output json ls prod:`) still resolves.
-// The first match wins, which is the subcommand: an operand that happens to
-// share a subcommand's name can only appear after it.
+// The first match is taken for the subcommand: an operand that happens to
+// share a subcommand's name can only appear after it. A global flag's value
+// can come before it, though, before the line is parsed and the two can be
+// told apart (`kernel --config confirm meter`, with a config directory named
+// confirm). The match is recorded, and Run refuses a line whose subcommand
+// is not it, rather than run one subcommand with another's flags.
 func (g *group) SetSubFlags(fs *flag.FlagSet, args []string) {
+	g.lined, g.flagged = true, ""
 	for i, arg := range args {
 		sub, ok := g.subs.Lookup(arg)
 		if !ok {
 			continue
 		}
+		g.flagged = arg
 		sub.SetFlags(fs)
 		// `storage key export --out …` is three levels; the middle one has no
 		// flags of its own but still owns the level that does.
@@ -81,6 +101,11 @@ func (g *group) Run(ctx context.Context, env *Env, args []string) error {
 	sub, ok := g.subs.Lookup(args[0])
 	if !ok {
 		return usagef("unknown %s subcommand %q (want %s)", g.name, args[0], strings.Join(g.subNames(), ", "))
+	}
+	if g.lined && args[0] != g.flagged {
+		// Its flags are not the ones the line was parsed with: a flag of its
+		// own may sit unread in the sibling's, --plan among them.
+		return usagef(msgGroupFlagsMismatch, args[0], g.flagged, g.flagged, g.name)
 	}
 	return sub.Run(ctx, env, args[1:])
 }

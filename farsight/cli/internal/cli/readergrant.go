@@ -6,11 +6,13 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/kube"
+	"github.com/sofmon/farcast/farsight/cli/internal/plan"
 	tcdeploy "github.com/sofmon/farcast/technocore/deploy"
 	tkube "github.com/sofmon/farcast/technocore/kube"
 )
@@ -48,13 +50,13 @@ func readerBackoffAt(attempt int) time.Duration {
 
 // The texts design §7.2 pins for 'reader grant'.
 const (
-	msgReaderGrantPrompt = "Grant %s, which the Cloud Shell script gave roles/container.clusterViewer, read access in %q's cluster: " +
+	msgReaderGrantPrompt = "Grant %s, which the Cloud Shell script gave " + readerIAMRole + ", read access in %q's cluster: " +
 		"namespaces (list); in farcast-system and every namespace the kernel meters, now and later (today %s): " +
 		"deployments, statefulsets, jobs, pods and their logs, and the ConfigMaps %s?"
-	// Until ADR 0023 M2.6 the --yes refusal ends at "in a terminal"; M2.6
-	// adds the plan and confirm route.
-	msgReaderGrantYes      = "reader grant cannot be run with --yes: it gives a Google identity read access to the cluster; confirm it in a terminal"
-	msgReaderGrantTerminal = "reader grant needs a terminal to confirm"
+	// msgReaderGrantYes names the instance, or <instance> for a name that
+	// is not one (A23-41).
+	msgReaderGrantYes      = "reader grant cannot be run with --yes: it gives a Google identity read access to the cluster; confirm it in a terminal, or review 'farcast reader grant %s --plan' and pass --confirm <digest>"
+	msgReaderGrantTerminal = "reader grant needs a terminal to confirm" + consentSuffix
 	msgReaderPropagating   = "IAM changes typically take 2 minutes, and can take 7 minutes or longer; checking again until %s"
 	// The second %s of these two is the review's why: "it is not read-only"
 	// for the four write and Secret reviews, which are design §7.2's text.
@@ -110,6 +112,9 @@ var readerReviews = []readerReview{
 // calls, as the reader, through newReader.
 type readerGrantCommand struct {
 	yes bool
+	// consent is --plan and --confirm <digest> (ADR 0023 M2.6): the route
+	// that needs no terminal, which --yes never is.
+	consent consentFlags
 
 	newApplier  func(clusterRef) (clusterApplier, error)
 	newReader   func(clusterRef) (readerVerifier, error)
@@ -125,7 +130,7 @@ func (*readerGrantCommand) Synopsis() string {
 
 func (*readerGrantCommand) Usage() string {
 	return strings.TrimSpace(`
-Usage: farcast reader grant <instance>
+Usage: farcast reader grant <instance> [--plan | --confirm <digest>]
 
 Grant the instance's reader service account read access in its cluster, then
 check, as the reader, that it can read and cannot write. Run it once the
@@ -156,17 +161,26 @@ and nothing is recorded; run again on a granted reader, it withdraws the
 earlier verification, so reads refuse until a clean grant. The questions
 sample; a role whose only extra powers are others does not show.
 
-It asks in a terminal, and --yes is refused: it gives a Google identity read
-access to the cluster.
+It asks in a terminal. --yes never covers it, and is refused: it gives a
+Google identity read access to the cluster. --plan prints the RBAC it would
+apply, with the plan's digest. It reads no cluster and no terminal, so it is
+the same plan in a terminal or not, and it changes nothing. --confirm
+<digest> computes the plan again. If anything the plan binds has changed
+since, it refuses, having written nothing. Otherwise it opens the reader and
+the writer, applies exactly that plan without asking, verifies it as the
+reader as above, and records it. A plan for a reader that is not recorded,
+not uploaded or not the one farcast derives is blocked, and its --confirm
+refuses.
 
 Until ADR 0023 M2.7 the RBAC is applied with kubectl, as the active gcloud
 configuration.`)
 }
 
 func (c *readerGrantCommand) SetFlags(fs *flag.FlagSet) {
-	const usage = "refused: reader grant gives a Google identity read access to the cluster, so it asks in a terminal"
+	const usage = "refused: reader grant gives a Google identity read access to the cluster, so it asks in a terminal, or takes --plan and then --confirm <digest>"
 	fs.BoolVar(&c.yes, "yes", false, usage)
 	fs.BoolVar(&c.yes, "y", false, usage)
+	c.consent.register(fs)
 }
 
 func (c *readerGrantCommand) ensureDefaults() {
@@ -224,45 +238,56 @@ func (c *readerGrantCommand) Run(ctx context.Context, env *Env, args []string) e
 		return usagef("reader grant takes one instance name")
 	}
 	name := args[0]
+	// The answers are counted first, so --yes beside --plan or --confirm is
+	// the three-way usage error, not the --yes refusal (A23-16).
+	mode, digest, err := c.consent.mode(c.yes)
+	if err != nil {
+		return err
+	}
 	if c.yes {
-		return usagef(msgReaderGrantYes)
+		shown := name
+		if validateInstanceName(name) != nil {
+			shown = "<instance>"
+		}
+		return usagef(msgReaderGrantYes, shown)
 	}
 	c.ensureDefaults()
 
-	// 2. The reader must be recorded, uploaded and the one farcast derives,
-	// before anything is rendered, asked or applied.
+	// 2. The record must be one farcast renders from before anything is
+	// rendered, asked or applied; a reader that is not recorded, not
+	// uploaded or not the one farcast derives is the plan's block.
 	meta, err := loadReaderRecord(env.ConfigDir, name)
 	if err != nil {
 		return err
 	}
-	email, err := grantableReader(env.ConfigDir, meta)
+	p, b, err := c.plan(ctx, env, meta)
 	if err != nil {
 		return err
+	}
+	switch mode {
+	case consentPlan:
+		// Read in a terminal or not, the plan is the same: it never asks.
+		return printPlan(env, b, c.now())
+	case consentConfirm:
+		if err := confirmPlan(b, digest); err != nil {
+			return err
+		}
+	default:
+		if p.refused != nil {
+			return p.refused
+		}
+		// 4. Consent, in a terminal only.
+		if !c.interactive(env) {
+			return usagef(msgReaderGrantTerminal)
+		}
 	}
 
-	// 3. The RBAC, with farcast-system and every namespace the kernel meters.
-	var metered []string
-	if meta.Kernel != nil {
-		metered = meta.Kernel.Namespaces
-	}
-	stream, err := renderReaderRBAC(email, metered)
-	if err != nil {
-		return err
-	}
-	bound, err := readerBoundNamespaces(metered)
-	if err != nil {
-		return err
-	}
-
-	// 4. Consent, in a terminal only.
-	if !c.interactive(env) {
-		return usagef(msgReaderGrantTerminal)
-	}
 	// The reader that step 6 verifies as is opened before anything is asked
 	// or applied. Every refusal openCluster makes is local (the endpoint
 	// rule, the cluster CA, reader.key) and it sends nothing (design §3.5),
 	// so a reader that could never verify the grant is refused before a
-	// Google identity is given RBAC.
+	// Google identity is given RBAC. Under --confirm it opens only after the
+	// comparison.
 	v, err := c.newReader(clusterRef{Dir: env.ConfigDir, Meta: meta, Identity: kube.Reader, Warn: env.Err})
 	if err != nil {
 		return err
@@ -277,19 +302,23 @@ func (c *readerGrantCommand) Run(ctx context.Context, env *Env, args []string) e
 	if err := applyReady(applier); err != nil {
 		return err
 	}
-	ok, err := newPrompter(env.In, env.Err).yesNo(fmt.Sprintf(msgReaderGrantPrompt,
-		email, name, strings.Join(bound, ", "), strings.Join(readerConfigMaps, ", ")))
-	if err != nil {
-		return err
+	// --confirm is the consent: the operator read the plan this one is.
+	if mode == consentNone {
+		ok, err := newPrompter(env.In, env.Err).yesNo(fmt.Sprintf(msgReaderGrantPrompt,
+			p.email, name, strings.Join(p.bound, ", "), strings.Join(readerConfigMaps, ", ")))
+		if err != nil {
+			return err
+		}
+		if !ok {
+			fprintln(env.Err, "Aborted.")
+			return nil
+		}
 	}
-	if !ok {
-		fprintln(env.Err, "Aborted.")
-		return nil
-	}
+	email := p.email
 
 	// 5. The apply, through kubectl as the active gcloud configuration until
 	// ADR 0023 M2.7.
-	if err := applier.Apply(ctx, stream); err != nil {
+	if err := applier.Apply(ctx, p.stream); err != nil {
 		return fmt.Errorf("apply instance %q's reader RBAC: %w; nothing was recorded", name, err)
 	}
 
@@ -315,8 +344,64 @@ func (c *readerGrantCommand) Run(ctx context.Context, env *Env, args []string) e
 		return fmt.Errorf("record instance %q's reader as verified: %w", name, err)
 	}
 	return env.Printer.Print(readerGrantResult{
-		Instance: name, Email: email, Scope: readerScopeMetered, Namespaces: bound, GrantedAt: now,
+		Instance: name, Email: email, Scope: readerScopeMetered, Namespaces: p.bound, GrantedAt: now,
 	})
+}
+
+// preparedReaderGrant is every decision reader grant executes, made once by
+// its plan: an interactive run and --confirm both execute from it.
+type preparedReaderGrant struct {
+	// email is the reader the RBAC binds, and bound the namespaces it is
+	// bound in: farcast-system, then each the kernel meters.
+	email  string
+	bound  []string
+	stream []byte
+	// refused is grantableReader's refusal, which the plan carries as its
+	// block; an interactive run returns it as it is.
+	refused error
+}
+
+// plan is reader grant's plan (design §9.4, A23-41): it reads the record
+// alone, never the cluster or the terminal. Its facts are the reader fact,
+// then a write for each document of the RBAC: the cluster-wide namespaces
+// grant and its binding, the rule set, and one binding per bound
+// namespace. A reader that is not recorded, not uploaded, or not the one
+// farcast derives blocks it, with no fact (A23-18).
+func (c *readerGrantCommand) plan(_ context.Context, env *Env, meta *config.InstanceMetadata) (preparedReaderGrant, plan.Bound, error) {
+	b := newBound("reader grant", meta, "none", "")
+	var p preparedReaderGrant
+	email, err := grantableReader(env.ConfigDir, meta)
+	if err != nil {
+		if !errors.Is(err, errCredentialMissing) {
+			return p, plan.Bound{}, err
+		}
+		p.refused = err
+		b.Blocked = []plan.Block{blockOf(err)}
+		return p, b, nil
+	}
+
+	// 3. The RBAC, with farcast-system and every namespace the kernel meters.
+	var metered []string
+	if meta.Kernel != nil {
+		metered = meta.Kernel.Namespaces
+	}
+	if p.stream, err = renderReaderRBAC(email, metered); err != nil {
+		return p, plan.Bound{}, err
+	}
+	if p.bound, err = readerBoundNamespaces(metered); err != nil {
+		return p, plan.Bound{}, err
+	}
+	writes, err := applyFacts(p.stream)
+	if err != nil {
+		return p, plan.Bound{}, err
+	}
+	p.email = email
+	reader := plan.ReaderFact{
+		Type: plan.TypeReader, Email: email, IAMRole: readerIAMRole, Scope: readerScopeMetered,
+		Namespaces: slices.Clone(p.bound), Resources: slices.Clone(readerResources), ConfigMaps: slices.Clone(readerConfigMaps),
+	}
+	b.Facts = append([]plan.Fact{reader}, writes...)
+	return p, b, nil
 }
 
 // grantableReader is step 2 of 'reader grant': the record must hold a reader

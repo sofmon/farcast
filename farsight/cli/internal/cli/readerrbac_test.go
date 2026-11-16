@@ -558,7 +558,9 @@ func TestReaderTextsPromiseOnlyTheNamespacesItRefuses(t *testing.T) {
 // ADR 0023 M2.3: 'kernel meter --remove' deletes nothing, so a farcast-reader
 // RoleBinding added there stays, and unlike the kernel's it still grants
 // reads without the listing. On an instance that records a reader the result
-// says so; on one with no reader it says nothing of one.
+// says so; on one with no reader it says nothing of one. It says it once:
+// the plan's notices of a removal restate the result, and are not printed
+// outside a plan (ADR 0023 M2.6, A23-26).
 func TestKernelMeterRemoveSaysTheReaderBindingStays(t *testing.T) {
 	const stays = "If 'reader grant' bound the reader there, its farcast-reader RoleBinding stays\n" +
 		"too, and still lets the reader read that namespace's workloads, pods and logs\n" +
@@ -568,12 +570,15 @@ func TestKernelMeterRemoveSaysTheReaderBindingStays(t *testing.T) {
 			dir := config.Dir(t.TempDir())
 			meteredInstance(t, dir, "p42", tcdeploy.DefaultNamespace, "demo")
 			withReader(t, dir, "p42", state)
-			env, out := testEnv(dir, output.ModeHuman)
+			env, out, errb := testEnvBoth(dir, output.ModeHuman)
 			fc := &fakeCluster{}
 			c := meterCmd(fc)
 			c.remove = true
 			if err := c.Run(context.Background(), env, []string{"p42", "demo"}); err != nil {
 				t.Fatal(err)
+			}
+			if errb.Len() != 0 {
+				t.Errorf("a removal printed %q on stderr; its result says what it leaves", errb)
 			}
 			var applied []string
 			for _, m := range fc.applied {
@@ -589,5 +594,37 @@ func TestKernelMeterRemoveSaysTheReaderBindingStays(t *testing.T) {
 				t.Errorf("with reader %s, the result says the reader's binding stays: %v; want %v:\n%s", state, said, state != "none", out)
 			}
 		})
+	}
+}
+
+// ADR 0023 M2.6 (A23-33): the reader fact's resources are the rule set's
+// grant, in its rule order, read from the role reader grant renders: every
+// resource of every rule that names none by name, so the ConfigMaps, which
+// readerConfigMaps names, are left out. The prompt names the IAM role the
+// fact binds.
+func TestReaderResourcesFollowTheRoleRuleOrder(t *testing.T) {
+	stream, err := renderReaderRBAC(readerEmail("atlas", "proj-test1"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var granted []string
+	for _, d := range rbacDocs(t, stream) {
+		if d.Kind != "ClusterRole" || d.Metadata.Name != readerRole {
+			continue
+		}
+		for _, r := range d.Rules {
+			if len(r.ResourceNames) == 0 {
+				granted = append(granted, r.Resources...)
+			}
+		}
+	}
+	if !slices.Equal(readerResources, granted) {
+		t.Errorf("readerResources is %q; the rule set grants %q, in that order", readerResources, granted)
+	}
+	if want := []string{"deployments", "statefulsets", "pods", "pods/log", "jobs"}; !slices.Equal(readerResources, want) {
+		t.Errorf("readerResources is %q; design §9.4 names %q", readerResources, want)
+	}
+	if readerIAMRole != "roles/container.clusterViewer" || !strings.Contains(msgReaderGrantPrompt, "gave "+readerIAMRole+", read access") {
+		t.Errorf("the prompt does not name the reader's IAM role %q: %q", readerIAMRole, msgReaderGrantPrompt)
 	}
 }
