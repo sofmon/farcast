@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/image"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
+	"github.com/sofmon/farcast/farsight/cli/internal/plan"
 	"github.com/sofmon/farcast/planck"
 )
 
@@ -28,6 +30,7 @@ func testRedeploy(p planck.Provider, b imageBuilder) *redeployCommand {
 	c.findSource = func(string) (string, error) {
 		return "", errors.New("no farcast checkout at or above the working directory")
 	}
+	c.findToolchain = fakeToolchain
 	asRelease(&c.fatlineDeployer, nil)
 	return c
 }
@@ -145,7 +148,13 @@ func TestRedeployDeploysAnExplicitImageAsGiven(t *testing.T) {
 func TestRedeployDeploysThePreflightedDigest(t *testing.T) {
 	dir := config.Dir(t.TempDir())
 	const name = "prod"
-	connectedInstance(t, dir, name)
+	// Its registry recorded, as connect records it: the one ensure is the
+	// plan's own, after consent (ADR 0023 M2.6, A23-24).
+	meta := connectedInstance(t, dir, name)
+	recordRegistry(meta, derivedRegistry(registrySpec(meta)))
+	if err := dir.SaveInstanceMetadata(name, meta); err != nil {
+		t.Fatal(err)
+	}
 	const previous = "us-central1-docker.pkg.dev/proj-1/farcast-prod/system/fatline@sha256:" +
 		"0000000000000000000000000000000000000000000000000000000000000000"
 	recordRunningImage(t, dir, name, previous)
@@ -173,7 +182,7 @@ func TestRedeployDeploysThePreflightedDigest(t *testing.T) {
 		t.Errorf("preflight used %q/%q, want the minted registry token", fb.user, fb.pass)
 	}
 	if len(fp.ensured) != 1 {
-		t.Fatalf("EnsureRegistry called %d times, want 1 (idempotent ensure)", len(fp.ensured))
+		t.Fatalf("EnsureRegistry called %d times, want 1 (the idempotent ensure, after consent)", len(fp.ensured))
 	}
 	pinned := pinnedRef(want, tagDigest)
 	if len(fc.applied) != 1 || !bytes.Contains(fc.applied[0], []byte(pinned)) {
@@ -186,11 +195,11 @@ func TestRedeployDeploysThePreflightedDigest(t *testing.T) {
 		t.Error("redeploy waited for an external IP; the carrier is connect's and must not be re-provisioned")
 	}
 
-	meta, _ := dir.LoadInstanceMetadata(name)
+	meta, _ = dir.LoadInstanceMetadata(name)
 	if deployedImage(meta) != pinned {
 		t.Fatalf("recorded image = %q, want the newly deployed digest", deployedImage(meta))
 	}
-	if meta.Carrier == nil || meta.Carrier.Endpoint != "9.9.9.9:8443" {
+	if meta.Carrier == nil || meta.Carrier.Endpoint != "192.0.2.10:8443" {
 		t.Fatalf("the carrier was disturbed: %+v", meta.Carrier)
 	}
 	for _, want := range []string{"redeployed FatLine to \"prod\"", previous, pinned, "(unchanged)"} {
@@ -283,7 +292,9 @@ func TestRedeployReappliesAnUnchangedImage(t *testing.T) {
 
 // TestRedeployNonInteractiveRequiresYes: the consent gate is not about cost, but
 // it is still consent — an unattended session that never asked for the change
-// must not get it, and the refusal has to name what it would have changed.
+// must not get it, and the refusal has to name what it would have changed and
+// both routes that need no terminal: --yes, and --plan then --confirm (ADR
+// 0023 M2.6, A23-16). The images were decided, and nothing was pushed.
 func TestRedeployNonInteractiveRequiresYes(t *testing.T) {
 	dir := config.Dir(t.TempDir())
 	const name = "prod"
@@ -293,7 +304,8 @@ func TestRedeployNonInteractiveRequiresYes(t *testing.T) {
 	recordRunningImage(t, dir, name, previous)
 
 	fc := &fakeCluster{}
-	c := testRedeploy(&fakeProvider{}, &fakeBuilder{}) // assumeYes stays false; env is non-interactive
+	fb := &fakeBuilder{resolveFn: notFoundForTags} // the plan pushes both images
+	c := testRedeploy(&fakeProvider{}, fb)         // assumeYes stays false; env is non-interactive
 	c.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 
 	env, _ := testEnv(dir, output.ModeHuman)
@@ -302,16 +314,99 @@ func TestRedeployNonInteractiveRequiresYes(t *testing.T) {
 	if !errors.As(err, &ue) {
 		t.Fatalf("err=%v, want a usageError (change not confirmed, non-interactive)", err)
 	}
-	if !strings.Contains(err.Error(), previous) || !strings.Contains(err.Error(), "--yes") {
-		t.Errorf("usage error %q must name the change and how to allow it", err)
+	want := "this replaces the image \"prod\" runs: " + previous + " → " + pinnedRef(instanceImageRef(name), tagDigest) +
+		"; pass --yes to confirm, or --plan and then --confirm <digest>"
+	if err.Error() != want || exitCodeOf(err) != 2 {
+		t.Errorf("usage error %q (exit %d); want %q, naming the change and both routes", err, exitCodeOf(err), want)
 	}
-	if len(fc.applied) != 0 {
-		t.Fatal("must not apply without confirmation")
+	if len(fc.applied) != 0 || len(fb.embedded)+len(fb.built) != 0 {
+		t.Fatalf("applied %d, pushed %d and built %d without confirmation", len(fc.applied), len(fb.embedded), len(fb.built))
 	}
 	meta, _ := dir.LoadInstanceMetadata(name)
 	if deployedImage(meta) != previous {
 		t.Fatalf("recorded image = %q, want it untouched by a refused redeploy", deployedImage(meta))
 	}
+}
+
+// redeployRefusalsNameThePlan is TestNonInteractiveRefusalsNameThePlan's
+// rows for redeploy: its change question and its build question, met with
+// no terminal and no --yes, refuse, exit 2, ending with the route that needs
+// neither.
+func redeployRefusalsNameThePlan(t *testing.T) {
+	t.Run("the change", func(t *testing.T) {
+		r := newRedeployRig(t)
+		_, _, err := r.run(t, output.ModeHuman)
+		want := fmt.Sprintf(msgRedeployYes, "this redeploys \"prod\" with "+carriedRef("fatline")+"; local state does not record what it runs today")
+		if err == nil || err.Error() != want || exitCodeOf(err) != 2 {
+			t.Errorf("redeploy with no terminal = %v (exit %d); want %q", err, exitCodeOf(err), want)
+		}
+	})
+	t.Run("a source build", func(t *testing.T) {
+		r := newRedeployRig(t)
+		r.configure = func(d *fatlineDeployer) { d.findSource = func(dir string) (string, error) { return dir, nil } }
+		_, _, err := r.run(t, output.ModeHuman, "--source", "/work/farcast")
+		want := fmt.Sprintf(msgBuildYes, "fatline", "/work/farcast", repoOf("fatline")) + consentSuffix
+		if err == nil || err.Error() != want || exitCodeOf(err) != 2 {
+			t.Errorf("a source build with no terminal = %v (exit %d); want %q", err, exitCodeOf(err), want)
+		}
+	})
+}
+
+// ADR 0023 M2.6 (A23-36): redeploy decides both images before it asks, and
+// ensures the registry, pushes and builds only after the answer. Asked
+// interactively (stdin a character device that answers nothing), it states
+// the change, with the pushed image's digest, the carried manifest's, in
+// hand; the answer never comes; and the registry was never ensured, nothing
+// was pushed or built, and nothing was applied or recorded. The same plan's
+// source build is asked about by its checkout, whose digest is not known
+// before it is built.
+func TestRedeployAsksBeforeItPushes(t *testing.T) {
+	const previous = "us-central1-docker.pkg.dev/proj-1/farcast-prod/system/fatline@sha256:" +
+		"0000000000000000000000000000000000000000000000000000000000000000"
+	for _, tc := range []struct {
+		name   string
+		flags  []string
+		asked  string
+		pushes func(r *deployRig) int
+	}{
+		{"the carried images, pushed", nil,
+			"this replaces the image \"prod\" runs: " + previous + " → " + carriedRef("fatline") + ".\nRe-apply FatLine's workload now? [y/N]: ",
+			func(r *deployRig) int { return len(r.fb.embedded) }},
+		{"a source build", []string{"--source", "/work/farcast"},
+			"fatline's image would be compiled from /work/farcast by /usr/local/go/bin/go (go1.27.5), with no container engine,\n",
+			func(r *deployRig) int { return len(r.fb.built) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRedeployRig(t, recorded(func(m *config.InstanceMetadata) { recordDeployedImage(m, previous) }))
+			r.fb.resolveFn = notFoundForTags
+			r.in = devNullTerminal
+			r.configure = func(d *fatlineDeployer) { d.findSource = func(dir string) (string, error) { return dir, nil } }
+			before := r.files(t)
+			_, errb, err := r.run(t, output.ModeHuman, tc.flags...)
+			if err == nil || err.Error() != "input closed" {
+				t.Fatalf("redeploy asked nothing, or went on: %v\n%s", err, errb)
+			}
+			if !strings.Contains(errb, tc.asked) {
+				t.Errorf("redeploy did not ask %q:\n%s", tc.asked, errb)
+			}
+			if got := tc.pushes(r); got != 0 || len(r.fb.embedded)+len(r.fb.built)+len(r.fp.ensured)+len(r.fc.applied) != 0 {
+				t.Errorf("before the answer: pushed %d, built %d, ensured %d, applied %d",
+					len(r.fb.embedded), len(r.fb.built), len(r.fp.ensured), len(r.fc.applied))
+			}
+			sameFiles(t, "a redeploy that was not answered", before, r.files(t))
+		})
+	}
+	t.Run("a source build, the change", func(t *testing.T) {
+		dec := imageDecision{action: plan.ImageBuildSource, source: imageSource{dir: "/work/farcast"}}
+		for _, tc := range []struct{ previous, want string }{
+			{previous, "this replaces the image \"prod\" runs: " + previous + " → a source build of /work/farcast, pushed once it is built"},
+			{"", "this redeploys \"prod\" with a source build of /work/farcast; local state does not record what it runs today"},
+		} {
+			if got := describeRedeploy(prodName, tc.previous, dec); got != tc.want {
+				t.Errorf("describeRedeploy = %q, want %q", got, tc.want)
+			}
+		}
+	})
 }
 
 // TestRedeployJSONOutput: automation gets exactly one JSON value on stdout and
@@ -350,7 +445,7 @@ func TestRedeployJSONOutput(t *testing.T) {
 	if err := dec.Decode(new(json.RawMessage)); !errors.Is(err, io.EOF) {
 		t.Fatalf("expected exactly one JSON value on stdout, got more: %s", out.String())
 	}
-	if res.Name != name || res.Carrier != "nlb" || res.Endpoint != "9.9.9.9:8443" || res.Status != "redeployed" {
+	if res.Name != name || res.Carrier != "nlb" || res.Endpoint != "192.0.2.10:8443" || res.Status != "redeployed" {
 		t.Fatalf("result=%+v", res)
 	}
 	if res.Registry != "us-central1-docker.pkg.dev/proj-1/farcast-prod" ||
@@ -365,19 +460,21 @@ func TestRedeployJSONOutput(t *testing.T) {
 // TestRedeployNeverMintsIdentity guards approved decision 4: FatLine already
 // trusts a CA, so a redeploy that minted a replacement would hand the operator a
 // certificate the running instance can only reject — and overwrite the record of
-// what it actually trusts. Minting stays connect's.
+// what it actually trusts. Minting stays connect's. The lost trust root is
+// said before the registry is read or ensured (ADR 0023 M2.6): the instance
+// records none, so a --yes run would otherwise ensure one first.
 func TestRedeployNeverMintsIdentity(t *testing.T) {
 	dir := config.Dir(t.TempDir())
 	const name = "prod"
 	meta := installedInstance(t, dir, name)
 	meta.FatLineDeployed = true
-	meta.Carrier = &config.Carrier{Type: "nlb", Endpoint: "9.9.9.9:8443", ServerName: "prod.fatline.farcast"}
+	meta.Carrier = &config.Carrier{Type: "nlb", Endpoint: "192.0.2.10:8443", ServerName: "prod.fatline.farcast"}
 	if err := dir.SaveInstanceMetadata(name, meta); err != nil {
 		t.Fatal(err)
 	} // note: no mTLS material saved
 
-	fc := &fakeCluster{}
-	c := testRedeploy(&fakeProvider{}, &fakeBuilder{})
+	fc, fp := &fakeCluster{}, &fakeProvider{}
+	c := testRedeploy(fp, &fakeBuilder{})
 	c.assumeYes = true
 	c.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 
@@ -385,6 +482,9 @@ func TestRedeployNeverMintsIdentity(t *testing.T) {
 	err := c.Run(context.Background(), env, []string{name})
 	if err == nil {
 		t.Fatal("redeploy minted a fresh CA for an instance already running FatLine")
+	}
+	if len(fp.ensured) != 0 {
+		t.Errorf("redeploy ensured the registry %d times before it said the trust root is lost", len(fp.ensured))
 	}
 	if !strings.Contains(err.Error(), "cannot be recovered") {
 		t.Errorf("err = %v, want it to explain the trust root is unrecoverable", err)
@@ -476,9 +576,10 @@ func TestRedeployRejectsBothImageFlags(t *testing.T) {
 	}
 }
 
-// TestRedeployKeepsTheRecordWhenTheRolloutFails: on one replica with the default
-// strategy a failed rollout leaves the previous image serving, so local state
-// must keep naming it — recording the new digest would name an image that never
+// TestRedeployKeepsTheRecordWhenTheRolloutFails: on two replicas the default
+// rolling strategy adds a new pod before it removes an old one, so a failed
+// rollout leaves the previous image serving, and local state must keep
+// naming it — recording the new digest would name an image that never
 // served a byte.
 func TestRedeployKeepsTheRecordWhenTheRolloutFails(t *testing.T) {
 	dir := config.Dir(t.TempDir())

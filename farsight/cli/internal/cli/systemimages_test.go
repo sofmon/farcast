@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -18,6 +20,7 @@ import (
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/image"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
+	"github.com/sofmon/farcast/farsight/cli/internal/plan"
 	"github.com/sofmon/farcast/fatline/tunnel"
 	"github.com/sofmon/farcast/planck"
 )
@@ -109,6 +112,16 @@ func notFoundForTags(ref string) (string, error) {
 		return ref, nil
 	}
 	return "", image.ErrNotFound
+}
+
+// foreignForTags answers a digest as itself and every version tag with an
+// image this farcast does not carry, sha256:f…: a tag moved under the
+// release.
+func foreignForTags(ref string) (string, error) {
+	if strings.Contains(ref, "@sha256:") {
+		return ref, nil
+	}
+	return pinnedRef(ref, "f"), nil
 }
 
 func TestEmbeddedImageIsPushedWhenTheTagIsMissing(t *testing.T) {
@@ -566,6 +579,108 @@ func TestEmbeddedOverAnotherVersionNeedsTheFlag(t *testing.T) {
 	if !strings.Contains(r.stderr, want) {
 		t.Errorf("stderr does not say %q:\n%s", want, r.stderr)
 	}
+
+	// kernel deploy and storage deploy, which have no plan yet, decide and
+	// realize their component's image at once (resolveImage, ADR 0023
+	// M2.6b): the same guard refuses there, version_skew, before anything
+	// is pushed or applied, and --embedded replaces the image, saying so.
+	//
+	// With the version tag foreign too, the refusal says nothing of the tag
+	// (review C-F2): the skew was refused before the tag was looked up, and
+	// the carried image is not pushed over it. --embedded pushes over it,
+	// and says so.
+	const foreignWarning = "Pushing the carried image over that tag."
+	for _, tc := range []struct {
+		component string
+		run       func(t *testing.T, dir config.Dir, fb *fakeBuilder, fc *fakeCluster, embedded bool) (string, error)
+		record    func(meta *config.InstanceMetadata, img string)
+	}{
+		{"technocore", func(t *testing.T, dir config.Dir, fb *fakeBuilder, fc *fakeCluster, embedded bool) (string, error) {
+			c := testKernelDeploy(fc, fb)
+			c.deployer.embedded = embedded
+			env, _, errb := testEnvBoth(dir, output.ModeHuman)
+			err := c.Run(t.Context(), env, []string{prodName})
+			return errb.String(), err
+		}, func(meta *config.InstanceMetadata, img string) { meta.Kernel = &config.Kernel{Image: img} }},
+		{"datasphered", func(t *testing.T, dir config.Dir, fb *fakeBuilder, fc *fakeCluster, embedded bool) (string, error) {
+			c := testStorageDeploy(&fakeProvider{}, fb)
+			c.deployer.assumeYes, c.deployer.embedded = true, embedded
+			c.deployer.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
+			env, _, errb := testEnvBoth(dir, output.ModeHuman)
+			err := c.Run(t.Context(), env, []string{prodName})
+			return errb.String(), err
+		}, func(meta *config.InstanceMetadata, img string) { meta.Keyholder = &config.Keyholder{Image: img} }},
+	} {
+		for _, tag := range []struct {
+			name    string
+			resolve func(string) (string, error)
+		}{{"its tag missing", notFoundForTags}, {"its tag foreign", foreignForTags}} {
+			for _, embedded := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s, %s, --embedded=%v", tc.component, tag.name, embedded), func(t *testing.T) {
+					dir := config.Dir(t.TempDir())
+					meta := deployableInstance(t, dir, prodName)
+					old := imageIn(tc.component, "1")
+					tc.record(meta, old)
+					recordSystemImage(meta, tc.component, config.SystemImage{Image: old, Origin: config.OriginEmbedded, Go: "go1.27.3", Farcast: "v0.8.0"})
+					if err := dir.SaveInstanceMetadata(prodName, meta); err != nil {
+						t.Fatal(err)
+					}
+					fb, fc := &fakeBuilder{resolveFn: tag.resolve}, &fakeCluster{}
+					stderr, err := tc.run(t, dir, fb, fc, embedded)
+					if !embedded {
+						if kindOf(err) != kindVersionSkew || !strings.Contains(err.Error(), tc.component+" runs "+old+", deployed by farcast v0.8.0 (go1.27.3)") ||
+							!strings.Contains(err.Error(), "Pass --embedded to replace it.") {
+							t.Fatalf("err = %v (kind %s), want version_skew naming %s", err, kindOf(err), old)
+						}
+						if len(fb.embedded)+len(fb.built)+len(fc.applied) != 0 {
+							t.Errorf("pushed %d, built %d and applied %d before refusing", len(fb.embedded), len(fb.built), len(fc.applied))
+						}
+						if strings.Contains(stderr, foreignWarning) || strings.Contains(stderr, "points at") || strings.Contains(stderr, "replacing") {
+							t.Errorf("said what it does not do before refusing the replacement:\n%s", stderr)
+						}
+						return
+					}
+					if err != nil {
+						t.Fatalf("--embedded: %v", err)
+					}
+					after, _ := dir.LoadInstanceMetadata(prodName)
+					if len(fb.embedded) != 1 || after.SystemImages[tc.component].Image != carriedRef(tc.component) {
+						t.Errorf("--embedded pushed %d and recorded %+v; want the carried image", len(fb.embedded), after.SystemImages[tc.component])
+					}
+					if tag.name == "its tag foreign" && !strings.Contains(stderr, foreignWarning) {
+						t.Errorf("--embedded pushed over a foreign tag without saying so:\n%s", stderr)
+					}
+				})
+			}
+		}
+	}
+}
+
+// ADR 0023 decision 4, A23-34 (review M-M26B-MUT-06): an interactive or
+// --yes run over another farcast version's image refuses with
+// version_skew even when the version tag cannot be looked up, as it did
+// when the skew was refused before the lookup: the skew stands in the
+// decision, and comes before decide's error. Nothing is ensured, pushed,
+// built or applied.
+func TestSkewBeatsAFailedTagLookup(t *testing.T) {
+	for _, dr := range deployRigs() {
+		t.Run(dr.name, func(t *testing.T) {
+			r := dr.rig(t, recorded(embeddedBy("v0.8.0", "go1.27.3")))
+			r.fb.resolveFn = func(ref string) (string, error) {
+				if strings.Contains(ref, "@sha256:") {
+					return ref, nil
+				}
+				return "", errors.New("registry unavailable")
+			}
+			_, _, err := r.run(t, output.ModeHuman, "--yes")
+			if kindOf(err) != kindVersionSkew {
+				t.Errorf("%s --yes over another version's image, its tag unreadable = %v (kind %s); want version_skew", dr.name, err, kindOf(err))
+			}
+			if len(r.fp.ensured)+len(r.fb.embedded)+len(r.fb.built)+len(r.fc.applied) != 0 {
+				t.Errorf("ensured %d, pushed %d, built %d, applied %d", len(r.fp.ensured), len(r.fb.embedded), len(r.fb.built), len(r.fc.applied))
+			}
+		})
+	}
 }
 
 func TestSkewGuardSaysWhenGoGoesBack(t *testing.T) {
@@ -696,15 +811,15 @@ func TestImageFlagsMustBeDigestPinned(t *testing.T) {
 			})
 			// Rule 1 again where the image is decided, for a caller that
 			// skipped the usage check.
-			t.Run("resolveImage", func(t *testing.T) {
+			t.Run("decideImage", func(t *testing.T) {
 				fb := &fakeBuilder{}
 				c := testRedeploy(&fakeProvider{}, fb)
 				c.fatlineImage = ref
 				env, _ := testEnv(emptyDir(t), output.ModeHuman)
-				got, err := c.resolveImage(context.Background(), env, nil, &config.InstanceMetadata{Name: prodName})
+				got, err := c.decideImage(context.Background(), env, nil, &config.InstanceMetadata{Name: prodName})
 				wantUsage(t, err, "--fatline-image", fb)
-				if got.Ref != "" {
-					t.Errorf("resolved %q", got.Ref)
+				if got.action != "" || got.target != "" {
+					t.Errorf("decided %q on %q", got.action, got.target)
 				}
 			})
 		})
@@ -1097,20 +1212,28 @@ func TestEmbeddedWithFatlineImageGovernsShrikeOnly(t *testing.T) {
 			t.Errorf("a refused connect recorded deployed=%v carrier %+v", r.meta.FatLineDeployed, r.meta.Carrier)
 		}
 	})
-	// The belt and braces in resolveSidecarImage, for a caller that reached
-	// it with no registry.
-	t.Run("resolveSidecarImage", func(t *testing.T) {
+	// The belt and braces in decideSidecarImage, for a caller that reached
+	// it with no registry. Deciding says nothing: the break-glass lines are
+	// the decision's notices, and realizing it deploys no Shrike.
+	t.Run("decideSidecarImage", func(t *testing.T) {
 		c := testRedeploy(&fakeProvider{}, &fakeBuilder{})
 		c.fatlineImage, c.embedded = given, true
-		env, _, errb := testEnvBoth(config.Dir(t.TempDir()), output.ModeHuman)
-		got, err := c.resolveSidecarImage(context.Background(), env, nil, &config.InstanceMetadata{Name: prodName})
-		if err == nil || !strings.Contains(err.Error(), "drop --embedded to deploy FatLine alone") || got.Ref != "" {
-			t.Fatalf("got %+v, %v; want the refusal", got, err)
+		env, out, errb := testEnvBoth(config.Dir(t.TempDir()), output.ModeHuman)
+		got, err := c.decideSidecarImage(context.Background(), env, nil, &config.InstanceMetadata{Name: prodName})
+		if err == nil || !strings.Contains(err.Error(), "drop --embedded to deploy FatLine alone") || got.action != "" {
+			t.Fatalf("decided %q, %v; want the refusal", got.action, err)
 		}
 		c.embedded = false
-		got, err = c.resolveSidecarImage(context.Background(), env, nil, &config.InstanceMetadata{Name: prodName})
-		if err != nil || got.Ref != "" || !strings.Contains(errb.String(), "deploying FatLine alone") {
-			t.Fatalf("got %+v, %v; want FatLine alone, said\nstderr:\n%s", got, err, errb.String())
+		got, err = c.decideSidecarImage(context.Background(), env, nil, &config.InstanceMetadata{Name: prodName})
+		if err != nil || got.action != "" || len(got.notices) != 2 || !strings.Contains(got.notices[0], "deploying FatLine alone") {
+			t.Fatalf("decided %q with notices %q, %v; want FatLine alone, said", got.action, got.notices, err)
+		}
+		if out.Len() != 0 || errb.Len() != 0 {
+			t.Errorf("deciding printed:\n%s%s", out.String(), errb.String())
+		}
+		res, err := c.realizeSidecarImage(context.Background(), env, nil, got)
+		if err != nil || res != (resolvedImage{}) {
+			t.Fatalf("realized %+v, %v; want no Shrike image and no record", res, err)
 		}
 	})
 }
@@ -1265,6 +1388,399 @@ func TestUnknownOriginReplacementIsSaid(t *testing.T) {
 	}
 }
 
+// The decide/realize split (ADR 0023 M2.6, A23-34). Every action of rules
+// 1–6 is decided, then realized, against the fake registry, with each phase
+// counted apart: deciding mints the registry token and looks up, and never
+// pushes, builds or prints; realizing pushes or builds and never looks
+// anything up again, and for a named, kept or reused image it makes no
+// registry call at all.
+
+// countingRegistry is the fake provider, counting the registry tokens it
+// mints.
+type countingRegistry struct {
+	*fakeProvider
+	tokens int
+}
+
+func (r *countingRegistry) RegistryToken(ctx context.Context) (planck.RegistryToken, error) {
+	r.tokens++
+	return r.fakeProvider.RegistryToken(ctx)
+}
+
+// imageCalls is what one phase asked of the registry.
+type imageCalls struct{ tokens, resolves, pushes, builds int }
+
+func imageCallsOf(fb *fakeBuilder, reg *countingRegistry) imageCalls {
+	return imageCalls{tokens: reg.tokens, resolves: len(fb.resolved), pushes: len(fb.embedded), builds: len(fb.built)}
+}
+
+func (a imageCalls) minus(b imageCalls) imageCalls {
+	return imageCalls{tokens: a.tokens - b.tokens, resolves: a.resolves - b.resolves, pushes: a.pushes - b.pushes, builds: a.builds - b.builds}
+}
+
+// fakeToolchain is the Go a source build in these tests compiles with.
+func fakeToolchain(context.Context, []string, string) (image.Toolchain, error) {
+	return image.Toolchain{Go: "/usr/local/go/bin/go", Version: "go1.27.5"}, nil
+}
+
+// noToolchain is a machine with no Go on its PATH.
+func noToolchain(context.Context, []string, string) (image.Toolchain, error) {
+	return image.Toolchain{}, image.ErrNoGo
+}
+
+// prodRegistry is prod's registry in the fake provider, counting its tokens.
+func prodRegistry() (*registryAccess, *countingRegistry) {
+	cr := &countingRegistry{fakeProvider: &fakeProvider{}}
+	return &registryAccess{provider: cr, registry: derivedRegistry(planck.RegistrySpec{Name: prodName, Location: "us-central1"})}, cr
+}
+
+func TestDecideAndRealizeEveryImageAction(t *testing.T) {
+	const source = "/work/farcast"
+	foreignTag := func(ref string) (string, error) {
+		if strings.Contains(ref, "@sha256:") {
+			return ref, nil
+		}
+		return pinnedRef(ref, "f"), nil
+	}
+	missing := func(gone string) func(string) (string, error) {
+		return func(ref string) (string, error) {
+			if ref == gone {
+				return "", image.ErrNotFound
+			}
+			return pinnedRef(ref, tagDigest), nil
+		}
+	}
+	sourceBuild := func(d *fatlineDeployer) { asSourceBuild(d, "dev") }
+	built := func(component, origin, farcast string) config.SystemImage {
+		return config.SystemImage{Image: pinnedRef(repoOf(component), "b"), Origin: origin, Go: "go1.27.5", Farcast: farcast, BuiltAt: testBuiltAt, Source: source}
+	}
+	carried := func(component string) config.SystemImage {
+		return config.SystemImage{Image: carriedRef(component), Origin: config.OriginEmbedded, Go: carriedGo, Farcast: testVersion}
+	}
+	operatorRec := config.SystemImage{Image: imageIn("fatline", "a"), Origin: config.OriginOperator, Go: "go1.27.5",
+		Farcast: "v0.8.0", BuiltAt: testBuiltAt, Source: "/home/op/farcast"}
+	developmentRec := config.SystemImage{Image: imageIn("fatline", "d"), Origin: config.OriginDevelopment, Go: "go1.27.5",
+		Farcast: "dev", BuiltAt: testBuiltAt, Source: "/work/farcast"}
+	toolchain := imageSource{dir: source, goPath: "/usr/local/go/bin/go", goVersion: "go1.27.5"}
+	lookedUp, minted := imageCalls{tokens: 1, resolves: 1}, imageCalls{tokens: 1}
+
+	for _, row := range []struct {
+		name       string
+		shrike     bool // decided and realized as connect and redeploy do Shrike's
+		setup      func(*config.InstanceMetadata)
+		configure  func(*fatlineDeployer)
+		resolve    func(string) (string, error)
+		noRegistry bool
+
+		decided   imageCalls
+		decideErr string // the refusal; the row ends with it
+		action    string
+		target    string
+		tagRef    string
+		source    imageSource
+		notices   []string
+		replacing string
+		replaces  bool // rule 5b
+
+		realized imageCalls
+		progress string // what realizing says on a verbose run
+		record   config.SystemImage
+	}{
+		{name: "rule 1: named", configure: func(d *fatlineDeployer) { d.fatlineImage = namedFatLine }, noRegistry: true,
+			action: plan.ImageNamed, target: namedFatLine,
+			record: config.SystemImage{Image: namedFatLine, Origin: config.OriginNamed, Farcast: testVersion}},
+		{name: "rule 2: no registry", noRegistry: true,
+			decideErr: "no image registry for this instance and no --fatline-image given"},
+		{name: "rule 3: build_source", configure: func(d *fatlineDeployer) { d.sourceDir = source },
+			decided: minted, action: plan.ImageBuildSource, source: toolchain,
+			realized: imageCalls{tokens: 1, builds: 1}, record: built("fatline", config.OriginOperator, testVersion)},
+		{name: "rule 4: keep_operator", setup: operatorRecorded,
+			decided: lookedUp, action: plan.ImageKeepOperator, target: imageIn("fatline", "a"),
+			notices: []string{"fatline: keeping the operator-built image " + imageIn("fatline", "a") +
+				" (go1.27.5, built 2026-11-13T12:00:00Z by farcast v0.8.0 from /home/op/farcast). This farcast carries go1.27.4. Pass --embedded to replace it, or --source to rebuild it."},
+			record: operatorRec},
+		{name: "rule 4: keep_development", setup: developmentRecorded, configure: sourceBuild,
+			decided: lookedUp, action: plan.ImageKeepDevelopment, target: imageIn("fatline", "d"),
+			notices: []string{"fatline: keeping the development image " + imageIn("fatline", "d") +
+				" (go1.27.5, built 2026-11-13T12:00:00Z by farcast dev from /work/farcast). This farcast carries no components. Pass --source to rebuild it."},
+			record: developmentRec},
+		{name: "rule 4: a missing development build, then rule 6", setup: developmentRecorded, configure: sourceBuild,
+			resolve: missing(imageIn("fatline", "d")),
+			decided: lookedUp, action: plan.ImageBuildDevelopment, source: toolchain,
+			notices:  []string{"fatline: the development image " + imageIn("fatline", "d") + " is no longer in the registry; building it again."},
+			realized: imageCalls{tokens: 1, builds: 1}, record: built("fatline", config.OriginDevelopment, "dev")},
+		{name: "rule 4: a missing operator build", setup: operatorRecorded, resolve: missing(imageIn("fatline", "a")),
+			decided: lookedUp, decideErr: "the operator-built fatline image " + imageIn("fatline", "a") + " recorded for this instance is no longer in its registry"},
+		{name: "rule 5: push", resolve: notFoundForTags,
+			decided: lookedUp, action: plan.ImagePush, target: carriedRef("fatline"), tagRef: instanceImageRef(prodName),
+			realized: imageCalls{tokens: 1, pushes: 1},
+			progress: "  fatline: pushing the image this farcast carries (go1.27.4, " + sha(tagDigest) + ")\n", record: carried("fatline")},
+		{name: "rule 5: reuse",
+			decided: lookedUp, action: plan.ImageReuse, target: carriedRef("fatline"), tagRef: instanceImageRef(prodName),
+			progress: "  fatline: " + instanceImageRef(prodName) + " already holds the image this farcast carries\n", record: carried("fatline")},
+		{name: "rule 5: push_over_foreign", resolve: foreignTag,
+			decided: lookedUp, action: plan.ImagePushOverForeign, target: carriedRef("fatline"), tagRef: instanceImageRef(prodName),
+			notices: []string{"warning: " + instanceImageRef(prodName) + " points at " + sha("f") + ", which is not the fatline image this farcast carries (" +
+				sha(tagDigest) + "); it will not be deployed. Pushing the carried image over that tag."},
+			realized: imageCalls{tokens: 1, pushes: 1},
+			progress: "  fatline: pushing the image this farcast carries (go1.27.4, " + sha(tagDigest) + ")\n", record: carried("fatline")},
+		{name: "rule 5b: the carried image replaces another version's", setup: embeddedBy("v0.8.0", "go1.27.3"), resolve: notFoundForTags,
+			decided: lookedUp, action: plan.ImagePush, target: carriedRef("fatline"), tagRef: instanceImageRef(prodName), replaces: true,
+			replacing: "fatline: replacing " + imageIn("fatline", "1") + ", deployed by farcast v0.8.0 (go1.27.3), with the image this farcast carries (go1.27.4).",
+			realized:  imageCalls{tokens: 1, pushes: 1},
+			progress:  "  fatline: pushing the image this farcast carries (go1.27.4, " + sha(tagDigest) + ")\n", record: carried("fatline")},
+		{name: "rule 5: a component this farcast does not carry", configure: func(d *fatlineDeployer) {
+			c := newFakeCarried()
+			delete(c.arts, "fatline")
+			d.carried = c
+		}, decided: minted, decideErr: "this farcast carries no fatline component"},
+		{name: "rule 6: build_development", configure: sourceBuild,
+			decided: minted, action: plan.ImageBuildDevelopment, source: toolchain,
+			realized: imageCalls{tokens: 1, builds: 1}, record: built("fatline", config.OriginDevelopment, "dev")},
+		{name: "Shrike, rule 5: push", shrike: true, configure: func(d *fatlineDeployer) { d.fatlineImage = namedFatLine },
+			resolve: notFoundForTags,
+			decided: lookedUp, action: plan.ImagePush, target: carriedRef("shrike"), tagRef: repoOf("shrike") + ":" + testVersion,
+			realized: imageCalls{tokens: 1, pushes: 1},
+			progress: "  shrike: pushing the image this farcast carries (go1.27.4, " + sha(tagDigest) + ")\n", record: carried("shrike")},
+		{name: "Shrike, rule 6: build_development", shrike: true, configure: sourceBuild,
+			decided: minted, action: plan.ImageBuildDevelopment, source: toolchain,
+			realized: imageCalls{tokens: 1, builds: 1}, record: built("shrike", config.OriginDevelopment, "dev")},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			fb := &fakeBuilder{resolveFn: row.resolve}
+			c := testRedeploy(&fakeProvider{}, fb)
+			d := &c.fatlineDeployer
+			d.findSource = func(string) (string, error) { return source, nil }
+			d.findToolchain = fakeToolchain
+			if row.configure != nil {
+				row.configure(d)
+			}
+			d.ensureDefaults()
+			meta := &config.InstanceMetadata{Name: prodName, Region: "us-central1"}
+			if row.setup != nil {
+				row.setup(meta)
+			}
+			reg, cr := prodRegistry()
+			if row.noRegistry {
+				reg = nil
+			}
+			env, out, errb := testEnvBoth(config.Dir(t.TempDir()), output.ModeHuman)
+			env.Verbose = true // so that a progress line decide printed would show
+
+			decide, realize := d.decideImage, d.realizeImage
+			if row.shrike {
+				decide, realize = d.decideSidecarImage, d.realizeSidecarImage
+			}
+			before := imageCallsOf(fb, cr)
+			dec, err := decide(context.Background(), env, reg, meta)
+			decided := imageCallsOf(fb, cr).minus(before)
+			if decided != row.decided {
+				t.Errorf("deciding asked %+v of the registry, want %+v", decided, row.decided)
+			}
+			if out.Len() != 0 || errb.Len() != 0 {
+				t.Errorf("deciding printed:\n%s%s", out.String(), errb.String())
+			}
+			if row.decideErr != "" {
+				if err == nil || !strings.Contains(err.Error(), row.decideErr) {
+					t.Fatalf("decide = %v, want the refusal %q", err, row.decideErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("decide: %v", err)
+			}
+			if dec.action != row.action || dec.target != row.target || dec.tagRef != row.tagRef || dec.source != row.source {
+				t.Errorf("decided %q on %q (tag %q, source %+v), want %q on %q (tag %q, source %+v)",
+					dec.action, dec.target, dec.tagRef, dec.source, row.action, row.target, row.tagRef, row.source)
+			}
+			wantComponent := "fatline"
+			if row.shrike {
+				wantComponent = "shrike"
+			}
+			if dec.component.Name != wantComponent || (!row.noRegistry && dec.repo != repoOf(wantComponent)) {
+				t.Errorf("decided for %q in %q, want %q in %q", dec.component.Name, dec.repo, wantComponent, repoOf(wantComponent))
+			}
+			if !slices.Equal(dec.notices, row.notices) || dec.replacing != row.replacing {
+				t.Errorf("notices %q and replacement %q,\nwant %q and %q", dec.notices, dec.replacing, row.notices, row.replacing)
+			}
+			refusal := dec.skewRefusal(false)
+			if dec.replacesOther != row.replaces || (refusal != nil) != row.replaces || (refusal != nil && kindOf(refusal) != kindVersionSkew) ||
+				dec.skewRefusal(true) != nil {
+				t.Errorf("replaces another version: %v, refusal %v; want %v, and none with --embedded", dec.replacesOther, refusal, row.replaces)
+			}
+			if row.replaces && dec.previous != imageIn("fatline", "1") {
+				t.Errorf("the replaced image is %q", dec.previous)
+			}
+
+			before = imageCallsOf(fb, cr)
+			res, err := realize(context.Background(), env, reg, dec)
+			if err != nil {
+				t.Fatalf("realize: %v", err)
+			}
+			realized := imageCallsOf(fb, cr).minus(before)
+			if realized != row.realized {
+				t.Errorf("realizing asked %+v of the registry, want %+v", realized, row.realized)
+			}
+			if got := errb.String(); got != row.progress || out.Len() != 0 {
+				t.Errorf("realizing printed %q on stderr and %q on stdout, want %q", got, out.String(), row.progress)
+			}
+			wantRef := row.target
+			if dec.builds() {
+				wantRef = row.record.Image
+				if got := fb.built[len(fb.built)-1]; got.SourceDir != source || got.Repository != repoOf(wantComponent) || got.Package != dec.component.Package {
+					t.Errorf("built %+v", got)
+				}
+			}
+			if res.Ref != wantRef || res.Record != row.record {
+				t.Errorf("realized %q recorded as %+v,\nwant %q recorded as %+v", res.Ref, res.Record, wantRef, row.record)
+			}
+		})
+	}
+
+	// A push the registry answers with another digest is refused: what is
+	// deployed is the digest this farcast was released with, never the
+	// registry's word for it.
+	t.Run("rule 5: a push that lands another image", func(t *testing.T) {
+		fb := &fakeBuilder{resolveFn: notFoundForTags, pushedRef: imageIn("fatline", "9")}
+		c := testRedeploy(&fakeProvider{}, fb)
+		d := &c.fatlineDeployer
+		d.ensureDefaults()
+		reg, _ := prodRegistry()
+		env, _ := testEnv(config.Dir(t.TempDir()), output.ModeHuman)
+		dec, err := d.decideImage(context.Background(), env, reg, &config.InstanceMetadata{Name: prodName, Region: "us-central1"})
+		if err != nil || dec.action != plan.ImagePush {
+			t.Fatalf("decided %q, %v", dec.action, err)
+		}
+		res, err := d.realizeImage(context.Background(), env, reg, dec)
+		want := "pushed " + instanceImageRef(prodName) + " as " + imageIn("fatline", "9") + ", not the " + carriedRef("fatline") + " this farcast carries"
+		if err == nil || err.Error() != want || res != (resolvedImage{}) {
+			t.Fatalf("realized %q, %v; want %q", res.Ref, err, want)
+		}
+	})
+}
+
+// The commands that do not plan yet decide and realize at once
+// (resolveImage), and say what the resolution always said, in the same
+// order: the decision's notices, then the build prompt, then the push's
+// progress, then the replacement note once the image is in the registry.
+func TestResolveImageSaysItsLinesInTheirOrder(t *testing.T) {
+	resolve := func(t *testing.T, mode output.Mode, in io.Reader, fb *fakeBuilder, setup func(*config.InstanceMetadata), configure func(*fatlineDeployer)) (resolvedImage, string, error) {
+		t.Helper()
+		c := testRedeploy(&fakeProvider{}, fb)
+		d := &c.fatlineDeployer
+		d.findSource = func(string) (string, error) { return "/work/farcast", nil }
+		d.findToolchain = fakeToolchain
+		if configure != nil {
+			configure(d)
+		}
+		d.ensureDefaults()
+		meta := &config.InstanceMetadata{Name: prodName, Region: "us-central1"}
+		setup(meta)
+		reg, _ := prodRegistry()
+		env, _, errb := testEnvBoth(config.Dir(t.TempDir()), mode)
+		env.Verbose = true
+		if in != nil {
+			env.In = in
+		}
+		res, err := d.resolveImage(context.Background(), env, reg, meta)
+		return res, errb.String(), err
+	}
+	inOrder := func(t *testing.T, stderr string, lines ...string) {
+		t.Helper()
+		at := -1
+		for _, l := range lines {
+			i := strings.Index(stderr, l)
+			if i <= at {
+				t.Fatalf("stderr does not say %q after what came before it:\n%s", l, stderr)
+			}
+			at = i
+		}
+	}
+
+	t.Run("an ignored record, the push and the replacement", func(t *testing.T) {
+		evil := "evil.example/x@" + sha("0")
+		res, stderr, err := resolve(t, output.ModeHuman, nil, &fakeBuilder{resolveFn: notFoundForTags}, func(meta *config.InstanceMetadata) {
+			recordFatLine(meta, evil, config.SystemImage{Origin: config.OriginOperator, Go: "go1.27.5", Farcast: testVersion, Source: "/x"})
+		}, nil)
+		if err != nil || res.Ref != carriedRef("fatline") {
+			t.Fatalf("resolved %q, %v", res.Ref, err)
+		}
+		inOrder(t, stderr,
+			"fatline: ignoring the recorded origin of "+evil+": it is not in this instance's registry "+repoOf("fatline")+"\n",
+			"  fatline: pushing the image this farcast carries (go1.27.4, "+sha(tagDigest)+")\n",
+			"fatline: replacing "+evil+" (its origin is not recorded on this machine).\n")
+	})
+	t.Run("a foreign tag, the push and the replacement", func(t *testing.T) {
+		_, stderr, err := resolve(t, output.ModeJSON, nil, &fakeBuilder{resolveFn: func(ref string) (string, error) {
+			if strings.Contains(ref, "@sha256:") {
+				return ref, nil
+			}
+			return pinnedRef(ref, "f"), nil
+		}}, namedBy(testVersion), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		inOrder(t, stderr,
+			"warning: "+instanceImageRef(prodName)+" points at "+sha("f"),
+			"  fatline: pushing the image this farcast carries",
+			"fatline: replacing the named image "+namedFatLine+" with the image this farcast carries.\n")
+	})
+	t.Run("a reused tag and the replacement", func(t *testing.T) {
+		_, stderr, err := resolve(t, output.ModeHuman, nil, &fakeBuilder{}, namedBy(testVersion), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		inOrder(t, stderr,
+			"  fatline: "+instanceImageRef(prodName)+" already holds the image this farcast carries\n",
+			"fatline: replacing the named image "+namedFatLine)
+	})
+	t.Run("a missing development build, then the build prompt", func(t *testing.T) {
+		fb := &fakeBuilder{resolveFn: func(ref string) (string, error) { return "", image.ErrNotFound }}
+		_, stderr, err := resolve(t, output.ModeHuman, nil, fb, developmentRecorded, func(d *fatlineDeployer) { asSourceBuild(d, "dev") })
+		var ue *usageError
+		if !errors.As(err, &ue) || err.Error() != "fatline's image would be compiled from /work/farcast with this machine's Go and pushed to "+repoOf("fatline")+":source-…; pass --yes to build it" {
+			t.Fatalf("err = %v, want the build confirmation's refusal", err)
+		}
+		if stderr != "fatline: the development image "+imageIn("fatline", "d")+" is no longer in the registry; building it again.\n" || len(fb.built) != 0 {
+			t.Errorf("built %d; stderr:\n%s", len(fb.built), stderr)
+		}
+	})
+	// The build prompt names the checkout and the Go the decision found, or
+	// why the Go could not be asked. /dev/null is a terminal to isTerminal,
+	// and it answers nothing: the prompt is asked, and its input is closed.
+	for _, tc := range []struct {
+		name      string
+		toolchain func(context.Context, []string, string) (image.Toolchain, error)
+		goLine    string
+	}{
+		{"the Go found", fakeToolchain, "/usr/local/go/bin/go (go1.27.5)"},
+		{"no Go", noToolchain, "the Go on PATH, which could not be asked (" + image.ErrNoGo.Error() + ")"},
+	} {
+		t.Run("the build prompt, "+tc.name, func(t *testing.T) {
+			devNull, err := os.Open(os.DevNull) // a character device: a terminal to isTerminal
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = devNull.Close() }()
+			fb := &fakeBuilder{}
+			_, stderr, err := resolve(t, output.ModeHuman, devNull, fb, func(*config.InstanceMetadata) {}, func(d *fatlineDeployer) {
+				asSourceBuild(d, "dev")
+				d.findToolchain = tc.toolchain
+			})
+			if err == nil || err.Error() != "input closed" || len(fb.built) != 0 {
+				t.Fatalf("err = %v, built %d; want the prompt's input closed, and nothing built", err, len(fb.built))
+			}
+			want := "This farcast carries no components (a source build), so fatline's image is compiled here.\n" +
+				"fatline's image would be compiled from /work/farcast by " + tc.goLine + ", with no container engine,\n" +
+				"pushed to the instance's registry as " + repoOf("fatline") + ":source-…, and recorded as a development build, which a release farcast replaces.\n" +
+				"Build and push it now? [y/N]: "
+			if stderr != want {
+				t.Errorf("stderr:\n%q\nwant\n%q", stderr, want)
+			}
+		})
+	}
+}
+
 // The version command.
 
 // versionDigit is the hex digit of each component's manifest in carriedVersion.
@@ -1402,5 +1918,170 @@ func TestWorldComponentGoVersion(t *testing.T) {
 	})
 	if goOf(got["datasphered"]) != "null" {
 		t.Errorf("a record with no Go gave %s", goOf(got["datasphered"]))
+	}
+}
+
+// ADR 0023 M2.6 (row 75): --confirm executes the decisions it compared,
+// never decisions made again. The plan reuses the carried images, whose
+// version tags hold them; the recomputed plan compares equal; and then, as
+// the writer opens, the tags move to another image. The command looks
+// nothing up again and pushes nothing: it deploys and records exactly the
+// images it compared.
+func TestConfirmExecutesWhatItCompared(t *testing.T) {
+	for _, dr := range deployRigs() {
+		t.Run(dr.name, func(t *testing.T) {
+			r := dr.rig(t)
+			moved := false
+			r.fb.resolveFn = func(ref string) (string, error) {
+				if moved && !strings.Contains(ref, "@sha256:") {
+					return pinnedRef(ref, "f"), nil
+				}
+				return tagOrDigest(ref)
+			}
+			doc := r.plan(t)
+			for _, f := range decodedBound(t, doc).Facts {
+				if img, ok := f.(plan.ImageFact); ok && img.Action != plan.ImageReuse {
+					t.Fatalf("the plan does not reuse %s's image: %+v", img.Component, img)
+				}
+			}
+			r.onWriter = func() { moved = true }
+			before := len(r.fb.resolved)
+			if _, errb, err := r.run(t, output.ModeJSON, "--confirm", doc.Digest); err != nil {
+				t.Fatalf("--confirm: %v\n%s", err, errb)
+			}
+			if !moved {
+				t.Fatal("the writer never opened, so the tags never moved")
+			}
+			if got := r.fb.resolved[before:]; len(got) != 2 {
+				t.Errorf("--confirm looked up %q; want the recomputation's two lookups and none after the comparison", got)
+			}
+			if len(r.fb.embedded)+len(r.fb.built) != 0 {
+				t.Errorf("pushed %d and built %d images the plan reused", len(r.fb.embedded), len(r.fb.built))
+			}
+			applied := string(slices.Concat(r.fc.applied...))
+			for _, c := range []string{"fatline", "shrike"} {
+				if !strings.Contains(applied, "image: "+carriedRef(c)) || r.meta(t).SystemImages[c].Image != carriedRef(c) {
+					t.Errorf("%s was not deployed and recorded as compared, %s", c, carriedRef(c))
+				}
+			}
+			if strings.Contains(applied, sha("f")) {
+				t.Error("the moved tag's image was deployed")
+			}
+		})
+	}
+}
+
+// ADR 0023 M2.6 (§9.5, row 83): under --confirm, the image fact's
+// replaces_other_version is the consent to replacing a component another
+// farcast version deployed, with or without --embedded. A plan made without
+// --embedded binds the replacement, and differs from the one made with it
+// only in that option; confirmed without --embedded, it replaces the image.
+func TestConfirmCoversTheReplacementItsPlanListed(t *testing.T) {
+	for _, dr := range deployRigs() {
+		t.Run(dr.name, func(t *testing.T) {
+			r := dr.rig(t, recorded(embeddedBy("v0.8.0", "go1.27.3")))
+			r.fb.resolveFn = notFoundForTags
+			without := decodedBound(t, r.plan(t))
+			var fact plan.ImageFact
+			for _, f := range without.Facts {
+				if img, ok := f.(plan.ImageFact); ok && img.Component == "fatline" {
+					fact = img
+				}
+			}
+			if !fact.ReplacesOtherVersion || fact.Action != plan.ImagePush || fact.Target != carriedRef("fatline") ||
+				fact.Current == nil || fact.Current.FarCast != "v0.8.0" || fact.Current.Image != imageIn("fatline", "1") {
+				t.Fatalf("the plan binds FatLine as %+v; want the replacement of v0.8.0's image listed", fact)
+			}
+			with := decodedBound(t, r.plan(t, "--embedded"))
+			if !reflect.DeepEqual(with.Facts, without.Facts) {
+				t.Errorf("a plan made with --embedded differs in its facts:\n%#v\n%#v", with.Facts, without.Facts)
+			}
+			var differ []string
+			for i, o := range without.Options {
+				if with.Options[i] != o {
+					differ = append(differ, o.Flag)
+				}
+			}
+			if !slices.Equal(differ, []string{"embedded"}) {
+				t.Errorf("the two plans' options differ in %q; want --embedded alone", differ)
+			}
+
+			doc := r.plan(t)
+			_, errb, err := r.run(t, output.ModeJSON, "--confirm", doc.Digest)
+			if err != nil {
+				t.Fatalf("--confirm of a plan that lists the replacement: %v\n%s", err, errb)
+			}
+			if deployedImage(r.meta(t)) != carriedRef("fatline") || len(r.fb.embedded) == 0 {
+				t.Errorf("deployed %q after pushing %d images; want the carried image", deployedImage(r.meta(t)), len(r.fb.embedded))
+			}
+			want := config.SystemImage{Image: carriedRef("fatline"), Origin: config.OriginEmbedded, Go: carriedGo, Farcast: testVersion}
+			if got := r.meta(t).SystemImages["fatline"]; got != want {
+				t.Errorf("recorded %+v, want %+v", got, want)
+			}
+			if !strings.Contains(errb, "fatline: replacing "+imageIn("fatline", "1")+", deployed by farcast v0.8.0") {
+				t.Errorf("the replacement was not said:\n%s", errb)
+			}
+		})
+	}
+}
+
+// ADR 0023 M2.6 (§9.5): --yes never implies --embedded. A --yes run, and a
+// run with no answer and no terminal, refuse to replace a component another
+// farcast version deployed, version_skew, before anything is asked, minted,
+// ensured, pushed or applied; --yes --embedded replaces it.
+func TestYesNeverReplacesAnotherVersionWithoutEmbedded(t *testing.T) {
+	// The version tag as the registry answers it. The refusal comes before
+	// anything is said or asked (review C-F1): not the replacement note,
+	// nor a foreign tag's warning that the carried image will be pushed
+	// over it, neither of which happens; as before the decisions were split
+	// from the pushes, when the skew was refused before the tag was looked
+	// up. The last row refuses through a plan that could not be made,
+	// Shrike's tag unreadable after FatLine's skew was decided.
+	for _, tag := range []struct {
+		name    string
+		resolve func(string) (string, error)
+	}{
+		{"its tag missing", notFoundForTags},
+		{"its tag foreign", foreignForTags},
+		{"its tag foreign, Shrike's unreadable", func(ref string) (string, error) {
+			if strings.Contains(ref, "system/shrike:") {
+				return "", errors.New("registry unavailable")
+			}
+			return foreignForTags(ref)
+		}},
+	} {
+		for _, dr := range deployRigs() {
+			for _, flags := range [][]string{{"--yes"}, nil} {
+				t.Run(fmt.Sprintf("%s/%s/%q", tag.name, dr.name, flags), func(t *testing.T) {
+					r := dr.rig(t, recorded(embeddedBy("v0.8.0", "go1.27.3")))
+					r.fb.resolveFn = tag.resolve
+					before := r.files(t)
+					_, errb, err := r.run(t, output.ModeHuman, flags...)
+					if kindOf(err) != kindVersionSkew || !strings.Contains(err.Error(), "Pass --embedded to replace it.") {
+						t.Fatalf("%s %q over another version's image = %v (kind %s); want version_skew", dr.name, flags, err, kindOf(err))
+					}
+					if len(r.fb.embedded)+len(r.fb.built)+len(r.fc.applied)+len(r.fp.ensured)+r.dials != 0 {
+						t.Errorf("pushed %d, built %d, applied %d, ensured %d and dialled %d before refusing",
+							len(r.fb.embedded), len(r.fb.built), len(r.fc.applied), len(r.fp.ensured), r.dials)
+					}
+					if errb != "" {
+						t.Errorf("said or asked something before refusing the replacement:\n%s", errb)
+					}
+					sameFiles(t, "a refused replacement", before, r.files(t))
+				})
+			}
+		}
+	}
+	for _, dr := range deployRigs() {
+		t.Run(dr.name+"/--yes --embedded", func(t *testing.T) {
+			r := dr.rig(t, recorded(embeddedBy("v0.8.0", "go1.27.3")))
+			r.fb.resolveFn = notFoundForTags
+			if _, errb, err := r.run(t, output.ModeHuman, "--yes", "--embedded"); err != nil {
+				t.Fatalf("--yes --embedded: %v\n%s", err, errb)
+			}
+			if deployedImage(r.meta(t)) != carriedRef("fatline") {
+				t.Errorf("deployed %q, want the carried image", deployedImage(r.meta(t)))
+			}
+		})
 	}
 }

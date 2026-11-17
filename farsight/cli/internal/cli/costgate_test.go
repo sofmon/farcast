@@ -154,7 +154,7 @@ func TestConnectCostGateNamesFatLineAsWellAsTheCarrier(t *testing.T) {
 		Name:      "p41",
 		CostLimit: config.CostLimit{Amount: 50, Currency: "USD", Period: "monthly"},
 	}
-	ok, err := c.confirmCost(env, meta)
+	ok, err := c.confirmCost(env, meta.Name, connectCost(meta))
 	if ok || err == nil {
 		t.Fatalf("expected a refusal without --yes; got ok=%v err=%v", ok, err)
 	}
@@ -164,5 +164,9 @@ func TestConnectCostGateNamesFatLineAsWellAsTheCarrier(t *testing.T) {
 	}
 	if !strings.Contains(strings.ToLower(err.Error()), "fatline") {
 		t.Errorf("refusal does not name FatLine's standing cost: %v", err)
+	}
+	// The figures are the plan's, in exact cents (A23-51 item 6).
+	if math.Abs(got[0]-pricing.CarrierMonthlyUSD) > 0.005 || math.Abs(got[1]-fatlineMonthlyUSD) > 0.005 {
+		t.Errorf("refusal quotes $%.2f and $%.2f, want $%.2f and $%.2f", got[0], got[1], pricing.CarrierMonthlyUSD, fatlineMonthlyUSD)
 	}
 }

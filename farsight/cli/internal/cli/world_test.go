@@ -234,7 +234,7 @@ func TestWorldReadsEverySectionOverOneTunnel(t *testing.T) {
 		t.Errorf("asked replicas %v, want [0 1]", f.seal.asked)
 	}
 	body, _ := json.Marshal(raw)
-	for _, never := range []string{"app-shop-api", "credential_sha256", credentialOf("a"), "proj-atlas", "9.9.9.9", readerEmail("atlas", "proj-atlas")} {
+	for _, never := range []string{"app-shop-api", "credential_sha256", credentialOf("a"), "proj-atlas", "192.0.2.10", readerEmail("atlas", "proj-atlas")} {
 		if strings.Contains(string(body), never) {
 			t.Errorf("the document carries %q", never)
 		}
@@ -332,11 +332,11 @@ func TestWorldTunnelFailures(t *testing.T) {
 	t.Run("unreachable", func(t *testing.T) {
 		f := newWorldFixture(t)
 		f.cmd.connect = func(context.Context, string, tunnel.ClientIdentity) (worldTunnel, error) {
-			return nil, errors.New("fatline: connect https://9.9.9.9:8443: connection refused")
+			return nil, errors.New("fatline: connect https://192.0.2.10:8443: connection refused")
 		}
 		doc, raw := f.run(t)
 		wantSections(t, doc.Sections, map[string]string{"network": kindTunnelUnreachable, "seal": kindTunnelUnreachable, "apps": "read"})
-		if body, _ := json.Marshal(raw); strings.Contains(string(body), "9.9.9.9") {
+		if body, _ := json.Marshal(raw); strings.Contains(string(body), "192.0.2.10") {
 			t.Errorf("the carrier's address reached the document:\n%s", body)
 		}
 	})
@@ -769,7 +769,7 @@ func TestAnUnparseableRecordIsNeverQuoted(t *testing.T) {
 		t.Fatal(err)
 	}
 	// What the fixture's record holds, and where it lives.
-	secrets := []string{email, "proj-atlas", "9.9.9.9", f.dir.Path()}
+	secrets := []string{email, "proj-atlas", "192.0.2.10", f.dir.Path()}
 
 	outputs := map[string]string{}
 	listing, code := runRouter(t, "--config", f.dir.Path(), "-o", "json", "instances")

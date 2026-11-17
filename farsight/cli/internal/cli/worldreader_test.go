@@ -60,7 +60,7 @@ func newWorldReaderFixture(t *testing.T, opts ...kubetest.Option) *worldReaderFi
 		t.Fatal(err)
 	}
 	meta.FatLineDeployed = true
-	meta.Carrier = &config.Carrier{Type: "nlb", Endpoint: "9.9.9.9:8443", ServerName: identity.ServerName("atlas")}
+	meta.Carrier = &config.Carrier{Type: "nlb", Endpoint: "192.0.2.10:8443", ServerName: identity.ServerName("atlas")}
 	meta.Kernel = &config.Kernel{Deployed: true, Applied: true, Namespaces: []string{tcdeploy.DefaultNamespace, "shop"}}
 	meta.Keyholder = &config.Keyholder{Deployed: true, Replicas: 2}
 	meta.Deployments = map[string]config.Deployment{"shop": {Repository: "https://github.com/example/shop", StorageWired: true}}

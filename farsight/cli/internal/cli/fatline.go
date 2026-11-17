@@ -2,6 +2,8 @@ package cli
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -9,6 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,6 +25,7 @@ import (
 	"github.com/sofmon/farcast/farsight/cli/internal/keyholder"
 	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 	"github.com/sofmon/farcast/farsight/cli/internal/oci"
+	"github.com/sofmon/farcast/farsight/cli/internal/plan"
 	"github.com/sofmon/farcast/fatline/deploy"
 	"github.com/sofmon/farcast/planck"
 	_ "github.com/sofmon/farcast/planck/providers" // register cloud adapters (gke)
@@ -168,20 +173,29 @@ func defaultProviderOpener(meta *config.InstanceMetadata, creds *config.Instance
 
 // The defaults of the provider and image-builder seams, as package variables
 // (ADR 0023 M2.6, A23-49): a command whose seam is unset takes these, and the
-// package's tests replace both with fakes that refuse, so no test reaches a
-// real cloud provider or registry through these two seams by leaving one
-// unset. Other seams keep defaults that are real.
+// package's tests replace them with fakes that refuse, so no test reaches a
+// real cloud provider or registry through these seams by leaving one unset.
+// Other seams keep defaults that are real, but for connect's dial
+// (connectDialDefault) and the two below.
 //
 // deployerNowDefault is the deployer's clock, a variable for the same
 // reason: a test that runs a command through the router, where it cannot
 // set the command's own clock, fixes it here, so a plan bound to the UTC
 // day (kernel confirm's) is not made on one day and confirmed on the next.
+//
+// findSourceDefault and findToolchainDefault are the search for a farcast
+// checkout and the question to its Go (`go env`, a process from PATH),
+// which deciding a build makes in every mode since M2.6. They are variables
+// so the package's tests refuse them too: no test runs this machine's Go,
+// or binds the checkout it happens to run in, by leaving either unset.
 var (
 	openProviderDefault providerOpener = defaultProviderOpener
 	newBuilderDefault                  = func(progress func(string)) imageBuilder {
 		return &image.Builder{Progress: progress}
 	}
-	deployerNowDefault = time.Now
+	deployerNowDefault   = time.Now
+	findSourceDefault    = image.FindSource
+	findToolchainDefault = image.FindToolchain
 )
 
 // registryAccess is the instance's ensured registry plus the ability to mint a
@@ -245,9 +259,13 @@ type fatlineDeployer struct {
 	openProvider providerOpener
 	newBuilder   func(progress func(string)) imageBuilder
 	findSource   func(dir string) (string, error)
-	carried      carriedComponents
-	build        func() buildinfo.Info
-	now          func() time.Time
+	// findToolchain is image.FindToolchain: the Go a source build compiles
+	// with, found when the image is decided (decideBuild), so a build's
+	// prompt and its plan name it without either reading the terminal.
+	findToolchain func(ctx context.Context, parent []string, dir string) (image.Toolchain, error)
+	carried       carriedComponents
+	build         func() buildinfo.Info
+	now           func() time.Time
 }
 
 func (d *fatlineDeployer) ensureDefaults() {
@@ -272,7 +290,10 @@ func (d *fatlineDeployer) ensureDefaults() {
 		d.newBuilder = newBuilderDefault
 	}
 	if d.findSource == nil {
-		d.findSource = image.FindSource
+		d.findSource = findSourceDefault
+	}
+	if d.findToolchain == nil {
+		d.findToolchain = findToolchainDefault
 	}
 	if d.carried == nil {
 		d.carried = packageCarried{}
@@ -305,7 +326,7 @@ func imageFlagUsage(who string, c components.Component) string {
 // command that first deploys FatLine and the one that replaces it.
 func (d *fatlineDeployer) setImageFlags(fs *flag.FlagSet) {
 	// The default is empty rather than a ref: it depends on the instance, which
-	// is not known until Run loads its metadata (see resolveImage).
+	// is not known until Run loads its metadata (see decideImage).
 	fs.StringVar(&d.fatlineImage, "fatline-image", "", imageFlagUsage("FatLine", components.FatLine))
 	fs.StringVar(&d.sourceDir, "source", "", "farcast checkout to build FatLine's and Shrike's images from with this machine's Go; recorded as operator-built")
 	fs.BoolVar(&d.embedded, "embedded", false, embeddedFatLineUsage)
@@ -535,6 +556,192 @@ func ensureRegistry(ctx context.Context, env *Env, name string, meta *config.Ins
 	return &registryAccess{provider: rp, registry: reg}, nil
 }
 
+// The texts of the registry a plan reads (A23-5, A23-24).
+const (
+	// msgNoRegistryRecorded is planRegistry's refusal of a record that names
+	// no registry: a plan reads the registry, and never creates one.
+	msgNoRegistryRecorded = "instance %q has no image registry recorded; run 'farcast connect %s' interactively or with --yes, which ensures it"
+	// msgPlanNeedsShrike is connect's and redeploy's refusal, under --plan
+	// and --confirm, of a plan that would deploy FatLine without its Shrike
+	// monitor (A23-5): with the instance, and the registry's failure.
+	msgPlanNeedsShrike = "--plan and --confirm never deploy FatLine without its Shrike monitor, and instance %q's image registry could not be read (%w); " +
+		"deploying FatLine alone is a break-glass step: run the command without --plan or --confirm, interactively or with --yes"
+	// msgRegistryMoved is the ensure after consent answering with another
+	// registry than the plan's: the instance, the registry now, and the
+	// planned one.
+	msgRegistryMoved = "instance %q's image registry is now %s, not the %s this command planned with; the registry was ensured, and nothing was pushed or deployed"
+)
+
+// planRegistry is the instance's registry as a plan reads it (ADR 0023 M2.6,
+// A23-24): the one the record names, with the installer's key, read by
+// loadInstallerKey, to mint the registry token its lookups use. It reads,
+// and writes nothing: it never ensures the registry, records it or saves the
+// record, and a record that names none is refused. Its steps, in order: the
+// recorded prefix; the key, a blank one (Application Default Credentials)
+// refused before the provider opens; then the provider, which must have a
+// registry.
+func (d *fatlineDeployer) planRegistry(_ context.Context, env *Env, name string, meta *config.InstanceMetadata) (*registryAccess, error) {
+	prefix := registryPrefix(meta)
+	if prefix == "" {
+		return nil, fmt.Errorf(msgNoRegistryRecorded, name, name)
+	}
+	creds, err := loadInstallerKey(env.ConfigDir, name)
+	if err != nil {
+		return nil, err
+	}
+	p, err := d.openProvider(meta, creds)
+	if err != nil {
+		return nil, err
+	}
+	rp, ok := p.(planck.RegistryProvider)
+	if !ok {
+		return nil, fmt.Errorf("provider %q has no image registry: %w", meta.Provider, planck.ErrRegistryUnsupported)
+	}
+	return &registryAccess{provider: rp, registry: &planck.Registry{Ref: registryRefFor(meta), Prefix: prefix, Puller: meta.Registry.Puller}}, nil
+}
+
+// registryForPlan is the registry connect's and redeploy's plans read
+// (A23-24), or nil when FatLine deploys alone. command names the command in
+// the break-glass line.
+//
+// An interactive or --yes run on a record that names no registry first
+// ensures one, as these commands always have, and then plans, so a first
+// connect after a failed install ensure still works outside --plan; a plan
+// never ensures (planRegistry). A registry that cannot be had refuses the
+// command when it needs the registry (registryRequired); under --plan and
+// --confirm it refuses it too when FatLine would deploy alone (A23-5), so no
+// plan deploys the boundary without its monitor. Otherwise, in an
+// interactive or --yes run, it says why and returns nil: the break-glass
+// path, which deploys FatLine alone.
+func (d *fatlineDeployer) registryForPlan(ctx context.Context, env *Env, name string, meta *config.InstanceMetadata, m consentMode, command string) (*registryAccess, error) {
+	if m == consentNone && registryPrefix(meta) == "" {
+		if _, err := d.ensureRegistry(ctx, env, name, meta); err != nil {
+			return nil, d.withoutRegistry(env, err, command)
+		}
+	}
+	reg, err := d.planRegistry(ctx, env, name, meta)
+	switch {
+	case err == nil:
+		return reg, nil
+	case m != consentNone && !d.registryRequired():
+		return nil, fmt.Errorf(msgPlanNeedsShrike, name, err)
+	}
+	return nil, d.withoutRegistry(env, err, command)
+}
+
+// withoutRegistry is a registry that could not be had, outside --plan and
+// --confirm: the command's refusal when it needs the registry, and
+// otherwise nil, once it has said so in the words connect and redeploy
+// always used.
+func (d *fatlineDeployer) withoutRegistry(env *Env, err error, command string) error {
+	if d.registryRequired() {
+		return d.registryFailed(err)
+	}
+	fprintf(env.Err, "Warning: %v\n", err)
+	fprintf(env.Err, "Continuing: --fatline-image names an image this %s neither looks up nor pushes.\n", command)
+	return nil
+}
+
+// realizeRegistry is the registry ensure as a realize step (ADR 0023 M2.6,
+// A23-24): after consent, in every mode, given the registry the plan was
+// made with. It ensures and records the registry, as ensureRegistry always
+// has, and refuses before anything is pushed: an ensure that failed, with
+// its own error and kind, and one that answered with another registry than
+// the planned one (plan_changed under --confirm). It never drops an image
+// the plan listed. With no planned registry, a break-glass plan that
+// deploys FatLine alone, it ensures nothing.
+func (d *fatlineDeployer) realizeRegistry(ctx context.Context, env *Env, name string, meta *config.InstanceMetadata, planned *registryAccess, m consentMode) (*registryAccess, error) {
+	if planned == nil {
+		return nil, nil
+	}
+	reg, err := d.ensureRegistry(ctx, env, name, meta)
+	if err != nil {
+		return nil, fmt.Errorf("%w; nothing was pushed or deployed", err)
+	}
+	if now, want := reg.registry.Prefix, planned.registry.Prefix; now != want {
+		return nil, changedAfterPlan(m, fmt.Sprintf(msgRegistryMoved, name, now, want))
+	}
+	return reg, nil
+}
+
+// readyWriter is openReady through the deployer's writing seam.
+func (d *fatlineDeployer) readyWriter(ctx context.Context, env *Env, meta *config.InstanceMetadata) (clusterApplier, error) {
+	return openReady(ctx, env, meta, d.newCluster)
+}
+
+// openReady opens the instance's writer through open, the command's writing
+// seam, and reads once as it, before anything is minted, ensured, pushed,
+// asked or applied (ADR 0023 M2.5, A20-10, A20-11): opening sends nothing,
+// so an instance this machine cannot write as is refused first; applyReady
+// finds a machine that cannot apply; and the read makes the writer's first
+// in-process call before kubectl applies anything. The uid it reads is
+// discarded: the plans of the commands that open it here bind none
+// (cluster_identity none). An interactive or --yes run opens it before its
+// plan, and --confirm right after the comparison (A23-23).
+func openReady[W preflighter](ctx context.Context, env *Env, meta *config.InstanceMetadata, open func(clusterRef) (W, error)) (W, error) {
+	var none W
+	cl, err := open(clusterRef{Dir: env.ConfigDir, Meta: meta, Identity: kube.Writer, Warn: env.Err})
+	if err != nil {
+		return none, err
+	}
+	if err := applyReady(cl); err != nil {
+		return none, err
+	}
+	if err := preflightNamespace(ctx, cl); err != nil {
+		return none, err
+	}
+	return cl, nil
+}
+
+// registryTarget is the instance's registry as a plan's cloud facts name it:
+// the recorded image-path prefix, which names its location, project and
+// repository; or, for a record that names none (a reconnect's plan, which
+// reads no registry), the repository the ensure would make, by location and
+// name.
+func registryTarget(meta *config.InstanceMetadata) string {
+	if p := registryPrefix(meta); p != "" {
+		return p
+	}
+	ref := registryRefFor(meta)
+	return ref.Location + "/" + ref.Name
+}
+
+// registryFacts are a plan's cloud facts for the registry (A23-24): the
+// ensure, unconditionally, as its two writes (the repository, then the
+// cluster's pull grant on it, whose target is the repository until ADR 0023
+// M2.8 reads the project number), then a push for each decision that puts an
+// image in the registry, in the order given.
+func registryFacts(meta *config.InstanceMetadata, decs ...imageDecision) []plan.Fact {
+	target := registryTarget(meta)
+	facts := []plan.Fact{
+		plan.CloudFact{Type: plan.TypeCloud, Service: plan.CloudArtifactRegistry, Action: plan.CloudCreateRepository, Target: target},
+		plan.CloudFact{Type: plan.TypeCloud, Service: plan.CloudArtifactRegistry, Action: plan.CloudSetPullGrant, Target: target},
+	}
+	for _, dec := range decs {
+		if dec.pushes() {
+			facts = append(facts, plan.CloudFact{Type: plan.TypeCloud, Service: plan.CloudArtifactRegistry, Action: plan.CloudPushImage, Target: dec.planTarget()})
+		}
+	}
+	return facts
+}
+
+// imageOptions are the deployer's image flags as a plan binds them (A23-28):
+// --embedded, the command's own image flag and --source, each its parsed
+// value. The command adds its other flags and sorts them (sortedOptions).
+func (d *fatlineDeployer) imageOptions() []plan.Option {
+	return []plan.Option{
+		{Flag: "embedded", Value: strconv.FormatBool(d.embedded)},
+		{Flag: strings.TrimPrefix(d.imageFlag(), "--"), Value: d.fatlineImage},
+		{Flag: "source", Value: d.sourceDir},
+	}
+}
+
+// sortedOptions is opts in the order a plan binds them: ascending by flag.
+func sortedOptions(opts []plan.Option) []plan.Option {
+	slices.SortFunc(opts, func(a, b plan.Option) int { return strings.Compare(a.Flag, b.Flag) })
+	return opts
+}
+
 // resolvedImage is what a resolution decided: the reference the cluster is
 // told to run, and where it came from.
 type resolvedImage struct {
@@ -542,8 +749,170 @@ type resolvedImage struct {
 	Record config.SystemImage // written by the caller exactly where it writes the deploy record
 }
 
-// resolveImage decides what the cluster will be told to run for d.component,
-// and where that image came from (ADR 0023 decision 4). The rules, in order:
+// imageDecision is what deciding a component's image found, before anything
+// is pushed, built, asked or printed (ADR 0023 M2.6, A23-34): which of
+// rules 1–6 applies, as a plan's image action, and everything realizing it
+// needs. Deciding only reads — the registry token, Resolve, the carried
+// components, the checkout and its Go — and realizing writes: a push or a
+// build. A plan binds a decision; a command that does not plan decides and
+// realizes at once (resolveImage).
+type imageDecision struct {
+	component components.Component
+	// action is a plan.Image* constant. It is "" only in Shrike's decision
+	// when FatLine deploys alone (decideSidecarImage's break-glass path),
+	// which no plan holds.
+	action string
+	// repo is the component's repository in the instance's registry, "" for
+	// a named image.
+	repo string
+	// target is the image the cluster is told to run: the flag's (named),
+	// the kept one (keep_*), or repo@<the carried manifest> (reuse, push,
+	// push_over_foreign). A build's is known once it is pushed, so it is "".
+	target string
+	// tagRef is the version tag the carried image is pushed under (rule 5).
+	tagRef string
+	// art is the carried artifact (rule 5).
+	art components.Artifact
+	// prov is the component's recorded provenance, valid when hasProv.
+	prov    config.SystemImage
+	hasProv bool
+	// previous is the image rule 5 replaces, which its replacement note
+	// names: the deploy record, or for Shrike its valid provenance.
+	previous string
+	// replacesOther is rule 5b: the carried image replaces one another
+	// farcast version deployed. skew is the version_skew refusal that stands
+	// for it while --embedded is not given (skewRefusal).
+	replacesOther bool
+	skew          error
+	// source is a build's checkout and Go (build_source, build_development).
+	source imageSource
+	// record is the provenance recorded once the image is deployed. A
+	// build's Image, Go and BuiltAt are filled in when it is pushed.
+	record config.SystemImage
+	// notices are the lines the resolution prints before it pushes or
+	// builds, in their order; replacing is rule 5's replacement note, which
+	// it prints once the image is in the registry (settleImage).
+	notices   []string
+	replacing string
+}
+
+// imageSource is a source build's checkout and the Go it compiles with.
+type imageSource struct {
+	dir       string
+	goPath    string
+	goVersion string
+	// goErr is findToolchain's failure. It is no refusal: the build prompt
+	// names it in place of the Go, as it did before the split.
+	goErr error
+}
+
+// builds reports whether realizing the decision compiles the image (rules 3
+// and 6), which confirmBuild asks about first.
+func (dec imageDecision) builds() bool {
+	return dec.action == plan.ImageBuildSource || dec.action == plan.ImageBuildDevelopment
+}
+
+// skewRefusal is the version-skew refusal when it stands: the decision
+// replaces a component another farcast version deployed, and --embedded was
+// not given (ADR 0021 decision 6, kept by ADR 0023 decision 4). Interactive
+// and --yes runs return it before anything is asked or pushed; nil otherwise.
+func (dec imageDecision) skewRefusal(embedded bool) error {
+	if dec.replacesOther && !embedded {
+		return dec.skew
+	}
+	return nil
+}
+
+// pushes reports whether realizing the decision puts an image in the
+// registry: the carried image pushed (rule 5c), or a build (rules 3 and 6).
+func (dec imageDecision) pushes() bool {
+	return dec.action == plan.ImagePush || dec.action == plan.ImagePushOverForeign || dec.builds()
+}
+
+// planTarget is the image a plan names for the decision: its target, or for
+// a build, whose digest exists only once it is built, the build placeholder
+// (A23-30).
+func (dec imageDecision) planTarget() string {
+	if dec.builds() {
+		return buildPlaceholder(dec.repo, dec.component.Name)
+	}
+	return dec.target
+}
+
+// buildPlaceholder is the image reference a plan renders for a component
+// built from source (A23-30): the repository, @sha256:, and the hex SHA-256
+// of farcast-placeholder:build:<component>. It is digest-shaped, so every
+// renderer takes it, and it is the one part of a rendering that may differ
+// from the real one by its digest alone (A23-31, item 4).
+func buildPlaceholder(repo, component string) string {
+	sum := sha256.Sum256([]byte("farcast-placeholder:build:" + component))
+	return repo + "@sha256:" + hex.EncodeToString(sum[:])
+}
+
+// said is what resolving the decision says, in its order: its notices, then
+// the replacement note. Outside a plan they print once each, before the
+// command asks anything; in a plan they are notice facts (A23-26).
+func (dec imageDecision) said() []string {
+	lines := slices.Clone(dec.notices)
+	if dec.replacing != "" {
+		lines = append(lines, dec.replacing)
+	}
+	return lines
+}
+
+// msgSourceBuildNotice is a source build's plan notice (A23-13): the plan
+// binds the checkout's directory and Go, not what the checkout holds.
+const msgSourceBuildNotice = "the build compiles whatever %s holds when --confirm runs; this plan binds the directory, not its content"
+
+// sourceNotices are a plan's notices for its source builds (A23-13): one
+// per checkout the decisions build from, in their order.
+func sourceNotices(decs ...imageDecision) []plan.Fact {
+	var facts []plan.Fact
+	var dirs []string
+	for _, dec := range decs {
+		if dec.builds() && !slices.Contains(dirs, dec.source.dir) {
+			dirs = append(dirs, dec.source.dir)
+			facts = append(facts, noticeFact(fmt.Sprintf(msgSourceBuildNotice, dec.source.dir)))
+		}
+	}
+	return facts
+}
+
+// imageFact is the decision as a plan binds it (A23-33): the component, the
+// action and the image it deploys (planTarget), that image's Go as recorded
+// once deployed ("" for a named image and a build), the image the record
+// says is deployed today, whether it replaces a component another farcast
+// version deployed, and for a build the checkout and the Go it compiles
+// with.
+func (dec imageDecision) imageFact(meta *config.InstanceMetadata) plan.ImageFact {
+	f := plan.ImageFact{
+		Type: plan.TypeImage, Component: dec.component.Name, Action: dec.action, Target: dec.planTarget(),
+		Go: dec.record.Go, Current: currentImage(meta, dec.component.Name), ReplacesOtherVersion: dec.replacesOther,
+	}
+	if dec.builds() {
+		f.Source = &plan.ImageSource{Dir: dec.source.dir, GoPath: dec.source.goPath, GoVersion: dec.source.goVersion}
+	}
+	return f
+}
+
+// currentImage is the image the record says a component runs, with its
+// recorded provenance when that names the same image, or nil when the
+// record names none.
+func currentImage(meta *config.InstanceMetadata, name string) *plan.ImageCurrent {
+	img := deployRecordOf(meta, name)
+	if img == "" {
+		return nil
+	}
+	cur := &plan.ImageCurrent{Image: img}
+	if rec, ok := meta.SystemImages[name]; ok && rec.Image == img {
+		cur.Origin, cur.FarCast, cur.Go = rec.Origin, rec.Farcast, rec.Go
+	}
+	return cur
+}
+
+// decideImage decides what the cluster will be told to run for d.component,
+// and where that image came from (ADR 0023 decision 4), without pushing,
+// building, asking or printing anything (M2.6, A23-34). The rules, in order:
 //
 //  1. An explicit image flag is deployed exactly as given. It is digest-pinned
 //     (checkImageFlags), and nothing is looked up or pushed. --embedded beside
@@ -560,40 +929,51 @@ type resolvedImage struct {
 //  6. A farcast that carries nothing (a source build) compiles the image from
 //     the checkout it finds, and records it as a development build.
 //
+// It mints the registry token and makes the Resolve calls, finds a build's
+// checkout and Go, and checks the carried components; realizeImage makes the
+// push or the build. What the resolution says on the way is in the
+// decision's notices, never printed here. On an error the decision holds
+// what was decided before it, its notices and a skew refusal among them, so
+// a caller that prints them first says what it always said.
+//
 // Every deploy is pinned by digest: a Deployment that names a tag can be
 // redirected by whoever can write that tag (ADR 0007 decision 4).
-func (d *fatlineDeployer) resolveImage(ctx context.Context, env *Env, reg *registryAccess, meta *config.InstanceMetadata) (resolvedImage, error) {
+func (d *fatlineDeployer) decideImage(ctx context.Context, env *Env, reg *registryAccess, meta *config.InstanceMetadata) (imageDecision, error) {
 	c := d.component
 	info := d.build()
+	dec := imageDecision{component: c}
 
 	// Rule 1: the operator named it; deploy exactly that.
 	if d.fatlineImage != "" {
 		if !isPinnedImageRef(d.fatlineImage) { // checked as usage already; belt and braces
-			return resolvedImage{}, d.checkImageFlags()
+			return dec, d.checkImageFlags()
 		}
-		return resolvedImage{
-			Ref:    d.fatlineImage,
-			Record: config.SystemImage{Image: d.fatlineImage, Origin: config.OriginNamed, Farcast: info.Version},
-		}, nil
+		dec.action, dec.target = plan.ImageNamed, d.fatlineImage
+		dec.record = config.SystemImage{Image: d.fatlineImage, Origin: config.OriginNamed, Farcast: info.Version}
+		return dec, nil
 	}
 	// Rule 2.
 	if reg == nil { // guarded by each command's needs-the-registry rule; belt and braces
-		return resolvedImage{}, fmt.Errorf("no image registry for this instance and no %s given", d.imageFlag())
+		return dec, fmt.Errorf("no image registry for this instance and no %s given", d.imageFlag())
 	}
-	repo := reg.registry.Prefix + "/" + c.ImagePath
+	dec.repo = reg.registry.Prefix + "/" + c.ImagePath
 	user, pass, err := reg.credentials(ctx)
 	if err != nil {
-		return resolvedImage{}, err
+		return dec, err
 	}
-	b := d.newBuilder(d.progressTo(env))
+	// Lookups only: progress belongs to the push or the build.
+	b := d.newBuilder(nil)
 
 	// Rule 3: an explicit --source always builds. An operator build is its own
 	// image, under its own tag and record, so there is nothing to look up first.
 	if d.sourceDir != "" {
-		return d.buildFromSource(ctx, env, b, repo, user, pass, config.OriginOperator)
+		return d.decideBuild(ctx, dec, config.OriginOperator)
 	}
 
-	prov, hasProv := d.provenance(env, meta, repo)
+	prov, hasProv, ignored := d.provenance(meta, dec.repo)
+	if ignored != "" {
+		dec.notices = append(dec.notices, ignored)
+	}
 
 	// Rule 4: a kept build.
 	if hasProv && ((prov.Origin == config.OriginOperator && !d.embedded) ||
@@ -601,10 +981,15 @@ func (d *fatlineDeployer) resolveImage(ctx context.Context, env *Env, reg *regis
 		_, err := b.Resolve(ctx, prov.Image, user, pass)
 		switch {
 		case err == nil:
-			fprintln(env.Err, d.keepingNote(prov))
-			return resolvedImage{Ref: prov.Image, Record: prov}, nil
+			dec.action = plan.ImageKeepOperator
+			if prov.Origin == config.OriginDevelopment {
+				dec.action = plan.ImageKeepDevelopment
+			}
+			dec.target, dec.record, dec.prov, dec.hasProv = prov.Image, prov, prov, true
+			dec.notices = append(dec.notices, d.keepingNote(prov))
+			return dec, nil
 		case !errors.Is(err, image.ErrNotFound):
-			return resolvedImage{}, fmt.Errorf("look up %s: %w", prov.Image, err)
+			return dec, fmt.Errorf("look up %s: %w", prov.Image, err)
 		case prov.Origin == config.OriginOperator:
 			// --embedded is named only where checkImageFlags accepts it, as in
 			// keepingNote: a refusal must not offer a remedy that is itself
@@ -613,13 +998,14 @@ func (d *fatlineDeployer) resolveImage(ctx context.Context, env *Env, reg *regis
 			if d.carried.Embedded() {
 				out = "pass --source <dir> to rebuild it, or --embedded to deploy the image this farcast carries"
 			}
-			return resolvedImage{}, fmt.Errorf("the operator-built %s image %s recorded for this instance is no longer in its registry; %s",
+			return dec, fmt.Errorf("the operator-built %s image %s recorded for this instance is no longer in its registry; %s",
 				c.Name, prov.Image, out)
 		default:
-			fprintf(env.Err, "%s: the development image %s is no longer in the registry; building it again.\n", c.Name, prov.Image)
+			dec.notices = append(dec.notices, fmt.Sprintf("%s: the development image %s is no longer in the registry; building it again.", c.Name, prov.Image))
 			hasProv = false
 		}
 	}
+	dec.prov, dec.hasProv = prov, hasProv
 
 	// Rule 5: the image this farcast carries.
 	if d.carried.Embedded() {
@@ -630,40 +1016,44 @@ func (d *fatlineDeployer) resolveImage(ctx context.Context, env *Env, reg *regis
 				old = prov.Image
 			}
 		}
-		return d.carriedImage(ctx, env, b, repo, user, pass, info, prov, hasProv, old)
+		return d.decideCarried(ctx, dec, b, user, pass, info, old)
 	}
 
 	// Rule 6: a source build of farcast, with nothing kept.
-	return d.buildFromSource(ctx, env, b, repo, user, pass, config.OriginDevelopment)
+	return d.decideBuild(ctx, dec, config.OriginDevelopment)
 }
 
-// carriedImage is rule 5: deploy the image this farcast carries.
+// decideCarried is rule 5: deploy the image this farcast carries.
 //
 // old is the image the component is recorded as running, which a replacement
 // note names: the deploy record, or for Shrike its valid provenance.
-func (d *fatlineDeployer) carriedImage(ctx context.Context, env *Env, b imageBuilder, repo, user, pass string,
-	info buildinfo.Info, prov config.SystemImage, hasProv bool, old string) (resolvedImage, error) {
+func (d *fatlineDeployer) decideCarried(ctx context.Context, dec imageDecision, b imageBuilder, user, pass string,
+	info buildinfo.Info, old string) (imageDecision, error) {
 	c := d.component
-	say := d.progressTo(env)
 
 	// a. The precheck again. The commands run it before anything is asked or
 	// called; this is the same check where the image is decided.
 	if err := checkCarried(d.carried, d.build); err != nil {
-		return resolvedImage{}, err
+		return dec, err
 	}
 	art, ok := d.carried.Lookup(c.Name)
 	if !ok {
-		return resolvedImage{}, fmt.Errorf("this farcast carries no %s component", c.Name)
+		return dec, fmt.Errorf("this farcast carries no %s component", c.Name)
 	}
-	want := repo + "@" + art.Manifest
+	want := dec.repo + "@" + art.Manifest
+	dec.art, dec.target, dec.previous = art, want, old
+	dec.record = config.SystemImage{Image: want, Origin: config.OriginEmbedded, Go: art.GoVersion, Farcast: info.Version}
 
 	// b. The version-skew guard (ADR 0021 decision 6, kept by ADR 0023
 	// decision 4): an image another farcast version deployed is replaced only
 	// when the operator says so, because two farcasts of different versions
 	// would otherwise keep redeploying each other's components, and an older
-	// one would silently put back an older Go.
-	if hasProv && (prov.Origin == config.OriginEmbedded || prov.Origin == config.OriginNamed) &&
-		prov.Image != want && prov.Farcast != "" && prov.Farcast != info.Version && !d.embedded {
+	// one would silently put back an older Go. The refusal is kept in the
+	// decision: interactive and --yes runs return it (skewRefusal), and a
+	// plan binds the replacement, which --confirm then executes.
+	prov := dec.prov
+	if dec.hasProv && (prov.Origin == config.OriginEmbedded || prov.Origin == config.OriginNamed) &&
+		prov.Image != want && prov.Farcast != "" && prov.Farcast != info.Version {
 		goOld := prov.Go
 		if goOld == "" {
 			goOld = "its Go is not recorded"
@@ -673,106 +1063,179 @@ func (d *fatlineDeployer) carriedImage(ctx context.Context, env *Env, b imageBui
 		if prov.Go != "" && goOlder(art.GoVersion, prov.Go) {
 			msg += fmt.Sprintf(" That replaces %s with an older Go, %s.", prov.Go, art.GoVersion)
 		}
-		return resolvedImage{}, withKind(kindVersionSkew, errors.New(msg))
+		dec.replacesOther, dec.skew = true, withKind(kindVersionSkew, errors.New(msg))
 	}
 
 	// c. The version tag holds only the image this farcast carries.
-	tagRef := repo + ":" + imageTag(info.Version)
-	push := false
-	switch t, err := b.Resolve(ctx, tagRef, user, pass); {
+	dec.tagRef = dec.repo + ":" + imageTag(info.Version)
+	switch t, err := b.Resolve(ctx, dec.tagRef, user, pass); {
 	case errors.Is(err, image.ErrNotFound):
-		push = true
+		dec.action = plan.ImagePush
 	case err != nil:
-		return resolvedImage{}, fmt.Errorf("look up %s: %w", tagRef, err)
+		return dec, fmt.Errorf("look up %s: %w", dec.tagRef, err)
 	case t == want:
-		if say != nil {
-			say(fmt.Sprintf("%s: %s already holds the image this farcast carries", c.Name, tagRef))
-		}
+		dec.action = plan.ImageReuse
 	default:
 		// Never deployed, and said whatever the output mode: a tag that moved
 		// under a release is something the operator has to hear about.
 		_, found, _ := strings.Cut(t, "@")
-		fprintf(env.Err, "warning: %s points at %s, which is not the %s image this farcast carries (%s); it will not be deployed. Pushing the carried image over that tag.\n",
-			tagRef, found, c.Name, art.Manifest)
-		push = true
-	}
-
-	// d. The push. No build confirmation: the image is part of the executable
-	// the operator chose to run, and pushing it changes nothing that runs. The
-	// command's own gate still applies to the deploy.
-	if push {
-		layer, err := d.carried.Layer(c.Name)
-		if err != nil {
-			return resolvedImage{}, err
-		}
-		if say != nil {
-			say(fmt.Sprintf("%s: pushing the image this farcast carries (%s, %s)", c.Name, art.GoVersion, art.Manifest))
-		}
-		pushed, err := b.PushEmbedded(ctx, image.EmbeddedOptions{
-			Ref: tagRef, Package: c.Package, BinaryPath: c.BinaryPath,
-			Layer: layer, LayerDigest: art.Layer, LayerSize: art.LayerSize,
-			DiffID: art.DiffID, Manifest: art.Manifest, GoVersion: art.GoVersion,
-		}, user, pass)
-		if err != nil {
-			return resolvedImage{}, err
-		}
-		if pushed.Ref != want {
-			return resolvedImage{}, fmt.Errorf("pushed %s as %s, not the %s this farcast carries", tagRef, pushed.Ref, want)
-		}
+		dec.action = plan.ImagePushOverForeign
+		dec.notices = append(dec.notices, fmt.Sprintf("warning: %s points at %s, which is not the %s image this farcast carries (%s); it will not be deployed. Pushing the carried image over that tag.",
+			dec.tagRef, found, c.Name, art.Manifest))
 	}
 
 	// e and f. A replacement is said, whatever replaced it.
 	if old != "" && old != want {
-		fprintln(env.Err, d.replacingNote(old, prov, hasProv, art))
+		dec.replacing = d.replacingNote(old, prov, dec.hasProv, art)
 	}
-
-	// g.
-	return resolvedImage{
-		Ref:    want,
-		Record: config.SystemImage{Image: want, Origin: config.OriginEmbedded, Go: art.GoVersion, Farcast: info.Version},
-	}, nil
+	return dec, nil
 }
 
-// buildFromSource is rules 3 and 6: compile the component from a checkout with
-// this machine's Go, push it under its own source- tag, and record it.
-func (d *fatlineDeployer) buildFromSource(ctx context.Context, env *Env, b imageBuilder, repo, user, pass, origin string) (resolvedImage, error) {
+// decideBuild is rules 3 and 6: the checkout to compile the component from,
+// and the Go this machine compiles it with.
+func (d *fatlineDeployer) decideBuild(ctx context.Context, dec imageDecision, origin string) (imageDecision, error) {
 	c := d.component
 	source, err := d.findSource(d.sourceDir)
 	if err != nil {
 		if origin == config.OriginOperator {
-			return resolvedImage{}, fmt.Errorf("--source %s is not a farcast checkout to build %s's image from: %w", d.sourceDir, c.Name, err)
+			return dec, fmt.Errorf("--source %s is not a farcast checkout to build %s's image from: %w", d.sourceDir, c.Name, err)
 		}
-		return resolvedImage{}, fmt.Errorf("%s's image is not in the instance's registry %s yet and there is no farcast checkout to build it from "+
-			"(run the command from a farcast checkout, or pass --source <dir>; a release farcast needs no checkout: it carries its components): %w", c.Name, repo, err)
+		return dec, fmt.Errorf("%s's image is not in the instance's registry %s yet and there is no farcast checkout to build it from "+
+			"(run the command from a farcast checkout, or pass --source <dir>; a release farcast needs no checkout: it carries its components): %w", c.Name, dec.repo, err)
 	}
-	ok, err := d.confirmBuild(ctx, env, repo, source, origin)
-	if err != nil {
-		return resolvedImage{}, err
+	dec.action = plan.ImageBuildDevelopment
+	if origin == config.OriginOperator {
+		dec.action = plan.ImageBuildSource
 	}
-	if !ok {
-		fprintln(env.Err, "Aborted.")
-		return resolvedImage{}, fmt.Errorf("building %s's image from %s was declined", c.Name, source)
-	}
-	pushed, err := b.BuildAndPush(ctx, image.Options{
-		SourceDir:  source,
-		Package:    c.Package,
-		Repository: repo,
-		BinaryPath: c.BinaryPath,
-	}, user, pass)
-	if err != nil {
-		return resolvedImage{}, err
+	dec.source.dir = source
+	if tc, err := d.findToolchain(ctx, os.Environ(), source); err == nil {
+		dec.source.goPath, dec.source.goVersion = tc.Go, tc.Version
+	} else {
+		dec.source.goErr = err
 	}
 	abs, err := filepath.Abs(source)
 	if err != nil {
 		abs = source
 	}
-	return resolvedImage{
-		Ref: pushed.Ref,
-		Record: config.SystemImage{
-			Image: pushed.Ref, Origin: origin, Go: pushed.GoVersion, Farcast: d.build().Version,
-			BuiltAt: d.now().UTC(), Source: abs,
-		},
-	}, nil
+	dec.record = config.SystemImage{Origin: origin, Farcast: d.build().Version, Source: abs}
+	return dec, nil
+}
+
+// realizeImage puts a decided image where the cluster can pull it (ADR 0023
+// M2.6, A23-34): it pushes the image this farcast carries (push,
+// push_over_foreign), or compiles and pushes a build (build_*), and returns
+// what the caller deploys and records. A named, kept or reused image is
+// already there, so for those it makes no registry call and looks nothing up
+// again. It asks nothing: a build's consent (confirmBuild) is the caller's,
+// given before this runs. Its progress lines, and their terminal check, are
+// here and nowhere in decideImage.
+func (d *fatlineDeployer) realizeImage(ctx context.Context, env *Env, reg *registryAccess, dec imageDecision) (resolvedImage, error) {
+	c := dec.component
+	say := d.progressTo(env)
+	switch dec.action {
+	case plan.ImageNamed, plan.ImageKeepOperator, plan.ImageKeepDevelopment:
+		return resolvedImage{Ref: dec.target, Record: dec.record}, nil
+	case plan.ImageReuse:
+		if say != nil {
+			say(fmt.Sprintf("%s: %s already holds the image this farcast carries", c.Name, dec.tagRef))
+		}
+		return resolvedImage{Ref: dec.target, Record: dec.record}, nil
+	case plan.ImagePush, plan.ImagePushOverForeign, plan.ImageBuildSource, plan.ImageBuildDevelopment:
+	default:
+		return resolvedImage{}, fmt.Errorf("cli: no image was decided for %s", c.Name)
+	}
+	if reg == nil { // decided with a registry, so realized with one; belt and braces
+		return resolvedImage{}, fmt.Errorf("no image registry for this instance to push %s's image to", c.Name)
+	}
+	// A credential of its own, minted where the push uses it (registryAccess)
+	// rather than kept in the decision: a decision holds no secret, and one
+	// made before a prompt may be answered after the token it read with has
+	// expired.
+	user, pass, err := reg.credentials(ctx)
+	if err != nil {
+		return resolvedImage{}, err
+	}
+	b := d.newBuilder(say)
+
+	if dec.builds() {
+		pushed, err := b.BuildAndPush(ctx, image.Options{
+			SourceDir:  dec.source.dir,
+			Package:    c.Package,
+			Repository: dec.repo,
+			BinaryPath: c.BinaryPath,
+		}, user, pass)
+		if err != nil {
+			return resolvedImage{}, err
+		}
+		rec := dec.record
+		rec.Image, rec.Go, rec.BuiltAt = pushed.Ref, pushed.GoVersion, d.now().UTC()
+		return resolvedImage{Ref: pushed.Ref, Record: rec}, nil
+	}
+
+	// d. The push. No build confirmation: the image is part of the executable
+	// the operator chose to run, and pushing it changes nothing that runs. The
+	// command's own gate still applies to the deploy.
+	art := dec.art
+	layer, err := d.carried.Layer(c.Name)
+	if err != nil {
+		return resolvedImage{}, err
+	}
+	if say != nil {
+		say(fmt.Sprintf("%s: pushing the image this farcast carries (%s, %s)", c.Name, art.GoVersion, art.Manifest))
+	}
+	pushed, err := b.PushEmbedded(ctx, image.EmbeddedOptions{
+		Ref: dec.tagRef, Package: c.Package, BinaryPath: c.BinaryPath,
+		Layer: layer, LayerDigest: art.Layer, LayerSize: art.LayerSize,
+		DiffID: art.DiffID, Manifest: art.Manifest, GoVersion: art.GoVersion,
+	}, user, pass)
+	if err != nil {
+		return resolvedImage{}, err
+	}
+	if pushed.Ref != dec.target {
+		return resolvedImage{}, fmt.Errorf("pushed %s as %s, not the %s this farcast carries", dec.tagRef, pushed.Ref, dec.target)
+	}
+	return resolvedImage{Ref: dec.target, Record: dec.record}, nil
+}
+
+// resolveImage decides d.component's image and realizes it at once, saying
+// what it always said, in the same order (settleImage). It is the path of the
+// commands that have no plan yet, kernel deploy and storage deploy, and goes
+// when they have one (ADR 0023 M2.6, A23-34). connect and redeploy decide
+// before their consent and realize after it (workloadImages).
+func (d *fatlineDeployer) resolveImage(ctx context.Context, env *Env, reg *registryAccess, meta *config.InstanceMetadata) (resolvedImage, error) {
+	dec, err := d.decideImage(ctx, env, reg, meta)
+	return d.settleImage(ctx, env, reg, dec, err)
+}
+
+// settleImage is a resolution after its decision, given decide's error: the
+// version-skew refusal, before anything is said, asked or pushed; the
+// decision's notices on stderr, whatever the output mode; decide's error;
+// the build prompt; realize; and the replacement note once the image is in
+// the registry. That is the order the lines came in before the decision was
+// split from the push: the skew was refused before the version tag was
+// looked up, so a skew decision's foreign-tag warning, which deciding now
+// makes, is never said.
+func (d *fatlineDeployer) settleImage(ctx context.Context, env *Env, reg *registryAccess, dec imageDecision, err error) (resolvedImage, error) {
+	if skew := dec.skewRefusal(d.embedded); skew != nil {
+		return resolvedImage{}, skew
+	}
+	for _, n := range dec.notices {
+		fprintln(env.Err, n)
+	}
+	if err != nil {
+		return resolvedImage{}, err
+	}
+	if err := d.buildConsent(env, dec); err != nil {
+		return resolvedImage{}, err
+	}
+	resolved, err := d.realizeImage(ctx, env, reg, dec)
+	if err != nil {
+		return resolvedImage{}, err
+	}
+	if dec.replacing != "" {
+		fprintln(env.Err, dec.replacing)
+	}
+	return resolved, nil
 }
 
 // provenance is this instance's recorded origin of the component's deployed
@@ -784,29 +1247,29 @@ func (d *fatlineDeployer) buildFromSource(ctx context.Context, env *Env, b image
 // in this instance's registry: those are only ever pushed there, and rule 4
 // hands the registry credential to whatever host a reference names, so a
 // record naming another host must never reach it. A record that fails is
-// ignored, said, and the command continues as if there were none.
-func (d *fatlineDeployer) provenance(env *Env, meta *config.InstanceMetadata, repo string) (config.SystemImage, bool) {
+// ignored, and the command continues as if there were none; ignored is the
+// line that says so, which the caller prints (a notice, never printed here).
+func (d *fatlineDeployer) provenance(meta *config.InstanceMetadata, repo string) (rec config.SystemImage, ok bool, ignored string) {
 	c := d.component
-	rec, ok := meta.SystemImages[c.Name]
+	rec, ok = meta.SystemImages[c.Name]
 	if !ok || rec.Image == "" {
-		return config.SystemImage{}, false
+		return config.SystemImage{}, false, ""
 	}
 	if c.Name != components.Shrike.Name && rec.Image != deployRecordOf(meta, c.Name) {
-		return config.SystemImage{}, false
+		return config.SystemImage{}, false, ""
 	}
 	switch rec.Origin {
 	case config.OriginEmbedded, config.OriginOperator, config.OriginDevelopment:
 		digest, found := strings.CutPrefix(rec.Image, repo+"@")
 		if !found || !isSHA256(digest) {
-			fprintf(env.Err, "%s: ignoring the recorded origin of %s: it is not in this instance's registry %s\n", c.Name, rec.Image, repo)
-			return config.SystemImage{}, false
+			return config.SystemImage{}, false, fmt.Sprintf("%s: ignoring the recorded origin of %s: it is not in this instance's registry %s", c.Name, rec.Image, repo)
 		}
 	case config.OriginNamed:
 	default:
 		// An origin this build does not know is no origin it can act on.
-		return config.SystemImage{}, false
+		return config.SystemImage{}, false, ""
 	}
-	return rec, true
+	return rec, true, ""
 }
 
 // deployRecordOf is the component's deploy record: the image the cluster was
@@ -898,8 +1361,7 @@ func recordSystemImage(meta *config.InstanceMetadata, name string, rec config.Sy
 	meta.SystemImages[name] = rec
 }
 
-// resolveSidecarImage settles Shrike's image in the same instance registry the
-// FatLine image came from.
+// sidecar is this deployer with Shrike's image in FatLine's place.
 //
 // It is this deployer with the component swapped, deliberately: the push, the
 // consent gate, the provenance and the version-skew guard must behave
@@ -910,29 +1372,204 @@ func recordSystemImage(meta *config.InstanceMetadata, name string, rec config.Sy
 // is the flag that governs Shrike (ADR 0023 M1, review finding SEC-2), so the
 // monitor follows rules 4 and 5 with it given, past the version-skew guard and
 // over an operator build.
-func (d *fatlineDeployer) resolveSidecarImage(ctx context.Context, env *Env, reg *registryAccess, meta *config.InstanceMetadata) (resolvedImage, error) {
+func (d *fatlineDeployer) sidecar() *fatlineDeployer {
+	s := *d
+	s.component = components.Shrike
+	s.fatlineImage = ""
+	return &s
+}
+
+// decideSidecarImage decides Shrike's image in the same instance registry
+// the FatLine image comes from, as decideImage does (sidecar), with one path
+// of its own: the break-glass one, where there is no image to decide.
+func (d *fatlineDeployer) decideSidecarImage(ctx context.Context, env *Env, reg *registryAccess, meta *config.InstanceMetadata) (imageDecision, error) {
 	// --embedded asked for Shrike's carried image, which only the registry can
 	// supply: refused rather than dropped. Each command refuses it at the
 	// ensure, before anything is resolved; this is belt and braces.
 	if d.fatlineImage != "" && reg == nil && d.embedded {
-		return resolvedImage{}, embeddedNeedsRegistry(errors.New("no image registry for this instance"))
+		return imageDecision{component: components.Shrike}, embeddedNeedsRegistry(errors.New("no image registry for this instance"))
 	}
 	// The break-glass path: --fatline-image names an image directly and needs
 	// no registry at all, which is what makes it usable when the registry is
 	// the thing that is broken. There is nowhere to get a monitor image from
 	// in that case, so FatLine deploys alone — said out loud, because a
 	// security component that quietly stops being deployed is worse than one
-	// that was never there.
+	// that was never there. The decision has no action, and its notices are
+	// those two lines. No plan holds it: --plan and --confirm never deploy
+	// FatLine without Shrike (A23-5).
 	if d.fatlineImage != "" && reg == nil {
-		fprintln(env.Err, "No image registry for this instance, so the Shrike monitor cannot be deployed: deploying FatLine alone.")
-		fprintln(env.Err, "Egress is still enforced and every decision is still logged by FatLine. What is missing is alerting.")
+		return imageDecision{component: components.Shrike, notices: []string{
+			"No image registry for this instance, so the Shrike monitor cannot be deployed: deploying FatLine alone.",
+			"Egress is still enforced and every decision is still logged by FatLine. What is missing is alerting.",
+		}}, nil
+	}
+	return d.sidecar().decideImage(ctx, env, reg, meta)
+}
+
+// realizeSidecarImage is realizeImage for Shrike's decision, where a
+// decision with no action is FatLine deployed alone: no image, and an empty
+// record, which removes Shrike's (recordSystemImage).
+func (d *fatlineDeployer) realizeSidecarImage(ctx context.Context, env *Env, reg *registryAccess, dec imageDecision) (resolvedImage, error) {
+	if dec.action == "" {
 		return resolvedImage{}, nil
 	}
-	sidecar := *d
-	sidecar.component = components.Shrike
-	sidecar.fatlineImage = ""
-	return sidecar.resolveImage(ctx, env, reg, meta)
+	return d.sidecar().realizeImage(ctx, env, reg, dec)
 }
+
+// workloadImages are FatLine's and Shrike's images as connect's and
+// redeploy's plans decide them (ADR 0023 M2.6, A23-34 to A23-36): the
+// registry the plan read, nil for a break-glass plan that deploys FatLine
+// alone; the two decisions; and what deciding them said, in today's words,
+// which a plan carries as notices and every other run prints once, before
+// anything is asked or, under --confirm, right after the comparison
+// (A23-26). Both commands decide, consent to and realize them through the
+// methods below, so they cannot drift on what FatLine's workload runs, and
+// both realize them only after consent: nothing is ensured, pushed or built
+// before the operator, or the plan, said so.
+type workloadImages struct {
+	reg             *registryAccess
+	fatline, shrike imageDecision
+	printed         []string
+}
+
+// decideWorkloadImages decides FatLine's image, then Shrike's, which ships
+// with the boundary, not after it. On an error the images hold what was
+// decided, and said, before it (refusal).
+func (d *fatlineDeployer) decideWorkloadImages(ctx context.Context, env *Env, reg *registryAccess, meta *config.InstanceMetadata) (workloadImages, error) {
+	im := workloadImages{reg: reg}
+	var err error
+	im.fatline, err = d.decideImage(ctx, env, reg, meta)
+	im.printed = append(im.printed, im.fatline.said()...)
+	if err != nil {
+		return im, err
+	}
+	im.shrike, err = d.decideSidecarImage(ctx, env, reg, meta)
+	im.printed = append(im.printed, im.shrike.said()...)
+	return im, err
+}
+
+// writeFacts are FatLine's workload as a plan binds it: rendered for carrier
+// over the images the plan names (a build's placeholder among them) and over
+// mtls, placeholderMTLS's material, so no key is opened (A23-25, A23-30).
+func (im workloadImages) writeFacts(carrier deploy.Carrier, mtls config.MTLSMaterial) ([]plan.Fact, error) {
+	stream, err := renderWorkload(im.fatline.planTarget(), im.shrike.planTarget(), carrier, mtls)
+	if err != nil {
+		return nil, err
+	}
+	return applyFacts(stream)
+}
+
+// imageFacts are the two image facts: FatLine's, then Shrike's. A Shrike
+// decision with no action, FatLine deployed alone, is in no plan that is
+// printed (A23-5).
+func (im workloadImages) imageFacts(meta *config.InstanceMetadata) []plan.Fact {
+	facts := []plan.Fact{im.fatline.imageFact(meta)}
+	if im.shrike.action != "" {
+		facts = append(facts, im.shrike.imageFact(meta))
+	}
+	return facts
+}
+
+// cloudFacts are the registry's cloud facts when the plan read the registry
+// (A23-24): the ensure, then a push for each image that goes into it.
+func (im workloadImages) cloudFacts(meta *config.InstanceMetadata) []plan.Fact {
+	if im.reg == nil {
+		return nil
+	}
+	return registryFacts(meta, im.fatline, im.shrike)
+}
+
+// noticeFacts are what deciding the images said, then the source builds'
+// notices, which only a plan carries (A23-13).
+func (im workloadImages) noticeFacts() []plan.Fact {
+	var facts []plan.Fact
+	for _, line := range im.printed {
+		facts = append(facts, noticeFact(line))
+	}
+	return append(facts, sourceNotices(im.fatline, im.shrike)...)
+}
+
+// skewRefusal is the version-skew refusal either image stands for while
+// --embedded is not given, FatLine's first: an interactive or --yes run
+// returns it before anything is asked (ADR 0023 decision 4; --yes never
+// implies --embedded). Under --confirm the plan's replaces_other_version is
+// the consent, and nothing refuses it (§9.5).
+func (im workloadImages) skewRefusal(embedded bool) error {
+	for _, dec := range []imageDecision{im.fatline, im.shrike} {
+		if skew := dec.skewRefusal(embedded); skew != nil {
+			return skew
+		}
+	}
+	return nil
+}
+
+// say prints, outside a plan, what deciding the images said: FatLine's
+// lines, then Shrike's, each through terminalText, since they carry values
+// from the record and from argv (A23-26). A decision whose version-skew
+// refusal stands ends it with that refusal, its own lines unsaid, as when
+// resolving an image refused the skew before it looked the version tag up:
+// an interactive or --yes run never announces a replacement, or a push over
+// a foreign tag, that it then refuses (ADR 0023 decision 4; --yes never
+// implies --embedded). embedded is --embedded, or true under --confirm,
+// whose plan is the consent to the replacement (§9.5), so there every line
+// prints, right after the comparison.
+func (im workloadImages) say(env *Env, embedded bool) error {
+	for _, dec := range []imageDecision{im.fatline, im.shrike} {
+		if skew := dec.skewRefusal(embedded); skew != nil {
+			return skew
+		}
+		for _, line := range dec.said() {
+			fprintln(env.Err, terminalText(line))
+		}
+	}
+	return nil
+}
+
+// refusal is how an interactive or --yes run refuses a plan it could not
+// make, in the order it always has: what resolving the images said up to a
+// version-skew refusal the decisions hold, which it returns (say); then the
+// error.
+func (im workloadImages) refusal(env *Env, embedded bool, err error) error {
+	if skew := im.say(env, embedded); skew != nil {
+		return skew
+	}
+	return err
+}
+
+// buildConsents asks, in an interactive or --yes run, for each image the
+// plan builds, FatLine's first (confirmBuild). --confirm asks nothing.
+func (d *fatlineDeployer) buildConsents(env *Env, im workloadImages) error {
+	for _, dec := range []imageDecision{im.fatline, im.shrike} {
+		if err := d.buildConsent(env, dec); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// realizeWorkloadImages makes the decisions real, after consent: the
+// registry ensure the plan bound, refused before any push when it fails or
+// answers with another registry (realizeRegistry); then FatLine's image,
+// then Shrike's, pushed or built where the plan said so, and nothing looked
+// up again. It returns what the cluster is told to run and records.
+func (d *fatlineDeployer) realizeWorkloadImages(ctx context.Context, env *Env, name string, meta *config.InstanceMetadata,
+	im workloadImages, m consentMode) (fl, sh resolvedImage, err error) {
+	reg, err := d.realizeRegistry(ctx, env, name, meta, im.reg, m)
+	if err != nil {
+		return resolvedImage{}, resolvedImage{}, err
+	}
+	if fl, err = d.realizeImage(ctx, env, reg, im.fatline); err != nil {
+		return resolvedImage{}, resolvedImage{}, err
+	}
+	if sh, err = d.realizeSidecarImage(ctx, env, reg, im.shrike); err != nil {
+		return resolvedImage{}, resolvedImage{}, err
+	}
+	return fl, sh, nil
+}
+
+// msgBuildYes is confirmBuild's refusal without a terminal and without
+// --yes. A command that has a plan adds consentSuffix (consentFlags.suffix).
+const msgBuildYes = "%s's image would be compiled from %s with this machine's Go and pushed to %s:source-…; pass --yes to build it"
 
 // confirmBuild gates compiling a component's image from source. It is not a
 // cost gate — registry storage is ~$0 (ADR 0007 decision 8) — it is a consent
@@ -941,31 +1578,47 @@ func (d *fatlineDeployer) resolveSidecarImage(ctx context.Context, env *Env, reg
 // should know it is happening, from where, with which Go, and how it is
 // recorded.
 //
-// It is asked only for --source and a source build's fallback. A release
-// farcast pushing the image it carries asks nothing here: that image is part
-// of the executable the operator chose to run.
-func (d *fatlineDeployer) confirmBuild(ctx context.Context, env *Env, repo, source, origin string) (bool, error) {
+// It is asked only for --source and a source build's fallback, from the
+// decision's source: the checkout and the Go that decideBuild found. A
+// release farcast pushing the image it carries asks nothing here: that image
+// is part of the executable the operator chose to run.
+func (d *fatlineDeployer) confirmBuild(env *Env, dec imageDecision) (bool, error) {
 	if d.assumeYes {
 		return true, nil
 	}
-	c := d.component.Name
+	c, source := dec.component.Name, dec.source.dir
 	if !isInteractive(env) {
-		return false, usagef("%s's image would be compiled from %s with this machine's Go and pushed to %s:source-…; pass --yes to build it", c, source, repo)
+		return false, usagef(msgBuildYes+d.consent.suffix(), c, source, dec.repo)
 	}
-	var goLine string
-	if tc, err := image.FindToolchain(ctx, os.Environ(), source); err == nil {
-		goLine = fmt.Sprintf("%s (%s)", tc.Go, tc.Version)
-	} else {
-		goLine = fmt.Sprintf("the Go on PATH, which could not be asked (%v)", err)
+	goLine := fmt.Sprintf("%s (%s)", dec.source.goPath, dec.source.goVersion)
+	if dec.source.goErr != nil {
+		goLine = fmt.Sprintf("the Go on PATH, which could not be asked (%v)", dec.source.goErr)
 	}
 	recorded := "recorded as operator-built: later commands keep it until --embedded or --source"
-	if origin == config.OriginDevelopment {
+	if dec.record.Origin == config.OriginDevelopment {
 		fprintf(env.Err, "This farcast carries no components (a source build), so %s's image is compiled here.\n", c)
 		recorded = "recorded as a development build, which a release farcast replaces"
 	}
 	fprintf(env.Err, "%s's image would be compiled from %s by %s, with no container engine,\n", c, source, goLine)
-	fprintf(env.Err, "pushed to the instance's registry as %s:source-…, and %s.\n", repo, recorded)
+	fprintf(env.Err, "pushed to the instance's registry as %s:source-…, and %s.\n", dec.repo, recorded)
 	return newPrompter(env.In, env.Err).yesNo("Build and push it now?")
+}
+
+// buildConsent is confirmBuild for a decision that builds, and nil for one
+// that does not: a declined build prints "Aborted." and is refused.
+func (d *fatlineDeployer) buildConsent(env *Env, dec imageDecision) error {
+	if !dec.builds() {
+		return nil
+	}
+	ok, err := d.confirmBuild(env, dec)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		fprintln(env.Err, "Aborted.")
+		return fmt.Errorf("building %s's image from %s was declined", dec.component.Name, dec.source.dir)
+	}
+	return nil
 }
 
 // progressTo returns the sink for build progress: stderr while the operator is

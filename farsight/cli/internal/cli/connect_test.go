@@ -10,10 +10,14 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"math/big"
 	"os"
+	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -24,6 +28,7 @@ import (
 	"github.com/sofmon/farcast/farsight/cli/internal/image"
 	"github.com/sofmon/farcast/farsight/cli/internal/oci"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
+	"github.com/sofmon/farcast/farsight/cli/internal/plan"
 	"github.com/sofmon/farcast/fatline"
 	"github.com/sofmon/farcast/fatline/identity"
 	"github.com/sofmon/farcast/fatline/tunnel"
@@ -282,6 +287,7 @@ func testConnect(p planck.Provider, b imageBuilder) *connectCommand {
 	c.findSource = func(string) (string, error) {
 		return "", errors.New("no farcast checkout at or above the working directory")
 	}
+	c.findToolchain = fakeToolchain
 	asRelease(&c.fatlineDeployer, nil)
 	return c
 }
@@ -383,12 +389,17 @@ func installedInstance(t *testing.T, dir config.Dir, name string) *config.Instan
 		t.Fatal(err)
 	}
 	// connect opens the provider from the stored credential to reach the
-	// instance's registry, so an installed instance has one.
-	if err := dir.SaveInstanceCredentials(name, &config.InstanceCredentials{Provider: "gke"}); err != nil {
+	// instance's registry, so an installed instance has one. Its key is a
+	// stand-in no fake reads: a plan refuses a blank one, an install with
+	// Application Default Credentials, before it opens the provider (A23-24).
+	if err := dir.SaveInstanceCredentials(name, &config.InstanceCredentials{Provider: "gke", ServiceAccountKey: standInKey}); err != nil {
 		t.Fatal(err)
 	}
 	return meta
 }
+
+// standInKey is installedInstance's installer key: not blank, and not a key.
+const standInKey = `{"type":"service_account","note":"a stand-in; no test parses it"}`
 
 // connectedInstance is an installed instance that has been through a first
 // connect: its mTLS material exists and its carrier is bound. That is the state
@@ -404,7 +415,7 @@ func connectedInstance(t *testing.T, dir config.Dir, name string) *config.Instan
 		t.Fatal(err)
 	}
 	meta.FatLineDeployed = true
-	meta.Carrier = &config.Carrier{Type: "nlb", Endpoint: "9.9.9.9:8443", ServerName: identity.ServerName(name)}
+	meta.Carrier = &config.Carrier{Type: "nlb", Endpoint: "192.0.2.10:8443", ServerName: identity.ServerName(name)}
 	if err := dir.SaveInstanceMetadata(name, meta); err != nil {
 		t.Fatal(err)
 	}
@@ -547,7 +558,7 @@ func TestConnectReconnectSkipsBootstrap(t *testing.T) {
 	if len(fc.applied) != 0 {
 		t.Fatal("a reconnect must not re-deploy")
 	}
-	if dialed != "https://9.9.9.9:8443" {
+	if dialed != "https://192.0.2.10:8443" {
 		t.Fatalf("dialed=%q, want the stored endpoint", dialed)
 	}
 	// The registry is still re-ensured (ADR 0007), so an instance installed
@@ -839,65 +850,130 @@ func TestConnectRegistryFailureDoesNotBreakReconnect(t *testing.T) {
 	}
 }
 
+// A first deploy needs the instance's registry for its images, so a registry
+// it cannot have stops it before anything is deployed: the ensure an
+// interactive or --yes run makes first when no registry is recorded, and the
+// ensure after consent, the plan's own (ADR 0023 M2.6, A23-24), which is
+// refused with nothing pushed.
 func TestConnectRegistryFailureStopsBootstrap(t *testing.T) {
-	dir := config.Dir(t.TempDir())
-	const name = "prod"
-	installedInstance(t, dir, name)
-
-	fp := &fakeProvider{ensureErr: errors.New("permission denied on artifactregistry.repositories.create")}
-	fc := &fakeCluster{ip: "34.0.0.1"}
-	c := testConnect(fp, &fakeBuilder{})
-	c.assumeYes = true
-	c.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
-	c.dial = func(context.Context, string, tunnel.ClientIdentity) (tunnelConn, error) {
-		t.Fatal("must not dial when the bootstrap has no image source")
-		return nil, nil
-	}
-
-	env, _ := testEnv(dir, output.ModeHuman)
-	err := c.Run(context.Background(), env, []string{name})
-	if err == nil || !strings.Contains(err.Error(), "ensure the image registry") {
-		t.Fatalf("err=%v, want the ensure failure (a first deploy needs the registry)", err)
-	}
-	if len(fc.applied) != 0 {
-		t.Fatal("must not deploy without an image source")
-	}
-	meta, _ := dir.LoadInstanceMetadata(name)
-	if meta.FatLineDeployed {
-		t.Fatal("must not mark deployed when the bootstrap failed")
+	denied := errors.New("permission denied on artifactregistry.repositories.create")
+	for _, tc := range []struct {
+		name string
+		rig  func(t *testing.T) *deployRig
+		want string
+	}{
+		{"no registry recorded, its ensure refused", func(t *testing.T) *deployRig {
+			return newConnectRig(t, recorded(func(m *config.InstanceMetadata) { m.Registry = nil }))
+		}, "ensure the image registry"},
+		{"the registry read, the ensure after consent refused", func(t *testing.T) *deployRig {
+			return newConnectRig(t)
+		}, "ensure the image registry for \"prod\": " + denied.Error() + "; nothing was pushed or deployed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := tc.rig(t)
+			r.fp.ensureErr = denied
+			_, _, err := r.run(t, output.ModeHuman, "--yes")
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err=%v, want %q (a first deploy needs the registry)", err, tc.want)
+			}
+			if len(r.fc.applied) != 0 || len(r.fb.embedded)+len(r.fb.built) != 0 || r.dials != 0 {
+				t.Fatalf("applied %d, pushed %d, built %d and dialled %d without an image source", len(r.fc.applied), len(r.fb.embedded), len(r.fb.built), r.dials)
+			}
+			if r.meta(t).FatLineDeployed {
+				t.Fatal("must not mark deployed when the bootstrap failed")
+			}
+		})
 	}
 }
 
+// --fatline-image names an image the operator vouches for, so outside --plan
+// and --confirm a registry that cannot be read deploys FatLine alone, saying
+// so (the break-glass path): with the ensure an interactive or --yes run
+// makes first refused, and with the registry recorded and its read refused.
+// A plan that read the registry and decided Shrike's image is another thing:
+// its ensure after consent failing refuses the command, with nothing pushed
+// or deployed, in every mode, and no image the plan listed is dropped
+// (A23-5, A23-24).
 func TestConnectExplicitImageSurvivesRegistryFailure(t *testing.T) {
-	dir := config.Dir(t.TempDir())
-	const name = "prod"
-	installedInstance(t, dir, name)
-
-	fp := &fakeProvider{ensureErr: errors.New("permission denied")}
-	fc := &fakeCluster{ip: "34.0.0.1"}
-	c := testConnect(fp, &fakeBuilder{})
-	c.assumeYes = true
-	c.fatlineImage = "registry.example/fatline@sha256:" + strings.Repeat("c", 64)
-	c.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
-	c.dial = connectedDial()
-
-	env, _ := testEnv(dir, output.ModeHuman)
-	if err := c.Run(context.Background(), env, []string{name}); err != nil {
-		t.Fatalf("an operator-supplied image needs no registry: %v", err)
-	}
-	if !bytes.Contains(fc.applied[0], []byte(c.fatlineImage)) {
-		t.Fatalf("deploy did not use the supplied image:\n%s", fc.applied[0])
-	}
-	// This connect deploys FatLine, so it does not claim to deploy nothing
-	// (review finding CON2-2), and it says Shrike is left out.
-	errb := env.Err.(*bytes.Buffer).String()
-	for _, want := range []string{"Warning: ", "--fatline-image names an image this connect neither looks up nor pushes", "deploying FatLine alone"} {
-		if !strings.Contains(errb, want) {
-			t.Errorf("stderr does not say %q:\n%s", want, errb)
+	named := "registry.example/fatline@sha256:" + strings.Repeat("c", 64)
+	unregistered := recorded(func(m *config.InstanceMetadata) { m.Registry = nil })
+	refusingProvider := func(d *fatlineDeployer) {
+		d.openProvider = func(*config.InstanceMetadata, *config.InstanceCredentials) (planck.Provider, error) {
+			return nil, errors.New("permission denied")
 		}
 	}
-	if strings.Contains(errb, "deploys nothing") {
-		t.Errorf("a connect that deploys FatLine said it deploys nothing:\n%s", errb)
+	for _, tc := range []struct {
+		name      string
+		rig       func(t *testing.T) *deployRig
+		configure func(d *fatlineDeployer)
+		mode      output.Mode
+		in        func(t *testing.T) io.Reader
+		flags     []string
+	}{
+		{"--yes, no registry recorded, its ensure refused", func(t *testing.T) *deployRig {
+			return newConnectRig(t, unregistered)
+		}, nil, output.ModeHuman, nil, []string{"--yes"}},
+		{"--yes, the registry's read refused", func(t *testing.T) *deployRig {
+			return newConnectRig(t)
+		}, refusingProvider, output.ModeHuman, nil, []string{"--yes"}},
+		// A resume asks no cost question, and a named FatLine and a Shrike
+		// left out ask no build question: interactive, it asks nothing.
+		{"interactive, no registry recorded, its ensure refused", func(t *testing.T) *deployRig {
+			return newConnectRig(t, unregistered, resumed)
+		}, nil, output.ModeHuman, devNullTerminal, nil},
+		{"interactive, the registry's read refused", func(t *testing.T) *deployRig {
+			return newConnectRig(t, resumed)
+		}, refusingProvider, output.ModeHuman, devNullTerminal, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := tc.rig(t)
+			r.fp.ensureErr = errors.New("permission denied")
+			r.configure = tc.configure
+			r.in = tc.in
+			_, errb, err := r.run(t, tc.mode, append([]string{"--fatline-image", named}, tc.flags...)...)
+			if err != nil {
+				t.Fatalf("an operator-supplied image needs no registry: %v\n%s", err, errb)
+			}
+			if len(r.fc.applied) != 1 || !bytes.Contains(r.fc.applied[0], []byte(named)) || bytes.Contains(r.fc.applied[0], []byte("system/shrike")) {
+				t.Fatalf("deploy did not use the supplied image alone:\n%s", r.fc.applied)
+			}
+			// This connect deploys FatLine, so it does not claim to deploy nothing
+			// (review finding CON2-2), and it says Shrike is left out.
+			for _, want := range []string{"Warning: ", "permission denied", "--fatline-image names an image this connect neither looks up nor pushes", "deploying FatLine alone"} {
+				if !strings.Contains(errb, want) {
+					t.Errorf("stderr does not say %q:\n%s", want, errb)
+				}
+			}
+			if strings.Contains(errb, "deploys nothing") || strings.Contains(errb, "[y/N]") {
+				t.Errorf("a connect that deploys FatLine said it deploys nothing, or asked:\n%s", errb)
+			}
+		})
+	}
+
+	// The plan read the registry and decided Shrike's image; the ensure
+	// after consent then fails. Refused, in --yes and --confirm alike.
+	for _, answer := range []string{"--yes", "--confirm"} {
+		t.Run(answer+", the registry read, the ensure after consent refused", func(t *testing.T) {
+			r := newConnectRig(t)
+			r.fb.resolveFn = notFoundForTags
+			flags := []string{"--fatline-image", named}
+			if answer == "--confirm" {
+				flags = append(flags, "--confirm", r.plan(t, flags...).Digest)
+			} else {
+				flags = append(flags, answer)
+			}
+			r.fp.ensureErr = errors.New("permission denied")
+			_, errb, err := r.run(t, output.ModeJSON, flags...)
+			if err == nil || !strings.HasSuffix(err.Error(), "permission denied; nothing was pushed or deployed") {
+				t.Fatalf("a failed ensure after consent = %v; want it refused, nothing pushed or deployed\n%s", err, errb)
+			}
+			if len(r.fc.applied)+len(r.fb.embedded)+len(r.fb.built)+r.dials != 0 {
+				t.Errorf("applied %d, pushed %d, built %d, dialled %d after the ensure failed", len(r.fc.applied), len(r.fb.embedded), len(r.fb.built), r.dials)
+			}
+			if strings.Contains(errb, "deploying FatLine alone") || r.meta(t).FatLineDeployed {
+				t.Errorf("the plan's Shrike was dropped:\n%s", errb)
+			}
+		})
 	}
 }
 
@@ -1044,7 +1120,7 @@ func TestConnectRefusesToRemintForADeployedInstance(t *testing.T) {
 	const name = "prod"
 	meta := installedInstance(t, dir, name)
 	meta.FatLineDeployed = true
-	meta.Carrier = &config.Carrier{Type: "nlb", Endpoint: "9.9.9.9:8443", ServerName: identity.ServerName(name)}
+	meta.Carrier = &config.Carrier{Type: "nlb", Endpoint: "192.0.2.10:8443", ServerName: identity.ServerName(name)}
 	if err := dir.SaveInstanceMetadata(name, meta); err != nil {
 		t.Fatal(err)
 	} // note: no mTLS material saved
@@ -1193,20 +1269,7 @@ func TestConnectRefusesAnEd25519Store(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, key, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "FarCast Instance CA: " + name},
-		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
-		KeyUsage: x509.KeyUsageCertSign, BasicConstraintsValid: true, IsCA: true,
-	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, key.Public(), key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	mtls.CACertPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	mtls.CACertPEM = ed25519CA(t, name)
 	if err := dir.SaveInstanceMTLS(name, mtls); err != nil {
 		t.Fatal(err)
 	}
@@ -1230,5 +1293,602 @@ func TestConnectRefusesAnEd25519Store(t *testing.T) {
 		if dialled != 0 || len(fc.applied) != 0 {
 			t.Errorf("connect (status %v) dialled %d time(s) and applied %d manifest(s) before refusing", statusOnly, dialled, len(fc.applied))
 		}
+	}
+}
+
+// ed25519CA is an instance CA certificate as a store minted before ADR 0020
+// holds it: Ed25519, which connect and redeploy refuse.
+func ed25519CA(t *testing.T, name string) []byte {
+	t.Helper()
+	_, key, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "FarCast Instance CA: " + name},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+		KeyUsage: x509.KeyUsageCertSign, BasicConstraintsValid: true, IsCA: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, key.Public(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+
+// ADR 0023 M2.6 (review O-2): a first connect decides its identity before
+// it takes the registry, as redeploy does and as connect did before M2.6,
+// so a trust root it refuses (a CA that is not P-256, or a CA certificate
+// it cannot read) refuses it before a record that names no registry is
+// given one: no EnsureRegistry, a Google write, and nothing pushed, built,
+// applied, minted or dialled. In every mode: --yes, and --plan, which
+// would otherwise refuse the record for naming no registry first.
+func TestConnectRefusesItsTrustRootBeforeTheRegistry(t *testing.T) {
+	noRegistry := recorded(func(m *config.InstanceMetadata) { m.Registry = nil })
+	for _, tc := range []struct {
+		trustRoot string
+		edit      rigEdit
+		want      string
+	}{
+		{"an Ed25519 CA", func(t *testing.T, dir config.Dir, meta *config.InstanceMetadata) {
+			withMaterial(t, dir, meta)
+			mtls, err := dir.LoadInstanceMTLS(meta.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mtls.CACertPEM = ed25519CA(t, meta.Name)
+			if err := dir.SaveInstanceMTLS(meta.Name, mtls); err != nil {
+				t.Fatal(err)
+			}
+		}, "ADR 0020"},
+		{"a CA certificate it cannot read", func(t *testing.T, dir config.Dir, meta *config.InstanceMetadata) {
+			if err := os.MkdirAll(filepath.Join(dir.InstancePath(meta.Name), "fatline", "ca.crt"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}, "load identity for"},
+	} {
+		for _, flags := range [][]string{{"--yes"}, {"--plan"}} {
+			t.Run(fmt.Sprintf("%s/%q", tc.trustRoot, flags), func(t *testing.T) {
+				r := newConnectRig(t, noRegistry, tc.edit)
+				before := r.files(t)
+				_, errb, err := r.run(t, output.ModeHuman, flags...)
+				if err == nil || !strings.Contains(err.Error(), tc.want) {
+					t.Fatalf("connect %q over %s = %v; want its refusal naming %q\n%s", flags, tc.trustRoot, err, tc.want, errb)
+				}
+				if len(r.fp.ensured)+len(r.fb.embedded)+len(r.fb.built)+len(r.fc.applied)+r.dials != 0 {
+					t.Errorf("ensured %d, pushed %d, built %d, applied %d and dialled %d before refusing its trust root",
+						len(r.fp.ensured), len(r.fb.embedded), len(r.fb.built), len(r.fc.applied), r.dials)
+				}
+				sameFiles(t, "a refused trust root", before, r.files(t))
+			})
+		}
+	}
+}
+
+// ADR 0023 M2.6: connect's plan, and the commands that deploy FatLine run
+// through --plan and --confirm.
+
+// registeredInstance is installedInstance with its registry recorded, as an
+// install's ensure records it: a plan reads it, and never ensures one.
+func registeredInstance(t *testing.T, dir config.Dir, name string) *config.InstanceMetadata {
+	t.Helper()
+	meta := installedInstance(t, dir, name)
+	recordRegistry(meta, derivedRegistry(registrySpec(meta)))
+	if err := dir.SaveInstanceMetadata(name, meta); err != nil {
+		t.Fatal(err)
+	}
+	return meta
+}
+
+// rigEdit changes a rig's fixture before the command runs.
+type rigEdit func(t *testing.T, dir config.Dir, meta *config.InstanceMetadata)
+
+// recorded is a rigEdit of the record alone.
+func recorded(edit func(*config.InstanceMetadata)) rigEdit {
+	return func(_ *testing.T, _ config.Dir, meta *config.InstanceMetadata) { edit(meta) }
+}
+
+// resumed is a bootstrap that deployed FatLine and stopped before its
+// carrier was recorded: connect resumes it, with no cost question.
+var resumed = recorded(func(m *config.InstanceMetadata) { m.FatLineDeployed, m.Carrier = true, nil })
+
+// withMaterial saves the instance's mTLS material, as a first connect does.
+func withMaterial(t *testing.T, dir config.Dir, meta *config.InstanceMetadata) {
+	t.Helper()
+	mat, err := identity.Mint(meta.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dir.SaveInstanceMTLS(meta.Name, toConfigMTLS(mat)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// reconnected is an instance connected before: its material minted, and
+// its carrier bound.
+func reconnected(t *testing.T, dir config.Dir, meta *config.InstanceMetadata) {
+	withMaterial(t, dir, meta)
+	meta.FatLineDeployed = true
+	meta.Carrier = &config.Carrier{Type: "nlb", Endpoint: "192.0.2.10:8443", ServerName: identity.ServerName(meta.Name)}
+}
+
+// devNullTerminal is stdin as /dev/null, a character device, which
+// isTerminal takes for a terminal: an interactive run whose every question
+// reads a closed input.
+func devNullTerminal(t *testing.T) io.Reader {
+	t.Helper()
+	f, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+	return f
+}
+
+// deployRig is a command that deploys FatLine (connect or redeploy) against
+// a fixture of its own, every seam that would leave this machine a fake,
+// for the tests that drive it through --plan and --confirm: each run is a
+// fresh command, its flags parsed as the router parses them.
+type deployRig struct {
+	name string
+	dir  config.Dir
+	args []string
+	fp   *fakeProvider
+	fb   *fakeBuilder
+	fc   *fakeCluster
+	// writers counts the writer's opens, and dials the carrier's.
+	writers, dials int
+	// cmd is a fresh command wired to the fakes above.
+	cmd func() Command
+	// configure, when set, changes the command's deployer after its flags
+	// are parsed; in, when set, is its stdin (no terminal otherwise);
+	// onWriter, when set, runs as the writer opens: under --confirm, right
+	// after the comparison.
+	configure func(d *fatlineDeployer)
+	in        func(t *testing.T) io.Reader
+	onWriter  func()
+}
+
+// deployRigs are the commands that deploy FatLine, each against an instance
+// it deploys to, changed by edits, for the tests that hold them all to one
+// rule (ADR 0023 M2.6b): connect, on a first deploy, and redeploy.
+func deployRigs() []struct {
+	name string
+	rig  func(t *testing.T, edits ...rigEdit) *deployRig
+} {
+	return []struct {
+		name string
+		rig  func(t *testing.T, edits ...rigEdit) *deployRig
+	}{
+		{"connect", newConnectRig},
+		{"redeploy", newRedeployRig},
+	}
+}
+
+// newRedeployRig is redeploy against "prod", installed with its registry
+// recorded, connected (its material minted, its carrier bound) and changed
+// by edits, as a release farcast carrying the fake components.
+func newRedeployRig(t *testing.T, edits ...rigEdit) *deployRig {
+	t.Helper()
+	dir := config.Dir(t.TempDir())
+	meta := registeredInstance(t, dir, prodName)
+	reconnected(t, dir, meta)
+	for _, edit := range edits {
+		edit(t, dir, meta)
+	}
+	if err := dir.SaveInstanceMetadata(prodName, meta); err != nil {
+		t.Fatal(err)
+	}
+	r := &deployRig{name: "redeploy", dir: dir, args: []string{prodName}, fp: &fakeProvider{}, fb: &fakeBuilder{}, fc: &fakeCluster{}}
+	r.cmd = func() Command {
+		c := testRedeploy(r.fp, r.fb)
+		c.newCluster = func(clusterRef) (clusterApplier, error) {
+			r.writers++
+			if r.onWriter != nil {
+				r.onWriter()
+			}
+			return r.fc, nil
+		}
+		return c
+	}
+	return r
+}
+
+// newConnectRig is connect against "prod", installed with its registry
+// recorded and changed by edits, as a release farcast carrying the fake
+// components.
+func newConnectRig(t *testing.T, edits ...rigEdit) *deployRig {
+	t.Helper()
+	dir := config.Dir(t.TempDir())
+	meta := registeredInstance(t, dir, prodName)
+	for _, edit := range edits {
+		edit(t, dir, meta)
+	}
+	if err := dir.SaveInstanceMetadata(prodName, meta); err != nil {
+		t.Fatal(err)
+	}
+	r := &deployRig{name: "connect", dir: dir, args: []string{prodName}, fp: &fakeProvider{}, fb: &fakeBuilder{}, fc: &fakeCluster{ip: "34.0.0.1"}}
+	r.cmd = func() Command {
+		c := testConnect(r.fp, r.fb)
+		c.newCluster = func(clusterRef) (clusterApplier, error) {
+			r.writers++
+			if r.onWriter != nil {
+				r.onWriter()
+			}
+			return r.fc, nil
+		}
+		c.dial = func(context.Context, string, tunnel.ClientIdentity) (tunnelConn, error) {
+			r.dials++
+			return &fakeConn{st: fatline.ConnStatus{Connected: true}}, nil
+		}
+		return c
+	}
+	return r
+}
+
+// deployerOf is the deployer a command that deploys FatLine embeds.
+func deployerOf(t *testing.T, cmd Command) *fatlineDeployer {
+	t.Helper()
+	switch c := cmd.(type) {
+	case *connectCommand:
+		return &c.fatlineDeployer
+	case *redeployCommand:
+		return &c.fatlineDeployer
+	}
+	t.Fatalf("%T deploys no FatLine", cmd)
+	return nil
+}
+
+// run runs the rig's command once with flags, in mode, and returns what it
+// printed.
+func (r *deployRig) run(t *testing.T, mode output.Mode, flags ...string) (stdout, stderr string, err error) {
+	t.Helper()
+	cmd := withFlags(t, r.cmd(), flags...)
+	if r.configure != nil {
+		r.configure(deployerOf(t, cmd))
+	}
+	env, out, errb := testEnvBoth(r.dir, mode)
+	if r.in != nil {
+		env.In = r.in(t)
+	}
+	err = cmd.Run(t.Context(), env, r.args)
+	return out.String(), errb.String(), err
+}
+
+// plan is the rig's --plan with flags, in JSON, which must succeed and say
+// nothing on stderr.
+func (r *deployRig) plan(t *testing.T, flags ...string) plan.Document {
+	t.Helper()
+	out, errb, err := r.run(t, output.ModeJSON, append(slices.Clone(flags), "--plan")...)
+	if err != nil {
+		t.Fatalf("%s --plan: %v\nstderr: %s", r.name, err, errb)
+	}
+	if errb != "" {
+		t.Errorf("%s --plan wrote on stderr: %q", r.name, errb)
+	}
+	return printedDocument(t, []byte(out))
+}
+
+// meta is the instance's record as the rig's fixture holds it now.
+func (r *deployRig) meta(t *testing.T) *config.InstanceMetadata {
+	t.Helper()
+	meta, err := r.dir.LoadInstanceMetadata(prodName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return meta
+}
+
+// files is every file of the rig's fixture.
+func (r *deployRig) files(t *testing.T) map[string]string {
+	t.Helper()
+	return treeFiles(t, string(r.dir))
+}
+
+// tagOrDigest answers a lookup as fakeBuilder does by default: a digest is
+// itself, and a tag holds the image the fake release carries.
+func tagOrDigest(ref string) (string, error) {
+	if strings.Contains(ref, "@sha256:") {
+		return ref, nil
+	}
+	return pinnedRef(ref, tagDigest), nil
+}
+
+// ADR 0023 M2.6 (A23-35), mutation 75a: a plan that said mint never mints
+// over material that appeared after it was made. The material appears while
+// the plan is recomputed (as the last image is looked up), after the
+// identity was decided: --confirm compares equal, then refuses at the
+// identity's realize step, plan_changed; a --yes run refuses there too, as
+// internal. Nothing is written: the material is the one that appeared,
+// untouched, and nothing is ensured, pushed, applied or recorded.
+func TestConfirmRefusesACAMintedAfterThePlan(t *testing.T) {
+	for _, answer := range []string{"--confirm", "--yes"} {
+		t.Run(answer, func(t *testing.T) {
+			r := newConnectRig(t)
+			var appeared []byte
+			armed := false
+			r.fb.resolveFn = func(ref string) (string, error) {
+				if armed && appeared == nil && strings.Contains(ref, "system/shrike") {
+					mat, err := identity.Mint(prodName)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := r.dir.SaveInstanceMTLS(prodName, toConfigMTLS(mat)); err != nil {
+						t.Fatal(err)
+					}
+					appeared = mat.CACertPEM
+				}
+				return tagOrDigest(ref)
+			}
+			flags := []string{answer}
+			if answer == "--confirm" {
+				doc := r.plan(t)
+				if b := decodedBound(t, doc); !slices.ContainsFunc(b.Facts, func(f plan.Fact) bool {
+					m, ok := f.(plan.MintFact)
+					return ok && m.What == plan.MintInstanceCA
+				}) {
+					t.Fatalf("the plan mints no CA: %s", doc.Bound)
+				}
+				flags = append(flags, doc.Digest)
+			}
+			armed = true
+			_, errb, err := r.run(t, output.ModeJSON, flags...)
+
+			want, kind := fmt.Sprintf(msgMaterialAppeared, prodName), kindInternal
+			if answer == "--confirm" {
+				want, kind = want+"; "+msgPlanAgain, kindPlanChanged
+			}
+			if err == nil || err.Error() != want || kindOf(classified(err)) != kind || exitCodeOf(err) != 1 {
+				t.Fatalf("%s = %v (kind %s); want %q, %s\n%s", answer, err, kindOf(classified(err)), want, kind, errb)
+			}
+			if appeared == nil {
+				t.Fatal("the material never appeared, so this test proved nothing")
+			}
+			got, err := r.dir.LoadInstanceCACert(prodName)
+			if err != nil || !bytes.Equal(got, appeared) {
+				t.Errorf("the CA that appeared was minted over (%v)", err)
+			}
+			if len(r.fp.ensured)+len(r.fb.embedded)+len(r.fb.built)+len(r.fc.applied)+r.dials != 0 {
+				t.Errorf("ensured %d, pushed %d, built %d, applied %d, dialled %d after refusing",
+					len(r.fp.ensured), len(r.fb.embedded), len(r.fb.built), len(r.fc.applied), r.dials)
+			}
+			if r.meta(t).FatLineDeployed {
+				t.Error("a refused connect recorded FatLine as deployed")
+			}
+		})
+	}
+}
+
+// ADR 0023 M2.6 (A23-35), mutation 91f: a reconnect's plan is the registry
+// ensure alone. Under --confirm, an ensure that fails still prints its
+// warning and the connection status, and then fails the command, exit 1,
+// saying so; an interactive or --yes reconnect warns and succeeds. No
+// reconnect opens a writer.
+func TestReconnectConfirmFailsWhenItsEnsureFails(t *testing.T) {
+	denied := errors.New("permission denied on artifactregistry.repositories.create")
+	for _, answer := range []string{"--confirm", "--yes", ""} {
+		t.Run("answer "+answer, func(t *testing.T) {
+			r := newConnectRig(t, reconnected)
+			var flags []string
+			switch answer {
+			case "--confirm":
+				doc := r.plan(t)
+				b := decodedBound(t, doc)
+				want := []plan.Fact{
+					plan.CloudFact{Type: plan.TypeCloud, Service: plan.CloudArtifactRegistry, Action: plan.CloudCreateRepository, Target: repoPrefix(prodName)},
+					plan.CloudFact{Type: plan.TypeCloud, Service: plan.CloudArtifactRegistry, Action: plan.CloudSetPullGrant, Target: repoPrefix(prodName)},
+				}
+				if !reflect.DeepEqual(b.Facts, want) {
+					t.Fatalf("a reconnect's plan binds %#v; want the registry ensure alone", b.Facts)
+				}
+				flags = []string{"--confirm", doc.Digest}
+			case "--yes":
+				flags = []string{"--yes"}
+			}
+			r.fp.ensureErr = denied
+			stdout, errb, err := r.run(t, output.ModeJSON, flags...)
+			if !strings.Contains(errb, "Warning: ensure the image registry for \"prod\": "+denied.Error()) ||
+				!strings.Contains(errb, "Continuing: this connect deploys nothing") {
+				t.Errorf("the reconnect did not warn:\n%s", errb)
+			}
+			if r.dials != 1 || !strings.Contains(stdout, `"connected":true`) {
+				t.Errorf("dialled %d times and printed %q; want the status read and printed", r.dials, stdout)
+			}
+			if r.writers != 0 {
+				t.Errorf("a reconnect opened the writer %d times", r.writers)
+			}
+			if answer != "--confirm" {
+				if err != nil {
+					t.Errorf("a reconnect %q failed for its ensure: %v", answer, err)
+				}
+				return
+			}
+			want := "the registry ensure this plan bound did not succeed: ensure the image registry for \"prod\": " + denied.Error() +
+				"; the connection status above was read, and nothing else was written"
+			if err == nil || err.Error() != want || exitCodeOf(err) != 1 {
+				t.Errorf("--confirm = %v (exit %d); want exit 1, %q", err, exitCodeOf(err), want)
+			}
+		})
+	}
+}
+
+// repoPrefix is an instance's registry as registeredInstance records it.
+func repoPrefix(instance string) string {
+	return "us-central1-docker.pkg.dev/proj-1/farcast-" + instance
+}
+
+// ADR 0023 M2.6 (A23-8): --status dials and reports, and writes nothing, so
+// it has no plan. Beside --plan or --confirm it is a usage error, exit 2,
+// raised before the record or anything else is read, and nothing is dialled.
+func TestConnectStatusHasNoPlan(t *testing.T) {
+	for _, answer := range [][]string{{"--plan"}, {"--confirm", sampleDigest}, {"--confirm=" + sampleDigest}} {
+		t.Run(answer[0], func(t *testing.T) {
+			r := newConnectRig(t, reconnected)
+			before := r.files(t)
+			reads := observeConfigReads(t)
+			stdout, _, err := r.run(t, output.ModeJSON, append([]string{"--status"}, answer...)...)
+			var ue *usageError
+			if !errors.As(err, &ue) || err.Error() != msgStatusHasNoPlan || exitCodeOf(err) != 2 {
+				t.Errorf("--status %q = %v; want the usage error %q", answer, err, msgStatusHasNoPlan)
+			}
+			if got := reads(); len(got) != 0 || stdout != "" || r.dials != 0 {
+				t.Errorf("--status %q read %q, printed %q and dialled %d times before refusing", answer, got, stdout, r.dials)
+			}
+			sameFiles(t, "--status with a plan", before, r.files(t))
+		})
+	}
+	// Through the router, too.
+	r := newConnectRig(t, reconnected)
+	if _, stderr, code := runLine([]string{"farcast", "--config", string(r.dir), "connect", prodName, "--plan", "--status"}); code != 2 ||
+		!strings.Contains(stderr, msgStatusHasNoPlan) {
+		t.Errorf("farcast connect --plan --status: exit %d, %q", code, stderr)
+	}
+}
+
+// connectRefusalsNameThePlan is TestNonInteractiveRefusalsNameThePlan's rows
+// for connect: its cost question and its build question, met with no
+// terminal and no --yes, refuse, exit 2, ending with the route that needs
+// neither. The build question is shared with commands that have no plan yet,
+// and on those it names no plan.
+func connectRefusalsNameThePlan(t *testing.T) {
+	t.Run("the cost", func(t *testing.T) {
+		r := newConnectRig(t)
+		_, _, err := r.run(t, output.ModeHuman)
+		cost := connectCost(r.meta(t))
+		want := fmt.Sprintf(msgConnectCostYes, amount(cost.Standing[0].MonthCents), amount(cost.Standing[1].MonthCents))
+		if err == nil || err.Error() != want || exitCodeOf(err) != 2 || !strings.HasSuffix(want, consentSuffix) {
+			t.Errorf("connect with no terminal = %v (exit %d); want %q", err, exitCodeOf(err), want)
+		}
+	})
+	t.Run("a source build", func(t *testing.T) {
+		r := newConnectRig(t, resumed)
+		r.configure = func(d *fatlineDeployer) { d.findSource = func(dir string) (string, error) { return dir, nil } }
+		_, _, err := r.run(t, output.ModeHuman, "--source", "/work/farcast")
+		want := fmt.Sprintf(msgBuildYes, "fatline", "/work/farcast", repoOf("fatline")) + consentSuffix
+		if err == nil || err.Error() != want || exitCodeOf(err) != 2 {
+			t.Errorf("a source build with no terminal = %v (exit %d); want %q", err, exitCodeOf(err), want)
+		}
+	})
+	t.Run("the build question of a command with no plan", func(t *testing.T) {
+		var d fatlineDeployer
+		d.component = components.TechnoCore
+		d.ensureDefaults()
+		env, _ := testEnv(config.Dir(t.TempDir()), output.ModeHuman)
+		dec := imageDecision{component: components.TechnoCore, action: plan.ImageBuildSource, repo: repoOf("technocore"), source: imageSource{dir: "/work/farcast"}}
+		_, err := d.confirmBuild(env, dec)
+		if want := fmt.Sprintf(msgBuildYes, "technocore", "/work/farcast", repoOf("technocore")); err == nil || err.Error() != want {
+			t.Errorf("kernel deploy's build question with no terminal = %v; want %q, which names no plan", err, want)
+		}
+	})
+}
+
+// ADR 0023 M2.6 (§9.2, A23-34; review M-M26B-MUT-01 and -02): --confirm of
+// a plan that builds from source builds both images from the checkout it
+// bound and asks nothing: no build question, with a terminal or without
+// one, and no refusal asking for --yes. Its plan is the consent to each
+// build.
+func TestConfirmBuildsTheSourceItsPlanBound(t *testing.T) {
+	const source = "/work/farcast"
+	for _, dr := range deployRigs() {
+		for _, stdin := range []string{"no terminal", "a terminal"} {
+			t.Run(dr.name+"/"+stdin, func(t *testing.T) {
+				r := dr.rig(t)
+				r.configure = func(d *fatlineDeployer) { d.findSource = func(dir string) (string, error) { return dir, nil } }
+				doc := r.plan(t, "--source", source)
+				if stdin == "a terminal" {
+					r.in = devNullTerminal
+				}
+				_, errb, err := r.run(t, output.ModeHuman, "--source", source, "--confirm", doc.Digest)
+				if err != nil {
+					t.Fatalf("%s --confirm of a source-build plan: %v\n%s", dr.name, err, errb)
+				}
+				if len(r.fb.built) != 2 || strings.Contains(errb, "Build and push it now?") || strings.Contains(errb, "pass --yes to build it") {
+					t.Errorf("%s --confirm built %d images, want 2, asking nothing; stderr:\n%s", dr.name, len(r.fb.built), errb)
+				}
+				for _, b := range r.fb.built {
+					if b.SourceDir != source {
+						t.Errorf("built from %q, want the checkout the plan bound, %q", b.SourceDir, source)
+					}
+				}
+			})
+		}
+	}
+}
+
+// ADR 0023 M2.6 (A23-24, A23-51 item 1; review M-M26B-MUT-03): a first
+// connect whose registry is recorded asks its cost question before it
+// ensures the registry, a Google write. Unanswered, with no terminal or a
+// closed one, it is refused with nothing ensured, pushed, built or applied.
+func TestConnectAsksBeforeItEnsures(t *testing.T) {
+	for _, stdin := range []string{"no terminal", "a terminal"} {
+		t.Run(stdin, func(t *testing.T) {
+			r := newConnectRig(t)
+			if stdin == "a terminal" {
+				r.in = devNullTerminal
+			}
+			_, errb, err := r.run(t, output.ModeHuman)
+			if err == nil {
+				t.Fatalf("connect with its cost unanswered went on\n%s", errb)
+			}
+			if len(r.fp.ensured)+len(r.fb.embedded)+len(r.fb.built)+len(r.fc.applied) != 0 {
+				t.Errorf("before the cost was answered: ensured %d, pushed %d, built %d, applied %d",
+					len(r.fp.ensured), len(r.fb.embedded), len(r.fb.built), len(r.fc.applied))
+			}
+		})
+	}
+}
+
+// ADR 0023 M2.6 (A23-13, A23-30): a source build's plan binds the checkout's
+// directory and the Go that builds from it, never what the checkout holds,
+// and says so once per checkout. Each image's target, and its push, is the
+// build placeholder. Another Go found when --confirm runs changes the plan,
+// which is refused before anything is built.
+func TestConnectSourcePlanBindsTheDirectoryAndItsGo(t *testing.T) {
+	const source = "/work/farcast"
+	r := newConnectRig(t)
+	checkout := func(d *fatlineDeployer) { d.findSource = func(dir string) (string, error) { return dir, nil } }
+	r.configure = checkout
+	doc := r.plan(t, "--source", source)
+	b := decodedBound(t, doc)
+	var pushes []string
+	images := map[string]plan.ImageFact{}
+	for _, f := range b.Facts {
+		switch f := f.(type) {
+		case plan.ImageFact:
+			images[f.Component] = f
+		case plan.CloudFact:
+			if f.Action == plan.CloudPushImage {
+				pushes = append(pushes, f.Target)
+			}
+		}
+	}
+	var targets []string
+	for _, c := range []string{"fatline", "shrike"} {
+		img := images[c]
+		want := plan.ImageSource{Dir: source, GoPath: "/usr/local/go/bin/go", GoVersion: "go1.27.5"}
+		if img.Action != plan.ImageBuildSource || img.Source == nil || *img.Source != want || img.Target != buildPlaceholder(repoOf(c), c) {
+			t.Errorf("%s's image fact is %+v (source %+v); want a source build of %s with its Go, at the build placeholder", c, img, img.Source, source)
+		}
+		targets = append(targets, img.Target)
+	}
+	if !slices.Equal(pushes, targets) {
+		t.Errorf("the plan pushes %q; want the builds' placeholders %q", pushes, targets)
+	}
+	if got, want := noticesOf(b), []string{fmt.Sprintf(msgSourceBuildNotice, source)}; !slices.Equal(got, want) {
+		t.Errorf("the plan's notices are %q; want %q", got, want)
+	}
+
+	r.configure = func(d *fatlineDeployer) {
+		checkout(d)
+		d.findToolchain = func(context.Context, []string, string) (image.Toolchain, error) {
+			return image.Toolchain{Go: "/opt/go/bin/go", Version: "go1.27.6"}, nil
+		}
+	}
+	_, _, err := r.run(t, output.ModeJSON, "--source", source, "--confirm", doc.Digest)
+	if kindOf(classified(err)) != kindPlanChanged {
+		t.Errorf("--confirm with another Go = %v; want plan_changed", err)
+	}
+	if len(r.fb.built)+len(r.fc.applied)+r.writers != 0 {
+		t.Errorf("built %d, applied %d and opened the writer %d times for a changed plan", len(r.fb.built), len(r.fc.applied), r.writers)
 	}
 }

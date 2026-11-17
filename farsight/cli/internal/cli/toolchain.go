@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
+	"github.com/sofmon/farcast/farsight/cli/internal/plan"
 )
 
 // The two third-party images an instance runs to turn a repository into a
@@ -72,26 +73,59 @@ var (
 // decision 10 wants a reviewed constant; this is how the operator obtains one,
 // and recording it is how they stop being asked.
 func resolveToolchainImage(ctx context.Context, env *Env, meta *config.InstanceMetadata, k toolchainKind, flagValue string, newBuilder func(func(string)) imageBuilder) (string, error) {
-	ref := flagValue
-	if ref == "" && meta.Toolchain != nil {
-		ref = k.get(meta.Toolchain)
+	ref, _, err := resolveToolchainSource(ctx, env, meta, k, flagValue, newBuilder)
+	return ref, err
+}
+
+// resolveToolchainSource is resolveToolchainImage, saying where the image
+// came from as a plan's image action names it (ADR 0023 M2.6, A23-33):
+// plan.ImageNamed for the flag's, plan.ImageRecorded for the one the
+// instance recorded. It reads no credential: a tag is resolved anonymously,
+// and only to be refused.
+func resolveToolchainSource(ctx context.Context, env *Env, meta *config.InstanceMetadata, k toolchainKind, flagValue string,
+	newBuilder func(func(string)) imageBuilder) (ref, source string, err error) {
+	ref, source = flagValue, plan.ImageNamed
+	if ref == "" {
+		ref, source = recordedToolchainImage(meta, k), plan.ImageRecorded
 	}
 	if ref == "" {
-		return "", usagef("%s is required and must be digest-pinned.\n"+
+		return "", "", usagef("%s is required and must be digest-pinned.\n"+
 			"%s.\n"+
 			"Pass that repository with a tag once and this command will report the digest to pin;\n"+
 			"pass the digest and %q remembers it.", k.flag, k.hint, meta.Name)
 	}
 	if isDigestPinned(ref) {
-		return ref, nil
+		return ref, source, nil
 	}
 	b := newBuilder(func(msg string) { fprintf(env.Err, "  %s\n", msg) })
 	pinned, err := b.Resolve(ctx, ref, "", "")
 	if err != nil {
-		return "", fmt.Errorf("resolve the %s image %q: %w", k.what, ref, err)
+		return "", "", fmt.Errorf("resolve the %s image %q: %w", k.what, ref, err)
 	}
-	return "", usagef("%s %q is a tag, not a digest.\nIt resolves today to:\n\n  %s\n\nPass that, and %s",
+	return "", "", usagef("%s %q is a tag, not a digest.\nIt resolves today to:\n\n  %s\n\nPass that, and %s",
 		k.flag, ref, pinned, k.why)
+}
+
+// recordedToolchainImage is the image of kind k the instance recorded, or "".
+func recordedToolchainImage(meta *config.InstanceMetadata, k toolchainKind) string {
+	if meta.Toolchain == nil {
+		return ""
+	}
+	return k.get(meta.Toolchain)
+}
+
+// toolchainImageFact is a toolchain image as a plan binds it (A23-33): the
+// kind (builder or fetcher) as the component, where the image came from
+// (named or recorded), the image, and the one the instance recorded for the
+// kind as what runs today (null when none is recorded). A toolchain image
+// has no Go of its own a plan knows, no source, and is never another farcast
+// version's component.
+func toolchainImageFact(meta *config.InstanceMetadata, k toolchainKind, ref, source string) plan.ImageFact {
+	f := plan.ImageFact{Type: plan.TypeImage, Component: k.what, Action: source, Target: ref}
+	if rec := recordedToolchainImage(meta, k); rec != "" {
+		f.Current = &plan.ImageCurrent{Image: rec}
+	}
+	return f
 }
 
 // recordToolchainImage writes a reviewed digest into the instance's metadata,

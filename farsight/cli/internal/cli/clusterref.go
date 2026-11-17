@@ -154,40 +154,54 @@ func openCluster(r clusterRef) (*cluster.Client, error) {
 }
 
 // writerCredential is openCluster's step 4 for the writer: the installer's
-// service-account key from credentials.yaml (design §3.5, A20-8). That file
-// holds the private key and nothing else of note, so no refusal quotes it: a
-// file that does not parse is named by config.ParseFault's fault and
-// position, never by the YAML library's text, which can echo the source
-// lines; and a key that is not a service-account key keeps kube's text,
-// which names the field and never its value. Each refusal matches
+// service-account key from credentials.yaml (design §3.5, A20-8), read by
+// loadInstallerKey. A key that is not a service-account key keeps kube's
+// text, which names the field and never its value. Each refusal matches
 // errCredentialMissing and sends nothing.
 func writerCredential(r clusterRef) (kube.Credential, error) {
-	name := r.Meta.Name
-	creds, err := r.Dir.LoadInstanceCredentials(name)
+	creds, err := loadInstallerKey(r.Dir, r.Meta.Name)
 	if err != nil {
-		var pe *fs.PathError
-		switch {
-		case errors.Is(err, fs.ErrNotExist):
-			return kube.Credential{}, refuse(errCredentialMissing, "instances/%s/credentials.yaml is missing; this machine holds no installer key for instance %q; nothing was sent", name, name)
-		case errors.As(err, &pe):
-			// The system's error alone: the path is the instance's own.
-			return kube.Credential{}, refuse(errCredentialMissing, "instance %q's credentials.yaml cannot be read (%v); nothing was sent", name, pe.Err)
-		}
-		fault, ok := config.ParseFault(err)
-		if !ok {
-			fault = "a YAML error"
-		}
-		return kube.Credential{}, refuse(errCredentialMissing, "instance %q's credentials.yaml does not parse (%s); nothing was sent", name, fault)
-	}
-	if strings.TrimSpace(creds.ServiceAccountKey) == "" {
-		return kube.Credential{}, refuse(errCredentialMissing, "instance %q was installed without a service-account key (Application Default Credentials), "+
-			"which farcast no longer uses for its cluster (ADR 0023 M2); release it ('farcast release %s') and install a new instance with --credentials", name, name)
+		return kube.Credential{}, err
 	}
 	cred, err := kube.ParseServiceAccountJSON([]byte(creds.ServiceAccountKey))
 	if err != nil {
 		return kube.Credential{}, refuse(errCredentialMissing, "%s", err)
 	}
 	return cred, nil
+}
+
+// loadInstallerKey reads the installer's service-account key from the
+// instance's credentials.yaml, for the writer (writerCredential) and for
+// what a command reads from Google with it (ADR 0023 M2.6, A23-24), so the
+// two refuse with one text. That file holds the private key and nothing
+// else of note, so no refusal quotes it: a file that does not parse is named
+// by config.ParseFault's fault and position, never by the YAML library's
+// text, which can echo the source lines. A missing, unreadable or
+// unparsable file, and a blank key (an instance installed with Application
+// Default Credentials), are each refused with errCredentialMissing, before
+// anything is opened with the key.
+func loadInstallerKey(dir config.Dir, name string) (*config.InstanceCredentials, error) {
+	creds, err := dir.LoadInstanceCredentials(name)
+	if err != nil {
+		var pe *fs.PathError
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+			return nil, refuse(errCredentialMissing, "instances/%s/credentials.yaml is missing; this machine holds no installer key for instance %q; nothing was sent", name, name)
+		case errors.As(err, &pe):
+			// The system's error alone: the path is the instance's own.
+			return nil, refuse(errCredentialMissing, "instance %q's credentials.yaml cannot be read (%v); nothing was sent", name, pe.Err)
+		}
+		fault, ok := config.ParseFault(err)
+		if !ok {
+			fault = "a YAML error"
+		}
+		return nil, refuse(errCredentialMissing, "instance %q's credentials.yaml does not parse (%s); nothing was sent", name, fault)
+	}
+	if strings.TrimSpace(creds.ServiceAccountKey) == "" {
+		return nil, refuse(errCredentialMissing, "instance %q was installed without a service-account key (Application Default Credentials), "+
+			"which farcast no longer uses for its cluster (ADR 0023 M2); release it ('farcast release %s') and install a new instance with --credentials", name, name)
+	}
+	return creds, nil
 }
 
 // readerCredential is openCluster's step 4 for the reader.

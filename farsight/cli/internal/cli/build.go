@@ -10,7 +10,7 @@ import (
 
 	"github.com/sofmon/farcast/farsight/cli/internal/cluster"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
-	"github.com/sofmon/farcast/farsight/cli/internal/kube"
+	"github.com/sofmon/farcast/farsight/cli/internal/plan"
 	pbuild "github.com/sofmon/farcast/planck/build"
 )
 
@@ -38,10 +38,14 @@ type buildCommand struct {
 	builderImage  string
 	tag           string
 	assumeYes     bool
+	// consent is --plan and --confirm <digest> (ADR 0023 M2.6).
+	consent consentFlags
 
 	// Seams, overridable in tests.
 	newCluster func(clusterRef) (jobWaiter, error)
 	newBuilder func(progress func(string)) imageBuilder
+	// now is the clock a printed plan is dated by (generated_at).
+	now func() time.Time
 }
 
 func (*buildCommand) Name() string { return "build" }
@@ -53,7 +57,7 @@ func (*buildCommand) Usage() string {
 	return strings.TrimSpace(`
 Usage: farcast build <instance> --repo <url> --app <name> --builder-image <ref@sha256:…>
                      [--ref <git-ref>] [--containerfile <path>] [--context <subpath>]
-                     [--git-secret <name>] [--tag <tag>] [-y]
+                     [--git-secret <name>] [--tag <tag>] [-y] [--plan | --confirm <digest>]
 
 Build an application's Containerfile into an image in the instance's own
 registry — inside the instance, not on this machine.
@@ -71,6 +75,15 @@ status. Deploying that image pins it by digest.
 An instance with no kernel is refused: the build is a billed Job, and nothing
 would count it against the cost limit.
 
+--plan prints what the build would do, and changes nothing: the build, its
+Job's cost, the builder image (--builder-image's, or the one the instance
+recorded) and the three documents it would apply, with the plan's digest. It
+reads the instance's record, and no cluster and no installer key; a builder
+given by tag is looked up anonymously, as without --plan, only to be refused
+with the digest to pin. --confirm <digest> does exactly the plan with that
+digest, asking nothing, and refuses, having written nothing, if anything it
+binds has changed since; only then does it open the instance's writer.
+
 'farcast run' reads a repository's manifest and builds every application in it;
 this builds one, with its Containerfile given explicitly.`)
 }
@@ -86,6 +99,7 @@ func (c *buildCommand) SetFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.tag, "tag", "", "tag to push (default: the git ref)")
 	fs.BoolVar(&c.assumeYes, "yes", false, "skip the cost confirmation")
 	fs.BoolVar(&c.assumeYes, "y", false, "skip the cost confirmation")
+	c.consent.register(fs)
 }
 
 func (c *buildCommand) ensureDefaults() {
@@ -103,6 +117,104 @@ func (c *buildCommand) ensureDefaults() {
 	if c.newBuilder == nil {
 		c.newBuilder = newBuilderDefault
 	}
+	if c.now == nil {
+		c.now = time.Now
+	}
+}
+
+// msgBuildCostYes is the build's refusal without a terminal and without
+// --yes: its Job's vCPU and MiB, and the two routes that need no terminal.
+const msgBuildCostYes = "building runs a %d vCPU / %d MiB Job in the instance until it finishes or its deadline expires; pass --yes to confirm" + consentSuffix
+
+// costWhatBuild is the build's one-off Job as its cost fact names it.
+const costWhatBuild = "the build Job"
+
+// preparedBuild is every decision a build executes, made once by its plan
+// (ADR 0023 M2.6, A23-37): interactive runs, --yes and --confirm all execute
+// from it.
+type preparedBuild struct {
+	// builder is the Kaniko image, digest-pinned; destination the tagged
+	// reference the build pushes to; manifest the stream it applies.
+	builder     string
+	tag         string
+	destination string
+	manifest    []byte
+	// cost is the build's cost fact, which its question is asked from.
+	cost plan.CostFact
+}
+
+// plan is build's plan (design §9.4, A23-37): the build, its Job's cost
+// against the instance's limit, the builder image as named or recorded, and
+// the three documents the build applies (its ServiceAccount, NetworkPolicy
+// and Job). It reads the record alone; it resolves a builder tag only to
+// refuse it, anonymously, so it makes no Google read until ADR 0023 M2.8's
+// push grant. It reads no cluster and no terminal, and writes nothing. build
+// has no block.
+func (c *buildCommand) plan(ctx context.Context, env *Env, meta *config.InstanceMetadata) (preparedBuild, plan.Bound, error) {
+	b := newBound("build", meta, "none", "")
+	b.Options = sortedOptions([]plan.Option{
+		{Flag: "app", Value: c.app},
+		{Flag: "builder-image", Value: c.builderImage},
+		{Flag: "containerfile", Value: c.containerfile},
+		{Flag: "context", Value: c.contextPath},
+		{Flag: "git-secret", Value: c.gitSecret},
+		{Flag: "ref", Value: c.ref},
+		{Flag: "repo", Value: c.repo},
+		{Flag: "tag", Value: c.tag},
+	})
+
+	builder, source, err := resolveToolchainSource(ctx, env, meta, builderKind, c.builderImage, c.newBuilder)
+	if err != nil {
+		return preparedBuild{}, plan.Bound{}, err
+	}
+	p := preparedBuild{builder: builder, tag: c.tag}
+	deployment := meta.Name
+	if p.tag == "" {
+		p.tag = imageTag(refTag(c.ref))
+	}
+	p.destination = fmt.Sprintf("%s/app/%s/%s:%s", meta.Registry.Prefix, deployment, c.app, p.tag)
+
+	p.manifest, err = pbuild.Render(pbuild.Config{
+		Instance:       meta.Name,
+		Deployment:     deployment,
+		App:            c.app,
+		Builder:        builder,
+		Repo:           c.repo,
+		Ref:            c.ref,
+		Containerfile:  c.containerfile,
+		ContextSubPath: c.contextPath,
+		Destination:    p.destination,
+		GitSecret:      c.gitSecret,
+		EgressHosts:    []string{hostOf(c.repo), hostOf(meta.Registry.Prefix)},
+	})
+	if err != nil {
+		return preparedBuild{}, plan.Bound{}, err
+	}
+	writes, err := applyFacts(p.manifest)
+	if err != nil {
+		return preparedBuild{}, plan.Bound{}, err
+	}
+	p.cost = buildCost(meta)
+	b.Facts = append([]plan.Fact{
+		plan.BuildFact{
+			Type: plan.TypeBuild, Repository: c.repo, Ref: c.ref, App: c.app,
+			Containerfile: c.containerfile, Context: c.contextPath, Tag: p.tag, Destination: p.destination,
+		},
+		p.cost,
+		toolchainImageFact(meta, builderKind, builder, source),
+	}, writes...)
+	return p, b, nil
+}
+
+// buildCost is the build's cost fact (A23-33): its one Job, with the vCPU,
+// MiB and deadline the build renders it with, against the instance's limit;
+// nothing standing; and the instance's floor fully provisioned.
+func buildCost(meta *config.InstanceMetadata) plan.CostFact {
+	f := fullFloorCost(meta)
+	f.OneOff = []plan.OneOffCost{{
+		What: costWhatBuild, Jobs: 1, CPUMilli: pbuild.RequestCPUMilli, MemMiB: pbuild.RequestMemMiB, DeadlineS: pbuild.DeadlineSeconds,
+	}}
+	return f
 }
 
 func (c *buildCommand) Run(ctx context.Context, env *Env, args []string) (err error) {
@@ -111,6 +223,10 @@ func (c *buildCommand) Run(ctx context.Context, env *Env, args []string) (err er
 	defer func() { err = writerRefused(err, meta) }()
 	if len(args) != 1 {
 		return usagef("build takes one instance argument")
+	}
+	mode, given, err := c.consent.mode(c.assumeYes)
+	if err != nil {
+		return err
 	}
 	name := args[0]
 	c.ensureDefaults()
@@ -134,61 +250,47 @@ func (c *buildCommand) Run(ctx context.Context, env *Env, args []string) (err er
 		return err
 	}
 
-	// The writer is opened, and read once, before the builder image is
-	// resolved or pushed and before anything is asked (ADR 0023 M2.5, A20-10
-	// and A20-11): an instance this machine cannot write as is refused with
-	// nothing spent, and an endpoint that refuses the installer's key
-	// refuses it before kubectl applies the build.
-	cl, err := c.newCluster(clusterRef{Dir: env.ConfigDir, Meta: meta, Identity: kube.Writer, Warn: env.Err})
+	// An interactive or --yes run opens the writer, and reads once as it,
+	// before the builder image is resolved and before anything is asked (ADR
+	// 0023 M2.5, A20-10 and A20-11): an instance this machine cannot write as
+	// is refused with nothing spent, and an endpoint that refuses the
+	// installer's key refuses it before kubectl applies the build. --plan
+	// never opens it, and --confirm right after the comparison (A23-23,
+	// A23-37).
+	var cl jobWaiter
+	if mode == consentNone {
+		if cl, err = openReady(ctx, env, meta, c.newCluster); err != nil {
+			return err
+		}
+	}
+
+	p, b, err := c.plan(ctx, env, meta)
 	if err != nil {
 		return err
 	}
-	if err := applyReady(cl); err != nil {
-		return err
+	switch mode {
+	case consentPlan:
+		return printPlan(env, b, c.now())
+	case consentConfirm:
+		if err := confirmPlan(b, given); err != nil {
+			return err
+		}
+		if cl, err = openReady(ctx, env, meta, c.newCluster); err != nil {
+			return err
+		}
+	default:
+		ok, err := c.confirm(env, meta, p)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			fprintln(env.Err, "Aborted.")
+			return nil
+		}
 	}
-	if err := preflightNamespace(ctx, cl); err != nil {
-		return err
-	}
+	deployment, builder, tag, destination := meta.Name, p.builder, p.tag, p.destination
 
-	builder, err := c.resolveBuilder(ctx, env, meta)
-	if err != nil {
-		return err
-	}
-
-	deployment := meta.Name
-	tag := c.tag
-	if tag == "" {
-		tag = imageTag(refTag(c.ref))
-	}
-	destination := fmt.Sprintf("%s/app/%s/%s:%s", meta.Registry.Prefix, deployment, c.app, tag)
-
-	manifest, err := pbuild.Render(pbuild.Config{
-		Instance:       name,
-		Deployment:     deployment,
-		App:            c.app,
-		Builder:        builder,
-		Repo:           c.repo,
-		Ref:            c.ref,
-		Containerfile:  c.containerfile,
-		ContextSubPath: c.contextPath,
-		Destination:    destination,
-		GitSecret:      c.gitSecret,
-		EgressHosts:    []string{hostOf(c.repo), hostOf(meta.Registry.Prefix)},
-	})
-	if err != nil {
-		return err
-	}
-
-	ok, err := c.confirm(env, meta, destination)
-	if err != nil {
-		return err
-	}
-	if !ok {
-		fprintln(env.Err, "Aborted.")
-		return nil
-	}
-
-	if err := cl.Apply(ctx, manifest); err != nil {
+	if err := cl.Apply(ctx, p.manifest); err != nil {
 		return fmt.Errorf("start the build: %w", err)
 	}
 	job := pbuild.JobName(deployment, c.app)
@@ -245,13 +347,6 @@ func (c *buildCommand) Run(ctx context.Context, env *Env, args []string) (err er
 	})
 }
 
-// resolveBuilder settles the Kaniko image, from the flag or from what this
-// instance already recorded. See resolveToolchainImage for why a tag is
-// reported and then refused.
-func (c *buildCommand) resolveBuilder(ctx context.Context, env *Env, meta *config.InstanceMetadata) (string, error) {
-	return resolveToolchainImage(ctx, env, meta, builderKind, c.builderImage, c.newBuilder)
-}
-
 // refTag turns a git ref into something usable as an image tag.
 func refTag(ref string) string {
 	if ref == "" {
@@ -273,17 +368,21 @@ func hostOf(s string) string {
 	return s
 }
 
-func (c *buildCommand) confirm(env *Env, meta *config.InstanceMetadata, destination string) (bool, error) {
+// confirm is the build's cost gate, asked from the plan's cost fact and
+// destination: the Job's requests and deadline, and where it pushes. --yes
+// proceeds; a non-interactive session without --yes is a usage error, which
+// names the plan's route too.
+func (c *buildCommand) confirm(env *Env, meta *config.InstanceMetadata, p preparedBuild) (bool, error) {
 	if c.assumeYes {
 		return true, nil
 	}
+	job := p.cost.OneOff[0]
 	if !isInteractive(env) {
-		return false, usagef("building runs a %d vCPU / %d MiB Job in the instance until it finishes or its deadline expires; pass --yes to confirm",
-			pbuild.RequestCPUMilli/1000, pbuild.RequestMemMiB)
+		return false, usagef(msgBuildCostYes, job.CPUMilli/1000, job.MemMiB)
 	}
 	fprintf(env.Err, "Building inside %q runs a Job requesting %dm CPU and %dMi, bounded by a %d-minute deadline.\n",
-		meta.Name, pbuild.RequestCPUMilli, pbuild.RequestMemMiB, pbuild.DeadlineSeconds/60)
-	fprintf(env.Err, "It pushes to %s.\n", destination)
+		meta.Name, job.CPUMilli, job.MemMiB, job.DeadlineS/60)
+	fprintf(env.Err, "It pushes to %s.\n", p.destination)
 	fprintf(env.Err, "The instance clones the repository itself; this machine never sees the source.\n")
 	return newPrompter(env.In, env.Err).yesNo("Build it?")
 }

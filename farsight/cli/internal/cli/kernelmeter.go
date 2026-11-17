@@ -166,7 +166,7 @@ func (c *kernelMeterCommand) Run(ctx context.Context, env *Env, args []string) (
 	// What the command printed while it worked, once, from the plan
 	// (A23-26).
 	for _, line := range p.printed {
-		fprintln(env.Err, line)
+		fprintln(env.Err, terminalText(line))
 	}
 	if p.noop {
 		return env.Printer.Print(meterResult{Instance: name, Metered: p.next})

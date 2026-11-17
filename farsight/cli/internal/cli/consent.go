@@ -46,6 +46,11 @@ const (
 	confirmUsage = "do exactly what the plan with this digest said, refusing if it has changed"
 )
 
+// msgPlanAgain ends every plan_changed refusal raised after the comparison
+// (A23-16, A24-2): what changed was found only once the confirmed plan ran,
+// so the way on is a new plan.
+const msgPlanAgain = "run the same command with --plan instead of --confirm"
+
 // consentFlags is --plan and --confirm <digest> on one command.
 type consentFlags struct {
 	plan bool
@@ -54,6 +59,10 @@ type consentFlags struct {
 	// rather than no answer.
 	confirm      string
 	confirmGiven bool
+	// registered says register ran: the command has a plan, so a refusal
+	// for want of a terminal that it shares with commands that have none
+	// yet (confirmBuild's) names the plan's route on it alone (suffix).
+	registered bool
 }
 
 // register adds --plan and --confirm to fs. --confirm's callback only stores
@@ -63,11 +72,21 @@ type consentFlags struct {
 // Like BoolVar, it starts both flags from their defaults: no answer.
 func (f *consentFlags) register(fs *flag.FlagSet) {
 	fs.BoolVar(&f.plan, "plan", false, planUsage)
-	f.confirm, f.confirmGiven = "", false
+	f.confirm, f.confirmGiven, f.registered = "", false, true
 	fs.Func("confirm", confirmUsage, func(v string) error {
 		f.confirm, f.confirmGiven = v, true
 		return nil
 	})
+}
+
+// suffix is consentSuffix on a command that has a plan, and "" on one that
+// has none yet: the end of a non-interactive refusal shared by both kinds
+// (A23-16: each part adds the suffix only for the commands it wires).
+func (f *consentFlags) suffix() string {
+	if f.registered {
+		return consentSuffix
+	}
+	return ""
 }
 
 // consentMode is the answer a command was given.
@@ -190,6 +209,19 @@ func planChanged(now, given string) error {
 	return withKind(kindPlanChanged, fmt.Errorf("the plan for this command is now %s, not the %s given to --confirm: "+
 		"something it binds has changed since the plan was made; run it with --plan to review the new one. Nothing was written.",
 		now, given))
+}
+
+// changedAfterPlan is the refusal of a command that finds, after its plan
+// was decided and before it writes what the plan said, that something the
+// plan relied on is no longer so. Under --confirm the plan changed: kind
+// plan_changed, ending with msgPlanAgain. An interactive or --yes run made
+// its plan a moment before and consented to it, not to a digest: internal,
+// with msg alone.
+func changedAfterPlan(m consentMode, msg string) error {
+	if m == consentConfirm {
+		return withKind(kindPlanChanged, errors.New(msg+"; "+msgPlanAgain))
+	}
+	return errors.New(msg)
 }
 
 // refuseBlocked is --confirm's refusal of a plan that carries blocks: the

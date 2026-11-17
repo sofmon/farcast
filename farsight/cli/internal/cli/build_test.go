@@ -3,6 +3,9 @@ package cli
 import (
 	"context"
 	"errors"
+	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -10,7 +13,9 @@ import (
 	"github.com/sofmon/farcast/farsight/cli/internal/cluster"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
+	"github.com/sofmon/farcast/farsight/cli/internal/plan"
 	pbuild "github.com/sofmon/farcast/planck/build"
+	"github.com/sofmon/farcast/technocore/pricing"
 )
 
 const builderDigest = "cgr.dev/chainguard/kaniko@sha256:" +
@@ -323,4 +328,204 @@ func TestBuildWithoutAKernelRefusesBeforeAnythingIsSpent(t *testing.T) {
 	if len(fj.applied) != 0 || len(fb.resolved) != 0 {
 		t.Errorf("build spent before refusing: %d applied, %d resolved", len(fj.applied), len(fb.resolved))
 	}
+}
+
+// buildRefusalNamesThePlan is TestNonInteractiveRefusalsNameThePlan's row
+// for build: its cost question, met with no terminal and no --yes, refuses,
+// exit 2, naming its Job's vCPU and MiB and ending with the route that needs
+// neither; nothing was opened or applied.
+func buildRefusalNamesThePlan(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	meteringInstance(t, dir, "p42")
+	env, _ := testEnv(dir, output.ModeHuman) // stdin is no terminal
+	fj := &fakeJobs{}
+	c := buildCmd(fj)
+	c.assumeYes = false
+	c.repo, c.app, c.builderImage = "https://github.com/example/repo.git", "api", builderDigest
+	err := c.Run(context.Background(), env, []string{"p42"})
+	want := "building runs a 1 vCPU / 2048 MiB Job in the instance until it finishes or its deadline expires; pass --yes to confirm" + consentSuffix
+	if err == nil || err.Error() != want || exitCodeOf(err) != 2 {
+		t.Errorf("build with no terminal = %v (exit %d); want %q", err, exitCodeOf(err), want)
+	}
+	if len(fj.applied) != 0 {
+		t.Errorf("a refused build applied %d streams", len(fj.applied))
+	}
+}
+
+// buildPlanCmd is build with its flags parsed, its builder counting its
+// lookups and its writer counting its opens: the plan's view of build.
+func buildPlanCmd(t *testing.T, fj *fakeJobs, fb *fakeBuilder, opened *int, flags ...string) *buildCommand {
+	t.Helper()
+	c := withFlags(t, &buildCommand{}, flags...)
+	c.newBuilder = func(func(string)) imageBuilder { return fb }
+	c.newCluster = func(clusterRef) (jobWaiter, error) {
+		*opened++
+		return fj, nil
+	}
+	return c
+}
+
+// ADR 0023 M2.6 (A23-37): build's plan binds the build, its Job's cost, the
+// builder image as named or as the instance recorded it, and the three
+// documents it applies, byte for byte as the build renders them; its
+// options are its eight behaviour flags. It reads the record alone: it
+// opens no writer, reads no installer key, looks nothing up for a pinned
+// builder, prints nothing on stderr, and changes no file.
+func TestBuildPlanBindsTheBuildItRuns(t *testing.T) {
+	flags := []string{"--repo", "https://github.com/example/repo.git", "--app", "api", "--ref", "refs/heads/release",
+		"--context", "svc", "--containerfile", "svc/Containerfile", "--git-secret", "repo-cred"}
+	recordedBuilder := "cgr.dev/chainguard/kaniko@sha256:" + strings.Repeat("a", 64)
+	for _, tc := range []struct {
+		name    string
+		flags   []string
+		record  string
+		action  string
+		builder string
+		current *plan.ImageCurrent
+	}{
+		{"a named builder", []string{"--builder-image", builderDigest}, "", plan.ImageNamed, builderDigest, nil},
+		{"a named builder over a recorded one", []string{"--builder-image", builderDigest}, recordedBuilder, plan.ImageNamed, builderDigest,
+			&plan.ImageCurrent{Image: recordedBuilder}},
+		{"a recorded builder", nil, recordedBuilder, plan.ImageRecorded, recordedBuilder, &plan.ImageCurrent{Image: recordedBuilder}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := config.Dir(t.TempDir())
+			meta := meteringInstance(t, dir, "p42")
+			if tc.record != "" {
+				meta.Toolchain = &config.Toolchain{Builder: tc.record}
+				if err := dir.SaveInstanceMetadata("p42", meta); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before := treeFiles(t, string(dir))
+			reads := observeConfigReads(t)
+			fb, opened := &fakeBuilder{}, 0
+			c := buildPlanCmd(t, &fakeJobs{}, fb, &opened, append(append(slices.Clone(flags), tc.flags...), "--plan")...)
+			env, out, errb := testEnvBoth(dir, output.ModeJSON)
+			if err := c.Run(context.Background(), env, []string{"p42"}); err != nil {
+				t.Fatalf("build --plan: %v", err)
+			}
+			b := decodedBound(t, printedDocument(t, out.Bytes()))
+
+			const destination = "us-central1-docker.pkg.dev/proj-1/farcast-p42/app/p42/api:release"
+			stream, err := pbuild.Render(pbuild.Config{
+				Instance: "p42", Deployment: "p42", App: "api", Builder: tc.builder,
+				Repo: "https://github.com/example/repo.git", Ref: "refs/heads/release",
+				Containerfile: "svc/Containerfile", ContextSubPath: "svc", Destination: destination, GitSecret: "repo-cred",
+				EgressHosts: []string{"github.com", "us-central1-docker.pkg.dev"},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			cost := plan.CostFact{
+				Type: plan.TypeCost, Currency: "USD", Period: "monthly", LimitCents: 10000, Standing: []plan.StandingCost{},
+				OneOff:          []plan.OneOffCost{{What: costWhatBuild, Jobs: 1, CPUMilli: 1000, MemMiB: 2048, DeadlineS: 1800}},
+				FloorMonthCents: cents(floorFull(meta).Total), BelowFloor: 100 < floorFull(meta).Total,
+				Pricing: plan.Pricing{Region: pricing.Region, AsOf: pricing.AsOf},
+			}
+			want := append([]plan.Fact{
+				plan.BuildFact{Type: plan.TypeBuild, Repository: "https://github.com/example/repo.git", Ref: "refs/heads/release",
+					App: "api", Containerfile: "svc/Containerfile", Context: "svc", Tag: "release", Destination: destination},
+				cost,
+				plan.ImageFact{Type: plan.TypeImage, Component: "builder", Action: tc.action, Target: tc.builder, Current: tc.current},
+			}, wantWrites(t, stream)...)
+			if !reflect.DeepEqual(b.Facts, want) {
+				t.Errorf("the plan binds\n%#v\nwant\n%#v", b.Facts, want)
+			}
+			if got := writeTargets(b); !slices.Equal(got, []string{"ServiceAccount farcast-system/farcast-builder",
+				"NetworkPolicy farcast-system/build-p42-api", "Job farcast-system/build-p42-api"}) {
+				t.Errorf("the plan writes %q; want the build's three documents", got)
+			}
+			builderFlag := ""
+			if len(tc.flags) > 0 {
+				builderFlag = builderDigest
+			}
+			wantOptions := []plan.Option{{Flag: "app", Value: "api"}, {Flag: "builder-image", Value: builderFlag},
+				{Flag: "containerfile", Value: "svc/Containerfile"}, {Flag: "context", Value: "svc"}, {Flag: "git-secret", Value: "repo-cred"},
+				{Flag: "ref", Value: "refs/heads/release"}, {Flag: "repo", Value: "https://github.com/example/repo.git"}, {Flag: "tag", Value: ""}}
+			if !reflect.DeepEqual(b.Options, wantOptions) || b.Command != "build" || b.ClusterIdentity != "none" || b.Target.SystemNamespaceUID != "" {
+				t.Errorf("the plan is %s, as %s, reading farcast-system %q, with options %+v", b.Command, b.ClusterIdentity, b.Target.SystemNamespaceUID, b.Options)
+			}
+			if opened != 0 || len(fb.resolved)+len(fb.built)+len(fb.embedded) != 0 || errb.Len() != 0 {
+				t.Errorf("the plan opened the writer %d times, looked up %v and said %q", opened, fb.resolved, errb)
+			}
+			for _, p := range reads() {
+				if filepath.Base(p) == "credentials.yaml" {
+					t.Errorf("build --plan read %s", p)
+				}
+			}
+			sameFiles(t, "build --plan", before, treeFiles(t, string(dir)))
+		})
+	}
+}
+
+// ADR 0023 M2.6 (A23-37): build --confirm compares the plan it recomputes
+// with the digest given, and only then opens the writer, runs applyReady and
+// the preflight read, and applies exactly the documents the plan bound, then
+// waits for the Job, asking nothing, with no terminal and no --yes. A plan
+// that changed since (the cost limit, which its cost fact binds) is refused
+// plan_changed with no writer opened and nothing applied.
+func TestBuildConfirmAppliesThePlannedJobAfterTheComparison(t *testing.T) {
+	flags := []string{"--repo", "https://github.com/example/repo.git", "--app", "api", "--builder-image", builderDigest}
+	planOf := func(t *testing.T, dir config.Dir) plan.Document {
+		t.Helper()
+		opened := 0
+		c := buildPlanCmd(t, &fakeJobs{}, &fakeBuilder{}, &opened, append(slices.Clone(flags), "--plan")...)
+		env, out := testEnv(dir, output.ModeJSON)
+		if err := c.Run(context.Background(), env, []string{"p42"}); err != nil {
+			t.Fatal(err)
+		}
+		return printedDocument(t, out.Bytes())
+	}
+
+	t.Run("the same plan", func(t *testing.T) {
+		dir := config.Dir(t.TempDir())
+		meteringInstance(t, dir, "p42")
+		doc := planOf(t, dir)
+		fj, opened := &fakeJobs{result: succeeded("sha256:" + strings.Repeat("c", 64))}, 0
+		c := buildPlanCmd(t, fj, &fakeBuilder{}, &opened, append(slices.Clone(flags), "--confirm", doc.Digest)...)
+		env, out, errb := testEnvBoth(dir, output.ModeHuman) // no terminal, no --yes
+		if err := c.Run(context.Background(), env, []string{"p42"}); err != nil {
+			t.Fatalf("build --confirm: %v\n%s", err, errb)
+		}
+		if opened != 1 || fj.uidReads != 1 || len(fj.applied) != 1 || len(fj.waited) != 1 {
+			t.Fatalf("opened the writer %d times, read %d times, applied %d streams and waited %d times; want each once",
+				opened, fj.uidReads, len(fj.applied), len(fj.waited))
+		}
+		var planned []plan.Fact
+		for _, f := range decodedBound(t, doc).Facts {
+			if w, ok := f.(plan.WriteFact); ok {
+				planned = append(planned, w)
+			}
+		}
+		if got := wantWrites(t, fj.applied[0]); !reflect.DeepEqual(got, planned) {
+			t.Errorf("applied\n%#v\nthe plan bound\n%#v", got, planned)
+		}
+		if strings.Contains(errb.String(), "[y/N]") || !strings.Contains(out.String(), "@sha256:"+strings.Repeat("c", 64)) {
+			t.Errorf("--confirm asked, or printed no pinned result:\n%s%s", errb, out)
+		}
+	})
+	t.Run("a changed plan", func(t *testing.T) {
+		dir := config.Dir(t.TempDir())
+		meteringInstance(t, dir, "p42")
+		doc := planOf(t, dir)
+		if _, err := dir.UpdateInstanceMetadata("p42", func(m *config.InstanceMetadata) error {
+			m.CostLimit.Amount = 75
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		before := treeFiles(t, string(dir))
+		fj, opened := &fakeJobs{}, 0
+		c := buildPlanCmd(t, fj, &fakeBuilder{}, &opened, append(slices.Clone(flags), "--confirm", doc.Digest)...)
+		env, _ := testEnv(dir, output.ModeJSON)
+		err := c.Run(context.Background(), env, []string{"p42"})
+		if kindOf(classified(err)) != kindPlanChanged || exitCodeOf(err) != 1 {
+			t.Fatalf("--confirm of a changed plan = %v; want plan_changed", err)
+		}
+		if opened+len(fj.applied) != 0 {
+			t.Errorf("a changed plan opened the writer %d times and applied %d streams", opened, len(fj.applied))
+		}
+		sameFiles(t, "a changed build plan", before, treeFiles(t, string(dir)))
+	})
 }

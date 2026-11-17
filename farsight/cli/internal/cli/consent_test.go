@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
+	"github.com/sofmon/farcast/farsight/cli/internal/image"
 	"github.com/sofmon/farcast/farsight/cli/internal/kube/kubetest"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
 	"github.com/sofmon/farcast/farsight/cli/internal/plan"
@@ -455,9 +456,10 @@ func TestNoticesPrintOnceInTheCommandsWords(t *testing.T) {
 }
 
 // wiredCommands is every writeCommands row whose fresh flag set defines
-// --plan: the commands wired so far (A23-14). In ADR 0023 M2.6a they are
-// exactly kernel meter, kernel confirm and reader grant; the other eight
-// register no consent flag yet, so --plan is an unknown flag on them.
+// --plan: the commands wired so far (A23-14). ADR 0023 M2.6a wired kernel
+// meter, kernel confirm and reader grant, and M2.6b wires connect, redeploy
+// and build; the other five register no consent flag yet, so --plan is an
+// unknown flag on them.
 func wiredCommands(t *testing.T) []writeCommand {
 	t.Helper()
 	var wired []writeCommand
@@ -474,8 +476,8 @@ func wiredCommands(t *testing.T) []writeCommand {
 			names = append(names, wc.name)
 		}
 	}
-	if want := []string{"kernel meter", "kernel confirm", "reader grant"}; !slices.Equal(names, want) {
-		t.Errorf("the commands with plans are %q; ADR 0023 M2.6a wires %q", names, want)
+	if want := []string{"connect", "redeploy", "build", "kernel meter", "kernel confirm", "reader grant"}; !slices.Equal(names, want) {
+		t.Errorf("the commands with plans are %q; ADR 0023 M2.6a and M2.6b wire %q", names, want)
 	}
 	return wired
 }
@@ -522,13 +524,26 @@ func runDirect(t *testing.T, dir config.Dir, wc writeCommand, extra ...string) (
 // the commands that have plans, through the router (A23-16): every pair and the triple of --plan,
 // --confirm <d> and --yes (or -y) is design §9.2's usage error, exit 2,
 // printing nothing on stdout under -o json and changing no file. --yes -y is
-// one answer, and --yes=false --plan is a plan.
+// one answer, and --yes=false --plan is a plan. connect runs as a first
+// deploy, and redeploy over the material the instance holds, with the
+// deployer's defaults faked, so their plans read a fake registry and their
+// --yes stops at the writer's applyReady, never dialling.
 func consentAnswersOnTheCommands(t *testing.T) {
 	noKubectl(t)
+	fakeDeployDefaults(t)
 	for _, wc := range wiredCommands(t) {
 		t.Run(wc.name, func(t *testing.T) {
 			s := kubetest.New(t)
-			dir, _ := writeInstance(t, s, true)
+			dir, meta := writeInstance(t, s, true)
+			if wc.edit != nil {
+				wc.edit(meta)
+				if err := dir.SaveInstanceMetadata(writeName, meta); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if wc.prepare != nil {
+				wc.prepare(t, dir)
+			}
 			before := treeFiles(t, string(dir))
 			for _, yes := range []string{"--yes", "-y"} {
 				for _, answers := range [][]string{
@@ -599,10 +614,14 @@ func malformedDigestOnTheCommands(t *testing.T) {
 
 // ADR 0023 M2.6 (A23-16): a command that defines --plan never ignores it.
 // --plan beside --yes is the three-way usage error on every one, raised
-// before the command reads its record, so consent.mode runs first.
+// before the command reads its record, so consent.mode runs first; and its
+// help shows both flags on its usage line.
 func TestAPlanFlagIsNeverIgnored(t *testing.T) {
 	for _, wc := range wiredCommands(t) {
 		t.Run(wc.name, func(t *testing.T) {
+			if usage := wc.cmd().Usage(); !strings.Contains(strings.SplitN(usage, "\n\n", 2)[0], "[--plan | --confirm <digest>]") {
+				t.Errorf("%s's usage line does not show --plan and --confirm:\n%s", wc.name, usage)
+			}
 			s := kubetest.New(t)
 			dir, _ := writeInstance(t, s, true)
 			reads := observeConfigReads(t)
@@ -617,6 +636,7 @@ func TestAPlanFlagIsNeverIgnored(t *testing.T) {
 	}
 
 	t.Run("through the router", planFlagThroughTheRouter)
+	t.Run("through the router, a top-level command", planFlagOfATopLevelCommand)
 }
 
 // planFlagThroughTheRouter is TestAPlanFlagIsNeverIgnored's rows through the
@@ -682,17 +702,99 @@ func planFlagThroughTheRouter(t *testing.T) {
 	sameFiles(t, "the plans", before, treeFiles(t, cwd))
 }
 
+// planFlagOfATopLevelCommand is TestAPlanFlagIsNeverIgnored's rows through
+// the router for the top-level commands that have plans (ADR 0023 M2.6b),
+// beside planFlagThroughTheRouter's for the groups: such a command has no
+// sibling whose flags could read its line, so a global flag's value naming
+// another command, before the command or after it, is that flag's value, and
+// the command named plans, its --plan never another's. The config
+// directories are named after the commands: "build" holds an instance not
+// yet connected, and "connect" one connected, with its material.
+func planFlagOfATopLevelCommand(t *testing.T) {
+	// A test binary carries no components, so connect and redeploy plan a
+	// build of a checkout: this one, named by --source, as the directory
+	// the lines run in holds none.
+	checkout, err := image.FindSource("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ran := strayKubectl(t)
+	fakeDeployDefaults(t)
+	cwd := t.TempDir()
+	t.Chdir(cwd)
+	var servers []*kubetest.Server
+	for _, d := range []struct {
+		name string
+		wc   writeCommand
+	}{{"build", writeCommandNamed(t, "connect")}, {"connect", writeCommandNamed(t, "redeploy")}} {
+		s := kubetest.New(t)
+		dir, meta := writeInstance(t, s, true)
+		if d.wc.edit != nil {
+			d.wc.edit(meta)
+			if err := dir.SaveInstanceMetadata(writeName, meta); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if d.wc.prepare != nil {
+			d.wc.prepare(t, dir)
+		}
+		if err := os.Rename(string(dir), filepath.Join(cwd, d.name)); err != nil {
+			t.Fatal(err)
+		}
+		servers = append(servers, s)
+	}
+	before := treeFiles(t, cwd)
+	build := []string{"--repo", "https://github.com/example/repo.git", "--app", "api", "--builder-image", builderDigest}
+	for _, tc := range []struct {
+		line    []string
+		command string
+	}{
+		{[]string{"--config", "build", "connect", writeName, "--source", checkout, "--plan"}, "connect"},
+		{[]string{"connect", "--config", "build", writeName, "--source", checkout, "--plan"}, "connect"},
+		{[]string{"--config", "connect", "redeploy", writeName, "--source", checkout, "--plan"}, "redeploy"},
+		{[]string{"redeploy", writeName, "--config", "connect", "--source", checkout, "--plan"}, "redeploy"},
+		{append([]string{"--config", "connect", "build", writeName, "--plan"}, build...), "build"},
+		{append([]string{"build", writeName, "--config", "connect"}, append(slices.Clone(build), "--plan")...), "build"},
+	} {
+		stdout, stderr, code := runLine(append([]string{"farcast", "-o", "json"}, tc.line...))
+		if code != 0 {
+			t.Errorf("farcast %q: exit %d, %q; want %s's plan", tc.line, code, stderr, tc.command)
+			continue
+		}
+		if b := decodedBound(t, printedDocument(t, []byte(stdout))); b.Command != tc.command || b.Instance != writeName {
+			t.Errorf("farcast %q planned %q of %q; want %s's plan", tc.line, b.Command, b.Instance, tc.command)
+		}
+	}
+	if ran() {
+		t.Error("a plan ran kubectl")
+	}
+	for _, s := range servers {
+		if got := s.Requests(); len(got) != 0 {
+			t.Errorf("a plan sent %d requests", len(got))
+		}
+	}
+	sameFiles(t, "the top-level commands' plans", before, treeFiles(t, cwd))
+}
+
 // ADR 0023 M2.6 (A23-16): a refusal for want of a terminal names the route
-// that needs none, --plan and then --confirm. reader grant's is the one gate
-// among the commands wired so far: kernel meter and kernel confirm ask
-// nothing, so a run without a terminal is not refused (A23-9).
+// that needs none, --plan and then --confirm. The gates among the commands
+// wired so far are reader grant's, connect's (its cost question, and the
+// build question it shares with commands that have no plan yet, which names
+// the route only on the commands that have one), redeploy's (its change
+// question, and that build question) and build's (its cost question):
+// kernel meter and kernel confirm ask nothing, so a run without a terminal
+// is not refused (A23-9).
 func TestNonInteractiveRefusalsNameThePlan(t *testing.T) {
-	gates := map[string]string{"reader grant": msgReaderGrantTerminal}
+	gates := map[string]string{"reader grant": msgReaderGrantTerminal, "connect": msgConnectCostYes,
+		"redeploy": msgRedeployYes, "build": msgBuildCostYes}
 	for name, text := range gates {
 		if !strings.HasSuffix(text, consentSuffix) {
 			t.Errorf("%s's non-interactive refusal %q does not end with %q", name, text, consentSuffix)
 		}
 	}
+	t.Run("connect", connectRefusalsNameThePlan)
+	t.Run("redeploy", redeployRefusalsNameThePlan)
+	t.Run("build", buildRefusalNamesThePlan)
 
 	dir := readerRecordFor(t, grantName, "proj-test1")
 	if _, err := dir.UpdateInstanceMetadata(grantName, func(m *config.InstanceMetadata) error {
@@ -738,10 +840,33 @@ func TestNonInteractiveRefusalsNameThePlan(t *testing.T) {
 // comparison. A plan that writes then stops at the writer's applyReady (this
 // test's PATH holds no kubectl), and one that writes nothing says so and
 // exits 0; a blocked plan prints no line.
+//
+// A row whose command has fakes behind its seams (connect's, redeploy's,
+// build's) cannot run through the router, which sets none: connect's
+// reconnect would dial the carrier. connect runs here as a first deploy
+// instead, and redeploy and build as writeCommands has them, with the
+// deployer's defaults faked; each stops at applyReady and never dials.
 func confirmLineOnTheCommands(t *testing.T) {
 	noKubectl(t)
 	pinPlanClock(t)
+	fakeDeployDefaults(t)
+	var rows []planCommand
+	for _, name := range []string{"connect", "redeploy", "build"} {
+		wc := writeCommandNamed(t, name)
+		var flags []string
+		for _, f := range wc.flags {
+			if f != "--yes" {
+				flags = append(flags, f)
+			}
+		}
+		rows = append(rows, planCommand{name: name, shape: "through the router", args: wc.args, flags: flags, edit: wc.edit, prepare: wc.prepare})
+	}
 	for _, row := range planCommands() {
+		if row.fakes == nil {
+			rows = append(rows, row)
+		}
+	}
+	for _, row := range rows {
 		t.Run(row.String(), func(t *testing.T) {
 			s, dir := planFixture(t, row)
 			wc := writeCommand{name: row.name, args: row.args, flags: row.flags}

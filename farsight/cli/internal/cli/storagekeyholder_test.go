@@ -506,6 +506,7 @@ func testStorageDeploy(fp *fakeProvider, fb *fakeBuilder) *storageDeployCommand 
 	}
 	c.deployer.newBuilder = func(func(string)) imageBuilder { return fb }
 	c.deployer.findSource = func(string) (string, error) { return "/checkouts/farcast", nil }
+	c.deployer.findToolchain = fakeToolchain
 	asRelease(&c.deployer, nil)
 	return c
 }

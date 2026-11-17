@@ -21,12 +21,16 @@ import (
 	"time"
 
 	dsdeploy "github.com/sofmon/farcast/datasphere/deploy"
+	"github.com/sofmon/farcast/farsight/cli/internal/buildinfo"
+	"github.com/sofmon/farcast/farsight/cli/internal/components"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 	"github.com/sofmon/farcast/farsight/cli/internal/kube/kubetest"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
 	"github.com/sofmon/farcast/farsight/cli/internal/plan"
+	fldeploy "github.com/sofmon/farcast/fatline/deploy"
 	"github.com/sofmon/farcast/fatline/identity"
+	"github.com/sofmon/farcast/fatline/tunnel"
 	"github.com/sofmon/farcast/planck"
 	tcdeploy "github.com/sofmon/farcast/technocore/deploy"
 	tkube "github.com/sofmon/farcast/technocore/kube"
@@ -62,7 +66,7 @@ func writeInstance(t *testing.T, s *kubetest.Server, keyed bool) (config.Dir, *c
 	meta.Kernel = &config.Kernel{Deployed: true, Applied: true, Namespaces: []string{tcdeploy.DefaultNamespace}}
 	meta.CostLimit = config.CostLimit{Amount: 100, Currency: "USD", Period: "monthly"}
 	meta.FatLineDeployed = true
-	meta.Carrier = &config.Carrier{Type: "nlb", Endpoint: "9.9.9.9:8443", ServerName: identity.ServerName(writeName)}
+	meta.Carrier = &config.Carrier{Type: "nlb", Endpoint: "192.0.2.10:8443", ServerName: identity.ServerName(writeName)}
 	meta.Keyholder = &config.Keyholder{Deployed: true, Replicas: 2}
 	meta.Storage = &config.Storage{Bucket: "b", Provider: "gcs", Location: "us-central1"}
 	if err := dir.SaveInstanceMetadata(writeName, meta); err != nil {
@@ -102,28 +106,45 @@ type writeCommand struct {
 	// edit changes the fixture's record for a command that needs it
 	// otherwise: connect deploys only into an instance not yet connected.
 	edit func(meta *config.InstanceMetadata)
+	// prepare, when set, writes what the record alone cannot say, for a test
+	// that takes the command as far as its plan: the instance's mTLS
+	// material, which redeploy loads and the fixture does not hold.
+	prepare func(t *testing.T, dir config.Dir)
 }
 
 // writeCommands is the eleven commands that write to an instance's cluster.
 func writeCommands() []writeCommand {
 	return []writeCommand{
-		{"connect", []string{writeName}, nil, func() Command { return newConnectCommand() },
-			func(m *config.InstanceMetadata) { m.FatLineDeployed, m.Carrier = false, nil }},
-		{"redeploy", []string{writeName}, nil, func() Command { return newRedeployCommand() }, nil},
-		{"build", []string{writeName}, []string{"--repo", "https://github.com/example/repo.git", "--app", "api", "--builder-image", builderDigest, "--yes"},
-			func() Command { return &buildCommand{} }, nil},
-		{"run", []string{writeName, "github.com/example/my-platform"}, []string{"--fetcher-image", fetcherDigest, "--builder-image", builderDigest, "--yes"},
-			func() Command { return &runCommand{newKeyholder: noKeyholder} }, nil},
-		{"kernel deploy", []string{writeName}, []string{"--yes"}, func() Command { return &kernelDeployCommand{} }, nil},
-		{"kernel meter", []string{writeName, writeNewNamespace}, nil, func() Command { return &kernelMeterCommand{} }, nil},
-		{"kernel confirm", []string{writeName}, []string{"--amount", "1", "--from", thisMonth(1), "--to", thisMonth(2)},
-			func() Command { return &kernelConfirmCommand{} }, nil},
-		{"storage deploy", []string{writeName}, []string{"--yes"}, func() Command { return &storageDeployCommand{} }, nil},
-		{"storage key pin", []string{writeName}, nil, func() Command { return &keyPinCommand{newKeyholder: noKeyholder} }, nil},
-		{"storage key rotate", []string{writeName}, []string{"--yes"}, func() Command { return &keyRotateCommand{newKeyholder: noKeyholder} }, nil},
-		{"reader grant", []string{writeName}, nil, func() Command {
+		{name: "connect", args: []string{writeName}, cmd: func() Command { return newConnectCommand() },
+			edit: func(m *config.InstanceMetadata) { m.FatLineDeployed, m.Carrier = false, nil }},
+		{name: "redeploy", args: []string{writeName}, cmd: func() Command { return newRedeployCommand() }, prepare: writeMaterial},
+		{name: "build", args: []string{writeName}, flags: []string{"--repo", "https://github.com/example/repo.git", "--app", "api", "--builder-image", builderDigest, "--yes"},
+			cmd: func() Command { return &buildCommand{} }},
+		{name: "run", args: []string{writeName, "github.com/example/my-platform"}, flags: []string{"--fetcher-image", fetcherDigest, "--builder-image", builderDigest, "--yes"},
+			cmd: func() Command { return &runCommand{newKeyholder: noKeyholder} }},
+		{name: "kernel deploy", args: []string{writeName}, flags: []string{"--yes"}, cmd: func() Command { return &kernelDeployCommand{} }},
+		{name: "kernel meter", args: []string{writeName, writeNewNamespace}, cmd: func() Command { return &kernelMeterCommand{} }},
+		{name: "kernel confirm", args: []string{writeName}, flags: []string{"--amount", "1", "--from", thisMonth(1), "--to", thisMonth(2)},
+			cmd: func() Command { return &kernelConfirmCommand{} }},
+		{name: "storage deploy", args: []string{writeName}, flags: []string{"--yes"}, cmd: func() Command { return &storageDeployCommand{} }},
+		{name: "storage key pin", args: []string{writeName}, cmd: func() Command { return &keyPinCommand{newKeyholder: noKeyholder} }},
+		{name: "storage key rotate", args: []string{writeName}, flags: []string{"--yes"}, cmd: func() Command { return &keyRotateCommand{newKeyholder: noKeyholder} }},
+		{name: "reader grant", args: []string{writeName}, cmd: func() Command {
 			return &readerGrantCommand{interactive: func(*Env) bool { return true }}
-		}, nil},
+		}},
+	}
+}
+
+// writeMaterial saves writeInstance's mTLS material, as its first connect
+// minted it.
+func writeMaterial(t *testing.T, dir config.Dir) {
+	t.Helper()
+	mat, err := identity.Mint(writeName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dir.SaveInstanceMTLS(writeName, toConfigMTLS(mat)); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -711,6 +732,71 @@ func TestWritersRefuseAnADCInstanceBeforeAnythingCosts(t *testing.T) {
 			sameFiles(t, name+" on an ADC instance", before, treeFiles(t, string(dir)))
 		})
 	}
+
+	// Under --confirm (ADR 0023 M2.6, A23-23): connect and redeploy read
+	// the registry to plan, so planRegistry refuses the record before any
+	// plan is computed, its blank key read before the provider opens; build
+	// plans with no key, so it compares and refuses at the writer's open.
+	// Either way nothing is minted, ensured, looked up or pushed, nothing is
+	// sent, and no file changes.
+	for _, row := range confirmingPlans(t) {
+		t.Run(row.String()+"/--confirm", func(t *testing.T) {
+			s, dir := planFixtureKeyed(t, row, false)
+			digest := sampleDigest
+			if row.name == "build" {
+				doc, _ := runPlan(t, dir, row, output.ModeJSON)
+				digest = doc.Digest
+			}
+			before := treeFiles(t, string(dir))
+			opened, resolved := row.fakes.opened, len(row.fakes.builder.resolved)
+			cmd := realWriter(t, withFlags(t, row.cmd(), append(slices.Clone(row.flags), "--confirm", digest)...))
+			env, out, errb := testEnvBoth(dir, output.ModeJSON)
+			err := cmd.Run(t.Context(), env, row.args)
+			if !errors.Is(err, errCredentialMissing) || !strings.Contains(err.Error(), msgADCRefused) || kindOf(classified(err)) != kindCredentialMissing {
+				t.Fatalf("%s --confirm on an ADC instance = %v; want the installer key refused, credential_missing", row, err)
+			}
+			if row.fakes.opened != opened || len(row.fakes.builder.resolved) != resolved {
+				t.Errorf("%s --confirm opened the provider %d times and looked up %v before refusing", row, row.fakes.opened-opened, row.fakes.builder.resolved[resolved:])
+			}
+			if f := row.fakes; len(f.provider.ensured)+len(f.builder.built)+len(f.builder.embedded) != 0 {
+				t.Errorf("%s --confirm ensured %d registries, built %d and pushed %d images", row, len(f.provider.ensured), len(f.builder.built), len(f.builder.embedded))
+			}
+			if out.Len()+errb.Len() != 0 || len(s.Requests()) != 0 {
+				t.Errorf("%s --confirm printed %q %q and sent %d requests before refusing", row, out, errb, len(s.Requests()))
+			}
+			sameFiles(t, row.String()+" --confirm on an ADC instance", before, treeFiles(t, string(dir)))
+		})
+	}
+}
+
+// confirmingPlans are the planCommands rows of the commands ADR 0023 M2.6b
+// wires that apply, one per state that confirms into a deploy: connect's
+// first deploy and resume, redeploy, and build.
+func confirmingPlans(t *testing.T) []planCommand {
+	t.Helper()
+	return []planCommand{
+		planCommandNamed(t, "connect", "first deploy"),
+		planCommandNamed(t, "connect", "resume"),
+		planCommandNamed(t, "redeploy", "the carried images"),
+		planCommandNamed(t, "build", "a named builder"),
+	}
+}
+
+// realWriter clears cmd's writing seam, which its planCommands row sets to
+// refuse, so --confirm opens the instance's writer as farcast does.
+func realWriter(t *testing.T, cmd Command) Command {
+	t.Helper()
+	switch c := cmd.(type) {
+	case *connectCommand:
+		c.newCluster = nil
+	case *redeployCommand:
+		c.newCluster = nil
+	case *buildCommand:
+		c.newCluster = nil
+	default:
+		t.Fatalf("%T has no writing seam here", cmd)
+	}
+	return cmd
 }
 
 // ADR 0023 M2.5 (A20-12), mutation 71c: each writing command checks that the
@@ -1048,6 +1134,50 @@ func TestCommandsThatApplyRefuseAMachineThatCannotApply(t *testing.T) {
 			})
 		}
 	}
+
+	// Under --confirm (ADR 0023 M2.6, A23-23): the plan needs no kubectl,
+	// so the command plans and compares, and only then opens the writer,
+	// whose applyReady refuses before anything is minted, ensured, pushed
+	// or sent, and before any kubectl runs.
+	for _, row := range confirmingPlans(t) {
+		for _, lack := range []struct {
+			name  string
+			setup func(t *testing.T, dir config.Dir) (ran func() bool)
+			cause string
+		}{
+			{"no kubectl", func(t *testing.T, _ config.Dir) func() bool {
+				noKubectl(t)
+				return func() bool { return false }
+			}, msgKubectlMissing},
+			{"no kubeconfig", func(t *testing.T, dir config.Dir) func() bool {
+				ran := strayKubectl(t)
+				if err := os.Remove(dir.InstanceKubeconfigPath(writeName)); err != nil {
+					t.Fatal(err)
+				}
+				return ran
+			}, msgNoKubeconfig},
+		} {
+			t.Run(row.String()+"/--confirm/"+lack.name, func(t *testing.T) {
+				s, dir := planFixture(t, row)
+				ran := lack.setup(t, dir)
+				doc, _ := runPlan(t, dir, row, output.ModeJSON)
+				before := treeFiles(t, string(dir))
+				cmd := realWriter(t, withFlags(t, row.cmd(), append(slices.Clone(row.flags), "--confirm", doc.Digest)...))
+				env, _, errb := testEnvBoth(dir, output.ModeJSON)
+				err := cmd.Run(t.Context(), env, row.args)
+				if err == nil || !strings.Contains(err.Error(), msgCannotApply+lack.cause) || kindOf(classified(err)) != kindInternal {
+					t.Fatalf("%s --confirm = %v; want applyReady's refusal after the comparison, %q", row, err, msgCannotApply+lack.cause)
+				}
+				if f := row.fakes; len(f.provider.ensured)+len(f.builder.built)+len(f.builder.embedded) != 0 {
+					t.Errorf("%s --confirm ensured %d registries, built %d and pushed %d images before refusing", row, len(f.provider.ensured), len(f.builder.built), len(f.builder.embedded))
+				}
+				if got := s.Requests(); len(got) != 0 || ran() || errb.Len() != 0 {
+					t.Errorf("%s --confirm sent %d requests, ran kubectl %v and said %q before refusing", row, len(got), ran(), errb)
+				}
+				sameFiles(t, row.String()+" --confirm on a machine that cannot apply", before, treeFiles(t, string(dir)))
+			})
+		}
+	}
 }
 
 // ADR 0023 M2.5 (A20-10, M-F10, mutation o16): storage deploy opens one
@@ -1137,9 +1267,10 @@ func TestRunRaisesThePinThroughItsOwnWriter(t *testing.T) {
 
 // ADR 0023 M2.6: the plans. planCommand is one --plan shape of a command
 // that has a plan, as these tests run it: fresh each time, its flags parsed
-// from flags and --plan, against writeInstance's fixture changed by edit, on
-// a kubetest server it must not reach unless it reads the cluster. Each part
-// of M2.6 adds the rows of the commands it wires (A23-14, A23-49).
+// from flags and --plan, against writeInstance's fixture changed by edit and
+// prepare, on a kubetest server it must not reach unless it reads the
+// cluster. Each part of M2.6 adds the rows of the commands it wires (A23-14,
+// A23-49).
 type planCommand struct {
 	name  string // the command, as writeCommands names it
 	shape string // which of its plans
@@ -1149,9 +1280,27 @@ type planCommand struct {
 	readsCluster bool
 	cmd          func() Command
 	edit         func(meta *config.InstanceMetadata)
+	// prepare, when set, writes what the record alone cannot say: the
+	// instance's mTLS material, for connect's resume and reconnect.
+	prepare func(t *testing.T, dir config.Dir)
+	// fakes are what the row's command reaches the provider, the registry,
+	// the writer and the carrier through, for a command that has those
+	// seams (connect's, redeploy's, and build's builder and writer): a plan
+	// may open the provider, mint the registry's token and look up, and
+	// nothing more. nil for one with none of them.
+	fakes *planFakes
 }
 
 func (p planCommand) String() string { return p.name + "/" + p.shape }
+
+// planFakes are a plan row's fakes, and what its plans asked of them.
+type planFakes struct {
+	provider *fakeProvider
+	builder  *fakeBuilder
+	// opened counts the provider's opens, writers the writer's, and
+	// dialled the carrier's dials.
+	opened, writers, dialled int
+}
 
 // planClock is the clock planCommands' kernel confirm reads, planNow, and
 // planMonth a day of its month: a plan bound to the UTC day must be made and
@@ -1173,10 +1322,45 @@ func pinPlanClock(t *testing.T) {
 	t.Cleanup(func() { deployerNowDefault = saved })
 }
 
+// routerCheckout is the farcast checkout fakeDeployDefaults finds when no
+// --source names one: a test binary carries no components, so a command the
+// router runs builds from it (rule 6), and its plan binds this directory,
+// never the checkout the test happens to run in.
+const routerCheckout = "/work/farcast"
+
+// fakeDeployDefaults makes the deployer's provider, builder, checkout and Go
+// defaults fakes for the rest of the test: for a test that runs connect
+// through the router, which sets no seam of its own, and whose unset seams
+// otherwise refuse (refusingdefaults_test.go). The provider answers as the
+// GKE adapter does, the builder as fakeBuilder, the checkout is --source's
+// directory or routerCheckout, and the Go is fakeToolchain's.
+func fakeDeployDefaults(t *testing.T) (*fakeProvider, *fakeBuilder) {
+	t.Helper()
+	fp, fb := &fakeProvider{}, &fakeBuilder{}
+	savedOpen, savedBuild := openProviderDefault, newBuilderDefault
+	savedSource, savedToolchain := findSourceDefault, findToolchainDefault
+	openProviderDefault = func(*config.InstanceMetadata, *config.InstanceCredentials) (planck.Provider, error) { return fp, nil }
+	newBuilderDefault = func(func(string)) imageBuilder { return fb }
+	findSourceDefault = func(dir string) (string, error) {
+		if dir == "" {
+			return routerCheckout, nil
+		}
+		return dir, nil
+	}
+	findToolchainDefault = fakeToolchain
+	t.Cleanup(func() {
+		openProviderDefault, newBuilderDefault = savedOpen, savedBuild
+		findSourceDefault, findToolchainDefault = savedSource, savedToolchain
+	})
+	return fp, fb
+}
+
 // planCommands is every --plan shape of the commands wired so far: kernel
 // meter, kernel confirm and reader grant (ADR 0023 M2.6a), none of which
-// reads the cluster. kernel confirm reads planClock; through the router,
-// pinPlanClock fixes the same clock.
+// reads the cluster; connect and redeploy (M2.6b), which read none either
+// and read the registry through their fakes; and build (M2.6b), which reads
+// neither the cluster nor Google. kernel confirm reads planClock; through
+// the router, pinPlanClock fixes the same clock.
 func planCommands() []planCommand {
 	meter := func() Command { return &kernelMeterCommand{} }
 	confirm := func() Command {
@@ -1188,14 +1372,90 @@ func planCommands() []planCommand {
 	metering := func(m *config.InstanceMetadata) {
 		m.Kernel.Namespaces = append(m.Kernel.Namespaces, writeNewNamespace)
 	}
+
+	// The deployer of connect and redeploy, a release farcast carrying the
+	// fake components, its every seam a fake that counts.
+	deployer := func(d *fatlineDeployer, f *planFakes) {
+		asRelease(d, nil)
+		d.openProvider = func(*config.InstanceMetadata, *config.InstanceCredentials) (planck.Provider, error) {
+			f.opened++
+			return f.provider, nil
+		}
+		d.newBuilder = func(func(string)) imageBuilder { return f.builder }
+		d.findSource = func(dir string) (string, error) {
+			if dir == "" {
+				return "", errors.New("no farcast checkout at or above the working directory")
+			}
+			return dir, nil
+		}
+		d.findToolchain = fakeToolchain
+		d.newCluster = func(clusterRef) (clusterApplier, error) {
+			f.writers++
+			return nil, errors.New("test: a plan opened the writer")
+		}
+	}
+	connect := func(f *planFakes) func() Command {
+		return func() Command {
+			c := newConnectCommand()
+			deployer(&c.fatlineDeployer, f)
+			c.dial = func(context.Context, string, tunnel.ClientIdentity) (tunnelConn, error) {
+				f.dialled++
+				return nil, errors.New("test: a plan dialled the carrier")
+			}
+			return c
+		}
+	}
+	redeploy := func(f *planFakes) func() Command {
+		return func() Command {
+			c := newRedeployCommand()
+			deployer(&c.fatlineDeployer, f)
+			return c
+		}
+	}
+	// build, its builder a fake that counts, and its writer refused.
+	build := func(f *planFakes) func() Command {
+		return func() Command {
+			c := &buildCommand{}
+			c.newBuilder = func(func(string)) imageBuilder { return f.builder }
+			c.newCluster = func(clusterRef) (jobWaiter, error) {
+				f.writers++
+				return nil, errors.New("test: a plan opened the writer")
+			}
+			return c
+		}
+	}
+	fakes := func(resolve func(string) (string, error)) *planFakes {
+		return &planFakes{provider: &fakeProvider{}, builder: &fakeBuilder{resolveFn: resolve}}
+	}
+	firstDeploy := func(m *config.InstanceMetadata) { m.FatLineDeployed, m.Carrier = false, nil }
+	resume := func(m *config.InstanceMetadata) { m.Carrier = nil }
+	builderRecorded := func(m *config.InstanceMetadata) { m.Toolchain = &config.Toolchain{Builder: builderDigest} }
+	buildFlags := []string{"--repo", "https://github.com/example/repo.git", "--app", "api"}
+	first, resumed, lost, again, source := fakes(notFoundForTags), fakes(nil), fakes(nil), fakes(nil), fakes(nil)
+	redeployed, rebuilt, named, recordedBuilder := fakes(notFoundForTags), fakes(nil), fakes(nil), fakes(nil)
+
 	return []planCommand{
-		{"kernel meter", "add", []string{writeName, writeNewNamespace}, nil, false, meter, nil},
-		{"kernel meter", "remove", []string{writeName, writeNewNamespace}, []string{"--remove"}, false, meter, metering},
-		{"kernel meter", "already metered", []string{writeName, writeNewNamespace}, nil, false, meter, metering},
-		{"kernel confirm", "a window", []string{writeName}, []string{"--amount", "1.25", "--from", planMonth(1), "--to", planMonth(2)}, false, confirm, nil},
-		{"kernel confirm", "an empty window", []string{writeName}, []string{"--amount", "0", "--from", planMonth(2), "--to", planMonth(2)}, false, confirm, nil},
-		{"reader grant", "a recorded reader", []string{writeName}, nil, false, grant, nil},
-		{"reader grant", "no reader", []string{writeName}, nil, false, grant, func(m *config.InstanceMetadata) { m.Reader = nil }},
+		{name: "kernel meter", shape: "add", args: []string{writeName, writeNewNamespace}, cmd: meter},
+		{name: "kernel meter", shape: "remove", args: []string{writeName, writeNewNamespace}, flags: []string{"--remove"}, cmd: meter, edit: metering},
+		{name: "kernel meter", shape: "already metered", args: []string{writeName, writeNewNamespace}, cmd: meter, edit: metering},
+		{name: "kernel confirm", shape: "a window", args: []string{writeName}, flags: []string{"--amount", "1.25", "--from", planMonth(1), "--to", planMonth(2)}, cmd: confirm},
+		{name: "kernel confirm", shape: "an empty window", args: []string{writeName}, flags: []string{"--amount", "0", "--from", planMonth(2), "--to", planMonth(2)}, cmd: confirm},
+		{name: "reader grant", shape: "a recorded reader", args: []string{writeName}, cmd: grant},
+		{name: "reader grant", shape: "no reader", args: []string{writeName}, cmd: grant, edit: func(m *config.InstanceMetadata) { m.Reader = nil }},
+		// A first deploy mints the instance's material and pushes the
+		// carried images, whose version tags the registry lacks.
+		{name: "connect", shape: "first deploy", args: []string{writeName}, cmd: connect(first), edit: firstDeploy, fakes: first},
+		{name: "connect", shape: "resume", args: []string{writeName}, cmd: connect(resumed), edit: resume, prepare: writeMaterial, fakes: resumed},
+		{name: "connect", shape: "resume, its material lost", args: []string{writeName}, cmd: connect(lost), edit: resume, fakes: lost},
+		{name: "connect", shape: "reconnect", args: []string{writeName}, cmd: connect(again), prepare: writeMaterial, fakes: again},
+		{name: "connect", shape: "a source build", args: []string{writeName}, flags: []string{"--source", "/work/farcast"}, cmd: connect(source), edit: firstDeploy, fakes: source},
+		// A redeploy pushes the carried images, whose version tags the
+		// registry lacks, over the material the instance holds.
+		{name: "redeploy", shape: "the carried images", args: []string{writeName}, cmd: redeploy(redeployed), prepare: writeMaterial, fakes: redeployed},
+		{name: "redeploy", shape: "a source build", args: []string{writeName}, flags: []string{"--source", "/work/farcast"}, cmd: redeploy(rebuilt), prepare: writeMaterial, fakes: rebuilt},
+		{name: "build", shape: "a named builder", args: []string{writeName}, flags: append(slices.Clone(buildFlags), "--builder-image", builderDigest), cmd: build(named), fakes: named},
+		{name: "build", shape: "a recorded builder", args: []string{writeName}, flags: append(slices.Clone(buildFlags), "--ref", "refs/tags/v2", "--context", "svc", "--containerfile", "svc/Containerfile"),
+			cmd: build(recordedBuilder), edit: builderRecorded, fakes: recordedBuilder},
 	}
 }
 
@@ -1211,16 +1471,27 @@ func planCommandNamed(t *testing.T, name, shape string) planCommand {
 	return planCommand{}
 }
 
-// planFixture is writeInstance, keyed, changed by row's edit.
+// planFixture is writeInstance, keyed, changed by row's edit and prepare.
 func planFixture(t *testing.T, row planCommand) (*kubetest.Server, config.Dir) {
 	t.Helper()
+	return planFixtureKeyed(t, row, true)
+}
+
+// planFixtureKeyed is planFixture, its credentials.yaml holding the
+// installer's key when keyed, and as an install with Application Default
+// Credentials wrote it otherwise.
+func planFixtureKeyed(t *testing.T, row planCommand, keyed bool) (*kubetest.Server, config.Dir) {
+	t.Helper()
 	s := kubetest.New(t)
-	dir, meta := writeInstance(t, s, true)
+	dir, meta := writeInstance(t, s, keyed)
 	if row.edit != nil {
 		row.edit(meta)
 		if err := dir.SaveInstanceMetadata(writeName, meta); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if row.prepare != nil {
+		row.prepare(t, dir)
 	}
 	return s, dir
 }
@@ -1374,16 +1645,38 @@ func writeTargets(b plan.Bound) []string {
 // ADR 0023 M2.6 (rows 72, 73): --plan writes nothing. Every shape, in both
 // modes, leaves the config directory byte for byte as it was, reaches the
 // cluster only with GETs as its reader if it reads it at all (and not at all
-// if not), and runs no kubectl.
+// if not), and runs no kubectl. A command with a provider, a registry or a
+// builder (connect's, redeploy's, build's) ensures and deletes no registry,
+// builds and pushes no image (its token and lookups are reads), opens no
+// writer and dials nothing.
 func TestPlansWriteNothing(t *testing.T) {
 	ran := strayKubectl(t)
 	for _, row := range planCommands() {
 		t.Run(row.String(), func(t *testing.T) {
 			s, dir := planFixture(t, row)
 			before := treeFiles(t, string(dir))
+			reads := observeConfigReads(t)
 			runPlan(t, dir, row, output.ModeJSON)
 			runPlan(t, dir, row, output.ModeHuman)
 			sameFiles(t, row.String()+" --plan", before, treeFiles(t, string(dir)))
+			for _, p := range reads() {
+				// A plan opens no private key (A23-25): the CA's, FatLine's
+				// server key, or the operator's.
+				if base := filepath.Base(p); base == "ca.key" || base == "server.key" || base == "client.key" {
+					t.Errorf("%s --plan read %s", row, p)
+				}
+			}
+			if f := row.fakes; f != nil {
+				if len(f.provider.ensured)+len(f.provider.regDeleted) != 0 {
+					t.Errorf("%s --plan ensured %d registries and deleted %d", row, len(f.provider.ensured), len(f.provider.regDeleted))
+				}
+				if len(f.builder.built)+len(f.builder.embedded) != 0 {
+					t.Errorf("%s --plan built %d images and pushed %d", row, len(f.builder.built), len(f.builder.embedded))
+				}
+				if f.writers+f.dialled != 0 {
+					t.Errorf("%s --plan opened the writer %d times and dialled %d", row, f.writers, f.dialled)
+				}
+			}
 			reqs := s.Requests()
 			if !row.readsCluster && len(reqs) != 0 {
 				t.Errorf("%s --plan reads no cluster, and sent %d requests", row, len(reqs))
@@ -1470,16 +1763,82 @@ func TestPlanIsDeterministic(t *testing.T) {
 	})
 }
 
-// ADR 0023 M2.6 (A23-24, §7.3): which plans read the installer's key, the
-// one credential that writes. In M2.6 a plan reads it only for the registry,
-// and kernel meter's, kernel confirm's and reader grant's plans have none:
-// none reads credentials.yaml. The read group arrives with the commands that
-// push images (M2.6b).
+// ADR 0023 M2.6 (A23-33, A23-35; review M-M26B-MUT-04 and -05): connect's
+// facts follow its state. Only a first deploy binds the cost, which only it
+// asks; mints come only when this machine holds no material; and a resume
+// that mints over the FatLine deployed binds a restart of FatLine, right
+// after the mints, the one fact of its plan that says FatLine's pods roll.
+func TestConnectPlanFactsFollowItsState(t *testing.T) {
+	for _, tc := range []struct {
+		shape                  string
+		cost, mints, restarted bool
+	}{
+		{"first deploy", true, true, false},
+		{"resume", false, false, false},
+		{"resume, its material lost", false, true, true},
+	} {
+		t.Run(tc.shape, func(t *testing.T) {
+			row := planCommandNamed(t, "connect", tc.shape)
+			_, dir := planFixture(t, row)
+			doc, _ := runPlan(t, dir, row, output.ModeJSON)
+			b := decodedBound(t, doc)
+			costs := 0
+			var mints []string
+			restartAt, lastMint := -1, -1
+			for i, f := range b.Facts {
+				switch f := f.(type) {
+				case plan.CostFact:
+					costs++
+				case plan.MintFact:
+					mints = append(mints, f.What)
+					lastMint = i
+				case plan.RestartFact:
+					if f.Component == components.FatLine.Name && f.Because == plan.RestartBecause {
+						restartAt = i
+					}
+				}
+			}
+			var wantMints []string
+			if tc.mints {
+				wantMints = []string{plan.MintInstanceCA, plan.MintFatLineLeaf, plan.MintOperatorLeaf}
+			}
+			wantCosts := 0
+			if tc.cost {
+				wantCosts = 1
+			}
+			if costs != wantCosts || !slices.Equal(mints, wantMints) || (restartAt >= 0) != tc.restarted || (tc.restarted && restartAt != lastMint+1) {
+				t.Errorf("connect %s binds %d costs, mints %q and a restart at %d (the last mint at %d); want %d costs, mints %q, a restart %v right after them",
+					tc.shape, costs, mints, restartAt, lastMint, wantCosts, wantMints, tc.restarted)
+			}
+		})
+	}
+}
+
+// ADR 0023 M2.6 (A23-24, §7.3), mutation 73a: which plans read the
+// installer's key, the one credential that writes. In M2.6 a plan reads it
+// only for the registry: connect's first deploy and resume, and redeploy,
+// read it; connect's reconnect, build (which resolves a builder tag only
+// anonymously, to refuse it, until M2.8's push grant), and kernel meter's,
+// kernel confirm's and reader grant's plans, have no registry read, and
+// none reads credentials.yaml. A plan of the read group on an instance
+// installed without a key (Application Default Credentials) is refused
+// credential_missing, before the provider opens.
 func TestPlansStillReadTheInstallerKeyForGoogle(t *testing.T) {
-	readsKey := map[string]bool{"kernel meter": false, "kernel confirm": false, "reader grant": false}
+	// By command, or by command/shape where its shapes differ.
+	readsKey := map[string]bool{
+		"kernel meter": false, "kernel confirm": false, "reader grant": false,
+		"connect": true, "connect/reconnect": false, "redeploy": true, "build": false,
+	}
+	groupOf := func(row planCommand) (bool, bool) {
+		if want, ok := readsKey[row.String()]; ok {
+			return want, true
+		}
+		want, ok := readsKey[row.name]
+		return want, ok
+	}
 	for _, row := range planCommands() {
 		t.Run(row.String(), func(t *testing.T) {
-			want, ok := readsKey[row.name]
+			want, ok := groupOf(row)
 			if !ok {
 				t.Fatalf("%s is in no group: say whether its plan reads the installer's key", row.name)
 			}
@@ -1490,16 +1849,35 @@ func TestPlansStillReadTheInstallerKeyForGoogle(t *testing.T) {
 			if got != want {
 				t.Errorf("%s --plan read credentials.yaml: %v, want %v (%q)", row, got, want, reads())
 			}
+			if !want {
+				return
+			}
+			t.Run("an install without a key", func(t *testing.T) {
+				_, dir := planFixtureKeyed(t, row, false)
+				opened := row.fakes.opened
+				cmd := withFlags(t, row.cmd(), append(slices.Clone(row.flags), "--plan")...)
+				env, out, _ := testEnvBoth(dir, output.ModeJSON)
+				err := cmd.Run(t.Context(), env, row.args)
+				if !errors.Is(err, errCredentialMissing) || !strings.Contains(err.Error(), msgADCRefused) || kindOf(classified(err)) != kindCredentialMissing {
+					t.Errorf("%s --plan on an ADC install = %v; want the installer key refused, credential_missing", row, err)
+				}
+				if row.fakes.opened != opened || out.Len() != 0 {
+					t.Errorf("%s --plan on an ADC install opened the provider %d times, and printed %q", row, row.fakes.opened-opened, out)
+				}
+			})
 		})
 	}
 }
 
-// ADR 0023 M2.6 (A23-26): under --plan, a line a command prints while it
-// works is a notice fact and is not printed; outside a plan it is printed
-// once, in the same words. Rows for meteredReader's warning, kernel meter's
-// no-op and kernel confirm's empty window. (M2.6b and M2.6c add keepingNote
-// and rotationScopeWarning.)
+// ADR 0023 M2.6 (A23-26), mutation 91a: under --plan, a line a command
+// prints while it works is a notice fact and is not printed; outside a plan
+// it is printed once, in the same words. Rows for meteredReader's warning,
+// kernel meter's no-op, kernel confirm's empty window, and connect's and
+// redeploy's keepingNote. (M2.6c adds rotationScopeWarning.)
 func TestPlanPrintsNoticesOnlyAsFacts(t *testing.T) {
+	keeper := fatlineDeployer{component: components.FatLine, carried: newFakeCarried()}
+	kept := config.SystemImage{Image: imageIn("fatline", "a"), Origin: config.OriginOperator, Go: "go1.27.5",
+		Farcast: "v0.8.0", BuiltAt: testBuiltAt, Source: "/home/op/farcast"}
 	for _, row := range []struct {
 		name  string
 		setup func(t *testing.T, dir config.Dir) (cmd func(flags ...string) Command, args []string)
@@ -1522,6 +1900,40 @@ func TestPlanPrintsNoticesOnlyAsFacts(t *testing.T) {
 				return withFlags(t, confirmCmd(&fakeCluster{}), append([]string{"--amount", "1", "--from", thisMonth(3), "--to", thisMonth(3)}, flags...)...)
 			}, []string{"p41"}
 		}, "Nothing to confirm: the window from " + thisMonth(3) + " to " + thisMonth(3) + " is empty."},
+		// A resume asks no cost question, and a kept image no build
+		// question: outside a plan it deploys, unasked.
+		{"connect's keepingNote", func(t *testing.T, dir config.Dir) (func(...string) Command, []string) {
+			meta := registeredInstance(t, dir, prodName)
+			operatorRecorded(meta)
+			meta.FatLineDeployed = true
+			if err := dir.SaveInstanceMetadata(prodName, meta); err != nil {
+				t.Fatal(err)
+			}
+			return func(flags ...string) Command {
+				c := testConnect(&fakeProvider{}, &fakeBuilder{})
+				c.newCluster = func(clusterRef) (clusterApplier, error) { return &fakeCluster{ip: "34.0.0.1"}, nil }
+				c.dial = connectedDial()
+				return withFlags(t, c, flags...)
+			}, []string{prodName}
+		}, keeper.keepingNote(kept)},
+		// Outside a plan, redeploy asks about the change, so its run there
+		// answers with --yes; it asks no build question for a kept image.
+		{"redeploy's keepingNote", func(t *testing.T, dir config.Dir) (func(...string) Command, []string) {
+			meta := registeredInstance(t, dir, prodName)
+			operatorRecorded(meta)
+			reconnected(t, dir, meta)
+			if err := dir.SaveInstanceMetadata(prodName, meta); err != nil {
+				t.Fatal(err)
+			}
+			return func(flags ...string) Command {
+				if len(flags) == 0 {
+					flags = []string{"--yes"}
+				}
+				c := testRedeploy(&fakeProvider{}, &fakeBuilder{})
+				c.newCluster = func(clusterRef) (clusterApplier, error) { return &fakeCluster{}, nil }
+				return withFlags(t, c, flags...)
+			}, []string{prodName}
+		}, keeper.keepingNote(kept)},
 	} {
 		t.Run(row.name, func(t *testing.T) {
 			dir := config.Dir(t.TempDir())
@@ -1548,6 +1960,474 @@ func TestPlanPrintsNoticesOnlyAsFacts(t *testing.T) {
 			}
 			if got := strings.Count(errb.String(), row.want+"\n"); got != 1 {
 				t.Errorf("outside a plan the line is printed %d times; want once:\n%s", got, errb)
+			}
+		})
+	}
+}
+
+// adcInstall is an instance installed with Application Default Credentials:
+// a credentials.yaml with a provider and no key.
+func adcInstall(t *testing.T, dir config.Dir, meta *config.InstanceMetadata) {
+	t.Helper()
+	if err := dir.SaveInstanceCredentials(meta.Name, &config.InstanceCredentials{Provider: "gke"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// ADR 0023 M2.6 (A23-5, D1), mutation 91b: no plan deploys FatLine without
+// its Shrike monitor. With --fatline-image and no --embedded, under --plan
+// and --confirm, a registry that cannot be read refuses the command before
+// any plan is computed, in each way it can fail, with A23-5's text and the
+// failure's own kind: nothing is printed, read past the failure, written,
+// ensured, looked up, opened or dialled. The break-glass path, FatLine
+// alone, stays an interactive or --yes act
+// (TestConnectExplicitImageSurvivesRegistryFailure).
+func TestPlanNeverDeploysFatLineWithoutShrike(t *testing.T) {
+	named := "registry.example/fatline@" + sha("c")
+	for _, cause := range []struct {
+		name      string
+		edit      rigEdit
+		configure func(d *fatlineDeployer)
+		kind      string
+	}{
+		{"no registry recorded", recorded(func(m *config.InstanceMetadata) { m.Registry = nil }), nil, kindInternal},
+		{"an install without a key", adcInstall, nil, kindCredentialMissing},
+		{"the provider refused", nil, func(d *fatlineDeployer) {
+			d.openProvider = func(*config.InstanceMetadata, *config.InstanceCredentials) (planck.Provider, error) {
+				return nil, errors.New("permission denied")
+			}
+		}, kindInternal},
+		{"a provider with no registry", nil, func(d *fatlineDeployer) {
+			d.openProvider = func(*config.InstanceMetadata, *config.InstanceCredentials) (planck.Provider, error) {
+				return clusterOnlyProvider{&fakeProvider{}}, nil
+			}
+		}, kindInternal},
+	} {
+		for _, dr := range deployRigs() {
+			for _, answer := range [][]string{{"--plan"}, {"--confirm", sampleDigest}} {
+				t.Run(dr.name+"/"+cause.name+"/"+answer[0], func(t *testing.T) {
+					var edits []rigEdit
+					if cause.edit != nil {
+						edits = append(edits, cause.edit)
+					}
+					r := dr.rig(t, edits...)
+					r.configure = cause.configure
+					before := r.files(t)
+					stdout, errb, err := r.run(t, output.ModeJSON, append([]string{"--fatline-image", named}, answer...)...)
+					lead := fmt.Sprintf("--plan and --confirm never deploy FatLine without its Shrike monitor, and instance %q's image registry could not be read (", prodName)
+					tail := "); deploying FatLine alone is a break-glass step: run the command without --plan or --confirm, interactively or with --yes"
+					if err == nil || !strings.HasPrefix(err.Error(), lead) || !strings.HasSuffix(err.Error(), tail) {
+						t.Fatalf("%s %s = %v; want A23-5's refusal", dr.name, answer[0], err)
+					}
+					if kind := kindOf(classified(err)); kind != cause.kind || exitCodeOf(err) != 1 {
+						t.Errorf("the refusal's kind is %s (exit %d), want the registry failure's, %s", kind, exitCodeOf(err), cause.kind)
+					}
+					if stdout != "" || errb != "" {
+						t.Errorf("printed %q and %q before refusing", stdout, errb)
+					}
+					if len(r.fp.ensured)+len(r.fb.resolved)+len(r.fb.embedded)+r.writers+r.dials+len(r.fc.applied) != 0 {
+						t.Errorf("ensured %d, looked up %v, pushed %d, opened the writer %d times, dialled %d, applied %d",
+							len(r.fp.ensured), r.fb.resolved, len(r.fb.embedded), r.writers, r.dials, len(r.fc.applied))
+					}
+					sameFiles(t, "a plan without Shrike", before, r.files(t))
+				})
+			}
+		}
+	}
+}
+
+// ADR 0023 M2.6 (A23-24), mutation 73b: a plan reads the instance's registry
+// and never ensures one. On a record that names none, --plan and --confirm
+// refuse with A23-24's text, kind internal, having ensured, written and
+// looked up nothing. Outside them, a record that names no registry is
+// ensured first, as before, and the command goes on: a first connect after
+// a failed install ensure still works.
+func TestPlanNeedsARecordedRegistry(t *testing.T) {
+	unregistered := recorded(func(m *config.InstanceMetadata) { m.Registry = nil })
+	for _, dr := range deployRigs() {
+		for _, answer := range [][]string{{"--plan"}, {"--confirm", sampleDigest}} {
+			t.Run(dr.name+"/"+answer[0], func(t *testing.T) {
+				r := dr.rig(t, unregistered)
+				before := r.files(t)
+				stdout, _, err := r.run(t, output.ModeJSON, answer...)
+				want := fmt.Sprintf(msgNoRegistryRecorded, prodName, prodName)
+				if err == nil || err.Error() != want || kindOf(classified(err)) != kindInternal {
+					t.Fatalf("%s %s with no registry recorded = %v; want %q", dr.name, answer[0], err, want)
+				}
+				if stdout != "" || len(r.fp.ensured)+len(r.fb.resolved)+r.writers != 0 {
+					t.Errorf("printed %q, ensured %d registries, looked up %v and opened the writer %d times", stdout, len(r.fp.ensured), r.fb.resolved, r.writers)
+				}
+				sameFiles(t, "a plan with no registry recorded", before, r.files(t))
+			})
+		}
+		t.Run(dr.name+"/--yes ensures it first", func(t *testing.T) {
+			r := dr.rig(t, unregistered)
+			if _, errb, err := r.run(t, output.ModeHuman, "--yes"); err != nil {
+				t.Fatalf("%s --yes with no registry recorded: %v\n%s", dr.name, err, errb)
+			}
+			if len(r.fp.ensured) == 0 || registryPrefix(r.meta(t)) != repoPrefix(prodName) || len(r.fc.applied) != 1 {
+				t.Errorf("ensured %d times, recorded %q, applied %d; want the registry ensured and recorded, then the deploy", len(r.fp.ensured), registryPrefix(r.meta(t)), len(r.fc.applied))
+			}
+		})
+	}
+}
+
+// ADR 0023 M2.6 (A23-24), mutation 75b: the registry ensured after consent
+// is the one the plan was made with. Answered with another, the command
+// refuses before anything is pushed or applied: plan_changed under
+// --confirm, ending with msgPlanAgain, and internal in a --yes run.
+func TestConfirmRefusesAMovedRegistry(t *testing.T) {
+	moved := &planck.Registry{
+		Ref:    planck.RegistryRef{Name: "farcast-moved", Location: "us-central1"},
+		Prefix: "us-central1-docker.pkg.dev/proj-1/farcast-moved",
+		Puller: "serviceAccount:1234-compute@developer.gserviceaccount.com",
+	}
+	for _, dr := range deployRigs() {
+		for _, answer := range []string{"--confirm", "--yes"} {
+			t.Run(dr.name+"/"+answer, func(t *testing.T) {
+				r := dr.rig(t)
+				r.fb.resolveFn = notFoundForTags // the plan pushes both images
+				flags := []string{answer}
+				if answer == "--confirm" {
+					flags = append(flags, r.plan(t).Digest)
+				}
+				r.fp.registry = moved
+				_, errb, err := r.run(t, output.ModeJSON, flags...)
+				want, kind := fmt.Sprintf(msgRegistryMoved, prodName, moved.Prefix, repoPrefix(prodName)), kindInternal
+				if answer == "--confirm" {
+					want, kind = want+"; "+msgPlanAgain, kindPlanChanged
+				}
+				if err == nil || err.Error() != want || kindOf(classified(err)) != kind {
+					t.Fatalf("%s %s over a moved registry = %v (kind %s); want %q, %s\n%s", dr.name, answer, err, kindOf(classified(err)), want, kind, errb)
+				}
+				if len(r.fb.embedded)+len(r.fb.built)+len(r.fc.applied)+r.dials != 0 {
+					t.Errorf("pushed %d, built %d, applied %d and dialled %d over a moved registry", len(r.fb.embedded), len(r.fb.built), len(r.fc.applied), r.dials)
+				}
+				if registryPrefix(r.meta(t)) != moved.Prefix {
+					t.Errorf("the registry ensured was not recorded, as the refusal says it was: %q", registryPrefix(r.meta(t)))
+				}
+			})
+		}
+	}
+}
+
+// ADR 0023 M2.6 (A23-10): a farcast whose carried components it must not
+// push is refused before any plan is computed, under --plan too, with
+// today's refusal and its kind, internal: no plan is printed, and nothing is
+// looked up or opened. (One --plan row per command that prechecks.)
+func TestPlanOfANonReleaseIsRefusedBeforeAnyPlan(t *testing.T) {
+	for _, dr := range deployRigs() {
+		t.Run(dr.name, func(t *testing.T) {
+			r := dr.rig(t)
+			opened := 0
+			r.configure = func(d *fatlineDeployer) {
+				d.build = devBuild
+				d.openProvider = func(*config.InstanceMetadata, *config.InstanceCredentials) (planck.Provider, error) {
+					opened++
+					return r.fp, nil
+				}
+			}
+			stdout, _, err := r.run(t, output.ModeJSON, "--plan")
+			if !errors.Is(err, buildinfo.ErrNotRelease) || kindOf(classified(err)) != kindInternal {
+				t.Fatalf("%s --plan from a farcast that is not a release = %v (kind %s); want the precheck's refusal, internal", dr.name, err, kindOf(classified(err)))
+			}
+			if stdout != "" || opened+len(r.fb.resolved)+r.writers != 0 {
+				t.Errorf("printed %q, opened the provider %d times, looked up %v and opened the writer %d times before refusing", stdout, opened, r.fb.resolved, r.writers)
+			}
+		})
+	}
+}
+
+// ADR 0023 M2.6 (A24-15): an option a plan binds from the command line must
+// be valid UTF-8, or two plans that differ only there would share a digest.
+// --plan and --confirm refuse such a value as an error the router prints,
+// kind internal, exit 1, saying it is not UTF-8 and never quoting it; no
+// plan is printed, and nothing is opened, pushed or applied. connect's and
+// redeploy's --source reaches the plan's own check (a checkout this
+// machine's file system names, faked here); build's values are refused
+// first where its documents are rendered, which is the same refusal, sooner.
+func TestPlanRefusesAnOptionThatIsNotUTF8(t *testing.T) {
+	const hostileDir = "/work/far\xffcast"
+	hostileBuilder := "cgr.dev/chainguard/kan\xffiko@sha256:" + strings.Repeat("b", 64)
+	refused := func(t *testing.T, err error, stdout string) {
+		t.Helper()
+		if err == nil || !strings.Contains(err.Error(), "not valid UTF-8") && !strings.Contains(err.Error(), "not UTF-8") ||
+			strings.Contains(err.Error(), "\xff") || kindOf(classified(err)) != kindInternal || exitCodeOf(err) != 1 {
+			t.Errorf("= %v (kind %s, exit %d); want it refused as not UTF-8, internal, exit 1, unquoted", err, kindOf(classified(err)), exitCodeOf(err))
+		}
+		if stdout != "" {
+			t.Errorf("printed %q", stdout)
+		}
+	}
+	for _, dr := range deployRigs() {
+		for _, answer := range [][]string{{"--plan"}, {"--confirm", sampleDigest}} {
+			t.Run(dr.name+"/"+answer[0], func(t *testing.T) {
+				r := dr.rig(t)
+				r.configure = func(d *fatlineDeployer) { d.findSource = func(dir string) (string, error) { return dir, nil } }
+				stdout, _, err := r.run(t, output.ModeJSON, append([]string{"--source", hostileDir}, answer...)...)
+				refused(t, err, stdout)
+				if err != nil && (!strings.HasPrefix(err.Error(), "plan: bound.options[") || !strings.HasSuffix(err.Error(), "].value is not valid UTF-8")) {
+					t.Errorf("%s's refusal is not the plan's own: %v", dr.name, err)
+				}
+				if r.writers+len(r.fb.built)+len(r.fb.embedded)+len(r.fp.ensured)+len(r.fc.applied) != 0 {
+					t.Errorf("opened the writer %d times, built %d, pushed %d, ensured %d, applied %d",
+						r.writers, len(r.fb.built), len(r.fb.embedded), len(r.fp.ensured), len(r.fc.applied))
+				}
+			})
+		}
+	}
+	for _, answer := range [][]string{{"--plan"}, {"--confirm", sampleDigest}} {
+		t.Run("build/"+answer[0], func(t *testing.T) {
+			dir := config.Dir(t.TempDir())
+			meteringInstance(t, dir, "p42")
+			fj, opened := &fakeJobs{}, 0
+			c := buildPlanCmd(t, fj, &fakeBuilder{}, &opened,
+				append([]string{"--repo", "https://github.com/example/repo.git", "--app", "api", "--builder-image", hostileBuilder}, answer...)...)
+			env, out := testEnv(dir, output.ModeJSON)
+			refused(t, c.Run(context.Background(), env, []string{"p42"}), out.String())
+			if opened+len(fj.applied) != 0 {
+				t.Errorf("opened the writer %d times and applied %d streams", opened, len(fj.applied))
+			}
+		})
+	}
+	// Through the router, whose envelope carries it.
+	dir := config.Dir(t.TempDir())
+	meteringInstance(t, dir, "p42")
+	stdout, stderr, code := runLine([]string{"farcast", "--config", string(dir), "-o", "json", "build", "p42",
+		"--repo", "https://github.com/example/repo.git", "--app", "api", "--builder-image", hostileBuilder, "--plan"})
+	if code != 1 || !strings.Contains(stdout, `"kind":"internal"`) || !strings.Contains(stdout, "not UTF-8") || strings.Contains(stdout, "\xff") {
+		t.Errorf("farcast build --builder-image <not UTF-8> --plan: exit %d, %q %q", code, stdout, stderr)
+	}
+}
+
+// kubectlCall is one run of the succeeding stand-in kubectl: its arguments
+// and what it read on stdin.
+type kubectlCall struct {
+	Args  []string
+	Stdin []byte
+}
+
+// succeedingKubectl pins PATH, for the rest of the test, to a directory
+// holding a kubectl that succeeds (A23-49): a /bin/sh script that writes
+// each run's arguments and stdin to numbered files and exits 0, as
+// cluster/open_test.go's recording kubectl does for one run. With it a
+// --confirm passes applyReady and reaches its apply, which runs nothing
+// real. It runs with only the PATH the cluster client hands it, so it names
+// cat by its path. calls reports every run, in order.
+func succeedingKubectl(t *testing.T) (calls func() []kubectlCall) {
+	t.Helper()
+	bin, saw := t.TempDir(), t.TempDir()
+	script := "#!/bin/sh\nn=0\nwhile [ -e '" + saw + "'/$n.argv ]; do n=$((n+1)); done\n" +
+		"for a in \"$@\"; do printf '%s\\000' \"$a\"; done > '" + saw + "'/$n.argv\n" +
+		"/bin/cat > '" + saw + "'/$n.stdin\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(bin, "kubectl"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
+	return func() []kubectlCall {
+		var out []kubectlCall
+		for n := 0; ; n++ {
+			argv, err := os.ReadFile(filepath.Join(saw, strconv.Itoa(n)+".argv"))
+			if errors.Is(err, os.ErrNotExist) {
+				return out
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			stdin, err := os.ReadFile(filepath.Join(saw, strconv.Itoa(n)+".stdin"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, kubectlCall{Args: strings.Split(strings.TrimSuffix(string(argv), "\x00"), "\x00"), Stdin: stdin})
+		}
+	}
+}
+
+// appliedStreams is what the stand-in kubectl was given to apply, in order.
+func appliedStreams(calls []kubectlCall) [][]byte {
+	var out [][]byte
+	for _, c := range calls {
+		if slices.Contains(c.Args, "apply") {
+			out = append(out, c.Stdin)
+		}
+	}
+	return out
+}
+
+// planWrites is a plan's write facts, in its order.
+func planWrites(b plan.Bound) []plan.Fact {
+	var out []plan.Fact
+	for _, f := range b.Facts {
+		if w, ok := f.(plan.WriteFact); ok {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+// masked is a document of FatLine's stream with exactly the differences
+// A23-31 allows that stream masked: each value of a Secret's data (item 1)
+// and the pod template's mTLS hash (item 2). The stream builds nothing, pins
+// nothing and binds no bucket or egress credential, so items 3 to 6 have
+// nothing to mask in it.
+func masked(doc []byte) []byte {
+	lines := strings.Split(string(doc), "\n")
+	secret, inData := slices.Contains(lines, "kind: Secret"), false
+	for i, l := range lines {
+		switch {
+		case secret && l == "data:":
+			inData = true
+			continue
+		case inData && strings.HasPrefix(l, "  ") && !strings.HasPrefix(l, "   "):
+			if k, _, ok := strings.Cut(strings.TrimSpace(l), ": "); ok {
+				lines[i] = "  " + k + ": <masked>"
+			}
+			continue
+		}
+		inData = false
+		if lead, _, ok := strings.Cut(l, "farcast.sofmon.com/mtls-hash: "); ok {
+			lines[i] = lead + "farcast.sofmon.com/mtls-hash: <masked>"
+		}
+	}
+	return []byte(strings.Join(lines, "\n"))
+}
+
+// ADR 0023 M2.6 (A23-31, row 80): what --confirm applies is what its plan
+// bound, but for the secrets the plan could only render as placeholders.
+// Each command is planned, then confirmed through its real writer against
+// kubetest, its kubectl the succeeding stand-in, which records the stream it
+// is given; the command then fails at its first read after the apply (the
+// rollout, or the build's Job, which kubetest does not hold), which this
+// test does not need. FatLine's stream, from connect's first deploy (which
+// mints the material) and from redeploy (which loads it): the plan's write
+// facts are the planned rendering, over placeholder leaves and the plan's
+// images, and the applied documents equal it document for document once a
+// Secret's data and the mTLS hash are masked, and differ unmasked only
+// there. build's three documents: byte for byte the plan's.
+func TestConfirmWritesThePlannedDocumentsExceptTheirSecrets(t *testing.T) {
+	for _, row := range []struct {
+		name    string
+		edit    func(m *config.InstanceMetadata)
+		prepare func(t *testing.T, dir config.Dir)
+		flags   []string
+		cmd     func(fp *fakeProvider, fb *fakeBuilder) Command
+		fatline bool // the stream is FatLine's, compared under A23-31's masks
+	}{
+		{"connect, a first deploy", func(m *config.InstanceMetadata) { m.FatLineDeployed, m.Carrier = false, nil }, nil, nil,
+			func(fp *fakeProvider, fb *fakeBuilder) Command {
+				c := testConnect(fp, fb)
+				c.dial = func(context.Context, string, tunnel.ClientIdentity) (tunnelConn, error) {
+					return nil, errors.New("test: the carrier is not dialled here")
+				}
+				return c
+			}, true},
+		{"redeploy", nil, writeMaterial, nil, func(fp *fakeProvider, fb *fakeBuilder) Command { return testRedeploy(fp, fb) }, true},
+		{"build", nil, nil, []string{"--repo", "https://github.com/example/repo.git", "--app", "api", "--builder-image", builderDigest},
+			func(_ *fakeProvider, fb *fakeBuilder) Command {
+				c := &buildCommand{}
+				c.newBuilder = func(func(string)) imageBuilder { return fb }
+				return c
+			}, false},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			calls := succeedingKubectl(t)
+			s := kubetest.New(t)
+			dir, meta := writeInstance(t, s, true)
+			if row.edit != nil {
+				row.edit(meta)
+				if err := dir.SaveInstanceMetadata(writeName, meta); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if row.prepare != nil {
+				row.prepare(t, dir)
+			}
+			// The registry the ensure answers is the one the record names, and
+			// the carried images' tags are missing, so both are pushed.
+			fp := &fakeProvider{registry: &planck.Registry{Ref: registryRefFor(meta), Prefix: meta.Registry.Prefix}}
+			fb := &fakeBuilder{resolveFn: notFoundForTags}
+			run := func(flags ...string) (string, error) {
+				cmd := withFlags(t, row.cmd(fp, fb), append(slices.Clone(row.flags), flags...)...)
+				env, out, errb := testEnvBoth(dir, output.ModeJSON)
+				err := cmd.Run(t.Context(), env, []string{writeName})
+				return out.String() + errb.String(), err
+			}
+			printed, err := run("--plan")
+			if err != nil {
+				t.Fatalf("--plan: %v", err)
+			}
+			doc := printedDocument(t, []byte(printed))
+			b := decodedBound(t, doc)
+			// The planned identity is decided before the confirm mints any.
+			var id identityDecision
+			if exists, _ := dir.InstanceMTLSExists(writeName); exists {
+				ca, err := dir.LoadInstanceCACert(writeName)
+				if err != nil {
+					t.Fatal(err)
+				}
+				id.caCertPEM = ca
+			} else {
+				id.mint = true
+			}
+
+			said, err := run("--confirm", doc.Digest)
+			if err == nil || kindOf(classified(err)) == kindPlanChanged {
+				t.Fatalf("--confirm = %v; want it past the comparison, to its first read after the apply\n%s", err, said)
+			}
+			t.Logf("--confirm stopped after its apply: %v", err)
+			applied := appliedStreams(calls())
+			if len(applied) != 1 {
+				t.Fatalf("the stand-in kubectl applied %d streams; want the plan's one\n%s", len(applied), said)
+			}
+			if !row.fatline {
+				if got, want := wantWrites(t, applied[0]), planWrites(b); !reflect.DeepEqual(got, want) {
+					t.Errorf("applied\n%#v\nthe plan bound\n%#v", got, want)
+				}
+				return
+			}
+
+			// FatLine's stream as the plan rendered it: its images, over the
+			// placeholder material.
+			images := map[string]string{}
+			for _, f := range b.Facts {
+				if img, ok := f.(plan.ImageFact); ok {
+					images[img.Component] = img.Target
+				}
+			}
+			planned, err := renderWorkload(images["fatline"], images["shrike"], fldeploy.CarrierLoadBalancer, placeholderMTLS(writeName, id))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, want := wantWrites(t, planned), planWrites(b); !reflect.DeepEqual(got, want) {
+				t.Fatalf("the plan's write facts are not the planned rendering:\n%#v\n%#v", want, got)
+			}
+			plannedDocs, err := kube.SplitStream(planned)
+			if err != nil {
+				t.Fatal(err)
+			}
+			appliedDocs, err := kube.SplitStream(applied[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(appliedDocs) != len(plannedDocs) {
+				t.Fatalf("applied %d documents; the plan bound %d", len(appliedDocs), len(plannedDocs))
+			}
+			differ := 0
+			for i, p := range plannedDocs {
+				a := appliedDocs[i]
+				if !bytes.Equal(masked(a.Raw), masked(p.Raw)) {
+					t.Errorf("document %d, %s %s/%s, differs from the plan beyond its secrets:\napplied:\n%s\nplanned:\n%s",
+						i, p.Kind.Kind, p.Namespace, p.Name, a.Raw, p.Raw)
+				}
+				if !bytes.Equal(a.Raw, p.Raw) {
+					differ++
+					if p.Kind.Kind != "Secret" && p.Kind.Kind != "Deployment" {
+						t.Errorf("document %d, a %s, differs unmasked", i, p.Kind.Kind)
+					}
+				}
+			}
+			if differ == 0 {
+				t.Error("no document differs from the planned rendering: the plan's placeholders are the real material, or this test masks nothing")
 			}
 		})
 	}

@@ -672,6 +672,82 @@ func TestOpenClusterRefusesTheWriterInOrder(t *testing.T) {
 	}
 }
 
+// ADR 0023 M2.6 (A23-24 step 2): loadInstallerKey is the one reader of the
+// installer's key, for the writer and for what a plan reads from Google with
+// it, so each of its refusals is the writer's, word for word, with the same
+// sentinel, and holds no byte of the key. A usable key is returned as it is
+// stored.
+func TestLoadInstallerKeyRefusesAsTheWriterDoes(t *testing.T) {
+	s := kubetest.New(t)
+	const name = "atlas"
+	writer := s.Credential("writer")
+	valid := writerKeyJSON(t, writer, nil)
+	credsFile := func(dir config.Dir) string { return filepath.Join(dir.InstancePath(name), "credentials.yaml") }
+	saved := func(key string) func(t *testing.T, dir config.Dir) {
+		return func(t *testing.T, dir config.Dir) {
+			if err := dir.SaveInstanceCredentials(name, &config.InstanceCredentials{Provider: "gke", ServiceAccountKey: key}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	for _, row := range []struct {
+		name  string
+		creds func(t *testing.T, dir config.Dir)
+	}{
+		{"no credentials.yaml", func(*testing.T, config.Dir) {}},
+		{"a credentials.yaml that cannot be read", func(t *testing.T, dir config.Dir) {
+			if err := os.Mkdir(credsFile(dir), 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"a credentials.yaml that does not parse", func(t *testing.T, dir config.Dir) {
+			saved(valid)(t, dir)
+			b, err := os.ReadFile(credsFile(dir))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(credsFile(dir), append(b, []byte("  - [unclosed\n")...), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"a blank key (Application Default Credentials)", saved("")},
+		{"a key of white space", saved(" \n\t")},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			dir := config.Dir(filepath.Join(t.TempDir(), "cfg"))
+			meta := &config.InstanceMetadata{Name: name, Provider: "gke", Project: "proj-test1", Region: "us-central1", Endpoint: s.Endpoint()}
+			writeRecord(t, dir, meta)
+			if err := os.WriteFile(filepath.Join(dir.InstancePath(name), "cluster-ca.crt"), s.CAPEM(), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			row.creds(t, dir)
+			creds, err := loadInstallerKey(dir, name)
+			if creds != nil || err == nil {
+				t.Fatalf("loadInstallerKey returned credentials (%v), or no refusal", creds != nil)
+			}
+			_, werr := openCluster(clusterRef{Dir: dir, Meta: meta, Identity: kube.Writer, Warn: &bytes.Buffer{}})
+			if werr == nil || err.Error() != werr.Error() {
+				t.Errorf("loadInstallerKey refused with\n %q\nthe writer with\n %q", err, werr)
+			}
+			if !errors.Is(err, errCredentialMissing) || kindOf(classified(err)) != kindCredentialMissing {
+				t.Errorf("%v is not credential_missing", err)
+			}
+			if keyBytesIn(err.Error(), writer.PrivateKeyPEM) || strings.Contains(err.Error(), "PRIVATE KEY") {
+				t.Error("the refusal holds the key")
+			}
+		})
+	}
+	t.Run("a usable key", func(t *testing.T) {
+		dir := config.Dir(filepath.Join(t.TempDir(), "cfg"))
+		writeRecord(t, dir, &config.InstanceMetadata{Name: name, Provider: "gke"})
+		saved(valid)(t, dir)
+		creds, err := loadInstallerKey(dir, name)
+		if err != nil || creds == nil || creds.ServiceAccountKey != valid || creds.Provider != "gke" {
+			t.Fatalf("loadInstallerKey = %v (credentials returned: %v), want the stored key", err, creds != nil)
+		}
+	})
+}
+
 // strconvQuote is a YAML double-quoted scalar for s: JSON's quoting, which
 // YAML reads.
 func strconvQuote(s string) string {

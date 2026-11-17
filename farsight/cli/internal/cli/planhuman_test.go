@@ -515,6 +515,67 @@ func TestEveryBoundFactIsRendered(t *testing.T) {
 			}
 		}
 	}
+
+	// Every plan a command prints (ADR 0023 M2.6b): each value its facts bind
+	// shows in its rendering, so a renderer that drops one only a command's
+	// own plan holds (connect's second standing cost, a source build's Go,
+	// redeploy's replaced image) fails here, not only on the samples above.
+	t.Run("the commands' plans", func(t *testing.T) {
+		for _, row := range planCommands() {
+			t.Run(row.String(), func(t *testing.T) {
+				_, dir := planFixture(t, row)
+				doc, _ := runPlan(t, dir, row, output.ModeJSON)
+				_, text := runPlan(t, dir, row, output.ModeHuman)
+				for i, f := range decodedBound(t, doc).Facts {
+					for _, want := range renderedValues(reflect.ValueOf(f), "") {
+						if !strings.Contains(text, want) {
+							t.Errorf("fact %d (%s) binds %q, which its rendering does not show:\n%s", i, f.FactType(), want, text)
+						}
+					}
+				}
+			})
+		}
+	})
+}
+
+// renderedValues is the text a plan's rendering must hold for each value v
+// binds (name is v's JSON name): every string but a fact's type, line by
+// line, through terminalText; an amount of cents as amount prints it; every
+// other number in decimal. A boolean prints as words, which the sample rows
+// check both ways.
+func renderedValues(v reflect.Value, name string) []string {
+	var out []string
+	switch v.Kind() {
+	case reflect.Pointer:
+		if !v.IsNil() {
+			out = renderedValues(v.Elem(), name)
+		}
+	case reflect.Struct:
+		for i := 0; i < v.NumField(); i++ {
+			f := v.Type().Field(i)
+			if !f.IsExported() || f.Name == "Type" {
+				continue
+			}
+			field, _, _ := strings.Cut(f.Tag.Get("json"), ",")
+			out = append(out, renderedValues(v.Field(i), field)...)
+		}
+	case reflect.Slice:
+		for i := 0; i < v.Len(); i++ {
+			out = append(out, renderedValues(v.Index(i), name)...)
+		}
+	case reflect.String:
+		for _, line := range strings.Split(v.String(), "\n") {
+			if line != "" {
+				out = append(out, terminalText(line))
+			}
+		}
+	case reflect.Int, reflect.Int32, reflect.Int64:
+		if strings.HasSuffix(name, "_cents") {
+			return []string{amount(v.Int())}
+		}
+		out = []string{strconv.FormatInt(v.Int(), 10)}
+	}
+	return out
 }
 
 // topField is the field of typ whose JSON name is the whole path p.
@@ -611,6 +672,111 @@ func TestPlanRenderingQuotesHostileText(t *testing.T) {
 	if strings.Contains(text, "\x1b") || strings.Contains(text, "\u202e") {
 		t.Errorf("a fact with no words prints a value raw:\n%q", text)
 	}
+
+	t.Run("the commands", hostileTextOnTheCommands)
+}
+
+// hostileTextOnTheCommands is TestPlanRenderingQuotesHostileText's rows for
+// connect, redeploy and build (ADR 0023 M2.6b): a value from the command
+// line that would act on the terminal, valid UTF-8, never prints raw. A
+// --source that holds one is bound by connect's and redeploy's plans as an
+// option, as the image's source and in the source-build notice, and each
+// prints Go-quoted; build refuses such a value where it renders its
+// documents, before any plan, and its refusal does not hold it either.
+func hostileTextOnTheCommands(t *testing.T) {
+	const hostileDir = "/work/far\x1b[2Kcast\u202etxt"
+	raw := func(s string) bool { return strings.Contains(s, "\x1b") || strings.Contains(s, "\u202e") }
+	for _, dr := range deployRigs() {
+		t.Run(dr.name, func(t *testing.T) {
+			r := dr.rig(t)
+			r.configure = func(d *fatlineDeployer) { d.findSource = func(dir string) (string, error) { return dir, nil } }
+			text, errb, err := r.run(t, output.ModeHuman, "--source", hostileDir, "--plan")
+			if err != nil {
+				t.Fatalf("%s --source <hostile> --plan: %v", dr.name, err)
+			}
+			if raw(text) || raw(errb) {
+				t.Errorf("%s's plan prints the directory raw:\n%q\n%q", dr.name, text, errb)
+			}
+			quoted := strconv.QuoteToGraphic(hostileDir)
+			for _, want := range []string{
+				"--source=" + quoted,
+				"  a source build of " + quoted + ", with ",
+				"notice: " + strconv.QuoteToGraphic(fmt.Sprintf(msgSourceBuildNotice, hostileDir)) + "\n",
+			} {
+				if !strings.Contains(text, want) {
+					t.Errorf("%s's plan should hold %q:\n%s", dr.name, want, text)
+				}
+			}
+		})
+	}
+	// What deciding the images said, outside the plan, under --confirm
+	// (review S-CSEC-4): a kept operator build whose recorded checkout
+	// holds an escape is said Go-quoted after the comparison, as the plan
+	// showed it, never raw.
+	const hostileSource = "/src\x1b[2Jevil"
+	keptHostile := recorded(func(m *config.InstanceMetadata) {
+		recordFatLine(m, imageIn("fatline", "a"), config.SystemImage{Origin: config.OriginOperator, Go: "go1.27.5",
+			Farcast: testVersion, BuiltAt: testBuiltAt, Source: hostileSource})
+	})
+	for _, dr := range deployRigs() {
+		t.Run(dr.name+" --confirm", func(t *testing.T) {
+			r := dr.rig(t, keptHostile)
+			r.fb.resolveFn = tagOrDigest
+			doc := r.plan(t)
+			_, errb, err := r.run(t, output.ModeHuman, "--confirm", doc.Digest)
+			if err != nil {
+				t.Fatalf("%s --confirm: %v\n%s", dr.name, err, errb)
+			}
+			if quoted := strconv.QuoteToGraphic(hostileSource); raw(errb) || !strings.Contains(errb, quoted[1:len(quoted)-1]) {
+				t.Errorf("%s --confirm should say the kept build's checkout Go-quoted, never raw:\n%q", dr.name, errb)
+			}
+		})
+	}
+	// And redeploy's question names a recorded image as it is shown
+	// everywhere else: a deploy record that holds an escape, with no
+	// provenance, is said Go-quoted in the replacement note and in the
+	// change the operator is asked about; and so is the image it deploys
+	// when the recorded registry holds one.
+	t.Run("redeploy's question", func(t *testing.T) {
+		const hostileImage = "registry.example/fat\x1b[2Jline@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+		r := newRedeployRig(t, recorded(func(m *config.InstanceMetadata) { recordDeployedImage(m, hostileImage) }))
+		r.fb.resolveFn = tagOrDigest
+		r.in = devNullTerminal
+		_, errb, _ := r.run(t, output.ModeHuman)
+		quoted := strconv.QuoteToGraphic(hostileImage)
+		if raw(errb) || !strings.Contains(errb, "this replaces the image \"prod\" runs: "+quoted+" → ") ||
+			!strings.Contains(errb, strconv.QuoteToGraphic("fatline: replacing "+hostileImage+" (its origin is not recorded on this machine).")+"\n") {
+			t.Errorf("redeploy should name the recorded image Go-quoted in its note and its question, never raw:\n%q", errb)
+		}
+
+		const hostilePrefix = "us-central1-docker.pkg.dev/proj-1/farcast-\x1b[2Jprod"
+		r = newRedeployRig(t, recorded(func(m *config.InstanceMetadata) {
+			m.Registry.Prefix = hostilePrefix
+			recordDeployedImage(m, imageIn("fatline", "1"))
+		}))
+		r.fb.resolveFn = tagOrDigest
+		r.in = devNullTerminal
+		_, errb, _ = r.run(t, output.ModeHuman)
+		target := strconv.QuoteToGraphic(hostilePrefix + "/system/fatline@" + sha(tagDigest))
+		if raw(errb) || !strings.Contains(errb, "this replaces the image \"prod\" runs: "+imageIn("fatline", "1")+" → "+target+".\n") {
+			t.Errorf("redeploy should name the image it deploys Go-quoted in its question, never raw:\n%q", errb)
+		}
+	})
+	t.Run("build", func(t *testing.T) {
+		dir := config.Dir(t.TempDir())
+		meteringInstance(t, dir, "p42")
+		fj, opened := &fakeJobs{}, 0
+		c := buildPlanCmd(t, fj, &fakeBuilder{}, &opened, "--repo", "https://github.com/example/repo.git",
+			"--app", "api\x1b[2K\u202e", "--builder-image", builderDigest, "--plan")
+		env, out, errb := testEnvBoth(dir, output.ModeHuman)
+		err := c.Run(t.Context(), env, []string{"p42"})
+		if err == nil || raw(err.Error()) || out.Len() != 0 || raw(errb.String()) {
+			t.Errorf("build --app <hostile> --plan = %v, printing %q %q; want it refused, nothing raw", err, out, errb)
+		}
+		if opened+len(fj.applied) != 0 {
+			t.Errorf("opened the writer %d times and applied %d streams", opened, len(fj.applied))
+		}
+	})
 }
 
 // setStrings sets every exported string below v, but a fact's Type, to s.
@@ -786,6 +952,23 @@ func TestABlockedPlanIsRefusedWithItsKind(t *testing.T) {
 		}
 		sameFiles(t, "a blocked reader grant", before, treeFiles(t, string(dir)))
 	})
+
+	// connect, redeploy and build have no block (A23-35 to A23-37): what
+	// would stop them refuses before any plan is computed, so every plan
+	// they print is unblocked and ends with its confirm line.
+	t.Run("connect, redeploy and build never block", func(t *testing.T) {
+		for _, row := range planCommands() {
+			if !slices.Contains([]string{"connect", "redeploy", "build"}, row.name) {
+				continue
+			}
+			_, dir := planFixture(t, row)
+			doc, _ := runPlan(t, dir, row, output.ModeJSON)
+			_, text := runPlan(t, dir, row, output.ModeHuman)
+			if b := decodedBound(t, doc); len(b.Blocked) != 0 || !strings.Contains(text, "\nTo do exactly this: ") || strings.Contains(text, "blocked") {
+				t.Errorf("%s's plan is blocked (%+v), or offers no confirm line:\n%s", row, b.Blocked, text)
+			}
+		}
+	})
 }
 
 // TestBlockKindsAreErrorKinds: a block's kind is the kind the router gives
@@ -864,24 +1047,41 @@ func TestConfirmRefusesAChangedPlan(t *testing.T) {
 
 	// Each command's plan, changed between --plan and --confirm by its
 	// record: refused plan_changed, exit 1, naming both digests, with
-	// nothing sent, run or written.
+	// nothing sent, run or written. Through the router, connect and redeploy
+	// carry no components (a test binary is not a release), so they plan a
+	// build of this checkout; what the registry answers is changed below, on
+	// a release.
 	for _, tc := range []struct {
 		row    planCommand
 		change func(m *config.InstanceMetadata)
 	}{
-		{planCommandNamed(t, "kernel meter", "add"), func(m *config.InstanceMetadata) {
+		{row: planCommandNamed(t, "kernel meter", "add"), change: func(m *config.InstanceMetadata) {
 			m.Kernel.Namespaces = append(m.Kernel.Namespaces, "other")
 		}},
-		{planCommandNamed(t, "kernel confirm", "a window"), func(m *config.InstanceMetadata) {
+		{row: planCommandNamed(t, "kernel confirm", "a window"), change: func(m *config.InstanceMetadata) {
 			m.Kernel.Confirmations = []config.KernelConfirmation{{Start: day(planMonth(3)), End: day(planMonth(4)), USD: 1}}
 		}},
-		{planCommandNamed(t, "reader grant", "a recorded reader"), func(m *config.InstanceMetadata) {
+		{row: planCommandNamed(t, "reader grant", "a recorded reader"), change: func(m *config.InstanceMetadata) {
 			m.Kernel.Namespaces = append(m.Kernel.Namespaces, "web")
+		}},
+		// Through the router, with the deployer's defaults faked: connect's
+		// cost fact binds the limit.
+		{row: planCommandNamed(t, "connect", "first deploy"), change: func(m *config.InstanceMetadata) {
+			m.CostLimit.Amount = 75
+		}},
+		// redeploy's image fact binds the image the record says FatLine runs.
+		{row: planCommandNamed(t, "redeploy", "the carried images"), change: func(m *config.InstanceMetadata) {
+			recordDeployedImage(m, m.Registry.Prefix+"/system/fatline@"+sha("0"))
+		}},
+		// build's binds the builder the instance recorded, which runs today.
+		{row: planCommandNamed(t, "build", "a named builder"), change: func(m *config.InstanceMetadata) {
+			m.Toolchain = &config.Toolchain{Builder: builderDigest}
 		}},
 	} {
 		t.Run(tc.row.String(), func(t *testing.T) {
 			ran := strayKubectl(t)
 			pinPlanClock(t)
+			fakeDeployDefaults(t)
 			s, dir := planFixture(t, tc.row)
 			wc := writeCommand{name: tc.row.name, args: tc.row.args, flags: tc.row.flags}
 			planned := func() string {
@@ -916,6 +1116,32 @@ func TestConfirmRefusesAChangedPlan(t *testing.T) {
 				t.Errorf("a changed plan sent %d requests or ran kubectl (%v)", len(s.Requests()), ran())
 			}
 			sameFiles(t, "a changed plan", before, treeFiles(t, string(dir)))
+		})
+	}
+
+	// connect's and redeploy's image facts bind what the registry's version
+	// tag answered, as a release farcast that carries its components asks
+	// it: holding the carried image when planned (a reuse), and gone when
+	// confirmed (a push). Refused plan_changed before the writer opens, with
+	// nothing minted, ensured, pushed or applied.
+	for _, dr := range deployRigs() {
+		t.Run(dr.name+"/the version tag gone", func(t *testing.T) {
+			r := dr.rig(t)
+			given := r.plan(t).Digest
+			r.fb.resolveFn = notFoundForTags
+			now := r.plan(t).Digest
+			before := r.files(t)
+			_, _, err := r.run(t, output.ModeJSON, "--confirm", given)
+			want := "the plan for this command is now " + now + ", not the " + given + " given to --confirm: " +
+				"something it binds has changed since the plan was made; run it with --plan to review the new one. Nothing was written."
+			if err == nil || err.Error() != want || kindOf(classified(err)) != kindPlanChanged || exitCodeOf(err) != 1 {
+				t.Errorf("%s --confirm after the tag moved = %v (kind %s); want plan_changed, %q", dr.name, err, kindOf(classified(err)), want)
+			}
+			if r.writers+r.dials+len(r.fp.ensured)+len(r.fb.embedded)+len(r.fb.built)+len(r.fc.applied) != 0 {
+				t.Errorf("opened the writer %d times, dialled %d, ensured %d, pushed %d, built %d, applied %d",
+					r.writers, r.dials, len(r.fp.ensured), len(r.fb.embedded), len(r.fb.built), len(r.fc.applied))
+			}
+			sameFiles(t, "a plan whose tag moved", before, r.files(t))
 		})
 	}
 }
