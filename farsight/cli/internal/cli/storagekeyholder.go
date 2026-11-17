@@ -858,10 +858,25 @@ const (
 	heldChanged = "changed"
 	// heldUnrecorded: this machine could not record them as in use.
 	heldUnrecorded = "unrecorded"
+	// heldUnpinned: under --confirm, the key pin that would hold them could
+	// not be written, for a reason other than another writer (ADR 0023
+	// M2.6c, A23-42): this machine's keyring was saved held, and they are
+	// not in use.
+	heldUnpinned = "unpinned"
 	// heldBehind: a serving replica refused them, holding keys this keyring
 	// lacks.
 	heldBehind = "behind"
 )
+
+// unwrittenHold is a beforeActivate failure to write the key pin that holds
+// the new keys, under --confirm (ADR 0023 M2.6c, A23-45 step 5): handOverKeys
+// says so (heldChanged when another writer moved the pin, plan_changed;
+// heldUnpinned otherwise), never as a keyring this machine could not save.
+// The error it wraps keeps its own kind.
+type unwrittenHold struct{ err error }
+
+func (e unwrittenHold) Error() string { return e.err.Error() }
+func (e unwrittenHold) Unwrap() error { return e.err }
 
 // Complete reports whether every replica now holds, and uses, the keys sent.
 func (r handOverResult) Complete() bool {
@@ -1075,6 +1090,27 @@ func handOverKeys(ctx context.Context, env *Env, meta *config.InstanceMetadata, 
 				// another machine rotated or deployed meanwhile.
 				res.Cause = heldChanged
 				res.Reason = fmt.Sprintf("the instance's key pin moved past this keyring meanwhile (%v)", behind)
+				return res
+			}
+			if kindOf(err) == kindPlanChanged {
+				// Under --confirm the pin that holds them is written only as
+				// its plan listed it, at the version the plan read (ADR 0023
+				// M2.6, A23-45): another writer moved it, or the hold is not
+				// the one planned. The keys stay held, and are not put in
+				// use; this machine's keyring was saved, so it is not
+				// heldUnrecorded's failure.
+				res.Cause = heldChanged
+				res.Reason = fmt.Sprintf("the key pin its plan listed was not written (%s)", terminalText(err.Error()))
+				return res
+			}
+			var hold unwrittenHold
+			if errors.As(err, &hold) {
+				// Under --confirm, a hold-stage write that failed for any
+				// other reason — the API server's 500, say — stops the
+				// rotation here too, the keys held and not in use. The cause
+				// can carry the API server's own text, so it is quoted here.
+				res.Cause = heldUnpinned
+				res.Reason = fmt.Sprintf("the key pin that would hold them could not be written (%s)", terminalText(hold.err.Error()))
 				return res
 			}
 			res.Cause = heldUnrecorded
@@ -1726,19 +1762,11 @@ func outdatedImage(st keyholder.State) bool {
 	return !st.Sealed() && len(st.Scopes) > 0 && st.Keys == nil
 }
 
-// heldKeys is what a replica reports once it holds this keyring: scope name
-// to the hex IDs of every KEK the scope holds, the active one first.
+// heldKeys is what a replica reports once it holds this keyring (heldOf):
+// scope name to the hex IDs of every KEK the scope holds, the active one
+// first.
 func heldKeys(k datasphere.Keyring) map[string][]string {
-	out := make(map[string][]string, len(k.Scopes()))
-	for _, s := range k.Scopes() {
-		keks := s.Keyring().KEKs()
-		ids := make([]string, len(keks))
-		for i, e := range keks {
-			ids[i] = e.ID.String()
-		}
-		out[s.Name] = ids
-	}
-	return out
+	return heldOf(kekLists(k))
 }
 
 // sameKeys reports whether a replica holds exactly the keys expected: the

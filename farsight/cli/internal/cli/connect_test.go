@@ -50,15 +50,19 @@ type fakeCluster struct {
 	namespaces    []string
 	namespacesErr error
 
-	// uidReads counts the writer's preflight reads (A20-11), and uidErr
-	// answers them.
+	// uidReads counts the writer's preflight reads (A20-11), and uid and
+	// uidErr answer them: farcast-system's uid, "" for none (A23-49).
 	uidReads int
+	uid      string
 	uidErr   error
 }
 
 func (f *fakeCluster) NamespaceUID(context.Context, string) (string, error) {
 	f.uidReads++
-	return "", f.uidErr
+	if f.uidErr != nil {
+		return "", f.uidErr
+	}
+	return f.uid, nil
 }
 
 func (f *fakeCluster) Apply(_ context.Context, m []byte) error {
@@ -431,7 +435,7 @@ func TestConnectBootstrapsAndReports(t *testing.T) {
 	const name = "prod"
 	installedInstance(t, dir, name)
 
-	fc := &fakeCluster{ip: "34.0.0.1"}
+	fc := &fakeCluster{ip: "203.0.113.1"}
 	fb := &fakeBuilder{}
 	var dialed string
 	c := testConnect(&fakeProvider{}, fb)
@@ -472,14 +476,14 @@ func TestConnectBootstrapsAndReports(t *testing.T) {
 		t.Fatalf("deploy did not use the overridden image:\n%s", fc.applied[0])
 	}
 	meta, _ := dir.LoadInstanceMetadata(name)
-	if !meta.FatLineDeployed || meta.Carrier == nil || meta.Carrier.Endpoint != "34.0.0.1:8443" {
+	if !meta.FatLineDeployed || meta.Carrier == nil || meta.Carrier.Endpoint != "203.0.113.1:8443" {
 		t.Fatalf("carrier not recorded: deployed=%v carrier=%+v", meta.FatLineDeployed, meta.Carrier)
 	}
 	if meta.Carrier.ServerName != "prod.fatline.farcast" {
 		t.Fatalf("carrier server name=%q", meta.Carrier.ServerName)
 	}
-	if dialed != "https://34.0.0.1:8443" {
-		t.Fatalf("dialed=%q, want https://34.0.0.1:8443", dialed)
+	if dialed != "https://203.0.113.1:8443" {
+		t.Fatalf("dialed=%q, want https://203.0.113.1:8443", dialed)
 	}
 	if !strings.Contains(out.String(), `connected to "prod"`) {
 		t.Fatalf("output missing connected line:\n%s", out.String())
@@ -490,7 +494,7 @@ func TestConnectCostGateRequiresYes(t *testing.T) {
 	dir := config.Dir(t.TempDir())
 	installedInstance(t, dir, "prod")
 
-	fc := &fakeCluster{ip: "1.2.3.4"}
+	fc := &fakeCluster{ip: "198.51.100.4"}
 	c := testConnect(&fakeProvider{}, &fakeBuilder{}) // assumeYes stays false; env is non-interactive
 	c.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 	c.dial = func(context.Context, string, tunnel.ClientIdentity) (tunnelConn, error) {
@@ -618,7 +622,7 @@ func TestConnectDefaultsImageToTheInstanceRegistry(t *testing.T) {
 	const name = "prod"
 	installedInstance(t, dir, name)
 
-	fc := &fakeCluster{ip: "34.0.0.1"}
+	fc := &fakeCluster{ip: "203.0.113.1"}
 	fp := &fakeProvider{}
 	fb := &fakeBuilder{}
 	c := testConnect(fp, fb)
@@ -660,7 +664,7 @@ func TestConnectBuildsTheImageWhenTheRegistryHasNone(t *testing.T) {
 	const name = "prod"
 	installedInstance(t, dir, name)
 
-	fc := &fakeCluster{ip: "34.0.0.1"}
+	fc := &fakeCluster{ip: "203.0.113.1"}
 	fb := &fakeBuilder{resolveErr: image.ErrNotFound}
 	var askedFor string
 	c := testConnect(&fakeProvider{}, fb)
@@ -705,7 +709,7 @@ func TestConnectMissingImageWithoutCheckoutFails(t *testing.T) {
 	const name = "prod"
 	installedInstance(t, dir, name)
 
-	fc := &fakeCluster{ip: "34.0.0.1"}
+	fc := &fakeCluster{ip: "203.0.113.1"}
 	fb := &fakeBuilder{resolveErr: image.ErrNotFound}
 	c := testConnect(&fakeProvider{}, fb) // findSource fails by default
 	asSourceBuild(&c.fatlineDeployer, "dev")
@@ -744,7 +748,7 @@ func TestConnectMissingImageNonInteractiveRequiresYes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	fc := &fakeCluster{ip: "34.0.0.1"}
+	fc := &fakeCluster{ip: "203.0.113.1"}
 	fb := &fakeBuilder{resolveErr: image.ErrNotFound}
 	c := testConnect(&fakeProvider{}, fb) // assumeYes stays false; env is non-interactive
 	asSourceBuild(&c.fatlineDeployer, "dev")
@@ -995,7 +999,7 @@ func TestConnectJSONOutput(t *testing.T) {
 	const name = "prod"
 	installedInstance(t, dir, name)
 
-	fc := &fakeCluster{ip: "34.0.0.2"}
+	fc := &fakeCluster{ip: "203.0.113.2"}
 	c := testConnect(&fakeProvider{}, &fakeBuilder{})
 	c.assumeYes = true
 	c.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
@@ -1017,7 +1021,7 @@ func TestConnectJSONOutput(t *testing.T) {
 	if err := json.Unmarshal(out.Bytes(), &res); err != nil {
 		t.Fatalf("decode JSON result: %v\n%s", err, out.String())
 	}
-	if !res.Connected || res.Carrier != "nlb" || res.Endpoint != "34.0.0.2:8443" || res.Identity != "farcast://prod/operator" {
+	if !res.Connected || res.Carrier != "nlb" || res.Endpoint != "203.0.113.2:8443" || res.Identity != "farcast://prod/operator" {
 		t.Fatalf("result=%+v", res)
 	}
 	if res.Registry != "us-central1-docker.pkg.dev/proj-1/farcast-prod" || res.Image != pinnedRef(instanceImageRef(name), tagDigest) {
@@ -1182,7 +1186,7 @@ func TestConnectRejectsBothImageFlags(t *testing.T) {
 	const name = "prod"
 	installedInstance(t, dir, name)
 
-	fc := &fakeCluster{ip: "34.0.0.1"}
+	fc := &fakeCluster{ip: "203.0.113.1"}
 	c := testConnect(&fakeProvider{}, &fakeBuilder{})
 	c.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 	c.dial = connectedDial()
@@ -1213,7 +1217,7 @@ func TestABootstrapWaitsForTheCarrierToStartForwarding(t *testing.T) {
 	c := testConnect(&fakeProvider{}, &fakeBuilder{})
 	c.assumeYes = true
 	c.fatlineImage = testNamedImage
-	c.newCluster = func(clusterRef) (clusterApplier, error) { return &fakeCluster{ip: "34.0.0.9"}, nil }
+	c.newCluster = func(clusterRef) (clusterApplier, error) { return &fakeCluster{ip: "203.0.113.9"}, nil }
 	c.warmupRetry, c.warmupWindow = time.Millisecond, time.Second
 
 	var attempts int
@@ -1244,7 +1248,7 @@ func TestStatusDoesNotWaitOutATimeout(t *testing.T) {
 
 	c := testConnect(&fakeProvider{}, &fakeBuilder{})
 	c.statusOnly = true
-	c.newCluster = func(clusterRef) (clusterApplier, error) { return &fakeCluster{ip: "34.0.0.9"}, nil }
+	c.newCluster = func(clusterRef) (clusterApplier, error) { return &fakeCluster{ip: "203.0.113.9"}, nil }
 	var attempts int
 	c.dial = func(context.Context, string, tunnel.ClientIdentity) (tunnelConn, error) {
 		attempts++
@@ -1323,13 +1327,14 @@ func ed25519CA(t *testing.T, name string) []byte {
 // given one: no EnsureRegistry, a Google write, and nothing pushed, built,
 // applied, minted or dialled. In every mode: --yes, and --plan, which
 // would otherwise refuse the record for naming no registry first.
+//
+// M2.6c (A26-2), mutation A26-2m: so does material missing one of its six
+// files, ca.key or server.key here, which deciding finds without opening
+// a key; until then it was found only when the identity was loaded, after
+// consent and after a --yes run had ensured the registry. Each row opens
+// no provider and prints nothing but its error.
 func TestConnectRefusesItsTrustRootBeforeTheRegistry(t *testing.T) {
-	noRegistry := recorded(func(m *config.InstanceMetadata) { m.Registry = nil })
-	for _, tc := range []struct {
-		trustRoot string
-		edit      rigEdit
-		want      string
-	}{
+	refusesItsTrustRootBeforeTheRegistry(t, newConnectRig, []trustRootRefusal{
 		{"an Ed25519 CA", func(t *testing.T, dir config.Dir, meta *config.InstanceMetadata) {
 			withMaterial(t, dir, meta)
 			mtls, err := dir.LoadInstanceMTLS(meta.Name)
@@ -1346,23 +1351,78 @@ func TestConnectRefusesItsTrustRootBeforeTheRegistry(t *testing.T) {
 				t.Fatal(err)
 			}
 		}, "load identity for"},
-	} {
+		withoutMaterialFile("ca.key"),
+		withoutMaterialFile("server.key"),
+	})
+}
+
+// trustRootRefusal is a trust root a command that deploys FatLine refuses:
+// the fixture's edit that makes it, and what the refusal says.
+type trustRootRefusal struct {
+	trustRoot string
+	edit      rigEdit
+	want      string
+}
+
+// withoutMaterialFile is the instance's mTLS material, minted and then
+// missing file, which deciding the identity refuses with the error loading
+// it gives (A26-2).
+func withoutMaterialFile(file string) trustRootRefusal {
+	return trustRootRefusal{"material without " + file, func(t *testing.T, dir config.Dir, meta *config.InstanceMetadata) {
+		withMaterial(t, dir, meta)
+		if err := os.Remove(filepath.Join(dir.InstancePath(meta.Name), "fatline", file)); err != nil {
+			t.Fatal(err)
+		}
+	}, fmt.Sprintf("load identity for %q: read %s: ", prodName, file)}
+}
+
+// refusesItsTrustRootBeforeTheRegistry runs newRig's command over each
+// refused trust root, on an instance whose record names no registry, with
+// --yes and with --plan: each must refuse, saying what the row wants,
+// before the provider is opened or anything is ensured, pushed, built,
+// applied or dialled, print nothing but its error, and change no file.
+func refusesItsTrustRootBeforeTheRegistry(t *testing.T, newRig func(*testing.T, ...rigEdit) *deployRig, refusals []trustRootRefusal) {
+	t.Helper()
+	noRegistry := recorded(func(m *config.InstanceMetadata) { m.Registry = nil })
+	for _, tc := range refusals {
 		for _, flags := range [][]string{{"--yes"}, {"--plan"}} {
 			t.Run(fmt.Sprintf("%s/%q", tc.trustRoot, flags), func(t *testing.T) {
-				r := newConnectRig(t, noRegistry, tc.edit)
+				r := newRig(t, noRegistry, tc.edit)
+				opened := countProviderOpens(r)
 				before := r.files(t)
-				_, errb, err := r.run(t, output.ModeHuman, flags...)
+				stdout, errb, err := r.run(t, output.ModeHuman, flags...)
 				if err == nil || !strings.Contains(err.Error(), tc.want) {
-					t.Fatalf("connect %q over %s = %v; want its refusal naming %q\n%s", flags, tc.trustRoot, err, tc.want, errb)
+					t.Fatalf("%s %q over %s = %v; want its refusal naming %q\n%s", r.name, flags, tc.trustRoot, err, tc.want, errb)
 				}
-				if len(r.fp.ensured)+len(r.fb.embedded)+len(r.fb.built)+len(r.fc.applied)+r.dials != 0 {
-					t.Errorf("ensured %d, pushed %d, built %d, applied %d and dialled %d before refusing its trust root",
-						len(r.fp.ensured), len(r.fb.embedded), len(r.fb.built), len(r.fc.applied), r.dials)
+				if *opened+len(r.fp.ensured)+len(r.fb.embedded)+len(r.fb.built)+len(r.fc.applied)+r.dials != 0 {
+					t.Errorf("opened the provider %d times, ensured %d, pushed %d, built %d, applied %d and dialled %d before refusing its trust root",
+						*opened, len(r.fp.ensured), len(r.fb.embedded), len(r.fb.built), len(r.fc.applied), r.dials)
+				}
+				if stdout != "" || errb != "" {
+					t.Errorf("printed %q and, on stderr, %q before refusing its trust root", stdout, errb)
 				}
 				sameFiles(t, "a refused trust root", before, r.files(t))
 			})
 		}
 	}
+}
+
+// countProviderOpens counts the opens of r's provider from now on, each
+// still answered by r's own opener.
+func countProviderOpens(r *deployRig) *int {
+	opened := new(int)
+	configure := r.configure
+	r.configure = func(d *fatlineDeployer) {
+		if configure != nil {
+			configure(d)
+		}
+		open := d.openProvider
+		d.openProvider = func(meta *config.InstanceMetadata, creds *config.InstanceCredentials) (planck.Provider, error) {
+			*opened++
+			return open(meta, creds)
+		}
+	}
+	return opened
 }
 
 // ADR 0023 M2.6: connect's plan, and the commands that deploy FatLine run
@@ -1507,7 +1567,7 @@ func newConnectRig(t *testing.T, edits ...rigEdit) *deployRig {
 	if err := dir.SaveInstanceMetadata(prodName, meta); err != nil {
 		t.Fatal(err)
 	}
-	r := &deployRig{name: "connect", dir: dir, args: []string{prodName}, fp: &fakeProvider{}, fb: &fakeBuilder{}, fc: &fakeCluster{ip: "34.0.0.1"}}
+	r := &deployRig{name: "connect", dir: dir, args: []string{prodName}, fp: &fakeProvider{}, fb: &fakeBuilder{}, fc: &fakeCluster{ip: "203.0.113.1"}}
 	r.cmd = func() Command {
 		c := testConnect(r.fp, r.fb)
 		c.newCluster = func(clusterRef) (clusterApplier, error) {
@@ -1663,7 +1723,9 @@ func TestConfirmRefusesACAMintedAfterThePlan(t *testing.T) {
 // ensure alone. Under --confirm, an ensure that fails still prints its
 // warning and the connection status, and then fails the command, exit 1,
 // saying so; an interactive or --yes reconnect warns and succeeds. No
-// reconnect opens a writer.
+// reconnect opens a writer. M2.6c (A26-1) adds the ensure an instance
+// installed with Application Default Credentials refuses, before the
+// provider opens: credential_missing, exit 1, the status printed.
 func TestReconnectConfirmFailsWhenItsEnsureFails(t *testing.T) {
 	denied := errors.New("permission denied on artifactregistry.repositories.create")
 	for _, answer := range []string{"--confirm", "--yes", ""} {
@@ -1710,6 +1772,109 @@ func TestReconnectConfirmFailsWhenItsEnsureFails(t *testing.T) {
 			}
 		})
 	}
+
+	// M2.6c (A26-1): an instance installed with Application Default
+	// Credentials. Its reconnect's plan reads no key, so it is made; under
+	// --confirm the ensure refuses the blank key before the provider opens,
+	// the warning and the status print, and the command fails, exit 1, with
+	// the refusal's kind, credential_missing.
+	t.Run("ADC/--confirm", func(t *testing.T) {
+		r := newConnectRig(t, reconnected, installedWithADC)
+		opened := countProviderOpens(r)
+		reads := observeConfigReads(t)
+		doc := r.plan(t)
+		credentials := filepath.Join(r.dir.InstancePath(prodName), "credentials.yaml")
+		if slices.Contains(reads(), credentials) {
+			t.Errorf("a reconnect's plan read the installer's key: %v", reads())
+		}
+		stdout, errb, err := r.run(t, output.ModeJSON, "--confirm", doc.Digest)
+		_, adc := loadInstallerKey(r.dir, prodName)
+		want := fmt.Errorf(msgReconnectEnsureFailed, adc).Error()
+		if err == nil || err.Error() != want || exitCodeOf(err) != 1 ||
+			!errors.Is(err, errCredentialMissing) || kindOf(classified(err)) != kindCredentialMissing {
+			t.Errorf("--confirm on an ADC instance = %v (exit %d, kind %s); want exit 1, credential_missing, %q",
+				err, exitCodeOf(err), kindOf(classified(err)), want)
+		}
+		if !strings.Contains(errb, "Warning: "+adc.Error()+"\n") || !strings.Contains(errb, "Continuing: this connect deploys nothing") {
+			t.Errorf("the reconnect did not warn with the installer key's refusal:\n%s", errb)
+		}
+		if r.dials != 1 || !strings.Contains(stdout, `"connected":true`) {
+			t.Errorf("dialled %d times and printed %q; want the status read and printed", r.dials, stdout)
+		}
+		if *opened != 0 || len(r.fp.ensured) != 0 || r.writers != 0 {
+			t.Errorf("opened the provider %d times, ensured %d times and opened the writer %d times", *opened, len(r.fp.ensured), r.writers)
+		}
+	})
+}
+
+// installedWithADC is an instance installed with Application Default
+// Credentials: its credentials.yaml holds no service-account key.
+func installedWithADC(t *testing.T, dir config.Dir, meta *config.InstanceMetadata) {
+	t.Helper()
+	if err := dir.SaveInstanceCredentials(meta.Name, &config.InstanceCredentials{Provider: "gke"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// ADR 0023 M2.6c (A26-1), mutation A26-1m: a reconnect never ensures the
+// registry as this machine's Application Default Credentials. On an
+// instance installed without a key, an interactive, --yes or unanswered
+// reconnect warns with the installer key's refusal, says it goes on, prints
+// the status and succeeds, and the provider is never opened; with a key the
+// ensure runs once, as it always has. (Under --confirm the same refusal
+// fails the command: TestReconnectConfirmFailsWhenItsEnsureFails.)
+func TestReconnectNeverEnsuresAsADC(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		adc   bool
+		flags []string
+		mode  output.Mode
+		in    func(t *testing.T) io.Reader
+		// status is what the printed status holds.
+		status string
+	}{
+		{"ADC/interactive", true, nil, output.ModeHuman, devNullTerminal, `connected to "prod"`},
+		{"ADC/--yes", true, []string{"--yes"}, output.ModeJSON, nil, `"connected":true`},
+		{"ADC/no answer", true, nil, output.ModeJSON, nil, `"connected":true`},
+		{"a stand-in key/interactive", false, nil, output.ModeHuman, devNullTerminal, `connected to "prod"`},
+		{"a stand-in key/--yes", false, []string{"--yes"}, output.ModeJSON, nil, `"connected":true`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			edits := []rigEdit{reconnected}
+			if tc.adc {
+				edits = append(edits, installedWithADC)
+			}
+			r := newConnectRig(t, edits...)
+			r.in = tc.in
+			opened := countProviderOpens(r)
+			stdout, errb, err := r.run(t, tc.mode, tc.flags...)
+			if err != nil {
+				t.Fatalf("a reconnect %q failed: %v\n%s", tc.flags, err, errb)
+			}
+			if r.dials != 1 || !strings.Contains(stdout, tc.status) {
+				t.Errorf("dialled %d times and printed %q; want the status read and printed", r.dials, stdout)
+			}
+			if r.writers != 0 {
+				t.Errorf("a reconnect opened the writer %d times", r.writers)
+			}
+			if !tc.adc {
+				if *opened != 1 || len(r.fp.ensured) != 1 || strings.Contains(errb, "Warning:") {
+					t.Errorf("with a key: opened the provider %d times and ensured %d times, and said %q; want one ensure, no warning", *opened, len(r.fp.ensured), errb)
+				}
+				return
+			}
+			_, adc := loadInstallerKey(r.dir, prodName)
+			if !errors.Is(adc, errCredentialMissing) {
+				t.Fatalf("the fixture's key is not refused as ADC: %v", adc)
+			}
+			if !strings.Contains(errb, "Warning: "+adc.Error()+"\n") || !strings.Contains(errb, "Continuing: this connect deploys nothing") {
+				t.Errorf("the reconnect did not warn with the installer key's refusal:\n%s", errb)
+			}
+			if *opened != 0 || len(r.fp.ensured) != 0 {
+				t.Errorf("an ADC reconnect opened the provider %d times and ensured the registry %d times", *opened, len(r.fp.ensured))
+			}
+		})
+	}
 }
 
 // repoPrefix is an instance's registry as registeredInstance records it.
@@ -1748,8 +1913,9 @@ func TestConnectStatusHasNoPlan(t *testing.T) {
 // connectRefusalsNameThePlan is TestNonInteractiveRefusalsNameThePlan's rows
 // for connect: its cost question and its build question, met with no
 // terminal and no --yes, refuse, exit 2, ending with the route that needs
-// neither. The build question is shared with commands that have no plan yet,
-// and on those it names no plan.
+// neither. The build question is shared with every deployer command, each
+// of which since ADR 0023 M2.6c has a plan; a deployer that registers no
+// consent flags names none (consentFlags.suffix).
 func connectRefusalsNameThePlan(t *testing.T) {
 	t.Run("the cost", func(t *testing.T) {
 		r := newConnectRig(t)
@@ -1769,15 +1935,18 @@ func connectRefusalsNameThePlan(t *testing.T) {
 			t.Errorf("a source build with no terminal = %v (exit %d); want %q", err, exitCodeOf(err), want)
 		}
 	})
+	// A deployer whose command registered no consent flags has no plan, so
+	// its build question's refusal names none (consentFlags.suffix). Since
+	// ADR 0023 M2.6c every command that holds a deployer registers them.
 	t.Run("the build question of a command with no plan", func(t *testing.T) {
 		var d fatlineDeployer
-		d.component = components.TechnoCore
+		d.component = components.Datasphered
 		d.ensureDefaults()
 		env, _ := testEnv(config.Dir(t.TempDir()), output.ModeHuman)
-		dec := imageDecision{component: components.TechnoCore, action: plan.ImageBuildSource, repo: repoOf("technocore"), source: imageSource{dir: "/work/farcast"}}
+		dec := imageDecision{component: components.Datasphered, action: plan.ImageBuildSource, repo: repoOf("datasphered"), source: imageSource{dir: "/work/farcast"}}
 		_, err := d.confirmBuild(env, dec)
-		if want := fmt.Sprintf(msgBuildYes, "technocore", "/work/farcast", repoOf("technocore")); err == nil || err.Error() != want {
-			t.Errorf("kernel deploy's build question with no terminal = %v; want %q, which names no plan", err, want)
+		if want := fmt.Sprintf(msgBuildYes, "datasphered", "/work/farcast", repoOf("datasphered")); err == nil || err.Error() != want {
+			t.Errorf("an unregistered deployer's build question with no terminal = %v; want %q, which names no plan", err, want)
 		}
 	})
 }

@@ -132,6 +132,62 @@ func (f *consentFlags) mode(yes bool) (consentMode, string, error) {
 	return consentNone, "", nil
 }
 
+// msgPlanNeedsReader is a plan's refusal when it would read the cluster and
+// the instance has no reader 'reader grant' has verified (design §7.3, as
+// A23-21 words it): the command, the answer (--plan or --confirm), the
+// instance, the reader's state as 'instances' prints it, and what to do
+// from that state (readerRemedy).
+const msgPlanNeedsReader = "'farcast %s %s' reads the cluster as instance %q's reader, whose state is %s; %s, or run the command in a terminal"
+
+// requireGrantedReader refuses a plan that reads the cluster as the
+// instance's reader when that reader is not one 'reader grant' has verified
+// read-only (ADR 0023 M2.6, A23-1, A23-21). Under --plan and --confirm every
+// plan whose cluster_identity is reader calls it before its reader seam, and
+// before credentials.yaml or any provider is opened, so the refusal reads no
+// key and sends nothing; there is no fallback to the writer. command is the
+// plan's Bound.Command. An interactive or --yes run reads as the writer it
+// opened, and needs no reader: m consentNone is never refused.
+//
+// The reader's state is told from the record and the presence of reader.key
+// (readerStateOf), never by opening the key; an error telling it is returned
+// as it is. A granted reader passes, and openCluster's own refusals stand for
+// it: a record that names another reader than the derived one, an unsafe
+// record, a reader.key that cannot be read.
+func requireGrantedReader(dir config.Dir, meta *config.InstanceMetadata, command string, m consentMode) error {
+	if m == consentNone {
+		return nil
+	}
+	name := meta.Name
+	state, err := readerStateOf(dir, name, meta)
+	if err != nil {
+		return err
+	}
+	if state == readerGranted {
+		return nil
+	}
+	answer := "--plan"
+	if m == consentConfirm {
+		answer = "--confirm"
+	}
+	return refuse(errCredentialMissing, msgPlanNeedsReader, command, answer, name, strings.ReplaceAll(state, "_", " "), readerRemedy(state, name))
+}
+
+// readerRemedy is what the operator does about a reader in state, for the
+// instance name: the steps of 'farcast reader' that remain from there
+// (A23-21). A state that is not one of the four (granted needs none) is
+// given the last step's.
+func readerRemedy(state, name string) string {
+	switch state {
+	case readerNone:
+		return fmt.Sprintf("run 'farcast reader init %s', the printed Cloud Shell script, 'farcast reader record' and 'farcast reader grant'", name)
+	case readerKeyMissing:
+		return fmt.Sprintf("copy reader.key from the machine that made it, or run 'farcast reader init %s --rotate'", name)
+	case readerNotUploaded:
+		return fmt.Sprintf("run the printed Cloud Shell script, then 'farcast reader record %s --key-id <id>' and 'farcast reader grant %s'", name, name)
+	}
+	return fmt.Sprintf("run 'farcast reader grant %s'", name)
+}
+
 // planStamp is the farcast a plan binds (design §9.3): a bundled and a
 // terminal farcast cannot confirm each other's plans. A variable, so the plan
 // vectors bind a fixed stamp.

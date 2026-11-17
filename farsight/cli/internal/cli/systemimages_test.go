@@ -414,7 +414,7 @@ func TestSourceBuildIsRecordedAsOperatorBuilt(t *testing.T) {
 		c := testConnect(&fakeProvider{}, fb)
 		c.assumeYes, c.sourceDir = true, source
 		c.findSource = func(d string) (string, error) { return d, nil }
-		c.newCluster = func(clusterRef) (clusterApplier, error) { return &fakeCluster{ip: "34.0.0.1"}, nil }
+		c.newCluster = func(clusterRef) (clusterApplier, error) { return &fakeCluster{ip: "203.0.113.1"}, nil }
 		c.dial = connectedDial()
 		env, _ := testEnv(dir, output.ModeHuman)
 		if err := c.Run(context.Background(), env, []string{prodName}); err != nil {
@@ -580,10 +580,12 @@ func TestEmbeddedOverAnotherVersionNeedsTheFlag(t *testing.T) {
 		t.Errorf("stderr does not say %q:\n%s", want, r.stderr)
 	}
 
-	// kernel deploy and storage deploy, which have no plan yet, decide and
-	// realize their component's image at once (resolveImage, ADR 0023
-	// M2.6b): the same guard refuses there, version_skew, before anything
-	// is pushed or applied, and --embedded replaces the image, saying so.
+	// kernel deploy and storage deploy, which since ADR 0023 M2.6c decide
+	// their image in their plan and realize it after consent: in a --yes
+	// run the same guard refuses there, version_skew, before anything is
+	// pushed or applied, and --embedded replaces the image, saying so.
+	// (Under --confirm the plan is the consent to the replacement:
+	// TestConfirmCoversTheReplacementItsPlanListed.)
 	//
 	// With the version tag foreign too, the refusal says nothing of the tag
 	// (review C-F2): the skew was refused before the tag was looked up, and
@@ -1178,7 +1180,7 @@ func TestEmbeddedWithFatlineImageGovernsShrikeOnly(t *testing.T) {
 		if err := dir.SaveInstanceMetadata(prodName, meta); err != nil {
 			t.Fatal(err)
 		}
-		fb, fc := &fakeBuilder{resolveFn: notFoundForTags}, &fakeCluster{ip: "34.0.0.1"}
+		fb, fc := &fakeBuilder{resolveFn: notFoundForTags}, &fakeCluster{ip: "203.0.113.1"}
 		c := testConnect(fp, fb)
 		c.assumeYes = true
 		c.fatlineImage, c.embedded = given, embedded
@@ -1333,7 +1335,7 @@ func TestShrikeImageIsRecorded(t *testing.T) {
 	t.Run("connect", func(t *testing.T) {
 		dir := config.Dir(t.TempDir())
 		installedInstance(t, dir, prodName)
-		fc := &fakeCluster{ip: "34.0.0.1"}
+		fc := &fakeCluster{ip: "203.0.113.1"}
 		c := testConnect(&fakeProvider{}, &fakeBuilder{})
 		c.assumeYes = true
 		c.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
@@ -1659,11 +1661,14 @@ func TestDecideAndRealizeEveryImageAction(t *testing.T) {
 	})
 }
 
-// The commands that do not plan yet decide and realize at once
-// (resolveImage), and say what the resolution always said, in the same
-// order: the decision's notices, then the build prompt, then the push's
-// progress, then the replacement note once the image is in the registry.
-func TestResolveImageSaysItsLinesInTheirOrder(t *testing.T) {
+// kernel deploy and storage deploy decide in their plan, and say what the
+// resolution always said, in the same order: the decision's notices
+// (imageDecision.say), before anything is asked; then, once the cost is
+// agreed, the build prompt (buildConsent), the push's progress, and the
+// replacement note once the image is in the registry (realizeAndNote).
+// (Until ADR 0023 M2.6c storage deploy decided and realized at once,
+// through resolveImage, and printed the notices after the cost question.)
+func TestDecidedImageSaysItsLinesInTheirOrder(t *testing.T) {
 	resolve := func(t *testing.T, mode output.Mode, in io.Reader, fb *fakeBuilder, setup func(*config.InstanceMetadata), configure func(*fatlineDeployer)) (resolvedImage, string, error) {
 		t.Helper()
 		c := testRedeploy(&fakeProvider{}, fb)
@@ -1682,7 +1687,7 @@ func TestResolveImageSaysItsLinesInTheirOrder(t *testing.T) {
 		if in != nil {
 			env.In = in
 		}
-		res, err := d.resolveImage(context.Background(), env, reg, meta)
+		res, err := settledImage(context.Background(), env, d, reg, meta)
 		return res, errb.String(), err
 	}
 	inOrder := func(t *testing.T, stderr string, lines ...string) {
@@ -1779,6 +1784,26 @@ func TestResolveImageSaysItsLinesInTheirOrder(t *testing.T) {
 			}
 		})
 	}
+}
+
+// settledImage is d's image decided, said, consented to and realized, in
+// the order kernel deploy and storage deploy go through them outside a plan,
+// the cost question between the saying and the build question aside: the
+// skew refusal or the notices (imageDecision.say); decide's error; the build
+// question (buildConsent); and the push or build with its replacement note
+// (realizeAndNote).
+func settledImage(ctx context.Context, env *Env, d *fatlineDeployer, reg *registryAccess, meta *config.InstanceMetadata) (resolvedImage, error) {
+	dec, err := d.decideImage(ctx, env, reg, meta)
+	if serr := dec.say(env, d.embedded); serr != nil {
+		return resolvedImage{}, serr
+	}
+	if err != nil {
+		return resolvedImage{}, err
+	}
+	if err := d.buildConsent(env, dec); err != nil {
+		return resolvedImage{}, err
+	}
+	return d.realizeAndNote(ctx, env, reg, dec)
 }
 
 // The version command.
@@ -1969,6 +1994,110 @@ func TestConfirmExecutesWhatItCompared(t *testing.T) {
 			}
 		})
 	}
+	// kernel deploy and storage deploy (ADR 0023 M2.6c, A23-38 and A23-43
+	// step 4; rows O54 and O55 of the M2.6c review): the same, for the one
+	// image each decides in its plan.
+	for _, sc := range singleImageCommands() {
+		t.Run(sc.name, func(t *testing.T) {
+			r := sc.rig(t, nil)
+			moved := false
+			r.fb.resolveFn = func(ref string) (string, error) {
+				if moved && !strings.Contains(ref, "@sha256:") {
+					return pinnedRef(ref, "f"), nil
+				}
+				return tagOrDigest(ref)
+			}
+			doc := r.plan(t)
+			if img := imageFactOf(t, doc, sc.component); img.Action != plan.ImageReuse {
+				t.Fatalf("the plan does not reuse %s's image: %+v", sc.component, img)
+			}
+			r.onWriter(func() { moved = true })
+			before := len(r.fb.resolved)
+			if _, errb, err := r.run(t, "--confirm", doc.Digest); err != nil {
+				t.Fatalf("--confirm: %v\n%s", err, errb)
+			}
+			if !moved {
+				t.Fatal("the writer never opened, so the tag never moved")
+			}
+			if got := r.fb.resolved[before:]; len(got) != 1 {
+				t.Errorf("--confirm looked up %q; want the recomputation's one lookup and none after the comparison", got)
+			}
+			if len(r.fb.embedded)+len(r.fb.built) != 0 {
+				t.Errorf("pushed %d and built %d images the plan reused", len(r.fb.embedded), len(r.fb.built))
+			}
+			meta := r.meta(t)
+			applied, want := string(slices.Concat(r.fc.applied...)), carriedRegistryRef(meta, sc.component)
+			if !strings.Contains(applied, "image: "+want) || meta.SystemImages[sc.component].Image != want || strings.Contains(applied, sha("f")) {
+				t.Errorf("%s was not deployed and recorded as compared, %s", sc.component, want)
+			}
+		})
+	}
+}
+
+// singleImageRig is kernelRig or storageRig as the cross-cutting --confirm
+// tests run them: a command that decides one system image in its plan
+// (ADR 0023 M2.6c). plan runs --plan with flags, run runs the command with
+// flags in JSON mode with no terminal, and onWriter sets what runs as the
+// writer opens.
+type singleImageRig struct {
+	dir      config.Dir
+	fp       *fakeProvider
+	fb       *fakeBuilder
+	fc       *fakeCluster
+	plan     func(t *testing.T, flags ...string) plan.Document
+	run      func(t *testing.T, flags ...string) (stdout, stderr string, err error)
+	onWriter func(func())
+}
+
+// meta is the instance's record as the rig's command left it.
+func (r singleImageRig) meta(t *testing.T) *config.InstanceMetadata {
+	t.Helper()
+	meta, err := r.dir.LoadInstanceMetadata(writeName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return meta
+}
+
+// singleImageCommand is kernel deploy or storage deploy, the component
+// whose image it decides, and how a record names that image deployed.
+type singleImageCommand struct {
+	name, component string
+	rig             func(t *testing.T, edit func(*config.InstanceMetadata)) singleImageRig
+	deployed        func(meta *config.InstanceMetadata, img string)
+}
+
+func singleImageCommands() []singleImageCommand {
+	return []singleImageCommand{
+		{"kernel deploy", "technocore", func(t *testing.T, edit func(*config.InstanceMetadata)) singleImageRig {
+			r := newKernelRig(t, edit)
+			return singleImageRig{dir: r.dir, fp: r.fp, fb: r.fb, fc: r.fc, plan: r.plan, run: r.run, onWriter: func(f func()) { r.onWriter = f }}
+		}, func(meta *config.InstanceMetadata, img string) { meta.Kernel.Image = img }},
+		{"storage deploy", "datasphered", func(t *testing.T, edit func(*config.InstanceMetadata)) singleImageRig {
+			r := newStorageRig(t, edit)
+			planned := func(t *testing.T, flags ...string) plan.Document {
+				t.Helper()
+				stdout, stderr, err := r.run(t, append([]string{"--plan"}, flags...)...)
+				if err != nil {
+					t.Fatalf("storage deploy --plan: %v\n%s", err, stderr)
+				}
+				return printedDocument(t, []byte(stdout))
+			}
+			return singleImageRig{dir: r.dir, fp: r.fp, fb: r.fb, fc: r.fc, plan: planned, run: r.run, onWriter: func(f func()) { r.onWriter = f }}
+		}, func(meta *config.InstanceMetadata, img string) { meta.Keyholder.Image = img }},
+	}
+}
+
+// imageFactOf is doc's image fact for component.
+func imageFactOf(t *testing.T, doc plan.Document, component string) plan.ImageFact {
+	t.Helper()
+	for _, f := range decodedBound(t, doc).Facts {
+		if img, ok := f.(plan.ImageFact); ok && img.Component == component {
+			return img
+		}
+	}
+	t.Fatalf("the plan has no image fact for %s", component)
+	return plan.ImageFact{}
 }
 
 // ADR 0023 M2.6 (§9.5, row 83): under --confirm, the image fact's
@@ -2019,6 +2148,40 @@ func TestConfirmCoversTheReplacementItsPlanListed(t *testing.T) {
 				t.Errorf("recorded %+v, want %+v", got, want)
 			}
 			if !strings.Contains(errb, "fatline: replacing "+imageIn("fatline", "1")+", deployed by farcast v0.8.0") {
+				t.Errorf("the replacement was not said:\n%s", errb)
+			}
+		})
+	}
+	// kernel deploy and storage deploy (ADR 0023 M2.6c; rows O30 and O31 of
+	// the M2.6c review): a plan made without --embedded over the image
+	// v0.8.0 deployed binds the replacement, and its --confirm, with no
+	// --embedded and no terminal, pushes, applies and records the carried
+	// image, saying so.
+	for _, sc := range singleImageCommands() {
+		t.Run(sc.name, func(t *testing.T) {
+			var old string
+			r := sc.rig(t, func(m *config.InstanceMetadata) {
+				old = m.Registry.Prefix + "/system/" + sc.component + "@" + sha("1")
+				sc.deployed(m, old)
+				recordSystemImage(m, sc.component, config.SystemImage{Image: old, Origin: config.OriginEmbedded, Go: "go1.27.3", Farcast: "v0.8.0"})
+			})
+			doc := r.plan(t)
+			if img := imageFactOf(t, doc, sc.component); !img.ReplacesOtherVersion || img.Action != plan.ImagePush ||
+				img.Current == nil || img.Current.FarCast != "v0.8.0" || img.Current.Image != old {
+				t.Fatalf("the plan binds %s as %+v; want the replacement of v0.8.0's image listed", sc.component, img)
+			}
+			_, errb, err := r.run(t, "--confirm", doc.Digest)
+			if err != nil {
+				t.Fatalf("--confirm of a plan that lists the replacement = %v (kind %s)\n%s", err, kindOf(classified(err)), errb)
+			}
+			meta := r.meta(t)
+			want := carriedRegistryRef(meta, sc.component)
+			if len(r.fb.embedded) != 1 || len(r.fc.applied) != 1 || meta.SystemImages[sc.component].Image != want ||
+				!strings.Contains(string(slices.Concat(r.fc.applied...)), "image: "+want) {
+				t.Errorf("pushed %d, applied %d, recorded %+v; want the carried image %s pushed, applied and recorded",
+					len(r.fb.embedded), len(r.fc.applied), meta.SystemImages[sc.component], want)
+			}
+			if !strings.Contains(errb, sc.component+": replacing "+old+", deployed by farcast v0.8.0") {
 				t.Errorf("the replacement was not said:\n%s", errb)
 			}
 		})

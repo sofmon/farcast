@@ -1488,6 +1488,19 @@ func TestRunHandsNewScopesToAServingKeyholder(t *testing.T) {
 	}
 }
 
+// runWriterWithPin is run's writer that also holds a pin: the cluster's
+// reads and applies are the run fake's, farcast-system's uid among them,
+// and the pin the pin fake's (a pinStore reaches NamespaceUID too, since
+// ADR 0023 M2.6c).
+type runWriterWithPin struct {
+	*fakeRunCluster
+	*fakePinStore
+}
+
+func (w runWriterWithPin) NamespaceUID(ctx context.Context, name string) (string, error) {
+	return w.fakeRunCluster.NamespaceUID(ctx, name)
+}
+
 // ADR 0023 M2.5 (C-F1): a run that mints a scope and hands it to a serving
 // keyholder raises the key pin through the writer it opened for the whole
 // run, never through a second opener, so the installer's token is minted
@@ -1507,10 +1520,7 @@ func TestRunRaisesThePinThroughTheWriterItOpened(t *testing.T) {
 	writer := &fakePinStore{}
 	c := runCmd(f)
 	c.newCluster = func(clusterRef) (runCluster, error) {
-		return struct {
-			*fakeRunCluster
-			*fakePinStore
-		}{f, writer}, nil
+		return runWriterWithPin{f, writer}, nil
 	}
 	c.newKeyholder = openerFor(&fakeStateKeyholder{phase: "unsealed"})
 	if err := c.Run(context.Background(), env, []string{"p43", "github.com/example/my-platform"}); err != nil {

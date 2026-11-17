@@ -351,10 +351,10 @@ func (c *connectCommand) Run(ctx context.Context, env *Env, args []string) (err 
 	}
 	// The identity is decided before the registry is taken, as redeploy
 	// decides it: a trust root that is refused (a CA certificate that cannot
-	// be read, or is not P-256) refuses the connect before a record that
-	// names no registry is given one, a Google write. Deciding reads the CA
-	// certificate alone (A23-25), so a missing ca.key is found only when
-	// the identity is realized, after consent.
+	// be read, or is not P-256, or material missing one of its six files)
+	// refuses the connect before a record that names no registry is given
+	// one, a Google write. Deciding reads the CA certificate alone (A23-25)
+	// and looks for the other five files without opening them (A26-2).
 	id, err := decideIdentity(env, name, connected)
 	if err != nil {
 		return err
@@ -492,7 +492,11 @@ func (c *connectCommand) consented(env *Env, name string, p preparedConnect) err
 // (A23-35). It opens no writer. An ensure that fails is a warning — a
 // stored installer credential that predates ADR 0007's role must not break
 // a working reconnect — except under --confirm, whose plan bound that
-// ensure: the status still prints, and the command then fails.
+// ensure: the status still prints, and the command then fails. An instance
+// installed with Application Default Credentials is such a failure,
+// credential_missing: the deployer's ensure refuses its blank key before
+// the provider opens, so a reconnect never ensures as this machine's ADC
+// (A26-1). Its plan reads no key; only this ensure does.
 func (c *connectCommand) reconnect(ctx context.Context, env *Env, name string, meta *config.InstanceMetadata, p preparedConnect, m consentMode) error {
 	mtls, err := realizeIdentity(env, name, p.identity, m)
 	if err != nil {
@@ -558,8 +562,12 @@ type identityDecision struct {
 // decideIdentity decides whether a command mints the per-instance mTLS
 // material or uses what this machine holds (ADR 0023 M2.6, A23-35). It reads
 // whether the material exists and, when it does, the CA certificate alone,
-// never ca.key: a plan opens no private key (A23-25). Its refusals are
-// errors in every mode (A23-18).
+// never ca.key: a plan opens no private key (A23-25). Material it would load
+// must be whole: each of its six files is looked for without being opened
+// (config.Dir.CheckInstanceMTLS, A26-2), so a missing ca.key, or any other
+// missing file, is refused here, before a registry is ensured, anything is
+// asked or a plan is printed, and not first when realizeIdentity loads it
+// after consent. Its refusals are errors in every mode (A23-18).
 //
 // Minting is connect's alone: every other command passes connected=true and
 // so can only ever take the load-or-explain path. A trust root is created
@@ -589,6 +597,9 @@ func decideIdentity(env *Env, name string, connected bool) (identityDecision, er
 	}
 	if err := requireP256(name, ca); err != nil {
 		return identityDecision{}, err
+	}
+	if err := env.ConfigDir.CheckInstanceMTLS(name); err != nil {
+		return identityDecision{}, fmt.Errorf("load identity for %q: %w", name, err)
 	}
 	return identityDecision{caCertPEM: ca}, nil
 }
@@ -776,11 +787,11 @@ func connectCost(meta *config.InstanceMetadata) plan.CostFact {
 	return f
 }
 
-// fullFloorCost is the cost fact of connect and build before their own
-// workloads are added (A23-33): the instance's cost limit, no standing and
-// no one-off cost, the instance's floor fully provisioned, with whether the
-// limit is below it (warnIfBelowFloor's condition, computed without
-// printing), and the rate card's region and date.
+// fullFloorCost is the cost fact of connect, build and kernel deploy before
+// their own workloads are added (A23-33): the instance's cost limit, no
+// standing and no one-off cost, the instance's floor fully provisioned, with
+// whether the limit is below it (warnIfBelowFloor's condition, computed
+// without printing), and the rate card's region and date.
 func fullFloorCost(meta *config.InstanceMetadata) plan.CostFact {
 	floor := floorFull(meta)
 	return plan.CostFact{

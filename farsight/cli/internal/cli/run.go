@@ -570,7 +570,7 @@ func (c *runCommand) raiseScopePin(ctx context.Context, env *Env, meta *config.I
 	ps, err := pinStoreFor(c.newPinStore, clusterRef{Dir: env.ConfigDir, Meta: meta, Identity: kube.Writer, Warn: env.Err}, cl)
 	var w pinWrite
 	if err == nil {
-		w, err = writePin(ctx, ps, keys, false, false)
+		w, err = writePinLoop(ctx, ps, keys, false, false)
 	}
 	var behind *pinBehind
 	switch {

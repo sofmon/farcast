@@ -4,24 +4,32 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/sofmon/farcast/datasphere"
 	dsdeploy "github.com/sofmon/farcast/datasphere/deploy"
+	dskeyholder "github.com/sofmon/farcast/datasphere/keyholder"
 	"github.com/sofmon/farcast/farsight/cli/internal/buildinfo"
+	"github.com/sofmon/farcast/farsight/cli/internal/cluster"
 	"github.com/sofmon/farcast/farsight/cli/internal/components"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/kube"
@@ -108,7 +116,8 @@ type writeCommand struct {
 	edit func(meta *config.InstanceMetadata)
 	// prepare, when set, writes what the record alone cannot say, for a test
 	// that takes the command as far as its plan: the instance's mTLS
-	// material, which redeploy loads and the fixture does not hold.
+	// material, which redeploy and storage deploy load and the fixture does
+	// not hold.
 	prepare func(t *testing.T, dir config.Dir)
 }
 
@@ -126,7 +135,7 @@ func writeCommands() []writeCommand {
 		{name: "kernel meter", args: []string{writeName, writeNewNamespace}, cmd: func() Command { return &kernelMeterCommand{} }},
 		{name: "kernel confirm", args: []string{writeName}, flags: []string{"--amount", "1", "--from", thisMonth(1), "--to", thisMonth(2)},
 			cmd: func() Command { return &kernelConfirmCommand{} }},
-		{name: "storage deploy", args: []string{writeName}, flags: []string{"--yes"}, cmd: func() Command { return &storageDeployCommand{} }},
+		{name: "storage deploy", args: []string{writeName}, flags: []string{"--yes"}, cmd: func() Command { return &storageDeployCommand{} }, prepare: writeMaterial},
 		{name: "storage key pin", args: []string{writeName}, cmd: func() Command { return &keyPinCommand{newKeyholder: noKeyholder} }},
 		{name: "storage key rotate", args: []string{writeName}, flags: []string{"--yes"}, cmd: func() Command { return &keyRotateCommand{newKeyholder: noKeyholder} }},
 		{name: "reader grant", args: []string{writeName}, cmd: func() Command {
@@ -436,7 +445,7 @@ func TestWritingCommandsCarryClusterKinds(t *testing.T) {
 		})
 	}
 
-	// writePin's three attempts, each answered 409: cluster_rejected.
+	// writePinLoop's three attempts, each answered 409: cluster_rejected.
 	t.Run("storage key pin/three conflicts", func(t *testing.T) {
 		s := kubetest.New(t)
 		dir, _ := writeInstance(t, s, true)
@@ -457,7 +466,7 @@ func TestWritingCommandsCarryClusterKinds(t *testing.T) {
 			}
 		}
 		if posts != 3 {
-			t.Errorf("storage key pin created %d times; want writePin's 3 attempts", posts)
+			t.Errorf("storage key pin created %d times; want writePinLoop's 3 attempts", posts)
 		}
 	})
 
@@ -556,7 +565,7 @@ func deployingCommands() []deployingCommand {
 		{"connect", func(t *testing.T, failAfter, failPreflight error) deploying {
 			dir := config.Dir(t.TempDir())
 			installedInstance(t, dir, "prod")
-			fc := &fakeCluster{ip: "34.0.0.1", rolloutErr: failAfter, uidErr: failPreflight}
+			fc := &fakeCluster{ip: "203.0.113.1", rolloutErr: failAfter, uidErr: failPreflight}
 			fp, fb := &fakeProvider{}, &fakeBuilder{}
 			c := testConnect(fp, fb)
 			c.assumeYes = true
@@ -733,12 +742,13 @@ func TestWritersRefuseAnADCInstanceBeforeAnythingCosts(t *testing.T) {
 		})
 	}
 
-	// Under --confirm (ADR 0023 M2.6, A23-23): connect and redeploy read
-	// the registry to plan, so planRegistry refuses the record before any
-	// plan is computed, its blank key read before the provider opens; build
-	// plans with no key, so it compares and refuses at the writer's open.
-	// Either way nothing is minted, ensured, looked up or pushed, nothing is
-	// sent, and no file changes.
+	// Under --confirm (ADR 0023 M2.6, A23-23): connect, redeploy, kernel
+	// deploy and storage deploy read the registry to plan, so planRegistry
+	// refuses the record before any plan is computed, its blank key read
+	// before the provider opens; kernel deploy and storage deploy have read
+	// the cluster as the reader first, which is all they sent. build plans with no key, so it compares and refuses at
+	// the writer's open. Either way nothing is minted for the writer,
+	// ensured, looked up or pushed, nothing is printed, and no file changes.
 	for _, row := range confirmingPlans(t) {
 		t.Run(row.String()+"/--confirm", func(t *testing.T) {
 			s, dir := planFixtureKeyed(t, row, false)
@@ -761,17 +771,43 @@ func TestWritersRefuseAnADCInstanceBeforeAnythingCosts(t *testing.T) {
 			if f := row.fakes; len(f.provider.ensured)+len(f.builder.built)+len(f.builder.embedded) != 0 {
 				t.Errorf("%s --confirm ensured %d registries, built %d and pushed %d images", row, len(f.provider.ensured), len(f.builder.built), len(f.builder.embedded))
 			}
-			if out.Len()+errb.Len() != 0 || len(s.Requests()) != 0 {
-				t.Errorf("%s --confirm printed %q %q and sent %d requests before refusing", row, out, errb, len(s.Requests()))
+			if out.Len()+errb.Len() != 0 {
+				t.Errorf("%s --confirm printed %q %q before refusing", row, out, errb)
 			}
+			onlyThePlansReads(t, row, s)
 			sameFiles(t, row.String()+" --confirm on an ADC instance", before, treeFiles(t, string(dir)))
 		})
 	}
+
+	// storage key pin (ADR 0023 M2.6c, A23-23; C-C-R3 of the M2.6c review)
+	// costs nothing, but writes: its plan reads as the reader and needs no
+	// installer key, so an ADC install plans, and its --confirm compares and
+	// is refused at the writer's open, credential_missing, having sent only
+	// the reader's reads, written no pin and opened no keyholder.
+	t.Run("storage key pin/a pin to write/--confirm", func(t *testing.T) {
+		realPinOpener(t)
+		row := planCommandNamed(t, "storage key pin", "a pin to write")
+		s, dir := planFixtureKeyed(t, row, false)
+		doc, _ := runPlan(t, dir, row, output.ModeJSON)
+		before := treeFiles(t, string(dir))
+		cmd := realWriter(t, withFlags(t, row.cmd(), append(slices.Clone(row.flags), "--confirm", doc.Digest)...))
+		env, out, errb := testEnvBoth(dir, output.ModeJSON)
+		err := cmd.Run(t.Context(), env, row.args)
+		if !errors.Is(err, errCredentialMissing) || !strings.Contains(err.Error(), msgADCRefused) || kindOf(classified(err)) != kindCredentialMissing {
+			t.Fatalf("%s --confirm on an ADC instance = %v; want the installer key refused at the writer's open, credential_missing", row, err)
+		}
+		if out.Len()+errb.Len() != 0 || row.fakes.keyholders != 0 {
+			t.Errorf("%s --confirm printed %q %q and opened the keyholder %d times before refusing", row, out, errb, row.fakes.keyholders)
+		}
+		onlyThePlansReads(t, row, s)
+		sameFiles(t, row.String()+" --confirm on an ADC instance", before, treeFiles(t, string(dir)))
+	})
 }
 
 // confirmingPlans are the planCommands rows of the commands ADR 0023 M2.6b
-// wires that apply, one per state that confirms into a deploy: connect's
-// first deploy and resume, redeploy, and build.
+// and M2.6c wire that apply, one per state that confirms into a deploy:
+// connect's first deploy and resume, redeploy, build, kernel deploy, and
+// storage deploy.
 func confirmingPlans(t *testing.T) []planCommand {
 	t.Helper()
 	return []planCommand{
@@ -779,11 +815,14 @@ func confirmingPlans(t *testing.T) []planCommand {
 		planCommandNamed(t, "connect", "resume"),
 		planCommandNamed(t, "redeploy", "the carried images"),
 		planCommandNamed(t, "build", "a named builder"),
+		planCommandNamed(t, "kernel deploy", "the carried image"),
+		planCommandNamed(t, "storage deploy", "the recorded bucket"),
 	}
 }
 
-// realWriter clears cmd's writing seam, which its planCommands row sets to
-// refuse, so --confirm opens the instance's writer as farcast does.
+// realWriter clears cmd's writing seams, which its planCommands row sets to
+// refuse, so --confirm opens the instance's writer as farcast does (and
+// storage deploy reaches its pin through it).
 func realWriter(t *testing.T, cmd Command) Command {
 	t.Helper()
 	switch c := cmd.(type) {
@@ -793,10 +832,33 @@ func realWriter(t *testing.T, cmd Command) Command {
 		c.newCluster = nil
 	case *buildCommand:
 		c.newCluster = nil
+	case *kernelDeployCommand:
+		c.deployer.newCluster = nil
+	case *storageDeployCommand:
+		c.deployer.newCluster, c.newPinStore = nil, nil
+	case *keyPinCommand:
+		c.newPinStore = nil
 	default:
 		t.Fatalf("%T has no writing seam here", cmd)
 	}
 	return cmd
+}
+
+// onlyThePlansReads fails t unless every request s saw is one row's plan
+// may make (design §7.3, A23-20): none for a plan that reads no cluster, and
+// for one that reads it, the reader's token and the reader's GETs.
+func onlyThePlansReads(t *testing.T, row planCommand, s *kubetest.Server) {
+	t.Helper()
+	for _, r := range s.Requests() {
+		switch {
+		case !row.readsCluster:
+			t.Errorf("%s reads no cluster, and sent %s %s as %q", row, r.Method, r.Path, r.As)
+		case r.As != "reader":
+			t.Errorf("%s sent %s %s as %q; a plan reads as the reader alone", row, r.Method, r.Path, r.As)
+		case r.Path != "/token" && r.Method != http.MethodGet:
+			t.Errorf("%s sent %s %s; a plan only reads", row, r.Method, r.Path)
+		}
+	}
 }
 
 // ADR 0023 M2.5 (A20-12), mutation 71c: each writing command checks that the
@@ -1006,7 +1068,7 @@ func TestPinHelpSaysThePinNeedsNoKubectl(t *testing.T) {
 		want string
 	}{
 		{"storage key pin", &keyPinCommand{}, "The pin is reached in-process, as the instance's installer service account, with the key 'farcast install --credentials' stored; it needs no kubectl."},
-		{"storage key rotate", &keyRotateCommand{}, "The pin is written in-process, as the instance's installer service account, with the key 'farcast install --credentials' stored, and needs no kubectl;"},
+		{"storage key rotate", &keyRotateCommand{}, "The pin is written in-process, as the instance's installer service account, with the key 'farcast install --credentials' stored, and needs no kubectl."},
 	} {
 		flat := strings.Join(strings.Fields(row.cmd.Usage()), " ")
 		if !strings.Contains(flat, row.want) || strings.Contains(flat, "needs kubectl") {
@@ -1138,7 +1200,8 @@ func TestCommandsThatApplyRefuseAMachineThatCannotApply(t *testing.T) {
 	// Under --confirm (ADR 0023 M2.6, A23-23): the plan needs no kubectl,
 	// so the command plans and compares, and only then opens the writer,
 	// whose applyReady refuses before anything is minted, ensured, pushed
-	// or sent, and before any kubectl runs.
+	// or sent as the writer, and before any kubectl runs. kernel deploy's
+	// plan reads the cluster as the reader, and that is all it sent.
 	for _, row := range confirmingPlans(t) {
 		for _, lack := range []struct {
 			name  string
@@ -1171,9 +1234,10 @@ func TestCommandsThatApplyRefuseAMachineThatCannotApply(t *testing.T) {
 				if f := row.fakes; len(f.provider.ensured)+len(f.builder.built)+len(f.builder.embedded) != 0 {
 					t.Errorf("%s --confirm ensured %d registries, built %d and pushed %d images before refusing", row, len(f.provider.ensured), len(f.builder.built), len(f.builder.embedded))
 				}
-				if got := s.Requests(); len(got) != 0 || ran() || errb.Len() != 0 {
-					t.Errorf("%s --confirm sent %d requests, ran kubectl %v and said %q before refusing", row, len(got), ran(), errb)
+				if ran() || errb.Len() != 0 {
+					t.Errorf("%s --confirm ran kubectl %v and said %q before refusing", row, ran(), errb)
 				}
+				onlyThePlansReads(t, row, s)
 				sameFiles(t, row.String()+" --confirm on a machine that cannot apply", before, treeFiles(t, string(dir)))
 			})
 		}
@@ -1283,11 +1347,16 @@ type planCommand struct {
 	// prepare, when set, writes what the record alone cannot say: the
 	// instance's mTLS material, for connect's resume and reconnect.
 	prepare func(t *testing.T, dir config.Dir)
+	// seed, when set, puts what the plan reads in the fixture's cluster:
+	// farcast-system, for a plan that reads the cluster.
+	seed func(s *kubetest.Server)
 	// fakes are what the row's command reaches the provider, the registry,
-	// the writer and the carrier through, for a command that has those
-	// seams (connect's, redeploy's, and build's builder and writer): a plan
-	// may open the provider, mint the registry's token and look up, and
-	// nothing more. nil for one with none of them.
+	// the writer, the carrier, the plan's reader, storage and the keyholder
+	// through, for a command that has those seams (connect's, redeploy's,
+	// kernel deploy's, storage deploy's, storage key pin's, storage key
+	// rotate's, and build's builder and writer): a plan may open the
+	// provider, mint the registry's token and look up, open its reader and
+	// read as it, and nothing more. nil for one with none of them.
 	fakes *planFakes
 }
 
@@ -1297,9 +1366,24 @@ func (p planCommand) String() string { return p.name + "/" + p.shape }
 type planFakes struct {
 	provider *fakeProvider
 	builder  *fakeBuilder
-	// opened counts the provider's opens, writers the writer's, and
-	// dialled the carrier's dials.
-	opened, writers, dialled int
+	// opened counts the provider's opens, writers the writer's (a pin
+	// store's included), dialled the carrier's dials, storages storage
+	// deploy's mints of the bucket and keyring, and keyholders the
+	// keyholder's opens.
+	opened, writers, dialled, storages, keyholders int
+	// readers is the identity the plan's reader seam was asked to open, at
+	// each open (A23-49).
+	readers []kube.Identity
+}
+
+// planSystemUID is farcast-system's uid in the fixture's cluster, which a
+// plan that reads the cluster binds as its target.
+const planSystemUID = "00000000-0000-4000-8000-0000000000a1"
+
+// systemNamespace puts farcast-system in s, at planSystemUID.
+func systemNamespace(s *kubetest.Server) {
+	s.Put(map[string]any{"apiVersion": "v1", "kind": "Namespace", "metadata": map[string]any{
+		"name": tcdeploy.DefaultNamespace, "uid": planSystemUID}})
 }
 
 // planClock is the clock planCommands' kernel confirm reads, planNow, and
@@ -1329,16 +1413,19 @@ func pinPlanClock(t *testing.T) {
 const routerCheckout = "/work/farcast"
 
 // fakeDeployDefaults makes the deployer's provider, builder, checkout and Go
-// defaults fakes for the rest of the test: for a test that runs connect
-// through the router, which sets no seam of its own, and whose unset seams
-// otherwise refuse (refusingdefaults_test.go). The provider answers as the
-// GKE adapter does, the builder as fakeBuilder, the checkout is --source's
-// directory or routerCheckout, and the Go is fakeToolchain's.
+// defaults fakes for the rest of the test, and a plan's reader the loopback
+// one: for a test that runs connect or kernel deploy through the router,
+// which sets no seam of its own, and whose unset seams otherwise refuse
+// (refusingdefaults_test.go). The provider answers as the GKE adapter does,
+// the builder as fakeBuilder, the checkout is --source's directory or
+// routerCheckout, the Go is fakeToolchain's, and the reader is
+// loopbackReader.
 func fakeDeployDefaults(t *testing.T) (*fakeProvider, *fakeBuilder) {
 	t.Helper()
 	fp, fb := &fakeProvider{}, &fakeBuilder{}
 	savedOpen, savedBuild := openProviderDefault, newBuilderDefault
 	savedSource, savedToolchain := findSourceDefault, findToolchainDefault
+	savedReader := openReaderDefault
 	openProviderDefault = func(*config.InstanceMetadata, *config.InstanceCredentials) (planck.Provider, error) { return fp, nil }
 	newBuilderDefault = func(func(string)) imageBuilder { return fb }
 	findSourceDefault = func(dir string) (string, error) {
@@ -1348,19 +1435,42 @@ func fakeDeployDefaults(t *testing.T) (*fakeProvider, *fakeBuilder) {
 		return dir, nil
 	}
 	findToolchainDefault = fakeToolchain
+	openReaderDefault = loopbackReader
 	t.Cleanup(func() {
 		openProviderDefault, newBuilderDefault = savedOpen, savedBuild
 		findSourceDefault, findToolchainDefault = savedSource, savedToolchain
+		openReaderDefault = savedReader
 	})
 	return fp, fb
+}
+
+// loopbackReader is openReader for a record whose endpoint is a loopback
+// address, a kubetest server's, and a refusal before anything is opened for
+// any other: the reader a test's plan reads the cluster as, which can reach
+// no cluster but one the test started.
+func loopbackReader(r clusterRef) (*cluster.Client, error) {
+	if r.Meta == nil {
+		return nil, errors.New("test: a plan's reader needs the instance's record")
+	}
+	host, _, err := net.SplitHostPort(r.Meta.Endpoint)
+	if ip := net.ParseIP(host); err != nil || ip == nil || !ip.IsLoopback() {
+		return nil, fmt.Errorf("test: a plan's reader opens only a loopback test server, and the record names %q", r.Meta.Endpoint)
+	}
+	return openReader(r)
 }
 
 // planCommands is every --plan shape of the commands wired so far: kernel
 // meter, kernel confirm and reader grant (ADR 0023 M2.6a), none of which
 // reads the cluster; connect and redeploy (M2.6b), which read none either
-// and read the registry through their fakes; and build (M2.6b), which reads
-// neither the cluster nor Google. kernel confirm reads planClock; through
-// the router, pinPlanClock fixes the same clock.
+// and read the registry through their fakes; build (M2.6b), which reads
+// neither the cluster nor Google; kernel deploy and storage deploy (M2.6c),
+// which read the cluster as the instance's reader, through loopbackReader
+// against the fixture's kubetest, and the registry through their fakes;
+// storage key pin (M2.6c), which reads the cluster as the reader and no
+// Google; and storage key rotate (M2.6c), which reads the cluster as the
+// reader when a keyholder is deployed, and no cluster otherwise, and no
+// Google. kernel confirm reads planClock; through the router, pinPlanClock
+// fixes the same clock.
 func planCommands() []planCommand {
 	meter := func() Command { return &kernelMeterCommand{} }
 	confirm := func() Command {
@@ -1424,6 +1534,88 @@ func planCommands() []planCommand {
 			return c
 		}
 	}
+	// kernel deploy, its deployer as connect's, and its plan's reader the
+	// instance's, against the fixture's kubetest, the identity it was asked
+	// for recorded.
+	kernelDeploy := func(f *planFakes) func() Command {
+		return func() Command {
+			c := &kernelDeployCommand{}
+			deployer(&c.deployer, f)
+			c.newPlanReader = func(r clusterRef) (kernelPlanReader, error) {
+				f.readers = append(f.readers, r.Identity)
+				cl, err := loopbackReader(r)
+				if err != nil {
+					return nil, err
+				}
+				return cl, nil
+			}
+			return c
+		}
+	}
+	// A plan's reader seam of the storage commands: the instance's reader,
+	// against the fixture's kubetest, the identity it was asked for
+	// recorded.
+	pinReader := func(f *planFakes) func(clusterRef) (pinPlanReader, error) {
+		return func(r clusterRef) (pinPlanReader, error) {
+			f.readers = append(f.readers, r.Identity)
+			cl, err := loopbackReader(r)
+			if err != nil {
+				return nil, err
+			}
+			return cl, nil
+		}
+	}
+	// The pin store as the writer, which no plan opens.
+	pinWriter := func(f *planFakes) pinStoreOpener {
+		return func(clusterRef) (pinStore, error) {
+			f.writers++
+			return nil, errors.New("test: a plan opened the pin as the writer")
+		}
+	}
+	// storage deploy, its deployer as connect's, its storage mint counting,
+	// its pin store as the writer refused, and its plan's reader the
+	// instance's.
+	storageDeploy := func(f *planFakes) func() Command {
+		return func() Command {
+			c := &storageDeployCommand{}
+			deployer(&c.deployer, f)
+			c.ensureStorage = func(context.Context, *Env, string) error {
+				f.storages++
+				return errors.New("test: a plan minted storage")
+			}
+			c.newPinStore = pinWriter(f)
+			c.newPlanReader = pinReader(f)
+			return c
+		}
+	}
+	// storage key pin, its pin store as the writer refused, its keyholder
+	// counting, and its plan's reader the instance's.
+	keyPin := func(f *planFakes) func() Command {
+		return func() Command {
+			c := &keyPinCommand{}
+			c.newPinStore = pinWriter(f)
+			c.newKeyholder = func(context.Context, *Env, string) (sealStateClient, func(), error) {
+				f.keyholders++
+				return nil, nil, errors.New("test: a plan opened the keyholder")
+			}
+			c.newPlanReader = pinReader(f)
+			return c
+		}
+	}
+	// storage key rotate, its pin store as the writer refused, its keyholder
+	// counting, and its plan's reader the instance's.
+	keyRotate := func(f *planFakes) func() Command {
+		return func() Command {
+			c := &keyRotateCommand{}
+			c.newPinStore = pinWriter(f)
+			c.newKeyholder = func(context.Context, *Env, string) (sealStateClient, func(), error) {
+				f.keyholders++
+				return nil, nil, errors.New("test: a plan opened the keyholder")
+			}
+			c.newPlanReader = pinReader(f)
+			return c
+		}
+	}
 	fakes := func(resolve func(string) (string, error)) *planFakes {
 		return &planFakes{provider: &fakeProvider{}, builder: &fakeBuilder{resolveFn: resolve}}
 	}
@@ -1433,6 +1625,13 @@ func planCommands() []planCommand {
 	buildFlags := []string{"--repo", "https://github.com/example/repo.git", "--app", "api"}
 	first, resumed, lost, again, source := fakes(notFoundForTags), fakes(nil), fakes(nil), fakes(nil), fakes(nil)
 	redeployed, rebuilt, named, recordedBuilder := fakes(notFoundForTags), fakes(nil), fakes(nil), fakes(nil)
+	kernelCarried, kernelBelow, kernelNamed, kernelMissing := fakes(notFoundForTags), fakes(nil), fakes(nil), fakes(nil)
+	belowFloor := func(m *config.InstanceMetadata) { m.CostLimit.Amount = 50 }
+	storageCarried, storageFirst, storageBehind, storageNamed := fakes(notFoundForTags), fakes(notFoundForTags), fakes(notFoundForTags), fakes(nil)
+	pinNew, pinUnion, pinLowered, pinBelow := fakes(nil), fakes(nil), fakes(nil), fakes(nil)
+	noStorage := func(m *config.InstanceMetadata) { m.Storage = nil }
+	rotateHanded, rotateAlone, rotateBelow := fakes(nil), fakes(nil), fakes(nil)
+	noKeyholderDeployed := func(m *config.InstanceMetadata) { m.Keyholder = nil }
 
 	return []planCommand{
 		{name: "kernel meter", shape: "add", args: []string{writeName, writeNewNamespace}, cmd: meter},
@@ -1456,8 +1655,109 @@ func planCommands() []planCommand {
 		{name: "build", shape: "a named builder", args: []string{writeName}, flags: append(slices.Clone(buildFlags), "--builder-image", builderDigest), cmd: build(named), fakes: named},
 		{name: "build", shape: "a recorded builder", args: []string{writeName}, flags: append(slices.Clone(buildFlags), "--ref", "refs/tags/v2", "--context", "svc", "--containerfile", "svc/Containerfile"),
 			cmd: build(recordedBuilder), edit: builderRecorded, fakes: recordedBuilder},
+		// A kernel deploy pushes the carried image, whose version tag the
+		// registry lacks; below the floor, it binds that as a fact; with
+		// --technocore-image it still reads the registry, which it ensures;
+		// and a namespace the cluster lacks blocks it.
+		{name: "kernel deploy", shape: "the carried image", args: []string{writeName}, readsCluster: true, cmd: kernelDeploy(kernelCarried),
+			seed: systemNamespace, fakes: kernelCarried},
+		{name: "kernel deploy", shape: "below the floor", args: []string{writeName}, readsCluster: true, cmd: kernelDeploy(kernelBelow),
+			edit: belowFloor, seed: systemNamespace, fakes: kernelBelow},
+		{name: "kernel deploy", shape: "a named image", args: []string{writeName}, flags: []string{"--technocore-image", namedKernelImage},
+			readsCluster: true, cmd: kernelDeploy(kernelNamed), seed: systemNamespace, fakes: kernelNamed},
+		{name: "kernel deploy", shape: "a missing namespace", args: []string{writeName}, flags: []string{"--namespaces", "web"},
+			readsCluster: true, cmd: kernelDeploy(kernelMissing), seed: systemNamespace, fakes: kernelMissing},
+		// A storage deploy over the recorded bucket pushes the carried
+		// image, and creates the pin, which the cluster lacks; a first one
+		// creates the bucket and mints the keyring too; with
+		// --datasphered-image it still reads the registry, which it
+		// ensures; and a keyring the pin is above blocks it.
+		{name: "storage deploy", shape: "the recorded bucket", args: []string{writeName}, readsCluster: true, cmd: storageDeploy(storageCarried),
+			prepare: writeMaterial, seed: systemNamespace, fakes: storageCarried},
+		{name: "storage deploy", shape: "a first deploy", args: []string{writeName}, readsCluster: true, cmd: storageDeploy(storageFirst),
+			edit: noStorage, prepare: noKeyring, seed: systemNamespace, fakes: storageFirst},
+		{name: "storage deploy", shape: "a named image", args: []string{writeName}, flags: []string{"--datasphered-image", namedKeyholderImage},
+			readsCluster: true, cmd: storageDeploy(storageNamed), prepare: writeMaterial, seed: systemNamespace, fakes: storageNamed},
+		{name: "storage deploy", shape: "behind the pin", args: []string{writeName}, readsCluster: true, cmd: storageDeploy(storageBehind),
+			prepare: writeMaterial, seed: pinSeeded(pinRequiringForeign), fakes: storageBehind},
+		// A key pin creates the pin the cluster lacks; with --replace over
+		// a pin it is not behind it raises it to the union, lowering
+		// nothing; with --replace from behind the pin it lowers it; and
+		// without --replace from behind the pin it is blocked.
+		{name: "storage key pin", shape: "a pin to write", args: []string{writeName}, readsCluster: true, cmd: keyPin(pinNew),
+			seed: systemNamespace, fakes: pinNew},
+		{name: "storage key pin", shape: "--replace over a pin it is not behind", args: []string{writeName}, flags: []string{"--replace"},
+			readsCluster: true, cmd: keyPin(pinUnion), seed: pinSeeded(pinRetiringForeign), fakes: pinUnion},
+		{name: "storage key pin", shape: "--replace from behind the pin", args: []string{writeName}, flags: []string{"--replace"},
+			readsCluster: true, cmd: keyPin(pinLowered), seed: pinSeeded(pinRequiringForeign), fakes: pinLowered},
+		{name: "storage key pin", shape: "behind the pin", args: []string{writeName}, readsCluster: true, cmd: keyPin(pinBelow),
+			seed: pinSeeded(pinRequiringForeign), fakes: pinBelow},
+		// A rotate with a keyholder deployed reads the cluster and plans the
+		// two pins the hand-over writes, the first a create of the pin the
+		// cluster lacks; one with none deployed reads no cluster and writes
+		// no pin; and a keyring the pin is above blocks it.
+		{name: "storage key rotate", shape: "with a keyholder", args: []string{writeName}, readsCluster: true, cmd: keyRotate(rotateHanded),
+			seed: systemNamespace, fakes: rotateHanded},
+		{name: "storage key rotate", shape: "no keyholder", args: []string{writeName}, cmd: keyRotate(rotateAlone),
+			edit: noKeyholderDeployed, fakes: rotateAlone},
+		{name: "storage key rotate", shape: "behind the pin", args: []string{writeName}, readsCluster: true, cmd: keyRotate(rotateBelow),
+			seed: pinSeeded(pinRequiringForeign), fakes: rotateBelow},
 	}
 }
+
+// foreignKeyID is a key id no fixture's keyring holds.
+const foreignKeyID = "00112233aabbccdd"
+
+// The pins the storage rows seed (pinSeeded): one that retires a key no
+// keyring here holds, which a keyring is not behind and a raise unions in;
+// and one that requires it, which every keyring here is behind.
+var (
+	pinRetiringForeign  = foreignPin(false)
+	pinRequiringForeign = foreignPin(true)
+)
+
+// foreignPin is a pin of foreignKeyID alone, required or retired.
+func foreignPin(require bool) string {
+	id, err := datasphere.ParseKeyID(foreignKeyID)
+	if err != nil {
+		panic(err)
+	}
+	if require {
+		return dskeyholder.Pin{Require: []datasphere.KeyID{id}}.Marshal()
+	}
+	return dskeyholder.Pin{Retired: []datasphere.KeyID{id}}.Marshal()
+}
+
+// pinSeeded puts farcast-system (systemNamespace) and the key pin, holding
+// value, in s.
+func pinSeeded(value string) func(s *kubetest.Server) {
+	return func(s *kubetest.Server) {
+		systemNamespace(s)
+		s.Put(map[string]any{
+			"apiVersion": "v1", "kind": "ConfigMap",
+			"metadata": map[string]any{"name": dsdeploy.PinConfigMapName(""), "namespace": dsdeploy.DefaultNamespace},
+			"data":     map[string]any{dsdeploy.PinKey: value},
+		})
+	}
+}
+
+// noKeyring is a first storage deploy's fixture: the instance's mTLS
+// material (writeMaterial), and no keyring on this machine, which the
+// deploy's storage mint makes.
+func noKeyring(t *testing.T, dir config.Dir) {
+	t.Helper()
+	writeMaterial(t, dir)
+	if err := os.Remove(dir.InstanceKeyringPath(writeName)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// namedKernelImage and namedKeyholderImage are operator-named TechnoCore and
+// keyholder images: digest-pinned, as every image flag must be.
+var (
+	namedKernelImage    = "registry.example/technocore@" + sha("7")
+	namedKeyholderImage = "registry.example/datasphered@" + sha("8")
+)
 
 // planCommandNamed is the planCommands row of name and shape.
 func planCommandNamed(t *testing.T, name, shape string) planCommand {
@@ -1482,7 +1782,17 @@ func planFixture(t *testing.T, row planCommand) (*kubetest.Server, config.Dir) {
 // Credentials wrote it otherwise.
 func planFixtureKeyed(t *testing.T, row planCommand, keyed bool) (*kubetest.Server, config.Dir) {
 	t.Helper()
-	s := kubetest.New(t)
+	return planFixtureWith(t, row, keyed)
+}
+
+// planFixtureWith is planFixtureKeyed on a kubetest server started with
+// opts.
+func planFixtureWith(t *testing.T, row planCommand, keyed bool, opts ...kubetest.Option) (*kubetest.Server, config.Dir) {
+	t.Helper()
+	s := kubetest.New(t, opts...)
+	if row.seed != nil {
+		row.seed(s)
+	}
 	dir, meta := writeInstance(t, s, keyed)
 	if row.edit != nil {
 		row.edit(meta)
@@ -1642,13 +1952,14 @@ func writeTargets(b plan.Bound) []string {
 	return out
 }
 
-// ADR 0023 M2.6 (rows 72, 73): --plan writes nothing. Every shape, in both
-// modes, leaves the config directory byte for byte as it was, reaches the
-// cluster only with GETs as its reader if it reads it at all (and not at all
-// if not), and runs no kubectl. A command with a provider, a registry or a
-// builder (connect's, redeploy's, build's) ensures and deletes no registry,
-// builds and pushes no image (its token and lookups are reads), opens no
-// writer and dials nothing.
+// ADR 0023 M2.6 (rows 72, 73, 72a): --plan writes nothing. Every shape, in
+// both modes, leaves the config directory byte for byte as it was, reaches
+// the cluster only with GETs as its reader if it reads it at all (and not at
+// all if not), and runs no kubectl. A command with a provider, a registry or
+// a builder (connect's, redeploy's, build's, kernel deploy's, storage
+// deploy's) ensures and deletes no registry, builds and pushes no image (its
+// token and lookups are reads), opens no writer and dials nothing; storage
+// deploy mints no storage, and storage key pin opens no keyholder.
 func TestPlansWriteNothing(t *testing.T) {
 	ran := strayKubectl(t)
 	for _, row := range planCommands() {
@@ -1673,26 +1984,59 @@ func TestPlansWriteNothing(t *testing.T) {
 				if len(f.builder.built)+len(f.builder.embedded) != 0 {
 					t.Errorf("%s --plan built %d images and pushed %d", row, len(f.builder.built), len(f.builder.embedded))
 				}
-				if f.writers+f.dialled != 0 {
-					t.Errorf("%s --plan opened the writer %d times and dialled %d", row, f.writers, f.dialled)
+				if f.writers+f.dialled+f.storages+f.keyholders != 0 {
+					t.Errorf("%s --plan opened the writer %d times, dialled %d, minted storage %d times and opened the keyholder %d times",
+						row, f.writers, f.dialled, f.storages, f.keyholders)
 				}
 			}
-			reqs := s.Requests()
-			if !row.readsCluster && len(reqs) != 0 {
-				t.Errorf("%s --plan reads no cluster, and sent %d requests", row, len(reqs))
-			}
-			for _, r := range reqs {
-				switch {
-				case r.Path == "/token" && r.As != "reader":
-					t.Errorf("%s --plan minted a token as %q", row, r.As)
-				case r.Path != "/token" && r.Method != http.MethodGet:
-					t.Errorf("%s --plan sent %s %s", row, r.Method, r.Path)
-				}
-			}
+			onlyThePlansReads(t, row, s)
 		})
 	}
 	if ran() {
 		t.Error("a plan ran kubectl")
+	}
+}
+
+// ADR 0023 M2.6 (A23-25, A23-45, mutation 91e): a plan opens keys.yaml for
+// its key ids and their times, and carries none of its key material. Every
+// plan of the storage commands — storage deploy's, storage key pin's and
+// storage key rotate's — whose fixture holds a keyring, printed in JSON and
+// in text, holds no key of it in base64 (padded or not, standard or URL) or
+// in hex; and none opens the CA's key, a server's key or the operator's.
+// (run's plans join it in ADR 0023 M2.6d.)
+func TestPlansCarryNoKeyMaterial(t *testing.T) {
+	rows := 0
+	for _, row := range planCommands() {
+		if !strings.HasPrefix(row.name, "storage ") {
+			continue
+		}
+		t.Run(row.String(), func(t *testing.T) {
+			_, dir := planFixture(t, row)
+			if held, err := dir.InstanceKeyringExists(writeName); err != nil || !held {
+				t.Skipf("no keyring to leak (%v)", err)
+			}
+			rows++
+			encoded, raw := keyMaterialOf(t, dir, writeName)
+			reads := observeConfigReads(t)
+			_, js := runPlan(t, dir, row, output.ModeJSON)
+			_, text := runPlan(t, dir, row, output.ModeHuman)
+			for i, key := range raw {
+				for _, form := range []string{encoded[i], base64.StdEncoding.EncodeToString(key), base64.RawStdEncoding.EncodeToString(key),
+					base64.URLEncoding.EncodeToString(key), base64.RawURLEncoding.EncodeToString(key), hex.EncodeToString(key)} {
+					if strings.Contains(js, form) || strings.Contains(text, form) {
+						t.Errorf("%s --plan prints key %d of keys.yaml, as %s", row, i, form)
+					}
+				}
+			}
+			for _, p := range reads() {
+				if base := filepath.Base(p); base == "ca.key" || base == "server.key" || base == "client.key" {
+					t.Errorf("%s --plan read %s", row, p)
+				}
+			}
+		})
+	}
+	if rows == 0 {
+		t.Fatal("no plan of a storage command ran over a keyring")
 	}
 }
 
@@ -1761,6 +2105,39 @@ func TestPlanIsDeterministic(t *testing.T) {
 			t.Errorf("two readings on 2026-11-16 bind different plans:\n%s\n%s", docs[0].Bound, docs[1].Bound)
 		}
 	})
+	// A23-44: storage key pin --replace over a pin this keyring is not
+	// behind plans the union with that pin, lowering nothing, twice alike;
+	// its --confirm writes exactly that pin, and an interactive --replace
+	// (here --yes) from the same pin writes the same one.
+	t.Run("storage key pin/--replace over a pin it is not behind", func(t *testing.T) {
+		dir, keys, ps := keyPinFixture(t)
+		seeded := dskeyholder.Pin{Retired: []datasphere.KeyID{foreignID(t)}}
+		union := pinFor(keys).Union(seeded)
+		ps.set(seeded.Marshal())
+		first := runKeyPinPlan(t, dir, nil, "--replace")
+		second := runKeyPinPlan(t, dir, nil, "--replace")
+		if !bytes.Equal(first.Bound, second.Bound) {
+			t.Errorf("two plans from one state differ:\n%s\n%s", first.Bound, second.Bound)
+		}
+		f := pinFactOf(t, decodedBound(t, first))
+		if !pinOfFact(t, f).Equal(union) || len(f.Lowering) != 0 || f.Repairing {
+			t.Fatalf("the plan's pin is %+v; want the union %s, lowering nothing", f, union.Marshal())
+		}
+		if _, stderr, err := runKeyPinConfirm(t, dir, nil, first, "--replace"); err != nil {
+			t.Fatalf("--confirm: %v\n%s", err, stderr)
+		}
+		confirmed := ps.pin(t)
+		ps.set(seeded.Marshal())
+		c := withFlags(t, &keyPinCommand{}, "--replace", "--yes")
+		c.newKeyholder = noKeyholder
+		env, _, errb := testEnvBoth(dir, output.ModeJSON)
+		if err := c.Run(t.Context(), env, []string{writeName}); err != nil {
+			t.Fatalf("--replace --yes: %v\n%s", err, errb)
+		}
+		if !confirmed.Equal(union) || !ps.pin(t).Equal(union) {
+			t.Errorf("--confirm wrote %s and --replace --yes %s; want both the planned union %s", confirmed.Marshal(), ps.value, union.Marshal())
+		}
+	})
 }
 
 // ADR 0023 M2.6 (A23-33, A23-35; review M-M26B-MUT-04 and -05): connect's
@@ -1816,11 +2193,14 @@ func TestConnectPlanFactsFollowItsState(t *testing.T) {
 
 // ADR 0023 M2.6 (A23-24, §7.3), mutation 73a: which plans read the
 // installer's key, the one credential that writes. In M2.6 a plan reads it
-// only for the registry: connect's first deploy and resume, and redeploy,
-// read it; connect's reconnect, build (which resolves a builder tag only
+// only for the registry: connect's first deploy and resume, redeploy,
+// kernel deploy and storage deploy, each with its image named or not, read it;
+// connect's reconnect, build (which resolves a builder tag only
 // anonymously, to refuse it, until M2.8's push grant), and kernel meter's,
-// kernel confirm's and reader grant's plans, have no registry read, and
-// none reads credentials.yaml. A plan of the read group on an instance
+// kernel confirm's, reader grant's and storage key pin's plans, have no
+// registry read, and none reads credentials.yaml, nor does a kernel deploy
+// blocked by a missing namespace, or a storage deploy blocked by the pin,
+// which read nothing after their block (A23-18). A plan of the read group on an instance
 // installed without a key (Application Default Credentials) is refused
 // credential_missing, before the provider opens.
 func TestPlansStillReadTheInstallerKeyForGoogle(t *testing.T) {
@@ -1828,6 +2208,9 @@ func TestPlansStillReadTheInstallerKeyForGoogle(t *testing.T) {
 	readsKey := map[string]bool{
 		"kernel meter": false, "kernel confirm": false, "reader grant": false,
 		"connect": true, "connect/reconnect": false, "redeploy": true, "build": false,
+		"kernel deploy": true, "kernel deploy/a missing namespace": false,
+		"storage deploy": true, "storage deploy/behind the pin": false, "storage key pin": false,
+		"storage key rotate": false,
 	}
 	groupOf := func(row planCommand) (bool, bool) {
 		if want, ok := readsKey[row.String()]; ok {
@@ -1872,8 +2255,10 @@ func TestPlansStillReadTheInstallerKeyForGoogle(t *testing.T) {
 // ADR 0023 M2.6 (A23-26), mutation 91a: under --plan, a line a command
 // prints while it works is a notice fact and is not printed; outside a plan
 // it is printed once, in the same words. Rows for meteredReader's warning,
-// kernel meter's no-op, kernel confirm's empty window, and connect's and
-// redeploy's keepingNote. (M2.6c adds rotationScopeWarning.)
+// kernel meter's no-op, kernel confirm's empty window, connect's and
+// redeploy's keepingNote, kernel deploy's dropped namespace, storage
+// deploy's bucket grant, storage key pin --replace's lowering warning, and
+// storage key rotate's rotationScopeWarning, the last three several lines.
 func TestPlanPrintsNoticesOnlyAsFacts(t *testing.T) {
 	keeper := fatlineDeployer{component: components.FatLine, carried: newFakeCarried()}
 	kept := config.SystemImage{Image: imageIn("fatline", "a"), Origin: config.OriginOperator, Go: "go1.27.5",
@@ -1911,7 +2296,7 @@ func TestPlanPrintsNoticesOnlyAsFacts(t *testing.T) {
 			}
 			return func(flags ...string) Command {
 				c := testConnect(&fakeProvider{}, &fakeBuilder{})
-				c.newCluster = func(clusterRef) (clusterApplier, error) { return &fakeCluster{ip: "34.0.0.1"}, nil }
+				c.newCluster = func(clusterRef) (clusterApplier, error) { return &fakeCluster{ip: "203.0.113.1"}, nil }
 				c.dial = connectedDial()
 				return withFlags(t, c, flags...)
 			}, []string{prodName}
@@ -1934,6 +2319,87 @@ func TestPlanPrintsNoticesOnlyAsFacts(t *testing.T) {
 				return withFlags(t, c, flags...)
 			}, []string{prodName}
 		}, keeper.keepingNote(kept)},
+		// kernel deploy's plan reads the cluster as the reader, here a fake
+		// that has farcast-system and not the namespace the record meters
+		// too; outside a plan it asks the cost, so its run there answers
+		// with --yes, reading the same fake as the writer.
+		{"kernel deploy's dropped namespace", func(t *testing.T, dir config.Dir) (func(...string) Command, []string) {
+			meta := planNoticeInstance(t, dir, "p44")
+			meta.Kernel = &config.Kernel{Deployed: true, Applied: true, Namespaces: []string{tcdeploy.DefaultNamespace, "gone"}}
+			if err := dir.SaveInstanceMetadata(meta.Name, meta); err != nil {
+				t.Fatal(err)
+			}
+			fc := &fakeCluster{namespaces: []string{tcdeploy.DefaultNamespace}, uid: "u1"}
+			return func(flags ...string) Command {
+				if len(flags) == 0 {
+					flags = []string{"--yes"}
+				}
+				c := withFlags(t, &kernelDeployCommand{}, flags...)
+				noticeDeployer(&c.deployer, fc)
+				c.newPlanReader = func(clusterRef) (kernelPlanReader, error) { return fc, nil }
+				return c
+			}, []string{meta.Name}
+		}, fmt.Sprintf(msgNoLongerMetering, "gone")},
+		// storage deploy's plan names the bucket grant its run prints
+		// before the apply (A23-12); outside a plan it asks the cost, so its
+		// run there answers with --yes. Its pin is the instance's in-memory
+		// one, read as the reader in the plan and as the writer outside it.
+		{"storage deploy's bucket grant", func(t *testing.T, dir config.Dir) (func(...string) Command, []string) {
+			meta := planNoticeInstance(t, dir, "p45")
+			meta.Storage = &config.Storage{Bucket: "farcast-p45-0a1b2c3d", Provider: "gcs", Location: meta.Region}
+			if err := dir.SaveInstanceMetadata(meta.Name, meta); err != nil {
+				t.Fatal(err)
+			}
+			pinStoreOf(dir, meta.Name).uid = "u1"
+			fc := &fakeCluster{uid: "u1"}
+			return func(flags ...string) Command {
+				if len(flags) == 0 {
+					flags = []string{"--yes"}
+				}
+				c := withFlags(t, &storageDeployCommand{}, flags...)
+				noticeDeployer(&c.deployer, fc)
+				c.newPinStore = testDefaultPinStore
+				c.newPlanReader = testPinPlanReader
+				c.ensureStorage = func(context.Context, *Env, string) error { return errors.New("test: the bucket is recorded") }
+				return c
+			}, []string{meta.Name}
+		}, bucketGrantText("proj-test1", "farcast-p45-0a1b2c3d")},
+		// storage key pin --replace from a keyring behind the pin: its plan
+		// names what lowering it admits again; outside a plan it says so
+		// before it asks, so its run there answers with --yes. The pin is
+		// the instance's in-memory one, holding a key this keyring lacks.
+		{"storage key pin --replace's lowering", func(t *testing.T, dir config.Dir) (func(...string) Command, []string) {
+			meta := planNoticeInstance(t, dir, "p46")
+			meta.Keyholder = &config.Keyholder{Deployed: true, Replicas: 2}
+			if err := dir.SaveInstanceMetadata(meta.Name, meta); err != nil {
+				t.Fatal(err)
+			}
+			saveKeyring(t, dir, meta.Name, appsKeyring(t, "web"))
+			ps := pinStoreOf(dir, meta.Name)
+			ps.uid = "u1"
+			ps.set(pinRequiringForeign)
+			return func(flags ...string) Command {
+				if len(flags) == 0 {
+					flags = []string{"--yes"}
+				}
+				c := withFlags(t, &keyPinCommand{}, append([]string{"--replace"}, flags...)...)
+				c.newPlanReader = testPinPlanReader
+				c.newKeyholder = noKeyholder
+				return c
+			}, []string{meta.Name}
+		}, keyPinLowerWarning(&pinBehind{Missing: []string{foreignKeyID}})},
+		// Outside a plan, rotate asks, so its run there answers with --yes;
+		// with no keyholder deployed it hands nothing over.
+		{"rotate's rotationScopeWarning", func(t *testing.T, dir config.Dir) (func(...string) Command, []string) {
+			kernelInstance(t, dir, "p43")
+			saveKeyring(t, dir, "p43", appsKeyring(t, "web"))
+			return func(flags ...string) Command {
+				if len(flags) == 0 {
+					flags = []string{"--yes"}
+				}
+				return withFlags(t, &keyRotateCommand{newKeyholder: noKeyholder}, flags...)
+			}, []string{"p43"}
+		}, rotationScopeWarning},
 	} {
 		t.Run(row.name, func(t *testing.T) {
 			dir := config.Dir(t.TempDir())
@@ -1950,8 +2416,8 @@ func TestPlanPrintsNoticesOnlyAsFacts(t *testing.T) {
 					if got := noticesOf(decodedBound(t, printedDocument(t, out.Bytes()))); !slices.Contains(got, row.want) {
 						t.Errorf("the plan's notices are %q; want %q among them", got, row.want)
 					}
-				} else if !strings.Contains(out.String(), "notice: "+row.want+"\n") {
-					t.Errorf("the rendering does not show the notice %q:\n%s", row.want, out)
+				} else if want := strings.Join(noticeLines(noticeFact(row.want)), "\n") + "\n"; !strings.Contains(out.String(), want) {
+					t.Errorf("the rendering does not show the notice %q:\n%s", want, out)
 				}
 			}
 			env, _, errb := testEnvBoth(dir, output.ModeHuman)
@@ -1963,6 +2429,41 @@ func TestPlanPrintsNoticesOnlyAsFacts(t *testing.T) {
 			}
 		})
 	}
+}
+
+// planNoticeInstance is TestPlanPrintsNoticesOnlyAsFacts's instance for the
+// commands whose plans read the cluster (ADR 0023 M2.6c): installed in
+// project proj-test1 with the installer's stand-in key, its registry
+// recorded, connected with its material minted, and its reader granted the
+// metered scope, its key on this machine. The rows add what each command
+// needs.
+func planNoticeInstance(t *testing.T, dir config.Dir, name string) *config.InstanceMetadata {
+	t.Helper()
+	meta := connectedInstance(t, dir, name)
+	meta.Project = "proj-test1"
+	recordRegistry(meta, derivedRegistry(registrySpec(meta)))
+	meta.Reader = &config.Reader{Email: readerEmail(name, "proj-test1"), KeyID: readerTestKeyID, GrantedAt: readerGrantedAt, Scope: readerScopeMetered}
+	if err := dir.SaveInstanceMetadata(name, meta); err != nil {
+		t.Fatal(err)
+	}
+	if err := dir.SaveReaderKey(name, []byte("not read"), []byte("not read")); err != nil {
+		t.Fatal(err)
+	}
+	return meta
+}
+
+// noticeDeployer is d as TestPlanPrintsNoticesOnlyAsFacts's rows run it: a
+// release carrying the fake components, its provider and builder fakes, its
+// checkout and Go fakes, and its writer fc.
+func noticeDeployer(d *fatlineDeployer, fc *fakeCluster) {
+	asRelease(d, nil)
+	d.openProvider = func(*config.InstanceMetadata, *config.InstanceCredentials) (planck.Provider, error) {
+		return &fakeProvider{}, nil
+	}
+	d.newBuilder = func(func(string)) imageBuilder { return &fakeBuilder{} }
+	d.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
+	d.findSource = func(string) (string, error) { return "/checkouts/farcast", nil }
+	d.findToolchain = fakeToolchain
 }
 
 // adcInstall is an instance installed with Application Default Credentials:
@@ -2109,6 +2610,35 @@ func TestConfirmRefusesAMovedRegistry(t *testing.T) {
 			})
 		}
 	}
+	// kernel deploy and storage deploy (ADR 0023 M2.6c; rows O52 and O53 of
+	// the M2.6c review): the same refusal, the same kinds.
+	for _, sc := range singleImageCommands() {
+		for _, answer := range []string{"--confirm", "--yes"} {
+			t.Run(sc.name+"/"+answer, func(t *testing.T) {
+				r := sc.rig(t, nil)
+				planned := registryPrefix(r.meta(t))
+				flags := []string{answer}
+				if answer == "--confirm" {
+					flags = append(flags, r.plan(t).Digest)
+				}
+				r.fp.registry = moved
+				_, errb, err := r.run(t, flags...)
+				want, kind := fmt.Sprintf(msgRegistryMoved, writeName, moved.Prefix, planned), kindInternal
+				if answer == "--confirm" {
+					want, kind = want+"; "+msgPlanAgain, kindPlanChanged
+				}
+				if err == nil || err.Error() != want || kindOf(classified(err)) != kind {
+					t.Fatalf("%s %s over a moved registry = %v (kind %s); want %q, %s\n%s", sc.name, answer, err, kindOf(classified(err)), want, kind, errb)
+				}
+				if len(r.fb.embedded)+len(r.fb.built)+len(r.fc.applied) != 0 {
+					t.Errorf("pushed %d, built %d and applied %d over a moved registry", len(r.fb.embedded), len(r.fb.built), len(r.fc.applied))
+				}
+				if registryPrefix(r.meta(t)) != moved.Prefix {
+					t.Errorf("the registry ensured was not recorded, as the refusal says it was: %q", registryPrefix(r.meta(t)))
+				}
+			})
+		}
+	}
 }
 
 // ADR 0023 M2.6 (A23-10): a farcast whose carried components it must not
@@ -2216,6 +2746,15 @@ type kubectlCall struct {
 // cat by its path. calls reports every run, in order.
 func succeedingKubectl(t *testing.T) (calls func() []kubectlCall) {
 	t.Helper()
+	calls, _ = succeedingKubectlRuns(t)
+	return calls
+}
+
+// succeedingKubectlRuns is succeedingKubectl, and runs, which counts the
+// runs begun so far by the files they left. runs never fails the test, so a
+// kubetest server's goroutine may ask it (WithAnswered).
+func succeedingKubectlRuns(t *testing.T) (calls func() []kubectlCall, runs func() int) {
+	t.Helper()
 	bin, saw := t.TempDir(), t.TempDir()
 	script := "#!/bin/sh\nn=0\nwhile [ -e '" + saw + "'/$n.argv ]; do n=$((n+1)); done\n" +
 		"for a in \"$@\"; do printf '%s\\000' \"$a\"; done > '" + saw + "'/$n.argv\n" +
@@ -2224,6 +2763,15 @@ func succeedingKubectl(t *testing.T) (calls func() []kubectlCall) {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin)
+	runs = func() int {
+		n := 0
+		for {
+			if _, err := os.Stat(filepath.Join(saw, strconv.Itoa(n)+".argv")); err != nil {
+				return n
+			}
+			n++
+		}
+	}
 	return func() []kubectlCall {
 		var out []kubectlCall
 		for n := 0; ; n++ {
@@ -2240,7 +2788,7 @@ func succeedingKubectl(t *testing.T) (calls func() []kubectlCall) {
 			}
 			out = append(out, kubectlCall{Args: strings.Split(strings.TrimSuffix(string(argv), "\x00"), "\x00"), Stdin: stdin})
 		}
-	}
+	}, runs
 }
 
 // appliedStreams is what the stand-in kubectl was given to apply, in order.
@@ -2298,7 +2846,9 @@ func masked(doc []byte) []byte {
 // kubetest, its kubectl the succeeding stand-in, which records the stream it
 // is given; the command then fails at its first read after the apply (the
 // rollout, or the build's Job, which kubetest does not hold), which this
-// test does not need. FatLine's stream, from connect's first deploy (which
+// test does not need. storage deploy, storage key pin and storage key rotate
+// have their own rows (ADR 0023 M2.6c): the keyholder's stream and the
+// bucket, and the pins. FatLine's stream, from connect's first deploy (which
 // mints the material) and from redeploy (which loads it): the plan's write
 // facts are the planned rendering, over placeholder leaves and the plan's
 // images, and the applied documents equal it document for document once a
@@ -2431,4 +2981,1122 @@ func TestConfirmWritesThePlannedDocumentsExceptTheirSecrets(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("storage deploy", confirmWritesTheKeyholderAsPlanned)
+	t.Run("the key pin", confirmWritesThePinAsPlanned)
+	t.Run("storage key rotate", confirmWritesRotatesPinsAsPlanned)
+}
+
+// bucketArgument is the keyholder's --bucket= argument, which A23-31 item 6
+// lets a first storage deploy's confirm differ in from its plan.
+var bucketArgument = regexp.MustCompile(`--bucket=\S+`)
+
+// pinWriteBody is the body of the one write to the key pin among reqs, as
+// the writer sent it: its create or its replace.
+func pinWriteBody(t *testing.T, reqs []kubetest.Request) []byte {
+	t.Helper()
+	var bodies [][]byte
+	for _, r := range reqs {
+		if (r.Method == http.MethodPost || r.Method == http.MethodPut) && strings.Contains(r.Path, "/configmaps") {
+			if r.As != "writer" {
+				t.Errorf("the pin was written as %q", r.As)
+			}
+			bodies = append(bodies, r.Body)
+		}
+	}
+	if len(bodies) != 1 {
+		t.Fatalf("the pin was written %d times; want once", len(bodies))
+	}
+	return bodies[0]
+}
+
+// pinWriteFact is a plan's one write of the key pin, or nil.
+func pinWriteFact(b plan.Bound) *plan.WriteFact {
+	for _, f := range planWrites(b) {
+		if w := f.(plan.WriteFact); w.Name == dsdeploy.PinConfigMapName("") {
+			return &w
+		}
+	}
+	return nil
+}
+
+// sameSHA256 fails t unless body is the document whose SHA-256 the write
+// fact w binds.
+func sameSHA256(t *testing.T, what string, body []byte, w *plan.WriteFact) {
+	t.Helper()
+	if sum := sha256.Sum256(body); w == nil || hex.EncodeToString(sum[:]) != w.SHA256 {
+		t.Errorf("%s sent\n%s\nwhich is not the document the plan's write %+v binds", what, body, w)
+	}
+}
+
+// confirmWritesTheKeyholderAsPlanned is
+// TestConfirmWritesThePlannedDocumentsExceptTheirSecrets's rows for storage
+// deploy (ADR 0023 M2.6c, A23-31): planned as the instance's reader, then
+// confirmed through the instance's real writer against kubetest, its
+// kubectl the succeeding stand-in, over the recorded bucket and as a first
+// deploy, whose storage mint records the bucket the real one would draw.
+// The keyholder's stream the plan rendered — over the plan's image, the
+// instance's CA certificate, the placeholder leaf and the plan's bucket, a
+// placeholder on a first deploy — is the plan's write facts; the applied
+// documents equal it once a Secret's data and the mTLS hash are masked, and
+// on a first deploy the --bucket= argument too (items 1, 2 and 6), and
+// differ unmasked only in the Secret and the StatefulSet. The pin is written
+// in-process, as the writer: its body is the document whose SHA-256 the
+// plan's pin write binds, byte for byte, its key ids this keyring's own.
+func confirmWritesTheKeyholderAsPlanned(t *testing.T) {
+	const minted = "farcast-atlas-0a1b2c3d"
+	for _, first := range []bool{false, true} {
+		name := "over the recorded bucket"
+		if first {
+			name = "a first deploy"
+		}
+		t.Run(name, func(t *testing.T) {
+			calls := succeedingKubectl(t)
+			realPinOpener(t)
+			s := kubetest.New(t)
+			systemNamespace(s)
+			dir, meta := writeInstance(t, s, true)
+			writeMaterial(t, dir)
+			if first {
+				meta.Storage = nil
+				if err := dir.SaveInstanceMetadata(writeName, meta); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Remove(dir.InstanceKeyringPath(writeName)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			fp := &fakeProvider{registry: &planck.Registry{Ref: registryRefFor(meta), Prefix: meta.Registry.Prefix}}
+			fb := &fakeBuilder{resolveFn: notFoundForTags}
+			minting := 0
+			run := func(flags ...string) (string, string, error) {
+				c := withFlags(t, &storageDeployCommand{}, flags...)
+				asRelease(&c.deployer, nil)
+				c.deployer.openProvider = func(*config.InstanceMetadata, *config.InstanceCredentials) (planck.Provider, error) { return fp, nil }
+				c.deployer.newBuilder = func(func(string)) imageBuilder { return fb }
+				c.newPlanReader = func(r clusterRef) (pinPlanReader, error) {
+					cl, err := loopbackReader(r)
+					if err != nil {
+						return nil, err
+					}
+					return cl, nil
+				}
+				c.ensureStorage = func(_ context.Context, env *Env, name string) error {
+					minting++
+					_, err := env.ConfigDir.UpdateInstanceMetadata(name, func(m *config.InstanceMetadata) error {
+						m.Storage = &config.Storage{Bucket: minted, Provider: "gcs", Location: m.Region}
+						return nil
+					})
+					return err
+				}
+				env, out, errb := testEnvBoth(dir, output.ModeJSON)
+				err := c.Run(t.Context(), env, []string{writeName})
+				return out.String(), errb.String(), err
+			}
+			printed, _, err := run("--plan")
+			if err != nil {
+				t.Fatalf("--plan: %v", err)
+			}
+			doc := printedDocument(t, []byte(printed))
+			b := decodedBound(t, doc)
+			reads := len(s.Requests())
+			if _, errb, err := run("--confirm", doc.Digest); err != nil {
+				t.Fatalf("--confirm: %v\n%s", err, errb)
+			}
+			if wantMints := map[bool]int{false: 0, true: 1}[first]; minting != wantMints {
+				t.Errorf("minted storage %d times; want %d", minting, wantMints)
+			}
+			applied := appliedStreams(calls())
+			if len(applied) != 1 {
+				t.Fatalf("the stand-in kubectl applied %d streams; want the plan's one", len(applied))
+			}
+
+			// The keyholder's stream as the plan rendered it.
+			var target string
+			for _, f := range b.Facts {
+				if img, ok := f.(plan.ImageFact); ok && img.Component == components.Datasphered.Name {
+					target = img.Target
+				}
+			}
+			ca, err := dir.LoadInstanceCACert(writeName)
+			if err != nil {
+				t.Fatal(err)
+			}
+			bucket, provider, location := placeholderBucket(writeName), "gcs", meta.Region
+			if !first {
+				bucket, provider, location = meta.Storage.Bucket, meta.Storage.Provider, meta.Storage.Location
+			}
+			planned, err := dsdeploy.Render(keyholderConfig(meta, target, bucket, provider, location, ca,
+				keyholderLeafPlaceholder(writeName, "cert"), keyholderLeafPlaceholder(writeName, "key")))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var workload []plan.Fact
+			for _, f := range planWrites(b) {
+				if f.(plan.WriteFact).Name != dsdeploy.PinConfigMapName("") {
+					workload = append(workload, f)
+				}
+			}
+			if got := wantWrites(t, planned); !reflect.DeepEqual(got, workload) {
+				t.Fatalf("the plan's write facts are not the planned rendering:\n%#v\n%#v", workload, got)
+			}
+			plannedDocs, err := kube.SplitStream(planned)
+			if err != nil {
+				t.Fatal(err)
+			}
+			appliedDocs, err := kube.SplitStream(applied[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(appliedDocs) != len(plannedDocs) {
+				t.Fatalf("applied %d documents; the plan bound %d", len(appliedDocs), len(plannedDocs))
+			}
+			mask := func(doc []byte) []byte {
+				m := masked(doc)
+				if first {
+					m = bucketArgument.ReplaceAll(m, []byte("--bucket=<masked>"))
+				}
+				return m
+			}
+			differ := 0
+			for i, p := range plannedDocs {
+				a := appliedDocs[i]
+				if !bytes.Equal(mask(a.Raw), mask(p.Raw)) {
+					t.Errorf("document %d, %s %s/%s, differs from the plan beyond what may differ:\napplied:\n%s\nplanned:\n%s",
+						i, p.Kind.Kind, p.Namespace, p.Name, a.Raw, p.Raw)
+				}
+				if !bytes.Equal(a.Raw, p.Raw) {
+					differ++
+					if p.Kind.Kind != "Secret" && p.Kind.Kind != "StatefulSet" {
+						t.Errorf("document %d, a %s, differs unmasked", i, p.Kind.Kind)
+					}
+				}
+			}
+			if differ == 0 {
+				t.Error("no document differs from the planned rendering: the plan's placeholders are the real material, or this test masks nothing")
+			}
+
+			sameSHA256(t, "the pin's write", pinWriteBody(t, s.Requests()[reads:]), pinWriteFact(b))
+		})
+	}
+}
+
+// confirmWritesThePinAsPlanned is
+// TestConfirmWritesThePlannedDocumentsExceptTheirSecrets's rows for storage
+// key pin (ADR 0023 M2.6c, A23-44): planned as the instance's reader, then
+// confirmed through the instance's real writer against kubetest. Its pin,
+// created or raised to the union at the version read, is sent as the
+// document whose SHA-256 the plan's write binds, byte for byte: nothing in
+// it may differ, its key ids being this keyring's and the pin's own.
+func confirmWritesThePinAsPlanned(t *testing.T) {
+	for _, shape := range []string{"a pin to write", "--replace over a pin it is not behind"} {
+		t.Run(shape, func(t *testing.T) {
+			realPinOpener(t)
+			row := planCommandNamed(t, "storage key pin", shape)
+			s, dir := planFixture(t, row)
+			doc, _ := runPlan(t, dir, row, output.ModeJSON)
+			b := decodedBound(t, doc)
+			reads := len(s.Requests())
+			c := withFlags(t, &keyPinCommand{}, append(slices.Clone(row.flags), "--confirm", doc.Digest)...)
+			c.newPlanReader = func(r clusterRef) (pinPlanReader, error) {
+				cl, err := loopbackReader(r)
+				if err != nil {
+					return nil, err
+				}
+				return cl, nil
+			}
+			c.newKeyholder = noKeyholder
+			env, _, errb := testEnvBoth(dir, output.ModeJSON)
+			if err := c.Run(t.Context(), env, row.args); err != nil {
+				t.Fatalf("--confirm: %v\n%s", err, errb)
+			}
+			w := pinWriteFact(b)
+			if w == nil {
+				t.Fatalf("the plan writes no pin: %+v", b.Facts)
+			}
+			sameSHA256(t, "the pin's write", pinWriteBody(t, s.Requests()[reads:]), w)
+		})
+	}
+}
+
+// keyIDs are key ids as a pin's ConfigMap holds them: 16 hex each.
+var keyIDs = regexp.MustCompile(`[0-9a-f]{16}`)
+
+// confirmWritesRotatesPinsAsPlanned is
+// TestConfirmWritesThePlannedDocumentsExceptTheirSecrets's row for storage
+// key rotate (ADR 0023 M2.6c, A23-45): its plan binds two pin writes, the
+// hold at the version it read and the final pin as a replace at the version
+// the hold produces, both over the new keys' placeholder ids. Confirmed
+// against a fleet that takes the keys, each body sent is the planned pin's
+// document at the version it was sent at, but for the key ids in its data,
+// which the arrays keep the count of (A23-31 item 3).
+func confirmWritesRotatesPinsAsPlanned(t *testing.T) {
+	r := newRotateRig(t, backdatedApps)
+	doc := r.plan(t)
+	pins, writes := rotatePins(t, decodedBound(t, doc))
+	if len(pins) != 2 || len(writes) != 2 {
+		t.Fatalf("the plan binds %d pins and %d pin writes; want the hold's and the final's", len(pins), len(writes))
+	}
+	if _, stderr, err := r.run(t, "--confirm", doc.Digest); err != nil {
+		t.Fatalf("--confirm: %v\n%s", err, stderr)
+	}
+	if len(r.writes) != 2 {
+		t.Fatalf("wrote the pin %d times; want the hold, then the final pin", len(r.writes))
+	}
+	for i, w := range r.writes {
+		bound, err := pinDocument(pinOfFact(t, pins[i]), writes[i].ResourceVersion)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sameSHA256(t, fmt.Sprintf("the plan's pin %d", i), bound, &writes[i])
+		planned, err := pinDocument(pinOfFact(t, pins[i]), w.rv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := keyIDs.ReplaceAll(w.body, []byte("<id>")), keyIDs.ReplaceAll(planned, []byte("<id>")); !bytes.Equal(got, want) {
+			t.Errorf("pin write %d sent\n%s\nthe plan's, at the version it was sent at, is\n%s", i, w.body, planned)
+		}
+		if bytes.Equal(w.body, planned) {
+			t.Errorf("pin write %d is the planned document unmasked: the plan's placeholder ids are the real keys", i)
+		}
+	}
+}
+
+// readerPlans are the planCommands rows that read the cluster as the
+// instance's reader, the first shape of each command: kernel deploy, storage
+// deploy, storage key pin and storage key rotate (ADR 0023 M2.6c). Each
+// command that reads the cluster in a plan adds its rows to planCommands,
+// and is then here.
+func readerPlans(t *testing.T) []planCommand {
+	t.Helper()
+	var rows []planCommand
+	seen := map[string]bool{}
+	for _, row := range planCommands() {
+		if row.readsCluster && !seen[row.name] {
+			seen[row.name] = true
+			rows = append(rows, row)
+		}
+	}
+	if len(rows) == 0 {
+		t.Fatal("no plan reads the cluster")
+	}
+	return rows
+}
+
+// ADR 0023 M2.6 (design §7.3, A23-50, row 84): a plan that reads the cluster
+// reads it as the instance's reader, and only as it: it succeeds, the cluster
+// sees at least one request, every one of them, every token among them, is
+// the reader's, and its reader seam was asked for the reader. A plan that
+// reads no cluster sends nothing.
+func TestPlansPresentOnlyTheReaderToken(t *testing.T) {
+	ran := strayKubectl(t)
+	for _, row := range planCommands() {
+		t.Run(row.String(), func(t *testing.T) {
+			s, dir := planFixture(t, row)
+			runPlan(t, dir, row, output.ModeJSON)
+			reqs := s.Requests()
+			if !row.readsCluster {
+				if len(reqs) != 0 {
+					t.Errorf("%s --plan reads no cluster, and sent %d requests", row, len(reqs))
+				}
+				return
+			}
+			if len(reqs) == 0 {
+				t.Fatalf("%s --plan reads the cluster, and sent nothing", row)
+			}
+			for _, r := range reqs {
+				if r.As != "reader" {
+					t.Errorf("%s --plan: %s %s?%s as %q; want only the reader", row, r.Method, r.Path, r.RawQuery, r.As)
+				}
+			}
+			if f := row.fakes; f == nil || len(f.readers) == 0 || slices.ContainsFunc(f.readers, func(id kube.Identity) bool { return id != kube.Reader }) {
+				t.Errorf("%s --plan opened its reader seam as %v; want the reader", row, row.fakes.readers)
+			}
+		})
+	}
+	if ran() {
+		t.Error("a plan ran kubectl")
+	}
+}
+
+// answeredStatuses is a kubetest option that collects, for each request the
+// server answered 403, its method, path and query.
+func answeredStatuses() (kubetest.Option, func() []string) {
+	var mu sync.Mutex
+	var refused []string
+	return kubetest.WithAnswered(func(r kubetest.Request, status int) {
+			if status == http.StatusForbidden {
+				mu.Lock()
+				defer mu.Unlock()
+				refused = append(refused, r.Method+" "+r.Path+"?"+r.RawQuery+" as "+r.As)
+			}
+		}), func() []string {
+			mu.Lock()
+			defer mu.Unlock()
+			return slices.Clone(refused)
+		}
+}
+
+// ADR 0023 M2.6 (design §7.3, P3, A23-50, row 76b): every read the reader
+// makes is one the RBAC 'reader grant' renders allows. kubetest authorizes
+// the reader with exactly renderReaderRBAC's stream for the namespaces the
+// fixture records as metered, and world, ps, costs, usage and logs, and
+// every plan that reads the cluster, read with no 403 and succeed. (run's
+// deploy plan joins them in ADR 0023 M2.6d.)
+func TestEveryReaderReadIsAllowedByTheRenderedRBAC(t *testing.T) {
+	t.Run("world", func(t *testing.T) {
+		email := worldReaderEmail()
+		stream, err := renderReaderRBAC(email, []string{tcdeploy.DefaultNamespace, "shop"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		statuses, refused := answeredStatuses()
+		f := newWorldReaderFixture(t, kubetest.WithRBAC(email, stream), statuses)
+		if meta, err := f.dir.LoadInstanceMetadata("atlas"); err != nil || !slices.Equal(meta.Kernel.Namespaces, []string{tcdeploy.DefaultNamespace, "shop"}) {
+			t.Fatalf("the fixture meters %v (%v); the RBAC is rendered for farcast-system and shop", meta.Kernel.Namespaces, err)
+		}
+		sections, _, _ := f.run(t)
+		wantSections(t, sections, map[string]string{"spend": "read", "apps": "read", "policy": "read"})
+		onlyTheReader(t, f.s)
+		if got := refused(); len(got) != 0 {
+			t.Errorf("world met 403s: %q", got)
+		}
+	})
+	for _, rc := range readCommands() {
+		t.Run(rc.name, func(t *testing.T) {
+			email := readerName(readName) + "@kubetest.invalid"
+			stream, err := renderReaderRBAC(email, []string{tcdeploy.DefaultNamespace, readNamespace})
+			if err != nil {
+				t.Fatal(err)
+			}
+			statuses, refused := answeredStatuses()
+			s := kubetest.New(t, kubetest.WithRBAC(email, stream), statuses)
+			dir, meta := readCommandsInstance(t, s, true)
+			if !slices.Equal(meta.Kernel.Namespaces, []string{tcdeploy.DefaultNamespace, readNamespace}) {
+				t.Fatalf("the fixture meters %v; the RBAC is rendered for farcast-system and %s", meta.Kernel.Namespaces, readNamespace)
+			}
+			out, errb, err := runRead(t, dir, rc)
+			if err != nil {
+				t.Fatalf("%s: %v\nstderr: %s", rc.name, err, errb)
+			}
+			rc.seeded(t, out)
+			onlyTheReader(t, s)
+			if got := refused(); len(got) != 0 {
+				t.Errorf("%s met 403s: %q", rc.name, got)
+			}
+		})
+	}
+	for _, row := range planCommands() {
+		if !row.readsCluster {
+			continue
+		}
+		t.Run(row.String(), func(t *testing.T) {
+			email := readerName(writeName) + "@kubetest.invalid"
+			stream, err := renderReaderRBAC(email, []string{tcdeploy.DefaultNamespace})
+			if err != nil {
+				t.Fatal(err)
+			}
+			statuses, refused := answeredStatuses()
+			s, dir := planFixtureWith(t, row, true, kubetest.WithRBAC(email, stream), statuses)
+			if meta, err := dir.LoadInstanceMetadata(writeName); err != nil || !slices.Equal(meta.Kernel.Namespaces, []string{tcdeploy.DefaultNamespace}) {
+				t.Fatalf("the fixture meters %v (%v); the RBAC is rendered for farcast-system", meta.Kernel.Namespaces, err)
+			}
+			runPlan(t, dir, row, output.ModeJSON)
+			onlyTheReader(t, s)
+			if got := refused(); len(got) != 0 {
+				t.Errorf("%s --plan met 403s: %q", row, got)
+			}
+		})
+	}
+}
+
+// ADR 0023 M2.6 (A23-1, A23-21; rows 85 and 85a): a plan that reads the
+// cluster needs a reader 'reader grant' has verified read-only, and has no
+// fallback to the installer's account. For each such plan, under --plan and
+// under --confirm, a reader in each of the four states short of granted is
+// refused credential_missing, with the text naming the command, the answer,
+// the state as 'instances' prints it, and what to do from that state, before
+// the plan's reader seam opens, before credentials.yaml is read and before
+// the provider opens: the cluster sees nothing, and nothing is printed. A
+// granted reader whose recorded email is not the derived one passes that
+// check, and openCluster refuses it, in its own words, sending nothing.
+func TestPlanWithoutAReaderIsRefused(t *testing.T) {
+	ran := strayKubectl(t)
+	for _, tc := range []struct {
+		state  string
+		edit   func(t *testing.T, dir config.Dir, meta *config.InstanceMetadata)
+		remedy string
+	}{
+		{"none", func(_ *testing.T, _ config.Dir, m *config.InstanceMetadata) { m.Reader = nil },
+			"run 'farcast reader init atlas', the printed Cloud Shell script, 'farcast reader record' and 'farcast reader grant'"},
+		{"key missing", func(t *testing.T, dir config.Dir, _ *config.InstanceMetadata) {
+			if err := os.Remove(filepath.Join(dir.InstancePath(writeName), "reader.key")); err != nil {
+				t.Fatal(err)
+			}
+		}, "copy reader.key from the machine that made it, or run 'farcast reader init atlas --rotate'"},
+		{"not uploaded", func(_ *testing.T, _ config.Dir, m *config.InstanceMetadata) { m.Reader.KeyID = "" },
+			"run the printed Cloud Shell script, then 'farcast reader record atlas --key-id <id>' and 'farcast reader grant atlas'"},
+		{"not granted", func(_ *testing.T, _ config.Dir, m *config.InstanceMetadata) { m.Reader.GrantedAt = time.Time{} },
+			"run 'farcast reader grant atlas'"},
+		{"granted, another reader", func(_ *testing.T, _ config.Dir, m *config.InstanceMetadata) {
+			m.Reader.Email = "writer@kubetest.invalid"
+		}, ""},
+	} {
+		for _, plans := range readerPlans(t) {
+			for _, answer := range [][]string{{"--plan"}, {"--confirm", sampleDigest}} {
+				t.Run(plans.String()+"/"+tc.state+"/"+answer[0], func(t *testing.T) {
+					row := planCommandNamed(t, plans.name, plans.shape) // its fakes fresh
+					s, dir := planFixture(t, row)
+					meta, err := dir.LoadInstanceMetadata(writeName)
+					if err != nil {
+						t.Fatal(err)
+					}
+					tc.edit(t, dir, meta)
+					if err := dir.SaveInstanceMetadata(writeName, meta); err != nil {
+						t.Fatal(err)
+					}
+					reads := observeConfigReads(t)
+					cmd := withFlags(t, row.cmd(), append(slices.Clone(row.flags), answer...)...)
+					env, out, errb := testEnvBoth(dir, output.ModeJSON)
+					err = cmd.Run(t.Context(), env, row.args)
+
+					want := fmt.Sprintf("'farcast %s %s' reads the cluster as instance %q's reader, whose state is %s; %s, or run the command in a terminal",
+						row.name, answer[0], writeName, tc.state, tc.remedy)
+					readersOpened := 0
+					if tc.remedy == "" {
+						// openCluster's own refusal of a reader that is not the
+						// derived one.
+						want = fmt.Sprintf("instance %q records the reader %q, which is not the reader farcast derives for it (%s); nothing was sent",
+							writeName, "writer@kubetest.invalid", readerName(writeName)+"@<a name under .invalid>")
+						readersOpened = 1
+					}
+					if err == nil || err.Error() != want || !errors.Is(err, errCredentialMissing) || kindOf(classified(err)) != kindCredentialMissing {
+						t.Fatalf("%s %s with a reader %s = %v (kind %s);\nwant %q", row, answer[0], tc.state, err, kindOf(classified(err)), want)
+					}
+					if got := len(s.Requests()); got != 0 {
+						t.Errorf("%s sent %d requests", row, got)
+					}
+					for _, p := range reads() {
+						if filepath.Base(p) == "credentials.yaml" {
+							t.Errorf("%s read %s", row, p)
+						}
+					}
+					if f := row.fakes; f.opened+f.writers != 0 || len(f.readers) != readersOpened {
+						t.Errorf("%s opened the provider %d times, the writer %d times and its reader seam %d times; want the reader seam %d times",
+							row, f.opened, f.writers, len(f.readers), readersOpened)
+					}
+					if out.Len()+errb.Len() != 0 {
+						t.Errorf("%s printed %q %q", row, out, errb)
+					}
+				})
+			}
+		}
+	}
+	if ran() {
+		t.Error("a plan ran kubectl")
+	}
+}
+
+// ADR 0023 M2.6 (A23-22, row 76e): an error a plan meets reading the
+// cluster as the reader says what the reader needs, once, and never blames
+// the installer's account, whose sentence writerRefused gives only the
+// writer's errors. An RBAC 403 names 'farcast reader grant', and any other
+// 403 the endpoint's IAM; either is kind forbidden, under --plan and in
+// --confirm's recomputation. Each command that reads the cluster in its
+// plan (readerPlans) meets it at its first read: kernel deploy's namespaces,
+// and the storage commands' key pin (row S-C26-S5 of the M2.6c review).
+func TestPlanReadErrorsNameTheReader(t *testing.T) {
+	firstRead := map[string]string{
+		"kernel deploy":      "/api/v1/namespaces",
+		"storage deploy":     pinPath,
+		"storage key pin":    pinPath,
+		"storage key rotate": pinPath,
+	}
+	iam := kube.Status{}
+	iam.Kind = "Error" // Google's JSON error, not a Kubernetes Status
+	for _, tc := range []struct {
+		name     string
+		status   kube.Status
+		sentence string
+	}{
+		{"forbidden by RBAC", kube.Status{}, "; run 'farcast reader grant atlas'"},
+		{"forbidden at the endpoint", iam, "; " + msgReaderIAMRefused},
+	} {
+		for _, plans := range readerPlans(t) {
+			path, ok := firstRead[plans.name]
+			if !ok {
+				t.Fatalf("%s reads the cluster in its plan: say which read it makes first", plans.name)
+			}
+			for _, answer := range [][]string{{"--plan"}, {"--confirm", sampleDigest}} {
+				t.Run(plans.String()+"/"+tc.name+"/"+answer[0], func(t *testing.T) {
+					row := planCommandNamed(t, plans.name, plans.shape) // its fakes fresh
+					s, dir := planFixture(t, row)
+					s.Fail(http.MethodGet, path, http.StatusForbidden, tc.status)
+					cmd := withFlags(t, row.cmd(), append(slices.Clone(row.flags), answer...)...)
+					env, out, _ := testEnvBoth(dir, output.ModeJSON)
+					err := cmd.Run(t.Context(), env, row.args)
+					if kind := kindOf(classified(err)); err == nil || kind != kindForbidden {
+						t.Fatalf("%s %s = %v (kind %s); want forbidden", row, answer[0], err, kind)
+					}
+					msg := err.Error()
+					if strings.Count(msg, tc.sentence) != 1 || strings.Contains(msg, "installer service account") {
+						t.Errorf("%s %s = %q;\nwant %q once and the installer's account never", row, answer[0], msg, tc.sentence)
+					}
+					if out.Len() != 0 || row.fakes.writers+row.fakes.opened != 0 {
+						t.Errorf("%s %s printed %q, opened the writer %d times and the provider %d times", row, answer[0], out, row.fakes.writers, row.fakes.opened)
+					}
+					onlyThePlansReads(t, row, s)
+				})
+			}
+		}
+	}
+}
+
+// ADR 0023 M2.6 (A23-23, row 76c): under --confirm, the writer opens only
+// after the comparison, and the cluster it reaches must be the one the plan
+// read as the reader. kernel deploy's plan reads farcast-system's uid u1
+// through its reader, and the writer's cluster answers another, u2, or has
+// no farcast-system at all: --confirm refuses, plan_changed, exit 1, naming
+// both uids, once the writer's preflight read it, and before anything is
+// ensured, pushed, recorded or applied; the kubectl stand-in never runs.
+func TestConfirmChecksTheWritersClusterIsThePlans(t *testing.T) {
+	for _, tc := range []struct {
+		name, writerUID, said string
+	}{
+		{"another farcast-system", "u2", "u2"},
+		{"no farcast-system", "", "absent"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ran := strayKubectl(t)
+			s := kubetest.New(t)
+			if tc.writerUID != "" {
+				s.Put(map[string]any{"apiVersion": "v1", "kind": "Namespace", "metadata": map[string]any{
+					"name": tcdeploy.DefaultNamespace, "uid": tc.writerUID}})
+			}
+			dir, meta := writeInstance(t, s, true)
+			fp := &fakeProvider{registry: &planck.Registry{Ref: registryRefFor(meta), Prefix: meta.Registry.Prefix}}
+			fb := &fakeBuilder{resolveFn: notFoundForTags}
+			reader := &fakeCluster{uid: "u1", namespaces: []string{tcdeploy.DefaultNamespace}}
+			var opened []kube.Identity
+			kernelDeploy := func(flags ...string) *kernelDeployCommand {
+				c := withFlags(t, &kernelDeployCommand{}, flags...)
+				asRelease(&c.deployer, nil)
+				c.deployer.openProvider = func(*config.InstanceMetadata, *config.InstanceCredentials) (planck.Provider, error) { return fp, nil }
+				c.deployer.newBuilder = func(func(string)) imageBuilder { return fb }
+				c.newPlanReader = func(r clusterRef) (kernelPlanReader, error) {
+					opened = append(opened, r.Identity)
+					return reader, nil
+				}
+				return c
+			}
+			env, out, _ := testEnvBoth(dir, output.ModeJSON)
+			if err := kernelDeploy("--plan").Run(t.Context(), env, []string{writeName}); err != nil {
+				t.Fatal(err)
+			}
+			doc := printedDocument(t, out.Bytes())
+			if b := decodedBound(t, doc); b.ClusterIdentity != "reader" || b.Target.SystemNamespaceUID != "u1" {
+				t.Fatalf("the plan reads as %q and binds the uid %q; want the reader's u1", b.ClusterIdentity, b.Target.SystemNamespaceUID)
+			}
+			before := treeFiles(t, string(dir))
+
+			env, out, errb := testEnvBoth(dir, output.ModeJSON)
+			err := kernelDeploy("--confirm", doc.Digest).Run(t.Context(), env, []string{writeName})
+			want := fmt.Sprintf("instance %q's cluster is not the one its plan read: farcast-system's uid is %s, not u1; nothing was written; %s",
+				writeName, tc.said, msgPlanAgain)
+			if err == nil || err.Error() != want || kindOf(classified(err)) != kindPlanChanged || exitCodeOf(err) != 1 {
+				t.Fatalf("--confirm against another cluster = %v (kind %s);\nwant %q, plan_changed\n%s", err, kindOf(classified(err)), want, errb)
+			}
+			if ran() || len(fp.ensured)+len(fb.embedded)+len(fb.built) != 0 || out.Len() != 0 {
+				t.Errorf("ran kubectl %v, ensured %d, pushed %d, built %d and printed %q before refusing", ran(), len(fp.ensured), len(fb.embedded), len(fb.built), out)
+			}
+			if !slices.Equal(opened, []kube.Identity{kube.Reader, kube.Reader}) {
+				t.Errorf("the plan's reader seam was asked for %v; want the reader, once for the plan and once for the recomputation", opened)
+			}
+			// The writer read once: its preflight, after its token.
+			var writerReads []string
+			for _, r := range s.Requests() {
+				if r.As != "writer" {
+					t.Errorf("%s %s as %q; only the writer reaches this cluster", r.Method, r.Path, r.As)
+				}
+				if r.Path != "/token" {
+					writerReads = append(writerReads, r.Method+" "+r.Path)
+				}
+			}
+			if !slices.Equal(writerReads, []string{"GET /api/v1/namespaces"}) {
+				t.Errorf("the writer sent %q; want its preflight read alone", writerReads)
+			}
+			sameFiles(t, "a confirm against another cluster", before, treeFiles(t, string(dir)))
+		})
+	}
+}
+
+// The storage commands' rows of TestConfirmChecksTheWritersClusterIsThePlans
+// (ADR 0023 M2.6c): storage deploy's, storage key pin's and storage key
+// rotate's plans read farcast-system's uid u1 through the in-memory pin's
+// reader view, and the writer answers u2. Each refuses plan_changed after
+// the comparison, naming both, with the pin unwritten; storage deploy has
+// minted, ensured, pushed and applied nothing, and rotate has minted
+// nothing and opened no keyholder.
+func TestConfirmChecksTheWritersClusterIsThePlansForTheStorageCommands(t *testing.T) {
+	want := fmt.Sprintf(msgOtherCluster, writeName, "u2", "u1")
+	t.Run("storage deploy", func(t *testing.T) {
+		r := newStorageRig(t, nil)
+		doc := r.plan(t)
+		r.fc.uid = "u2"
+		_, _, err := r.run(t, "--confirm", doc.Digest)
+		if err == nil || err.Error() != want || kindOf(classified(err)) != kindPlanChanged {
+			t.Fatalf("--confirm against another cluster = %v (kind %s);\nwant %q", err, kindOf(classified(err)), want)
+		}
+		r.wroteNothing(t)
+		if r.ps.exists {
+			t.Errorf("wrote the pin %s", r.ps.value)
+		}
+	})
+	t.Run("storage key pin", func(t *testing.T) {
+		dir, _, ps := keyPinFixture(t)
+		ps.uid = "u1"
+		doc := runKeyPinPlan(t, dir, nil)
+		c := keyPinPlanCmd(t, nil, "--confirm", doc.Digest)
+		c.newPinStore = func(r clusterRef) (pinStore, error) {
+			if r.Identity != kube.Writer {
+				return nil, fmt.Errorf("test: the pin opened as %q", r.Identity)
+			}
+			return pinsAt{ps, "u2"}, nil
+		}
+		env, out, _ := testEnvBoth(dir, output.ModeJSON)
+		err := c.Run(t.Context(), env, []string{writeName})
+		if err == nil || err.Error() != want || kindOf(classified(err)) != kindPlanChanged {
+			t.Fatalf("--confirm against another cluster = %v (kind %s);\nwant %q", err, kindOf(classified(err)), want)
+		}
+		if ps.exists || out.Len() != 0 {
+			t.Errorf("wrote the pin %s, and printed %q", ps.value, out)
+		}
+	})
+	t.Run("storage key rotate", func(t *testing.T) {
+		r := newRotateRig(t, backdatedApps)
+		doc := r.plan(t)
+		r.writerUID = "u2"
+		before := keyringBytes(t, r.dir, writeName)
+		stdout, _, err := r.run(t, "--confirm", doc.Digest)
+		if err == nil || err.Error() != want || kindOf(classified(err)) != kindPlanChanged {
+			t.Fatalf("--confirm against another cluster = %v (kind %s);\nwant %q", err, kindOf(classified(err)), want)
+		}
+		if !bytes.Equal(before, keyringBytes(t, r.dir, writeName)) || len(r.writes) != 0 || r.keyholders != 0 || stdout != "" {
+			t.Errorf("changed keys.yaml, wrote the pin %d times, opened the keyholder %d times, or printed %q", len(r.writes), r.keyholders, stdout)
+		}
+	})
+}
+
+// pinsAt is a pin store whose cluster answers farcast-system's uid as uid:
+// the same pin, reached in another cluster.
+type pinsAt struct {
+	*fakePinStore
+	uid string
+}
+
+func (p pinsAt) NamespaceUID(context.Context, string) (string, error) { return p.uid, nil }
+
+// ADR 0023 M2.6 (design §7.3, A23-23, A23-50, rows 76 and 76a): --confirm
+// recomputes the plan as the identity the plan read with, and writes as the
+// writer only after the comparison. kernel deploy, planned and then
+// confirmed against one kubetest server through its real reader and its
+// real writer, kubectl the succeeding stand-in, runs to the end: every
+// request the confirm sends as the reader comes before the writer's first
+// token, every request after that token is the writer's, nothing the reader
+// read was answered after the stand-in ran, and the stand-in applied, after
+// the writer's preflight and before its rollout read, exactly the documents
+// the plan bound. (That the apply itself runs as the writer is M2.7's
+// assertion.)
+func TestConfirmRecomputesAsThePlansIdentity(t *testing.T) {
+	t.Run("kernel deploy", func(t *testing.T) {
+		calls, runs := succeedingKubectlRuns(t)
+		type answered struct {
+			as, method, path string
+			applied          int
+		}
+		var mu sync.Mutex
+		var seen []answered
+		s := kubetest.New(t, kubetest.WithAnswered(func(r kubetest.Request, _ int) {
+			n := runs()
+			mu.Lock()
+			defer mu.Unlock()
+			seen = append(seen, answered{r.As, r.Method, r.Path, n})
+		}))
+		systemNamespace(s)
+		s.Put(map[string]any{
+			"apiVersion": "apps/v1", "kind": "Deployment",
+			"metadata": map[string]any{"name": tcdeploy.DefaultName, "namespace": tcdeploy.DefaultNamespace},
+			"spec":     map[string]any{"replicas": 1},
+			"status":   map[string]any{"replicas": 1, "updatedReplicas": 1, "availableReplicas": 1},
+		})
+		dir, meta := writeInstance(t, s, true)
+		fp := &fakeProvider{registry: &planck.Registry{Ref: registryRefFor(meta), Prefix: meta.Registry.Prefix}}
+		fb := &fakeBuilder{resolveFn: notFoundForTags}
+		var readers []kube.Identity
+		kernelDeploy := func(flags ...string) *kernelDeployCommand {
+			c := withFlags(t, &kernelDeployCommand{}, flags...)
+			asRelease(&c.deployer, nil)
+			c.deployer.openProvider = func(*config.InstanceMetadata, *config.InstanceCredentials) (planck.Provider, error) { return fp, nil }
+			c.deployer.newBuilder = func(func(string)) imageBuilder { return fb }
+			c.newPlanReader = func(r clusterRef) (kernelPlanReader, error) {
+				readers = append(readers, r.Identity)
+				cl, err := loopbackReader(r)
+				if err != nil {
+					return nil, err
+				}
+				return cl, nil
+			}
+			return c
+		}
+		env, out, errb := testEnvBoth(dir, output.ModeJSON)
+		if err := kernelDeploy("--plan").Run(t.Context(), env, []string{writeName}); err != nil {
+			t.Fatalf("--plan: %v\n%s", err, errb)
+		}
+		doc := printedDocument(t, out.Bytes())
+		mu.Lock()
+		planned := len(seen)
+		mu.Unlock()
+
+		env, _, errb = testEnvBoth(dir, output.ModeJSON)
+		if err := kernelDeploy("--confirm", doc.Digest).Run(t.Context(), env, []string{writeName}); err != nil {
+			t.Fatalf("--confirm: %v\n%s", err, errb)
+		}
+		mu.Lock()
+		confirmed := slices.Clone(seen[planned:])
+		mu.Unlock()
+
+		firstWriter := slices.IndexFunc(confirmed, func(a answered) bool { return a.as == "writer" && a.path == "/token" })
+		if firstWriter < 1 {
+			t.Fatalf("the confirm's requests %+v; want the reader's recomputation, then the writer's token", confirmed)
+		}
+		for i, a := range confirmed {
+			switch {
+			case i < firstWriter && (a.as != "reader" || a.applied != 0):
+				t.Errorf("before the writer's token: %s %s as %q, after %d applies; want the reader's, before any apply", a.method, a.path, a.as, a.applied)
+			case i > firstWriter && a.as != "writer":
+				t.Errorf("after the writer's token: %s %s as %q; want the writer's", a.method, a.path, a.as)
+			}
+		}
+		var writerReads []answered
+		for _, a := range confirmed[firstWriter+1:] {
+			if a.path != "/token" {
+				writerReads = append(writerReads, a)
+			}
+		}
+		rollout := "/apis/apps/v1/namespaces/" + tcdeploy.DefaultNamespace + "/deployments/" + tcdeploy.DefaultName
+		if len(writerReads) != 2 || writerReads[0].path != "/api/v1/namespaces" || writerReads[0].applied != 0 ||
+			writerReads[1].path != rollout || writerReads[1].applied != 1 {
+			t.Errorf("the writer read %+v; want its preflight before the apply, then the rollout after it", writerReads)
+		}
+		applied := appliedStreams(calls())
+		if len(applied) != 1 {
+			t.Fatalf("the stand-in applied %d streams; want the plan's one", len(applied))
+		}
+		if got, want := wantWrites(t, applied[0]), planWrites(decodedBound(t, doc)); !reflect.DeepEqual(got, want) {
+			t.Errorf("applied\n%#v\nthe plan bound\n%#v", got, want)
+		}
+		if !slices.Equal(readers, []kube.Identity{kube.Reader, kube.Reader}) {
+			t.Errorf("the plan's reader seam was asked for %v; want the reader for the plan and for the recomputation", readers)
+		}
+		after, err := dir.LoadInstanceMetadata(writeName)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if after.Kernel == nil || !after.Kernel.Applied || after.Kernel.Image != carriedRegistryRef(meta, "technocore") {
+			t.Errorf("recorded %+v; want the kernel applied with the carried image", after.Kernel)
+		}
+	})
+}
+
+// carriedRegistryRef is a component's carried image in meta's recorded
+// registry: what a release farcast carrying the fake components pushes and
+// deploys there.
+func carriedRegistryRef(meta *config.InstanceMetadata, component string) string {
+	return meta.Registry.Prefix + "/system/" + component + "@" + sha(tagDigest)
+}
+
+// ADR 0023 M2.6 (A23-23, rows 76d): under --confirm, a writing command
+// checks its writer before anything it cannot take back. storage deploy, on
+// a first deploy over a pin its plan raises: a writer that will not open, a
+// writer whose cluster refuses its preflight, and a pin whose
+// resourceVersion moved between the comparison and the writer's read of it
+// each refuse the command with no bucket or keyring minted, no registry
+// ensured, no image pushed or built, nothing applied, the pin and every file
+// under the config directory as they were. The moved pin is plan_changed,
+// in A23-42's words. storage key rotate, with a keyholder deployed, opens
+// its writer after the comparison and before it mints: a writer that will
+// not open, an install with no key behind the real pin opener, a writer
+// whose cluster refuses its preflight, and a pin moved after the comparison
+// each refuse it with keys.yaml as it was, no pin written and the keyholder,
+// and so the tunnel, never opened.
+func TestConfirmChecksTheWriterBeforeAnythingIrreversible(t *testing.T) {
+	refused := errors.New("test: the writer is refused")
+	for _, tc := range []struct {
+		name  string
+		setup func(r *storageRig)
+		want  func(err error) bool
+	}{
+		{"storage deploy/the writer refused", func(r *storageRig) { r.writerErr = refused },
+			func(err error) bool { return errors.Is(err, refused) }},
+		{"storage deploy/the writer's preflight refused", func(r *storageRig) { r.fc.uidErr = errRBAC },
+			func(err error) bool {
+				return kindOf(classified(err)) == kindForbidden && strings.Contains(err.Error(), msgWriterRBACRefused)
+			}},
+		{"storage deploy/the pin moved after the comparison", func(r *storageRig) {
+			r.onWriter = func() { r.ps.set(r.ps.value) }
+		}, func(err error) bool {
+			return err.Error() == msgPinChanged && kindOf(classified(err)) == kindPlanChanged
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newStorageRig(t, func(m *config.InstanceMetadata) { m.Storage = nil })
+			r.mintsBucket(nil)
+			r.ps.set(dskeyholder.Pin{}.Marshal())
+			doc := r.plan(t)
+			if w := planWrites(decodedBound(t, doc)); len(w) == 0 || w[0].(plan.WriteFact).Method != plan.WriteReplace || w[0].(plan.WriteFact).ResourceVersion != "1" {
+				t.Fatalf("the plan's first write is %+v; want the pin's replace at the version read, 1", w)
+			}
+			tc.setup(r)
+			before, pinBefore := treeFiles(t, string(r.dir)), r.ps.value
+			stdout, _, err := r.run(t, "--confirm", doc.Digest)
+			if err == nil || !tc.want(err) || exitCodeOf(err) != 1 {
+				t.Fatalf("--confirm = %v (kind %s, exit %d)", err, kindOf(classified(err)), exitCodeOf(err))
+			}
+			if r.writers != 1 {
+				t.Errorf("the writer opened %d times; want once, after the comparison", r.writers)
+			}
+			r.wroteNothing(t)
+			if r.ps.value != pinBefore || stdout != "" {
+				t.Errorf("the pin is %s (was %s), and the command printed %q", r.ps.value, pinBefore, stdout)
+			}
+			sameFiles(t, tc.name, before, treeFiles(t, string(r.dir)))
+		})
+	}
+
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T, r *rotateRig)
+		want  func(err error) bool
+	}{
+		{"storage key rotate/the writer refused", func(_ *testing.T, r *rotateRig) { r.writerErr = refused },
+			func(err error) bool { return errors.Is(err, refused) }},
+		{"storage key rotate/an install without a key", func(t *testing.T, r *rotateRig) {
+			meta, err := r.dir.LoadInstanceMetadata(writeName)
+			if err != nil {
+				t.Fatal(err)
+			}
+			adcInstall(t, r.dir, meta)
+			realPinOpener(t)
+			r.realWriter = true
+		}, func(err error) bool {
+			return errors.Is(err, errCredentialMissing) && strings.Contains(err.Error(), msgADCRefused) && kindOf(classified(err)) == kindCredentialMissing
+		}},
+		{"storage key rotate/the writer's preflight refused", func(_ *testing.T, r *rotateRig) { r.writerUIDErr = errRBAC },
+			func(err error) bool {
+				return kindOf(classified(err)) == kindForbidden && strings.Contains(err.Error(), msgWriterRBACRefused)
+			}},
+		{"storage key rotate/the pin moved after the comparison", func(_ *testing.T, r *rotateRig) {
+			r.onWriter = func() { r.ps.set(r.ps.value) }
+		}, func(err error) bool {
+			return err.Error() == msgPinChanged && kindOf(classified(err)) == kindPlanChanged
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRotateRig(t, backdatedApps)
+			r.ps.set(pinFor(liveKeyring(t, r.dir, writeName)).Marshal())
+			doc := r.plan(t)
+			tc.setup(t, r)
+			before, pinBefore := treeFiles(t, string(r.dir)), r.ps.value
+			stdout, _, err := r.run(t, "--confirm", doc.Digest)
+			if err == nil || !tc.want(err) || exitCodeOf(err) != 1 {
+				t.Fatalf("--confirm = %v (kind %s, exit %d)", err, kindOf(classified(err)), exitCodeOf(err))
+			}
+			if r.keyholders != 0 || len(r.writes) != 0 || r.ps.value != pinBefore || stdout != "" {
+				t.Errorf("opened the keyholder %d times, wrote the pin %d times (it is %s, was %s), and printed %q",
+					r.keyholders, len(r.writes), r.ps.value, pinBefore, stdout)
+			}
+			sameFiles(t, tc.name, before, treeFiles(t, string(r.dir)))
+		})
+	}
+
+	// A plan that writes no pin — the pin already this keyring's, as on
+	// every routine storage deploy and repeated key pin — still holds the
+	// writer to the pin it read (checkPlannedPin, A23-23 step 4; rows O09
+	// and O32 of the M2.6c review): another writer that replaces it after
+	// the comparison is plan_changed, before anything is ensured, pushed,
+	// applied or handed over, and nothing is written over it.
+	t.Run("storage deploy/a pin it does not write, moved after the comparison", func(t *testing.T) {
+		r := newStorageRig(t, nil)
+		keys := liveKeyring(t, r.dir, writeName)
+		r.ps.set(pinFor(keys).Marshal())
+		doc := r.plan(t)
+		if w := planWrites(decodedBound(t, doc)); slices.ContainsFunc(w, func(f plan.Fact) bool { return f.(plan.WriteFact).Name == dsdeploy.PinConfigMapName("") }) {
+			t.Fatalf("guard: the plan writes the pin: %+v", w)
+		}
+		other := pinFor(keys)
+		other.Retired = append(other.Retired, foreignID(t))
+		r.onWriter = func() { r.ps.set(other.Marshal()) }
+		stdout, _, err := r.run(t, "--confirm", doc.Digest)
+		if err == nil || err.Error() != msgPinChanged || kindOf(classified(err)) != kindPlanChanged {
+			t.Fatalf("--confirm over a pin changed after the comparison = %v (kind %s); want plan_changed, %q", err, kindOf(classified(err)), msgPinChanged)
+		}
+		r.wroteNothing(t)
+		if r.ps.value != other.Marshal() || stdout != "" {
+			t.Errorf("the pin is %s, and the command printed %q; want the other writer's, and nothing", r.ps.value, stdout)
+		}
+	})
+	t.Run("storage key pin/a pin it does not write, moved after the comparison", func(t *testing.T) {
+		dir, keys, ps := keyPinFixture(t)
+		ps.set(pinFor(keys).Marshal())
+		kh := &fakeStateKeyholder{phase: "unsealed"}
+		doc := runKeyPinPlan(t, dir, kh)
+		if w := planWrites(decodedBound(t, doc)); len(w) != 0 {
+			t.Fatalf("guard: the plan writes %+v", w)
+		}
+		other := pinFor(keys)
+		other.Retired = append(other.Retired, foreignID(t))
+		c := keyPinPlanCmd(t, kh, "--confirm", doc.Digest)
+		c.newPinStore = func(ref clusterRef) (pinStore, error) {
+			ps.set(other.Marshal())
+			return testDefaultPinStore(ref)
+		}
+		env, out, _ := testEnvBoth(dir, output.ModeJSON)
+		err := c.Run(t.Context(), env, []string{writeName})
+		if err == nil || err.Error() != msgPinChanged || kindOf(classified(err)) != kindPlanChanged {
+			t.Fatalf("--confirm over a pin changed after the comparison = %v (kind %s); want plan_changed, %q", err, kindOf(classified(err)), msgPinChanged)
+		}
+		if out.Len() != 0 || ps.value != other.Marshal() {
+			t.Errorf("printed %q, and the pin is %s; want nothing, and the other writer's", out, ps.value)
+		}
+		for i := range 2 {
+			if p := kh.replica(i).pin; p != nil {
+				t.Errorf("replica %d was handed %s", i, p.Marshal())
+			}
+		}
+	})
+}
+
+// ADR 0023 M2.6 (A23-43, mutation 91d): under --confirm, a first storage
+// deploy reads its record again once the bucket and the keyring are minted,
+// and refuses, plan_changed, if the keyholder, the bucket, the storage
+// provider or the storage location is not what its plan read and rendered:
+// nothing is ensured, pushed, built, written to the pin or applied, and the
+// keyholder is not recorded. A record the mint left as the plan said goes on
+// and deploys. storage key rotate reads its record again once its new keys
+// are saved, and refuses, plan_changed, if the keyholder is not the one its
+// plan read: no pin is written and nothing is handed over (A23-45).
+func TestConfirmRefusesARecordChangedDuringTheCommand(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		change func(m *config.InstanceMetadata)
+		what   string
+	}{
+		{"the keyholder", func(m *config.InstanceMetadata) { m.Keyholder.Replicas = 3 }, "keyholder"},
+		{"no bucket", func(m *config.InstanceMetadata) { m.Storage.Bucket = "" }, "storage bucket"},
+		{"the provider", func(m *config.InstanceMetadata) { m.Storage.Provider = "s3" }, "storage provider"},
+		{"the location", func(m *config.InstanceMetadata) { m.Storage.Location = "europe-west4" }, "storage location"},
+		{"nothing", nil, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newStorageRig(t, func(m *config.InstanceMetadata) { m.Storage = nil })
+			r.mintsBucket(tc.change)
+			doc := r.plan(t)
+			_, stderr, err := r.run(t, "--confirm", doc.Digest)
+			if r.minted != 1 {
+				t.Fatalf("minted storage %d times; want once, after the comparison", r.minted)
+			}
+			if tc.what == "" {
+				if err != nil || len(r.fc.applied) != 1 {
+					t.Fatalf("--confirm over the record the plan read = %v, applying %d streams\n%s", err, len(r.fc.applied), stderr)
+				}
+				return
+			}
+			want := fmt.Sprintf("instance %q's record changed while the command ran (its %s is not what the plan read); "+
+				"the bucket and the keyring were ensured, and nothing else was written; %s", writeName, tc.what, msgPlanAgain)
+			if err == nil || err.Error() != want || kindOf(classified(err)) != kindPlanChanged {
+				t.Fatalf("--confirm over a record that changed = %v (kind %s);\nwant %q", err, kindOf(classified(err)), want)
+			}
+			if len(r.fp.ensured)+len(r.fb.embedded)+len(r.fb.built)+len(r.fc.applied) != 0 || r.ps.exists {
+				t.Errorf("ensured %d, pushed %d, built %d, applied %d, and wrote the pin %v after the record changed",
+					len(r.fp.ensured), len(r.fb.embedded), len(r.fb.built), len(r.fc.applied), r.ps.exists)
+			}
+			if after, err := r.dir.LoadInstanceMetadata(writeName); err != nil || after.Keyholder.Image != "" {
+				t.Errorf("recorded the keyholder %+v (%v)", after.Keyholder, err)
+			}
+		})
+	}
+
+	for _, tc := range []struct {
+		name   string
+		change func(m *config.InstanceMetadata)
+	}{
+		{"storage key rotate/the keyholder's replicas", func(m *config.InstanceMetadata) { m.Keyholder.Replicas = 3 }},
+		{"storage key rotate/no keyholder", func(m *config.InstanceMetadata) { m.Keyholder = nil }},
+		{"storage key rotate/nothing", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRotateRig(t, backdatedApps)
+			doc := r.plan(t)
+			before := liveKeyring(t, r.dir, writeName)
+			if tc.change != nil {
+				// While the command runs: after the comparison, as the
+				// writer opens.
+				r.onWriter = func() {
+					if _, err := r.dir.UpdateInstanceMetadata(writeName, func(m *config.InstanceMetadata) error {
+						tc.change(m)
+						return nil
+					}); err != nil {
+						t.Error(err)
+					}
+				}
+			}
+			stdout, stderr, err := r.run(t, "--confirm", doc.Digest)
+			if tc.change == nil {
+				if err != nil || len(r.writes) != 2 {
+					t.Fatalf("--confirm over the record the plan read = %v, writing %d pins\n%s", err, len(r.writes), stderr)
+				}
+				return
+			}
+			want := fmt.Sprintf("instance %q's record changed while the command ran (its keyholder is not what the plan read); "+
+				"the new keys were minted and saved in keys.yaml, and no pin was written; %s", writeName, msgPlanAgain)
+			if err == nil || err.Error() != want || kindOf(classified(err)) != kindPlanChanged {
+				t.Fatalf("--confirm over a record that changed = %v (kind %s);\nwant %q", err, kindOf(classified(err)), want)
+			}
+			if r.keyholders != 0 || len(r.writes) != 0 || stdout != "" {
+				t.Errorf("opened the keyholder %d times, wrote the pin %d times and printed %q after the record changed", r.keyholders, len(r.writes), stdout)
+			}
+			after := liveKeyring(t, r.dir, writeName)
+			if len(after.Scopes()[0].Keyring().KEKs()) != len(before.Scopes()[0].Keyring().KEKs())+1 || scopeKEK(after) != scopeKEK(before) {
+				t.Error("the refusal says the new keys were saved, held: keys.yaml does not hold them so")
+			}
+		})
+	}
+	// A record that cannot be read again once the new keys are saved — a
+	// hand-edit as the command ran — is refused too (msgRotateRecordUnread,
+	// internal; row O16 of the M2.6c review): no pin is written, nothing is
+	// handed over, and keys.yaml holds the new keys, held.
+	t.Run("storage key rotate/an unreadable record", func(t *testing.T) {
+		r := newRotateRig(t, backdatedApps)
+		doc := r.plan(t)
+		before := liveKeyring(t, r.dir, writeName)
+		path := filepath.Join(r.dir.InstancePath(writeName), "metadata.yaml")
+		r.onWriter = func() {
+			if err := os.WriteFile(path, []byte("{not: [yaml"), 0o600); err != nil {
+				t.Error(err)
+			}
+		}
+		stdout, _, err := r.run(t, "--confirm", doc.Digest)
+		prefix := fmt.Sprintf("re-read instance %q after minting its new keys: ", writeName)
+		if err == nil || !strings.HasPrefix(err.Error(), prefix) || !strings.HasSuffix(err.Error(), "; the new keys were saved in keys.yaml, and no pin was written") ||
+			kindOf(classified(err)) != kindInternal {
+			t.Fatalf("--confirm over an unreadable record = %v (kind %s); want msgRotateRecordUnread, internal", err, kindOf(classified(err)))
+		}
+		if r.keyholders != 0 || len(r.writes) != 0 || stdout != "" {
+			t.Errorf("opened the keyholder %d times, wrote the pin %d times and printed %q", r.keyholders, len(r.writes), stdout)
+		}
+		after := liveKeyring(t, r.dir, writeName)
+		if len(after.Scopes()[0].Keyring().KEKs()) != len(before.Scopes()[0].Keyring().KEKs())+1 || scopeKEK(after) != scopeKEK(before) {
+			t.Error("the refusal says the new keys were saved, held: keys.yaml does not hold them so")
+		}
+	})
 }

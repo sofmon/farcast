@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -20,25 +21,27 @@ import (
 	"github.com/sofmon/farcast/farsight/cli/internal/keeper"
 	"github.com/sofmon/farcast/farsight/cli/internal/keyholder"
 	"github.com/sofmon/farcast/farsight/cli/internal/kube"
+	"github.com/sofmon/farcast/farsight/cli/internal/kube/kubetest"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
+	"github.com/sofmon/farcast/farsight/cli/internal/plan"
+	"github.com/sofmon/farcast/planck"
+	tkube "github.com/sofmon/farcast/technocore/kube"
 )
 
 // Every test that does not bring its own pin store gets one in memory, per
 // instance (its config directory and name), so no test reaches a cluster for
 // the pin. The pin is the writer's (ADR 0023 M2.5), so a command that opens
-// it as anything else is refused here too.
+// it as anything else is refused here too; a plan reads it through a
+// read-only view of the same store, as the reader (testPinPlanReader, ADR
+// 0023 M2.6c).
 var testPinStores = struct {
 	sync.Mutex
 	by map[string]*fakePinStore
 }{by: map[string]*fakePinStore{}}
 
-// testDefaultPinStore is the default the tests install in place of
-// openPinStore.
-func testDefaultPinStore(r clusterRef) (pinStore, error) {
-	if r.Meta == nil || r.Identity != kube.Writer {
-		return nil, fmt.Errorf("test pin store: the pin opens as the instance's writer, not %q", r.Identity)
-	}
-	key := string(r.Dir) + "/" + r.Meta.Name
+// testPinStoreFor is the instance's in-memory pin store, made on first use.
+func testPinStoreFor(dir config.Dir, instance string) *fakePinStore {
+	key := string(dir) + "/" + instance
 	testPinStores.Lock()
 	defer testPinStores.Unlock()
 	ps, ok := testPinStores.by[key]
@@ -46,8 +49,46 @@ func testDefaultPinStore(r clusterRef) (pinStore, error) {
 		ps = &fakePinStore{}
 		testPinStores.by[key] = ps
 	}
+	return ps
+}
+
+// testDefaultPinStore is the default the tests install in place of
+// openPinStore. It records the open as the writer's.
+func testDefaultPinStore(r clusterRef) (pinStore, error) {
+	if r.Meta == nil || r.Identity != kube.Writer {
+		return nil, fmt.Errorf("test pin store: the pin opens as the instance's writer, not %q", r.Identity)
+	}
+	ps := testPinStoreFor(r.Dir, r.Meta.Name)
+	ps.openedAs(r.Identity)
 	return ps, nil
 }
+
+// testPinPlanReader is a plan's reader of the in-memory pin (A23-20): a
+// read-only view of the instance's same store, opened only as the reader,
+// and recorded as the reader's open.
+func testPinPlanReader(r clusterRef) (pinPlanReader, error) {
+	if r.Meta == nil || r.Identity != kube.Reader {
+		return nil, fmt.Errorf("test pin reader: a plan reads the pin as the instance's reader, not %q", r.Identity)
+	}
+	ps := testPinStoreFor(r.Dir, r.Meta.Name)
+	ps.openedAs(r.Identity)
+	return pinReadView{ps}, nil
+}
+
+// pinReadView is a read-only view of a fakePinStore: a pinPlanReader and
+// never a pinStore, so a plan holding it cannot write.
+type pinReadView struct{ ps *fakePinStore }
+
+func (v pinReadView) ConfigMapData(ctx context.Context, namespace, name string) (map[string]string, string, bool, error) {
+	return v.ps.ConfigMapData(ctx, namespace, name)
+}
+
+func (v pinReadView) NamespaceUID(ctx context.Context, name string) (string, error) {
+	return v.ps.NamespaceUID(ctx, name)
+}
+
+// The read-only view reads and cannot write.
+var _ pinPlanReader = pinReadView{}
 
 func init() {
 	defaultPinStore = testDefaultPinStore
@@ -55,15 +96,12 @@ func init() {
 
 // pinStoreOf is the in-memory pin a test's instance got by default.
 func pinStoreOf(dir config.Dir, instance string) *fakePinStore {
-	ps, err := testDefaultPinStore(clusterRef{Dir: dir, Meta: &config.InstanceMetadata{Name: instance}, Identity: kube.Writer})
-	if err != nil {
-		panic(err)
-	}
-	return ps.(*fakePinStore)
+	return testPinStoreFor(dir, instance)
 }
 
 // fakePinStore is the pin ConfigMap with the API server's own rules: create
-// fails over an existing one, and replace fails at a stale resourceVersion.
+// fails over an existing one, and replace fails at a stale resourceVersion,
+// each as tkube.ErrConflict, as the cluster client returns them (A20-7).
 type fakePinStore struct {
 	mu      sync.Mutex
 	exists  bool
@@ -71,6 +109,13 @@ type fakePinStore struct {
 	version int
 	// failRead and failWrite make the next calls fail as infrastructure does.
 	failRead, failWrite error
+	// uid and uidErr answer NamespaceUID: farcast-system's uid, "" for none.
+	uid    string
+	uidErr error
+	// opened is the identity each open of the store asked for, in order:
+	// the writer's (testDefaultPinStore) or the reader's
+	// (testPinPlanReader).
+	opened []kube.Identity
 	// onWrite runs before a write lands, so a test can race another writer.
 	onWrite func()
 	// loseAnswer lets the next write land and then report failure, as a
@@ -90,6 +135,26 @@ func (f *fakePinStore) ConfigMapData(context.Context, string, string) (map[strin
 		return nil, "", false, nil
 	}
 	return map[string]string{dsdeploy.PinKey: f.value}, strconv.Itoa(f.version), true, nil
+}
+
+// openedAs records an open of the store as id.
+func (f *fakePinStore) openedAs(id kube.Identity) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.opened = append(f.opened, id)
+}
+
+// openedBy is the identities the store was opened as, in order.
+func (f *fakePinStore) openedBy() []kube.Identity {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.opened)
+}
+
+func (f *fakePinStore) NamespaceUID(context.Context, string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.uid, f.uidErr
 }
 
 func (f *fakePinStore) write(manifest []byte, create bool) error {
@@ -118,9 +183,9 @@ func (f *fakePinStore) write(manifest []byte, create bool) error {
 	}
 	switch {
 	case create && f.exists:
-		return errors.New("AlreadyExists")
+		return fmt.Errorf("AlreadyExists: %w", tkube.ErrConflict)
 	case !create && (!f.exists || doc.Metadata.ResourceVersion != strconv.Itoa(f.version)):
-		return errors.New("Conflict")
+		return fmt.Errorf("Conflict: %w", tkube.ErrConflict)
 	}
 	f.exists, f.value = true, doc.Data[dsdeploy.PinKey]
 	f.version++
@@ -242,12 +307,12 @@ func TestWritePinCreatesRaisesAndNeverLowers(t *testing.T) {
 	ctx := context.Background()
 	ps := &fakePinStore{}
 	k := appsKeyring(t, "web")
-	w, err := writePin(ctx, ps, k, true, false)
+	w, err := writePinLoop(ctx, ps, k, true, false)
 	if err != nil || !w.Changed || !w.Created || !ps.exists {
 		t.Fatalf("create = %+v, %v", w, err)
 	}
 	before := ps.version
-	if w, err := writePin(ctx, ps, k, true, false); err != nil || w.Changed || ps.version != before {
+	if w, err := writePinLoop(ctx, ps, k, true, false); err != nil || w.Changed || ps.version != before {
 		t.Errorf("an unchanged pin was rewritten: %+v, %v", w, err)
 	}
 
@@ -255,7 +320,7 @@ func TestWritePinCreatesRaisesAndNeverLowers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if w, err := writePin(ctx, ps, rotated, true, false); err != nil || !w.Changed || w.Created {
+	if w, err := writePinLoop(ctx, ps, rotated, true, false); err != nil || !w.Changed || w.Created {
 		t.Fatalf("raise = %+v, %v; want changed, and not created", w, err)
 	}
 	if got := ps.pin(t); !got.Equal(pinFor(rotated).Union(pinFor(k))) {
@@ -263,11 +328,11 @@ func TestWritePinCreatesRaisesAndNeverLowers(t *testing.T) {
 	}
 	stored := ps.value
 	var behind *pinBehind
-	if _, err := writePin(ctx, ps, k, true, false); !errors.As(err, &behind) || ps.value != stored {
+	if _, err := writePinLoop(ctx, ps, k, true, false); !errors.As(err, &behind) || ps.value != stored {
 		t.Errorf("an older keyring = %v, and the pin is %s; want refused and unchanged", err, ps.value)
 	}
 	// Replace is the operator lowering it on purpose.
-	if w, err := writePin(ctx, ps, k, true, true); err != nil || !w.Pin.Equal(pinFor(k)) {
+	if w, err := writePinLoop(ctx, ps, k, true, true); err != nil || !w.Pin.Equal(pinFor(k)) {
 		t.Errorf("replace = %+v, %v", w, err)
 	}
 }
@@ -278,7 +343,7 @@ func TestWritePinNeverWritesOverAnotherWriter(t *testing.T) {
 	ctx := context.Background()
 	ps := &fakePinStore{}
 	k := appsKeyring(t, "web")
-	if _, err := writePin(ctx, ps, k, true, false); err != nil {
+	if _, err := writePinLoop(ctx, ps, k, true, false); err != nil {
 		t.Fatal(err)
 	}
 	other, err := k.AddScope(mustAppScope(t, "api"))
@@ -292,7 +357,7 @@ func TestWritePinNeverWritesOverAnotherWriter(t *testing.T) {
 	// Between this machine's read and its write, another raises the pin with
 	// a key this keyring also holds (an import brought it over).
 	ps.onWrite = func() { ps.set(pinFor(other).Marshal()) }
-	w, err := writePin(ctx, ps, mine, true, false)
+	w, err := writePinLoop(ctx, ps, mine, true, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -301,7 +366,7 @@ func TestWritePinNeverWritesOverAnotherWriter(t *testing.T) {
 	}
 	// Infrastructure failing is an error, not a silent success.
 	ps.failWrite = errors.New("credentials expired")
-	if _, err := writePin(ctx, ps, appsKeyring(t, "fresh"), true, true); err == nil || !strings.Contains(err.Error(), "credentials expired") {
+	if _, err := writePinLoop(ctx, ps, appsKeyring(t, "fresh"), true, true); err == nil || !strings.Contains(err.Error(), "credentials expired") {
 		t.Errorf("a failing write = %v", err)
 	}
 }
@@ -328,7 +393,7 @@ func TestAWrittenPinAlwaysAdmitsTheKeyringItWasWrittenFrom(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if _, err := writePin(ctx, ps, k, r.IntN(2) == 0, false); err != nil {
+			if _, err := writePinLoop(ctx, ps, k, r.IntN(2) == 0, false); err != nil {
 				t.Fatalf("round %d: %v", i, err)
 			}
 			if err := ps.pin(t).Admits(heldKeys(k)); err != nil {
@@ -396,6 +461,31 @@ func TestKeyPinCommandRefusesToLowerWithoutReplace(t *testing.T) {
 		if p := kh.replica(i).pin; p == nil || !p.Equal(pinFor(keys)) {
 			t.Errorf("replica %d enforces %v; want the lowered pin, live", i, p)
 		}
+	}
+}
+
+// keyPinRefusalNamesThePlan is TestNonInteractiveRefusalsNameThePlan's row
+// for storage key pin (ADR 0023 M2.6c): lowering the pin with --replace,
+// with no terminal and no --yes, is refused naming the plan's route, and the
+// pin is left as it was.
+func keyPinRefusalNamesThePlan(t *testing.T) {
+	dir, _, env, _ := handOverInstance(t, "p321")
+	keys := scopedKeyring(t, dir, "p321", "apps", "web")
+	rotated, _, err := keys.RotateScopeKEKs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ps := pinStoreOf(dir, "p321")
+	ps.set(pinFor(rotated).Marshal())
+	stored := ps.value
+	c := withFlags(t, &keyPinCommand{}, "--replace")
+	c.newKeyholder = openerFor(&fakeStateKeyholder{phase: "unsealed"})
+	err = c.Run(t.Context(), env, []string{"p321"})
+	if err == nil || err.Error() != msgKeyPinLowerYes || exitCodeOf(err) != 2 || !strings.HasSuffix(msgKeyPinLowerYes, consentSuffix) {
+		t.Errorf("storage key pin --replace with no terminal = %v (exit %d); want %q", err, exitCodeOf(err), msgKeyPinLowerYes)
+	}
+	if ps.value != stored {
+		t.Errorf("a refused lowering wrote the pin %s", ps.value)
 	}
 }
 
@@ -850,7 +940,7 @@ func TestWritePinNeverDropsWhatWasRetired(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := writePin(ctx, ps, grown, false, false); err != nil {
+	if _, err := writePinLoop(ctx, ps, grown, false, false); err != nil {
 		t.Fatal(err)
 	}
 	if p := ps.pin(t); !containsID(p.Retired, rots[0].Previous) {
@@ -861,7 +951,7 @@ func TestWritePinNeverDropsWhatWasRetired(t *testing.T) {
 // A write that landed and lost its answer is success, found by reading back.
 func TestWritePinThatLandedButLostItsAnswerSucceeds(t *testing.T) {
 	ps := &fakePinStore{loseAnswer: true}
-	w, err := writePin(context.Background(), ps, appsKeyring(t, "web"), true, false)
+	w, err := writePinLoop(context.Background(), ps, appsKeyring(t, "web"), true, false)
 	if err != nil || !w.Changed {
 		t.Fatalf("= %+v, %v; want the landed write reported as written", w, err)
 	}
@@ -981,7 +1071,7 @@ func TestThePinNeverGrowsPastWhatAReplicaReads(t *testing.T) {
 	ps.set(raw)
 	stored := ps.value
 	var behind *pinBehind
-	if _, err := writePin(context.Background(), ps, appsKeyring(t, "web"), true, false); !errors.As(err, &behind) || ps.value != stored {
+	if _, err := writePinLoop(context.Background(), ps, appsKeyring(t, "web"), true, false); !errors.As(err, &behind) || ps.value != stored {
 		t.Errorf("a keyring behind an oversize pin = %v; want it refused as behind, the pin untouched", err)
 	}
 }
@@ -999,7 +1089,7 @@ func TestWritePinRefusesAPinNoReplicaCouldRead(t *testing.T) {
 		}
 	}
 	ps := &fakePinStore{}
-	if _, err := writePin(context.Background(), ps, k, true, false); err == nil || !strings.Contains(err.Error(), "more than") || ps.exists {
+	if _, err := writePinLoop(context.Background(), ps, k, true, false); err == nil || !strings.Contains(err.Error(), "more than") || ps.exists {
 		t.Errorf("an oversize pin = %v, written %v; want it refused and nothing written", err, ps.exists)
 	}
 }
@@ -1031,5 +1121,612 @@ func TestKeyPinReportsARecreatedPinAsWritten(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), `raised the key pin of "p320"`) || strings.Contains(out.String(), "there was none") {
 		t.Errorf("a raise over an existing pin was not reported as a raise:\n%s", out.String())
+	}
+}
+
+// ADR 0023 M2.6c: storage key pin and storage deploy through --plan and
+// --confirm, against fakes. The fixture is writeInstance's, so the instance
+// has a reader 'reader grant' verified; the plan reads the in-memory pin as
+// the reader, through its read-only view (testPinPlanReader), and the writer
+// writes the same pin; nothing reaches the fixture's kubetest server.
+
+// keyPinFixture is writeInstance's instance (its keyring holds one
+// application scope), its pin the instance's in-memory one, and its
+// keyholder's replicas kh's: the keyring and the pin store.
+func keyPinFixture(t *testing.T) (config.Dir, datasphere.Keyring, *fakePinStore) {
+	t.Helper()
+	dir, _ := writeInstance(t, kubetest.New(t), true)
+	keys, err := keyringOf(&Env{ConfigDir: dir}, writeName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dir, keys, pinStoreOf(dir, writeName)
+}
+
+// keyPinPlanCmd is storage key pin with its flags parsed, reading the pin
+// as the reader through its read-only view and handing it to kh.
+func keyPinPlanCmd(t *testing.T, kh sealStateClient, flags ...string) *keyPinCommand {
+	t.Helper()
+	c := withFlags(t, &keyPinCommand{}, flags...)
+	c.newPlanReader = testPinPlanReader
+	c.newKeyholder = noKeyholder
+	if kh != nil {
+		c.newKeyholder = openerFor(kh)
+	}
+	return c
+}
+
+// runKeyPinPlan runs key pin with --plan and flags, in JSON mode with no
+// terminal, and returns its plan.
+func runKeyPinPlan(t *testing.T, dir config.Dir, kh sealStateClient, flags ...string) plan.Document {
+	t.Helper()
+	env, out, errb := testEnvBoth(dir, output.ModeJSON)
+	if err := keyPinPlanCmd(t, kh, append(slices.Clone(flags), "--plan")...).Run(t.Context(), env, []string{writeName}); err != nil {
+		t.Fatalf("storage key pin --plan: %v\n%s", err, errb)
+	}
+	return printedDocument(t, out.Bytes())
+}
+
+// runKeyPinConfirm runs key pin with --confirm of doc and flags, in JSON
+// mode with no terminal: what it printed, and its error.
+func runKeyPinConfirm(t *testing.T, dir config.Dir, kh sealStateClient, doc plan.Document, flags ...string) (stdout, stderr string, err error) {
+	t.Helper()
+	env, out, errb := testEnvBoth(dir, output.ModeJSON)
+	err = keyPinPlanCmd(t, kh, append(slices.Clone(flags), "--confirm", doc.Digest)...).Run(t.Context(), env, []string{writeName})
+	return out.String(), errb.String(), err
+}
+
+// pinFactOf is the one pin fact a plan carries.
+func pinFactOf(t *testing.T, b plan.Bound) plan.PinFact {
+	t.Helper()
+	var found []plan.PinFact
+	for _, f := range b.Facts {
+		if p, ok := f.(plan.PinFact); ok {
+			found = append(found, p)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("the plan carries %d pin facts; want one", len(found))
+	}
+	return found[0]
+}
+
+// pinOfFact is a pin fact as a pin.
+func pinOfFact(t *testing.T, f plan.PinFact) dskeyholder.Pin {
+	t.Helper()
+	p, ok := pinFromReport(&dskeyholder.PinReport{Require: f.Require, Retired: f.Retired})
+	if !ok {
+		t.Fatalf("the pin fact %+v holds an id that is not a key id", f)
+	}
+	return p
+}
+
+// foreignID is foreignKeyID as a key id.
+func foreignID(t *testing.T) datasphere.KeyID {
+	t.Helper()
+	id, err := datasphere.ParseKeyID(foreignKeyID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+// storageRig is storage deploy against writeInstance's fixture, its
+// material saved and its record changed by edit, as a release farcast
+// carrying the fake components: its provider, builder, writer and storage
+// mint fakes, its plan's reader the in-memory pin's read-only view, and its
+// writer's pin that same pin. The writer's cluster and the pin answer
+// farcast-system's uid u1.
+type storageRig struct {
+	dir config.Dir
+	fp  *fakeProvider
+	fb  *fakeBuilder
+	fc  *fakeCluster
+	ps  *fakePinStore
+	// minted counts the storage mints, and mint is what each does (nothing
+	// when nil).
+	minted int
+	mint   func(dir config.Dir) error
+	// opened counts the provider's opens.
+	opened int
+	// writers counts the writer's opens; onWriter runs as it opens, and
+	// writerErr refuses it.
+	writers   int
+	onWriter  func()
+	writerErr error
+}
+
+func newStorageRig(t *testing.T, edit func(meta *config.InstanceMetadata)) *storageRig {
+	t.Helper()
+	dir, meta := writeInstance(t, kubetest.New(t), true)
+	writeMaterial(t, dir)
+	if edit != nil {
+		edit(meta)
+		if err := dir.SaveInstanceMetadata(writeName, meta); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The registry the ensure answers is the one the record names, when it
+	// names one.
+	fp := &fakeProvider{}
+	if meta.Registry != nil {
+		fp.registry = &planck.Registry{Ref: registryRefFor(meta), Prefix: meta.Registry.Prefix}
+	}
+	r := &storageRig{dir: dir, fp: fp, fb: &fakeBuilder{resolveFn: notFoundForTags}, fc: &fakeCluster{uid: "u1"}, ps: pinStoreOf(dir, writeName)}
+	r.ps.uid = "u1"
+	return r
+}
+
+// mintsBucket is a storage mint that records the bucket the real one would,
+// in the instance's region, then changes the record by change.
+func (r *storageRig) mintsBucket(change func(m *config.InstanceMetadata)) {
+	r.mint = func(dir config.Dir) error {
+		_, err := dir.UpdateInstanceMetadata(writeName, func(m *config.InstanceMetadata) error {
+			m.Storage = &config.Storage{Bucket: "farcast-atlas-0a1b2c3d", Provider: "gcs", Location: m.Region}
+			if change != nil {
+				change(m)
+			}
+			return nil
+		})
+		return err
+	}
+}
+
+func (r *storageRig) cmd(t *testing.T, flags ...string) *storageDeployCommand {
+	t.Helper()
+	c := withFlags(t, &storageDeployCommand{}, flags...)
+	asRelease(&c.deployer, nil)
+	c.deployer.openProvider = func(*config.InstanceMetadata, *config.InstanceCredentials) (planck.Provider, error) {
+		r.opened++
+		return r.fp, nil
+	}
+	c.deployer.newBuilder = func(func(string)) imageBuilder { return r.fb }
+	c.deployer.newCluster = func(clusterRef) (clusterApplier, error) {
+		r.writers++
+		if r.onWriter != nil {
+			r.onWriter()
+		}
+		if r.writerErr != nil {
+			return nil, r.writerErr
+		}
+		return r.fc, nil
+	}
+	c.newPinStore = testDefaultPinStore
+	c.newPlanReader = testPinPlanReader
+	c.ensureStorage = func(context.Context, *Env, string) error {
+		r.minted++
+		if r.mint != nil {
+			return r.mint(r.dir)
+		}
+		return nil
+	}
+	return c
+}
+
+// run runs storage deploy with flags, in JSON mode with no terminal.
+func (r *storageRig) run(t *testing.T, flags ...string) (stdout, stderr string, err error) {
+	t.Helper()
+	env, out, errb := testEnvBoth(r.dir, output.ModeJSON)
+	err = r.cmd(t, flags...).Run(t.Context(), env, []string{writeName})
+	return out.String(), errb.String(), err
+}
+
+// plan is storage deploy's --plan.
+func (r *storageRig) plan(t *testing.T) plan.Document {
+	t.Helper()
+	stdout, stderr, err := r.run(t, "--plan")
+	if err != nil {
+		t.Fatalf("storage deploy --plan: %v\n%s", err, stderr)
+	}
+	return printedDocument(t, []byte(stdout))
+}
+
+// wroteNothing fails t if the rig minted storage, ensured the registry,
+// pushed or built an image, or applied anything.
+func (r *storageRig) wroteNothing(t *testing.T) {
+	t.Helper()
+	if r.minted+len(r.fp.ensured)+len(r.fb.embedded)+len(r.fb.built)+len(r.fc.applied) != 0 {
+		t.Errorf("minted storage %d times, ensured %d registries, pushed %d, built %d and applied %d",
+			r.minted, len(r.fp.ensured), len(r.fb.embedded), len(r.fb.built), len(r.fc.applied))
+	}
+}
+
+// ADR 0023 M2.6 (A23-42, A23-23, row 86): under --confirm the pin is
+// written once, at the version its plan read, and never as anything the
+// plan did not list. Another writer that raises the pin between the
+// comparison and the write makes that write a conflict: the command refuses
+// plan_changed, with A23-42's text, and leaves the other writer's pin as it
+// is, unioned with nothing and written over by nothing. storage deploy then
+// records no keyholder and applies nothing. storage key rotate writes two
+// pins, and each is that one attempt: the hold, at the version the plan
+// read, and the final pin, at the version the hold produced (A23-45).
+func TestConfirmNeverWritesAPinThePlanDidNotList(t *testing.T) {
+	raise := func(t *testing.T, ps *fakePinStore) string {
+		t.Helper()
+		other := dskeyholder.Pin{Retired: []datasphere.KeyID{foreignID(t)}}.Marshal()
+		ps.onWrite = func() { ps.set(other) }
+		return other
+	}
+	t.Run("storage key pin", func(t *testing.T) {
+		dir, _, ps := keyPinFixture(t)
+		doc := runKeyPinPlan(t, dir, nil)
+		other := raise(t, ps)
+		_, _, err := runKeyPinConfirm(t, dir, nil, doc)
+		if err == nil || err.Error() != msgPinChanged || kindOf(classified(err)) != kindPlanChanged || exitCodeOf(err) != 1 {
+			t.Fatalf("--confirm over another writer's pin = %v (kind %s); want plan_changed, %q", err, kindOf(classified(err)), msgPinChanged)
+		}
+		if ps.value != other || ps.version != 1 {
+			t.Errorf("the pin is %s at version %d; want the other writer's %s, written once", ps.value, ps.version, other)
+		}
+	})
+	t.Run("storage deploy", func(t *testing.T) {
+		r := newStorageRig(t, nil)
+		doc := r.plan(t)
+		other := raise(t, r.ps)
+		_, _, err := r.run(t, "--confirm", doc.Digest)
+		if err == nil || err.Error() != msgPinChanged || kindOf(classified(err)) != kindPlanChanged {
+			t.Fatalf("--confirm over another writer's pin = %v (kind %s); want plan_changed, %q", err, kindOf(classified(err)), msgPinChanged)
+		}
+		if r.ps.value != other || r.ps.version != 1 {
+			t.Errorf("the pin is %s at version %d; want the other writer's %s, written once", r.ps.value, r.ps.version, other)
+		}
+		if len(r.fc.applied) != 0 {
+			t.Errorf("applied %d streams after the pin was refused", len(r.fc.applied))
+		}
+		if after, err := r.dir.LoadInstanceMetadata(writeName); err != nil || after.Keyholder.Image != "" {
+			t.Errorf("recorded the keyholder %+v (%v) after the pin was refused", after.Keyholder, err)
+		}
+	})
+	for _, stage := range []struct {
+		name string
+		n    int // the pin write the other writer comes before
+	}{{"storage key rotate/the hold stage", 1}, {"storage key rotate/the final pin", 2}} {
+		t.Run(stage.name, func(t *testing.T) {
+			r := newRotateRig(t, backdatedApps)
+			doc := r.plan(t)
+			other, version := dskeyholder.Pin{Retired: []datasphere.KeyID{foreignID(t)}}.Marshal(), 0
+			r.beforeWrite = func(n int) {
+				if n == stage.n {
+					r.ps.set(other)
+					version = r.ps.version
+				}
+			}
+			_, _, err := r.run(t, "--confirm", doc.Digest)
+			if err == nil || err.Error() != msgPinChanged || kindOf(classified(err)) != kindPlanChanged || exitCodeOf(err) != 1 {
+				t.Fatalf("--confirm over another writer's pin = %v (kind %s); want plan_changed, %q", err, kindOf(classified(err)), msgPinChanged)
+			}
+			if r.ps.value != other || r.ps.version != version || len(r.writes) != stage.n {
+				t.Errorf("the pin is %s at version %d after %d writes; want the other writer's %s at %d, after %d", r.ps.value, r.ps.version, len(r.writes), other, version, stage.n)
+			}
+		})
+	}
+}
+
+// ADR 0023 M2.6 (A23-42, mutation 86d): under --confirm a pin write that
+// landed and lost its answer is read back, and the planned pin there counts
+// as written: the command succeeds, writing once. The pin was opened as the
+// reader for the plan and again for its recomputation, and as the writer
+// once, after the comparison (A23-20, A21-3 as A23-43 qualifies it).
+func TestConfirmPinThatLandedButLostItsAnswerSucceeds(t *testing.T) {
+	opens := []kube.Identity{kube.Reader, kube.Reader, kube.Writer}
+	t.Run("storage key pin", func(t *testing.T) {
+		dir, keys, ps := keyPinFixture(t)
+		doc := runKeyPinPlan(t, dir, nil)
+		ps.loseAnswer = true
+		stdout, stderr, err := runKeyPinConfirm(t, dir, nil, doc)
+		if err != nil {
+			t.Fatalf("--confirm whose write lost its answer = %v\n%s", err, stderr)
+		}
+		if !ps.pin(t).Equal(pinFor(keys)) || ps.version != 1 || !strings.Contains(stdout, `"written":true`) {
+			t.Errorf("the pin is %s at version %d, and the result %s; want this keyring's, written once", ps.value, ps.version, stdout)
+		}
+		if got := ps.openedBy(); !slices.Equal(got, opens) {
+			t.Errorf("the pin was opened as %v; want %v", got, opens)
+		}
+	})
+	t.Run("storage deploy", func(t *testing.T) {
+		r := newStorageRig(t, nil)
+		doc := r.plan(t)
+		r.ps.loseAnswer = true
+		if _, stderr, err := r.run(t, "--confirm", doc.Digest); err != nil {
+			t.Fatalf("--confirm whose pin write lost its answer = %v\n%s", err, stderr)
+		}
+		if r.ps.version != 1 || len(r.fc.applied) != 1 {
+			t.Errorf("the pin was written %d times and %d streams applied; want once each", r.ps.version, len(r.fc.applied))
+		}
+		if got := r.ps.openedBy(); !slices.Equal(got, opens) || r.writers != 1 {
+			t.Errorf("the pin was opened as %v and the writer %d times; want %v, and the writer once", got, r.writers, opens)
+		}
+	})
+	t.Run("storage key rotate", func(t *testing.T) {
+		r := newRotateRig(t, backdatedApps)
+		doc := r.plan(t)
+		r.ps.loseAnswer = true
+		stdout, stderr, err := r.run(t, "--confirm", doc.Digest)
+		if err != nil {
+			t.Fatalf("--confirm whose hold lost its answer = %v\n%s", err, stderr)
+		}
+		if res := rotated(t, stdout); !res.Active || len(r.writes) != 2 || r.ps.version != 2 || !r.ps.pin(t).Equal(r.writes[1].pin) {
+			t.Errorf("the pin is %s at version %d after %d writes, and the result %+v; want the hold, then the final pin, each written once",
+				r.ps.value, r.ps.version, len(r.writes), res)
+		}
+		if got := r.ps.openedBy(); !slices.Equal(got, opens) || r.writers != 1 {
+			t.Errorf("the pin was opened as %v and the writer %d times; want %v, and the writer once", got, r.writers, opens)
+		}
+	})
+}
+
+// ADR 0023 M2.6 (A23-42): under --confirm a pin write that fails for any
+// reason but a conflict keeps its own kind: a 500 is cluster_rejected, not
+// plan_changed, and nothing is written.
+func TestConfirmPinNon409FailureKeepsItsKind(t *testing.T) {
+	failed := &kube.APIError{Method: "POST", Path: configMapsPath,
+		Status: kube.Status{Status: tkube.Status{Code: 500, Reason: "InternalError", Message: "etcd is unhappy"}}, KubernetesStatus: true}
+	t.Run("storage key pin", func(t *testing.T) {
+		dir, _, ps := keyPinFixture(t)
+		doc := runKeyPinPlan(t, dir, nil)
+		ps.failWrite = failed
+		_, _, err := runKeyPinConfirm(t, dir, nil, doc)
+		if kind := kindOf(classified(err)); err == nil || kind != kindClusterRejected || !errors.Is(err, failed) {
+			t.Fatalf("--confirm whose pin write failed = %v (kind %s); want its own kind, %s", err, kind, kindClusterRejected)
+		}
+		if ps.exists {
+			t.Errorf("a failed write left a pin: %s", ps.value)
+		}
+	})
+	t.Run("storage deploy", func(t *testing.T) {
+		r := newStorageRig(t, nil)
+		doc := r.plan(t)
+		r.ps.failWrite = failed
+		_, _, err := r.run(t, "--confirm", doc.Digest)
+		if kind := kindOf(classified(err)); err == nil || kind != kindClusterRejected || !strings.Contains(err.Error(), "the key pin could not be written, so nothing was deployed") {
+			t.Fatalf("--confirm whose pin write failed = %v (kind %s); want its own kind, %s", err, kind, kindClusterRejected)
+		}
+		if len(r.fc.applied) != 0 {
+			t.Errorf("applied %d streams after the pin failed", len(r.fc.applied))
+		}
+	})
+	// With no keyring here the plan creates the empty pin. A create that
+	// failed reads back absent, which is not the empty pin written (row O33
+	// of the M2.6c review): the replicas are never deployed with no pin
+	// ConfigMap at all.
+	t.Run("storage deploy, no keyring here", func(t *testing.T) {
+		r := newStorageRig(t, nil)
+		if err := os.Remove(r.dir.InstanceKeyringPath(writeName)); err != nil {
+			t.Fatal(err)
+		}
+		doc := r.plan(t)
+		if w := planWrites(decodedBound(t, doc)); len(w) == 0 || w[0].(plan.WriteFact).Name != dsdeploy.PinConfigMapName("") || w[0].(plan.WriteFact).Method != plan.WriteCreate {
+			t.Fatalf("the plan's first write is %+v; want the empty pin's create", w)
+		}
+		r.ps.failWrite = failed
+		_, _, err := r.run(t, "--confirm", doc.Digest)
+		if kind := kindOf(classified(err)); err == nil || kind != kindClusterRejected || !strings.Contains(err.Error(), "the key pin could not be written, so nothing was deployed") {
+			t.Fatalf("--confirm whose empty pin's create failed = %v (kind %s); want its own kind, %s", err, kind, kindClusterRejected)
+		}
+		if r.ps.exists || len(r.fc.applied) != 0 {
+			t.Errorf("the pin exists: %v, and %d streams were applied; want neither", r.ps.exists, len(r.fc.applied))
+		}
+	})
+	// rotate's two pins: the hold's failure stops the rotation with the new
+	// keys held, and the final pin's leaves them in use; either is the
+	// command's error, with its own kind, never an unfinished rotation's
+	// internal. The hold's says it is the pin that was not written, the keys
+	// held and unused, never a keyring this machine could not save (ADR 0023
+	// M2.6c).
+	for _, stage := range []struct {
+		name   string
+		n      int
+		active bool
+	}{{"storage key rotate/the hold stage", 1, false}, {"storage key rotate/the final pin", 2, true}} {
+		t.Run(stage.name, func(t *testing.T) {
+			r := newRotateRig(t, backdatedApps)
+			doc := r.plan(t)
+			r.beforeWrite = func(n int) {
+				if n == stage.n {
+					r.ps.failWrite = failed
+				}
+			}
+			stdout, _, err := r.run(t, "--confirm", doc.Digest)
+			if kind := kindOf(classified(err)); err == nil || kind != kindClusterRejected || !errors.Is(err, failed) {
+				t.Fatalf("--confirm whose pin write failed = %v (kind %s); want its own kind, %s", err, kind, kindClusterRejected)
+			}
+			res := rotated(t, stdout)
+			if res.Active != stage.active || len(r.writes) != stage.n {
+				t.Errorf("the rotation is in use: %v, after %d pin writes; want %v, after %d", res.Active, len(r.writes), stage.active, stage.n)
+			}
+			if stage.active {
+				return
+			}
+			if !strings.Contains(res.Keyholder, "every replica took the new keys to hold, but the key pin that would hold them could not be written (write the key pin: ") ||
+				!strings.Contains(res.Keyholder, "held and unused") || strings.Contains(res.Keyholder, "could not save its keyring") || res.Status != "held" {
+				t.Errorf("the result says %+v; want the new keys held and unused, the pin named as why", res)
+			}
+		})
+	}
+	// The same 500, its message hostile, in human mode: no byte the API
+	// server sent can act on the terminal, on the keyholder line or any
+	// other (ADR 0023 M2.6c, A20-13).
+	t.Run("storage key rotate/the hold stage, a hostile message", func(t *testing.T) {
+		hostile := &kube.APIError{Method: "PUT", Path: configMapsPath,
+			Status: kube.Status{Status: tkube.Status{Code: 500, Reason: "InternalError", Message: "boom \x1b]0;pwned\x07 \x1b[2J"}}, KubernetesStatus: true}
+		r := newRotateRig(t, backdatedApps)
+		doc := r.plan(t)
+		r.beforeWrite = func(n int) {
+			if n == 1 {
+				r.ps.failWrite = hostile
+			}
+		}
+		env, out, errb := testEnvBoth(r.dir, output.ModeHuman)
+		err := r.cmd(t, "--confirm", doc.Digest).Run(t.Context(), env, []string{writeName})
+		if kind := kindOf(classified(err)); err == nil || kind != kindClusterRejected {
+			t.Fatalf("--confirm whose hold write failed = %v (kind %s); want %s", err, kind, kindClusterRejected)
+		}
+		for name, text := range map[string]string{"stdout": out.String(), "stderr": errb.String()} {
+			for i := 0; i < len(text); i++ {
+				if c := text[i]; c < 0x20 && c != '\n' {
+					t.Errorf("%s carries the control byte %#x: %q", name, c, text)
+					break
+				}
+			}
+		}
+		if !strings.Contains(out.String(), "the key pin that would hold them could not be written") {
+			t.Errorf("the keyholder line does not name the pin:\n%s", out)
+		}
+	})
+}
+
+// ADR 0023 M2.6 (A23-3, A23-44, mutation 91c): under --confirm, --replace
+// lowers what its plan said it lowers without asking: with no terminal and
+// no --yes, from a keyring behind the pin, the pin is lowered to this
+// keyring's and every replica handed it in place of what it enforced; and
+// over a pin it is not behind, a replica found enforcing another pin is
+// handed this one in its place. Its plan is the consent; confirmLower is
+// never asked.
+func TestKeyPinReplaceConfirmLowersReplicasWithoutAsking(t *testing.T) {
+	t.Run("from behind the pin", func(t *testing.T) {
+		dir, keys, ps := keyPinFixture(t)
+		ps.set(dskeyholder.Pin{Require: []datasphere.KeyID{foreignID(t)}}.Marshal())
+		kh := &fakeStateKeyholder{phase: "unsealed"}
+		above := dskeyholder.Pin{Require: []datasphere.KeyID{foreignID(t)}}
+		for i := range 2 {
+			kh.replica(i).pin = &above
+		}
+		doc := runKeyPinPlan(t, dir, kh, "--replace")
+		if f := pinFactOf(t, decodedBound(t, doc)); !slices.Equal(f.Lowering, []string{foreignKeyID}) {
+			t.Fatalf("the plan lowers %q; want %q", f.Lowering, foreignKeyID)
+		}
+		stdout, stderr, err := runKeyPinConfirm(t, dir, kh, doc, "--replace")
+		if err != nil {
+			t.Fatalf("--replace --confirm with no terminal = %v\n%s", err, stderr)
+		}
+		if strings.Contains(stderr, "Lower the key pin") {
+			t.Errorf("--confirm asked: %s", stderr)
+		}
+		if !ps.pin(t).Equal(pinFor(keys)) || !strings.Contains(stdout, `"lowered":["`+foreignKeyID+`"]`) {
+			t.Errorf("the pin is %s, the result %s; want this keyring's own, lowering %s", ps.value, stdout, foreignKeyID)
+		}
+		for i := range 2 {
+			if p := kh.replica(i).pin; p == nil || !p.Equal(pinFor(keys)) {
+				t.Errorf("replica %d enforces %v; want this keyring's pin, handed in place of the old", i, p)
+			}
+		}
+	})
+	t.Run("a replica above a pin it is not behind", func(t *testing.T) {
+		dir, keys, ps := keyPinFixture(t)
+		ps.set(pinFor(keys).Marshal())
+		kh := &fakeStateKeyholder{phase: "unsealed"}
+		above := pinFor(keys).Union(dskeyholder.Pin{Require: []datasphere.KeyID{foreignID(t)}})
+		kh.replica(1).pin = &above
+		doc := runKeyPinPlan(t, dir, kh, "--replace")
+		stdout, stderr, err := runKeyPinConfirm(t, dir, kh, doc, "--replace")
+		if err != nil {
+			t.Fatalf("--replace --confirm with no terminal = %v\n%s", err, stderr)
+		}
+		if strings.Contains(stderr, "Lower the key pin") || !strings.Contains(stderr, "replica 1 enforce a pin other than this keyring's") {
+			t.Errorf("--confirm asked, or did not say what it lowers: %s", stderr)
+		}
+		if p := kh.replica(1).pin; p == nil || !p.Equal(pinFor(keys)) || !strings.Contains(stdout, `"lowered":["replica 1"]`) {
+			t.Errorf("replica 1 enforces %v, the result %s; want this keyring's pin, handed in place of the higher one", p, stdout)
+		}
+	})
+	// Behind the pin only because this keyring writes under a key the pin
+	// retired — a stale or imported keyring after another machine rotated
+	// (A23-44: lowering is the missing keys, then the retired active ones;
+	// row O17 of the M2.6c review): the plan binds that key as lowered, and
+	// --confirm lowers it, without asking.
+	t.Run("from behind the pin by a key it retires", func(t *testing.T) {
+		dir, keys, ps := keyPinFixture(t)
+		active := scopeKEK(keys)
+		cur := pinFor(keys)
+		cur.Retired = append(cur.Retired, active)
+		ps.set(cur.Marshal())
+		kh := &fakeStateKeyholder{phase: "unsealed"}
+		doc := runKeyPinPlan(t, dir, kh, "--replace")
+		b := decodedBound(t, doc)
+		if f := pinFactOf(t, b); len(b.Blocked) != 0 || !slices.Equal(f.Lowering, []string{active.String()}) {
+			t.Fatalf("the plan blocks %+v and lowers %q; want it unblocked, lowering the retired active key %s", b.Blocked, f.Lowering, active)
+		}
+		stdout, stderr, err := runKeyPinConfirm(t, dir, kh, doc, "--replace")
+		if err != nil {
+			t.Fatalf("--replace --confirm with no terminal = %v\n%s", err, stderr)
+		}
+		if strings.Contains(stderr, "Lower the key pin") || !strings.Contains(stdout, `"lowered":["`+active.String()+`"]`) {
+			t.Errorf("--confirm asked, or its result %s does not lower %s: %s", stdout, active, stderr)
+		}
+	})
+}
+
+// ADR 0023 M2.6 (A23-44; row O40 of the M2.6c review): storage key pin's plan
+// binds --replace as given, true or false, as its one option.
+func TestKeyPinPlanBindsReplace(t *testing.T) {
+	for _, replace := range []bool{false, true} {
+		t.Run(strconv.FormatBool(replace), func(t *testing.T) {
+			dir, _, _ := keyPinFixture(t)
+			var flags []string
+			if replace {
+				flags = []string{"--replace"}
+			}
+			b := decodedBound(t, runKeyPinPlan(t, dir, nil, flags...))
+			if want := []plan.Option{{Flag: "replace", Value: strconv.FormatBool(replace)}}; !slices.Equal(b.Options, want) {
+				t.Errorf("the plan binds %+v; want %+v", b.Options, want)
+			}
+		})
+	}
+}
+
+// ADR 0023 M2.6 (A23-20): the key pin opens only as the writer. A plan
+// reads it through its own reader, and pinStoreFor refuses any other
+// identity before anything is opened.
+func TestPinStoreForOpensOnlyTheWriter(t *testing.T) {
+	opened := 0
+	seam := func(clusterRef) (pinStore, error) {
+		opened++
+		return &fakePinStore{}, nil
+	}
+	for _, id := range []kube.Identity{kube.Reader, ""} {
+		ps, err := pinStoreFor(seam, clusterRef{Meta: &config.InstanceMetadata{Name: writeName}, Identity: id}, &fakePinStore{})
+		if err == nil || err.Error() != msgPinWriterOnly || ps != nil || kindOf(classified(err)) != kindInternal {
+			t.Errorf("pinStoreFor as %q = %v, %v; want %q", id, ps, err, msgPinWriterOnly)
+		}
+	}
+	if opened != 0 {
+		t.Errorf("a refused identity opened the pin %d times", opened)
+	}
+	if _, err := pinStoreFor(seam, clusterRef{Meta: &config.InstanceMetadata{Name: writeName}, Identity: kube.Writer}, nil); err != nil || opened != 1 {
+		t.Errorf("pinStoreFor as the writer = %v, opening %d times", err, opened)
+	}
+}
+
+// ADR 0023 M2.6c (A23-43): with a bucket recorded and no keyring on this
+// machine, storage deploy keeps a readable pin as it is, whatever it
+// requires, and writes the empty pin only where there is none or none that
+// reads: its plan binds the pin there and no pin write, and its --yes run and
+// its --confirm leave the pin untouched, at its version.
+func TestStorageDeployWithNoKeyringKeepsAReadablePin(t *testing.T) {
+	for _, answer := range []string{"--yes", "--confirm"} {
+		t.Run(answer, func(t *testing.T) {
+			r := newStorageRig(t, nil)
+			if err := os.Remove(r.dir.InstanceKeyringPath(writeName)); err != nil {
+				t.Fatal(err)
+			}
+			held := dskeyholder.Pin{Require: []datasphere.KeyID{foreignID(t)}}
+			r.ps.set(held.Marshal())
+			doc := r.plan(t)
+			b := decodedBound(t, doc)
+			if f := pinFactOf(t, b); !pinOfFact(t, f).Equal(held) || len(planWrites(b)) == 0 || planWrites(b)[0].(plan.WriteFact).Kind == "ConfigMap" {
+				t.Fatalf("the plan binds the pin %+v and the writes %+v; want the readable pin kept, and no pin write", f, planWrites(b))
+			}
+			flags := []string{"--yes"}
+			if answer == "--confirm" {
+				flags = []string{"--confirm", doc.Digest}
+			}
+			if _, stderr, err := r.run(t, flags...); err != nil {
+				t.Fatalf("storage deploy %s: %v\n%s", answer, err, stderr)
+			}
+			if r.ps.value != held.Marshal() || r.ps.version != 1 || len(r.fc.applied) != 1 {
+				t.Errorf("the pin is %s at version %d, with %d streams applied; want the readable pin untouched, and the keyholder applied", r.ps.value, r.ps.version, len(r.fc.applied))
+			}
+		})
 	}
 }

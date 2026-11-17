@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -17,6 +18,7 @@ import (
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/keyholder"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
+	"github.com/sofmon/farcast/farsight/cli/internal/plan"
 	"github.com/sofmon/farcast/planck"
 )
 
@@ -311,23 +313,13 @@ func TestDeployRefusesWithoutATunnel(t *testing.T) {
 // bucketless instance — it just gets there by creating one.
 func TestDeployMintsTheBucketItNeeds(t *testing.T) {
 	dir := config.Dir(t.TempDir())
-	if err := os.Chmod(string(dir), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := dir.CreateInstance("prod"); err != nil {
-		t.Fatal(err)
-	}
-	meta := &config.InstanceMetadata{
-		Name: "prod", Provider: "gke", Region: "us-central1", Status: "running",
-		FatLineDeployed: true,
-	}
-	if err := dir.SaveInstanceMetadata("prod", meta); err != nil {
-		t.Fatal(err)
-	}
+	// Connected, with no storage recorded: the plan reads the instance's
+	// material and registry before anything is minted (ADR 0023 M2.6c).
+	connectedInstance(t, dir, "prod")
 	env, _ := testEnv(dir, output.ModeHuman)
 
 	var minted []string
-	c := &storageDeployCommand{}
+	c := testStorageDeploy(&fakeProvider{}, &fakeBuilder{})
 	// The writer opens first (ADR 0023 M2.5); a fake, as no cluster is here.
 	c.deployer.newCluster = func(clusterRef) (clusterApplier, error) { return &fakeCluster{}, nil }
 	// Consent first: since the Phase 4.4 walk the cost gate sits above the
@@ -440,23 +432,17 @@ func TestDeployCreatesNothingWithoutConsent(t *testing.T) {
 // Non-interactive runs must not provision standing compute without consent.
 func TestDeployRequiresConsentForStandingCost(t *testing.T) {
 	dir := config.Dir(t.TempDir())
-	if err := os.Chmod(string(dir), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := dir.CreateInstance("prod"); err != nil {
-		t.Fatal(err)
-	}
-	meta := &config.InstanceMetadata{
-		Name: "prod", Provider: "gke", Region: "us-central1", Status: "running",
-		FatLineDeployed: true,
-		Storage:         &config.Storage{Bucket: "b", Provider: "gcs"},
-	}
+	// The plan reads the instance's material and registry before the cost
+	// is asked (ADR 0023 M2.6c), and a run that cannot pass the gate gives
+	// a record none.
+	meta := deployableInstance(t, dir, "prod")
+	meta.Registry = &config.Registry{Prefix: "us-central1-docker.pkg.dev/proj-1/farcast-prod"}
 	if err := dir.SaveInstanceMetadata("prod", meta); err != nil {
 		t.Fatal(err)
 	}
 	env, _ := testEnv(dir, output.ModeHuman)
 
-	c := &storageDeployCommand{}
+	c := testStorageDeploy(&fakeProvider{}, &fakeBuilder{})
 	// The writer opens first (ADR 0023 M2.5); a fake, as no cluster is here.
 	c.deployer.newCluster = func(clusterRef) (clusterApplier, error) { return &fakeCluster{}, nil }
 	err := c.Run(context.Background(), env, []string{"prod"})
@@ -473,6 +459,36 @@ func TestDeployRequiresConsentForStandingCost(t *testing.T) {
 	}
 }
 
+// ADR 0023 M2.6 (A23-43; row O37 of the M2.6c review): a first storage
+// deploy on a machine that holds no keyring states that it mints one — key
+// material whose loss loses the data — and one over a keyring this machine
+// holds states no such mint.
+func TestFirstStorageDeployStatesTheKeyringItMints(t *testing.T) {
+	for _, held := range []bool{false, true} {
+		t.Run(fmt.Sprintf("a keyring here: %v", held), func(t *testing.T) {
+			r := newStorageRig(t, func(m *config.InstanceMetadata) { m.Storage = nil })
+			if !held {
+				if err := os.Remove(r.dir.InstanceKeyringPath(writeName)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var mints []plan.MintFact
+			for _, f := range decodedBound(t, r.plan(t)).Facts {
+				if m, ok := f.(plan.MintFact); ok && m.What == plan.MintKeyring {
+					mints = append(mints, m)
+				}
+			}
+			want := []plan.MintFact{{Type: plan.TypeMint, What: plan.MintKeyring, Subject: writeName}}
+			if held {
+				want = nil
+			}
+			if !slices.Equal(mints, want) {
+				t.Errorf("the plan states the keyring mints %+v; want %+v", mints, want)
+			}
+		})
+	}
+}
+
 // The two system workloads must not share an image path, or one would
 // overwrite the other in the instance's registry.
 func TestSystemComponentsHaveDistinctImagePaths(t *testing.T) {
@@ -484,6 +500,108 @@ func TestSystemComponentsHaveDistinctImagePaths(t *testing.T) {
 	}
 	if !strings.HasPrefix(components.Datasphered.ImagePath, "system/") {
 		t.Errorf("the keyholder image is not under system/: %s", components.Datasphered.ImagePath)
+	}
+}
+
+// storageDeployRefusalNamesThePlan is TestNonInteractiveRefusalsNameThePlan's
+// row for storage deploy (ADR 0023 M2.6c): with no terminal and no --yes its
+// cost question is refused in exact cents, naming the plan's route, before
+// anything is created, ensured, pushed, applied or recorded. On a record
+// that names no registry such a run gives none first: only a run that can
+// pass the gate ensures before its plan, so it is refused in planRegistry's
+// words, the provider never opened and the record as it was.
+func storageDeployRefusalNamesThePlan(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		registry bool
+		want     string
+		exit     int
+	}{
+		{"the cost", true, fmt.Sprintf(msgKeyholderCostYes, amount(cents(keyholderMonthlyUSD)), keyholderReplicas), 2},
+		{"no registry recorded", false, fmt.Sprintf(msgNoRegistryRecorded, "p41", "p41"), 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := config.Dir(t.TempDir())
+			meta := deployableInstance(t, dir, "p41")
+			if tc.registry {
+				meta.Registry = &config.Registry{Prefix: "us-central1-docker.pkg.dev/proj-1/farcast-p41"}
+				if err := dir.SaveInstanceMetadata("p41", meta); err != nil {
+					t.Fatal(err)
+				}
+			}
+			fc, fb := &fakeCluster{}, &fakeBuilder{resolveFn: notFoundForTags}
+			fp := &fakeProvider{}
+			c := withFlags(t, testStorageDeploy(fp, fb))
+			opened := 0
+			c.deployer.openProvider = func(*config.InstanceMetadata, *config.InstanceCredentials) (planck.Provider, error) {
+				opened++
+				return fp, nil
+			}
+			c.deployer.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
+			minted := 0
+			c.ensureStorage = func(context.Context, *Env, string) error {
+				minted++
+				return nil
+			}
+			env, _ := testEnv(dir, output.ModeHuman) // stdin is no terminal
+			err := c.Run(t.Context(), env, []string{"p41"})
+			if err == nil || err.Error() != tc.want || exitCodeOf(err) != tc.exit || (tc.exit == 2 && !strings.HasSuffix(tc.want, consentSuffix)) {
+				t.Errorf("storage deploy with no terminal = %v (exit %d); want %q", err, exitCodeOf(err), tc.want)
+			}
+			if minted+len(fp.ensured)+len(fb.embedded)+len(fb.built)+len(fc.applied) != 0 || (!tc.registry && opened != 0) {
+				t.Errorf("a refused deploy minted %d, ensured %d registries, pushed %d, built %d and applied %d, and opened the provider %d times",
+					minted, len(fp.ensured), len(fb.embedded), len(fb.built), len(fc.applied), opened)
+			}
+			after, _ := dir.LoadInstanceMetadata("p41")
+			if after.Keyholder != nil {
+				t.Errorf("a refused deploy recorded a keyholder: %+v", after.Keyholder)
+			}
+			if registryPrefix(after) != registryPrefix(meta) {
+				t.Errorf("a refused deploy recorded the registry %q; want %q", registryPrefix(after), registryPrefix(meta))
+			}
+		})
+	}
+}
+
+// ADR 0023 M2.6c (A23-43, A26-2): storage deploy decides the instance's
+// identity as the commands that deploy FatLine do, connected, so material
+// missing one of its files — ca.key, which the keyholder's leaf is issued
+// from, or server.key — is refused before anything is asked or minted and
+// before a record that names no registry is given one: with --yes and with
+// --plan, the provider is never opened, nothing is ensured, minted, pushed
+// or applied, nothing is printed, and no file changes. Material whose CA
+// certificate is gone is a lost trust root, refused in its own words: only
+// connect mints a CA (row O51 of the M2.6c review).
+func TestStorageDeployRefusesMaterialMissingAFileBeforeTheRegistry(t *testing.T) {
+	for _, file := range []string{"ca.key", "server.key", "ca.crt"} {
+		for _, flags := range [][]string{{"--yes"}, {"--plan"}} {
+			t.Run(fmt.Sprintf("%s/%q", file, flags), func(t *testing.T) {
+				r := newStorageRig(t, func(m *config.InstanceMetadata) { m.Registry = nil })
+				if err := os.Remove(filepath.Join(r.dir.InstancePath(writeName), "fatline", file)); err != nil {
+					t.Fatal(err)
+				}
+				before := treeFiles(t, string(r.dir))
+				stdout, stderr, err := r.run(t, flags...)
+				want := fmt.Sprintf("load identity for %q: read %s: ", writeName, file)
+				if file == "ca.crt" {
+					want = fmt.Sprintf("instance %q is deployed but its mTLS material is missing from local state; the CA it trusts cannot be recovered", writeName)
+				}
+				if err == nil || !strings.Contains(err.Error(), want) {
+					t.Fatalf("storage deploy %q without %s = %v; want %q", flags, file, err, want)
+				}
+				if exists, _ := r.dir.InstanceMTLSExists(writeName); exists && file == "ca.crt" {
+					t.Error("storage deploy minted the instance's CA")
+				}
+				if r.opened != 0 {
+					t.Errorf("opened the provider %d times before refusing", r.opened)
+				}
+				r.wroteNothing(t)
+				if stdout+stderr != "" {
+					t.Errorf("printed %q %q before refusing", stdout, stderr)
+				}
+				sameFiles(t, "material missing "+file, before, treeFiles(t, string(r.dir)))
+			})
+		}
 	}
 }
 
@@ -673,13 +791,20 @@ func TestDeployReallyMintsTheBucket(t *testing.T) {
 	if err := dir.SaveInstanceMetadata("prod", meta); err != nil {
 		t.Fatal(err)
 	}
+	// Connected: its material minted, and its installer key a stand-in, as
+	// the plan reads both before anything is minted (ADR 0023 M2.6c).
+	withMaterial(t, dir, meta)
+	if err := dir.SaveInstanceCredentials("prod", &config.InstanceCredentials{Provider: "gke", ServiceAccountKey: standInKey}); err != nil {
+		t.Fatal(err)
+	}
 
-	c := &storageDeployCommand{}
+	c := testStorageDeploy(&fakeProvider{}, &fakeBuilder{})
 	c.deployer.assumeYes = true
 	// The writer opens first (ADR 0023 M2.5); a fake, as no cluster is here.
 	c.deployer.newCluster = func(clusterRef) (clusterApplier, error) { return &fakeCluster{}, nil }
-	// It will fail later, at the registry, with no cloud to reach. What
-	// matters is what exists by then.
+	// The mint itself, not a stand-in: the test's own cloud answers it.
+	c.ensureStorage = mintStorage
+	// What matters is what exists once it has run.
 	_ = c.Run(context.Background(), env, []string{"prod"})
 
 	got, err := dir.LoadInstanceMetadata("prod")

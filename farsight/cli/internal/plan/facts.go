@@ -246,7 +246,9 @@ type KernelSettingsFact struct {
 	Type  string `json:"type"`
 	Adapt bool   `json:"adapt"`
 	// AdaptCooldownS and IntervalS are the knobs as the record stores them,
-	// in seconds; 0 means the kernel's default.
+	// in seconds; 0 means the kernel's default. kernel deploy refuses a
+	// flag that is not a whole number of seconds, and its plan a recorded
+	// knob that is not, so the seconds are exact.
 	AdaptCooldownS int64 `json:"adapt_cooldown_s"`
 	IntervalS      int64 `json:"interval_s"`
 	// Namespaces come in the command's order.

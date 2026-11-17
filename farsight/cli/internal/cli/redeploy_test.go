@@ -497,6 +497,21 @@ func TestRedeployNeverMintsIdentity(t *testing.T) {
 	}
 }
 
+// ADR 0023 M2.6c (A26-2), mutation A26-2m: redeploy only loads the
+// instance's mTLS material, and material missing one of its six files,
+// ca.key or server.key here, is refused when the identity is decided,
+// before the registry is taken: under --yes before a record that names no
+// registry is given one, and under --plan before that record is refused for
+// it. The provider is never opened, nothing is ensured, pushed, built or
+// applied, nothing is printed but the error, and no file changes.
+// (TestConnectRefusesItsTrustRootBeforeTheRegistry holds connect to the same.)
+func TestRedeployRefusesMaterialMissingAFileBeforeTheRegistry(t *testing.T) {
+	refusesItsTrustRootBeforeTheRegistry(t, newRedeployRig, []trustRootRefusal{
+		withoutMaterialFile("ca.key"),
+		withoutMaterialFile("server.key"),
+	})
+}
+
 // TestRedeploySourceForcesARebuild is the operator's own patch path (ADR 0023
 // decision 6). An operator build is its own image, under its own source- tag
 // and its own record, so --source always builds and nothing is looked up

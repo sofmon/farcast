@@ -3,13 +3,18 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/sofmon/farcast/datasphere"
 	"github.com/sofmon/farcast/farsight/cli/internal/buildinfo"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
+	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
 	"github.com/sofmon/farcast/farsight/cli/internal/plan"
 	"github.com/sofmon/farcast/fatline/tunnel"
@@ -19,9 +24,13 @@ import (
 // The plan vectors (ADR 0023 M2.6, A23-29): each command's printed plan, byte
 // for byte, made by the command itself through its seams against the atlas
 // fixture's record, with this farcast's stamp and clock fixed at the world
-// vectors' own. They read no cluster: the commands of M2.6a and M2.6b have
-// plans that read none. connect's and redeploy's read the registry, through
-// a fake provider and a fake builder whose registry holds neither carried
+// vectors' own. The commands of M2.6a and M2.6b read no cluster. Those of
+// M2.6c — kernel deploy, storage deploy, storage key pin and storage key
+// rotate — read it as the instance's reader, through vectorCluster, a fixed
+// cluster that holds atlas's namespaces and no key pin yet, and the storage
+// commands read the ids and times of vectorKeyring's keys. connect's,
+// redeploy's, kernel deploy's and storage deploy's read the registry,
+// through a fake provider and a fake builder whose registry holds no carried
 // image's version tag, as a release farcast at the vector stamp that carries
 // the fake components. They are produced in Go and are not copied to
 // FarSightKit until ADR 0021 step 7.1. Each part of M2.6 adds the vectors of
@@ -148,6 +157,118 @@ func vectorMaterial(t *testing.T, dir config.Dir) {
 	}
 }
 
+// vectorSystemUID is farcast-system's uid in vectorCluster, the one A23-29
+// chose for the vectors' reader seams.
+const vectorSystemUID = "00000000-0000-4000-8000-000000000026"
+
+// vectorCluster is the cluster the plan vectors of M2.6c read, as the
+// instance's reader: the atlas fixture's namespaces, farcast-system at
+// vectorSystemUID, and no key pin yet. It answers nothing else, and is
+// opened as nothing but the reader (vectorReader).
+type vectorCluster struct{}
+
+func (vectorCluster) Namespaces(context.Context) ([]string, error) {
+	return []string{"farcast-system", "shop"}, nil
+}
+
+func (vectorCluster) NamespaceUID(context.Context, string) (string, error) {
+	return vectorSystemUID, nil
+}
+
+func (vectorCluster) ConfigMapData(context.Context, string, string) (map[string]string, string, bool, error) {
+	return nil, "", false, nil
+}
+
+// vectorReader is a plan's reader seam over vectorCluster, which refuses any
+// identity but the reader's.
+func vectorReader(r clusterRef) (vectorCluster, error) {
+	if r.Identity != kube.Reader {
+		return vectorCluster{}, fmt.Errorf("test: a vector's plan opened the cluster as %q", r.Identity)
+	}
+	return vectorCluster{}, nil
+}
+
+// vectorPinReader is vectorReader as the storage commands' seam.
+func vectorPinReader(r clusterRef) (pinPlanReader, error) {
+	c, err := vectorReader(r)
+	if err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// vectorNoPinWriter and vectorNoKeyholder are the storage commands' writer
+// and keyholder in the vectors: a plan opens neither.
+func vectorNoPinWriter(clusterRef) (pinStore, error) {
+	return nil, errors.New("test: a vector's plan opened the pin as the writer")
+}
+
+func vectorNoKeyholder(context.Context, *Env, string) (sealStateClient, func(), error) {
+	return nil, nil, errors.New("test: a vector's plan opened the keyholder")
+}
+
+// vectorReaderKey puts atlas's reader key on this machine, as 'reader init'
+// left it: a plan that reads the cluster needs the reader granted, which it
+// tells by the file's presence, and never reads it here.
+func vectorReaderKey(t *testing.T, dir config.Dir) {
+	t.Helper()
+	if err := dir.SaveReaderKey("atlas", []byte("not read"), []byte("not read")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// vectorKeyring is atlas's keyring for the storage vectors, written as
+// keys.yaml: the instance's key space and one application scope, shop/web,
+// each with one name key and one key-encryption key, at fixed ids and times.
+// Its key material is a counted pattern, test data trusted nowhere; a plan
+// reads the ids and the times, never a key, and TestPlanVectors checks that
+// no vector holds one.
+func vectorKeyring(t *testing.T, dir config.Dir) {
+	t.Helper()
+	scope, err := datasphere.AppScopeName("shop", "web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Each key counts up from its first byte, so none of them reads as the
+	// fixtures' digests, which repeat one hex digit.
+	key := func(b byte) string {
+		k := make([]byte, 32)
+		for i := range k {
+			k[i] = b + byte(i)
+		}
+		return base64.StdEncoding.EncodeToString(k)
+	}
+	const created = "2026-11-01T09:00:00Z"
+	keys := fmt.Sprintf(`version: 2
+name_keys:
+- id: "a7a7000000000001"
+  key: %s
+  created: %s
+keys:
+- id: "a7a7000000000002"
+  key: %s
+  created: %s
+scopes:
+- name: %s
+  prefix: %s
+  created: %s
+  name_keys:
+  - id: "a7a7000000000003"
+    key: %s
+    created: %s
+  keys:
+  - id: "a7a7000000000004"
+    key: %s
+    created: %s
+`, key(0x11), created, key(0x22), created, scope, datasphere.AppScopePrefix("shop", "web"), created, key(0x33), created, key(0x44), created)
+	if _, err := datasphere.ParseKeyring([]byte(keys)); err != nil {
+		t.Fatalf("the vectors' keyring does not parse: %v", err)
+	}
+	if err := dir.CreateInstanceKeyring("atlas", []byte(keys)); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // vectorConfirmations is the confirmed window the kernel_confirm vector's
 // record already holds, so the plan's windows_after has two.
 func vectorConfirmations(m *config.InstanceMetadata) {
@@ -199,6 +320,58 @@ func planVectors() []planVector {
 			c.now = vectorClock
 			return c
 		}, []string{"atlas"}, []string{"--repo", "https://github.com/example/shop", "--app", "api", "--builder-image", builderDigest}, nil},
+		// kernel deploy, as the reader reads the cluster: the kernel's image,
+		// its settings, and every document of its workload.
+		{"kernel_deploy", nil, func(t *testing.T, flags ...string) Command {
+			c := withFlags(t, &kernelDeployCommand{}, flags...)
+			vectorDeployer(&c.deployer)
+			c.newPlanReader = func(r clusterRef) (kernelPlanReader, error) { return vectorReader(r) }
+			return c
+		}, []string{"atlas"}, nil, func(t *testing.T, dir config.Dir) {
+			vectorKey(t, dir)
+			vectorReaderKey(t, dir)
+		}},
+		// storage deploy over the recorded bucket: the keyholder's image, its
+		// leaf, a restart of the replicas deployed, the pin this keyring
+		// implies, created, and the keyholder's workload.
+		{"storage_deploy", nil, func(t *testing.T, flags ...string) Command {
+			c := withFlags(t, &storageDeployCommand{}, flags...)
+			vectorDeployer(&c.deployer)
+			c.newPlanReader = vectorPinReader
+			c.newPinStore = vectorNoPinWriter
+			c.ensureStorage = func(context.Context, *Env, string) error { return errors.New("test: a vector's plan minted storage") }
+			return c
+		}, []string{"atlas"}, nil, func(t *testing.T, dir config.Dir) {
+			vectorMaterial(t, dir)
+			vectorReaderKey(t, dir)
+			vectorKeyring(t, dir)
+		}},
+		// storage key pin: the pin this keyring implies, created.
+		{"storage_key_pin", nil, func(t *testing.T, flags ...string) Command {
+			c := withFlags(t, &keyPinCommand{}, flags...)
+			c.newPlanReader = vectorPinReader
+			c.newPinStore = vectorNoPinWriter
+			c.newKeyholder = vectorNoKeyholder
+			c.now = vectorClock
+			return c
+		}, []string{"atlas"}, nil, func(t *testing.T, dir config.Dir) {
+			vectorReaderKey(t, dir)
+			vectorKeyring(t, dir)
+		}},
+		// storage key rotate, with the keyholder deployed: a key for the
+		// instance's key space and for shop/web, and the hold and final pins
+		// over the new key's placeholder id.
+		{"storage_key_rotate", nil, func(t *testing.T, flags ...string) Command {
+			c := withFlags(t, &keyRotateCommand{}, flags...)
+			c.newPlanReader = vectorPinReader
+			c.newPinStore = vectorNoPinWriter
+			c.newKeyholder = vectorNoKeyholder
+			c.now = vectorClock
+			return c
+		}, []string{"atlas"}, nil, func(t *testing.T, dir config.Dir) {
+			vectorReaderKey(t, dir)
+			vectorKeyring(t, dir)
+		}},
 	}
 }
 
@@ -230,11 +403,23 @@ func TestPlanVectors(t *testing.T) {
 				t.Fatalf("two vectors are named %q", v.name)
 			}
 			seen[v.name] = true
-			_, out, err := runPlanVector(t, v, "--plan")
+			env, out, err := runPlanVector(t, v, "--plan")
 			if err != nil {
 				t.Fatal(err)
 			}
 			got := out.Bytes()
+			// A vector made over a keyring holds none of its keys (A23-25).
+			if held, err := env.ConfigDir.InstanceKeyringExists("atlas"); err != nil || held {
+				encoded, raw := keyMaterialOf(t, env.ConfigDir, "atlas")
+				for i, key := range raw {
+					for _, form := range []string{encoded[i], base64.RawStdEncoding.EncodeToString(key), base64.URLEncoding.EncodeToString(key),
+						base64.RawURLEncoding.EncodeToString(key), hex.EncodeToString(key)} {
+						if bytes.Contains(got, []byte(form)) {
+							t.Fatalf("the vector holds key %d of its keyring, as %s", i, form)
+						}
+					}
+				}
+			}
 			doc := printedDocument(t, got)
 			if b := decodedBound(t, doc); len(b.Blocked) != 0 || len(b.Facts) == 0 || b.Target.Project != "proj-atlas" {
 				t.Fatalf("the vector is not a plan of the atlas fixture: %s", got)

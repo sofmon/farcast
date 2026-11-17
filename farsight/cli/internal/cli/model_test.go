@@ -418,7 +418,7 @@ func runModel(t *testing.T, seed int64, steps, nMachines int, coverage modelCove
 	cm := &fakePinStore{}
 	pins := &faultyPins{fakePinStore: cm, rng: rng, fail: modelRate(t, "FARCAST_MODEL_PINFAIL", 0.1), log: &log}
 	pinOpener := func(clusterRef) (pinStore, error) { return pins, nil }
-	if _, err := writePin(ctx, cm, liveKeyring(t, first, instance), true, false); err != nil {
+	if _, err := writePinLoop(ctx, cm, liveKeyring(t, first, instance), true, false); err != nil {
 		t.Fatal(err)
 	}
 	for i := range 2 {

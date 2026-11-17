@@ -566,6 +566,126 @@ func TestLoadOperatorLeafNeedsNoCAKey(t *testing.T) {
 	}
 }
 
+// ADR 0023 M2.6c (A26-2), mutation A26-2m's base: CheckInstanceMTLS finds
+// what LoadInstanceMTLS would refuse for a file that is not there, without
+// opening a file. Each missing file gives its own "read <file>: …" error,
+// the one LoadInstanceMTLS gives it, and with several missing both name
+// the same first one, so the two keep one order; a directory in place of a
+// file is refused. It reads nothing: the read observer sees no path, and it
+// passes with ca.key, client.key and server.key at mode 000, where
+// LoadInstanceMTLS fails.
+func TestCheckInstanceMTLSReadsNoKey(t *testing.T) {
+	files := []string{caCertFile, caKeyFile, clientCertFile, clientKeyFile, serverCertFile, serverKeyFile}
+	material := func(t *testing.T) (Dir, string) {
+		t.Helper()
+		d := testDir(t)
+		if err := d.SaveInstanceMTLS("prod", MTLSMaterial{
+			CACertPEM: []byte("ca"), CAKeyPEM: []byte("cakey"), ClientCertPEM: []byte("leaf"),
+			ClientKeyPEM: []byte("k"), ServerCertPEM: []byte("s"), ServerKeyPEM: []byte("sk"),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return d, d.fatlineDir("prod")
+	}
+	// check is CheckInstanceMTLS under the read observer, which must see
+	// nothing.
+	check := func(t *testing.T, d Dir) error {
+		t.Helper()
+		reads := observeReads(t)
+		err := d.CheckInstanceMTLS("prod")
+		if got := reads(); len(got) != 0 {
+			t.Errorf("CheckInstanceMTLS read %v", got)
+		}
+		return err
+	}
+
+	t.Run("all six present", func(t *testing.T) {
+		d, _ := material(t)
+		if err := check(t, d); err != nil {
+			t.Fatalf("CheckInstanceMTLS with every file present = %v", err)
+		}
+	})
+
+	seen := map[string]string{}
+	for _, file := range files {
+		t.Run("missing "+file, func(t *testing.T) {
+			d, dir := material(t)
+			if err := os.Remove(filepath.Join(dir, file)); err != nil {
+				t.Fatal(err)
+			}
+			err := check(t, d)
+			if err == nil || !strings.HasPrefix(err.Error(), "read "+file+": ") || !errors.Is(err, fs.ErrNotExist) ||
+				!strings.Contains(err.Error(), filepath.Join(dir, file)) {
+				t.Fatalf("CheckInstanceMTLS without %s = %v; want read %s: …, not exist, naming its path", file, err, file)
+			}
+			_, loadErr := d.LoadInstanceMTLS("prod")
+			if loadErr == nil || !strings.HasPrefix(loadErr.Error(), "read "+file+": ") || !errors.Is(loadErr, fs.ErrNotExist) {
+				t.Fatalf("LoadInstanceMTLS without %s = %v; the check's error is not the load's", file, loadErr)
+			}
+			if other, ok := seen[err.Error()]; ok {
+				t.Errorf("a missing %s and a missing %s give one error: %v", file, other, err)
+			}
+			seen[err.Error()] = file
+		})
+	}
+
+	// With every file from the i-th on removed, the check and the load both
+	// name the i-th: they meet the files in one order.
+	for i, first := range files {
+		t.Run("missing from "+first, func(t *testing.T) {
+			d, dir := material(t)
+			for _, file := range files[i:] {
+				if err := os.Remove(filepath.Join(dir, file)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			err := check(t, d)
+			_, loadErr := d.LoadInstanceMTLS("prod")
+			want := "read " + first + ": "
+			if err == nil || !strings.HasPrefix(err.Error(), want) || loadErr == nil || !strings.HasPrefix(loadErr.Error(), want) {
+				t.Errorf("without %v: check = %v, load = %v; want both to name %s", files[i:], err, loadErr, first)
+			}
+		})
+	}
+
+	t.Run("a directory in place of client.key", func(t *testing.T) {
+		d, dir := material(t)
+		path := filepath.Join(dir, clientKeyFile)
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		err := check(t, d)
+		if err == nil || !strings.HasPrefix(err.Error(), "read client.key: ") || !errors.Is(err, errNotAFile) || !strings.Contains(err.Error(), path) {
+			t.Fatalf("CheckInstanceMTLS with a directory for client.key = %v; want it refused, naming the path", err)
+		}
+		if _, err := d.LoadInstanceMTLS("prod"); err == nil || !strings.HasPrefix(err.Error(), "read client.key: ") {
+			t.Errorf("LoadInstanceMTLS with a directory for client.key = %v; want it refused", err)
+		}
+	})
+
+	t.Run("keys at mode 000", func(t *testing.T) {
+		d, dir := material(t)
+		for _, file := range []string{caKeyFile, clientKeyFile, serverKeyFile} {
+			path := filepath.Join(dir, file)
+			if err := os.Chmod(path, 0o000); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.Chmod(path, 0o600) })
+		}
+		if err := check(t, d); err != nil {
+			t.Fatalf("CheckInstanceMTLS with the keys unreadable = %v; it must open none of them", err)
+		}
+		// The control: the loader, which opens them, fails here, so the pass
+		// above is about opening nothing and not a vacuous one.
+		if _, err := d.LoadInstanceMTLS("prod"); err == nil || !errors.Is(err, fs.ErrPermission) {
+			t.Fatalf("LoadInstanceMTLS with ca.key at mode 000 = %v; the test proves nothing (run as root?)", err)
+		}
+	})
+}
+
 // TestSystemImagesRoundTrip: every origin, with every field a build records,
 // reads back exactly (ADR 0023 decision 4).
 func TestSystemImagesRoundTrip(t *testing.T) {

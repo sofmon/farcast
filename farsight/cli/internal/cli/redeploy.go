@@ -220,7 +220,9 @@ func (c *redeployCommand) Run(ctx context.Context, env *Env, args []string) (err
 	// connected instance keeps this on the load-or-explain path, so a lost
 	// trust root is reported as unrecoverable, before the registry is read or
 	// ensured, instead of being replaced by a CA the running FatLine has
-	// never heard of. Deciding reads the CA certificate alone (A23-25).
+	// never heard of. Deciding reads the CA certificate alone (A23-25), and
+	// looks for the other five files without opening them, so material
+	// missing one, ca.key or a leaf's key, is refused here too (A26-2).
 	id, err := decideIdentity(env, name, true)
 	if err != nil {
 		return err

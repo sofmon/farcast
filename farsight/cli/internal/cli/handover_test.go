@@ -2390,3 +2390,49 @@ func TestARotationRefusedAsBehindAtActivationSplitsNothing(t *testing.T) {
 		t.Errorf("rotate did not say a replica refused this keyring as behind:\n%s", out.String())
 	}
 }
+
+// ADR 0023 M2.6c (A23-45, mutation 86c): rotate's --confirm writes the pin
+// that holds the new keys only as its plan listed it, and a hand-over whose
+// beforeActivate answers plan_changed stops there: every replica holds the
+// new keys, none uses them, and the cause is heldChanged, with the refusal
+// as its reason, never heldUnrecorded's keyring this machine could not save.
+// Any other failure there is still heldUnrecorded.
+func TestAPlanChangedBeforeActivationLeavesTheKeysHeld(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		err   error
+		cause string
+	}{
+		{"plan_changed", withKind(kindPlanChanged, errors.New(msgPinChanged)), heldChanged},
+		{"a keyring not saved", errors.New("the disk is full"), heldUnrecorded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir, meta, env, _, _ := backdatedInstance(t, "p140", "alpha")
+			base := servingFleet(t, env, meta, dir)
+			k := liveKeyring(t, dir, "p140")
+			keys, rots, err := k.RotateScopeKEKs()
+			if err != nil {
+				t.Fatal(err)
+			}
+			previous := map[string]datasphere.KeyID{}
+			for _, r := range rots {
+				previous[r.Scope] = r.Previous
+			}
+			res := handOverKeys(context.Background(), env, meta, openerFor(base), keys, handOverOptions{
+				rotated:        previous,
+				beforeActivate: func(sealStateClient) error { return tc.err },
+			})
+			if res.Activated || res.Cause != tc.cause || !strings.Contains(res.Reason, tc.err.Error()) {
+				t.Errorf("activated %v, cause %q, reason %q; want held, %q, naming %q", res.Activated, res.Cause, res.Reason, tc.cause, tc.err)
+			}
+			for _, r := range rots {
+				for i := range 2 {
+					ids := base.replica(i).keys[r.Scope]
+					if len(ids) == 0 || ids[0] != r.Previous.String() || !slices.Contains(ids, r.Active.String()) {
+						t.Errorf("replica %d holds %s as %v; want %s held and %s in use", i, r.Scope, ids, r.Active, r.Previous)
+					}
+				}
+			}
+		})
+	}
+}

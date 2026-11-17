@@ -457,9 +457,10 @@ func TestNoticesPrintOnceInTheCommandsWords(t *testing.T) {
 
 // wiredCommands is every writeCommands row whose fresh flag set defines
 // --plan: the commands wired so far (A23-14). ADR 0023 M2.6a wired kernel
-// meter, kernel confirm and reader grant, and M2.6b wires connect, redeploy
-// and build; the other five register no consent flag yet, so --plan is an
-// unknown flag on them.
+// meter, kernel confirm and reader grant, M2.6b connect, redeploy and build,
+// and M2.6c kernel deploy, storage deploy, storage key pin and storage key
+// rotate; run registers no consent flag yet, so --plan is an unknown flag on
+// it.
 func wiredCommands(t *testing.T) []writeCommand {
 	t.Helper()
 	var wired []writeCommand
@@ -476,8 +477,8 @@ func wiredCommands(t *testing.T) []writeCommand {
 			names = append(names, wc.name)
 		}
 	}
-	if want := []string{"connect", "redeploy", "build", "kernel meter", "kernel confirm", "reader grant"}; !slices.Equal(names, want) {
-		t.Errorf("the commands with plans are %q; ADR 0023 M2.6a and M2.6b wire %q", names, want)
+	if want := []string{"connect", "redeploy", "build", "kernel deploy", "kernel meter", "kernel confirm", "storage deploy", "storage key pin", "storage key rotate", "reader grant"}; !slices.Equal(names, want) {
+		t.Errorf("the commands with plans are %q; ADR 0023 M2.6a, M2.6b and M2.6c wire %q", names, want)
 	}
 	return wired
 }
@@ -646,17 +647,24 @@ func TestAPlanFlagIsNeverIgnored(t *testing.T) {
 // sibling's flags: --plan would be the sibling's and ignored, so kernel
 // meter would apply, and --confirm would never be compared. Each such line
 // is refused, exit 2, with nothing run, sent or written, whichever group
-// and level it is in (S-R5-1). The same lines with the global flag before
-// the group or after the subcommand, or naming the subcommand itself, are a
-// plan.
+// and level it is in (S-R5-1): the kernel group's, the storage group's and
+// the storage key group's, each command with a plan among the subcommands
+// and among the siblings (ADR 0023 M2.6c). The same lines with the global
+// flag before the group or after the subcommand, or naming the subcommand
+// itself, are a plan; kernel deploy's and the storage commands' read the
+// cluster as the reader (fakeDeployDefaults' loopback reader).
 func planFlagThroughTheRouter(t *testing.T) {
 	ran := strayKubectl(t)
+	fakeDeployDefaults(t)
 	cwd := t.TempDir()
 	t.Chdir(cwd)
 	var servers []*kubetest.Server
-	for _, name := range []string{"confirm", "meter", "grant", "pin"} {
+	for _, name := range []string{"confirm", "meter", "grant", "pin", "deploy", "rotate"} {
 		s := kubetest.New(t)
+		systemNamespace(s)
 		dir, _ := writeInstance(t, s, true)
+		// storage deploy's plan checks the instance's material.
+		writeMaterial(t, dir)
 		if err := os.Rename(string(dir), filepath.Join(cwd, name)); err != nil {
 			t.Fatal(err)
 		}
@@ -670,8 +678,13 @@ func planFlagThroughTheRouter(t *testing.T) {
 		{[]string{"kernel", "--config", "confirm", "meter", writeName, writeNewNamespace, "--plan"}, "meter", "confirm", "kernel"},
 		{[]string{"kernel", "--config", "confirm", "meter", writeName, writeNewNamespace, "--confirm", sampleDigest}, "meter", "confirm", "kernel"},
 		{[]string{"kernel", "--config", "meter", "deploy", writeName, "--plan"}, "deploy", "meter", "kernel"},
+		{[]string{"kernel", "--config", "deploy", "meter", writeName, writeNewNamespace, "--plan"}, "meter", "deploy", "kernel"},
+		{[]string{"kernel", "--config", "deploy", "confirm", writeName, "--confirm", sampleDigest}, "confirm", "deploy", "kernel"},
 		{[]string{"reader", "--config", "grant", "init", writeName, "--plan"}, "init", "grant", "reader"},
 		{[]string{"storage", "key", "--config", "pin", "list", writeName}, "list", "pin", "key"},
+		{[]string{"storage", "--config", "deploy", "key", "pin", writeName, "--plan"}, "key", "deploy", "storage"},
+		{[]string{"storage", "key", "--config", "rotate", "pin", writeName, "--plan"}, "pin", "rotate", "key"},
+		{[]string{"storage", "key", "--config", "pin", "rotate", writeName, "--confirm", sampleDigest}, "rotate", "pin", "key"},
 	} {
 		stdout, stderr, code := runLine(append([]string{"farcast"}, tc.line...))
 		want := fmt.Sprintf(msgGroupFlagsMismatch, tc.sub, tc.sibling, tc.sibling, tc.group)
@@ -693,6 +706,12 @@ func planFlagThroughTheRouter(t *testing.T) {
 		{"--config", "confirm", "kernel", "meter", writeName, writeNewNamespace, "--plan"},
 		{"kernel", "meter", "--config", "confirm", writeName, writeNewNamespace, "--plan"},
 		{"kernel", "--config", "meter", "meter", writeName, writeNewNamespace, "--plan"},
+		{"kernel", "deploy", "--config", "meter", writeName, "--plan"},
+		{"kernel", "--config", "deploy", "deploy", writeName, "--plan"},
+		{"storage", "--config", "deploy", "deploy", writeName, "--plan"},
+		{"storage", "--config", "pin", "key", "pin", writeName, "--plan"},
+		{"storage", "key", "pin", "--config", "rotate", writeName, "--plan"},
+		{"storage", "key", "--config", "rotate", "rotate", writeName, "--plan"},
 	} {
 		stdout, stderr, code := runLine(append([]string{"farcast"}, line...))
 		if code != 0 || !strings.Contains(stdout, "\ndigest: sha256:") {
@@ -779,22 +798,34 @@ func planFlagOfATopLevelCommand(t *testing.T) {
 // ADR 0023 M2.6 (A23-16): a refusal for want of a terminal names the route
 // that needs none, --plan and then --confirm. The gates among the commands
 // wired so far are reader grant's, connect's (its cost question, and the
-// build question it shares with commands that have no plan yet, which names
-// the route only on the commands that have one), redeploy's (its change
-// question, and that build question) and build's (its cost question):
-// kernel meter and kernel confirm ask nothing, so a run without a terminal
-// is not refused (A23-9).
+// build question it shares with every deployer command, each of which since
+// M2.6c has a plan; a deployer that registers no consent flags names none
+// (consentFlags.suffix)), redeploy's (its change
+// question, and that build question), build's (its cost question), kernel
+// deploy's (its cost question, below the floor or not, and the build
+// question), storage deploy's (its cost question, and the build question),
+// storage key pin's (lowering the pin with --replace) and storage key
+// rotate's (its question): kernel meter and kernel confirm ask nothing, so a
+// run without a terminal is not refused (A23-9).
 func TestNonInteractiveRefusalsNameThePlan(t *testing.T) {
 	gates := map[string]string{"reader grant": msgReaderGrantTerminal, "connect": msgConnectCostYes,
-		"redeploy": msgRedeployYes, "build": msgBuildCostYes}
+		"redeploy": msgRedeployYes, "build": msgBuildCostYes, "kernel deploy": msgKernelCostYes,
+		"storage deploy": msgKeyholderCostYes, "storage key pin": msgKeyPinLowerYes, "storage key rotate": msgRotateYes}
 	for name, text := range gates {
 		if !strings.HasSuffix(text, consentSuffix) {
 			t.Errorf("%s's non-interactive refusal %q does not end with %q", name, text, consentSuffix)
 		}
 	}
+	if !strings.HasSuffix(msgKernelBelowFloorYes, consentSuffix) {
+		t.Errorf("kernel deploy's refusal below the floor %q does not end with %q", msgKernelBelowFloorYes, consentSuffix)
+	}
 	t.Run("connect", connectRefusalsNameThePlan)
 	t.Run("redeploy", redeployRefusalsNameThePlan)
 	t.Run("build", buildRefusalNamesThePlan)
+	t.Run("kernel deploy", kernelDeployRefusalsNameThePlan)
+	t.Run("storage deploy", storageDeployRefusalNamesThePlan)
+	t.Run("storage key pin", keyPinRefusalNamesThePlan)
+	t.Run("storage key rotate", rotateRefusalNamesThePlan)
 
 	dir := readerRecordFor(t, grantName, "proj-test1")
 	if _, err := dir.UpdateInstanceMetadata(grantName, func(m *config.InstanceMetadata) error {
@@ -846,10 +877,22 @@ func TestNonInteractiveRefusalsNameThePlan(t *testing.T) {
 // reconnect would dial the carrier. connect runs here as a first deploy
 // instead, and redeploy and build as writeCommands has them, with the
 // deployer's defaults faked; each stops at applyReady and never dials.
+//
+// kernel deploy's and the storage commands' rows (ADR 0023 M2.6c) run
+// through the router as planCommands has them, their fakes left to the
+// router's defaults: the deployer's faked, the plan's reader the loopback
+// one, the key pin reached as the writer against the fixture's kubetest
+// (realPinOpener), and the keyholder and the storage mint refused. kernel
+// deploy and storage deploy stop at applyReady, after the reader's reads
+// alone. storage key pin writes its pin and hands it to no replica,
+// exit 0; storage key rotate with no keyholder mints and saves, exit 0; and
+// with one it mints, saves and cannot open the keyholder, so its rotation is
+// unfinished, exit 1. Each got past the comparison.
 func confirmLineOnTheCommands(t *testing.T) {
 	noKubectl(t)
 	pinPlanClock(t)
 	fakeDeployDefaults(t)
+	realPinOpener(t)
 	var rows []planCommand
 	for _, name := range []string{"connect", "redeploy", "build"} {
 		wc := writeCommandNamed(t, name)
@@ -861,8 +904,13 @@ func confirmLineOnTheCommands(t *testing.T) {
 		}
 		rows = append(rows, planCommand{name: name, shape: "through the router", args: wc.args, flags: flags, edit: wc.edit, prepare: wc.prepare})
 	}
+	readsCluster := []string{"kernel deploy", "storage deploy", "storage key pin", "storage key rotate"}
 	for _, row := range planCommands() {
-		if row.fakes == nil {
+		switch {
+		case row.fakes == nil:
+			rows = append(rows, row)
+		case slices.Contains(readsCluster, row.name):
+			row.fakes, row.cmd = nil, nil
 			rows = append(rows, row)
 		}
 	}
@@ -893,6 +941,7 @@ func confirmLineOnTheCommands(t *testing.T) {
 			if slices.Contains(words, "--plan") {
 				t.Errorf("the confirm line still plans: %q", line)
 			}
+			reads := len(s.Requests())
 			out, errb, code := runLine(words)
 			if strings.Contains(errb, "the plan for this command is now") {
 				t.Fatalf("the confirm line computed another plan: %s", errb)
@@ -901,11 +950,38 @@ func confirmLineOnTheCommands(t *testing.T) {
 			switch {
 			case noop && (code != 0 || out == ""):
 				t.Errorf("the confirm line of a plan that writes nothing: exit %d, %q %q", code, out, errb)
+			case row.name == "storage key pin" || row.String() == "storage key rotate/no keyholder":
+				if code != 0 || out == "" {
+					t.Errorf("the confirm line: exit %d, %q %q; want it done", code, out, errb)
+				}
+			case row.String() == "storage key rotate/with a keyholder":
+				if code != 1 || !strings.Contains(errb, "the hand-over did not happen") {
+					t.Errorf("the confirm line: exit %d, %q; want it past the comparison, its keyholder refused", code, errb)
+				}
 			case !noop && (code != 1 || !strings.Contains(errb, msgCannotApply+msgKubectlMissing)):
 				t.Errorf("the confirm line: exit %d, %q; want it past the comparison, at applyReady", code, errb)
 			}
-			if got := s.Requests(); len(got) != 0 {
-				t.Errorf("%s sent %d requests", row, len(got))
+			switch {
+			case !row.readsCluster:
+				if got := s.Requests(); len(got) != 0 {
+					t.Errorf("%s sent %d requests", row, len(got))
+				}
+			case row.name == "kernel deploy" || row.name == "storage deploy":
+				onlyThePlansReads(t, row, s)
+			default:
+				// The recomputation reads as the reader, and only then does
+				// the writer reach the pin.
+				confirmed := s.Requests()[reads:]
+				firstWriter := slices.IndexFunc(confirmed, func(r kubetest.Request) bool { return r.As == "writer" })
+				for i, r := range confirmed {
+					reading := firstWriter < 0 || i < firstWriter
+					if (reading && r.As != "reader") || (!reading && r.As != "writer") {
+						t.Errorf("%s --confirm sent %s %s as %q at %d; want the reader's reads, then the writer's", row, r.Method, r.Path, r.As, i)
+					}
+				}
+				if firstWriter < 1 {
+					t.Errorf("%s --confirm's requests begin with the writer's, at %d", row, firstWriter)
+				}
 			}
 		})
 	}

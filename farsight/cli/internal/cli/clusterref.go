@@ -271,8 +271,9 @@ const msgReaderIAMRefused = "the cluster's endpoint refused the identity (IAM); 
 // RBAC refusal, a 403 whose body is a Kubernetes Status, says to run 'farcast
 // reader grant'; any other 403 is the endpoint's IAM. Every other error, nil
 // included, is returned as it is, and the result still matches everything err
-// did. Only the read commands call it, which read as the reader and know the
-// instance's name; a writer's 403 is writerRefused's.
+// did. Only the read commands and readerPhase, for a plan's reads, call it,
+// which read as the reader and know the instance's name; a writer's 403 is
+// writerRefused's.
 func readerRefused(err error, name string) error {
 	if !errors.Is(err, tkube.ErrForbidden) {
 		return err
@@ -283,6 +284,40 @@ func readerRefused(err error, name string) error {
 	return fmt.Errorf("%w; %s", err, msgReaderIAMRefused)
 }
 
+// readerPhaseError is an error a plan's reader read returned, under --plan
+// or in --confirm's recomputation (ADR 0023 M2.6, A23-22): readerPhase made
+// it, and its text already says what the reader's refusal needs. Its Error
+// and Unwrap are its error's, so it is matched and kinded as that error is;
+// it only tells writerRefused that the writer did not meet it.
+type readerPhaseError struct{ err error }
+
+func (e *readerPhaseError) Error() string { return e.err.Error() }
+func (e *readerPhaseError) Unwrap() error { return e.err }
+
+// readerPhase is err, an error a plan's read as instance name's reader
+// returned, marked as the reader's (A23-22): readerRefused's sentence for a
+// 403, which names 'farcast reader grant' or the endpoint's IAM, and never
+// the installer's account, which writerRefused would otherwise append. nil
+// is returned as nil.
+func readerPhase(err error, name string) error {
+	if err == nil {
+		return nil
+	}
+	return &readerPhaseError{readerRefused(err, name)}
+}
+
+// planRead is the error a plan read in mode m returned, as its command
+// reports it (A23-22): under --plan and --confirm the plan reads as the
+// reader, and the error is readerPhase's; an interactive or --yes run's plan
+// reads as the writer it opened, and the error is returned as it is, for
+// writerRefused to say whose it was.
+func planRead(m consentMode, err error, name string) error {
+	if m == consentNone {
+		return err
+	}
+	return readerPhase(err, name)
+}
+
 // writerRefused is err with one sentence appended when the cluster refused
 // the instance's installer service account, the writer (403,
 // tkube.ErrForbidden; ADR 0023 M2.5, A20-9): an RBAC refusal, a 403 whose
@@ -290,11 +325,15 @@ func readerRefused(err error, name string) error {
 // Each writing command applies it once, to the error its Run returns; nothing
 // else does, and classified never appends it. Every other error, nil
 // included, is returned as it is, and so is any error when meta is nil (a
-// command that failed before it read the record reached no cluster). What an
-// IAM refusal looks like on the wire is not walked; the probe walk pins it.
-// The transitional kubectl Apply's errors never carry tkube.ErrForbidden.
+// command that failed before it read the record reached no cluster), and any
+// a plan's reader met (readerPhaseError), which says whose it was already.
+// What an IAM refusal looks like on the wire is not walked; the probe walk
+// pins it. The transitional kubectl Apply's errors never carry
+// tkube.ErrForbidden.
 func writerRefused(err error, meta *config.InstanceMetadata) error {
-	if meta == nil || !errors.Is(err, tkube.ErrForbidden) {
+	// A plan's reader met it, and readerPhase already said whose it was.
+	var reader *readerPhaseError
+	if meta == nil || errors.As(err, &reader) || !errors.Is(err, tkube.ErrForbidden) {
 		return err
 	}
 	if forbiddenByRBAC(err) {

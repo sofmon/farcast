@@ -1063,23 +1063,33 @@ func (d Dir) SaveInstanceMTLS(name string, m MTLSMaterial) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create fatline directory: %w", err)
 	}
-	files := []struct {
-		name string
-		data []byte
-	}{
-		{caCertFile, m.CACertPEM},
-		{caKeyFile, m.CAKeyPEM},
-		{clientCertFile, m.ClientCertPEM},
-		{clientKeyFile, m.ClientKeyPEM},
-		{serverCertFile, m.ServerCertPEM},
-		{serverKeyFile, m.ServerKeyPEM},
-	}
-	for _, f := range files {
-		if err := os.WriteFile(filepath.Join(dir, f.name), f.data, 0o600); err != nil {
+	for _, f := range mtlsFiles(&m) {
+		if err := os.WriteFile(filepath.Join(dir, f.name), *f.data, 0o600); err != nil {
 			return fmt.Errorf("write %s: %w", f.name, err)
 		}
 	}
 	return nil
+}
+
+// mtlsFile is one file of an instance's mTLS material: its name under
+// <instance>/fatline/, and the field of the material it holds.
+type mtlsFile struct {
+	name string
+	data *[]byte
+}
+
+// mtlsFiles is m file by file, in the one order SaveInstanceMTLS writes it,
+// LoadInstanceMTLS reads it and CheckInstanceMTLS checks it: ca.crt, ca.key,
+// client.crt, client.key, server.crt, server.key.
+func mtlsFiles(m *MTLSMaterial) []mtlsFile {
+	return []mtlsFile{
+		{caCertFile, &m.CACertPEM},
+		{caKeyFile, &m.CAKeyPEM},
+		{clientCertFile, &m.ClientCertPEM},
+		{clientKeyFile, &m.ClientKeyPEM},
+		{serverCertFile, &m.ServerCertPEM},
+		{serverKeyFile, &m.ServerKeyPEM},
+	}
 }
 
 // LoadInstanceCACert reads only the instance CA's certificate — public, and
@@ -1132,34 +1142,43 @@ func (d Dir) LoadDialIdentity(name string) (DialIdentity, error) {
 // LoadInstanceMTLS reads the per-instance mTLS material.
 func (d Dir) LoadInstanceMTLS(name string) (MTLSMaterial, error) {
 	dir := d.fatlineDir(name)
-	read := func(file string) ([]byte, error) {
-		b, err := readFile(filepath.Join(dir, file))
-		if err != nil {
-			return nil, fmt.Errorf("read %s: %w", file, err)
-		}
-		return b, nil
-	}
 	var m MTLSMaterial
-	var err error
-	if m.CACertPEM, err = read(caCertFile); err != nil {
-		return MTLSMaterial{}, err
-	}
-	if m.CAKeyPEM, err = read(caKeyFile); err != nil {
-		return MTLSMaterial{}, err
-	}
-	if m.ClientCertPEM, err = read(clientCertFile); err != nil {
-		return MTLSMaterial{}, err
-	}
-	if m.ClientKeyPEM, err = read(clientKeyFile); err != nil {
-		return MTLSMaterial{}, err
-	}
-	if m.ServerCertPEM, err = read(serverCertFile); err != nil {
-		return MTLSMaterial{}, err
-	}
-	if m.ServerKeyPEM, err = read(serverKeyFile); err != nil {
-		return MTLSMaterial{}, err
+	for _, f := range mtlsFiles(&m) {
+		b, err := readFile(filepath.Join(dir, f.name))
+		if err != nil {
+			return MTLSMaterial{}, fmt.Errorf("read %s: %w", f.name, err)
+		}
+		*f.data = b
 	}
 	return m, nil
+}
+
+// errNotAFile is a material file's path naming something other than a
+// regular file: a directory, a device, a socket or a pipe.
+var errNotAFile = errors.New("not a regular file")
+
+// CheckInstanceMTLS reports whether LoadInstanceMTLS would find each of the
+// instance's six mTLS files, without opening any of them (ADR 0023 M2.6c,
+// A26-2): it stats each, in LoadInstanceMTLS's order, and returns for the
+// first that is missing, or is not a regular file, the "read <file>: …"
+// error LoadInstanceMTLS gives that file. The cause names stat, since
+// nothing was opened. It reads no file, so it never brings ca.key or a
+// leaf's key into memory, and a plan can find a missing key before it asks
+// or writes anything. A file it passes can still fail the load: one this
+// process may not read, or one removed after the check.
+func (d Dir) CheckInstanceMTLS(name string) error {
+	dir := d.fatlineDir(name)
+	for _, f := range mtlsFiles(new(MTLSMaterial)) {
+		path := filepath.Join(dir, f.name)
+		info, err := os.Stat(path)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", f.name, err)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("read %s: %w", f.name, &fs.PathError{Op: "stat", Path: path, Err: errNotAFile})
+		}
+	}
+	return nil
 }
 
 // writeInstanceFile writes data to <instance>/<file> at 0600. The instance

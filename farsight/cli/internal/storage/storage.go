@@ -89,7 +89,7 @@ func Open(ctx context.Context, opt Options) (*Session, error) {
 		return nil, fmt.Errorf("load credentials for %q: %w", opt.Instance, err)
 	}
 
-	providerName, err := storageProviderFor(meta)
+	providerName, err := ProviderFor(meta)
 	if err != nil {
 		return nil, err
 	}
@@ -183,10 +183,12 @@ type KeySpace struct {
 	Store  *datasphere.Store
 }
 
-// storageProviderFor picks the storage provider for an instance, preferring
-// what was recorded so a change to the table below cannot repoint an existing
-// instance at a different cloud.
-func storageProviderFor(meta *config.InstanceMetadata) (string, error) {
+// ProviderFor picks the storage provider for an instance, preferring what
+// was recorded so a change to the table below cannot repoint an existing
+// instance at a different cloud. It is exported for storage deploy's plan
+// (ADR 0023 M2.6, A23-43), which renders a first deploy's keyholder with the
+// provider the mint will record before anything is minted.
+func ProviderFor(meta *config.InstanceMetadata) (string, error) {
 	if meta.Storage != nil && meta.Storage.Provider != "" {
 		return meta.Storage.Provider, nil
 	}

@@ -99,7 +99,7 @@ func TestKeyholderCostGateRefusesNonInteractivelyWithTheFigure(t *testing.T) {
 		Name:      "p41",
 		CostLimit: config.CostLimit{Amount: 50, Currency: "USD", Period: "monthly"},
 	}
-	ok, err := c.confirmCost(env, meta)
+	ok, err := c.confirmCost(env, meta, keyholderCost(meta))
 	if ok || err == nil {
 		t.Fatalf("expected a refusal without --yes; got ok=%v err=%v", ok, err)
 	}

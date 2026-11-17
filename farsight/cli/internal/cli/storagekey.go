@@ -11,11 +11,15 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/sofmon/farcast/datasphere"
+	dsdeploy "github.com/sofmon/farcast/datasphere/deploy"
+	dskeyholder "github.com/sofmon/farcast/datasphere/keyholder"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
+	"github.com/sofmon/farcast/farsight/cli/internal/plan"
 	"github.com/sofmon/farcast/farsight/cli/internal/storage"
 )
 
@@ -359,10 +363,40 @@ func (r keyImportResult) Human(w io.Writer) error {
 
 type keyRotateCommand struct {
 	assumeYes bool
-	// newKeyholder reaches the keyholder for the hand-over; nil dials it.
+	// consent is --plan and --confirm <digest> (ADR 0023 M2.6c).
+	consent consentFlags
+	// newKeyholder reaches the keyholder for the hand-over and the pin's
+	// raise; nil is openKeyholderDefault, which dials it.
 	newKeyholder keyholderOpener
-	// newPinStore reaches the key pin; nil reaches the cluster.
+	// newPinStore reaches the key pin as the instance's writer; nil reaches
+	// the cluster.
 	newPinStore pinStoreOpener
+	// newPlanReader opens what the plan reads the pin and farcast-system's
+	// uid through under --plan and --confirm, when a keyholder is deployed:
+	// the instance's reader (ADR 0023 M2.6, A23-20), openPinPlanReader when
+	// unset, and never the writer.
+	newPlanReader func(clusterRef) (pinPlanReader, error)
+	// now is the clock a printed plan is dated by (generated_at), and the one
+	// --confirm waits on before it mints (waitPastNewestKey), sleeping
+	// through sleep: time.Now and sleepContext when unset.
+	now   func() time.Time
+	sleep func(context.Context, time.Duration) error
+}
+
+// ensureDefaults sets the seams a test left unset.
+func (c *keyRotateCommand) ensureDefaults() {
+	if c.newKeyholder == nil {
+		c.newKeyholder = openKeyholderDefault
+	}
+	if c.newPlanReader == nil {
+		c.newPlanReader = openPinPlanReader
+	}
+	if c.now == nil {
+		c.now = time.Now
+	}
+	if c.sleep == nil {
+		c.sleep = sleepContext
+	}
 }
 
 func (*keyRotateCommand) Name() string     { return "rotate" }
@@ -370,7 +404,7 @@ func (*keyRotateCommand) Synopsis() string { return "Add new key-encryption keys
 
 func (*keyRotateCommand) Usage() string {
 	return strings.TrimSpace(`
-Usage: farcast storage key rotate <instance> [-y]
+Usage: farcast storage key rotate <instance> [-y] [--plan | --confirm <digest>]
 
 Add a new key-encryption key to the instance's own key space AND to every
 application's scope, and make each the one that wraps new writes. Every
@@ -399,9 +433,38 @@ ones are in use. From then on a replica that restarts refuses any bundle from
 before the rotation — a keeper's included — even with no serving replica left
 to compare it against. The pin is written in-process, as the instance's
 installer service account, with the key 'farcast install --credentials'
-stored, and needs no kubectl; if it cannot be written the rotation still
-happens, this exits non-zero, and 'farcast storage key pin' writes it
-afterwards.
+stored, and needs no kubectl. In an interactive or --yes run, if it cannot
+be written the rotation still happens, this exits non-zero, and 'farcast
+storage key pin' writes it afterwards; under --confirm a writer that will
+not open refuses the rotation before anything is minted. The pin is read
+before the question, so a keyring behind it is refused before anything is
+asked.
+
+--plan prints what it would mint — a key for the instance's own key space
+and one for each application's scope, named by what they are, since their
+ids are drawn only when they are minted — and, with a keyholder deployed and
+an application scope, both pins: the one that holds the new keys before any
+replica uses them, and the one that retires the old keys after, with the
+plan's digest. It changes nothing. It needs the instance's record. With a
+keyholder deployed it reads the pin and the cluster as the instance's
+reader, which 'farcast reader grant' must have verified read-only (there is
+no fallback to the installer's account); without one it reads no cluster. A
+keyring that lacks a key the pin requires is a block: the plan says so, and
+its --confirm refuses it. Which keyholder replicas take the new keys is
+decided when the rotation runs, outside the plan.
+
+--confirm <digest> does exactly the plan with that digest, asking nothing,
+and refuses, having minted nothing, if anything it binds has changed since:
+it computes the plan again as the reader, opens the writer only after the
+comparison and, with an application scope, checks that the pin is where the
+plan read it, and waits, at most a second, until this machine's clock is
+past the newest key. Each pin is written once, and only as the plan listed
+it. A rotation the replicas did not take as planned leaves the new keys
+held, writes no further pin, and exits non-zero, as an interactive one does.
+A pin another writer moved before the hold is written is plan_changed, with
+the keys held and not in use; one moved after it is plan_changed with the
+keys in use and the final pin not written, which 'farcast storage key pin'
+writes.
 
 Once the new keys are in use, run 'farcast storage key rekey' to move existing
 objects onto them. Then re-enrol every keeper: each one's bundle predates the
@@ -411,39 +474,73 @@ rotation.`)
 func (c *keyRotateCommand) SetFlags(fs *flag.FlagSet) {
 	fs.BoolVar(&c.assumeYes, "yes", false, "skip the confirmation")
 	fs.BoolVar(&c.assumeYes, "y", false, "skip the confirmation")
+	c.consent.register(fs)
 }
 
+// The texts of storage key rotate's refusals, notices and pin lines (ADR 0023
+// M2.6c).
+const (
+	// msgRotateYes is the refusal of a run with no terminal and no --yes.
+	msgRotateYes = "refusing to rotate without confirmation; pass --yes" + consentSuffix
+	// msgRotateHandOver is the notice of a plan that hands the new keys
+	// over (A23-45).
+	msgRotateHandOver = "which keyholder replicas take the new keys is decided when the rotation runs, outside this plan"
+	// msgRotateRecordChanged is --confirm's refusal of a record whose
+	// keyholder changed while the rotation ran (A23-45, after A23-43's): the
+	// instance, and what of it.
+	msgRotateRecordChanged = "instance %q's record changed while the command ran (its %s is not what the plan read); " +
+		"the new keys were minted and saved in keys.yaml, and no pin was written"
+	// msgRotateRecordUnread is --confirm's refusal of a record it could not
+	// read again once the new keys were saved.
+	msgRotateRecordUnread = "re-read instance %q after minting its new keys: %w; the new keys were saved in keys.yaml, and no pin was written"
+	// msgRotateHoldUnplanned is --confirm's refusal to write a pin that
+	// holds the new keys other than the one its plan listed.
+	msgRotateHoldUnplanned = "the key pin that would hold the new keys is not the one the plan listed, so it was not written"
+	// msgRotateUnplanned is the pin line of a --confirm whose hand-over
+	// ended in a state its plan did not describe (A23-11): the outcome, and
+	// the instance.
+	msgRotateUnplanned = "not moved: the rotation ended in a state its plan did not describe (%s); 'farcast storage key pin %s' writes it once the keys settle"
+	// msgRotateFinalPinChanged is the pin line of a --confirm whose final
+	// pin another writer moved after the hold-stage write (A23-45 step 6):
+	// the new keys are in use, and what is left is that pin, then the
+	// rekey. The command that writes the pin, and the instance. The
+	// command's error is still msgPinChanged, plan_changed.
+	msgRotateFinalPinChanged = "not written: the instance's key pin changed after the hold-stage write, and nothing was written over it; " +
+		"a replica that restarts may still admit a bundle from before this rotation. Run %s once the keys settle, then 'farcast storage key rekey %s'"
+)
+
+// The outcomes of a hand-over that its plan did not describe, as A23-11
+// names them. --confirm writes no further pin after one.
+const (
+	outcomeNeverHeld = "the replicas never took the held keys"
+	outcomePutBack   = "this machine was put back on its old keys"
+	outcomeRefused   = "a replica refused the new keys"
+)
+
 func (c *keyRotateCommand) Run(ctx context.Context, env *Env, args []string) (err error) {
-	// A 403 the writer met says whose it was, once (A20-9).
+	// A 403 the writer met says whose it was, once (A20-9); one a plan's
+	// reader met says so already (A23-22), and writerRefused leaves it.
 	var meta *config.InstanceMetadata
 	defer func() { err = writerRefused(err, meta) }()
 	instance, err := oneInstance("rotate", args)
 	if err != nil {
 		return err
 	}
+	mode, digest, err := c.consent.mode(c.assumeYes)
+	if err != nil {
+		return err
+	}
+	c.ensureDefaults()
+	if mode != consentNone {
+		return c.planned(ctx, env, instance, mode, digest, &meta)
+	}
 	keyring, raw, err := keyringAndBytesOf(env, instance)
 	if err != nil {
 		return err
 	}
-	// The scope warning goes before the confirmation, not after the result: a
-	// warning printed once the deed is done is read by nobody who was already
-	// sure they knew what rotation did.
-	fprintf(env.Err, "%s\n", rotationScopeWarning)
-	if !c.assumeYes {
-		if env.Printer.Mode != output.ModeHuman || !isTerminal(env.In) {
-			return usagef("refusing to rotate without confirmation; pass --yes")
-		}
-		ok, err := newPrompter(env.In, env.Err).yesNo("Add new key-encryption keys")
-		if err != nil {
-			return err
-		}
-		if !ok {
-			fprintln(env.Err, "Aborted.")
-			return nil
-		}
-	}
-	// The pin is read before anything is minted. A keyring that lacks a key
-	// the pin requires is behind the instance: rotating from it would put a
+	// The pin is read before anything is minted, and before the question
+	// (ADR 0023 M2.6c, A23-51 item 3). A keyring that lacks a key the pin
+	// requires is behind the instance: rotating from it would put a
 	// replica onto keys that omit another machine's, and every replica would
 	// refuse them anyway. One that holds every required key and only writes
 	// under a retired one — what an import leaves — is left to the hand-over:
@@ -455,7 +552,8 @@ func (c *keyRotateCommand) Run(ctx context.Context, env *Env, args []string) (er
 	//
 	// The pin is reached as the instance's writer (ADR 0023 M2.5). A writer
 	// that cannot open — no installer key on this machine, say — is a pin
-	// not reached, and the rotation goes on without it, as documented.
+	// not reached, and the rotation goes on without it, as documented: in
+	// an interactive or --yes run only (A23-45).
 	var ps pinStore
 	var pinErr error
 	m, lerr := env.ConfigDir.LoadInstanceMetadata(instance)
@@ -465,23 +563,285 @@ func (c *keyRotateCommand) Run(ctx context.Context, env *Env, args []string) (er
 		}
 	}
 	if lerr == nil && pinMeta(m) {
-		open := c.newPinStore
-		if open == nil {
-			open = defaultPinStore
-		}
-		if ps, pinErr = open(clusterRef{Dir: env.ConfigDir, Meta: m, Identity: kube.Writer, Warn: env.Err}); pinErr == nil {
+		ref := clusterRef{Dir: env.ConfigDir, Meta: m, Identity: kube.Writer, Warn: env.Err}
+		if ps, pinErr = pinStoreFor(c.newPinStore, ref, nil); pinErr == nil {
 			cur, present, _, invalid, err := readPin(ctx, ps)
 			switch {
 			case err != nil:
 				pinErr = err
 			case present && invalid == nil:
 				if b := pinVerdict(cur, keyring); b != nil && len(b.Missing) > 0 {
-					return fmt.Errorf("%v, so nothing was rotated: %w", b,
-						keyringBehind(0, behindKey, "is held to keys this machine's keyring lacks by the instance's key pin", instance))
+					return rotateBehind(b, instance)
 				}
 			}
 		}
 	}
+	// The scope warning goes before the confirmation, not after the result: a
+	// warning printed once the deed is done is read by nobody who was already
+	// sure they knew what rotation did.
+	fprintf(env.Err, "%s\n", rotationScopeWarning)
+	if !c.assumeYes {
+		if env.Printer.Mode != output.ModeHuman || !isTerminal(env.In) {
+			return usagef(msgRotateYes)
+		}
+		ok, err := newPrompter(env.In, env.Err).yesNo("Add new key-encryption keys")
+		if err != nil {
+			return err
+		}
+		if !ok {
+			fprintln(env.Err, "Aborted.")
+			return nil
+		}
+	}
+	return c.rotate(ctx, env, instance, keyring, raw, ps, pinErr, nil, &meta)
+}
+
+// rotateBehind is the refusal of a keyring that lacks a key the instance's
+// pin requires: nothing was rotated. Under --plan and --confirm it is the
+// plan's block (A23-18).
+func rotateBehind(b *pinBehind, instance string) error {
+	return fmt.Errorf("%v, so nothing was rotated: %w", b,
+		keyringBehind(0, behindKey, "is held to keys this machine's keyring lacks by the instance's key pin", instance))
+}
+
+// planned is a run under --plan or --confirm (ADR 0023 M2.6c, A23-45). It
+// needs the instance's record, from which the plan's target is bound. With a
+// keyholder deployed the plan reads the pin and farcast-system's uid as the
+// instance's reader, which 'reader grant' must have verified (A23-21);
+// without one it reads no cluster and needs no reader. --plan prints the plan.
+// --confirm compares it, says what it says once, and then, with a keyholder,
+// opens the writer — no applyReady: rotate applies nothing — whose
+// farcast-system must be the plan's and whose pin must be where the plan read
+// it (A23-23), and waits for the clock to pass the newest key (A23-32), before
+// anything is minted, saved, opened or handed over.
+func (c *keyRotateCommand) planned(ctx context.Context, env *Env, instance string, mode consentMode, digest string,
+	metaOut **config.InstanceMetadata) error {
+	meta, err := env.ConfigDir.LoadInstanceMetadata(instance)
+	if err != nil {
+		return fmt.Errorf("load instance %q: %w", instance, err)
+	}
+	if err := recordNamed(meta, instance); err != nil {
+		return err
+	}
+	*metaOut = meta
+	// The keyring, for its key ids and their times (A23-25); --confirm
+	// mints from it, and saves only over the bytes read here.
+	keyring, raw, err := keyringAndBytesOf(env, instance)
+	if err != nil {
+		return err
+	}
+	ref := clusterRef{Dir: env.ConfigDir, Meta: meta, Warn: env.Err}
+	var rd pinPlanReader
+	if pinMeta(meta) {
+		if err := requireGrantedReader(env.ConfigDir, meta, "storage key rotate", mode); err != nil {
+			return err
+		}
+		ref.Identity = kube.Reader
+		if rd, err = c.newPlanReader(ref); err != nil {
+			return err
+		}
+	}
+	p, b, err := c.plan(ctx, meta, keyring, rd, mode)
+	if err != nil {
+		return err
+	}
+	if mode == consentPlan {
+		return printPlan(env, b, c.now())
+	}
+	if err := confirmPlan(b, digest); err != nil {
+		return err
+	}
+	// What the plan says, once, right after the comparison (A23-26).
+	fprintf(env.Err, "%s\n", rotationScopeWarning)
+	var ps pinStore
+	if p.reads {
+		ref.Identity = kube.Writer
+		if ps, err = pinStoreFor(c.newPinStore, ref, nil); err != nil {
+			return fmt.Errorf("the key pin could not be reached: %w", err)
+		}
+		uid, err := preflightUID(ctx, ps)
+		if err != nil {
+			return err
+		}
+		if err := confirmedCluster(meta, b, uid); err != nil {
+			return err
+		}
+		if p.pins {
+			if err := checkPlannedPin(ctx, ps, p.hold); err != nil {
+				return err
+			}
+		}
+	}
+	if p.pins {
+		if err := waitPastNewestKey(ctx, c.now, c.sleep, kekLists(keyring)); err != nil {
+			return err
+		}
+	}
+	return c.rotate(ctx, env, instance, keyring, raw, ps, nil, &p, metaOut)
+}
+
+// preparedRotate is every decision storage key rotate's --confirm executes,
+// made once by its plan (design §9.4, A23-45).
+type preparedRotate struct {
+	// reads: a keyholder is deployed, so the plan read the pin and the
+	// cluster, and --confirm checks the writer's cluster and pin.
+	reads bool
+	// keyholderDeployed and replicas are the keyholder the plan read in the
+	// record, which the record read again after minting must still name.
+	keyholderDeployed bool
+	replicas          int
+	// pins: the plan writes the pin twice, the hold and the final pin, for
+	// it hands keys to a keyholder (reads, and an application scope).
+	pins bool
+	// cur, present and invalid are the pin the plan read; hold.rv is the
+	// resourceVersion it was read at.
+	cur     dskeyholder.Pin
+	present bool
+	invalid error
+	// hold is the pin that holds the new keys, at the version read, and
+	// final the pin that retires the old ones, a replace at the version the
+	// hold-stage write produces: each over the placeholder ids of the new
+	// keys.
+	hold, final pinDecision
+}
+
+// plan is storage key rotate's plan (design §9.4, A23-45). With a keyholder
+// deployed it reads the pin, then farcast-system's uid, through rd — the
+// reader, its errors the reader's (planRead) — and binds that uid; a keyring
+// that lacks a key the pin requires blocks it. Without one it reads no
+// cluster, and its cluster_identity is none. Its facts are the rotation, a
+// key minted for the instance's key space and for each scope, and, with a
+// keyholder and a scope, the hold-stage pin and its write, at the version
+// read, and the final pin and its write, at the version the hold-stage write
+// produces, each decided over placeholder keys (placeholderEntry) as an
+// interactive run's writes are (decidePin; A23-32), and a pin either of
+// which no replica would take blocks it; then its notices. It reads no
+// terminal, mints nothing, and reads no key material: the keyring's ids and
+// times only (A23-25).
+func (c *keyRotateCommand) plan(ctx context.Context, meta *config.InstanceMetadata, keys datasphere.Keyring, rd pinPlanReader, m consentMode) (preparedRotate, plan.Bound, error) {
+	name := meta.Name
+	p := preparedRotate{reads: pinMeta(meta)}
+	if meta.Keyholder != nil {
+		p.keyholderDeployed, p.replicas = meta.Keyholder.Deployed, meta.Keyholder.Replicas
+	}
+	lists := kekLists(keys)
+	b := newBound("storage key rotate", meta, "none", "")
+	var rv string
+	if p.reads {
+		cur, present, read, invalid, err := readPin(ctx, rd)
+		if err != nil {
+			return p, plan.Bound{}, planRead(m, err, name)
+		}
+		uid, err := rd.NamespaceUID(ctx, dsdeploy.DefaultNamespace)
+		if err != nil {
+			return p, plan.Bound{}, planRead(m, fmt.Errorf("read the uid of the instance's %s namespace: %w", dsdeploy.DefaultNamespace, err), name)
+		}
+		b = newBound("storage key rotate", meta, "reader", uid)
+		if present && invalid == nil {
+			if behind := verdictOf(cur, lists); behind != nil && len(behind.Missing) > 0 {
+				b.Blocked = []plan.Block{blockOf(rotateBehind(behind, name))}
+				return preparedRotate{}, b, nil
+			}
+		}
+		p.cur, p.present, p.invalid, rv = cur, present, invalid, read
+	}
+	handover := 0
+	if p.reads && len(lists) > 0 {
+		handover = replicaCount(meta)
+	}
+	facts := []plan.Fact{
+		plan.RotationFact{Type: plan.TypeRotation, NewKeys: 1 + len(lists), HandoverReplicas: handover},
+		plan.MintFact{Type: plan.TypeMint, What: plan.MintKey, Subject: ""},
+	}
+	for _, s := range lists {
+		facts = append(facts, plan.MintFact{Type: plan.TypeMint, What: plan.MintKey, Subject: s.Name})
+	}
+	if p.reads && len(lists) > 0 {
+		p.pins = true
+		// Each scope with its new key in use, as the rotation leaves it.
+		rotated := make([]scopeKEKs, len(lists))
+		for i, s := range lists {
+			rotated[i] = scopeKEKs{Name: s.Name, KEKs: append([]datasphere.KeyEntry{placeholderEntry(s.Name, 1, s.KEKs)}, s.KEKs...)}
+		}
+		// The hold: every key required, the new ones with them, and nothing
+		// retired that the pin does not retire already.
+		hold, err := decidePin(p.cur, p.present, rv, p.invalid, rotated, false, false)
+		if err != nil {
+			b.Blocked = []plan.Block{blockOf(err)}
+			return preparedRotate{}, b, nil
+		}
+		// The final pin: over the hold, every key older than a scope's new
+		// one retired; a replace at the version the hold-stage write
+		// produces, which no plan can know, so it binds none.
+		final, err := decidePin(hold.pin, true, "", nil, rotated, true, false)
+		if err != nil {
+			b.Blocked = []plan.Block{blockOf(err)}
+			return preparedRotate{}, b, nil
+		}
+		final.method, final.rv = plan.WriteReplace, ""
+		for _, dec := range []pinDecision{hold, final} {
+			pf, err := pinFacts(dec, nil)
+			if err != nil {
+				return p, plan.Bound{}, err
+			}
+			facts = append(facts, pf...)
+		}
+		p.hold, p.final = hold, final
+	}
+	facts = append(facts, noticeFact(rotationScopeWarning))
+	if p.pins {
+		facts = append(facts, noticeFact(msgRotateHandOver))
+	}
+	b.Facts = facts
+	return p, b, nil
+}
+
+// sameRecord is --confirm's check of the record rotate reads again once its
+// new keys are saved (A23-45): still this instance's, with the keyholder the
+// plan read, or plan_changed, with no pin written and nothing handed over.
+func (p preparedRotate) sameRecord(name string, fresh *config.InstanceMetadata) error {
+	if err := recordNamed(fresh, name); err != nil {
+		return err
+	}
+	deployed, replicas := false, 0
+	if fresh.Keyholder != nil {
+		deployed, replicas = fresh.Keyholder.Deployed, fresh.Keyholder.Replicas
+	}
+	if deployed != p.keyholderDeployed || replicas != p.replicas {
+		return changedAfterPlan(consentConfirm, fmt.Sprintf(msgRotateRecordChanged, name, "keyholder"))
+	}
+	return nil
+}
+
+// writeHold is --confirm's hold stage (A23-45 step 5): the pin that holds the
+// keyring the hand-over pushed held, decided over the pin the plan read as an
+// interactive run's write decides it, and written once, at the version the
+// plan read (writePinOnce), only when it is — its new keys mapped back to
+// their placeholders (planned) — the hold the plan listed. Otherwise nothing
+// is written, and it is plan_changed (msgRotateHoldUnplanned).
+func (p preparedRotate) writeHold(ctx context.Context, ps pinStore, held *datasphere.Keyring, planned map[datasphere.KeyID]datasphere.KeyID) (pinWrite, error) {
+	if held == nil {
+		return pinWrite{}, changedAfterPlan(consentConfirm, msgRotateHoldUnplanned)
+	}
+	dec, err := decidePin(p.cur, p.present, p.hold.rv, p.invalid, kekLists(*held), false, false)
+	if err != nil {
+		return pinWrite{}, err
+	}
+	if !dec.writes() || !mappedBack(dec.pin, planned).Equal(p.hold.pin) {
+		return pinWrite{}, changedAfterPlan(consentConfirm, msgRotateHoldUnplanned)
+	}
+	return writePinOnce(ctx, ps, dec.pin, dec.rv)
+}
+
+// rotate mints the new keys, saves them, hands them to the keyholder and
+// moves the pin: the rest of an interactive or --yes run, with ps the pin
+// it reached as the writer (nil and pinErr when it could not), and of a
+// --confirm, with conf the plan it confirmed. Under --confirm it records the
+// placeholder each new key was planned as, writes each pin only as the plan
+// listed it, and checks the record it reads again (A23-45). The record read
+// again goes to *metaOut.
+func (c *keyRotateCommand) rotate(ctx context.Context, env *Env, instance string, keyring datasphere.Keyring, raw []byte,
+	ps pinStore, pinErr error, conf *preparedRotate, metaOut **config.InstanceMetadata) error {
 	entry, err := datasphere.NewKey()
 	if err != nil {
 		return err
@@ -494,8 +854,13 @@ func (c *keyRotateCommand) Run(ctx context.Context, env *Env, args []string) (er
 		return err
 	}
 	previous := make(map[string]datasphere.KeyID, len(scopes))
+	// planned is each scope's new key, by the placeholder id its plan listed
+	// it as (A23-32): a pin --confirm would write is compared with the plan's
+	// over it.
+	planned := make(map[datasphere.KeyID]datasphere.KeyID, len(scopes))
 	for _, r := range scopes {
 		previous[r.Scope] = r.Previous
+		planned[r.Active] = placeholderKeyID(r.Scope, 1)
 	}
 	held, err := rotated.WithScopeActive(previous)
 	if err != nil {
@@ -542,6 +907,27 @@ func (c *keyRotateCommand) Run(ctx context.Context, env *Env, args []string) (er
 	}
 
 	meta, merr := env.ConfigDir.LoadInstanceMetadata(instance)
+	if merr == nil {
+		*metaOut = meta
+	}
+	// Under --confirm the record read again must still name the keyholder
+	// the plan read: a keyholder deployed or resized since would be handed
+	// keys, and a pin written, that the plan never described (A23-45).
+	if conf != nil {
+		if merr != nil {
+			return fmt.Errorf(msgRotateRecordUnread, instance, merr)
+		}
+		if err := conf.sameRecord(instance, meta); err != nil {
+			return err
+		}
+	}
+	// Under --confirm: the hold stage's failure, which the command returns
+	// once the result is printed (A23-45 step 5); the pin the hold stage
+	// wrote; and, when the hand-over ends where the plan did not say, which
+	// way (A23-11).
+	var holdErr error
+	var holdPin *dskeyholder.Pin
+	activated, outcome := false, outcomeNeverHeld
 	switch {
 	case len(scopes) == 0:
 		// Nothing a keyholder holds changed.
@@ -585,8 +971,24 @@ func (c *keyRotateCommand) Run(ctx context.Context, env *Env, args []string) (er
 			// holds every key the active one does — and retires nothing yet:
 			// the old keys may still be put back.
 			beforeActivate: func(client sealStateClient) error {
+				if conf != nil {
+					// Under --confirm it is written once, and only as the
+					// plan listed it (A23-45 step 5). A failure stops the
+					// rotation here, the keys held and not in use, and is the
+					// command's error, with its own kind: there is no going on
+					// without the pin. The hand-over names it as the pin it is
+					// (unwrittenHold), never as a keyring not saved.
+					w, err := conf.writeHold(ctx, ps, pushedHeld, planned)
+					if err != nil {
+						holdErr = err
+						return unwrittenHold{err}
+					}
+					holdPin = &w.Pin
+					warnUnraised(env, raisePins(ctx, client, replicaCount(meta), w.Pin, false, instance, heldKeys(*pushedHeld)))
+					return save(rotated)
+				}
 				if ps != nil && pinErr == nil && pushedHeld != nil {
-					w, err := writePin(ctx, ps, *pushedHeld, false, false)
+					w, err := writePinLoop(ctx, ps, *pushedHeld, false, false)
 					var behind *pinBehind
 					switch {
 					case errors.As(err, &behind):
@@ -594,16 +996,13 @@ func (c *keyRotateCommand) Run(ctx context.Context, env *Env, args []string) (er
 					case err != nil:
 						pinErr = err
 					default:
-						for _, row := range raisePins(ctx, client, replicaCount(meta), w.Pin, false, instance, heldKeys(*pushedHeld)) {
-							if !row.Raised {
-								fprintf(env.Err, "warning: keyholder replica %d %s\n", row.Ordinal, row.Note)
-							}
-						}
+						warnUnraised(env, raisePins(ctx, client, replicaCount(meta), w.Pin, false, instance, heldKeys(*pushedHeld)))
 					}
 				}
 				return save(rotated)
 			},
 		})
+		activated, outcome = res.Activated, unplannedOutcome(res, holdPin != nil)
 		// The pin follows only a hand-over that checked this keyring against
 		// the fleet. One that never reached the replicas, or found this
 		// keyring behind them, has nothing to say about what the instance's
@@ -678,11 +1077,25 @@ func (c *keyRotateCommand) Run(ctx context.Context, env *Env, args []string) (er
 	case merr != nil || !pinMeta(meta) || len(scopes) == 0:
 	case !checked:
 		result.Pin = "not moved: the hand-over did not check this keyring against the replicas, so it says nothing about the instance's keys"
+	case conf != nil && holdErr != nil:
+		result.Pin = "not written: " + terminalText(holdErr.Error())
+	case conf != nil:
+		result.Pin, pinUnwritten = c.finishPlannedPin(ctx, env, meta, ps, *conf, holdPin, activated, lastK, planned, outcome)
 	default:
 		result.Pin, pinUnwritten = c.finishPin(ctx, env, meta, ps, pinErr, lastK)
 	}
 	if err := env.Printer.Print(result); err != nil {
 		return err
+	}
+	// Under --confirm the hold stage's failure, whatever Unfinished says,
+	// and a pin another writer moved after the comparison, are the
+	// command's error, with their own kinds: plan_changed is never an
+	// unfinished rotation (A23-45).
+	if holdErr != nil {
+		return holdErr
+	}
+	if conf != nil && pinUnwritten != nil && kindOf(pinUnwritten) == kindPlanChanged {
+		return pinUnwritten
 	}
 	if pinUnwritten != nil && result.Unfinished == "" {
 		return pinUnwritten
@@ -694,6 +1107,31 @@ func (c *keyRotateCommand) Run(ctx context.Context, env *Env, args []string) (er
 		return rotationUnfinished(result.Unfinished)
 	}
 	return nil
+}
+
+// unplannedOutcome is which of A23-11's outcomes a hand-over that its plan
+// did not describe ended in: the keys were put in use and then this machine
+// went back to its old ones; the hold was written, or a replica refused the
+// held push, and the keys were never put in use; or the replicas never took
+// the held keys.
+func unplannedOutcome(res handOverResult, holdWritten bool) string {
+	switch {
+	case res.Activated:
+		return outcomePutBack
+	case holdWritten || (res.Held != nil && len(res.Held.Refused) > 0):
+		return outcomeRefused
+	}
+	return outcomeNeverHeld
+}
+
+// warnUnraised prints a warning for each replica that did not take a pin
+// live.
+func warnUnraised(env *Env, rows []pinRaise) {
+	for _, row := range rows {
+		if !row.Raised {
+			fprintf(env.Err, "warning: keyholder replica %d %s\n", row.Ordinal, row.Note)
+		}
+	}
 }
 
 // finishPin writes the pin from the keyring this rotation left saved, retiring
@@ -709,9 +1147,7 @@ func (c *keyRotateCommand) finishPin(ctx context.Context, env *Env, meta *config
 			line := fmt.Sprintf("NOT moved: %v. %s", behind, behindRemedy(behind, meta.Name))
 			return line, rotationUnfinished("the key pin is ahead of this keyring; " + behindRemedy(behind, meta.Name))
 		}
-		line := fmt.Sprintf("NOT written (%s): a replica that restarts may still admit a bundle from before this rotation. Run %s, then 'farcast storage key rekey %s'",
-			terminalText(err.Error()), pinRemedy(meta.Name), meta.Name)
-		return line, rotationUnfinished("the key pin was not written; " + pinRemedy(meta.Name) + " writes it")
+		return pinNotWrittenLine(err, meta.Name), rotationUnfinished("the key pin was not written; " + pinRemedy(meta.Name) + " writes it")
 	}
 	if ps == nil || pinErr != nil {
 		if pinErr == nil {
@@ -719,29 +1155,81 @@ func (c *keyRotateCommand) finishPin(ctx context.Context, env *Env, meta *config
 		}
 		return unwritten(pinErr)
 	}
-	w, err := writePin(ctx, ps, k, true, false)
+	w, err := writePinLoop(ctx, ps, k, true, false)
 	if err != nil {
 		return unwritten(err)
 	}
-	line := fmt.Sprintf("requires %s, retires %s", plural(len(w.Pin.Require), "key", "keys"), plural(len(w.Pin.Retired), "key", "keys"))
-	open := c.newKeyholder
-	if open == nil {
-		open = openKeyholder
+	return c.handPin(ctx, env, meta, w.Pin, k), nil
+}
+
+// pinNotWrittenLine is the result's pin line when the pin could not be
+// written, quoting why as it is built (A21-7).
+func pinNotWrittenLine(err error, instance string) string {
+	return fmt.Sprintf("NOT written (%s): a replica that restarts may still admit a bundle from before this rotation. Run %s, then 'farcast storage key rekey %s'",
+		terminalText(err.Error()), pinRemedy(instance), instance)
+}
+
+// finishPlannedPin is finishPin under --confirm (ADR 0023 M2.6, A23-45 step
+// 6, A23-11). After a hand-over that put the new keys in use, with the hold
+// written, it reads the pin again, which must be exactly the hold-stage pin —
+// another writer since, or a conflict on the write, is plan_changed, nothing
+// is written over it, and the line names the pin and the rekey still to do
+// (msgRotateFinalPinChanged), the keys being in use — and
+// writes the pin from the keyring this rotation left saved, k, once, at the
+// version just read, only when it is, its new keys mapped back to their
+// placeholders, the final pin the plan listed. After any other ending
+// (outcome) it writes no pin: the keys stay as the hand-over left them, the
+// line says so, and the rotation is unfinished, internal, as an interactive
+// one's is. Any other failure to read or write keeps its own kind.
+func (c *keyRotateCommand) finishPlannedPin(ctx context.Context, env *Env, meta *config.InstanceMetadata, ps pinStore, p preparedRotate,
+	hold *dskeyholder.Pin, activated bool, k datasphere.Keyring, planned map[datasphere.KeyID]datasphere.KeyID, outcome string) (string, error) {
+	name := meta.Name
+	unplanned := func() (string, error) {
+		return fmt.Sprintf(msgRotateUnplanned, outcome, terminalText(name)),
+			rotationUnfinished("the key pin was not moved: the rotation ended in a state its plan did not describe; " + pinRemedy(name) + " writes it once the keys settle")
 	}
-	client, done, err := open(ctx, env, meta.Name)
+	if hold == nil || !activated {
+		return unplanned()
+	}
+	cur, present, rv, invalid, err := readPin(ctx, ps)
 	if err != nil {
-		return line + fmt.Sprintf("; not handed to the replicas live (%v) — each loads it when it next restarts", err), nil
+		return pinNotWrittenLine(err, name), err
+	}
+	if !present || invalid != nil || !cur.Equal(*hold) {
+		return fmt.Sprintf(msgRotateFinalPinChanged, pinRemedy(terminalText(name)), terminalText(name)), withKind(kindPlanChanged, errors.New(msgPinChanged))
+	}
+	dec, err := decidePin(cur, present, rv, invalid, kekLists(k), true, false)
+	if err != nil || !dec.writes() || !mappedBack(dec.pin, planned).Equal(p.final.pin) {
+		return unplanned()
+	}
+	w, err := writePinOnce(ctx, ps, dec.pin, dec.rv)
+	if err != nil {
+		if kindOf(err) == kindPlanChanged {
+			return fmt.Sprintf(msgRotateFinalPinChanged, pinRemedy(terminalText(name)), terminalText(name)), err
+		}
+		return pinNotWrittenLine(err, name), err
+	}
+	return c.handPin(ctx, env, meta, w.Pin, k), nil
+}
+
+// handPin hands the pin a rotation wrote to every replica now, and is the
+// result's pin line: what the pin holds, and how many replicas enforce it.
+func (c *keyRotateCommand) handPin(ctx context.Context, env *Env, meta *config.InstanceMetadata, pin dskeyholder.Pin, k datasphere.Keyring) string {
+	line := fmt.Sprintf("requires %s, retires %s", plural(len(pin.Require), "key", "keys"), plural(len(pin.Retired), "key", "keys"))
+	client, done, err := c.newKeyholder(ctx, env, meta.Name)
+	if err != nil {
+		return line + fmt.Sprintf("; not handed to the replicas live (%v) — each loads it when it next restarts", err)
 	}
 	defer done()
 	raised := 0
-	for _, row := range raisePins(ctx, client, replicaCount(meta), w.Pin, false, meta.Name, heldKeys(k)) {
+	for _, row := range raisePins(ctx, client, replicaCount(meta), pin, false, meta.Name, heldKeys(k)) {
 		if row.Raised {
 			raised++
 		} else {
 			fprintf(env.Err, "warning: keyholder replica %d %s\n", row.Ordinal, row.Note)
 		}
 	}
-	return line + fmt.Sprintf("; %d of %d replicas enforce it now", raised, replicaCount(meta)), nil
+	return line + fmt.Sprintf("; %d of %d replicas enforce it now", raised, replicaCount(meta))
 }
 
 // pinVerdictAt reads the instance's pin and checks a keyring against it. No
@@ -794,6 +1282,9 @@ func describeRotation(res handOverResult, instance string) string {
 	case !res.Activated && res.Cause == heldChanged:
 		return fmt.Sprintf("every replica took the new keys to hold, but %s (see 'farcast storage state %s'). %s. Run %s again; "+
 			"the keys minted now stay held and unused", res.Reason, instance, unused, again)
+	case !res.Activated && res.Cause == heldUnpinned:
+		return fmt.Sprintf("every replica took the new keys to hold, but %s. %s. Run %s again once the key pin can be written; "+
+			"the keys minted now stay held and unused", res.Reason, unused, again)
 	case !res.Activated:
 		return fmt.Sprintf("the new keys are held by %d of %d replicas and in use on none, because %s (see 'farcast storage state %s'). %s. "+
 			"Run %s again once every replica is serving and answers; the keys minted now stay held and unused",

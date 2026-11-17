@@ -56,16 +56,26 @@ type preflighter interface {
 	NamespaceUID(ctx context.Context, name string) (string, error)
 }
 
-// preflightNamespace is that read: farcast-system's uid, discarded. It makes
-// the first in-process call as the writer, the installer's key, before a
-// command's first kubectl Apply could land, so an endpoint or a cluster that
-// refuses the writer refuses it before anything was written, asked, minted
-// or pushed. "" (no farcast-system yet, a first connect) is no failure.
-func preflightNamespace(ctx context.Context, cl preflighter) error {
-	if _, err := cl.NamespaceUID(ctx, deploy.DefaultNamespace); err != nil {
-		return fmt.Errorf("before changing anything, read the instance's cluster as its installer service account: %w", err)
+// preflightUID is that read: farcast-system's uid, as the writer reads it
+// (ADR 0023 M2.6, A23-23). It makes the first in-process call as the writer,
+// the installer's key, before a command's first kubectl Apply could land, so
+// an endpoint or a cluster that refuses the writer refuses it before anything
+// was written, asked, minted or pushed. "" (no farcast-system yet, a first
+// connect) is no failure. Under --confirm a plan that read the cluster as
+// the reader compares it with the uid it bound (openConfirmed).
+func preflightUID(ctx context.Context, cl preflighter) (string, error) {
+	uid, err := cl.NamespaceUID(ctx, deploy.DefaultNamespace)
+	if err != nil {
+		return "", fmt.Errorf("before changing anything, read the instance's cluster as its installer service account: %w", err)
 	}
-	return nil
+	return uid, nil
+}
+
+// preflightNamespace is preflightUID with the uid discarded: the preflight
+// of a command, or a run, whose plan binds none.
+func preflightNamespace(ctx context.Context, cl preflighter) error {
+	_, err := preflightUID(ctx, cl)
+	return err
 }
 
 // openWriter is every writing seam's default: openCluster as the instance's
@@ -75,6 +85,17 @@ func preflightNamespace(ctx context.Context, cl preflighter) error {
 // configuration.
 func openWriter(r clusterRef) (*cluster.Client, error) {
 	r.Identity, r.Verifying = kube.Writer, false
+	return openCluster(r)
+}
+
+// openReader is what a plan that reads the cluster reads it as (ADR 0023
+// M2.6, A23-20): openCluster as the instance's reader, which 'reader grant'
+// has verified read-only. It is the default of every plan's reader seam,
+// through openReaderDefault, and never the writer: a plan mints no token
+// that can write to the cluster. An interactive or --yes run reads as the
+// writer it opened instead (design §7.3).
+func openReader(r clusterRef) (*cluster.Client, error) {
+	r.Identity, r.Verifying = kube.Reader, false
 	return openCluster(r)
 }
 
@@ -111,12 +132,22 @@ func applyReady(cl any) error {
 	return nil
 }
 
+// msgPinWriterOnly is pinStoreFor's refusal of a ref that is not the
+// writer's (ADR 0023 M2.6, A23-20).
+const msgPinWriterOnly = "cli: the key pin is written only as the instance's writer"
+
 // pinStoreFor is the pin a writing command reads and writes: its own seam
 // when a test set one; otherwise the writer it already opened, when that
 // writer reaches the pin too (the cluster client does), so one writer, one
 // read of credentials.yaml and one token serve the whole command (A20-10);
-// otherwise the default opener.
+// otherwise the default opener. It opens only the writer: a ref of any
+// other identity is refused before anything is opened, so no plan reaches
+// the pin through it (A23-20); a plan reads the pin through its own reader
+// seam, a pinPlanReader.
 func pinStoreFor(seam pinStoreOpener, ref clusterRef, cl any) (pinStore, error) {
+	if ref.Identity != kube.Writer {
+		return nil, errors.New(msgPinWriterOnly)
+	}
 	if seam != nil {
 		return seam(ref)
 	}
@@ -176,7 +207,7 @@ func defaultProviderOpener(meta *config.InstanceMetadata, creds *config.Instance
 // package's tests replace them with fakes that refuse, so no test reaches a
 // real cloud provider or registry through these seams by leaving one unset.
 // Other seams keep defaults that are real, but for connect's dial
-// (connectDialDefault) and the two below.
+// (connectDialDefault) and the three below.
 //
 // deployerNowDefault is the deployer's clock, a variable for the same
 // reason: a test that runs a command through the router, where it cannot
@@ -188,6 +219,11 @@ func defaultProviderOpener(meta *config.InstanceMetadata, creds *config.Instance
 // which deciding a build makes in every mode since M2.6. They are variables
 // so the package's tests refuse them too: no test runs this machine's Go,
 // or binds the checkout it happens to run in, by leaving either unset.
+//
+// openReaderDefault is what a plan's reader seam opens when a command's own
+// is unset (ADR 0023 M2.6c, A23-20): openReader, the instance's cluster as
+// its reader. It is a variable so the package's tests refuse it too: no test
+// reaches a cluster through a plan by leaving its reader seam unset.
 var (
 	openProviderDefault providerOpener = defaultProviderOpener
 	newBuilderDefault                  = func(progress func(string)) imageBuilder {
@@ -196,6 +232,7 @@ var (
 	deployerNowDefault   = time.Now
 	findSourceDefault    = image.FindSource
 	findToolchainDefault = image.FindToolchain
+	openReaderDefault    = openReader
 )
 
 // registryAccess is the instance's ensured registry plus the ability to mint a
@@ -498,8 +535,21 @@ func checkCarried(carried carriedComponents, build func() buildinfo.Info) error 
 // ImagePullBackOff inside the cluster. The ensure is idempotent, and it is not
 // cost-gated — the registry is cents at most (decision 8), unlike connect's load
 // balancer.
+//
+// The installer's key is read by loadInstallerKey, before the provider is
+// opened (ADR 0023 M2.6c, A26-1): one that is missing, unreadable, does not
+// parse or is blank, an instance installed with Application Default
+// Credentials, is refused with errCredentialMissing in the writer's words,
+// and the provider is never opened with it. So no deploying command, a
+// reconnect included, ensures a registry as this machine's ADC. The
+// package-level ensureRegistry, which toolchain calls, is unchanged: ADC
+// leaves it at M3b.
 func (d *fatlineDeployer) ensureRegistry(ctx context.Context, env *Env, name string, meta *config.InstanceMetadata) (*registryAccess, error) {
-	return ensureRegistry(ctx, env, name, meta, d.openProvider)
+	creds, err := loadInstallerKey(env.ConfigDir, name)
+	if err != nil {
+		return nil, err
+	}
+	return ensureRegistryAs(ctx, env, name, meta, creds, d.openProvider)
 }
 
 // registryRequired reports whether this deploy cannot go on without the
@@ -536,6 +586,14 @@ func ensureRegistry(ctx context.Context, env *Env, name string, meta *config.Ins
 	if err != nil {
 		return nil, fmt.Errorf("load credentials for %q: %w", name, err)
 	}
+	return ensureRegistryAs(ctx, env, name, meta, creds, open)
+}
+
+// ensureRegistryAs is ensureRegistry with the installer's credentials
+// already read: it opens the provider with them, ensures the registry and
+// records it.
+func ensureRegistryAs(ctx context.Context, env *Env, name string, meta *config.InstanceMetadata,
+	creds *config.InstanceCredentials, open providerOpener) (*registryAccess, error) {
 	p, err := open(meta, creds)
 	if err != nil {
 		return nil, err
@@ -664,6 +722,26 @@ func (d *fatlineDeployer) realizeRegistry(ctx context.Context, env *Env, name st
 	return reg, nil
 }
 
+// deployRegistry is the instance's registry as kernel deploy's and storage
+// deploy's plans read it (A23-24): the one the record names (planRegistry),
+// in every plan, an image named by the command's image flag included,
+// because the deploy ensures it whatever its image. With ensure — an
+// interactive or --yes run, the only runs that can pass the command's gate
+// (A23-24's exception) — a record that names none is first given one, and
+// then read; a plan never ensures, and nor does a run with no terminal and
+// no --yes, which planRegistry then refuses with nothing written (ADR 0023
+// M2.6c). Before M2.6c these two commands ensured only after the cost was
+// agreed; the caller decides ensure outside the plan, which reads no
+// terminal (A23-38).
+func (d *fatlineDeployer) deployRegistry(ctx context.Context, env *Env, meta *config.InstanceMetadata, ensure bool) (*registryAccess, error) {
+	if ensure && registryPrefix(meta) == "" {
+		if _, err := d.ensureRegistry(ctx, env, meta.Name, meta); err != nil {
+			return nil, err
+		}
+	}
+	return d.planRegistry(ctx, env, meta.Name, meta)
+}
+
 // readyWriter is openReady through the deployer's writing seam.
 func (d *fatlineDeployer) readyWriter(ctx context.Context, env *Env, meta *config.InstanceMetadata) (clusterApplier, error) {
 	return openReady(ctx, env, meta, d.newCluster)
@@ -679,18 +757,75 @@ func (d *fatlineDeployer) readyWriter(ctx context.Context, env *Env, meta *confi
 // (cluster_identity none). An interactive or --yes run opens it before its
 // plan, and --confirm right after the comparison (A23-23).
 func openReady[W preflighter](ctx context.Context, env *Env, meta *config.InstanceMetadata, open func(clusterRef) (W, error)) (W, error) {
+	cl, _, err := openReadyAt(ctx, env, meta, open)
+	return cl, err
+}
+
+// openReadyAt is openReady with the uid its preflight read.
+func openReadyAt[W preflighter](ctx context.Context, env *Env, meta *config.InstanceMetadata, open func(clusterRef) (W, error)) (W, string, error) {
 	var none W
 	cl, err := open(clusterRef{Dir: env.ConfigDir, Meta: meta, Identity: kube.Writer, Warn: env.Err})
 	if err != nil {
-		return none, err
+		return none, "", err
 	}
 	if err := applyReady(cl); err != nil {
+		return none, "", err
+	}
+	uid, err := preflightUID(ctx, cl)
+	if err != nil {
+		return none, "", err
+	}
+	return cl, uid, nil
+}
+
+// msgOtherCluster is --confirm's refusal when the cluster the writer reaches
+// is not the one its plan read as the reader (A23-23): the instance, the uid
+// of farcast-system the writer read, and the one the plan bound, each
+// "absent" for none.
+const msgOtherCluster = "instance %q's cluster is not the one its plan read: farcast-system's uid is %s, not %s; nothing was written; " + msgPlanAgain
+
+// openConfirmed is openReady under --confirm, right after the comparison and
+// the block check, before anything is minted, ensured, pushed or saved, for
+// the plan b that was confirmed (ADR 0023 M2.6, A23-23): the writer opens
+// through open, applyReady runs, and its preflight reads farcast-system's
+// uid. A plan that read the cluster as the reader bound that uid, and the
+// writer must read the same one: the reader and the writer are two
+// credentials, and the cluster the writer reaches must be the cluster the
+// plan was made from. Otherwise it refuses, plan_changed, with nothing
+// written. A plan that read no cluster (cluster_identity none) bound no uid,
+// and the one read is discarded, as openReady discards it.
+func openConfirmed[W preflighter](ctx context.Context, env *Env, meta *config.InstanceMetadata, b plan.Bound, open func(clusterRef) (W, error)) (W, error) {
+	var none W
+	cl, uid, err := openReadyAt(ctx, env, meta, open)
+	if err != nil {
 		return none, err
 	}
-	if err := preflightNamespace(ctx, cl); err != nil {
+	if err := confirmedCluster(meta, b, uid); err != nil {
 		return none, err
 	}
 	return cl, nil
+}
+
+// confirmedCluster is openConfirmed's check of the uid of farcast-system
+// the writer read, uid, against the plan b that was confirmed: a plan that
+// read the cluster as the reader bound one, and the writer must read the
+// same, or the command refuses, plan_changed, with nothing written. A plan
+// that read no cluster bound none, and nothing is compared. storage key pin,
+// which applies nothing and so opens its writer without applyReady, checks
+// it here too.
+func confirmedCluster(meta *config.InstanceMetadata, b plan.Bound, uid string) error {
+	if b.ClusterIdentity == "reader" && uid != b.Target.SystemNamespaceUID {
+		return withKind(kindPlanChanged, fmt.Errorf(msgOtherCluster, meta.Name, uidText(uid), uidText(b.Target.SystemNamespaceUID)))
+	}
+	return nil
+}
+
+// uidText is a namespace uid as a refusal names it: "absent" for none.
+func uidText(uid string) string {
+	if uid == "" {
+		return "absent"
+	}
+	return terminalText(uid)
 }
 
 // registryTarget is the instance's registry as a plan's cloud facts name it:
@@ -754,8 +889,9 @@ type resolvedImage struct {
 // rules 1–6 applies, as a plan's image action, and everything realizing it
 // needs. Deciding only reads — the registry token, Resolve, the carried
 // components, the checkout and its Go — and realizing writes: a push or a
-// build. A plan binds a decision; a command that does not plan decides and
-// realizes at once (resolveImage).
+// build. Every command that deploys one of FarCast's own components decides
+// in its plan, before anything is asked, and realizes after consent; a plan
+// binds the decision.
 type imageDecision struct {
 	component components.Component
 	// action is a plan.Image* constant. It is "" only in Shrike's decision
@@ -790,8 +926,9 @@ type imageDecision struct {
 	// build's Image, Go and BuiltAt are filled in when it is pushed.
 	record config.SystemImage
 	// notices are the lines the resolution prints before it pushes or
-	// builds, in their order; replacing is rule 5's replacement note, which
-	// it prints once the image is in the registry (settleImage).
+	// builds, in their order (say); replacing is rule 5's replacement note,
+	// which kernel deploy and storage deploy print once the image is in the
+	// registry (realizeAndNote), and connect and redeploy before they ask.
 	notices   []string
 	replacing string
 }
@@ -819,6 +956,22 @@ func (dec imageDecision) builds() bool {
 func (dec imageDecision) skewRefusal(embedded bool) error {
 	if dec.replacesOther && !embedded {
 		return dec.skew
+	}
+	return nil
+}
+
+// say prints, outside a plan, what deciding the image said (A23-26): a
+// version-skew refusal that stands (skewRefusal; embedded is --embedded, or
+// true under --confirm, whose plan is the consent) is returned before any of
+// its lines, as the resolution refused it before it said anything (A25-23);
+// otherwise each notice, once, through terminalText. kernel deploy and
+// storage deploy say it before they ask anything.
+func (dec imageDecision) say(env *Env, embedded bool) error {
+	if skew := dec.skewRefusal(embedded); skew != nil {
+		return skew
+	}
+	for _, line := range dec.notices {
+		fprintln(env.Err, terminalText(line))
 	}
 	return nil
 }
@@ -1197,43 +1350,17 @@ func (d *fatlineDeployer) realizeImage(ctx context.Context, env *Env, reg *regis
 	return resolvedImage{Ref: dec.target, Record: dec.record}, nil
 }
 
-// resolveImage decides d.component's image and realizes it at once, saying
-// what it always said, in the same order (settleImage). It is the path of the
-// commands that have no plan yet, kernel deploy and storage deploy, and goes
-// when they have one (ADR 0023 M2.6, A23-34). connect and redeploy decide
-// before their consent and realize after it (workloadImages).
-func (d *fatlineDeployer) resolveImage(ctx context.Context, env *Env, reg *registryAccess, meta *config.InstanceMetadata) (resolvedImage, error) {
-	dec, err := d.decideImage(ctx, env, reg, meta)
-	return d.settleImage(ctx, env, reg, dec, err)
-}
-
-// settleImage is a resolution after its decision, given decide's error: the
-// version-skew refusal, before anything is said, asked or pushed; the
-// decision's notices on stderr, whatever the output mode; decide's error;
-// the build prompt; realize; and the replacement note once the image is in
-// the registry. That is the order the lines came in before the decision was
-// split from the push: the skew was refused before the version tag was
-// looked up, so a skew decision's foreign-tag warning, which deciding now
-// makes, is never said.
-func (d *fatlineDeployer) settleImage(ctx context.Context, env *Env, reg *registryAccess, dec imageDecision, err error) (resolvedImage, error) {
-	if skew := dec.skewRefusal(d.embedded); skew != nil {
-		return resolvedImage{}, skew
-	}
-	for _, n := range dec.notices {
-		fprintln(env.Err, n)
-	}
-	if err != nil {
-		return resolvedImage{}, err
-	}
-	if err := d.buildConsent(env, dec); err != nil {
-		return resolvedImage{}, err
-	}
+// realizeAndNote is realizeImage, then the decision's replacement note once
+// the image is in the registry, through terminalText: kernel deploy's and
+// storage deploy's image after consent, which say the rest of what their
+// decision says before anything is asked (imageDecision.say).
+func (d *fatlineDeployer) realizeAndNote(ctx context.Context, env *Env, reg *registryAccess, dec imageDecision) (resolvedImage, error) {
 	resolved, err := d.realizeImage(ctx, env, reg, dec)
 	if err != nil {
 		return resolvedImage{}, err
 	}
 	if dec.replacing != "" {
-		fprintln(env.Err, dec.replacing)
+		fprintln(env.Err, terminalText(dec.replacing))
 	}
 	return resolved, nil
 }

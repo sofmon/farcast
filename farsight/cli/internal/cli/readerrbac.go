@@ -263,9 +263,9 @@ func meteredReaderNote(env *Env, name string, meta *config.InstanceMetadata) (em
 	return email, ""
 }
 
-// meteredReader is meteredReaderNote for the callers that have no plan yet
-// (kernel deploy until ADR 0023 M2.6c, run until M2.6d): it prints the
-// warning on stderr and returns the email.
+// meteredReader is meteredReaderNote for the caller that has no plan yet
+// (run, until ADR 0023 M2.6d): it prints the warning on stderr and returns
+// the email.
 func meteredReader(env *Env, name string, meta *config.InstanceMetadata) string {
 	email, warning := meteredReaderNote(env, name, meta)
 	if warning != "" {

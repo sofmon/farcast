@@ -8,6 +8,8 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io/fs"
+	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -18,8 +20,10 @@ import (
 	"time"
 
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
+	"github.com/sofmon/farcast/farsight/cli/internal/kube/kubetest"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
 	"github.com/sofmon/farcast/farsight/cli/internal/plan"
+	tcdeploy "github.com/sofmon/farcast/technocore/deploy"
 	tkube "github.com/sofmon/farcast/technocore/kube"
 )
 
@@ -519,15 +523,23 @@ func TestEveryBoundFactIsRendered(t *testing.T) {
 	// Every plan a command prints (ADR 0023 M2.6b): each value its facts bind
 	// shows in its rendering, so a renderer that drops one only a command's
 	// own plan holds (connect's second standing cost, a source build's Go,
-	// redeploy's replaced image) fails here, not only on the samples above.
+	// redeploy's replaced image, rotate's two pins) fails here, not only on
+	// the samples above.
 	t.Run("the commands' plans", func(t *testing.T) {
 		for _, row := range planCommands() {
 			t.Run(row.String(), func(t *testing.T) {
 				_, dir := planFixture(t, row)
 				doc, _ := runPlan(t, dir, row, output.ModeJSON)
 				_, text := runPlan(t, dir, row, output.ModeHuman)
-				for i, f := range decodedBound(t, doc).Facts {
+				b := decodedBound(t, doc)
+				// A placeholder key id, rotate's, renders as the key it
+				// stands for (A23-32).
+				labels, _ := placeholderKeyLabels(b.Facts)
+				for i, f := range b.Facts {
 					for _, want := range renderedValues(reflect.ValueOf(f), "") {
+						if label, ok := labels[want]; ok {
+							want = label
+						}
 						if !strings.Contains(text, want) {
 							t.Errorf("fact %d (%s) binds %q, which its rendering does not show:\n%s", i, f.FactType(), want, text)
 						}
@@ -682,7 +694,9 @@ func TestPlanRenderingQuotesHostileText(t *testing.T) {
 // --source that holds one is bound by connect's and redeploy's plans as an
 // option, as the image's source and in the source-build notice, and each
 // prints Go-quoted; build refuses such a value where it renders its
-// documents, before any plan, and its refusal does not hold it either.
+// documents, before any plan, and its refusal does not hold it either. And
+// for kernel deploy, storage deploy, storage key pin and storage key rotate
+// (M2.6c): a value from the cluster or the record they read.
 func hostileTextOnTheCommands(t *testing.T) {
 	const hostileDir = "/work/far\x1b[2Kcast\u202etxt"
 	raw := func(s string) bool { return strings.Contains(s, "\x1b") || strings.Contains(s, "\u202e") }
@@ -760,6 +774,41 @@ func hostileTextOnTheCommands(t *testing.T) {
 		target := strconv.QuoteToGraphic(hostilePrefix + "/system/fatline@" + sha(tagDigest))
 		if raw(errb) || !strings.Contains(errb, "this replaces the image \"prod\" runs: "+imageIn("fatline", "1")+" → "+target+".\n") {
 			t.Errorf("redeploy should name the image it deploys Go-quoted in its question, never raw:\n%q", errb)
+		}
+	})
+	// What the plans of the commands that read the cluster bind from it, or
+	// from the record (ADR 0023 M2.6c): farcast-system's uid, which the
+	// cluster answers and the header names, and, for kernel deploy, a
+	// namespace the record meters that the cluster no longer has, which the
+	// plan names in a notice. Each prints Go-quoted in the rendering, never
+	// raw.
+	t.Run("the commands that read the cluster", func(t *testing.T) {
+		const hostileUID = "uid\x1b[2Jevil\u202etxt"
+		const hostileNamespace = "gone\x1b[2Kns\u202e"
+		for _, row := range readerPlans(t) {
+			t.Run(row.String(), func(t *testing.T) {
+				row.seed = func(s *kubetest.Server) {
+					s.Put(map[string]any{"apiVersion": "v1", "kind": "Namespace", "metadata": map[string]any{
+						"name": tcdeploy.DefaultNamespace, "uid": hostileUID}})
+				}
+				if row.name == "kernel deploy" {
+					row.edit = func(m *config.InstanceMetadata) { m.Kernel.Namespaces = append(m.Kernel.Namespaces, hostileNamespace) }
+				}
+				_, dir := planFixture(t, row)
+				_, text := runPlan(t, dir, row, output.ModeHuman)
+				if raw(text) {
+					t.Errorf("%s's plan prints a value raw:\n%q", row, text)
+				}
+				wants := []string{strconv.QuoteToGraphic(hostileUID)}
+				if row.name == "kernel deploy" {
+					wants = append(wants, "notice: "+terminalText(fmt.Sprintf(msgNoLongerMetering, hostileNamespace))+"\n")
+				}
+				for _, want := range wants {
+					if !strings.Contains(text, want) {
+						t.Errorf("%s's plan should hold %q:\n%s", row, want, text)
+					}
+				}
+			})
 		}
 	})
 	t.Run("build", func(t *testing.T) {
@@ -953,6 +1002,60 @@ func TestABlockedPlanIsRefusedWithItsKind(t *testing.T) {
 		sameFiles(t, "a blocked reader grant", before, treeFiles(t, string(dir)))
 	})
 
+	// The blocks of the commands that read the cluster (ADR 0023 M2.6c,
+	// A23-18): kernel deploy's namespace the cluster lacks, and a keyring
+	// behind the pin for storage deploy, storage key pin and storage key
+	// rotate. Each plan begins with its one block, internal, and ends with
+	// the blocked line and no confirm line; its --confirm recomputes it as
+	// the reader and refuses with the block's kind and words, exit 1,
+	// printing nothing, having opened no writer, provider, storage or
+	// keyholder, sent nothing but the reader's reads, run no kubectl and
+	// written nothing.
+	t.Run("the commands that read the cluster", func(t *testing.T) {
+		for _, row := range []planCommand{
+			planCommandNamed(t, "kernel deploy", "a missing namespace"),
+			planCommandNamed(t, "storage deploy", "behind the pin"),
+			planCommandNamed(t, "storage key pin", "behind the pin"),
+			planCommandNamed(t, "storage key rotate", "behind the pin"),
+		} {
+			t.Run(row.String(), func(t *testing.T) {
+				ran := strayKubectl(t)
+				s, dir := planFixture(t, row)
+				before := treeFiles(t, string(dir))
+				doc, _ := runPlan(t, dir, row, output.ModeJSON)
+				b := decodedBound(t, doc)
+				if len(b.Blocked) != 1 || b.Blocked[0].Kind != kindInternal || len(b.Facts) != 0 {
+					t.Fatalf("%s's plan blocks %+v with %d facts; want one internal block and none", row, b.Blocked, len(b.Facts))
+				}
+				block := b.Blocked[0]
+				_, text := runPlan(t, dir, row, output.ModeHuman)
+				first, _, _ := strings.Cut(block.Message, "\n")
+				if !strings.HasPrefix(text, "blocked (internal): "+output.ErrorText(first)) ||
+					!strings.HasSuffix(text, "\ndigest: "+doc.Digest+"\nblocked: --confirm would refuse this plan (internal)\n") ||
+					strings.Contains(text, "To do exactly this") {
+					t.Errorf("%s --plan of a blocked plan:\n%s", row, text)
+				}
+
+				cmd := withFlags(t, row.cmd(), append(slices.Clone(row.flags), "--confirm", doc.Digest)...)
+				env, out, _ := testEnvBoth(dir, output.ModeJSON)
+				err := cmd.Run(t.Context(), env, row.args)
+				if err == nil || err.Error() != block.Message || kindOf(classified(err)) != kindInternal || exitCodeOf(err) != 1 {
+					t.Errorf("%s --confirm of the blocked plan = %v (kind %s, exit %d); want its block", row, err, kindOf(classified(err)), exitCodeOf(err))
+				}
+				f := row.fakes
+				if out.Len() != 0 || f.opened+f.writers+f.storages+f.keyholders != 0 {
+					t.Errorf("%s --confirm of the blocked plan printed %q, and opened the provider %d times, the writer %d, storage %d and the keyholder %d",
+						row, out, f.opened, f.writers, f.storages, f.keyholders)
+				}
+				if ran() {
+					t.Errorf("%s ran kubectl for a blocked plan", row)
+				}
+				onlyThePlansReads(t, row, s)
+				sameFiles(t, "a blocked "+row.name, before, treeFiles(t, string(dir)))
+			})
+		}
+	})
+
 	// connect, redeploy and build have no block (A23-35 to A23-37): what
 	// would stop them refuses before any plan is computed, so every plan
 	// they print is unblocked and ends with its confirm line.
@@ -993,6 +1096,42 @@ func TestBlockKindsAreErrorKinds(t *testing.T) {
 		}
 		if !slices.Contains(errorKinds, b.Kind) {
 			t.Errorf("blockOf(%v) has the kind %q, which is not an error kind", tc.err, b.Kind)
+		}
+	}
+
+	// storage deploy's, storage key pin's and storage key rotate's blocks, a
+	// keyring behind the pin, as their plans raise them (A23-18): internal,
+	// with nothing read after.
+	// Each block is the command's own refusal, word for word as it says
+	// what it did not do.
+	for _, tc := range []struct {
+		row     planCommand
+		refusal string
+	}{
+		{planCommandNamed(t, "storage deploy", "behind the pin"), "so nothing was deployed"},
+		{planCommandNamed(t, "storage key pin", "behind the pin"), "Nothing was written"},
+		{planCommandNamed(t, "storage key rotate", "behind the pin"), "so nothing was rotated"},
+	} {
+		row, refusal := tc.row, tc.refusal
+		_, dir := planFixture(t, row)
+		doc, _ := runPlan(t, dir, row, output.ModeJSON)
+		b := decodedBound(t, doc)
+		if len(b.Blocked) != 1 || b.Blocked[0].Kind != kindInternal || !strings.HasPrefix(b.Blocked[0].Message, "this keyring is behind the instance's key pin") ||
+			!strings.Contains(b.Blocked[0].Message, refusal) || len(b.Facts) != 0 {
+			t.Errorf("%s blocks %+v with %d facts; want one internal block, the keyring behind the pin saying %q, and no facts", row, b.Blocked, len(b.Facts), refusal)
+		}
+	}
+
+	// kernel deploy's block, a namespace --namespaces names that the cluster
+	// lacks, as its plan raises it (A23-18): internal, in the refusal's own
+	// words.
+	{
+		row := planCommandNamed(t, "kernel deploy", "a missing namespace")
+		_, dir := planFixture(t, row)
+		doc, _ := runPlan(t, dir, row, output.ModeJSON)
+		want := plan.Block{Kind: kindInternal, Message: fmt.Sprintf(msgNoSuchNamespace, "web")}
+		if blocked := decodedBound(t, doc).Blocked; !slices.Equal(blocked, []plan.Block{want}) || !slices.Contains(errorKinds, blocked[0].Kind) {
+			t.Errorf("%s blocks %+v; want %+v, an error kind", row, blocked, want)
 		}
 	}
 
@@ -1047,13 +1186,16 @@ func TestConfirmRefusesAChangedPlan(t *testing.T) {
 
 	// Each command's plan, changed between --plan and --confirm by its
 	// record: refused plan_changed, exit 1, naming both digests, with
-	// nothing sent, run or written. Through the router, connect and redeploy
-	// carry no components (a test binary is not a release), so they plan a
-	// build of this checkout; what the registry answers is changed below, on
-	// a release.
+	// nothing sent but a plan's reads as the reader, run or written. Through
+	// the router, connect, redeploy and kernel deploy carry no components (a
+	// test binary is not a release), so they plan a build of this checkout;
+	// what the registry answers is changed below, on a release.
 	for _, tc := range []struct {
 		row    planCommand
 		change func(m *config.InstanceMetadata)
+		// changeCluster, when set, changes what the plan read in the
+		// cluster instead.
+		changeCluster func(s *kubetest.Server)
 	}{
 		{row: planCommandNamed(t, "kernel meter", "add"), change: func(m *config.InstanceMetadata) {
 			m.Kernel.Namespaces = append(m.Kernel.Namespaces, "other")
@@ -1077,6 +1219,25 @@ func TestConfirmRefusesAChangedPlan(t *testing.T) {
 		{row: planCommandNamed(t, "build", "a named builder"), change: func(m *config.InstanceMetadata) {
 			m.Toolchain = &config.Toolchain{Builder: builderDigest}
 		}},
+		// kernel deploy's cost fact binds the limit; it reads the cluster as
+		// the reader, and the writer never opens.
+		{row: planCommandNamed(t, "kernel deploy", "the carried image"), change: func(m *config.InstanceMetadata) {
+			m.CostLimit.Amount = 75
+		}},
+		// storage deploy's cost fact binds the limit too; it reads the pin
+		// and the cluster as the reader.
+		{row: planCommandNamed(t, "storage deploy", "the recorded bucket"), change: func(m *config.InstanceMetadata) {
+			m.CostLimit.Amount = 75
+		}},
+		// storage key pin's pin fact binds the pin it read: another writer
+		// put one there since.
+		{row: planCommandNamed(t, "storage key pin", "a pin to write"), changeCluster: pinSeeded(pinRetiringForeign)},
+		// storage key rotate's pins bind the pin it read, too.
+		{row: planCommandNamed(t, "storage key rotate", "with a keyholder"), changeCluster: pinSeeded(pinRetiringForeign)},
+		// And its rotation fact binds the keyholder's replicas.
+		{row: planCommandNamed(t, "storage key rotate", "with a keyholder"), change: func(m *config.InstanceMetadata) {
+			m.Keyholder.Replicas = 3
+		}},
 	} {
 		t.Run(tc.row.String(), func(t *testing.T) {
 			ran := strayKubectl(t)
@@ -1092,7 +1253,9 @@ func TestConfirmRefusesAChangedPlan(t *testing.T) {
 				return printedDocument(t, []byte(stdout)).Digest
 			}
 			given := planned()
-			if _, err := dir.UpdateInstanceMetadata(writeName, func(m *config.InstanceMetadata) error {
+			if tc.changeCluster != nil {
+				tc.changeCluster(s)
+			} else if _, err := dir.UpdateInstanceMetadata(writeName, func(m *config.InstanceMetadata) error {
 				tc.change(m)
 				return nil
 			}); err != nil {
@@ -1112,9 +1275,10 @@ func TestConfirmRefusesAChangedPlan(t *testing.T) {
 			if err := json.Unmarshal([]byte(stdout), &envelope); err != nil || code != 1 || envelope.Error.Kind != kindPlanChanged || envelope.Error.Message != want {
 				t.Errorf("--confirm of the old plan: exit %d, %s (%v); want plan_changed, %q", code, stdout, err, want)
 			}
-			if len(s.Requests()) != 0 || ran() {
-				t.Errorf("a changed plan sent %d requests or ran kubectl (%v)", len(s.Requests()), ran())
+			if ran() {
+				t.Error("a changed plan ran kubectl")
 			}
+			onlyThePlansReads(t, tc.row, s)
 			sameFiles(t, "a changed plan", before, treeFiles(t, string(dir)))
 		})
 	}
@@ -1142,6 +1306,152 @@ func TestConfirmRefusesAChangedPlan(t *testing.T) {
 					r.writers, r.dials, len(r.fp.ensured), len(r.fb.embedded), len(r.fb.built), len(r.fc.applied))
 			}
 			sameFiles(t, "a plan whose tag moved", before, r.files(t))
+		})
+	}
+}
+
+// copyConfigDir is a second config directory holding a copy of every file
+// under src, at the same modes: the same instances, as another machine's
+// directory, or a backup, would hold them.
+func copyConfigDir(t *testing.T, src config.Dir) config.Dir {
+	t.Helper()
+	dst := filepath.Join(t.TempDir(), "other")
+	err := filepath.WalkDir(string(src), func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(string(src), p)
+		if err != nil {
+			return err
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		to := filepath.Join(dst, rel)
+		if d.IsDir() {
+			return os.MkdirAll(to, info.Mode().Perm())
+		}
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(to, data, info.Mode().Perm())
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return config.Dir(dst)
+}
+
+// confirmRefusedAsChanged runs row's --confirm of digest against dir, as
+// the row's command with its own seams, and fails t unless it is refused
+// plan_changed, exit 1, design §9.2's text naming the digest given, printing
+// nothing, having opened no writer, storage or keyholder, ensured, built or
+// pushed nothing, sent nothing to s but a plan's reads as the reader, and
+// written nothing under dir.
+func confirmRefusedAsChanged(t *testing.T, row planCommand, s *kubetest.Server, dir config.Dir, digest string) {
+	t.Helper()
+	before := treeFiles(t, string(dir))
+	cmd := withFlags(t, row.cmd(), append(slices.Clone(row.flags), "--confirm", digest)...)
+	env, out, _ := testEnvBoth(dir, output.ModeJSON)
+	err := cmd.Run(t.Context(), env, row.args)
+	if err == nil || kindOf(classified(err)) != kindPlanChanged || exitCodeOf(err) != 1 ||
+		!strings.HasPrefix(err.Error(), "the plan for this command is now sha256:") || !strings.Contains(err.Error(), ", not the "+digest+" given to --confirm: ") {
+		t.Errorf("%s --confirm of the plan = %v (kind %s, exit %d); want plan_changed, naming %s", row, err, kindOf(classified(err)), exitCodeOf(err), digest)
+	}
+	if out.Len() != 0 {
+		t.Errorf("%s --confirm of a plan that changed printed %q", row, out)
+	}
+	if f := row.fakes; f != nil && (f.writers+f.storages+f.keyholders+f.dialled != 0 || len(f.provider.ensured)+len(f.builder.built)+len(f.builder.embedded) != 0) {
+		t.Errorf("%s --confirm of a plan that changed opened the writer %d times, storage %d, the keyholder %d, dialled %d, "+
+			"and ensured %d registries, built %d and pushed %d images", row, f.writers, f.storages, f.keyholders, f.dialled,
+			len(f.provider.ensured), len(f.builder.built), len(f.builder.embedded))
+	}
+	onlyThePlansReads(t, row, s)
+	sameFiles(t, row.String()+" --confirm of a plan that changed", before, treeFiles(t, string(dir)))
+}
+
+// ADR 0023 M2.6 (design §9.3, row 77): a plan binds the instance's target,
+// and its project among it. A plan reviewed against one config directory is
+// confirmed against a second that holds a copy of every file of the first,
+// the record's project alone changed: the recomputed plan is another, so
+// --confirm refuses it plan_changed and nothing is opened, sent or written.
+// kernel meter reads no cluster; storage key pin and kernel deploy read it
+// as the reader, both directories naming the same one.
+func TestPlanFromAnotherConfigDirIsRefused(t *testing.T) {
+	for _, row := range []planCommand{
+		planCommandNamed(t, "kernel meter", "add"),
+		planCommandNamed(t, "storage key pin", "a pin to write"),
+		planCommandNamed(t, "kernel deploy", "the carried image"),
+	} {
+		t.Run(row.String(), func(t *testing.T) {
+			ran := strayKubectl(t)
+			s, dir := planFixture(t, row)
+			doc, _ := runPlan(t, dir, row, output.ModeJSON)
+			other := copyConfigDir(t, dir)
+			if _, err := other.UpdateInstanceMetadata(writeName, func(m *config.InstanceMetadata) error {
+				m.Project = "proj-test2"
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			confirmRefusedAsChanged(t, row, s, other, doc.Digest)
+			if ran() {
+				t.Error("a plan confirmed against another directory ran kubectl")
+			}
+		})
+	}
+}
+
+// ADR 0023 M2.6 (design §9.3): a plan binds the record's creation time. An
+// instance released and installed again under the same name, project,
+// region and cluster records a new one, so a plan made before is refused
+// plan_changed by --confirm after, with nothing opened, sent or written.
+func TestPlanAfterReinstallIsRefused(t *testing.T) {
+	for _, row := range []planCommand{
+		planCommandNamed(t, "kernel meter", "add"),
+		planCommandNamed(t, "storage key pin", "a pin to write"),
+	} {
+		t.Run(row.String(), func(t *testing.T) {
+			ran := strayKubectl(t)
+			s, dir := planFixture(t, row)
+			doc, _ := runPlan(t, dir, row, output.ModeJSON)
+			if _, err := dir.UpdateInstanceMetadata(writeName, func(m *config.InstanceMetadata) error {
+				m.CreatedAt = m.CreatedAt.Add(24 * time.Hour)
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			confirmRefusedAsChanged(t, row, s, dir, doc.Digest)
+			if ran() {
+				t.Error("a plan confirmed after a reinstall ran kubectl")
+			}
+		})
+	}
+}
+
+// ADR 0023 M2.6 (design §9.3, row 77): a plan that reads the cluster binds
+// farcast-system's uid. The same record, its cluster's farcast-system
+// replaced between --plan and --confirm — kubetest seeded again with
+// another uid — is another cluster: --confirm, recomputing as the reader,
+// refuses plan_changed before the writer opens, for every command whose plan
+// reads it.
+func TestPlanAgainstAReplacedSystemNamespaceIsRefused(t *testing.T) {
+	for _, row := range readerPlans(t) {
+		t.Run(row.String(), func(t *testing.T) {
+			ran := strayKubectl(t)
+			s, dir := planFixture(t, row)
+			doc, _ := runPlan(t, dir, row, output.ModeJSON)
+			if got := decodedBound(t, doc).Target.SystemNamespaceUID; got != planSystemUID {
+				t.Fatalf("%s's plan binds farcast-system's uid %q; want %q", row, got, planSystemUID)
+			}
+			s.Put(map[string]any{"apiVersion": "v1", "kind": "Namespace", "metadata": map[string]any{
+				"name": tcdeploy.DefaultNamespace, "uid": "00000000-0000-4000-8000-0000000000a2"}})
+			confirmRefusedAsChanged(t, row, s, dir, doc.Digest)
+			if ran() {
+				t.Error("a plan confirmed against a replaced farcast-system ran kubectl")
+			}
 		})
 	}
 }
