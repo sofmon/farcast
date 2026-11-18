@@ -377,7 +377,9 @@ func invalid(w http.ResponseWriter, k kube.Kind, name, format string, a ...any) 
 // apply is a server-side apply: PATCH with Content-Type
 // application/apply-patch+yaml. It requires fieldManager and
 // fieldValidation=Strict, a YAML body with the URL's kind, name and
-// namespace, and answers 201 on create and 200 on update with the object.
+// namespace, and answers 201 on create and 200 on update with the object, or
+// its metadata alone as a PartialObjectMetadata when Accept asks for that, as
+// a GET's answer is.
 //
 // The object becomes the body, minus status and the server-set metadata,
 // which the server keeps (uid, creationTimestamp, status) or sets
@@ -386,8 +388,23 @@ func invalid(w http.ResponseWriter, k kube.Kind, name, format string, a ...any) 
 // manager's Apply entry, {manager, operation: Apply, apiVersion, time,
 // fieldsType: FieldsV1, fieldsV1: {}}, is replaced, and every other entry
 // stays as it was. No field-level ownership is kept, so no conflict is ever
-// found; Fail injects one. An apply that changes nothing writes nothing.
+// found; Fail and FailNextApply inject one. An apply that changes nothing
+// writes nothing. WithSettledWorkloads settles what it stores.
+//
+// A gap, kept on purpose: kubetest rebuilds an applied object from the body.
+// From the stored one it keeps only uid, creationTimestamp, resourceVersion,
+// status, and other managers' managed-fields entries (and, under
+// WithSettledWorkloads, a Job's selector and template labels). A real server
+// keeps every field another manager owns: kubectl's last-applied annotation,
+// the kernel's adapted-at annotation, and replicas set through /scale. So an
+// apply's answer here never carries the annotation of an earlier client-side
+// apply, and a test that needs one answers the apply through WithHandler.
 func (s *Server) apply(w http.ResponseWriter, r *http.Request, req Request, ri requestInfo, k kube.Kind, caller tokenInfo, az *authorizer) {
+	partial, err := wantPartial(r.Header.Get("Accept"), false)
+	if err != nil {
+		writeStatus(w, http.StatusNotAcceptable, "", err.Error(), nil)
+		return
+	}
 	q := r.URL.Query()
 	manager := q.Get("fieldManager")
 	if manager == "" {
@@ -448,6 +465,7 @@ func (s *Server) apply(w http.ResponseWriter, r *http.Request, req Request, ri r
 		writeStatus(w, http.StatusInternalServerError, "", "failed to decode managed fields: "+err.Error(), nil)
 		return
 	}
+	s.settle(next, k)
 	code := http.StatusOK
 	switch {
 	case old == nil:
@@ -459,7 +477,7 @@ func (s *Server) apply(w http.ResponseWriter, r *http.Request, req Request, ri r
 		metadataOf(next)["resourceVersion"] = s.nextRV()
 		old.obj = next
 	}
-	body := mustMarshal(next)
+	body := answerBody(next, partial)
 	s.mu.Unlock()
 	writeRaw(w, code, "application/json", body)
 }
@@ -481,6 +499,9 @@ func (s *Server) appliedObject(old *stored, body map[string]any, k kube.Kind, ma
 		if generationKinds[k.Kind] {
 			md["generation"] = json.Number("1")
 		}
+		if s.opts.settled && k.Kind == "Job" {
+			defaultJobSelector(next)
+		}
 	} else {
 		omd := metadataOf(old.obj)
 		for _, key := range []string{"uid", "creationTimestamp", "resourceVersion"} {
@@ -490,6 +511,9 @@ func (s *Server) appliedObject(old *stored, body map[string]any, k kube.Kind, ma
 		}
 		if st, ok := old.obj["status"]; ok {
 			next["status"] = st
+		}
+		if s.opts.settled && k.Kind == "Job" {
+			keepJobSelector(next, old.obj)
 		}
 		if generationKinds[k.Kind] {
 			g, _ := strconv.ParseInt(fmt.Sprint(omd["generation"]), 10, 64)
@@ -531,6 +555,105 @@ func (s *Server) appliedObject(old *stored, body map[string]any, k kube.Kind, ma
 	}
 	withEntry(now)
 	return cloneObject(next), nil
+}
+
+// The settled values WithSettledWorkloads writes.
+const (
+	// settledIngressIP is the address a LoadBalancer Service is given: from
+	// TEST-NET-3 (RFC 5737), so it can never reach anything.
+	settledIngressIP = "203.0.113.10"
+
+	// The labels the API server's Job defaulting gives a Job created with no
+	// selector, and its template [unverified; design A30-10].
+	jobControllerUID = "batch.kubernetes.io/controller-uid"
+	jobName          = "batch.kubernetes.io/job-name"
+	legacyJobUID     = "controller-uid"
+	legacyJobName    = "job-name"
+)
+
+// settle is WithSettledWorkloads' controller, run on an object a write is
+// about to store (its comment has the rules); without the option it does
+// nothing. It is called with mu held, on the write's own copy.
+func (s *Server) settle(obj map[string]any, k kube.Kind) {
+	if !s.opts.settled {
+		return
+	}
+	switch k.Kind {
+	case "Deployment", "StatefulSet":
+		spec, _ := obj["spec"].(map[string]any)
+		replicas := json.Number("1")
+		if v, ok := spec["replicas"]; ok && v != nil {
+			replicas = json.Number(fmt.Sprint(v))
+		}
+		st := childMap(obj, "status")
+		if g, ok := metadataOf(obj)["generation"]; ok {
+			st["observedGeneration"] = g
+		}
+		for _, f := range []string{"replicas", "updatedReplicas", "readyReplicas", "availableReplicas"} {
+			st[f] = replicas
+		}
+	case "Service":
+		spec, _ := obj["spec"].(map[string]any)
+		if str(spec, "type") != "LoadBalancer" {
+			return
+		}
+		lb := childMap(childMap(obj, "status"), "loadBalancer")
+		if ingress, _ := lb["ingress"].([]any); len(ingress) > 0 {
+			return
+		}
+		lb["ingress"] = []any{map[string]any{"ip": settledIngressIP}}
+	}
+}
+
+// defaultJobSelector is the API server's defaulting of a Job created with no
+// spec.selector, under WithSettledWorkloads: a selector on its uid, and the
+// template labels it selects.
+func defaultJobSelector(job map[string]any) {
+	spec := childMap(job, "spec")
+	if sel, ok := spec["selector"]; ok && sel != nil {
+		return
+	}
+	md := metadataOf(job)
+	uid, name := str(md, "uid"), str(md, "name")
+	spec["selector"] = map[string]any{"matchLabels": map[string]any{jobControllerUID: uid}}
+	labels := childMap(childMap(childMap(spec, "template"), "metadata"), "labels")
+	labels[jobControllerUID], labels[jobName] = uid, name
+	labels[legacyJobUID], labels[legacyJobName] = uid, name
+}
+
+// keepJobSelector keeps, in an apply's Job, the stored Job's spec.selector
+// and the stored template labels the body omits, under WithSettledWorkloads:
+// the applier does not own them, and a real server keeps them.
+func keepJobSelector(job, stored map[string]any) {
+	ospec, _ := stored["spec"].(map[string]any)
+	sel, ok := ospec["selector"].(map[string]any)
+	if !ok {
+		return
+	}
+	spec := childMap(job, "spec")
+	spec["selector"] = cloneObject(sel)
+	otmpl, _ := ospec["template"].(map[string]any)
+	otmd, _ := otmpl["metadata"].(map[string]any)
+	olabels, _ := otmd["labels"].(map[string]any)
+	if len(olabels) == 0 {
+		return
+	}
+	labels := childMap(childMap(childMap(spec, "template"), "metadata"), "labels")
+	for key, v := range olabels {
+		if _, ok := labels[key]; !ok {
+			labels[key] = v
+		}
+	}
+}
+
+// childMap is m[key] as an object, made empty when absent or not an object.
+func childMap(m map[string]any, key string) map[string]any {
+	c, ok := m[key].(map[string]any)
+	if !ok {
+		c = map[string]any{}
+		m[key] = c
+	}
+	return c
 }
 
 // patchOp is one RFC 6902 operation, as readPatch reads it.
@@ -606,7 +729,16 @@ const annotationsPointer = "/metadata/annotations/"
 // The real API server also records the patch itself as an Update by its
 // field manager; whether that leaves a farcast/Update entry is open (§6.3),
 // and kubetest records none.
+//
+// It answers 200 with the object, or its metadata alone as a
+// PartialObjectMetadata when Accept asks for that, as a GET's answer is.
+// WithSettledWorkloads settles what it stores.
 func (s *Server) jsonPatch(w http.ResponseWriter, r *http.Request, req Request, ri requestInfo, k kube.Kind) {
+	partial, err := wantPartial(r.Header.Get("Accept"), false)
+	if err != nil {
+		writeStatus(w, http.StatusNotAcceptable, "", err.Error(), nil)
+		return
+	}
 	q := r.URL.Query()
 	if q.Has("dryRun") {
 		badRequest(w, "kubetest does not emulate dryRun")
@@ -685,11 +817,12 @@ func (s *Server) jsonPatch(w http.ResponseWriter, r *http.Request, req Request, 
 			}
 		}
 	}
+	s.settle(next, k)
 	if !reflect.DeepEqual(old.obj, next) {
 		md["resourceVersion"] = s.nextRV()
 		old.obj = next
 	}
-	body := mustMarshal(next)
+	body := answerBody(next, partial)
 	s.mu.Unlock()
 	writeRaw(w, http.StatusOK, "application/json", body)
 }
@@ -825,7 +958,9 @@ func writeBody(w http.ResponseWriter, req Request, ri requestInfo, k kube.Kind) 
 }
 
 // createConfigMap is POST …/configmaps: 201 with the object, or 409
-// AlreadyExists. POST and PUT record no managed-fields entry.
+// AlreadyExists. POST and PUT record no managed-fields entry. Only ConfigMaps
+// are written this way, so WithSettledWorkloads finds nothing to settle in
+// either.
 func (s *Server) createConfigMap(w http.ResponseWriter, req Request, ri requestInfo, k kube.Kind) {
 	m, ok := writeBody(w, req, ri, k)
 	if !ok {
@@ -851,6 +986,7 @@ func (s *Server) createConfigMap(w http.ResponseWriter, req Request, ri requestI
 	md["uid"] = newUID()
 	md["creationTimestamp"] = nowString()
 	md["resourceVersion"] = s.nextRV()
+	s.settle(m, k)
 	s.objects[path] = &stored{kind: k, namespace: ri.namespace, name: name, obj: m}
 	body := mustMarshal(m)
 	s.mu.Unlock()
@@ -893,6 +1029,7 @@ func (s *Server) replaceConfigMap(w http.ResponseWriter, req Request, ri request
 			md[key] = v
 		}
 	}
+	s.settle(m, k)
 	if !reflect.DeepEqual(old.obj, m) {
 		md["resourceVersion"] = s.nextRV()
 		old.obj = m

@@ -250,7 +250,7 @@ Why this shape:
 
 ## The translator — `./farcast` → workloads (Phase 4.2)
 
-[`translate.Render`](translate/) turns a parsed manifest into an apply stream: one Namespace, then a ConfigMap, Deployment, Service and NetworkPolicy for each app. It renders plain YAML, like every other module's deploy package, and knows nothing about how the images were built — [ADR 0010](../docs/adr/0010-application-image-builds.md) settles that separately, and the translator simply refuses anything that is not digest-pinned.
+[`translate.Render`](translate/) turns a parsed manifest into an apply stream: one Namespace, then a Secret, ConfigMap, NetworkPolicy, Deployment and Service for each app. Each policy comes before the workload it guards, so a stream stopped part-way never leaves pods running without their policy. It renders plain YAML, like every other module's deploy package, and knows nothing about how the images were built — [ADR 0010](../docs/adr/0010-application-image-builds.md) settles that separately, and the translator simply refuses anything that is not digest-pinned.
 
 ### What it refuses
 

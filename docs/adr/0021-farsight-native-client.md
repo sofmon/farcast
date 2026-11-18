@@ -95,7 +95,7 @@ The only Phase 7 line that names AllThing is 7.3's *"AllThing chat as a built-in
 2. **No inbound route reaches an application.**
    - FatLine mounts its status probe and one stream handler ([`fatline.go:218-225`](../../fatline/fatline.go)).
    - Behind that handler is a closed, deploy-time list of routes, today `datasphered` and `shrike` ([`fatline/stream.go:28-73`](../../fatline/stream.go)).
-   - Application Services are ClusterIP on an assumed port 8080, and their NetworkPolicy admits only same-namespace pods ([`planck/translate/workload.go:204-237`](../../planck/translate/workload.go)).
+   - Application Services are ClusterIP on an assumed port 8080, and their NetworkPolicy admits only same-namespace pods ([`planck/translate/workload.go:285-289`](../../planck/translate/workload.go) and [`:152-157`](../../planck/translate/workload.go)).
 3. **No second device can connect.**
    - The public tunnel admits only the operator leaf and keeper leaves ([`fatline/admit.go`](../../fatline/admit.go)).
    - A keeper may open only the routes in `KeeperRoutes`, today the keyholder's ([`fatline.go:59-61`](../../fatline/fatline.go), enforced at [`stream.go:136-141`](../../fatline/stream.go)).

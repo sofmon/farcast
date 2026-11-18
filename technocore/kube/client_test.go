@@ -188,6 +188,57 @@ func TestScalePatchesTheScaleSubresource(t *testing.T) {
 	}
 }
 
+// TestKernelWritesNameTechnocore (ADR 0023 M2.7, design §5.4, A30-11): each
+// of the kernel's four writes names FieldManager as its only query, so the
+// API server records the kernel's fields under technocore; its reads name
+// none (TestListPodsDecodesWhatTheKernelReads, TestGetServiceReadsTheType and
+// TestListPodMetricsReadsTheAggregatedAPI pin their exact queries).
+func TestKernelWritesNameTechnocore(t *testing.T) {
+	var seen []capture
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, capture{method: r.Method, path: r.URL.Path, query: r.URL.RawQuery, contentType: r.Header.Get("Content-Type")})
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPut:
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"kind":"Status","code":404,"reason":"NotFound"}`))
+		case r.Header.Get("Content-Type") == "application/strategic-merge-patch+json":
+			_, _ = w.Write([]byte(`{"metadata":{"name":"web","namespace":"farcast-apps"},"spec":{"template":{"spec":{"containers":[{"name":"web","resources":{"requests":{"cpu":"250m","memory":"512Mi"}}}]}}}}`))
+		default:
+			_, _ = w.Write([]byte(`{}`))
+		}
+	}))
+	t.Cleanup(s.Close)
+	c := client(t, s.URL, tokenFileWith(t, "tkn"))
+	ctx := context.Background()
+
+	if err := c.Scale(ctx, "farcast-apps", "web", 0); err != nil {
+		t.Fatalf("Scale: %v", err)
+	}
+	if _, _, err := c.SetRequests(ctx, "farcast-apps", "web", "web", 250, 512, nil); err != nil {
+		t.Fatalf("SetRequests: %v", err)
+	}
+	cm := ConfigMap{Metadata: ObjectMeta{Name: "technocore-ledger"}, Data: map[string]string{"k": "v"}}
+	if err := c.SaveConfigMap(ctx, "farcast-system", cm); err != nil {
+		t.Fatalf("SaveConfigMap: %v", err)
+	}
+	want := []capture{
+		{method: http.MethodPatch, path: "/apis/apps/v1/namespaces/farcast-apps/deployments/web/scale", contentType: "application/merge-patch+json"},
+		{method: http.MethodPatch, path: "/apis/apps/v1/namespaces/farcast-apps/deployments/web", contentType: "application/strategic-merge-patch+json"},
+		{method: http.MethodPut, path: "/api/v1/namespaces/farcast-system/configmaps/technocore-ledger", contentType: "application/json"},
+		{method: http.MethodPost, path: "/api/v1/namespaces/farcast-system/configmaps", contentType: "application/json"},
+	}
+	if len(seen) != len(want) {
+		t.Fatalf("the server saw %d requests, want %d: %+v", len(seen), len(want), seen)
+	}
+	for i, w := range want {
+		w.query = "fieldManager=technocore"
+		if seen[i] != w {
+			t.Errorf("write %d = %s %s?%s (%s)\nwant      %s %s?%s (%s)", i+1, seen[i].method, seen[i].path, seen[i].query, seen[i].contentType, w.method, w.path, w.query, w.contentType)
+		}
+	}
+}
+
 func TestScaleRejectsANegativeReplicaCount(t *testing.T) {
 	s := server(t, 200, `{}`, nil)
 	if err := client(t, s.URL, tokenFileWith(t, "t")).Scale(context.Background(), "ns", "web", -1); err == nil {

@@ -13,13 +13,16 @@
 // is deliberate: field ownership (an apply keeps one managed-fields entry per
 // manager, with empty fieldsV1), admission, controllers and watch. Field
 // semantics belong to the real-Kubernetes test (§10.6), not to this fake.
+// WithSettledWorkloads stands in for the few results of controllers and
+// defaulting that farcast waits on or reads back, nothing more.
 //
 // The order every API request goes through is: authentication (401), the
-// WithRBAC check (403, before any object is looked up), WithHandler, the
-// answers queued by Fail, the answers set by Script, and then the emulation.
-// Everything the emulation does not cover answers 405. Every request is
-// recorded, whatever its answer, unless WithoutRecording; and WithAnswered
-// sees each one after its answer.
+// WithRBAC check (403, before any object is looked up), the answers queued by
+// FailNextApply (server-side applies only), WithHandler, the answers queued
+// by Fail, the answers set by Script, and then the emulation. Everything the
+// emulation does not cover answers 405. Every request is recorded, whatever
+// its answer, unless WithoutRecording; and WithAnswered sees each one after
+// its answer.
 package kubetest
 
 import (
@@ -89,15 +92,16 @@ type Server struct {
 	inflight  sync.WaitGroup
 	closeOnce sync.Once
 
-	mu       sync.Mutex
-	keys     map[string][]registeredKey // by email
-	tokens   map[string]*tokenInfo
-	minted   int
-	requests []Request
-	objects  map[string]*stored // by the object's path
-	rv       uint64
-	fails    map[failKey][]injected
-	scripts  map[string]*script
+	mu         sync.Mutex
+	keys       map[string][]registeredKey // by email
+	tokens     map[string]*tokenInfo
+	minted     int
+	requests   []Request
+	objects    map[string]*stored // by the object's path
+	rv         uint64
+	fails      map[failKey][]injected
+	applyFails []injected // FailNextApply's, in the order queued
+	scripts    map[string]*script
 }
 
 // Request is one request the server saw.
@@ -127,6 +131,7 @@ type options struct {
 	warnings    func(r Request) []string
 	answered    func(r Request, status int)
 	noRecording bool
+	settled     bool
 }
 
 type identity struct {
@@ -238,6 +243,31 @@ func WithAnswered(f func(r Request, status int)) Option {
 // request.
 func WithoutRecording() Option {
 	return func(o *options) { o.noRecording = true }
+}
+
+// WithSettledWorkloads settles what a write leaves stored (a server-side
+// apply, a POST, a PUT or a JSON patch), as the API server's defaulting and
+// the cluster's controllers would, so a client that waits on a rollout or an
+// address, or reads a Job's pods, is answered at once:
+//   - a Deployment or StatefulSet gets status.observedGeneration equal to its
+//     metadata.generation, and status.replicas, updatedReplicas,
+//     readyReplicas and availableReplicas equal to spec.replicas, 1 when it
+//     has none, so kube.RolloutState reads it rolled out;
+//   - a Service of type LoadBalancer with no ingress gets
+//     status.loadBalancer.ingress [{ip: 203.0.113.10}] (RFC 5737);
+//   - a Job created with no spec.selector gets the API server's own default
+//     [unverified; the real-API suite's TestReapplyingAnUnchangedJobIsANoOp
+//     records it]: spec.selector.matchLabels
+//     {batch.kubernetes.io/controller-uid: <its uid>}, and the template labels
+//     batch.kubernetes.io/controller-uid, batch.kubernetes.io/job-name,
+//     controller-uid and job-name; an apply to a stored Job keeps the stored
+//     spec.selector, and the stored template labels the body omits, as fields
+//     the applier does not own.
+//
+// Nothing else changes: conditions are not touched, and no Pod is made.
+// Without the option, kubetest settles nothing.
+func WithSettledWorkloads() Option {
+	return func(o *options) { o.settled = true }
 }
 
 // New starts a TLS server on 127.0.0.1:0, with a leaf for IP 127.0.0.1 issued by
@@ -585,6 +615,12 @@ func (s *Server) answerAPI(w http.ResponseWriter, r *http.Request, req Request, 
 		writeForbidden(w, ri, info.email)
 		return
 	}
+	if r.Method == http.MethodPatch && mediaType(req.ContentType) == applyPatchType {
+		if f, ok := s.takeFailApply(); ok {
+			writeInjected(w, f, ri, info.email)
+			return
+		}
+	}
 	if h := s.opts.handler; h != nil {
 		if code, body, ok := h(req); ok {
 			writeAnswer(w, code, body)
@@ -653,6 +689,35 @@ func (s *Server) takeFail(method, path string) (injected, bool) {
 	} else {
 		s.fails[k] = q[1:]
 	}
+	return f, true
+}
+
+// FailNextApply queues one answer for the next server-side apply (a PATCH
+// with Content-Type application/apply-patch+yaml), whatever its path. The
+// answer is built as Fail's are (its comment has the rules), and nothing is
+// stored. It is checked after authentication and after WithRBAC's check of
+// the request's own verb, patch, so an apply either of them refuses consumes
+// nothing. An apply that would create its object, by a caller WithRBAC lets
+// patch but not create, is answered with the injection, not 403: the create
+// check comes later, inside the apply, as the API server's comes inside its
+// patch handler. It is checked before WithHandler and Fail's answers,
+// which see every other request as before. Each call injects one answer,
+// consumed by one apply, in the order the calls were made; the apply after it
+// is answered as usual.
+func (s *Server) FailNextApply(code int, st kube.Status) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.applyFails = append(s.applyFails, injected{code: code, st: st})
+}
+
+func (s *Server) takeFailApply() (injected, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.applyFails) == 0 {
+		return injected{}, false
+	}
+	f := s.applyFails[0]
+	s.applyFails = s.applyFails[1:]
 	return f, true
 }
 

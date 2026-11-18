@@ -27,9 +27,10 @@
 #      documents under farsight/cli/internal/image/base/ (about 1.4 min and
 #      about 2.1 GiB of temporary files at the peak, build caches included;
 #      steps 1b, 1c and 3b measured 2026-11-13 on the dev Mac)
-#   4  go vet, including the integration- and walk-tagged files (type-checked,
-#      never run)
-#   5  golangci-lint, mandatory — a missing linter fails the check
+#   4  go vet, including the integration-, walk- and realapi-tagged files:
+#      type-checked here and linted in step 5, never run
+#   5  golangci-lint, mandatory — a missing linter fails the check; the
+#      tagged files included
 #   6  go test -race
 #   7  the Apple client: the source gate (only allowed file types and the
 #      one backdrop image, no links; the CLI's vectors and FatLine's PKI
@@ -295,17 +296,18 @@ ok "three builds: identical components, layers, table and Linux farcast; the sam
 step "4 — go vet"
 go vet -mod=vendor ./...
 ok "root"
-# Type-checks the integration- and walk-tagged tests, which nothing else
-# compiles. They are never RUN here: they touch billable cloud, or a live
-# instance.
-go vet -mod=vendor -tags=integration,walk ./...
-ok "root, with the integration- and walk-tagged files"
+# Type-checks the integration-, walk- and realapi-tagged tests, which nothing
+# else compiles; step 5 lints them. They are never RUN here: they touch
+# billable cloud, a live instance, or a real API server (the realapi suite
+# runs only by docs/runbooks/adr-0023-m2-realapi.md).
+go vet -mod=vendor -tags=integration,walk,realapi ./...
+ok "root, with the integration-, walk- and realapi-tagged files"
 (cd sdk/go && go vet ./...)
 ok "sdk/go"
 
 # ---- 5. lint ---------------------------------------------------------------------
 step "5 — golangci-lint"
-golangci-lint run --config "$ROOT/.golangci.yml" --build-tags=integration,walk ./...
+golangci-lint run --config "$ROOT/.golangci.yml" --build-tags=integration,walk,realapi ./...
 ok "root: 0 issues"
 (cd sdk/go && golangci-lint run --config "$ROOT/.golangci.yml" ./...)
 ok "sdk/go: 0 issues"

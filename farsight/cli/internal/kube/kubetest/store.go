@@ -263,7 +263,7 @@ func (s *Server) emulate(w http.ResponseWriter, r *http.Request, req Request, ri
 	case http.MethodPatch:
 		if object {
 			switch mediaType(req.ContentType) {
-			case "application/apply-patch+yaml":
+			case applyPatchType:
 				s.apply(w, r, req, ri, k, caller, az)
 				return
 			case "application/json-patch+json":
@@ -289,6 +289,9 @@ func (s *Server) emulate(w http.ResponseWriter, r *http.Request, req Request, ri
 	}
 	notEmulated(w, r)
 }
+
+// applyPatchType is a server-side apply's Content-Type.
+const applyPatchType = "application/apply-patch+yaml"
 
 func mediaType(contentType string) string {
 	mt, _, err := mime.ParseMediaType(contentType)
@@ -333,6 +336,16 @@ func wantPartial(accept string, list bool) (bool, error) {
 	return false, nil
 }
 
+// answerBody is one object as an answer carries it: whole, or, when the
+// request asked for it (wantPartial), its metadata alone as a
+// PartialObjectMetadata. A GET and a PATCH answer alike.
+func answerBody(obj map[string]any, partial bool) []byte {
+	if partial {
+		return mustMarshal(map[string]any{"kind": asPartial, "apiVersion": metaV1APIVersion, "metadata": obj["metadata"]})
+	}
+	return mustMarshal(obj)
+}
+
 func notFound(w http.ResponseWriter, k kube.Kind, name string) {
 	writeStatus(w, http.StatusNotFound, "", fmt.Sprintf("%s %q not found", qualifiedResource(k), name),
 		&wireDetails{Name: name, Group: groupOf(k), Kind: k.Resource})
@@ -350,11 +363,7 @@ func (s *Server) get(w http.ResponseWriter, r *http.Request, ri requestInfo, k k
 	so := s.objects[k.Path(ri.namespace, ri.name)]
 	var body []byte
 	if so != nil {
-		if partial {
-			body = mustMarshal(map[string]any{"kind": asPartial, "apiVersion": metaV1APIVersion, "metadata": so.obj["metadata"]})
-		} else {
-			body = mustMarshal(so.obj)
-		}
+		body = answerBody(so.obj, partial)
 	}
 	s.mu.Unlock()
 	if so == nil {

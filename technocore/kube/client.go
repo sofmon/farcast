@@ -24,6 +24,13 @@ const (
 	namespaceFile = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
 )
 
+// FieldManager is the field manager the kernel names, explicitly, on every
+// write it makes: Scale, SaveConfigMap's PUT and POST, and SetRequests. The
+// API server records each write's fields under it, so an object's managed
+// fields name the kernel as technocore, never as a manager the server derives
+// from the User-Agent (ADR 0023 M2.7). Reads carry no field manager.
+const FieldManager = "technocore"
+
 var (
 	// ErrNotFound and friends let callers branch on what went wrong without
 	// parsing prose. They are the small part of client-go's error taxonomy
@@ -163,7 +170,8 @@ func (c *Client) ListDeployments(ctx context.Context, namespace, selector string
 	return out.Items, nil
 }
 
-// Scale sets a deployment's replica count through the scale subresource.
+// Scale sets a deployment's replica count through the scale subresource,
+// named as FieldManager's write.
 //
 // A merge patch against /scale, rather than a full update of the Deployment:
 // an update would require reading the object, changing one field and writing
@@ -203,7 +211,8 @@ func (c *Client) GetConfigMap(ctx context.Context, namespace, name string) (*Con
 	return &out, nil
 }
 
-// SaveConfigMap writes a ConfigMap, creating it if it does not exist.
+// SaveConfigMap writes a ConfigMap, creating it if it does not exist: a PUT,
+// then a POST when the PUT finds none, each named as FieldManager's write.
 //
 // An update carries the ResourceVersion the caller read, so a concurrent
 // writer produces ErrConflict rather than silently overwriting. TechnoCore
@@ -231,12 +240,20 @@ func (c *Client) get(ctx context.Context, path, selector string, out any) error 
 	return c.do(ctx, http.MethodGet, path, selector, "", nil, out)
 }
 
+// do sends one request. Its query is the label selector, when one is set, and
+// fieldManager=FieldManager on every method but GET, so every write the kernel
+// makes names it and no read does.
 func (c *Client) do(ctx context.Context, method, path, selector, contentType string, body []byte, out any) error {
 	u := *c.base
 	u.Path = path
+	q := url.Values{}
 	if selector != "" {
-		u.RawQuery = url.Values{"labelSelector": {selector}}.Encode()
+		q.Set("labelSelector", selector)
 	}
+	if method != http.MethodGet {
+		q.Set("fieldManager", FieldManager)
+	}
+	u.RawQuery = q.Encode()
 
 	var reader io.Reader
 	if body != nil {
@@ -318,7 +335,8 @@ func net(host, port string) string {
 }
 
 // SetRequests changes one container's resource requests on a Deployment, and
-// stamps the object with the caller's annotations in the same patch.
+// stamps the object with the caller's annotations in the same patch, named as
+// FieldManager's write.
 //
 // A STRATEGIC merge patch, not a plain one: containers are a list, and a plain
 // merge patch on a list replaces the whole list — which would delete every

@@ -169,7 +169,7 @@ func (c *Config) withDefaults() {
 }
 
 // Render produces the Kubernetes apply stream for a manifest: one Namespace,
-// then a ConfigMap, Deployment, Service and NetworkPolicy for each app.
+// then a Secret, ConfigMap, NetworkPolicy, Deployment and Service for each app.
 func Render(c Config) ([]byte, error) {
 	c.withDefaults()
 	if c.Manifest.Name == "" {

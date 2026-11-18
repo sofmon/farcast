@@ -1,8 +1,11 @@
 package kube_test
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 
@@ -60,6 +63,7 @@ func TestObjectDecodesAnAnswerThatCarriesKind(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	hadApply := slices.ContainsFunc(o.Metadata.ManagedFields, kube.IsOwnApply)
 	patch, err := kube.MigrationPatch(o, csa, kube.FieldManager)
 	if err != nil || patch == nil {
 		t.Fatalf("MigrationPatch = %s, %v", patch, err)
@@ -71,7 +75,7 @@ func TestObjectDecodesAnAnswerThatCarriesKind(t *testing.T) {
 	if p.Kind.Kind != "Deployment" {
 		t.Errorf("PatchJSON's Kind = %+v", p.Kind)
 	}
-	if err := kube.MigratedEndState(p, csa, kube.FieldManager); err != nil {
+	if err := kube.MigratedEndState(p, csa, kube.FieldManager, hadApply); err != nil {
 		t.Errorf("the patch's answer is not migrated: %v", err)
 	}
 	r = last(t, s)
@@ -80,7 +84,7 @@ func TestObjectDecodesAnAnswerThatCarriesKind(t *testing.T) {
 		t.Errorf("PatchJSON sent %s ?%s (%s)", r.Method, r.RawQuery, r.ContentType)
 	}
 	back, err := c.GetObject(ctx, deployments, "web", "api")
-	if err != nil || kube.MigratedEndState(back, csa, kube.FieldManager) != nil {
+	if err != nil || kube.MigratedEndState(back, csa, kube.FieldManager, hadApply) != nil {
 		t.Errorf("read back: %+v, %v", back.Metadata.ManagedFields, err)
 	}
 
@@ -217,6 +221,10 @@ func TestMigratedEndStateRefusesAKeptListWhoseOwnerLostTheAnnotation(t *testing.
 	if err != nil || len(csa) != 1 || csa[0] != "kubectl-edit" {
 		t.Fatalf("ClientSideManagers = %q, %v; want kubectl-edit", csa, err)
 	}
+	hadApply := slices.ContainsFunc(before.Metadata.ManagedFields, kube.IsOwnApply)
+	if !hadApply {
+		t.Fatal("the object's farcast/Apply entry did not read as farcast's own Apply")
+	}
 	patch, err := kube.MigrationPatch(before, csa, kube.FieldManager)
 	if err != nil {
 		t.Fatal(err)
@@ -243,12 +251,73 @@ func TestMigratedEndStateRefusesAKeptListWhoseOwnerLostTheAnnotation(t *testing.
 		if err != nil || len(left) != 0 {
 			t.Fatalf("the read-back still shows client-side managers %q (%v); the server strips the annotation's path from every entry", left, err)
 		}
-		err = kube.MigratedEndState(got, csa, kube.FieldManager)
+		err = kube.MigratedEndState(got, csa, kube.FieldManager, hadApply)
 		if !errors.Is(err, kube.ErrNotMigrated) || err.Error() != "kubectl-edit/Update still present" {
 			t.Errorf("MigratedEndState = %v, want kubectl-edit/Update still present", err)
 		}
 		if err != nil && strings.Contains(err.Error(), "LAST-APPLIED-MARKER") {
 			t.Error("the refusal carries the annotation's value")
 		}
+	}
+}
+
+// TestPatchJSONAsksForMetadataOnly (design A30-9): the migration's patch asks
+// for its answer as a PartialObjectMetadata, as GetObject asks for a read, so
+// a Secret's values never come back over the wire; the answer, decoded into
+// metadata, still says what the patch did.
+func TestPatchJSONAsksForMetadataOnly(t *testing.T) {
+	secrets := mustKind(t, "v1", "Secret")
+	s := kubetest.New(t)
+	const value = "U0VDUkVULVZBTFVFLU1BUktFUg==" // base64 of a marker
+	s.Put(clientSideApplied("v1", "Secret", "web", "git", map[string]any{"data": map[string]any{"token": value}}))
+	c, _ := connect(t, s, "writer")
+	var answers [][]byte
+	kube.TapAnswers(c, func(method, path string, body []byte) {
+		if method == http.MethodPatch {
+			answers = append(answers, body)
+		}
+	})
+	ctx := t.Context()
+
+	o, err := c.GetObject(ctx, secrets, "web", "git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	csa, err := kube.ClientSideManagers(o.Metadata.ManagedFields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	patch, err := kube.MigrationPatch(o, csa, kube.FieldManager)
+	if err != nil || patch == nil {
+		t.Fatalf("MigrationPatch = %s, %v", patch, err)
+	}
+	p, err := c.PatchJSON(ctx, secrets, "web", "git", patch)
+	if err != nil {
+		t.Fatalf("PatchJSON: %v", err)
+	}
+	r := last(t, s)
+	if r.Method != http.MethodPatch || r.Path != "/api/v1/namespaces/web/secrets/git" ||
+		r.Accept != "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1" {
+		t.Errorf("PatchJSON sent %s %s, Accept %q", r.Method, r.Path, r.Accept)
+	}
+	if len(answers) != 1 {
+		t.Fatalf("%d PATCH answers seen, want 1", len(answers))
+	}
+	// The answer is never printed: it could carry the annotation's value.
+	if bytes.Contains(answers[0], []byte(value)) || bytes.Contains(answers[0], []byte(`"data"`)) {
+		t.Error("the PATCH answer carries the Secret's data")
+	}
+	var wire struct {
+		Kind       string `json:"kind"`
+		APIVersion string `json:"apiVersion"`
+	}
+	if err := json.Unmarshal(answers[0], &wire); err != nil || wire.Kind != "PartialObjectMetadata" || wire.APIVersion != "meta.k8s.io/v1" {
+		t.Errorf("the PATCH answer is %s %s (%v), want PartialObjectMetadata meta.k8s.io/v1", wire.Kind, wire.APIVersion, err)
+	}
+	if p.Kind.Kind != "Secret" || p.Metadata.Name != "git" {
+		t.Errorf("PatchJSON's answer = %+v", p)
+	}
+	if err := kube.MigratedEndState(p, csa, kube.FieldManager, slices.ContainsFunc(o.Metadata.ManagedFields, kube.IsOwnApply)); err != nil {
+		t.Errorf("the metadata-only answer is not migrated: %v", err)
 	}
 }

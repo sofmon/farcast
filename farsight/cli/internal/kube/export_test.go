@@ -1,7 +1,9 @@
 package kube
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"net/http"
 	"time"
 )
@@ -19,6 +21,36 @@ func SetAttemptTimeout(c *Client, d time.Duration) { c.attemptTimeout = d }
 // client, which has none, is left as it is. Call it before c sends anything.
 func SetResponseHeaderTimeout(c *Client, d time.Duration) {
 	c.api.Transport.(*apiTransport).inner.(*http.Transport).ResponseHeaderTimeout = d
+}
+
+// TapAnswers lets f see the whole body of every API answer c receives, with
+// its request's method and path, for package kube_test: a test reads what the
+// server sent, which the client's decode then reduces to what it declares. f
+// runs on the request's own goroutine. Call it before c sends anything, and
+// not with SetResponseHeaderTimeout, which reaches the transport it wraps.
+func TapAnswers(c *Client, f func(method, path string, body []byte)) {
+	at := c.api.Transport.(*apiTransport)
+	at.inner = answerTap{inner: at.inner, f: f}
+}
+
+type answerTap struct {
+	inner http.RoundTripper
+	f     func(method, path string, body []byte)
+}
+
+func (t answerTap) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.inner.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+	b, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		return nil, err
+	}
+	t.f(req.Method, req.URL.Path, b)
+	resp.Body = io.NopCloser(bytes.NewReader(b))
+	return resp, nil
 }
 
 // The documents stream_test.go hides a refused key in, from go-yaml alone

@@ -96,6 +96,7 @@ func TestCanonicalWritesEmptyArraysNotNull(t *testing.T) {
 		run,
 		ApplicationResetFact{Type: TypeApplicationReset},
 		ReaderFact{Type: TypeReader},
+		MigrateFact{Type: TypeMigrate, Objects: []MigrateObject{{Kind: "Deployment"}}},
 	}}
 	withEmpties := Bound{Protocol: Protocol, Options: []Option{}, Blocked: []Block{}, Facts: []Fact{
 		CostFact{Type: TypeCost, Standing: []StandingCost{}, OneOff: []OneOffCost{}},
@@ -110,6 +111,8 @@ func TestCanonicalWritesEmptyArraysNotNull(t *testing.T) {
 		RunFact{Type: TypeRun, Apps: []RunApp{{Name: "web", External: []RunHost{}}}, OtherDeploymentsKept: []string{}},
 		ApplicationResetFact{Type: TypeApplicationReset},
 		ReaderFact{Type: TypeReader, Namespaces: []string{}, Resources: []string{}, ConfigMaps: []string{}},
+		MigrateFact{Type: TypeMigrate, Local: []string{},
+			Objects: []MigrateObject{{Kind: "Deployment", CSAManagers: []string{}, OtherManagers: []string{}}}},
 	}}
 
 	got, err := Canonical(withNils)
@@ -134,7 +137,7 @@ func TestCanonicalWritesEmptyArraysNotNull(t *testing.T) {
 	for _, member := range []string{
 		`"options":[]`, `"blocked":[]`, `"standing":[]`, `"one_off":[]`, `"namespaces":[]`, `"add":[]`,
 		`"metered_after":[]`, `"windows_after":[]`, `"lowering":[]`, `"external":[]`, `"other_deployments_kept":[]`,
-		`"configmaps":[]`,
+		`"configmaps":[]`, `"local":[]`, `"csa_managers":[]`, `"other_managers":[]`,
 	} {
 		if !bytes.Contains(got, []byte(member)) {
 			t.Errorf("Canonical has no %s: %s", member, got)
@@ -239,6 +242,7 @@ func factSamples() map[string]Fact {
 		"ApplicationResetFact": ApplicationResetFact{},
 		"ReaderFact":           ReaderFact{},
 		"NoticeFact":           NoticeFact{},
+		"MigrateFact":          MigrateFact{},
 	}
 }
 
@@ -327,8 +331,8 @@ func TestFactTypesAreCanonical(t *testing.T) {
 	if declared := factTypesDeclared(t); !reflect.DeepEqual(declared, sampled) {
 		t.Fatalf("the fact types declared are\n  %v\nbut the samples are\n  %v", declared, sampled)
 	}
-	if len(sampled) != 17 {
-		t.Errorf("M2.6 has 17 fact types, not %d", len(sampled))
+	if len(sampled) != 18 {
+		t.Errorf("ADR 0023 M2.7 has 18 fact types, not %d", len(sampled))
 	}
 
 	seen := map[reflect.Type]bool{}
@@ -380,7 +384,8 @@ func jsonPaths(typ reflect.Type, prefix string) []string {
 }
 
 func TestFactFieldsFollowTheFactTable(t *testing.T) {
-	// §9.4's fact table as A23-33 amends it, and §9.3's Bound and Document.
+	// §9.4's fact table as A23-33 amends it, with A30-12's migrate fact, and
+	// §9.3's Bound and Document.
 	want := map[string]string{
 		TypeCost: "type currency period limit_cents " +
 			"standing standing[].what standing[].replicas standing[].cpu_milli standing[].mem_mib standing[].month_cents standing[].max_month_cents " +
@@ -407,6 +412,8 @@ func TestFactFieldsFollowTheFactTable(t *testing.T) {
 			"requests_live requests_live.cpu_milli requests_live.mem_mib requests_after requests_after.cpu_milli requests_after.mem_mib",
 		TypeReader: "type email iam_role scope namespaces resources configmaps",
 		TypeNotice: "type text",
+		TypeMigrate: "type objects objects[].api objects[].kind objects[].namespace objects[].name objects[].uid " +
+			"objects[].csa_managers objects[].csa_fields_sha256 objects[].annotation objects[].other_managers local irreversible",
 	}
 	samples := factSamples()
 	if len(samples) != len(want) {

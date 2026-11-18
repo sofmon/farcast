@@ -75,6 +75,10 @@ const (
 	metadataFile    = "metadata.yaml"
 	credentialsFile = "credentials.yaml"
 	kubeconfigFile  = "kubeconfig.yaml"
+	// pluginCacheFile is the GKE auth plugin's token cache, which kubectl,
+	// run over kubeconfigFile, left beside it. farcast migrate, from ADR 0023
+	// M2.7b (not built at M2.7a), is to delete both (LegacyKubectlFiles).
+	pluginCacheFile = "gke_gcloud_auth_plugin_cache"
 	fatlineSubdir   = "fatline"
 	// datasphereSubdir holds the instance's storage keyring. It sits beside
 	// the FatLine material because the two are the instance's crown jewels and
@@ -854,6 +858,67 @@ func (d Dir) SaveInstanceKubeconfig(name string, kubeconfig []byte) error {
 // connect bootstrap can hand it to kubectl).
 func (d Dir) InstanceKubeconfigPath(name string) string {
 	return filepath.Join(d.instanceDir(name), kubeconfigFile)
+}
+
+// legacyKubectlFiles are the files an instance's kubectl left on this
+// machine, in the order LegacyKubectlFiles names them: the kubeconfig farcast
+// wrote for it, then the GKE auth plugin's token cache beside it.
+var legacyKubectlFiles = [...]string{kubeconfigFile, pluginCacheFile}
+
+// legacyKubectlFile is one of them as LegacyKubectlFiles names it: a
+// slash-separated path relative to the config directory.
+func legacyKubectlFile(name, file string) string {
+	return instancesSubdir + "/" + name + "/" + file
+}
+
+// LegacyKubectlFiles names the files kubectl left for an instance that are
+// still on this machine: instances/<name>/kubeconfig.yaml, then
+// instances/<name>/gke_gcloud_auth_plugin_cache, each a slash-separated path
+// relative to the config directory, present ones only (A30-14). It uses
+// os.Lstat alone: it opens neither file, so ObserveReads sees nothing, and a
+// link is named as the file it is, wherever it points. An error other than a
+// file not being there is returned.
+func (d Dir) LegacyKubectlFiles(name string) ([]string, error) {
+	var present []string
+	for _, f := range legacyKubectlFiles {
+		_, err := os.Lstat(d.instanceFile(name, f))
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		present = append(present, legacyKubectlFile(name, f))
+	}
+	return present, nil
+}
+
+// RemoveLegacyKubectlFiles deletes the files LegacyKubectlFiles names, each
+// that is there: a file already gone is not a failure. removed lists the ones
+// it deleted, in LegacyKubectlFiles' form and order. err is the first
+// failure, an *fs.PathError whose Path is the file it was deleting in that
+// same form; it still tries the other file. A link is deleted, never what it
+// points to.
+func (d Dir) RemoveLegacyKubectlFiles(name string) (removed []string, err error) {
+	for _, f := range legacyKubectlFiles {
+		rerr := os.Remove(d.instanceFile(name, f))
+		if errors.Is(rerr, fs.ErrNotExist) {
+			continue
+		}
+		if rerr != nil {
+			if err == nil {
+				cause := rerr
+				var pe *fs.PathError
+				if errors.As(rerr, &pe) {
+					cause = pe.Err
+				}
+				err = &fs.PathError{Op: "delete", Path: legacyKubectlFile(name, f), Err: cause}
+			}
+			continue
+		}
+		removed = append(removed, legacyKubectlFile(name, f))
+	}
+	return removed, err
 }
 
 // datasphereDir is where an instance's storage keyring lives.

@@ -1321,6 +1321,368 @@ func managedFields(t *testing.T, obj map[string]any) []entry {
 	return es
 }
 
+// serviceDoc is a Service of type LoadBalancer, as connect renders FatLine's.
+const serviceDoc = `apiVersion: v1
+kind: Service
+metadata:
+  name: fatline
+  namespace: farcast-system
+spec:
+  type: LoadBalancer
+  selector:
+    app: fatline
+  ports:
+  - port: 443
+`
+
+// jobDoc is a Job as farcast renders its build and fetch Jobs: no selector,
+// its template labelled by farcast alone.
+func jobDoc(name, image string) string {
+	return fmt.Sprintf(`apiVersion: batch/v1
+kind: Job
+metadata:
+  name: %s
+  namespace: farcast-build
+spec:
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/managed-by: farcast
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: build
+        image: %s
+`, name, image)
+}
+
+// TestSettledWorkloadsRollOutAndGetAnAddress (design A30-10): under
+// WithSettledWorkloads an applied Deployment or StatefulSet reads rolled out,
+// a created LoadBalancer Service gets an address from TEST-NET-3, a stored
+// Job keeps its selector and template labels across an apply that omits
+// them, and a created one is given the API server's default selector; without
+// the option, none of this happens.
+func TestSettledWorkloadsRollOutAndGetAnAddress(t *testing.T) {
+	const (
+		deployment  = "/apis/apps/v1/namespaces/web/deployments/web"
+		statefulset = "/apis/apps/v1/namespaces/web/statefulsets/db"
+		service     = "/api/v1/namespaces/farcast-system/services/fatline"
+		seededJob   = "/apis/batch/v1/namespaces/farcast-build/jobs/seeded"
+		createdJob  = "/apis/batch/v1/namespaces/farcast-build/jobs/created"
+	)
+	statefulsetDoc := strings.NewReplacer("kind: Deployment", "kind: StatefulSet", "name: web", "name: db").Replace(deploymentDoc("web", "web", 3))
+	seed := func(s *kubetest.Server) {
+		s.Put(map[string]any{"apiVersion": "batch/v1", "kind": "Job",
+			"metadata": map[string]any{"name": "seeded", "namespace": "farcast-build", "uid": "uid-seeded", "generation": 1},
+			"spec": map[string]any{
+				"selector": map[string]any{"matchLabels": map[string]any{"batch.kubernetes.io/controller-uid": "uid-seeded"}},
+				"template": map[string]any{
+					"metadata": map[string]any{"labels": map[string]any{
+						"app.kubernetes.io/managed-by": "farcast", "batch.kubernetes.io/controller-uid": "uid-seeded", "batch.kubernetes.io/job-name": "seeded",
+						"controller-uid": "uid-seeded", "job-name": "seeded"}},
+					"spec": map[string]any{"restartPolicy": "Never", "containers": []any{map[string]any{"name": "build", "image": "example.invalid/build:1"}}},
+				},
+			}})
+	}
+	deploymentOf := func(t *testing.T, a answer) kube.Deployment {
+		t.Helper()
+		var d kube.Deployment
+		if err := json.Unmarshal(a.body, &d); err != nil {
+			t.Fatalf("not a Deployment: %v: %s", err, a.body)
+		}
+		return d
+	}
+
+	t.Run("settled", func(t *testing.T) {
+		f := newFixture(t, kubetest.WithSettledWorkloads())
+		seed(f.s)
+		tok := f.mint(f.s.Credential("writer"))
+
+		// A Deployment rolls out on create and on an update that moves its
+		// generation; the answer and a later GET agree.
+		wantCode(t, f.apply(deployment, tok, deploymentDoc("web", "web", 1)), http.StatusCreated)
+		a := f.apply(deployment, tok, deploymentDoc("web", "web", 2))
+		wantCode(t, a, http.StatusOK)
+		for _, a := range []answer{a, f.get(deployment, tok)} {
+			d := deploymentOf(t, a)
+			done, waiting, err := kube.RolloutState(d)
+			if !done || err != nil || d.Metadata.Generation != 2 || d.Status.ObservedGeneration != 2 || d.Status.AvailableReplicas != 2 || d.Status.ReadyReplicas != 2 {
+				t.Errorf("the Deployment reads done=%v (%q, %v), generation %d observed %d, available %d ready %d",
+					done, waiting, err, d.Metadata.Generation, d.Status.ObservedGeneration, d.Status.AvailableReplicas, d.Status.ReadyReplicas)
+			}
+		}
+		// An unchanged apply of a settled Deployment writes nothing.
+		rv := metaOf(t, object(t, f.get(deployment, tok)))["resourceVersion"]
+		if got := metaOf(t, object(t, f.apply(deployment, tok, deploymentDoc("web", "web", 2))))["resourceVersion"]; got != rv {
+			t.Errorf("an unchanged apply of a settled Deployment moved its resourceVersion from %v to %v", rv, got)
+		}
+		// A Deployment with no replicas counts one.
+		wantCode(t, f.apply("/apis/apps/v1/namespaces/web/deployments/bare", tok, strings.Replace(deploymentDoc("bare", "web", 1), "  replicas: 1\n", "", 1)), http.StatusCreated)
+		if d := deploymentOf(t, f.get("/apis/apps/v1/namespaces/web/deployments/bare", tok)); d.Spec.Replicas != nil || d.Status.UpdatedReplicas != 1 || d.Status.AvailableReplicas != 1 {
+			t.Errorf("a Deployment without replicas settled as %+v (spec.replicas %v)", d.Status, d.Spec.Replicas)
+		}
+
+		// A StatefulSet too.
+		wantCode(t, f.apply(statefulset, tok, statefulsetDoc), http.StatusCreated)
+		ss := object(t, f.get(statefulset, tok))
+		if get(ss, "status", "observedGeneration") != json.Number("1") || get(ss, "status", "readyReplicas") != json.Number("3") ||
+			get(ss, "status", "replicas") != json.Number("3") || get(ss, "status", "updatedReplicas") != json.Number("3") || get(ss, "status", "availableReplicas") != json.Number("3") {
+			t.Errorf("the StatefulSet's status = %v", ss["status"])
+		}
+
+		// A created LoadBalancer Service gets the address.
+		wantCode(t, f.apply(service, tok, serviceDoc), http.StatusCreated)
+		svc := object(t, f.get(service, tok))
+		ingress, _ := get(svc, "status", "loadBalancer", "ingress").([]any)
+		if len(ingress) != 1 || get(ingress[0].(map[string]any), "ip") != "203.0.113.10" {
+			t.Errorf("the Service's status = %v", svc["status"])
+		}
+		var lb kube.Service
+		if err := json.Unmarshal(f.get(service, tok).body, &lb); err != nil || len(lb.Status.LoadBalancer.Ingress) != 1 || lb.Status.LoadBalancer.Ingress[0].IP != "203.0.113.10" {
+			t.Errorf("kube.Service reads %+v (%v)", lb.Status, err)
+		}
+		// A Service that is not a LoadBalancer gets none, as a real server
+		// gives a ClusterIP Service none.
+		const clusterIP = "/api/v1/namespaces/farcast-system/services/internal"
+		wantCode(t, f.apply(clusterIP, tok, strings.NewReplacer("name: fatline", "name: internal", "type: LoadBalancer", "type: ClusterIP").Replace(serviceDoc)), http.StatusCreated)
+		if st := get(object(t, f.get(clusterIP, tok)), "status"); st != nil {
+			t.Errorf("a settled ClusterIP Service has status %v", st)
+		}
+		// A LoadBalancer Service that already has an address keeps it.
+		const kept = "/api/v1/namespaces/farcast-system/services/kept"
+		f.s.Put(map[string]any{"apiVersion": "v1", "kind": "Service",
+			"metadata": map[string]any{"name": "kept", "namespace": "farcast-system"},
+			"spec":     map[string]any{"type": "LoadBalancer", "selector": map[string]any{"app": "fatline"}, "ports": []any{map[string]any{"port": 443}}},
+			"status":   map[string]any{"loadBalancer": map[string]any{"ingress": []any{map[string]any{"ip": "198.51.100.7"}}}}})
+		wantCode(t, f.apply(kept, tok, strings.Replace(serviceDoc, "name: fatline", "name: kept", 1)), http.StatusOK)
+		if ingress, _ := get(object(t, f.get(kept, tok)), "status", "loadBalancer", "ingress").([]any); len(ingress) != 1 || get(ingress[0].(map[string]any), "ip") != "198.51.100.7" {
+			t.Errorf("a Service's own address after an apply = %v, want 198.51.100.7 kept", ingress)
+		}
+
+		// A JSON patch settles what it stores: a Deployment Put left with no
+		// status reads rolled out after one, as migrate's patch leaves it.
+		const patched = "/apis/apps/v1/namespaces/web/deployments/patched"
+		f.s.Put(map[string]any{"apiVersion": "apps/v1", "kind": "Deployment",
+			"metadata": map[string]any{"name": "patched", "namespace": "web", "generation": 2, "annotations": map[string]any{"k": "v"}},
+			"spec": map[string]any{"replicas": 2, "selector": map[string]any{"matchLabels": map[string]any{"app": "patched"}},
+				"template": map[string]any{"metadata": map[string]any{"labels": map[string]any{"app": "patched"}},
+					"spec": map[string]any{"containers": []any{map[string]any{"name": "web", "image": "example.invalid/web:1"}}}}}})
+		if st := get(object(t, f.get(patched, tok)), "status"); st != nil {
+			t.Fatalf("a Deployment Put stored is settled already: %v", st)
+		}
+		wantCode(t, f.patchJSON(patched, tok, []map[string]any{{"op": "remove", "path": "/metadata/annotations/k"}}), http.StatusOK)
+		if d := deploymentOf(t, f.get(patched, tok)); d.Status.ObservedGeneration != 2 || d.Status.AvailableReplicas != 2 || d.Status.ReadyReplicas != 2 {
+			t.Errorf("a JSON patch left the Deployment's status %+v, want it settled at generation 2 with 2 replicas", d.Status)
+		}
+
+		// A stored Job keeps its selector and the template labels the
+		// body omits, and an unchanged spec moves no generation.
+		a = f.apply(seededJob, tok, jobDoc("seeded", "example.invalid/build:1"))
+		wantCode(t, a, http.StatusOK)
+		job := object(t, a)
+		if sel := get(job, "spec", "selector", "matchLabels", "batch.kubernetes.io/controller-uid"); sel != "uid-seeded" {
+			t.Errorf("the applied Job's selector = %v", get(job, "spec", "selector"))
+		}
+		labels, _ := get(job, "spec", "template", "metadata", "labels").(map[string]any)
+		for _, key := range []string{"app.kubernetes.io/managed-by", "batch.kubernetes.io/controller-uid", "batch.kubernetes.io/job-name", "controller-uid", "job-name"} {
+			if labels[key] == nil {
+				t.Errorf("the applied Job's template lost the label %s: %v", key, labels)
+			}
+		}
+		if g := metaOf(t, job)["generation"]; g != json.Number("1") {
+			t.Errorf("an apply that changed only fields the body omits moved the Job's generation to %v", g)
+		}
+		var kj kube.Job
+		if err := json.Unmarshal(f.get(seededJob, tok).body, &kj); err != nil || kj.Spec.Selector == nil || kj.Spec.Selector.MatchLabels["batch.kubernetes.io/controller-uid"] != "uid-seeded" {
+			t.Errorf("kube.Job reads the selector as %+v (%v)", kj.Spec.Selector, err)
+		}
+
+		// A created Job is given the default selector on its uid.
+		a = f.apply(createdJob, tok, jobDoc("created", "example.invalid/build:1"))
+		wantCode(t, a, http.StatusCreated)
+		job = object(t, a)
+		uid := metaOf(t, job)["uid"]
+		if uid == "" || uid == nil || get(job, "spec", "selector", "matchLabels", "batch.kubernetes.io/controller-uid") != uid {
+			t.Errorf("the created Job's selector = %v, uid %v", get(job, "spec", "selector"), uid)
+		}
+		labels, _ = get(job, "spec", "template", "metadata", "labels").(map[string]any)
+		want := map[string]any{"app.kubernetes.io/managed-by": "farcast", "batch.kubernetes.io/controller-uid": uid, "batch.kubernetes.io/job-name": "created",
+			"controller-uid": uid, "job-name": "created"}
+		if !reflect.DeepEqual(labels, want) {
+			t.Errorf("the created Job's template labels = %v\nwant %v", labels, want)
+		}
+		// Re-applying it unchanged is a no-op.
+		rv = metaOf(t, job)["resourceVersion"]
+		if got := metaOf(t, object(t, f.apply(createdJob, tok, jobDoc("created", "example.invalid/build:1"))))["resourceVersion"]; got != rv {
+			t.Errorf("an unchanged apply of a created Job moved its resourceVersion from %v to %v", rv, got)
+		}
+	})
+
+	t.Run("without the option", func(t *testing.T) {
+		f := newFixture(t)
+		seed(f.s)
+		tok := f.mint(f.s.Credential("writer"))
+
+		wantCode(t, f.apply(deployment, tok, deploymentDoc("web", "web", 2)), http.StatusCreated)
+		d := deploymentOf(t, f.get(deployment, tok))
+		if done, _, _ := kube.RolloutState(d); done || d.Status.ObservedGeneration != 0 || d.Status.AvailableReplicas != 0 {
+			t.Errorf("an unsettled Deployment reads done=%v, status %+v", done, d.Status)
+		}
+		wantCode(t, f.apply(statefulset, tok, statefulsetDoc), http.StatusCreated)
+		if st := get(object(t, f.get(statefulset, tok)), "status"); st != nil {
+			t.Errorf("an unsettled StatefulSet has status %v", st)
+		}
+		wantCode(t, f.apply(service, tok, serviceDoc), http.StatusCreated)
+		if st := get(object(t, f.get(service, tok)), "status"); st != nil {
+			t.Errorf("an unsettled Service has status %v", st)
+		}
+		job := object(t, f.apply(seededJob, tok, jobDoc("seeded", "example.invalid/build:1")))
+		if sel := get(job, "spec", "selector"); sel != nil {
+			t.Errorf("an unsettled apply kept the Job's selector %v", sel)
+		}
+		if labels, _ := get(job, "spec", "template", "metadata", "labels").(map[string]any); len(labels) != 1 {
+			t.Errorf("an unsettled apply kept the Job's template labels %v", labels)
+		}
+		job = object(t, f.apply(createdJob, tok, jobDoc("created", "example.invalid/build:1")))
+		if sel := get(job, "spec", "selector"); sel != nil {
+			t.Errorf("an unsettled create was given the selector %v", sel)
+		}
+	})
+}
+
+// TestFailNextApplyRefusesOneApply (design A30-10): the next server-side
+// apply, whatever its path, is answered as Fail answers and stores nothing;
+// an unauthenticated apply does not consume it (TestFailNextApplyComesAfterRBAC
+// has WithRBAC's rows), and neither a GET nor a JSON patch does; the apply
+// after it lands. It comes before WithHandler and Fail's answers, which see
+// every other request as before.
+func TestFailNextApplyRefusesOneApply(t *testing.T) {
+	const (
+		path   = "/apis/apps/v1/namespaces/web/deployments/web"
+		other  = "/api/v1/namespaces/web/configmaps/settings"
+		seeded = "/api/v1/namespaces/web/configmaps/seeded"
+	)
+	var handled atomic.Int32
+	f := newFixture(t, kubetest.WithHandler(func(r kubetest.Request) (int, []byte, bool) {
+		if r.Method == http.MethodPatch {
+			handled.Add(1)
+		}
+		return 0, nil, false
+	}))
+	annotated := configMap("web", "seeded", map[string]string{"k": "v"})
+	annotated["metadata"].(map[string]any)["annotations"] = map[string]any{lastApplied: `{"marker":"last-applied"}`}
+	f.s.Put(annotated)
+	tok := f.mint(f.s.Credential("writer"))
+
+	f.s.FailNextApply(http.StatusInternalServerError, kube.Status{})
+	wantCode(t, f.apply(path, "", deploymentDoc("web", "web", 1)), http.StatusUnauthorized) // an unauthenticated apply consumes nothing
+	wantCode(t, f.get(seeded, tok), http.StatusOK)                                          // nor does a GET
+	if handled.Load() != 0 {
+		t.Fatal("the handler saw a PATCH before any authorized apply")
+	}
+	a := f.apply(path, tok, deploymentDoc("web", "web", 1))
+	if st := wantStatus(t, a, http.StatusInternalServerError, "InternalError"); st.Message != "Internal Server Error" || st.Status.Status != "Failure" {
+		t.Errorf("the refused apply's Status = %+v", st)
+	}
+	if handled.Load() != 0 {
+		t.Error("WithHandler saw the apply FailNextApply answered")
+	}
+	wantStatus(t, f.get(path, tok), http.StatusNotFound, "NotFound") // it stored nothing
+	wantCode(t, f.apply(path, tok, deploymentDoc("web", "web", 1)), http.StatusCreated)
+	wantCode(t, f.get(path, tok), http.StatusOK)
+	if handled.Load() != 1 {
+		t.Errorf("WithHandler saw %d PATCHes, want the one apply after the refused one", handled.Load())
+	}
+
+	// Whatever its path, with its own Status, once per call; Fail's answers
+	// come after it, and a JSON patch is not an apply.
+	f.s.FailNextApply(http.StatusConflict, kube.Status{Status: tkube.Status{Reason: "Conflict", Message: "refused once"}})
+	f.s.FailNextApply(http.StatusForbidden, kube.Status{})
+	f.s.Fail(http.MethodPatch, other, http.StatusServiceUnavailable, kube.Status{})
+	cm := "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: settings\n  namespace: web\n"
+	wantCode(t, f.patchJSON(seeded, tok, []map[string]any{{"op": "remove", "path": "/metadata/annotations/" + strings.ReplaceAll(lastApplied, "/", "~1")}}), http.StatusOK)
+	if st := wantStatus(t, f.apply(other, tok, cm), http.StatusConflict, "Conflict"); st.Message != "refused once" {
+		t.Errorf("the second refusal's message = %q", st.Message)
+	}
+	st := wantStatus(t, f.apply(other, tok, cm), http.StatusForbidden, "Forbidden")
+	if !strings.Contains(st.Message, `User "writer@kubetest.invalid" cannot patch resource "configmaps"`) {
+		t.Errorf("a queued 403's message = %q, want the API server's, naming the caller", st.Message)
+	}
+	wantStatus(t, f.apply(other, tok, cm), http.StatusServiceUnavailable, "ServiceUnavailable") // Fail's, queued before
+	wantCode(t, f.apply(other, tok, cm), http.StatusCreated)
+	var applies int
+	for _, r := range f.s.Requests() {
+		if r.Method == http.MethodPatch && r.ContentType == "application/apply-patch+yaml" {
+			applies++
+		}
+	}
+	if applies != 7 {
+		t.Errorf("the log holds %d applies, want all 7, refused or not", applies)
+	}
+}
+
+// TestFailNextApplyComesAfterRBAC (design A30-10): FailNextApply is checked
+// after WithRBAC's check of the request's own verb. An apply WithRBAC refuses
+// that way is 403 and consumes nothing, so the injection answers the next
+// writer's apply. An apply that would create its object, by a caller WithRBAC
+// lets patch but not create, is answered with the injection instead of 403:
+// the create check comes later, inside the apply's emulation, as a real API
+// server's comes inside its patch handler.
+func TestFailNextApplyComesAfterRBAC(t *testing.T) {
+	const (
+		getter  = "getter@kubetest.invalid"
+		patcher = "patcher@kubetest.invalid"
+		path    = "/api/v1/namespaces/web/configmaps/c"
+		doc     = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: c\n  namespace: web\ndata:\n  a: b\n"
+	)
+	role := func(user, verb string) []byte {
+		return []byte(`apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cm
+  namespace: web
+rules:
+- apiGroups: [""]
+  resources: [configmaps]
+  verbs: [` + verb + `]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cm
+  namespace: web
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: cm
+subjects:
+- kind: User
+  name: ` + user + `
+`)
+	}
+	f := newFixture(t, kubetest.WithRBAC(getter, role(getter, "get")), kubetest.WithRBAC(patcher, role(patcher, "patch")))
+	gtok := f.mint(f.s.CredentialFor("writer", getter))
+	ptok := f.mint(f.s.CredentialFor("writer", patcher))
+	wtok := f.mint(f.s.Credential("writer"))
+
+	// Refused for its own verb: nothing is consumed.
+	f.s.FailNextApply(http.StatusInternalServerError, kube.Status{})
+	if st := wantStatus(t, f.apply(path, gtok, doc), http.StatusForbidden, "Forbidden"); !strings.Contains(st.Message, `cannot patch resource "configmaps"`) {
+		t.Errorf("the getter's apply = %q, want refused for patch", st.Message)
+	}
+	wantStatus(t, f.apply(path, wtok, doc), http.StatusInternalServerError, "InternalError")
+	wantStatus(t, f.get(path, wtok), http.StatusNotFound, "NotFound")
+
+	// Allowed to patch, not to create: without an injection the apply is
+	// 403 for create; with one queued, the injection answers it.
+	if st := wantStatus(t, f.apply(path, ptok, doc), http.StatusForbidden, "Forbidden"); !strings.Contains(st.Message, `cannot create resource "configmaps"`) {
+		t.Errorf("the patcher's apply = %q, want refused for create", st.Message)
+	}
+	f.s.FailNextApply(http.StatusInternalServerError, kube.Status{})
+	wantStatus(t, f.apply(path, ptok, doc), http.StatusInternalServerError, "InternalError")
+	wantCode(t, f.apply(path, wtok, doc), http.StatusCreated)
+}
+
 // TestApplyRequiresFieldManagerAndStrictValidation: an apply without
 // fieldManager, or without fieldValidation=Strict, is 400 and stores nothing.
 func TestApplyRequiresFieldManagerAndStrictValidation(t *testing.T) {
@@ -1611,6 +1973,42 @@ func TestPartialObjectMetadataAnswersCarryNoData(t *testing.T) {
 	a = f.send(call{method: http.MethodGet, path: "/api/v1/namespaces/web/secrets/s", token: tok, accept: "application/json"})
 	if !bytes.Contains(a.body, []byte(secretValue)) {
 		t.Errorf("a full get lost the data: %s", a.body)
+	}
+
+	// A PATCH's answer honours Accept as a GET's does (design A30-9): a JSON
+	// patch's and an apply's, and a view it cannot give is 406 before
+	// anything is written.
+	rv := metaOf(t, object(t, a))["resourceVersion"].(string)
+	const secret = "/api/v1/namespaces/web/secrets/s"
+	ops, err := json.Marshal([]map[string]any{{"op": "replace", "path": "/metadata/resourceVersion", "value": rv}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	patch := call{method: http.MethodPatch, path: secret + "?fieldManager=farcast&fieldValidation=Strict", token: tok, contentType: jsonPatch, accept: partialOne, body: ops}
+	applied := "apiVersion: v1\nkind: Secret\nmetadata:\n  name: s\n  namespace: web\ndata:\n  key: " + secretValue + "\n  more: " + secretValue + "\n"
+	apply := call{method: http.MethodPatch, path: secret + applyQuery, token: tok, contentType: applyType, accept: partialOne, body: []byte(applied)}
+	for _, c := range []call{patch, apply} {
+		a = f.send(c)
+		wantCode(t, a, http.StatusOK)
+		one := object(t, a)
+		if one["kind"] != "PartialObjectMetadata" || one["apiVersion"] != "meta.k8s.io/v1" || one["data"] != nil || bytes.Contains(a.body, []byte(secretValue)) ||
+			get(one, "metadata", "name") != "s" {
+			t.Errorf("a metadata-only %s answer = %s", c.contentType, a.body)
+		}
+	}
+	rv = metaOf(t, object(t, f.get(secret, tok)))["resourceVersion"].(string)
+	for _, c := range []call{patch, apply} {
+		c.accept = partialList
+		c.body = []byte(strings.Replace(string(c.body), "more:", "other:", 1))
+		wantStatus(t, f.send(c), http.StatusNotAcceptable, "NotAcceptable")
+	}
+	full := object(t, f.get(secret, tok))
+	if metaOf(t, full)["resourceVersion"] != rv || get(full, "data", "other") != nil {
+		t.Errorf("a PATCH answered 406 wrote: %v", full)
+	}
+	a = f.send(call{method: http.MethodPatch, path: secret + applyQuery, token: tok, contentType: applyType, body: []byte(applied)})
+	if !bytes.Contains(a.body, []byte(secretValue)) {
+		t.Errorf("a PATCH without a metadata-only Accept lost the data: %s", a.body)
 	}
 }
 

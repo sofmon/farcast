@@ -76,6 +76,141 @@ func TestEveryRenderedStreamPassesTheApplyChecks(t *testing.T) {
 	}
 }
 
+// ADR 0023 M2.7's migrate, not yet built, is to find what it rewrites by
+// farcast's label alone: one cluster-wide list per kind, selected by
+// app.kubernetes.io/managed-by=farcast (design §6.2). A document rendered
+// without the label would never be migrated: its next forced apply would
+// carry kubectl's client-side trace, and the instance's migrated record would
+// be cleared after every migration (A30-16). So every document of every
+// rendered stream carries it, the kernel's seed technocore-namespaces and the
+// confirmations ConfigMap among them.
+func TestEveryRenderedDocumentIsManagedByFarcast(t *testing.T) {
+	key, value, _ := strings.Cut(managedSelector, "=")
+	seen := map[string]bool{}
+	for _, s := range renderedStreams(t) {
+		docs, err := kube.SplitStream(s.stream)
+		if err != nil {
+			t.Fatalf("%s: refused: %v", s.name, err)
+		}
+		for _, d := range docs {
+			seen[docIdentity(d)] = true
+			if got, ok := renderedObjectOf(t, d).Metadata.Labels[key]; !ok || got != value {
+				t.Errorf("%s: %s carries %s %q (present %t), want %q", s.name, docIdentity(d), key, got, ok, value)
+			}
+		}
+	}
+	for _, want := range []string{
+		"ConfigMap " + tcdeploy.DefaultNamespace + "/" + kernel.DefaultNamespacesName,
+		"ConfigMap " + tcdeploy.DefaultNamespace + "/" + kernel.DefaultConfirmationsName,
+	} {
+		if !seen[want] {
+			t.Errorf("no rendered stream holds %s, so its label goes unchecked", want)
+		}
+	}
+}
+
+// A stream is applied in order, and from ADR 0023 M2.7 the in-process apply
+// stops at its first failing document (design D3). A NetworkPolicy rendered
+// after the workload it selects would be left unapplied by a failure between
+// the two, with the workload's pods running unrestricted by it (an
+// application's egress not denied by default, the keyholder's ports reachable
+// from any pod); kubectl, which carries on past a failure, hid this. So every
+// NetworkPolicy comes before each Deployment, StatefulSet and Job in its
+// namespace whose pods it selects, and in a stream that renders any
+// NetworkPolicy, every such workload has one before it (A30-17).
+func TestEveryNetworkPolicyPrecedesItsWorkload(t *testing.T) {
+	checked := 0
+	for _, s := range renderedStreams(t) {
+		t.Run(s.name, func(t *testing.T) {
+			docs, err := kube.SplitStream(s.stream)
+			if err != nil {
+				t.Fatalf("refused: %v", err)
+			}
+			objs := make([]renderedObject, len(docs))
+			policies := false
+			for i, d := range docs {
+				objs[i] = renderedObjectOf(t, d)
+				if d.Kind.Kind != "NetworkPolicy" {
+					continue
+				}
+				policies = true
+				// Only matchLabels is read here, so a selector this test
+				// cannot evaluate fails it rather than passing unread.
+				if len(objs[i].Spec.PodSelector.MatchExpressions) != 0 {
+					t.Errorf("%s selects by matchExpressions, which this test does not read", docIdentity(d))
+				}
+			}
+			for i, w := range docs {
+				switch w.Kind.Kind {
+				case "Deployment", "StatefulSet", "Job":
+				default:
+					continue
+				}
+				pod := objs[i].Spec.Template.Metadata.Labels
+				before := 0
+				for j, p := range docs {
+					if p.Kind.Kind != "NetworkPolicy" || p.Namespace != w.Namespace || !selectsPod(objs[j].Spec.PodSelector.MatchLabels, pod) {
+						continue
+					}
+					if j > i {
+						t.Errorf("%s selects the pods of %s and comes after it; the order is %v", docIdentity(p), docIdentity(w), identities(docs))
+						continue
+					}
+					before++
+				}
+				if policies {
+					checked++
+					if before == 0 {
+						t.Errorf("%s has no NetworkPolicy before it that selects its pods; the order is %v", docIdentity(w), identities(docs))
+					}
+				}
+			}
+		})
+	}
+	if checked == 0 {
+		t.Error("no rendered stream holds both a NetworkPolicy and a workload, so nothing was checked")
+	}
+}
+
+// renderedObject is the part of a rendered document these tests read: its
+// labels, a NetworkPolicy's pod selector, and a workload's pod-template labels.
+type renderedObject struct {
+	Metadata struct {
+		Labels map[string]string `yaml:"labels"`
+	} `yaml:"metadata"`
+	Spec struct {
+		PodSelector struct {
+			MatchLabels      map[string]string `yaml:"matchLabels"`
+			MatchExpressions []any             `yaml:"matchExpressions"`
+		} `yaml:"podSelector"`
+		Template struct {
+			Metadata struct {
+				Labels map[string]string `yaml:"labels"`
+			} `yaml:"metadata"`
+		} `yaml:"template"`
+	} `yaml:"spec"`
+}
+
+func renderedObjectOf(t *testing.T, d kube.Document) renderedObject {
+	t.Helper()
+	var o renderedObject
+	if err := yaml.Unmarshal(d.Raw, &o); err != nil {
+		t.Fatalf("%s does not decode: %v", docIdentity(d), err)
+	}
+	return o
+}
+
+// selectsPod is whether a pod selector's matchLabels are all among a pod's
+// labels. An empty selector selects every pod.
+func selectsPod(selector, pod map[string]string) bool {
+	for k, v := range selector {
+		if got, ok := pod[k]; !ok || got != v {
+			return false
+		}
+	}
+	return true
+}
+
 type renderedStream struct {
 	name   string
 	stream []byte

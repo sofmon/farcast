@@ -335,6 +335,12 @@ type templateData struct {
 // deployment shape and either stream may be applied first, so the shared
 // document has to converge rather than fight — identical content makes the
 // second apply a no-op instead of a field-ownership tug-of-war.
+//
+// The NetworkPolicy comes before the StatefulSet, because a stream stopped
+// part-way (kubectl interrupted, or from ADR 0023 M2.7 the in-process apply at
+// its first failing document, design D3) leaves what came before it, so a
+// policy after its workload could leave the keyholder's pods running without
+// it.
 var workloadTemplate = template.Must(template.New("datasphered").Parse(`apiVersion: v1
 kind: Namespace
 metadata:
@@ -381,6 +387,78 @@ data:
   ca.crt: {{.CACert}}
   server.crt: {{.ServerCert}}
   server.key: {{.ServerKey}}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{.Name}}
+  namespace: {{.Namespace}}
+  labels:
+    app.kubernetes.io/name: datasphered
+    app.kubernetes.io/managed-by: farcast
+# Who may reach the keyholder, and on which port.
+#
+# This is a control, not tidiness. When it was written the SDK's storage client
+# presented no client certificate, so the data port could not tell one caller
+# from another and anything that could route to it could read and write the
+# instance's storage. Since ADR 0018 decision 1 the port also requires a client
+# leaf and decides from its role what a caller may reach, so this is now one of
+# two controls rather than the only one — and it stays, because network position
+# and identity fail in different ways.
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: datasphered
+  # INGRESS ONLY. Declaring Egress here would silence the keyholder's own
+  # traffic — the bucket it serves and the metadata server that mints its
+  # Workload Identity token — and the failure would look like a broken
+  # provider rather than a policy. Hardening that path is a separate change
+  # with its own risk.
+  policyTypes:
+    - Ingress
+  ingress:
+    # The status port, from anywhere, and this rule is load-bearing rather
+    # than lazy. Kubelet probes originate from the NODE, not from a pod, so
+    # no namespaceSelector or podSelector can express them — and a policy
+    # that selected these pods while omitting the status port would deny
+    # liveness and readiness, and Kubernetes would kill the keyholder for
+    # failing the probes this file just blocked. Storage would die, on a
+    # cluster nobody touched, because of a security improvement.
+    #
+    # What it exposes is what ADR 0008 decision 7 deliberately made
+    # reportable: seal state, generation, scope names. Metadata, never key
+    # material and never object content.
+    - ports:
+        - protocol: TCP
+          port: {{.StatusPort}}
+    # The data port: FarCast applications only. Both selectors sit in ONE
+    # "from" element, which means AND — a namespace FarCast manages *and* a
+    # pod classified as an application. Two elements would mean OR and would
+    # admit any pod in any FarCast namespace.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              app.kubernetes.io/managed-by: farcast
+          podSelector:
+            matchLabels:
+              farcast.sofmon.com/tier: app
+      ports:
+        - protocol: TCP
+          port: {{.DataPort}}
+    # The unseal port: FatLine only. The operator's push arrives through the
+    # tunnel's stream relay (ADR 0008), so FatLine is the only legitimate
+    # source — and this is the port where key material lands, which makes it
+    # the one worth narrowing hardest.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{.Namespace}}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: fatline
+      ports:
+        - protocol: TCP
+          port: {{.UnsealPort}}
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -603,78 +681,6 @@ spec:
   selector:
     matchLabels:
       app.kubernetes.io/name: datasphered
----
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: {{.Name}}
-  namespace: {{.Namespace}}
-  labels:
-    app.kubernetes.io/name: datasphered
-    app.kubernetes.io/managed-by: farcast
-# Who may reach the keyholder, and on which port.
-#
-# This is a control, not tidiness. When it was written the SDK's storage client
-# presented no client certificate, so the data port could not tell one caller
-# from another and anything that could route to it could read and write the
-# instance's storage. Since ADR 0018 decision 1 the port also requires a client
-# leaf and decides from its role what a caller may reach, so this is now one of
-# two controls rather than the only one — and it stays, because network position
-# and identity fail in different ways.
-spec:
-  podSelector:
-    matchLabels:
-      app.kubernetes.io/name: datasphered
-  # INGRESS ONLY. Declaring Egress here would silence the keyholder's own
-  # traffic — the bucket it serves and the metadata server that mints its
-  # Workload Identity token — and the failure would look like a broken
-  # provider rather than a policy. Hardening that path is a separate change
-  # with its own risk.
-  policyTypes:
-    - Ingress
-  ingress:
-    # The status port, from anywhere, and this rule is load-bearing rather
-    # than lazy. Kubelet probes originate from the NODE, not from a pod, so
-    # no namespaceSelector or podSelector can express them — and a policy
-    # that selected these pods while omitting the status port would deny
-    # liveness and readiness, and Kubernetes would kill the keyholder for
-    # failing the probes this file just blocked. Storage would die, on a
-    # cluster nobody touched, because of a security improvement.
-    #
-    # What it exposes is what ADR 0008 decision 7 deliberately made
-    # reportable: seal state, generation, scope names. Metadata, never key
-    # material and never object content.
-    - ports:
-        - protocol: TCP
-          port: {{.StatusPort}}
-    # The data port: FarCast applications only. Both selectors sit in ONE
-    # "from" element, which means AND — a namespace FarCast manages *and* a
-    # pod classified as an application. Two elements would mean OR and would
-    # admit any pod in any FarCast namespace.
-    - from:
-        - namespaceSelector:
-            matchLabels:
-              app.kubernetes.io/managed-by: farcast
-          podSelector:
-            matchLabels:
-              farcast.sofmon.com/tier: app
-      ports:
-        - protocol: TCP
-          port: {{.DataPort}}
-    # The unseal port: FatLine only. The operator's push arrives through the
-    # tunnel's stream relay (ADR 0008), so FatLine is the only legitimate
-    # source — and this is the port where key material lands, which makes it
-    # the one worth narrowing hardest.
-    - from:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: {{.Namespace}}
-          podSelector:
-            matchLabels:
-              app.kubernetes.io/name: fatline
-      ports:
-        - protocol: TCP
-          port: {{.UnsealPort}}
 ---
 apiVersion: v1
 kind: Service

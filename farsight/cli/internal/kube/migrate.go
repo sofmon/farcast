@@ -46,17 +46,20 @@ const lastAppliedPatchPath = "/metadata/annotations/kubectl.kubernetes.io~1last-
 // The first half is kubectl v0.37.2's own selection (pkg/cmd/apply/apply.go,
 // migrateToSSAIfNecessary: csaupgrade.FindFieldsOwners(…,
 // ManagedFieldsOperationUpdate, lastAppliedAnnotationFieldPath)); the second
-// adds kubectl-client-side-apply by name whenever it has an Update entry. The
-// names are sorted and distinct. kubectl skips an entry whose fields do not
-// decode; farcast refuses instead, because such an entry may own the
-// annotation and would then be left behind.
+// adds kubectl-client-side-apply by name whenever it has an Update entry on
+// the main resource (subresource ""), the only entry the rewrite converts or
+// removes (isCSAEntry): an entry of that name on /scale or /status is judged
+// by its fields alone, as any other manager's is. The names are sorted and
+// distinct. kubectl skips an entry whose fields do not decode; farcast refuses
+// instead, because such an entry may own the annotation and would then be left
+// behind.
 func ClientSideManagers(entries []ManagedFieldsEntry) ([]string, error) {
 	var names []string
 	for i, e := range entries {
 		if e.Operation != operationUpdate {
 			continue
 		}
-		if e.Manager == kubectlClientSideApply {
+		if e.Manager == kubectlClientSideApply && e.Subresource == "" {
 			names = append(names, e.Manager)
 			continue
 		}
@@ -116,17 +119,40 @@ func UpgradeManagedFields(entries []ManagedFieldsEntry, csa []string, ssa string
 }
 
 // IsLastApply reports whether a managed-fields entry records an apply of the
-// object by farcast: its own server-side apply (FieldManager, Apply), or
-// kubectl's client-side apply (kubectl-client-side-apply, Update), which
-// farcast's Apply runs until ADR 0023 M2.7. KUBERC=off keeps that apply
-// client-side, so an operator's kuberc cannot record it under another pair.
-// Either way the entry is the object's own, never a subresource's: a write
-// to /scale or /status is not an apply of the object. These are the two
-// entries the migration converts and keeps (isSSAEntry, isCSAEntry), one
-// spelling of them, which cluster's DeploymentState reads for an
-// application's last apply and ADR 0023 M2.7's Traces is to share.
+// object by farcast: its own server-side apply (IsOwnApply), or kubectl's
+// client-side apply (kubectl-client-side-apply, Update), whose entry still
+// marks the last apply of an object an older farcast wrote. Either way the
+// entry is the object's own, never a subresource's: a write to /scale or
+// /status is not an apply of the object. These are the two entries the
+// migration converts and keeps (isSSAEntry, isCSAEntry), one spelling of
+// them, which cluster's DeploymentState reads for an application's last
+// apply. A trace of kubectl's client-side apply is ClientSideTrace, never
+// this: every server-side apply's answer carries farcast's own entry.
 func IsLastApply(e ManagedFieldsEntry) bool {
-	return isSSAEntry(FieldManager)(e) || isCSAEntry(kubectlClientSideApply)(e)
+	return IsOwnApply(e) || isCSAEntry(kubectlClientSideApply)(e)
+}
+
+// IsOwnApply reports whether a managed-fields entry is farcast's own
+// server-side apply of the object: FieldManager's Apply entry on the main
+// resource (subresource ""). Every answer to Apply carries one, and a
+// migration's caller reads it before the patch, as MigratedEndState's
+// hadApply.
+func IsOwnApply(e ManagedFieldsEntry) bool {
+	return isSSAEntry(FieldManager)(e)
+}
+
+// ClientSideTrace reports whether an object's metadata carries a trace of
+// kubectl's client-side apply, which a migration rewrites (§6.2, §6.6): the
+// last-applied annotation's key, whose value is never read, or a non-empty
+// ClientSideManagers, which names kubectl-client-side-apply's own Update
+// entry. Managed fields that ClientSideManagers cannot read count as a trace,
+// so a doubt fails closed. farcast's own Apply entry alone is no trace.
+func ClientSideTrace(md ObjectMeta) bool {
+	if _, annotated := md.Annotations[lastAppliedAnnotation]; annotated {
+		return true
+	}
+	csa, err := ClientSideManagers(md.ManagedFields)
+	return err != nil || len(csa) > 0
 }
 
 func isSSAEntry(ssa string) func(ManagedFieldsEntry) bool {
@@ -244,13 +270,22 @@ func MigrationPatch(o Object, csa []string, ssa string) ([]byte, error) {
 // other than kubectl-client-side-apply then no longer reads as client-side,
 // although it still holds its other client-side fields.
 //
+// hadApply is whether the object, as read before the patch, carried an ssa
+// entry with operation Apply on its main resource; a caller reads it with
+// slices.ContainsFunc(read.Metadata.ManagedFields, IsOwnApply), ssa being
+// FieldManager. With neither a client-side manager to convert nor such an
+// entry, the patch only removes the annotation: an operator's `kubectl apply
+// --server-side` leaves kubectl/Apply and the annotation, and its migration
+// adds no ssa entry. Another Apply owner keeps its entry and its fields.
+//
 // The end state is: no Update entry, on the main resource, of any manager in
 // csa or in ClientSideManagers of the object as read back; no annotation;
-// exactly one ssa entry with operation Apply; and no ssa entry with operation
-// Update. The error's whole text is what is left, such as
-// "kubectl-client-side-apply/Update still present; annotation
-// kubectl.kubernetes.io/last-applied-configuration still present".
-func MigratedEndState(o Object, csa []string, ssa string) error {
+// exactly one ssa entry with operation Apply when csa is non-empty or hadApply
+// holds, and none otherwise; and no ssa entry with operation Update. The
+// error's whole text is what is left, such as "kubectl-client-side-apply/Update
+// still present; annotation kubectl.kubernetes.io/last-applied-configuration
+// still present".
+func MigratedEndState(o Object, csa []string, ssa string, hadApply bool) error {
 	left, err := ClientSideManagers(o.Metadata.ManagedFields)
 	if err != nil {
 		return refuse(ErrNotMigrated, "its managed fields do not read")
@@ -281,8 +316,11 @@ func MigratedEndState(o Object, csa []string, ssa string) error {
 			updates++
 		}
 	}
-	if applies != 1 {
+	switch {
+	case (len(csa) > 0 || hadApply) && applies != 1:
 		faults = append(faults, fmt.Sprintf("%s/%s present %d times, not once", ssa, operationApply, applies))
+	case len(csa) == 0 && !hadApply && applies != 0:
+		faults = append(faults, fmt.Sprintf("%s/%s present %d times, where the object had none", ssa, operationApply, applies))
 	}
 	if updates > 0 {
 		faults = append(faults, ssa+"/"+operationUpdate+" present")
@@ -343,9 +381,12 @@ func (c *Client) GetObject(ctx context.Context, k Kind, namespace, name string) 
 
 // PatchJSON sends one JSON patch (RFC 6902), the migration's one write (§6.3):
 // PATCH k.Path(namespace, name)?fieldManager=farcast&fieldValidation=Strict,
-// Content-Type: application/json-patch+json. It is never retried on 429 or
-// 503: the migration's own loop re-reads and retries (§6.4). The answer is
-// decoded into Object, its Kind k.
+// Content-Type: application/json-patch+json, asking for the answer as a
+// PartialObjectMetadata, as GetObject does, so a Secret's values are not sent
+// back. A server that answers with the whole object is decoded into Object,
+// which declares metadata only, so they are discarded unread. It is never
+// retried on 429 or 503, because migrate's loop retries a 409 only and stops
+// on anything else (design A30-23). The answer's Kind is k.
 func (c *Client) PatchJSON(ctx context.Context, k Kind, namespace, name string, patch []byte) (Object, error) {
 	if f := kindFault(k); f != "" {
 		return Object{}, notSent(f)
@@ -359,6 +400,7 @@ func (c *Client) PatchJSON(ctx context.Context, k Kind, namespace, name string, 
 		method:      http.MethodPatch,
 		path:        path,
 		query:       writeQuery(),
+		accept:      acceptPartial,
 		contentType: mediaJSONPatch,
 		body:        patch,
 	}, &o)

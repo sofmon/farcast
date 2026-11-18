@@ -77,6 +77,91 @@ func TestClientSideManagersFindsTheAnnotationsOwner(t *testing.T) {
 	}
 }
 
+// TestClientSideManagersIgnoresSubresourceEntries (design A30-7): a
+// kubectl-client-side-apply Update entry on /scale or /status is not selected
+// by its name, because the rewrite converts and removes only the main
+// resource's (isCSAEntry); selected, it would never be converted and would
+// refuse the end state on every run. Judged by its fields, as any other
+// manager's entry is, it owns no annotation and is not selected either.
+func TestClientSideManagersIgnoresSubresourceEntries(t *testing.T) {
+	scale := ManagedFieldsEntry{Manager: "kubectl-client-side-apply", Operation: "Update", APIVersion: "autoscaling/v1", Subresource: "scale",
+		FieldsType: "FieldsV1", FieldsV1: json.RawMessage(`{"f:spec":{"f:replicas":{}}}`)}
+	status := ManagedFieldsEntry{Manager: "kubectl-client-side-apply", Operation: "Update", APIVersion: "apps/v1", Subresource: "status"}
+	for _, row := range []struct {
+		name    string
+		entries []ManagedFieldsEntry
+		want    []string
+	}{
+		{"a scale entry alone", []ManagedFieldsEntry{scale}, nil},
+		{"a status entry with no fields", []ManagedFieldsEntry{status}, nil},
+		{"beside farcast's own Apply", []ManagedFieldsEntry{entry("farcast", "Apply", "apps/v1", ownsAnnNot), scale, status}, nil},
+		{"beside the main resource's entry, which is still selected",
+			[]ManagedFieldsEntry{scale, entry("kubectl-client-side-apply", "Update", "apps/v1", ownsAnnNot), status}, []string{"kubectl-client-side-apply"}},
+	} {
+		got, err := ClientSideManagers(row.entries)
+		if err != nil {
+			t.Errorf("%s: ClientSideManagers: %v", row.name, err)
+			continue
+		}
+		if !slices.Equal(got, row.want) {
+			t.Errorf("%s: ClientSideManagers = %q, want %q", row.name, got, row.want)
+		}
+	}
+
+	// The end state of an object that keeps only the scale entry: nothing
+	// is left to convert, so it passes.
+	o := migratable()
+	o.Metadata.Annotations = map[string]string{"other": "x"}
+	o.Metadata.ManagedFields = []ManagedFieldsEntry{entry("farcast", "Apply", "apps/v1", ownsAnnRemoved), scale}
+	if err := MigratedEndState(o, []string{"kubectl-client-side-apply"}, "farcast", false); err != nil {
+		t.Errorf("a migrated object keeping kubectl-client-side-apply's scale entry is refused: %v", err)
+	}
+}
+
+// TestClientSideTraceIsNotFarcastsOwnApply (design A30-6): an object carries
+// a trace of kubectl's client-side apply when it has the last-applied
+// annotation or a client-side manager, or managed fields ClientSideManagers
+// cannot read; farcast's own Apply entry, which every server-side apply's
+// answer carries, is no trace, and neither is a subresource's entry.
+func TestClientSideTraceIsNotFarcastsOwnApply(t *testing.T) {
+	meta := func(annotations map[string]string, entries ...ManagedFieldsEntry) ObjectMeta {
+		var md ObjectMeta
+		md.Name, md.Namespace = "api", "web"
+		md.Annotations = annotations
+		md.ManagedFields = entries
+		return md
+	}
+	own := entry("farcast", "Apply", "apps/v1", ownsAnnNot)
+	annotated := map[string]string{lastAppliedAnnotation: `{"marker":"MARKER-VALUE"}`}
+	for _, row := range []struct {
+		name string
+		md   ObjectMeta
+		want bool
+	}{
+		{"the annotation alone", meta(annotated), true},
+		{"the annotation beside farcast's own Apply", meta(annotated, own), true},
+		// The key is the trace, whatever its value (A30-6): cluster's
+		// ListMeta, GetMeta and PatchManagedFields hand it over blanked.
+		{"the annotation's key with an empty value", meta(map[string]string{lastAppliedAnnotation: ""}), true},
+		{"kubectl-client-side-apply/Update", meta(nil, entry("kubectl-client-side-apply", "Update", "apps/v1", ownsAnnNot)), true},
+		{"another Update manager owning the annotation's path", meta(nil, own, entry("kubectl-edit", "Update", "apps/v1", ownsAnn)), true},
+		{"an Update entry whose fieldsType is not FieldsV1",
+			meta(nil, own, ManagedFieldsEntry{Manager: "kubectl-edit", Operation: "Update", APIVersion: "apps/v1", FieldsType: "FieldsV2", FieldsV1: json.RawMessage(`{}`)}), true},
+		{"an Update entry whose fields do not read", meta(nil, entry("kubectl-edit", "Update", "apps/v1", `{"f:metadata":[]}`)), true},
+		{"farcast/Apply alone", meta(nil, own), false},
+		{"farcast/Apply owning the annotation's path, as an Apply entry", meta(nil, entry("farcast", "Apply", "apps/v1", ownsAnn)), false},
+		{"kubectl-client-side-apply/Update with subresource scale",
+			meta(nil, own, ManagedFieldsEntry{Manager: "kubectl-client-side-apply", Operation: "Update", APIVersion: "autoscaling/v1", Subresource: "scale",
+				FieldsType: "FieldsV1", FieldsV1: json.RawMessage(`{"f:spec":{"f:replicas":{}}}`)}), false},
+		{"the kernel's Update entry", meta(nil, own, entry("technocore", "Update", "apps/v1", `{"f:spec":{"f:template":{}}}`)), false},
+		{"nothing at all", meta(nil), false},
+	} {
+		if got := ClientSideTrace(row.md); got != row.want {
+			t.Errorf("%s: ClientSideTrace = %v, want %v", row.name, got, row.want)
+		}
+	}
+}
+
 // ADR 0023 M2.6 (A23-46, A28-7): an apply of the object by farcast is
 // farcast's own Apply or kubectl's client-side apply Update, each on the
 // object itself. The same managers under the other operation, a subresource
@@ -315,50 +400,54 @@ func TestMigratedEndStateRefusesALeftoverEntry(t *testing.T) {
 	csaOnly := []string{"kubectl-client-side-apply"}
 	withEdit := []string{"kubectl-client-side-apply", "kubectl-edit"}
 
-	if err := MigratedEndState(migrated(applied, kernel), withEdit, "farcast"); err != nil {
+	if err := MigratedEndState(migrated(applied, kernel), withEdit, "farcast", false); err != nil {
 		t.Errorf("a migrated object is refused: %v", err)
 	}
 	// A manager of csa may keep an entry on a subresource: only the main
 	// resource's Update entries are the client-side ones.
 	scale := ManagedFieldsEntry{Manager: "kubectl-edit", Operation: "Update", APIVersion: "autoscaling/v1", Subresource: "scale", FieldsType: "FieldsV1", FieldsV1: json.RawMessage(`{"f:spec":{"f:replicas":{}}}`)}
-	if err := MigratedEndState(migrated(applied, scale), withEdit, "farcast"); err != nil {
+	if err := MigratedEndState(migrated(applied, scale), withEdit, "farcast", false); err != nil {
 		t.Errorf("a subresource entry of a converted manager is refused: %v", err)
 	}
 
+	// hadApply is what each fixture implies of the object before its patch:
+	// a farcast/Apply entry it already carried, when the live list was kept
+	// with one in it; with a non-empty csa it does not change the rule.
 	cases := []struct {
-		name string
-		o    Object
-		csa  []string
-		want string
+		name     string
+		o        Object
+		csa      []string
+		hadApply bool
+		want     string
 	}{
-		{"the live list kept, and the annotation", migratable(), csaOnly,
+		{"the live list kept, and the annotation", migratable(), csaOnly, slices.ContainsFunc(migratable().Metadata.ManagedFields, IsOwnApply),
 			"kubectl-client-side-apply/Update still present; annotation kubectl.kubernetes.io/last-applied-configuration still present; farcast/Apply present 0 times, not once"},
-		{"the client-side entry left", migrated(applied, entry("kubectl-client-side-apply", "Update", "apps/v1", ownsAnnNot)), csaOnly,
+		{"the client-side entry left", migrated(applied, entry("kubectl-client-side-apply", "Update", "apps/v1", ownsAnnNot)), csaOnly, true,
 			"kubectl-client-side-apply/Update still present"},
-		{"another owner of the annotation left", migrated(applied, entry("kubectl-edit", "Update", "apps/v1", ownsAnn)), csaOnly,
+		{"another owner of the annotation left", migrated(applied, entry("kubectl-edit", "Update", "apps/v1", ownsAnn)), csaOnly, false,
 			"kubectl-edit/Update still present"},
 		// The live list was kept with a farcast/Apply entry already in it (an
 		// instance written again by kubectl after its migration, §6.6), and
 		// the server stripped the annotation's path from kubectl-edit's entry
 		// when it removed the annotation: only csa still names it.
-		{"a converted owner left without the annotation's path", migrated(applied, entry("kubectl-edit", "Update", "apps/v1", ownsAnnNot)), withEdit,
+		{"a converted owner left without the annotation's path", migrated(applied, entry("kubectl-edit", "Update", "apps/v1", ownsAnnNot)), withEdit, true,
 			"kubectl-edit/Update still present"},
 		{"a converted owner left, and kubectl-client-side-apply", migrated(applied,
-			entry("kubectl-edit", "Update", "apps/v1", ownsAnnNot), entry("kubectl-client-side-apply", "Update", "apps/v1", ownsAnnNot)), withEdit,
+			entry("kubectl-edit", "Update", "apps/v1", ownsAnnNot), entry("kubectl-client-side-apply", "Update", "apps/v1", ownsAnnNot)), withEdit, true,
 			"kubectl-client-side-apply/Update still present; kubectl-edit/Update still present"},
 		{"the annotation left", func() Object {
 			o := migrated(applied)
 			o.Metadata.Annotations = migratable().Metadata.Annotations
 			return o
-		}(), csaOnly,
+		}(), csaOnly, false,
 			"annotation kubectl.kubernetes.io/last-applied-configuration still present"},
-		{"no farcast entry", migrated(kernel), csaOnly, "farcast/Apply present 0 times, not once"},
-		{"two farcast Apply entries", migrated(applied, entry("farcast", "Apply", "apps/v1beta1", `{}`)), csaOnly, "farcast/Apply present 2 times, not once"},
-		{"a farcast Update entry", migrated(applied, entry("farcast", "Update", "apps/v1", `{"f:metadata":{}}`)), csaOnly, "farcast/Update present"},
+		{"no farcast entry", migrated(kernel), csaOnly, false, "farcast/Apply present 0 times, not once"},
+		{"two farcast Apply entries", migrated(applied, entry("farcast", "Apply", "apps/v1beta1", `{}`)), csaOnly, false, "farcast/Apply present 2 times, not once"},
+		{"a farcast Update entry", migrated(applied, entry("farcast", "Update", "apps/v1", `{"f:metadata":{}}`)), csaOnly, false, "farcast/Update present"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := MigratedEndState(tc.o, tc.csa, "farcast")
+			err := MigratedEndState(tc.o, tc.csa, "farcast", tc.hadApply)
 			if err == nil {
 				t.Fatal("the end state passed")
 			}
@@ -372,6 +461,79 @@ func TestMigratedEndStateRefusesALeftoverEntry(t *testing.T) {
 				t.Error("the error carries the annotation's value")
 			}
 		})
+	}
+}
+
+// TestMigratedEndStateAllowsAnAnnotationOnlyObject (design A30-8): an
+// operator's `kubectl apply --server-side` leaves kubectl/Apply and the
+// last-applied annotation, and no client-side manager. Its migration only
+// removes the annotation and adds no farcast/Apply, so that object ends
+// migrated with none. An object that had farcast's Apply entry before the
+// patch must still have exactly one, and one with client-side managers keeps
+// today's rule.
+func TestMigratedEndStateAllowsAnAnnotationOnlyObject(t *testing.T) {
+	serverSide := entry("kubectl", "Apply", "apps/v1", ownsAnn) // kubectl's own csaupgrade renamed kubectl-client-side-apply
+	before := migratable()
+	before.Metadata.ManagedFields = []ManagedFieldsEntry{serverSide}
+	csa, err := ClientSideManagers(before.Metadata.ManagedFields)
+	if err != nil || len(csa) != 0 {
+		t.Fatalf("ClientSideManagers of kubectl/Apply = %q, %v; want none", csa, err)
+	}
+	hadApply := slices.ContainsFunc(before.Metadata.ManagedFields, IsOwnApply)
+	if hadApply {
+		t.Fatal("kubectl/Apply read as farcast's own Apply")
+	}
+	patch, err := MigrationPatch(before, csa, "farcast")
+	if err != nil || !strings.Contains(string(patch), `"op":"remove"`) {
+		t.Fatalf("an annotation-only object's patch = %s, %v; want the annotation's removal", patch, err)
+	}
+	// As the API server leaves it: the annotation gone, and its path
+	// stripped from kubectl/Apply's fields.
+	after := func(entries ...ManagedFieldsEntry) Object {
+		o := migratable()
+		o.Metadata.Annotations = map[string]string{"other": "x"}
+		o.Metadata.ManagedFields = entries
+		return o
+	}
+	stripped := entry("kubectl", "Apply", "apps/v1", ownsAnnRemoved)
+	own := entry("farcast", "Apply", "apps/v1", ownsAnnRemoved)
+
+	if err := MigratedEndState(after(stripped), csa, "farcast", hadApply); err != nil {
+		t.Errorf("csa empty, no farcast/Apply before or after, the annotation gone: %v", err)
+	}
+	if err := MigratedEndState(after(stripped, own), nil, "farcast", true); err != nil {
+		t.Errorf("csa empty, farcast/Apply before and after: %v", err)
+	}
+	for _, row := range []struct {
+		name     string
+		o        Object
+		csa      []string
+		hadApply bool
+		want     string
+	}{
+		{"csa empty, hadApply, and the entry gone after", after(stripped), nil, true, "farcast/Apply present 0 times, not once"},
+		{"csa empty, no farcast/Apply before, and one after", after(stripped, own), nil, false, "farcast/Apply present 1 times, where the object had none"},
+		{"csa empty, the annotation left", func() Object {
+			o := after(stripped)
+			o.Metadata.Annotations = migratable().Metadata.Annotations
+			return o
+		}(), nil, false, "annotation kubectl.kubernetes.io/last-applied-configuration still present"},
+		{"csa non-empty, no farcast/Apply after", after(stripped), []string{"kubectl-client-side-apply"}, false, "farcast/Apply present 0 times, not once"},
+		{"csa non-empty and hadApply, no farcast/Apply after", after(stripped), []string{"kubectl-client-side-apply"}, true, "farcast/Apply present 0 times, not once"},
+	} {
+		err := MigratedEndState(row.o, row.csa, "farcast", row.hadApply)
+		if !errors.Is(err, ErrNotMigrated) || err.Error() != row.want {
+			t.Errorf("%s: MigratedEndState = %v, want %q", row.name, err, row.want)
+		}
+		if err != nil && strings.Contains(err.Error(), "MARKER-VALUE") {
+			t.Errorf("%s: the refusal carries the annotation's value", row.name)
+		}
+	}
+	// csa non-empty: exactly one, today's rule, whatever hadApply says.
+	for _, had := range []bool{false, true} {
+		if err := MigratedEndState(after(stripped, own), []string{"kubectl-client-side-apply"}, "farcast", had); err != nil {
+			t.Errorf("csa non-empty, hadApply %v, one farcast/Apply after: %v", had, err)
+		}
 	}
 }
 
@@ -390,7 +552,7 @@ func TestMigrationRoundTrip(t *testing.T) {
 	after := o
 	after.Metadata.ManagedFields = up
 	after.Metadata.Annotations = map[string]string{"other": "x"}
-	if err := MigratedEndState(after, csa, "farcast"); err != nil {
+	if err := MigratedEndState(after, csa, "farcast", slices.ContainsFunc(o.Metadata.ManagedFields, IsOwnApply)); err != nil {
 		t.Errorf("the rewritten object is not in the end state: %v", err)
 	}
 	if again, err := MigrationPatch(after, csa, "farcast"); again != nil || err != nil {

@@ -115,6 +115,83 @@ func (c *Client) NamespaceUID(ctx context.Context, name string) (string, error) 
 	return uid, nil
 }
 
+// lastAppliedAnnotation is kubectl's client-side apply's annotation: on an
+// object an older farcast applied with kubectl, a copy of every field it
+// applied, a Secret's values included.
+const lastAppliedAnnotation = "kubectl.kubernetes.io/last-applied-configuration"
+
+// blankLastApplied keeps the last-applied annotation's key on o and empties
+// its value, so nothing a caller prints or binds can carry it (ADR 0023
+// §6.4). Every reader of the annotation tests its key alone:
+// kube.ClientSideTrace, kube.MigrationPatch and kube.MigratedEndState.
+func blankLastApplied(o *kube.Object) {
+	if _, ok := o.Metadata.Annotations[lastAppliedAnnotation]; ok {
+		o.Metadata.Annotations[lastAppliedAnnotation] = ""
+	}
+}
+
+// ListMeta lists one kind's objects, metadata only: kube.Client.ListObjects,
+// k.ListPath(namespace) with the label selector, "" being every namespace,
+// paged (ADR 0023 §2.3). It is for migrate's discovery (§6.2). A Secret's
+// data and stringData are never decoded. Its last-applied annotation, which
+// on a Secret kubectl applied holds a copy of them, is decoded into memory
+// with the metadata; each object is returned with that annotation's key and
+// an empty value (blankLastApplied).
+func (c *Client) ListMeta(ctx context.Context, k kube.Kind, namespace, selector string) ([]kube.Object, error) {
+	if c.kube == nil {
+		return nil, inProcessOnly("ListMeta")
+	}
+	objs, err := c.kube.ListObjects(ctx, k, namespace, selector)
+	c.flushWarnings()
+	if err != nil {
+		return nil, err
+	}
+	for i := range objs {
+		blankLastApplied(&objs[i])
+	}
+	return objs, nil
+}
+
+// GetMeta reads one object's metadata: kube.Client.GetObject (ADR 0023
+// §2.3), for migrate's re-read before and after each rewrite (§6.4), and
+// git-credential's Secret read (§9.8). As with ListMeta, a Secret's data and
+// stringData are never decoded, and the last-applied annotation is returned
+// with its key and an empty value.
+func (c *Client) GetMeta(ctx context.Context, k kube.Kind, namespace, name string) (kube.Object, error) {
+	if c.kube == nil {
+		return kube.Object{}, inProcessOnly("GetMeta")
+	}
+	o, err := c.kube.GetObject(ctx, k, namespace, name)
+	c.flushWarnings()
+	if err != nil {
+		return kube.Object{}, err
+	}
+	blankLastApplied(&o)
+	return o, nil
+}
+
+// PatchManagedFields sends migrate's one write, a JSON patch of an object's
+// managed fields and its last-applied annotation (ADR 0023 §6.3):
+// kube.Client.PatchJSON, as fieldManager farcast, its answer metadata only,
+// with the last-applied annotation's value emptied as GetMeta empties it. A
+// reader client refuses it before anything is sent, a token included. It is
+// never retried here: migrate's loop, from M2.7b, is to retry a 409.
+func (c *Client) PatchManagedFields(ctx context.Context, k kube.Kind, namespace, name string, patch []byte) (kube.Object, error) {
+	if err := c.neverWrites(); err != nil {
+		return kube.Object{}, err
+	}
+	if c.kube == nil {
+		return kube.Object{}, inProcessOnly("PatchManagedFields")
+	}
+	o, err := c.kube.PatchJSON(ctx, k, namespace, name, patch)
+	c.flushWarnings()
+	if err != nil {
+		return kube.Object{}, err
+	}
+	blankLastApplied(&o)
+	return o, nil
+}
+
 // inProcessOnly is the refusal, naming the method, of every exported method
 // but Apply on a Client that has no in-process client: nothing is run and
 // nothing is sent. Each of them begins with that check. Open always builds an

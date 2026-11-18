@@ -475,6 +475,7 @@ func TestAKubectlClientHasNoCanI(t *testing.T) {
 	c := newWithEnv("/cfg/instances/atlas/kubeconfig.yaml", []string{"PATH=" + bin})
 	ctx := context.Background()
 	pin := []byte(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"datasphered-pin","namespace":"farcast-system","resourceVersion":"7"},"data":{"pin":"x"}}`)
+	deployments, _ := kube.KindOf("apps/v1", "Deployment")
 	var out bytes.Buffer
 	for _, m := range []struct {
 		name string
@@ -541,6 +542,20 @@ func TestAKubectlClientHasNoCanI(t *testing.T) {
 		}},
 		{"Logs, followed", func() (bool, error) {
 			return true, c.Logs(ctx, &out, "web", "deployment/api", 10, true, false)
+		}},
+		// ADR 0023 M2.7 (A30-15): migrate's three calls refuse too, until
+		// kubectl goes and this client with it.
+		{"ListMeta", func() (bool, error) {
+			objs, err := c.ListMeta(ctx, deployments, "", "app.kubernetes.io/managed-by=farcast")
+			return objs == nil, err
+		}},
+		{"GetMeta", func() (bool, error) {
+			o, err := c.GetMeta(ctx, deployments, "web", "api")
+			return o.Metadata.Name == "" && o.Kind.Kind == "", err
+		}},
+		{"PatchManagedFields", func() (bool, error) {
+			o, err := c.PatchManagedFields(ctx, deployments, "web", "api", []byte(`[]`))
+			return o.Metadata.Name == "" && o.Kind.Kind == "", err
 		}},
 	} {
 		method, _, _ := strings.Cut(m.name, ",")

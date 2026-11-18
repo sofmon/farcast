@@ -116,7 +116,7 @@ func planHeader(b plan.Bound) []string {
 }
 
 // isIrreversible is a fact that says it cannot be undone; the rendering puts
-// it before the others. No fact of ADR 0023 M2.6 is one.
+// it before the others. migrate's fact is one (ADR 0023 M2.7, A30-12).
 func isIrreversible(f plan.Fact) bool {
 	i, ok := factValue(f).(interface{ Irreversible() bool })
 	return ok && i.Irreversible()
@@ -179,6 +179,8 @@ func factLines(f plan.Fact, keys map[string]string, minted string) []string {
 			listText(f.Namespaces), listText(f.ConfigMaps))}
 	case plan.NoticeFact:
 		return noticeLines(f)
+	case plan.MigrateFact:
+		return migrateLines(f)
 	}
 	return fallbackLines(f)
 }
@@ -279,12 +281,21 @@ func imageLines(f plan.ImageFact) []string {
 	return lines
 }
 
-func writeLine(f plan.WriteFact) string {
-	obj := terminalText(f.Name)
-	if f.Namespace != "" {
-		obj = terminalText(f.Namespace) + "/" + obj
+// describeObject names one cluster object as an operator reads it: <Kind>
+// <namespace>/<name>, or <Kind> <name> for a cluster-scoped one (namespace
+// ""), each through terminalText, since the namespace and the name may be the
+// server's. A write, a migrated object, and migrate's blocks and errors are
+// all named by it (A30-13).
+func describeObject(kind, namespace, name string) string {
+	obj := terminalText(name)
+	if namespace != "" {
+		obj = terminalText(namespace) + "/" + obj
 	}
-	line := fmt.Sprintf("write: %s %s %s (%s)", terminalText(f.Method), terminalText(f.Kind), obj, terminalText(f.API))
+	return terminalText(kind) + " " + obj
+}
+
+func writeLine(f plan.WriteFact) string {
+	line := fmt.Sprintf("write: %s %s (%s)", terminalText(f.Method), describeObject(f.Kind, f.Namespace, f.Name), terminalText(f.API))
 	switch {
 	case f.ResourceVersion != "":
 		line += ", at resourceVersion " + terminalText(f.ResourceVersion)
@@ -442,6 +453,43 @@ func resetLines(f plan.ApplicationResetFact) []string {
 		fmt.Sprintf("  replicas: %s now, %d after; requests: %s now, %dm CPU and %d MiB after",
 			live, f.ReplicasAfter, liveReq, f.RequestsAfter.CPUMilli, f.RequestsAfter.MemMiB),
 	}
+}
+
+// migrateIrreversible closes the rendering of a migrate fact that cannot be
+// undone, design §6.7's paragraph verbatim.
+const migrateIrreversible = `This cannot be undone. Which fields kubectl's client-side apply owned is lost when its entry is renamed; ` +
+	`csaupgrade, kubectl's own routine for the same rename, says "This operation is not reversible". ` +
+	`A farcast older than this one must not write to the instance afterwards: its client-side apply would copy each Secret's keys back into an annotation.`
+
+// migrateLines is migrate's fact (A30-13): what it rewrites on the cluster and
+// deletes on this machine, one line per object, and, when it cannot be
+// undone, §6.7's paragraph, before the digest. Every string the server sent
+// (a namespace, a name, a uid, a manager) goes through terminalText, and
+// every list through listText.
+func migrateLines(f plan.MigrateFact) []string {
+	local := "no local file"
+	if len(f.Local) > 0 {
+		local = listText(f.Local)
+	}
+	irreversible := "no"
+	if f.CannotBeUndone {
+		irreversible = "yes"
+	}
+	lines := []string{fmt.Sprintf("migrate %d object(s) on the cluster; then delete %s; irreversible: %s", len(f.Objects), local, irreversible)}
+	for _, o := range f.Objects {
+		annotation := "absent"
+		if o.Annotation {
+			annotation = "present, removed"
+		}
+		lines = append(lines, fmt.Sprintf("  %s (%s, uid %s): client-side managers %s become farcast/Apply; "+
+			"their fields' sha256 %s; last-applied annotation %s; other managers kept: %s",
+			describeObject(o.Kind, o.Namespace, o.Name), terminalText(o.API), terminalText(o.UID), listText(o.CSAManagers),
+			terminalText(o.CSAFieldsSHA256), annotation, listText(o.OtherManagers)))
+	}
+	if f.CannotBeUndone {
+		lines = append(lines, "  "+migrateIrreversible)
+	}
+	return lines
 }
 
 // noticeLines is a notice in the command's own words. A notice of several

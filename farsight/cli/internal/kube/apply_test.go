@@ -91,6 +91,86 @@ func TestApplyIsOneServerSideApply(t *testing.T) {
 	}
 }
 
+// TestEveryWriteNamesFarcast (design §1, A30-9, mutation row 102): every
+// write the package makes names farcast's field manager explicitly, so the
+// API server never derives one from the User-Agent: Apply, the pin's create
+// and replace (CreateConfigMap, ReplaceConfigMap) and the migration's
+// PatchJSON, each sent as the writer. DeleteSecret is exempt until ADR 0023
+// M2.8: a DELETE carries DeleteOptions, which has no field manager.
+func TestEveryWriteNamesFarcast(t *testing.T) {
+	s := kubetest.New(t)
+	s.Put(clientSideApplied("v1", "ConfigMap", "web", "settings", nil))
+	c, _ := connect(t, s, "writer")
+	ctx := t.Context()
+	configmaps := mustKind(t, "v1", "ConfigMap")
+
+	o, err := c.GetObject(ctx, configmaps, "web", "settings")
+	if err != nil {
+		t.Fatal(err)
+	}
+	csa, err := kube.ClientSideManagers(o.Metadata.ManagedFields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	patch, err := kube.MigrationPatch(o, csa, kube.FieldManager)
+	if err != nil || patch == nil {
+		t.Fatalf("MigrationPatch = %s, %v", patch, err)
+	}
+	pin := func(rv string) []byte {
+		md := `"name":"datasphered-pin","namespace":"farcast-system"`
+		if rv != "" {
+			md += `,"resourceVersion":"` + rv + `"`
+		}
+		return []byte(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{` + md + `},"data":{"pin":"1"}}`)
+	}
+	// The migration's patch is guarded on the resourceVersion it was read
+	// at, so it goes first, and the apply last, as a later write would.
+	writes := []struct {
+		name   string
+		method string
+		path   string
+		send   func() error
+	}{
+		{"PatchJSON", http.MethodPatch, "/api/v1/namespaces/web/configmaps/settings", func() error {
+			_, err := c.PatchJSON(ctx, configmaps, "web", "settings", patch)
+			return err
+		}},
+		{"CreateConfigMap", http.MethodPost, "/api/v1/namespaces/farcast-system/configmaps", func() error {
+			return c.CreateConfigMap(ctx, pin(""))
+		}},
+		{"ReplaceConfigMap", http.MethodPut, "/api/v1/namespaces/farcast-system/configmaps/datasphered-pin", func() error {
+			cm, err := c.GetConfigMap(ctx, "farcast-system", "datasphered-pin")
+			if err != nil {
+				return err
+			}
+			return c.ReplaceConfigMap(ctx, pin(cm.Metadata.ResourceVersion))
+		}},
+		{"Apply", http.MethodPatch, "/api/v1/namespaces/web/configmaps/settings", func() error {
+			_, err := c.Apply(ctx, splitOne(t, settingsV2), true)
+			return err
+		}},
+	}
+	for _, w := range writes {
+		before := len(s.Requests())
+		if err := w.send(); err != nil {
+			t.Fatalf("%s: %v", w.name, err)
+		}
+		var sent []kubetest.Request
+		for _, r := range s.Requests()[before:] {
+			if r.Method == w.method && r.Path == w.path {
+				sent = append(sent, r)
+			}
+		}
+		if len(sent) != 1 {
+			t.Fatalf("%s: %d %s requests to %s, want 1", w.name, len(sent), w.method, w.path)
+		}
+		r := sent[0]
+		if q := query(t, r); len(q["fieldManager"]) != 1 || q.Get("fieldManager") != kube.FieldManager || r.As != "writer" {
+			t.Errorf("%s sent ?%s as %q; want exactly one fieldManager=farcast, as the writer", w.name, r.RawQuery, r.As)
+		}
+	}
+}
+
 // TestApplyConflictSurfacesFieldConflicts: a 409 whose causes are
 // FieldManagerConflict comes back as an APIError FieldConflicts reads, and
 // is not retried.
