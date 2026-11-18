@@ -2,7 +2,7 @@
 
 From [ADR 0023](../adr/0023-one-download-farcast.md) M2.7b, which is not built at the commit this runbook is written against, farcast is to write to a cluster with its own server-side apply, not kubectl. An instance an older farcast wrote is then migrated once: each object's client-side apply entry is renamed to farcast's, and kubectl's last-applied annotation is removed. farcast's tests run against `kubetest`, a local emulation of the API server. kubetest does not track ownership field by field, does not default, and follows no generation rule of a real server. So it cannot show whether a migrated object keeps a field farcast later drops, whether the first apply after a migration rolls a workload, or what the server records for a patch. This runbook runs farcast's real-API suite against a real `kube-apiserver` and `etcd`, from envtest v1.36.2. They run on the keeper VM, listen only on that VM's loopback, and are reached from the Mac through `ssh -L`. The run sits between M2.7a and M2.7b: the migration is built only after it.
 
-**Status.** *Written 2026-11-18 against M2.7a; not run.*
+**Status.** *Written 2026-11-18 against M2.7a. Run once on 2026-11-18, from 2728e5f; the Results are below. A re-run is due before M2.7b's commit (the M2 design's §31, "The re-run").*
 
 **It records:**
 1. whether a field that a migrated object's manifest later drops is removed by farcast's next apply, for §6.8's seven cases; and whether mutation row 104's mutant is killed there;
@@ -54,9 +54,9 @@ Throughout:
   ```
   - The script reaches the VM on stdin, under a quoted delimiter, so nothing in it is expanded on the Mac, and the steps' own quotes need no escaping.
   - From R3 on, each step starts with `cd "$D"`, as above. R2 makes `$D`, and R9's checks run after it is deleted, so those two leave the `cd` out.
-  - `$K` is kubectl as this run uses it: its own kubeconfig, and its discovery and HTTP caches under `$D`, so nothing lands in the account's `~/.kube/cache`. `KUBERC=off` and `--cache-dir` are *to be confirmed on the VM*.
+  - `$K` is kubectl as this run uses it: its own kubeconfig, and its discovery and HTTP caches under `$D`, so nothing lands in the account's `~/.kube/cache`. `--cache-dir` is *confirmed on the VM, 2026-11-18*: no discovery cache landed outside `$D`. Every `$K` call ran with `KUBERC=off` and succeeded; what it suppresses was not observed.
 
-A flag below taken from documentation, and not yet run, is marked *to be confirmed on the VM*. A flag that has to change is recorded in §31, and this runbook is corrected in place with a dated note.
+A flag below taken from documentation, and not yet run, was marked *to be confirmed on the VM*. A flag that has to change is recorded in §31, and this runbook is corrected in place with a dated note. *2026-11-18: every mark ran without error, and none had to change. Each now reads "confirmed on the VM", except `KUBERC=off`, whose effect was not observed.*
 
 ---
 
@@ -71,7 +71,8 @@ Before R2, the agent presents:
 - the account: the VM's existing one, which `$VM` names;
 - the loopback ports: 2379, 2380 and 6443 on the VM, and 16443 on the Mac;
 - about 45 minutes, and USD 0;
-- what this exposes (above).
+- what this exposes (above);
+- for a re-run, the tree it builds from: M2.7b's uncommitted tree, and the HEAD it sits on (R1 step 7's dated note; the M2 design's A30-1).
 
 Then it waits for the operator's yes in this session. Approval does not carry over from another run or walk, as in [adr-0023-m2-probe-walk.md](adr-0023-m2-probe-walk.md).
 
@@ -97,7 +98,7 @@ Then it waits for the operator's yes in this session. Approval does not carry ov
    printf '{"Replace":{"%s":"%s"}}\n' "$PWD/farsight/cli/internal/kube/migrate.go" "$RUN/row104/migrate.go" >"$RUN/row104/overlay.json"
    ```
    - The one edit is in `upgradeOne`, right after the conversion inside `if target < 0`: the converted entry loses `f:metadata`'s `f:labels`, so it owns no label, and keeps every other field it owned, so it is not empty. That is mutation row 104 as the M2 design's §30 re-points it, amended 2026-11-18: a converted entry left with `fieldsV1` `{}` may be pruned by the server *(inferred: not in the saved sources)*, and the end-state check would then refuse before the stuck-field assertion.
-   - Under it, the label `farcast.sofmon.com/instance`, which the subtest `a label leaves` drops in its v2, is owned by no manager after the migration. So v2's forced apply should leave it *(inferred from server-side apply's removal rule, which removes only a field the applier owned)*, and that subtest fails at `stuck field: `.
+   - Under it, the label `farcast.sofmon.com/instance`, which the subtest `a label leaves` drops in its v2, is owned by no manager after the migration. So v2's forced apply should leave it *(inferred from server-side apply's removal rule, which removes only a field the applier owned)*, and that subtest fails at `stuck field: `. *Confirmed by the run, 2026-11-18: the mutant failed there and nowhere else.*
    - `diff` must print exactly that one added line. Anything else stops the run before R2.
 7. **The test binaries**, built once, at the M2.7a commit, from a clean tree. A re-run builds from the tree the M2 design's A30-1 names, and records its tree hash. One binary per suite means one firewall rule each, should loopback dials ever need one *(inferred: they do not)*.
    ```bash
@@ -113,6 +114,18 @@ Then it waits for the operator's yes in this session. Approval does not carry ov
    env GOWORK=off GOTOOLCHAIN=go1.27.4 GOPROXY=off GOFLAGS=-mod=vendor \
      go test -c -tags realapi -overlay "$RUN/row104/overlay.json" -o "$RUN/kube-realapi-row104.test" ./farsight/cli/internal/kube/
    ```
+   - *Corrected 2026-11-18, for a re-run on an uncommitted tree.* The M2 design's A30-1 names M2.7b's tree before its commit, and R0 names it to the operator. In place of the check above, the agent hashes the working tree through a throwaway index under `$RUN`, never the real index or the stash. `.claude/` is gitignored, so `git add -A` leaves it out:
+     ```bash
+     : "${VM:?}" "${RUN:?}"
+     git rev-parse HEAD
+     GIT_INDEX_FILE="$RUN/tree.index" git read-tree HEAD && GIT_INDEX_FILE="$RUN/tree.index" git add -A && GIT_INDEX_FILE="$RUN/tree.index" git write-tree >"$RUN/tree-before.txt" && cat "$RUN/tree-before.txt"
+     ```
+     This runs before the builds above: three, or two when row 104's mutant is not run (no `-overlay` build). After them, the same hash is taken again, and the run stops unless it is equal:
+     ```bash
+     : "${VM:?}" "${RUN:?}"
+     GIT_INDEX_FILE="$RUN/tree.index" git add -A && GIT_INDEX_FILE="$RUN/tree.index" git write-tree | diff "$RUN/tree-before.txt" - && echo 'the tree did not change' || echo 'STOP: the tree changed during the builds'
+     ```
+     R8 records the tree hash and the HEAD it sits on.
 
 ## R2. Download, on the VM
 
@@ -126,19 +139,19 @@ curl -fL --proto '=https' --tlsv1.2 -O https://github.com/kubernetes-sigs/contro
 cat envtest-v1.36.2-linux-arm64.tar.gz.sha512
 ```
 - `mkdir` and `cd` are two commands, so under `set -e` an existing `$D` ends the step before anything is downloaded. **If `$D` already exists, stop.** It is left from an earlier run: finish that run's R9 first.
-- The sidecar's name, `….tar.gz.sha512`, is *to be confirmed on the VM*. If its download fails, the step ends there, with the computed size and sha512 already printed. Nothing is extracted: the operator decides, from the other two values, whether the run goes on, and §31 records that the sidecar was not read.
+- The sidecar's name, `….tar.gz.sha512`, is *confirmed on the VM, 2026-11-18*. Its line names the archive with a leading `/`, so `sha512sum -c` would not read it as is; this step compares by eye and does not use `-c`. If its download fails, the step ends there, with the computed size and sha512 already printed. Nothing is extracted: the operator decides, from the other two values, whether the run goes on, and §31 records that the sidecar was not read.
 - **The operator compares three values** before anything is extracted:
   - the computed sha512;
   - the sidecar's;
   - the full value for v1.36.2 linux/arm64 in controller-tools' `envtest-releases.yaml`, read in their own browser.
 
   All three must be equal, beginning `2d72ee985a8e262a` and ending `c6d824dd9c6649ac`.
-- **The size is a sanity check only; the sha512 binds.** `stat` prints bytes. GitHub's 45.1 MB is about 45.1 million bytes if its MB is decimal, and about 47.3 million if it is binary, as GitHub's asset sizes are believed to be *(inferred)*. A byte count far outside that range is a mismatch.
+- **The size is a sanity check only; the sha512 binds.** `stat` prints bytes. GitHub's 45.1 MB is binary: the run measured 47,304,572 bytes, 45.11 MiB (2026-11-18). A byte count far from that is a mismatch.
 - **On any mismatch:** stop, `rm -rf "$D"`, and record it.
 
 ## R3. Extract
 
-1. `tar -tvzf envtest-v1.36.2-linux-arm64.tar.gz` must list only the regular files `controller-tools/envtest/kube-apiserver`, `etcd` and `kubectl`, and their directories. The prefix is *to be confirmed on the VM*. Any absolute path, any `..`, any link, or any other entry stops the run.
+1. `tar -tvzf envtest-v1.36.2-linux-arm64.tar.gz` must list only the regular files `controller-tools/envtest/kube-apiserver`, `etcd` and `kubectl`, and their directories. The prefix is *confirmed on the VM, 2026-11-18*: one directory and the three regular files. Any absolute path, any `..`, any link, or any other entry stops the run.
 2. Then:
    ```bash
    tar -xzf envtest-v1.36.2-linux-arm64.tar.gz --no-same-owner --no-same-permissions -C "$D"
@@ -176,12 +189,12 @@ current-context: realapi
 EOF
 ```
 - `wc` prints `64`, the byte count only.
-- The kubeconfig names the server `https://127.0.0.1:6443`, the certificate R5 makes, and a user whose `tokenFile` is `$D/token`. So it holds no token. `tokenFile` is *to be confirmed on the VM*.
-- The static-token file's format (`token,user,uid,group`) and `system:masters` bypassing RBAC under `--authorization-mode RBAC` are from documentation, *to be confirmed on the VM*.
+- The kubeconfig names the server `https://127.0.0.1:6443`, the certificate R5 makes, and a user whose `tokenFile` is `$D/token`. So it holds no token. `tokenFile` is *confirmed on the VM, 2026-11-18*.
+- The static-token file's format (`token,user,uid,group`) and `system:masters` bypassing RBAC under `--authorization-mode RBAC` are from documentation, *confirmed on the VM, 2026-11-18*.
 
 ## R5. etcd, then kube-apiserver, on 127.0.0.1
 
-As envtest starts them, with its client certificates replaced by a static token. Every flag here is *to be confirmed on the VM*.
+As envtest starts them, with its client certificates replaced by a static token. Every flag here is *confirmed on the VM, 2026-11-18*.
 ```bash
 nohup "$B/etcd" --name realapi --data-dir "$D/etcd-data" \
   --listen-client-urls http://127.0.0.1:2379 --advertise-client-urls http://127.0.0.1:2379 \
@@ -266,13 +279,13 @@ export FARCAST_REALAPI_ENDPOINT=127.0.0.1:16443 FARCAST_REALAPI_CA_FILE="$RUN/ap
 lsof -nP -iTCP:16443 -sTCP:LISTEN >/dev/null || echo 'STOP: the forward is gone; start it again as R6 does'
 (cd farsight/cli/internal/kube && FARCAST_REALAPI_KUBECTL_NAMESPACE=realapi-kubectl "$RUN/kube-realapi.test" -test.run '^TestEmulatedSeedMatchesKubectl$' -test.v -test.count=1 >"$RUN/kubectl.out" 2>&1); echo "exit $?"
 ```
-- kubectl's apply is client-side by default at 1.36, so each object should show `kubectl-client-side-apply`/Update. That is *to be confirmed on the VM*.
+- kubectl's apply is client-side by default at 1.36, so each object should show `kubectl-client-side-apply`/Update. That is *confirmed on the VM, 2026-11-18*.
 - If the two seeds differ, the test's `fact:` lines say how. The emulated seed is then corrected, and the stuck-field cases run again under the re-run rule (What the run decides).
 
 ## R8. Results, scrubbed
 
 This runbook's Results and the M2 design's §31 hold only:
-- the commit the binaries were built from (R1 step 7);
+- the commit the binaries were built from, and its tree hash (R1 step 7); for a re-run from an uncommitted tree, the tree hash and the HEAD it sits on;
 - the versions, the archive's byte count, and that its sha512 matched both published values;
 - each test's PASS or FAIL, `TestApplyRefusesAStaleResourceVersion`'s two subtests' included, and whether row 104's mutant was killed;
 - the facts each test records: managers, operations, subresources, field paths, HTTP codes, kinds and generation moves;
@@ -287,15 +300,27 @@ Each record follows the scrub rule (Throughout).
 
 ## R9. Teardown
 
-1. On the VM, in one shell:
+1. On the VM, in one shell. `kube-apiserver` is stopped first, and `etcd` only once it has exited.
    ```bash
-   for p in apiserver etcd; do kill "$(cat "$D/$p.pid")" 2>/dev/null || echo "$p: not running"; done
+   stop() {  # $1: the pid file's name; fails when that process outlives 30 s
+     p=$(cat "$D/$1.pid" 2>/dev/null) || { echo "$1: no pid file"; return 0; }
+     kill "$p" 2>/dev/null || { echo "$1: not running"; return 0; }
+     for i in $(seq 30); do kill -0 "$p" 2>/dev/null || return 0; sleep 1; done
+     return 1
+   }
+   stop apiserver || { echo 'STOP: kube-apiserver still runs 30 s after SIGTERM; etcd is left running, nothing deleted'; exit 1; }
+   stop etcd || { echo 'STOP: etcd still runs 30 s after SIGTERM; nothing deleted'; exit 1; }
    for i in $(seq 30); do pgrep -u "$(id -u)" -x 'etcd|kube-apiserver|kubectl' >/dev/null || break; sleep 1; done
-   if pgrep -u "$(id -u)" -x 'etcd|kube-apiserver|kubectl'; then echo 'STOP: still running; nothing deleted'; exit 1; fi
+   if pgrep -u "$(id -u)" -x 'etcd|kube-apiserver|kubectl' >/dev/null; then echo 'STOP: still running; nothing deleted'; exit 1; fi
    cd ~ && rm -rf "$D" && echo 'the run directory is deleted'
    ```
-   - Each `kill` that finds its process gone says so and goes on, so a server that already exited (as when it would not start) still leaves the other to be stopped and `$D` to be deleted.
+   - Each `stop` that finds its process gone says so and goes on, so a server that already exited (as when it would not start) still leaves the other to be stopped and `$D` to be deleted.
+   - A `kube-apiserver` that outlives its 30 s leaves `etcd` running, so it can still shut down cleanly.
    - `$D` is deleted only when none of the three runs any more. On a `STOP` line, the operator decides what is stopped, and this step runs again.
+   - *Corrected 2026-11-18.* The first run sent SIGTERM to both servers at once. `kube-apiserver`, with its etcd gone, kept retrying it for over 90 s, so the step stopped at `STOP` with nothing deleted. The operator then approved a SIGKILL, and the step ran again and passed. If that recurs, the remedy for the operator to approve is this, which sends nothing unless the pid file still names the run's own binary:
+     ```bash
+     p=$(cat "$D/apiserver.pid"); if [ "$(readlink "/proc/$p/exe" 2>/dev/null)" = "$B/kube-apiserver" ]; then kill -9 "$p" && echo 'apiserver: SIGKILL sent'; else echo 'apiserver.pid does not name the run'"'"'s kube-apiserver; nothing sent'; fi
+     ```
 2. Check on the VM, in a VM shell without the `cd "$D"`. Each line prints its own verdict:
    ```bash
    if ss -ltnH '( sport = :2379 or sport = :2380 or sport = :6443 )' | grep -q .; then echo 'STOP: a port still listens'; else echo 'ports: free'; fi
@@ -352,4 +377,55 @@ The run's scrubbed outcome is written into Results below and into the M2 design 
 
 ## Results
 
-Not run.
+### Run 1, 2026-11-18
+
+**The run.**
+- Built on the Mac from 2728e5f (M2.7a), on a clean tree whose hash is 8bde46e9807fbe09518e95bd04ff1fc1fdbc8c23. The servers ran as the VM's existing account.
+- Versions: `kube-apiserver` v1.36.2, `etcd` 3.6.8, `kubectl` v1.36.2.
+- The archive: 47,304,572 bytes. Its sha512 equalled the `.sha512` asset and, by the operator's comparison, `envtest-releases.yaml`.
+- Every flag marked *to be confirmed on the VM* ran without error, and none had to change. `KUBERC=off`'s effect was not observed.
+- **Teardown:** R9 first stopped at `STOP`, because `kube-apiserver` kept retrying its stopped etcd. A SIGKILL, which the operator approved, ended it; R9 then ran again and every check passed. R9 is corrected (dated note).
+- **Agent-side variations, none changing what was tested:**
+  - the forward ran as a background job of the agent's shell, by `exec`, with `-o ServerAliveInterval=30`;
+  - `curl -s` and `scp -q`;
+  - R1 also recorded the tree hash.
+
+**Each test.** The kube suite counted 12 results, and the cli suite 1.
+
+| Test | Result |
+|---|---|
+| `TestMigrationRemovesAFieldLaterDroppedFromTheManifest` | PASS, all seven cases; each object's only entry afterwards is `farcast/Apply` |
+| `TestAnnotationRemovalInTheSamePatchLeavesNoUpdateEntry` | PASS: no `farcast`/Update entry, in the answer or the read-back, for a Deployment, a Secret or a ConfigMap |
+| `TestRealAPIKeepsTheLiveListOnAnUndecodableRewrite` | PASS: 200, the live list kept; the same patch's annotation removal took effect |
+| `TestMigrationIsResumable` | PASS: 409 at a moved resourceVersion; afterwards `farcast/Apply` and `realapi-other/Apply` |
+| `TestFirstApplyAfterMigrationChangesNoGeneration` | PASS: the migration moved a Deployment's generation by one (the annotation); the first apply moved none and added no entry |
+| `TestReapplyingAnUnchangedJobIsANoOp` | PASS: 200, forced and unforced, with nothing moved |
+| `TestApplyRefusesAStaleResourceVersion` | PASS: a stale rv is answered 409 and nothing is written; a deleted Secret's rv is answered 201, recreating it |
+| `TestMetadataOnlyListsCarryNoSecretData` | PASS: every metadata-only answer carries `apiVersion`, `kind` and `metadata` only |
+| `TestStatusCauseWireName` | PASS: 409, cause type `FieldManagerConflict` |
+| `TestTypedListItemsCarryNoKind` | PASS: typed items carry no kind; partial items are `PartialObjectMetadata` |
+| `TestKernelWritesAreTrackedAsTechnocore` | FAIL in `Scale` only: the `/scale` write of 0 left no `technocore` entry. `SetRequests` and `SaveConfigMap` are `technocore/Update` |
+| `TestMigrationLeavesAnotherManagersFieldAlone` | FAIL at its premise only: the kernel's `/scale` write of 0 left no entry to keep. The migration and the forced reset of `replicas` passed |
+| `TestEveryRenderedStreamAppliesOnARealServer` | FAIL: all 23 streams applied twice with no refusal, but the build and fetch NetworkPolicies moved their generation on the second apply |
+| Row 104's mutant | killed, in `a_label_leaves` only |
+| `TestEmulatedSeedMatchesKubectl` | PASS, all four kinds equal |
+
+**Two checks beyond this runbook**, made against the same server with the run's own kubectl:
+- **`ingress: []`.** A NetworkPolicy carrying it moves its generation on every unchanged server-side apply; without it, it does not. The stored object has no `ingress` field either way. Only the build and fetch renderers emit it.
+- **`/scale`.** Every write tried set 0; a non-zero count was not tried.
+  - A `/scale` write of 0 records no entry for its writer, and it removes `spec.replicas` from every existing entry, the Apply entry included. Why *(inferred, not run)*: a Scale of 0 carries no `replicas` field, because autoscaling/v1 omits an empty one, so its writer owns nothing.
+  - The same merge PATCH on the Deployment itself is recorded as its manager's Update.
+  - After a `/scale` write of 0, an unforced apply of `replicas` takes the field back with no conflict.
+- **`kubectl get`** leaves out managed fields unless `--show-managed-fields` is given.
+
+**What it decided** (the M2 design's §31):
+- the migration's single patch stands;
+- the egress policy's resourceVersion precondition is built in M2.7b, catching a concurrent change but not a deletion, which a 201 recreates;
+- row 104 is verified;
+- the build and fetch policies drop `ingress: []` in M2.7b;
+- the kernel's `/scale` write, always of 0, is untracked. That changes two of this suite's tests in M2.7b, and `run`'s stopped fact not at all. Whether it moves the time `run`'s adapted fact reads was not recorded.
+
+**Due: a re-run** on M2.7b's tree before its commit, because two renderers change and the egress policy's precondition changes `SplitStream`, `Apply` and the policy's renderer.
+- It runs R0–R6, R8 and R9, with R1 step 7's uncommitted-tree path.
+- Row 104's mutant (R1 step 6, R1 step 7's `-overlay` build, and R6's row-104 run and its grep) runs again only if M2.7b changes `upgradeOne`, and R7 only if the emulated seed changes. R8's grep then leaves out the outputs that were not made.
+- Until it runs, these are not run against a real server: the build and fetch renderers' fix, the precondition's rv-carrying policy apply, and the two reframed tests.
