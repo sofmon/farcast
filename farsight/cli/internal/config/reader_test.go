@@ -358,7 +358,7 @@ func TestReaderRoundTripsAndMerges(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	stale.Carrier = &Carrier{Type: "nlb", Endpoint: "34.0.0.5:443", ServerName: "fatline"}
+	stale.Carrier = &Carrier{Type: "nlb", Endpoint: "203.0.113.5:443", ServerName: "fatline"}
 	if err := d.SaveInstanceMetadata("atlas", stale); err != nil {
 		t.Fatalf("save over a newer reader: %v", err)
 	}
@@ -376,7 +376,7 @@ func TestReaderRoundTripsAndMerges(t *testing.T) {
 		!got.Reader.GrantedAt.Equal(want.GrantedAt) || got.Reader.Scope != want.Scope {
 		t.Errorf("reader after the merge = %+v, want %+v", got.Reader, want)
 	}
-	if got.Carrier == nil || got.Carrier.Endpoint != "34.0.0.5:443" {
+	if got.Carrier == nil || got.Carrier.Endpoint != "203.0.113.5:443" {
 		t.Errorf("the stale command's own change was lost: carrier = %+v", got.Carrier)
 	}
 

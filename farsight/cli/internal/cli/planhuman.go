@@ -12,6 +12,7 @@ import (
 	"github.com/sofmon/farcast/datasphere"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
 	"github.com/sofmon/farcast/farsight/cli/internal/plan"
+	pfetch "github.com/sofmon/farcast/planck/fetch"
 	"github.com/sofmon/farcast/technocore/kernel"
 )
 
@@ -162,7 +163,8 @@ func factLines(f plan.Fact, keys map[string]string, minted string) []string {
 		return []string{fmt.Sprintf("rotation: %d new key(s), handed to %d keyholder replica(s)", f.NewKeys, f.HandoverReplicas)}
 	case plan.FetchFact:
 		return []string{fmt.Sprintf("fetch: the manifest %s from %s at %s, read by the Job %s with %s",
-			terminalText(f.Manifest), terminalText(f.Repository), terminalText(f.Ref), terminalText(f.Job), terminalText(f.Fetcher))}
+			defaulted(f.Manifest, pfetch.DefaultManifest), terminalText(f.Repository), defaulted(f.Ref, fetchDefaultRef),
+			terminalText(f.Job), terminalText(f.Fetcher))}
 	case plan.RunFact:
 		return runLines(f)
 	case plan.BuildFact:
@@ -179,6 +181,16 @@ func factLines(f plan.Fact, keys map[string]string, minted string) []string {
 		return noticeLines(f)
 	}
 	return fallbackLines(f)
+}
+
+// defaulted is a flag's value as a fact binds it, given (A28-8): one that
+// was not given is bound as "", and reads as the value the command uses in
+// its place, said to be the default.
+func defaulted(given, def string) string {
+	if given == "" {
+		return def + " (the default)"
+	}
+	return terminalText(given)
 }
 
 // fallbackLines is a fact this farcast has no words for, shown as its JSON
@@ -398,7 +410,13 @@ func runLines(f plan.RunFact) []string {
 	if f.MeteringAdded {
 		metering = ns + " is added to what the kernel meters"
 	}
-	return append(lines, fmt.Sprintf("  other deployments kept in %s: %s; %s", ns, listText(f.OtherDeploymentsKept), metering))
+	lines = append(lines, fmt.Sprintf("  other deployments kept in %s: %s; %s", ns, listText(f.OtherDeploymentsKept), metering))
+	// While the spending reads at its limit the plan says so, in the line
+	// the review prints (A28-1): confirming it is the consent to deploying.
+	if f.LimitReached {
+		return append(lines, "  "+limitLine(terminalText(f.LimitReason)))
+	}
+	return append(lines, "  the instance's spending is not at its limit")
 }
 
 func resetLines(f plan.ApplicationResetFact) []string {

@@ -13,11 +13,16 @@ import (
 	fldeploy "github.com/sofmon/farcast/fatline/deploy"
 	"github.com/sofmon/farcast/fatline/policy"
 	"net/url"
+	"os"
+	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/goccy/go-yaml"
+	dsdeploy "github.com/sofmon/farcast/datasphere/deploy"
 	"github.com/sofmon/farcast/farsight/cli/internal/cluster"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
@@ -78,11 +83,67 @@ type fakeRunCluster struct {
 	// waitErr fails every WaitJob after the Job was applied, as the cluster
 	// client does when it cannot read the Job.
 	waitErr error
+
+	// cmErrs fails ConfigMapValue for ns/name/key, answering found as
+	// given: the cluster client answers a 403 found false, and a ConfigMap
+	// without the key found true (A28-4).
+	cmErrs map[string]cmFailure
+	// namespaces is what Namespaces lists, and nsErr fails it. The target
+	// namespace is absent unless listed, so every application is new.
+	namespaces []string
+	nsErr      error
+	// deployments answers DeploymentState by ns/name, and deployErrs fails
+	// it; an application in neither is absent, as the cluster client
+	// answers a 404 Status.
+	deployments map[string]cluster.DeploymentState
+	deployErrs  map[string]error
+	stateReads  []string
+	// onBuild runs as a build's WaitJob is asked, before it answers: the
+	// kernel acting while the builds run (A23-2).
+	onBuild func(job string)
+	// jobUIDs is the uid WaitJob answers for a Job, by name; "" when unset.
+	jobUIDs map[string]string
+	// rvs is the resourceVersion ConfigMapData answers for ns/name, and
+	// dataErrs fails it.
+	rvs      map[string]string
+	dataErrs map[string]error
+	// workloads is what Workloads lists, by namespace.
+	workloads map[string][]cluster.Workload
+	// uid is farcast-system's uid, as NamespaceUID answers it.
+	uid string
+	// gone is the Jobs JobState answers absent although they were applied:
+	// a fetch Job whose time ran out. jobStateErr fails JobState.
+	gone        map[string]bool
+	jobStateErr error
+	// jobStates counts JobState's reads.
+	jobStates int
+	// workloadReads is each namespace Workloads listed, and workloadsErr
+	// fails it.
+	workloadReads []string
+	workloadsErr  error
+}
+
+type cmFailure struct {
+	found bool
+	err   error
 }
 
 func (f *fakeRunCluster) NamespaceUID(context.Context, string) (string, error) {
 	f.uidReads++
-	return "", f.uidErr
+	return f.uid, f.uidErr
+}
+
+// JobState answers a Job that was applied, and not gone, as there, with its
+// uid; any other as absent, as the cluster client answers a 404 Status.
+func (f *fakeRunCluster) JobState(_ context.Context, _, name string) (cluster.JobResult, bool, error) {
+	f.jobStates++
+	if f.jobStateErr != nil {
+		return cluster.JobResult{}, false, f.jobStateErr
+	}
+	if !f.jobs[name] || f.gone[name] {
+		return cluster.JobResult{}, false, nil
+	}
+	return cluster.JobResult{Succeeded: true, UID: f.jobUIDs[name]}, true, nil
 }
 
 func (f *fakeRunCluster) Apply(_ context.Context, m []byte) error {
@@ -123,13 +184,17 @@ func (f *fakeRunCluster) WaitJob(_ context.Context, ns, name string, _ time.Dura
 	if f.waitErr != nil {
 		return cluster.JobResult{}, f.waitErr
 	}
+	uid := f.jobUIDs[name]
 	if strings.HasPrefix(name, "fetch-") {
-		return cluster.JobResult{Succeeded: !f.fetchFails, Message: f.report}, nil
+		return cluster.JobResult{Succeeded: !f.fetchFails, Message: f.report, UID: uid}, nil
+	}
+	if f.onBuild != nil {
+		f.onBuild(name)
 	}
 	if f.buildFails {
-		return cluster.JobResult{Succeeded: false, Message: "boom"}, nil
+		return cluster.JobResult{Succeeded: false, Message: "boom", UID: uid}, nil
 	}
-	return cluster.JobResult{Succeeded: true, Message: "sha256:" + strings.Repeat("c", 64)}, nil
+	return cluster.JobResult{Succeeded: true, Message: "sha256:" + strings.Repeat("c", 64), UID: uid}, nil
 }
 
 // JobLogs honours the tail it is asked for, because a fetch's whole output IS
@@ -157,8 +222,50 @@ func (f *fakeRunCluster) JobLogs(_ context.Context, _, job string, lines int) (s
 // ConfigMapValue answers the egress-policy read. An empty map is an instance
 // that has never deployed an application.
 func (f *fakeRunCluster) ConfigMapValue(_ context.Context, ns, name, key string) (string, bool, error) {
+	if e, failed := f.cmErrs[ns+"/"+name+"/"+key]; failed {
+		return "", e.found, e.err
+	}
 	v, ok := f.configMaps[ns+"/"+name+"/"+key]
 	return v, ok, nil
+}
+
+// ConfigMapData answers from configMaps too: a ConfigMap is there when one
+// of its keys is, and its data is every key under ns/name. Its
+// resourceVersion is rvs[ns/name].
+func (f *fakeRunCluster) ConfigMapData(_ context.Context, ns, name string) (map[string]string, string, bool, error) {
+	if err := f.dataErrs[ns+"/"+name]; err != nil {
+		return nil, "", false, err
+	}
+	var data map[string]string
+	for k, v := range f.configMaps {
+		if key, ok := strings.CutPrefix(k, ns+"/"+name+"/"); ok {
+			if data == nil {
+				data = map[string]string{}
+			}
+			data[key] = v
+		}
+	}
+	if data == nil {
+		return nil, "", false, nil
+	}
+	return data, f.rvs[ns+"/"+name], true, nil
+}
+
+func (f *fakeRunCluster) Namespaces(context.Context) ([]string, error) {
+	return f.namespaces, f.nsErr
+}
+
+func (f *fakeRunCluster) Workloads(_ context.Context, ns string) ([]cluster.Workload, error) {
+	f.workloadReads = append(f.workloadReads, ns)
+	return f.workloads[ns], f.workloadsErr
+}
+
+func (f *fakeRunCluster) DeploymentState(_ context.Context, ns, name string) (cluster.DeploymentState, error) {
+	f.stateReads = append(f.stateReads, ns+"/"+name)
+	if err := f.deployErrs[ns+"/"+name]; err != nil {
+		return cluster.DeploymentState{}, err
+	}
+	return f.deployments[ns+"/"+name], nil
 }
 
 func (f *fakeRunCluster) RolloutStatus(_ context.Context, ns, name string, _ time.Duration) error {
@@ -689,32 +796,235 @@ func TestStorageIsWiredWhenTheInstanceHasAKeyholder(t *testing.T) {
 
 // A machine without the CA key cannot mint an application's storage identity,
 // and must say so rather than deploy an application that reaches nothing.
+// It says so before anything is built (ADR 0023 M2.6d, A23-51 item 5,
+// A28-9): only the manifest read was applied, no scope was minted into the
+// keyring, and nothing was deployed. An empty ca.key, which SaveInstanceMTLS
+// writes for material with no CA key, is no key, as a missing one is not.
 func TestRunRefusesStorageWithoutTheCAKey(t *testing.T) {
+	for _, row := range []struct {
+		name   string
+		remove func(t *testing.T, dir config.Dir, mtls config.MTLSMaterial)
+	}{
+		{"an empty ca.key", func(t *testing.T, dir config.Dir, mtls config.MTLSMaterial) {
+			mtls.CAKeyPEM = nil
+			if err := dir.SaveInstanceMTLS("p43", mtls); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"no ca.key", func(t *testing.T, dir config.Dir, _ config.MTLSMaterial) {
+			if err := os.Remove(filepath.Join(dir.InstancePath("p43"), "fatline", "ca.key")); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			dir := config.Dir(t.TempDir())
+			meta := runnableInstance(t, dir, "p43")
+			meta.Keyholder = &config.Keyholder{Deployed: true}
+			if err := dir.SaveInstanceMetadata("p43", meta); err != nil {
+				t.Fatal(err)
+			}
+			mintKeyring(t, dir, "p43")
+			mtls, err := dir.LoadInstanceMTLS("p43")
+			if err != nil {
+				t.Fatal(err)
+			}
+			row.remove(t, dir, mtls)
+			keysBefore, err := dir.LoadInstanceKeyring("p43")
+			if err != nil {
+				t.Fatal(err)
+			}
+			env, _ := testEnv(dir, output.ModeHuman)
+			f := newFakeRun(twoAppManifest)
+			err = runCmd(f).Run(context.Background(), env, []string{"p43", "github.com/example/my-platform"})
+			want := `this machine holds no CA key for "p43", so it cannot give applications a storage identity; ` +
+				"deploy from the machine that installed the instance"
+			if err == nil || err.Error() != want {
+				t.Fatalf("err = %v;\nwant %q", err, want)
+			}
+			// The manifest read, and nothing after it: no build Job, no
+			// egress policy, no workload.
+			if len(f.applied) != 1 || len(docsIn(t, f.applied[0])) != 3 || !strings.Contains(f.applied[0], "name: fetch-") {
+				t.Errorf("applied %d streams, want only the manifest read's:\n%s", len(f.applied), strings.Join(f.applied, "\n=====\n"))
+			}
+			if builtAnything(t, f) {
+				t.Error("a build Job or a Deployment was applied before the refusal")
+			}
+			keysAfter, err := dir.LoadInstanceKeyring("p43")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(keysAfter) != string(keysBefore) {
+				t.Error("a storage scope was minted into keys.yaml before the refusal")
+			}
+		})
+	}
+
+	// The control: the refusal is about storage. With no keyholder
+	// deployed, a machine without the CA key wires no storage and deploys.
+	t.Run("no keyholder", func(t *testing.T) {
+		dir := config.Dir(t.TempDir())
+		runnableInstance(t, dir, "p43")
+		if err := os.Remove(filepath.Join(dir.InstancePath("p43"), "fatline", "ca.key")); err != nil {
+			t.Fatal(err)
+		}
+		env, _ := testEnv(dir, output.ModeHuman)
+		f := newFakeRun(twoAppManifest)
+		if err := runCmd(f).Run(context.Background(), env, []string{"p43", "github.com/example/my-platform"}); err != nil {
+			t.Fatalf("a run that wires no storage, without the CA key = %v; want it deployed", err)
+		}
+		if !builtAnything(t, f) {
+			t.Error("nothing was built or deployed")
+		}
+	})
+}
+
+// ADR 0023 M2.6d (A28-9): issueAppLeaves, which issues the real leaves after
+// the builds, refuses a CA key emptied since refuseNoCAKey passed in
+// refuseNoCAKey's words. Another mTLS file that is missing still fails
+// there, after the builds: the residual A28-9 records, whose words are the
+// load's.
+func TestIssueAppLeavesRefusesAKeyGoneSinceTheCheck(t *testing.T) {
 	dir := config.Dir(t.TempDir())
 	meta := runnableInstance(t, dir, "p43")
 	meta.Keyholder = &config.Keyholder{Deployed: true}
-	if err := dir.SaveInstanceMetadata("p43", meta); err != nil {
-		t.Fatal(err)
-	}
-	mintKeyring(t, dir, "p43")
 	mtls, err := dir.LoadInstanceMTLS("p43")
 	if err != nil {
 		t.Fatal(err)
 	}
-	mtls.CAKeyPEM = nil
+	if noKey, err := refuseNoCAKey(dir, meta); noKey != nil || err != nil {
+		t.Fatalf("refuseNoCAKey with the key = %v, %v", noKey, err)
+	}
+	if ca, issue, err := issueAppLeaves(dir, meta); err != nil || string(ca) != string(mtls.CACertPEM) || issue == nil {
+		t.Fatalf("issueAppLeaves with the key = %d bytes of CA, %t, %v; want the CA certificate and an issuer", len(ca), issue != nil, err)
+	}
+
+	emptied := mtls
+	emptied.CAKeyPEM = nil
+	if err := dir.SaveInstanceMTLS("p43", emptied); err != nil {
+		t.Fatal(err)
+	}
+	_, issue, err := issueAppLeaves(dir, meta)
+	if err == nil || issue != nil || err.Error() != noCAKey("p43").Error() {
+		t.Errorf("issueAppLeaves with an empty ca.key = %t, %v; want %q", issue != nil, err, noCAKey("p43"))
+	}
+
 	if err := dir.SaveInstanceMTLS("p43", mtls); err != nil {
 		t.Fatal(err)
 	}
-	env, _ := testEnv(dir, output.ModeHuman)
-	f := newFakeRun(twoAppManifest)
-	err = runCmd(f).Run(context.Background(), env, []string{"p43", "github.com/example/my-platform"})
-	if err == nil || !strings.Contains(err.Error(), "CA key") {
-		t.Fatalf("err = %v, want a refusal naming the missing CA key", err)
+	if err := os.Remove(filepath.Join(dir.InstancePath("p43"), "fatline", "server.key")); err != nil {
+		t.Fatal(err)
 	}
-	for name := range appliedKinds(t, f) {
-		if strings.HasPrefix(name, "Deployment/") {
-			t.Errorf("%s was deployed without a storage identity", name)
+	if noKey, err := refuseNoCAKey(dir, meta); noKey != nil || err != nil {
+		t.Errorf("refuseNoCAKey without server.key = %v, %v; it checks the CA key alone", noKey, err)
+	}
+	_, issue, err = issueAppLeaves(dir, meta)
+	if want := "read the instance CA so applications can verify the key holder: read server.key: "; err == nil || issue != nil || !strings.HasPrefix(err.Error(), want) {
+		t.Errorf("issueAppLeaves without server.key = %t, %v; want %q…", issue != nil, err, want)
+	}
+}
+
+// ADR 0023 M2.6d (A23-30, A23-47): translate wires each application with the
+// CA certificate and the leaf it is given, so a plan can render with
+// placeholders and open no key: the leaf issue gives namespace/app reaches
+// that application's Secret, and the CA certificate its ConfigMap. With no
+// keyholder deployed it asks the issuer for nothing.
+func TestTranslateWiresTheLeavesItIsGiven(t *testing.T) {
+	m, err := parseTestManifest(twoAppManifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta := &config.InstanceMetadata{Name: "p43", Keyholder: &config.Keyholder{Deployed: true}}
+	images := map[string]string{"api": "registry.example/app/my-platform/api@" + sha("e"), "web": "registry.example/app/my-platform/web@" + sha("f")}
+	credentials := map[string]string{"api": "credential-api", "web": "credential-web"}
+	scopes := map[string]datasphere.Scope{"api": {Name: "app-my-platform-api"}, "web": {Name: "app-my-platform-web"}}
+	var asked []string
+	issue := func(namespace, app string) ([]byte, []byte, error) {
+		asked = append(asked, namespace+"/"+app)
+		return []byte("leaf-cert-of-" + namespace + "/" + app), []byte("leaf-key-of-" + namespace + "/" + app), nil
+	}
+	b, err := runCmd(newFakeRun(twoAppManifest)).translate(meta, "my-platform", *m, images, credentials, scopes, []byte("ca-cert-given"), issue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(asked, []string{"my-platform/api", "my-platform/web"}) {
+		t.Errorf("the issuer was asked for %q; want each application once, in manifest order", asked)
+	}
+	rendered := &fakeRunCluster{applied: []string{string(b)}}
+	for _, app := range []string{"api", "web"} {
+		data := egressSecretData(t, rendered, app)
+		if got, want := data["FARCAST_STORAGE_CLIENT_CERT"], "leaf-cert-of-my-platform/"+app+"\n"; got != want {
+			t.Errorf("%s's leaf is %q, not the issuer's %q", app, got, want)
 		}
+		if got, want := data["FARCAST_STORAGE_CLIENT_KEY"], "leaf-key-of-my-platform/"+app+"\n"; got != want {
+			t.Errorf("%s's leaf key is %q, not the issuer's %q", app, got, want)
+		}
+	}
+	if !strings.Contains(string(b), "FARCAST_STORAGE_CA: |\n    ca-cert-given\n") {
+		t.Errorf("the CA certificate given is not the one wired:\n%s", b)
+	}
+
+	asked = nil
+	if _, err := runCmd(newFakeRun(twoAppManifest)).translate(&config.InstanceMetadata{Name: "p43"}, "my-platform", *m, images, credentials, nil, nil, issue); err != nil || len(asked) != 0 {
+		t.Errorf("translate with no keyholder = %v, asking the issuer for %q; want nothing asked", err, asked)
+	}
+	// Wiring storage with no issuer is a bug in the caller, said as one.
+	if _, err := runCmd(newFakeRun(twoAppManifest)).translate(meta, "my-platform", *m, images, credentials, scopes, []byte("ca-cert-given"), nil); err == nil ||
+		!strings.Contains(err.Error(), "this is a bug in the deploy order") {
+		t.Errorf("translate wiring storage with no issuer = %v; want the deploy-order bug", err)
+	}
+}
+
+// ADR 0023 M2.6d (A23-32, A28-10): ensureAppScopes returns, for each scope it
+// mints, its key-encryption key's real id and the placeholder a plan lists
+// it as, the scope's first (placeholderKeyID). Mapped back over them, the
+// pin of the keyring it saved requires the placeholder and no new key's real
+// id. A scope that was there already maps nothing, and a run that mints
+// nothing returns no ids.
+func TestEnsureAppScopesMapsEachNewKeyToItsPlaceholder(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	runnableInstance(t, dir, "p43")
+	mintKeyring(t, dir, "p43")
+	env, _ := testEnv(dir, output.ModeHuman)
+	m, err := parseTestManifest(twoAppManifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api, err := datasphere.NewAppScope("my-platform", "api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	k, err := liveKeyring(t, dir, "p43").AddScope(api)
+	if err != nil {
+		t.Fatal(err)
+	}
+	saveKeyring(t, dir, "p43", k)
+
+	c := runCmd(newFakeRun(twoAppManifest))
+	scopes, minted, ids, err := c.ensureAppScopes(env, "p43", "my-platform", *m, consentNone, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(minted, []string{"web"}) {
+		t.Fatalf("minted %q; want web alone", minted)
+	}
+	webName, err := datasphere.AppScopeName("my-platform", "web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	webKEK := scopes["web"].Keyring().KEKs()[0].ID
+	if want := map[datasphere.KeyID]datasphere.KeyID{webKEK: placeholderKeyID(webName, 1)}; !reflect.DeepEqual(ids, want) {
+		t.Fatalf("ids = %v; want web's key mapped to %s", ids, placeholderKeyID(webName, 1))
+	}
+	pin := mappedBack(pinFor(liveKeyring(t, dir, "p43")), ids)
+	if !slices.Contains(pin.Require, placeholderKeyID(webName, 1)) || slices.Contains(pin.Require, webKEK) ||
+		!slices.Contains(pin.Require, api.Keyring().KEKs()[0].ID) {
+		t.Errorf("the saved keyring's pin, mapped back, requires %v; want web's placeholder, not its real id, beside api's key", pin.Require)
+	}
+
+	_, minted, ids, err = c.ensureAppScopes(env, "p43", "my-platform", *m, consentNone, nil)
+	if err != nil || len(minted) != 0 || len(ids) != 0 {
+		t.Errorf("a second run minted %q with ids %v (%v); want nothing", minted, ids, err)
 	}
 }
 
@@ -1491,7 +1801,8 @@ func TestRunHandsNewScopesToAServingKeyholder(t *testing.T) {
 // runWriterWithPin is run's writer that also holds a pin: the cluster's
 // reads and applies are the run fake's, farcast-system's uid among them,
 // and the pin the pin fake's (a pinStore reaches NamespaceUID too, since
-// ADR 0023 M2.6c).
+// ADR 0023 M2.6c). Both read ConfigMaps whole (ADR 0023 M2.6d, A28-11):
+// the pin's is the pin fake's, and every other the run fake's.
 type runWriterWithPin struct {
 	*fakeRunCluster
 	*fakePinStore
@@ -1499,6 +1810,13 @@ type runWriterWithPin struct {
 
 func (w runWriterWithPin) NamespaceUID(ctx context.Context, name string) (string, error) {
 	return w.fakeRunCluster.NamespaceUID(ctx, name)
+}
+
+func (w runWriterWithPin) ConfigMapData(ctx context.Context, namespace, name string) (map[string]string, string, bool, error) {
+	if namespace == dsdeploy.DefaultNamespace && name == dsdeploy.PinConfigMapName("") {
+		return w.fakePinStore.ConfigMapData(ctx, namespace, name)
+	}
+	return w.fakeRunCluster.ConfigMapData(ctx, namespace, name)
 }
 
 // ADR 0023 M2.5 (C-F1): a run that mints a scope and hands it to a serving
@@ -1579,6 +1897,30 @@ func TestRunRefusesAKeyringWithTheSharedAppScope(t *testing.T) {
 	if err := dir.SaveInstanceMetadata("p44", meta); err != nil {
 		t.Fatal(err)
 	}
+	saveSharedScopeKeyring(t, dir, "p44")
+
+	env, _ := testEnv(dir, output.ModeHuman)
+	f := newFakeRun(twoAppManifest)
+	c := runCmd(f)
+	c.newKeyholder = openerFor(&fakeStateKeyholder{phase: "unsealed"})
+	err := c.Run(context.Background(), env, []string{"p44", "github.com/example/my-platform"})
+	if err == nil || !strings.Contains(err.Error(), "shared before per-application scopes") || !strings.Contains(err.Error(), "install a new one") {
+		t.Fatalf("run on a legacy keyring = %v; want it refused, naming the way out", err)
+	}
+	if len(f.applied) != 0 {
+		t.Errorf("run applied %d manifests on a keyring it refused", len(f.applied))
+	}
+	if after := liveKeyring(t, dir, "p44"); len(after.Scopes()) != 1 {
+		t.Errorf("the refused run changed the keyring: %d scopes", len(after.Scopes()))
+	}
+}
+
+// saveSharedScopeKeyring saves, as instance's keyring on this machine, one
+// holding only the scope every application shared before per-application
+// scopes (ADR 0018 decision 5), owning all of app/: no application's own
+// scope can be minted beside it.
+func saveSharedScopeKeyring(t *testing.T, dir config.Dir, instance string) {
+	t.Helper()
 	k, err := datasphere.NewKeyring()
 	if err != nil {
 		t.Fatal(err)
@@ -1590,20 +1932,26 @@ func TestRunRefusesAKeyringWithTheSharedAppScope(t *testing.T) {
 	if k, err = k.AddScope(shared); err != nil {
 		t.Fatal(err)
 	}
-	saveKeyring(t, dir, "p44", k)
+	saveKeyring(t, dir, instance, k)
+}
 
-	env, _ := testEnv(dir, output.ModeHuman)
+// runRefusalNamesThePlan is TestNonInteractiveRefusalsNameThePlan's row for
+// run (ADR 0023 M2.6d): with no terminal and no --yes it prints the review
+// and refuses, a usage error naming --yes and the plan's route, having read
+// the manifest and built nothing.
+func runRefusalNamesThePlan(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	runnableInstance(t, dir, "p43")
+	env, _ := testEnv(dir, output.ModeHuman) // stdin is no terminal
 	f := newFakeRun(twoAppManifest)
 	c := runCmd(f)
-	c.newKeyholder = openerFor(&fakeStateKeyholder{phase: "unsealed"})
-	err = c.Run(context.Background(), env, []string{"p44", "github.com/example/my-platform"})
-	if err == nil || !strings.Contains(err.Error(), "shared before per-application scopes") || !strings.Contains(err.Error(), "install a new one") {
-		t.Fatalf("run on a legacy keyring = %v; want it refused, naming the way out", err)
+	c.assumeYes = false
+	err := c.Run(context.Background(), env, []string{"p43", "github.com/example/my-platform"})
+	want := "running a repository builds and deploys code this machine has not read; pass --yes to confirm" + consentSuffix
+	if err == nil || err.Error() != want || exitCodeOf(err) != 2 {
+		t.Errorf("run with no terminal = %v (exit %d); want %q", err, exitCodeOf(err), want)
 	}
-	if len(f.applied) != 0 {
-		t.Errorf("run applied %d manifests on a keyring it refused", len(f.applied))
-	}
-	if after := liveKeyring(t, dir, "p44"); len(after.Scopes()) != 1 {
-		t.Errorf("the refused run changed the keyring: %d scopes", len(after.Scopes()))
+	if got := builds(t, f); len(got) != 0 {
+		t.Errorf("a refused run built %q", got)
 	}
 }

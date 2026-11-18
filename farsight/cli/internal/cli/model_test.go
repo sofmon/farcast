@@ -483,7 +483,7 @@ func runModel(t *testing.T, seed int64, steps, nMachines int, coverage modelCove
 			}
 			rc := &runCommand{newKeyholder: openerFor(fleet), newPinStore: pinOpener}
 			keys := liveKeyring(t, m.dir, instance)
-			res := handOverKeys(ctx, m.env, md, openerFor(fleet), keys, handOverOptions{beforePush: rc.pinScopes(ctx, m.env, md, keys, nil)})
+			res := handOverKeys(ctx, m.env, md, openerFor(fleet), keys, handOverOptions{beforePush: rc.pinScopes(ctx, m.env, md, keys, nil, nil, nil)})
 			log = append(log, fmt.Sprintf("  -> problem=%q activated=%v cause=%q loaded=%v", res.Problem, res.Activated, res.Cause, res.Loaded))
 			if res.Unsafe && strings.Contains(res.Problem, "behind the instance's") {
 				coverage["refuse a keyring behind the fleet"]++

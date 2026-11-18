@@ -55,7 +55,7 @@ import (
 // the instance's reader (openPinPlanReader by default); an interactive or
 // --yes run of storage deploy passes the pinStore it opened as the writer.
 type pinPlanReader interface {
-	ConfigMapData(ctx context.Context, namespace, name string) (map[string]string, string, bool, error)
+	configMapDataReader
 	preflighter
 }
 
@@ -883,7 +883,7 @@ func (c *keyPinCommand) handOver(ctx context.Context, env *Env, meta *config.Ins
 	instance := meta.Name
 	client, done, kerr := c.newKeyholder(ctx, env, instance)
 	if kerr != nil {
-		res.Live = fmt.Sprintf("not handed to the replicas live (%v); each loads it when it next restarts", kerr)
+		res.Live = fmt.Sprintf("not handed to the replicas live (%s); each loads it when it next restarts", output.ErrorText(kerr.Error()))
 		return env.Printer.Print(res)
 	}
 	defer done()

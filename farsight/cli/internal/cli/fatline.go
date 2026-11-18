@@ -71,13 +71,6 @@ func preflightUID(ctx context.Context, cl preflighter) (string, error) {
 	return uid, nil
 }
 
-// preflightNamespace is preflightUID with the uid discarded: the preflight
-// of a command, or a run, whose plan binds none.
-func preflightNamespace(ctx context.Context, cl preflighter) error {
-	_, err := preflightUID(ctx, cl)
-	return err
-}
-
 // openWriter is every writing seam's default: openCluster as the instance's
 // writer, the installer's service-account key (ADR 0023 M2.5). Its reads,
 // and the storage key pin's create and replace, run in-process as that key;

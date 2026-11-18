@@ -69,7 +69,13 @@ func replaceKeyring(t *testing.T, dir config.Dir, instance string, data []byte) 
 
 func handOverInstance(t *testing.T, name string) (config.Dir, *config.InstanceMetadata, *Env, *operatorSees) {
 	t.Helper()
-	dir := config.Dir(t.TempDir())
+	return handOverInstanceIn(t, config.Dir(t.TempDir()), name)
+}
+
+// handOverInstanceIn is handOverInstance in a config directory the test
+// chose.
+func handOverInstanceIn(t *testing.T, dir config.Dir, name string) (config.Dir, *config.InstanceMetadata, *Env, *operatorSees) {
+	t.Helper()
 	meta := runnableInstance(t, dir, name)
 	meta.Keyholder = &config.Keyholder{Deployed: true, Replicas: 2}
 	if err := dir.SaveInstanceMetadata(name, meta); err != nil {
@@ -650,6 +656,13 @@ func TestStorageStateFlagsAReplicaServingOtherKeys(t *testing.T) {
 // runWith deploys the two-application manifest against a keyholder fake.
 func runWith(t *testing.T, name string, kh sealStateClient, keepers ...config.Keeper) string {
 	t.Helper()
+	return runWithOpener(t, name, openerFor(kh), keepers...).err.String()
+}
+
+// runWithOpener is runWith that reaches the keyholder through open, and
+// returns everything the run printed.
+func runWithOpener(t *testing.T, name string, open keyholderOpener, keepers ...config.Keeper) *operatorSees {
+	t.Helper()
 	dir := config.Dir(t.TempDir())
 	meta := runnableInstance(t, dir, name)
 	meta.Keyholder = &config.Keyholder{Deployed: true, Replicas: 2}
@@ -658,13 +671,13 @@ func runWith(t *testing.T, name string, kh sealStateClient, keepers ...config.Ke
 		t.Fatal(err)
 	}
 	mintKeyring(t, dir, name)
-	env, _, errBuf := testEnvBoth(dir, output.ModeHuman)
+	env, outBuf, errBuf := testEnvBoth(dir, output.ModeHuman)
 	c := runCmd(newFakeRun(twoAppManifest))
-	c.newKeyholder = func(context.Context, *Env, string) (sealStateClient, func(), error) { return kh, func() {}, nil }
+	c.newKeyholder = open
 	if err := c.Run(context.Background(), env, []string{name, "github.com/example/my-platform"}); err != nil {
 		t.Fatal(err)
 	}
-	return errBuf.String()
+	return &operatorSees{out: outBuf, err: errBuf}
 }
 
 // Adding an application switches the keeper fleet off until it is re-enrolled
@@ -1317,7 +1330,14 @@ func TestRunSaysWhatHandsTheScopeOverOnceTheKeyringIsFixed(t *testing.T) {
 // real instance, and as 'which key is newer' needs it to be.
 func backdatedInstance(t *testing.T, name string, apps ...string) (config.Dir, *config.InstanceMetadata, *Env, *operatorSees, datasphere.Keyring) {
 	t.Helper()
-	dir, meta, env, out := handOverInstance(t, name)
+	return backdatedInstanceIn(t, config.Dir(t.TempDir()), name, apps...)
+}
+
+// backdatedInstanceIn is backdatedInstance in a config directory the test
+// chose.
+func backdatedInstanceIn(t *testing.T, dir config.Dir, name string, apps ...string) (config.Dir, *config.InstanceMetadata, *Env, *operatorSees, datasphere.Keyring) {
+	t.Helper()
+	dir, meta, env, out := handOverInstanceIn(t, dir, name)
 	k := backdated(t, scopedKeyring(t, dir, name, "demo", apps...), "2020-01-01T00:00:00Z")
 	saveKeyring(t, dir, name, k)
 	return dir, meta, env, out, k

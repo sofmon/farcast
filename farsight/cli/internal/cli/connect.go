@@ -505,7 +505,7 @@ func (c *connectCommand) reconnect(ctx context.Context, env *Env, name string, m
 	// The instance's own registry (ADR 0007), re-ensured defensively.
 	_, ensureErr := c.ensureRegistry(ctx, env, name, meta)
 	if ensureErr != nil {
-		fprintf(env.Err, "Warning: %v\n", ensureErr)
+		fprintf(env.Err, "Warning: %s\n", output.ErrorText(ensureErr.Error()))
 		fprintln(env.Err, "Continuing: this connect deploys nothing, so it needs no image from the registry.")
 	}
 	// `--status` and a re-connect do NOT retry: there the carrier has been up
@@ -739,7 +739,7 @@ func (c *connectCommand) bootstrap(ctx context.Context, env *Env, cl clusterAppl
 		// unrecorded; silently dropping this error would defeat it. The connect
 		// continues — the load balancer is already real either way — but the
 		// operator has to know that local state may not name it.
-		fprintf(env.Err, "Warning: FatLine is deployed and its load balancer is billable, but recording that locally failed: %v\n", err)
+		fprintf(env.Err, "Warning: FatLine is deployed and its load balancer is billable, but recording that locally failed: %s\n", output.ErrorText(err.Error()))
 		fprintf(env.Err, "Re-run 'farcast connect %s' to record it; 'farcast release %s' still tears the instance down.\n", name, name)
 	}
 
@@ -788,12 +788,19 @@ func connectCost(meta *config.InstanceMetadata) plan.CostFact {
 }
 
 // fullFloorCost is the cost fact of connect, build and kernel deploy before
-// their own workloads are added (A23-33): the instance's cost limit, no
-// standing and no one-off cost, the instance's floor fully provisioned, with
-// whether the limit is below it (warnIfBelowFloor's condition, computed
-// without printing), and the rate card's region and date.
+// their own workloads are added (A23-33): floorCost over the instance's floor
+// fully provisioned.
 func fullFloorCost(meta *config.InstanceMetadata) plan.CostFact {
-	floor := floorFull(meta)
+	return floorCost(meta, floorFull(meta))
+}
+
+// floorCost is a cost fact before the command's own workloads are added: the
+// instance's cost limit, no standing and no one-off cost, the command's floor,
+// with whether the limit is below it (warnIfBelowFloor's condition, computed
+// without printing), and the rate card's region and date. run states its
+// floor as its review does, the instance as it stands with its applications
+// in it.
+func floorCost(meta *config.InstanceMetadata, floor instanceFloor) plan.CostFact {
 	return plan.CostFact{
 		Type: plan.TypeCost, Currency: meta.CostLimit.Currency, Period: meta.CostLimit.Period,
 		LimitCents:      cents(meta.CostLimit.Amount),
@@ -954,7 +961,9 @@ func (r connectResult) Human(w io.Writer) error {
 		status = "reached (boundary reports not-connected)"
 	}
 	fprintf(w, "✓ %s to %q\n", status, r.Name)
-	fprintf(w, "  carrier:     public mTLS NLB  %s\n", r.Endpoint)
+	// The endpoint, the registry and the image are the record's, so they go
+	// through terminalText too (ADR 0023 M2.6d, A28-3).
+	fprintf(w, "  carrier:     public mTLS NLB  %s\n", terminalText(r.Endpoint))
 	fprintf(w, "  identity:    %s\n", r.Identity)
 	fprintf(w, "  active:      %d streams\n", r.Active)
 	// The allowlist and the node are FatLine's own report, read through the
@@ -968,10 +977,10 @@ func (r connectResult) Human(w io.Writer) error {
 		fprintf(w, "  relayed by:  the FatLine replica on %s\n", terminalText(r.Node))
 	}
 	if r.Registry != "" {
-		fprintf(w, "  registry:    %s\n", r.Registry)
+		fprintf(w, "  registry:    %s\n", terminalText(r.Registry))
 	}
 	if r.Image != "" {
-		fprintf(w, "  image:       %s\n", r.Image)
+		fprintf(w, "  image:       %s\n", terminalText(r.Image))
 	}
 	fprintf(w, "  cost:        load balancer ~$%.0f/mo + FatLine and Shrike ~$%.0f/mo + registry %s/mo (limit: %s %.0f/%s)\n",
 		pricing.CarrierMonthlyUSD, fatlineMonthlyUSD, registryMonthlyCost, r.costLimit.Currency, r.costLimit.Amount, r.costLimit.Period)

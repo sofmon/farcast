@@ -77,6 +77,33 @@ func TestClientSideManagersFindsTheAnnotationsOwner(t *testing.T) {
 	}
 }
 
+// ADR 0023 M2.6 (A23-46, A28-7): an apply of the object by farcast is
+// farcast's own Apply or kubectl's client-side apply Update, each on the
+// object itself. The same managers under the other operation, a subresource
+// entry under either, and every other manager are not one: the kernel's
+// writes among them, under whatever name the server gives them.
+func TestIsLastApplyIsFarcastsOwnApplyOfTheObject(t *testing.T) {
+	for _, row := range []struct {
+		e    ManagedFieldsEntry
+		want bool
+	}{
+		{entry("farcast", "Apply", "apps/v1", ""), true},
+		{entry("kubectl-client-side-apply", "Update", "apps/v1", ""), true},
+		{entry("farcast", "Update", "apps/v1", ""), false},
+		{entry("kubectl-client-side-apply", "Apply", "apps/v1", ""), false},
+		{ManagedFieldsEntry{Manager: "farcast", Operation: "Apply", APIVersion: "apps/v1", Subresource: "status"}, false},
+		{ManagedFieldsEntry{Manager: "kubectl-client-side-apply", Operation: "Update", APIVersion: "autoscaling/v1", Subresource: "scale"}, false},
+		{entry("kubectl", "Apply", "apps/v1", ""), false},
+		{entry("Go-http-client", "Update", "apps/v1", ""), false},
+		{entry("technocore", "Update", "apps/v1", ""), false},
+		{ManagedFieldsEntry{}, false},
+	} {
+		if got := IsLastApply(row.e); got != row.want {
+			t.Errorf("IsLastApply(%s, %s, subresource %q) = %v, want %v", row.e.Manager, row.e.Operation, row.e.Subresource, got, row.want)
+		}
+	}
+}
+
 // TestUpgradeManagedFields is the csaupgrade port of §6.3, step by step.
 func TestUpgradeManagedFields(t *testing.T) {
 	const csaV1beta1 = `{"f:spec":{"f:paused":{}}}`

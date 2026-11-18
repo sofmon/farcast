@@ -7,18 +7,24 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/sofmon/farcast/datasphere"
 	"github.com/sofmon/farcast/farsight/cli/internal/buildinfo"
+	"github.com/sofmon/farcast/farsight/cli/internal/cluster"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
 	"github.com/sofmon/farcast/farsight/cli/internal/plan"
+	fldeploy "github.com/sofmon/farcast/fatline/deploy"
+	"github.com/sofmon/farcast/fatline/policy"
 	"github.com/sofmon/farcast/fatline/tunnel"
+	"github.com/sofmon/farcast/manifest/parser"
 	"github.com/sofmon/farcast/planck"
+	"github.com/sofmon/farcast/technocore/cost"
 )
 
 // The plan vectors (ADR 0023 M2.6, A23-29): each command's printed plan, byte
@@ -73,6 +79,9 @@ type planVector struct {
 	// installer's key, for a plan that reads the registry, and the CA
 	// certificate, for one that loads the instance's material.
 	prepare func(t *testing.T, dir config.Dir)
+	// deploy marks run's deploy plan: the vector is what --confirm with the
+	// fetch plan's digest prints, in place of --plan.
+	deploy bool
 }
 
 // vectorRevision is the revision the plan vectors' farcast was built at,
@@ -269,6 +278,150 @@ scopes:
 	}
 }
 
+// vectorRunManifest is the manifest run's vectors read from
+// github.com/example/shop: web, whose scope atlas's keyring already holds,
+// and api, which is new and reaches one host.
+const vectorRunManifest = `name: shop
+apps:
+  - name: web
+    containerfile: web/Containerfile
+    context: web
+  - name: api
+    containerfile: api/Containerfile
+    external:
+      - host: api.stripe.com
+        reason: payment processing
+`
+
+// vectorRunJobUID is the fetch Job's uid in vectorRunCluster.
+const vectorRunJobUID = "00000000-0000-4000-8000-0000000000f1"
+
+var (
+	vectorRunArgs  = []string{"atlas", "github.com/example/shop"}
+	vectorRunFlags = []string{"--fetcher-image", fetcherDigest, "--builder-image", builderDigest}
+)
+
+// vectorRunCluster is the cluster run's deploy vector reads, as the
+// instance's reader: the fetch Job, finished, at vectorRunJobUID, which read
+// vectorRunManifest; the kernel's ledger, fresh at the vectors' clock and
+// below the limit; atlas's namespaces; shop's web Deployment, which the
+// kernel adapted after farcast last applied it, and a StatefulSet beside it;
+// another deployment's egress policy at resourceVersion 41; and no key pin.
+type vectorRunCluster struct{ ledger string }
+
+func (vectorRunCluster) NamespaceUID(context.Context, string) (string, error) {
+	return vectorSystemUID, nil
+}
+
+func (vectorRunCluster) Namespaces(context.Context) ([]string, error) {
+	return []string{"farcast-system", "shop"}, nil
+}
+
+func (c vectorRunCluster) ConfigMapValue(_ context.Context, ns, name, key string) (string, bool, error) {
+	if ns+"/"+name+"/"+key == ledgerKey {
+		return c.ledger, true, nil
+	}
+	return "", false, nil
+}
+
+func (vectorRunCluster) ConfigMapData(_ context.Context, ns, name string) (map[string]string, string, bool, error) {
+	if ns != fldeploy.DefaultNamespace || name != fldeploy.PolicyConfigMap {
+		return nil, "", false, nil
+	}
+	doc := &policy.Document{Version: policy.Version, Apps: []policy.App{{Name: "worker", Namespace: "jobs",
+		CredentialSHA256: credentialOf("e"), External: []parser.External{{Host: "queue.example", Reason: "jobs"}}}}}
+	body, err := doc.Marshal()
+	if err != nil {
+		return nil, "", false, err
+	}
+	return map[string]string{fldeploy.PolicyKey: string(body)}, "41", true, nil
+}
+
+func (vectorRunCluster) JobState(context.Context, string, string) (cluster.JobResult, bool, error) {
+	return cluster.JobResult{Succeeded: true, UID: vectorRunJobUID}, true, nil
+}
+
+func (vectorRunCluster) WaitJob(context.Context, string, string, time.Duration) (cluster.JobResult, error) {
+	return cluster.JobResult{Succeeded: true, Message: reportFor(vectorRunManifest), UID: vectorRunJobUID}, nil
+}
+
+func (vectorRunCluster) JobLogs(context.Context, string, string, int) (string, error) {
+	return vectorRunManifest, nil
+}
+
+func (vectorRunCluster) DeploymentState(_ context.Context, ns, name string) (cluster.DeploymentState, error) {
+	if ns != "shop" || name != "web" {
+		return cluster.DeploymentState{}, nil
+	}
+	replicas := int32(1)
+	return cluster.DeploymentState{
+		Present: true, Replicas: &replicas,
+		Requests:      map[string]cluster.Requests{"web": {CPUMilli: 250, MemMiB: 512}},
+		AdaptedAt:     time.Date(2026, 11, 12, 8, 0, 0, 0, time.UTC),
+		LastAppliedAt: time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC),
+	}, nil
+}
+
+func (vectorRunCluster) Workloads(_ context.Context, ns string) ([]cluster.Workload, error) {
+	return []cluster.Workload{wl("Deployment", ns, "web", 1, 1), wl("StatefulSet", ns, "db", 1, 1)}, nil
+}
+
+// vectorRunWriter is run's writer in the deploy vector: --confirm with the
+// fetch plan's digest applies the read through it, and nothing else.
+type vectorRunWriter struct{ vectorRunCluster }
+
+func (vectorRunWriter) Apply(_ context.Context, stream []byte) error {
+	if !strings.Contains(string(stream), "name: fetch-") {
+		return errors.New("test: a vector's run applied more than its read")
+	}
+	return nil
+}
+
+func (vectorRunWriter) RolloutStatus(context.Context, string, string, time.Duration) error {
+	return errors.New("test: a vector's run waited on a rollout")
+}
+
+// vectorRun is run for its vectors: its reader vectorRunCluster, opened as
+// nothing but the reader; its writer, for the read alone; its clock the
+// vectors'; and every seam that would mint, push or reach the keyholder
+// refused.
+func vectorRun(t *testing.T, flags ...string) Command {
+	c := withFlags(t, &runCommand{}, flags...)
+	cl := vectorRunCluster{ledger: savedCheckpoint(t, cost.LevelOK.String(), vectorNow.Add(-time.Minute))}
+	c.newPlanReader = func(r clusterRef) (runPlanReader, error) {
+		if r.Identity != kube.Reader {
+			return nil, fmt.Errorf("test: a vector's plan read the cluster as %q", r.Identity)
+		}
+		return cl, nil
+	}
+	c.newCluster = func(r clusterRef) (runCluster, error) {
+		if r.Identity != kube.Writer {
+			return nil, fmt.Errorf("test: a vector's run wrote as %q", r.Identity)
+		}
+		return vectorRunWriter{cl}, nil
+	}
+	c.newBuilder = func(func(string)) imageBuilder { return &fakeBuilder{} }
+	c.newKeyholder = vectorNoKeyholder
+	c.newPinStore = vectorNoPinWriter
+	c.mintCredential = func(string, string) (string, error) {
+		return "", errors.New("test: a vector's plan minted a credential")
+	}
+	c.now = vectorClock
+	return c
+}
+
+// vectorRunMaterial is what run's deploy vector reads on this machine: the
+// reader's key, atlas's keyring, the CA certificate, and a stand-in ca.key,
+// whose size alone the plan reads (A28-9), and never its bytes.
+func vectorRunMaterial(t *testing.T, dir config.Dir) {
+	t.Helper()
+	vectorReaderKey(t, dir)
+	vectorKeyring(t, dir)
+	if err := dir.SaveInstanceMTLS("atlas", config.MTLSMaterial{CACertPEM: []byte(vectorCACert), CAKeyPEM: []byte("a stand-in, never read\n")}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // vectorConfirmations is the confirmed window the kernel_confirm vector's
 // record already holds, so the plan's windows_after has two.
 func vectorConfirmations(m *config.InstanceMetadata) {
@@ -284,17 +437,17 @@ func planVectors() []planVector {
 			c := withFlags(t, &kernelMeterCommand{}, flags...)
 			c.deployer.now = vectorClock
 			return c
-		}, []string{"atlas", "web"}, nil, nil},
+		}, []string{"atlas", "web"}, nil, nil, false},
 		{"kernel_confirm", vectorConfirmations, func(t *testing.T, flags ...string) Command {
 			c := withFlags(t, &kernelConfirmCommand{}, flags...)
 			c.deployer.now = vectorClock
 			return c
-		}, []string{"atlas"}, []string{"--amount", "2.71"}, nil},
+		}, []string{"atlas"}, []string{"--amount", "2.71"}, nil, false},
 		{"reader_grant", nil, func(t *testing.T, flags ...string) Command {
 			c := withFlags(t, &readerGrantCommand{}, flags...)
 			c.now = vectorClock
 			return c
-		}, []string{"atlas"}, nil, nil},
+		}, []string{"atlas"}, nil, nil, false},
 		// connect's first deploy: the material minted, the carried images
 		// pushed, the load balancer's cost.
 		{"connect_first", vectorFirstConnect, func(t *testing.T, flags ...string) Command {
@@ -304,14 +457,14 @@ func planVectors() []planVector {
 				return nil, errors.New("test: a plan dialled the carrier")
 			}
 			return c
-		}, []string{"atlas"}, nil, vectorKey},
+		}, []string{"atlas"}, nil, vectorKey, false},
 		// redeploy over the material the instance holds, replacing what an
 		// earlier release deployed.
 		{"redeploy", vectorRedeployed, func(t *testing.T, flags ...string) Command {
 			c := withFlags(t, newRedeployCommand(), flags...)
 			vectorDeployer(&c.fatlineDeployer)
 			return c
-		}, []string{"atlas"}, []string{"--embedded"}, vectorMaterial},
+		}, []string{"atlas"}, []string{"--embedded"}, vectorMaterial, false},
 		// build, its builder named: it reads the record alone.
 		{"build", nil, func(t *testing.T, flags ...string) Command {
 			c := withFlags(t, &buildCommand{}, flags...)
@@ -319,7 +472,7 @@ func planVectors() []planVector {
 			c.newCluster = func(clusterRef) (jobWaiter, error) { return nil, errors.New("test: a plan opened the writer") }
 			c.now = vectorClock
 			return c
-		}, []string{"atlas"}, []string{"--repo", "https://github.com/example/shop", "--app", "api", "--builder-image", builderDigest}, nil},
+		}, []string{"atlas"}, []string{"--repo", "https://github.com/example/shop", "--app", "api", "--builder-image", builderDigest}, nil, false},
 		// kernel deploy, as the reader reads the cluster: the kernel's image,
 		// its settings, and every document of its workload.
 		{"kernel_deploy", nil, func(t *testing.T, flags ...string) Command {
@@ -330,7 +483,7 @@ func planVectors() []planVector {
 		}, []string{"atlas"}, nil, func(t *testing.T, dir config.Dir) {
 			vectorKey(t, dir)
 			vectorReaderKey(t, dir)
-		}},
+		}, false},
 		// storage deploy over the recorded bucket: the keyholder's image, its
 		// leaf, a restart of the replicas deployed, the pin this keyring
 		// implies, created, and the keyholder's workload.
@@ -345,7 +498,7 @@ func planVectors() []planVector {
 			vectorMaterial(t, dir)
 			vectorReaderKey(t, dir)
 			vectorKeyring(t, dir)
-		}},
+		}, false},
 		// storage key pin: the pin this keyring implies, created.
 		{"storage_key_pin", nil, func(t *testing.T, flags ...string) Command {
 			c := withFlags(t, &keyPinCommand{}, flags...)
@@ -357,7 +510,7 @@ func planVectors() []planVector {
 		}, []string{"atlas"}, nil, func(t *testing.T, dir config.Dir) {
 			vectorReaderKey(t, dir)
 			vectorKeyring(t, dir)
-		}},
+		}, false},
 		// storage key rotate, with the keyholder deployed: a key for the
 		// instance's key space and for shop/web, and the hold and final pins
 		// over the new key's placeholder id.
@@ -371,7 +524,17 @@ func planVectors() []planVector {
 		}, []string{"atlas"}, nil, func(t *testing.T, dir config.Dir) {
 			vectorReaderKey(t, dir)
 			vectorKeyring(t, dir)
-		}},
+		}, false},
+		// run's fetch plan: the manifest read, its Job's cost, the fetcher
+		// and the read's three documents. It reads keys.yaml for the scope
+		// every application once shared, and no cluster.
+		{"run_fetch", nil, vectorRun, vectorRunArgs, vectorRunFlags, vectorKeyring, false},
+		// run's deploy plan, as --confirm with the fetch plan's digest prints
+		// it, computed as the reader over vectorRunCluster: shop's two
+		// applications, web adapted by the kernel and its scope already
+		// minted, api new, with its scope and key and the pin they raise,
+		// and a StatefulSet kept.
+		{"run_deploy", nil, vectorRun, vectorRunArgs, vectorRunFlags, vectorRunMaterial, true},
 	}
 }
 
@@ -380,6 +543,17 @@ func planVectors() []planVector {
 // and returns what it printed in JSON mode, and its error.
 func runPlanVector(t *testing.T, v planVector, extra ...string) (*Env, *bytes.Buffer, error) {
 	t.Helper()
+	// run's deploy plan is what confirming its fetch plan prints: the fetch
+	// plan first, from the same record, then its digest confirmed.
+	if v.deploy && slices.Equal(extra, []string{"--plan"}) {
+		fetch := v
+		fetch.deploy = false
+		_, out, err := runPlanVector(t, fetch, "--plan")
+		if err != nil {
+			return nil, nil, err
+		}
+		extra = []string{"--confirm", printedDocument(t, out.Bytes()).Digest}
+	}
 	dir := vectorConfigDir(t)
 	meta := planVectorMeta()
 	if v.edit != nil {

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/url"
 	"slices"
@@ -19,6 +20,7 @@ import (
 	dsdeploy "github.com/sofmon/farcast/datasphere/deploy"
 	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 	"github.com/sofmon/farcast/farsight/cli/internal/kube/kubetest"
+	"github.com/sofmon/farcast/technocore/kernel"
 	tkube "github.com/sofmon/farcast/technocore/kube"
 )
 
@@ -270,10 +272,10 @@ const fatlineService = "/api/v1/namespaces/farcast-system/services/fatline"
 
 func TestWaitExternalIPReturnsIP(t *testing.T) {
 	s := kubetest.New(t)
-	s.Script(fatlineService, serviceWith(), serviceWith(map[string]any{"hostname": ""}), serviceWith(map[string]any{"ip": "34.0.0.5"}))
+	s.Script(fatlineService, serviceWith(), serviceWith(map[string]any{"hostname": ""}), serviceWith(map[string]any{"ip": "203.0.113.5"}))
 	c := quick(openReader(t, s, nil))
 	ip, err := c.WaitExternalIP(t.Context(), "farcast-system", "fatline", time.Minute)
-	if err != nil || ip != "34.0.0.5" {
+	if err != nil || ip != "203.0.113.5" {
 		t.Fatalf("ip = %q, %v", ip, err)
 	}
 	if got := apiPaths(s); len(got) != 3 || got[0] != "GET "+fatlineService {
@@ -281,7 +283,7 @@ func TestWaitExternalIPReturnsIP(t *testing.T) {
 	}
 
 	// An address that is not one never becomes an endpoint.
-	for _, bad := range []string{"34.0.0.256", "fe80::1%eth0", "fatline.example"} {
+	for _, bad := range []string{"203.0.113.256", "fe80::1%eth0", "fatline.example"} {
 		s.Script(fatlineService, serviceWith(map[string]any{"ip": bad}))
 		if ip, err := c.WaitExternalIP(t.Context(), "farcast-system", "fatline", time.Minute); err == nil || ip != "" {
 			t.Errorf("ingress IP %q = %q, %v; want an error", bad, ip, err)
@@ -418,9 +420,16 @@ func running() map[string]any {
 	return map[string]any{"name": "sidecar", "state": map[string]any{"running": map[string]any{}}}
 }
 
+// withUID is obj with metadata.uid set to uid.
+func withUID(obj map[string]any, uid string) map[string]any {
+	obj["metadata"].(map[string]any)["uid"] = uid
+	return obj
+}
+
 // A Job ends on its counts or on its conditions, and its message is the
 // newest pod's first terminated container's, trimmed; a Job that has not
-// ended by the deadline is a timeout.
+// ended by the deadline is a timeout. Since ADR 0023 M2.6 (A23-46, A28-7)
+// the result carries the uid the GET that ended the wait read.
 func TestWaitJobReadsTheOutcomeAndTheNewestPodsMessage(t *testing.T) {
 	for _, row := range []struct {
 		name      string
@@ -433,26 +442,28 @@ func TestWaitJobReadsTheOutcomeAndTheNewestPodsMessage(t *testing.T) {
 		{"failed condition", map[string]any{"conditions": []any{map[string]any{"type": "Failed", "status": "True"}}}, false},
 	} {
 		s := kubetest.New(t)
-		s.Put(jobObject("build", []string{"kaniko"}, row.status))
+		s.Put(withUID(jobObject("build", []string{"kaniko"}, row.status), "uid-"+row.name))
 		s.Put(buildPod("build-old", "2026-11-15T10:00:00Z", terminated("sha256:old")))
 		s.Put(buildPod("build-new", "2026-11-15T10:05:00Z", running(), terminated("  sha256:new\n")))
 		s.Put(buildPod("build-mid", "2026-11-15T10:02:00Z", terminated("sha256:mid")))
 		res, err := openReader(t, s, nil).WaitJob(t.Context(), "farcast-system", "build", time.Minute)
-		if err != nil || res.Succeeded != row.succeeded || res.Message != "sha256:new" {
-			t.Errorf("%s: %+v, %v; want succeeded %v with the newest pod's message", row.name, res, err, row.succeeded)
+		if err != nil || res.Succeeded != row.succeeded || res.Message != "sha256:new" || res.UID != "uid-"+row.name {
+			t.Errorf("%s: %+v, %v; want succeeded %v with the newest pod's message and the Job's uid", row.name, res, err, row.succeeded)
 		}
 	}
 
+	// The uid is the one the GET that ended the wait read, not an earlier
+	// poll's: a Job re-created under its name is another Job.
 	s := kubetest.New(t)
 	s.Script(buildJob,
-		jobObject("build", []string{"kaniko"}, map[string]any{"active": 1}),
-		jobObject("build", []string{"kaniko"}, map[string]any{"conditions": []any{map[string]any{"type": "Complete", "status": "False"}}}),
-		jobObject("build", []string{"kaniko"}, map[string]any{"succeeded": 1}),
+		withUID(jobObject("build", []string{"kaniko"}, map[string]any{"active": 1}), "uid-first"),
+		withUID(jobObject("build", []string{"kaniko"}, map[string]any{"conditions": []any{map[string]any{"type": "Complete", "status": "False"}}}), "uid-second"),
+		withUID(jobObject("build", []string{"kaniko"}, map[string]any{"succeeded": 1}), "uid-third"),
 	)
 	c := quick(openReader(t, s, nil))
 	res, err := c.WaitJob(t.Context(), "farcast-system", "build", time.Minute)
-	if err != nil || !res.Succeeded || res.Message != "" {
-		t.Errorf("after polling, with no pod: %+v, %v; want succeeded with no message", res, err)
+	if err != nil || !res.Succeeded || res.Message != "" || res.UID != "uid-third" {
+		t.Errorf("after polling, with no pod: %+v, %v; want succeeded with no message, and the third read's uid", res, err)
 	}
 	reads := 0
 	for _, p := range apiPaths(s) {
@@ -469,6 +480,282 @@ func TestWaitJobReadsTheOutcomeAndTheNewestPodsMessage(t *testing.T) {
 	const want = "cluster: job farcast-system/build neither succeeded nor failed after 0s"
 	if res != (JobResult{}) || !errors.Is(err, kube.ErrTimedOut) || err.Error() != want {
 		t.Errorf("at the deadline: %+v, %v; want %q wrapping kube.ErrTimedOut", res, err, want)
+	}
+}
+
+// countedWarnings is a WithWarnings function whose every answer under prefix
+// carries one Warning text no other answer carries, so that each read's own
+// warning is written once, after it.
+func countedWarnings(prefix string) kubetest.Option {
+	var n atomic.Int64
+	return kubetest.WithWarnings(func(r kubetest.Request) []string {
+		if strings.HasPrefix(r.Path, prefix) {
+			return []string{fmt.Sprintf("read %d", n.Add(1))}
+		}
+		return nil
+	})
+}
+
+// onlyRead runs read and checks that it sent exactly one GET, of path, and
+// wrote exactly that GET's warning, after it.
+func onlyRead(t *testing.T, s *kubetest.Server, w *bytes.Buffer, path string, read func()) {
+	t.Helper()
+	sent, warned := len(apiRequests(s)), w.String()
+	read()
+	if got := apiPaths(s)[sent:]; !slices.Equal(got, []string{"GET " + path}) {
+		t.Errorf("the read of %s sent %v; want one GET", path, got)
+	}
+	if got := strings.TrimPrefix(w.String(), warned); !strings.HasPrefix(got, "Warning (cluster): read ") || strings.Count(got, "\n") != 1 {
+		t.Errorf("the read of %s wrote %q of warnings; want its one", path, got)
+	}
+}
+
+// appDeployment is the Deployment web/<name> with these containers, each a
+// name and its cpu and memory requests ("" for one not set), these replicas
+// (nil for none), and these annotations and managed-fields entries.
+func appDeployment(name string, replicas any, containers [][3]string, annotations map[string]string, managed ...map[string]any) map[string]any {
+	var cs []any
+	for _, ct := range containers {
+		requests := map[string]any{}
+		if ct[1] != "" {
+			requests["cpu"] = ct[1]
+		}
+		if ct[2] != "" {
+			requests["memory"] = ct[2]
+		}
+		cs = append(cs, map[string]any{"name": ct[0], "image": "example.invalid/" + ct[0], "resources": map[string]any{"requests": requests}})
+	}
+	spec := map[string]any{
+		"selector": selectorOf(map[string]string{"app": name}),
+		"template": map[string]any{"spec": map[string]any{"containers": cs}},
+	}
+	if replicas != nil {
+		spec["replicas"] = replicas
+	}
+	md := map[string]any{}
+	if annotations != nil {
+		md["annotations"] = annotations
+	}
+	if managed != nil {
+		var mf []any
+		for _, e := range managed {
+			mf = append(mf, e)
+		}
+		md["managedFields"] = mf
+	}
+	return object("apps/v1", "Deployment", "web", name, map[string]any{"metadata": md, "spec": spec})
+}
+
+// managedEntry is one managed-fields entry, as the API server writes it.
+func managedEntry(manager, operation, subresource, at string) map[string]any {
+	e := map[string]any{"manager": manager, "operation": operation, "apiVersion": "apps/v1", "time": at,
+		"fieldsType": "FieldsV1", "fieldsV1": map[string]any{"f:spec": map[string]any{"f:replicas": map[string]any{}}}}
+	if subresource != "" {
+		e["subresource"] = subresource
+		e["apiVersion"] = "autoscaling/v1"
+	}
+	return e
+}
+
+// stateText is a DeploymentState as a test failure shows it.
+func stateText(st DeploymentState) string {
+	replicas := "nil"
+	if st.Replicas != nil {
+		replicas = fmt.Sprint(*st.Replicas)
+	}
+	return fmt.Sprintf("present %v, replicas %s, requests %v, adapted %s, applied %s, rv %q",
+		st.Present, replicas, st.Requests, st.AdaptedAt.Format(time.RFC3339), st.LastAppliedAt.Format(time.RFC3339), st.ResourceVersion)
+}
+
+// sameState compares two DeploymentStates field by field: the struct holds a
+// map and a pointer, and its times are compared as instants.
+func sameState(a, b DeploymentState) bool {
+	sameReplicas := (a.Replicas == nil) == (b.Replicas == nil) && (a.Replicas == nil || *a.Replicas == *b.Replicas)
+	return a.Present == b.Present && sameReplicas && (a.Requests == nil) == (b.Requests == nil) && maps.Equal(a.Requests, b.Requests) &&
+		a.AdaptedAt.Equal(b.AdaptedAt) && a.LastAppliedAt.Equal(b.LastAppliedAt) && a.ResourceVersion == b.ResourceVersion
+}
+
+// ADR 0023 M2.6 (A23-46, A28-7): DeploymentState is one GET of the
+// Deployment, its warnings written after it. Its replicas, each container's
+// requests ("" as 0), the kernel's adapted-at stamp as the kernel reads it
+// (zero when it does not parse), and the newest time among the entries that
+// record farcast's own apply of the object: farcast's Apply and kubectl's
+// client-side apply Update. A subresource entry (the kernel's scale), another
+// operation, another manager and a time that does not parse are passed over,
+// each seeded newer than the answer. Only the API server's own 404 Status is
+// absent; a 404 that is not a Status and a 403 are errors, and a set request
+// that does not parse is an error wrapping kube.ErrUnreadable.
+func TestDeploymentStateReadsTheAdaptationAndTheLastApply(t *testing.T) {
+	const prefix = "/apis/apps/v1/namespaces/web/deployments/"
+	s := kubetest.New(t, countedWarnings(prefix))
+	var w bytes.Buffer
+	c := openReader(t, s, &w)
+	at := func(v string) time.Time {
+		tm, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return tm
+	}
+	zero, one := int32(0), int32(1)
+
+	api := appDeployment("api", 0, [][3]string{{"api", "250m", "512Mi"}, {"sidecar", "", ""}, {"log", "100m", ""}},
+		map[string]string{kernel.AdaptedAtLabel: "2026-11-17T10:00:00Z", kernel.AdaptedFromLabel: "100m/128Mi"},
+		managedEntry("kubectl-client-side-apply", "Update", "", "2026-11-17T09:00:00Z"),
+		managedEntry("farcast", "Apply", "", "2026-11-17T09:30:00Z"),
+		managedEntry("farcast", "Apply", "status", "2026-11-17T11:00:00Z"),
+		managedEntry("kubectl-client-side-apply", "Update", "scale", "2026-11-17T11:15:00Z"),
+		managedEntry("farcast", "Update", "", "2026-11-17T11:30:00Z"),
+		managedEntry("Go-http-client", "Update", "", "2026-11-17T12:00:00Z"),
+		managedEntry("kubectl-client-side-apply", "Update", "", "not a time"),
+	)
+	api["metadata"].(map[string]any)["resourceVersion"] = "41"
+	s.Put(api)
+	s.Put(appDeployment("web", nil, [][3]string{{"web", "1", "1Gi"}},
+		map[string]string{kernel.AdaptedAtLabel: "yesterday-ish"},
+		managedEntry("farcast", "Apply", "", "2026-11-17T08:00:00Z"),
+		managedEntry("kubectl-client-side-apply", "Update", "", "2026-11-17T12:45:30+02:00"),
+	))
+	s.Put(appDeployment("bare", 1, [][3]string{{"bare", "", ""}}, map[string]string{kernel.AdaptedAtLabel: "2026-11-17T11:00:00+01:00"}))
+	s.Put(appDeployment("bad-cpu", 1, [][3]string{{"bad-cpu", "lots", "128Mi"}}, nil))
+	s.Put(appDeployment("bad-mem", 1, [][3]string{{"bad-mem", "100m", "a lot"}}, nil))
+
+	ctx := t.Context()
+	read := func(name string) (DeploymentState, error) {
+		var (
+			st  DeploymentState
+			err error
+		)
+		onlyRead(t, s, &w, prefix+name, func() { st, err = c.DeploymentState(ctx, "web", name) })
+		return st, err
+	}
+	for _, row := range []struct {
+		name string
+		want DeploymentState
+	}{
+		{"api", DeploymentState{
+			Present: true, Replicas: &zero,
+			Requests:  map[string]Requests{"api": {250, 512}, "sidecar": {0, 0}, "log": {100, 0}},
+			AdaptedAt: at("2026-11-17T10:00:00Z"), LastAppliedAt: at("2026-11-17T09:30:00Z"), ResourceVersion: "41",
+		}},
+		{"web", DeploymentState{
+			Present: true, Requests: map[string]Requests{"web": {1000, 1024}},
+			LastAppliedAt: at("2026-11-17T10:45:30Z"),
+		}},
+		{"bare", DeploymentState{
+			Present: true, Replicas: &one, Requests: map[string]Requests{"bare": {0, 0}},
+			AdaptedAt: at("2026-11-17T10:00:00Z"),
+		}},
+	} {
+		got, err := read(row.name)
+		if row.name != "api" {
+			row.want.ResourceVersion = got.ResourceVersion // the one kubetest gave it
+		}
+		if err != nil || !sameState(got, row.want) {
+			t.Errorf("DeploymentState(web/%s) = %s, %v;\nwant %s", row.name, stateText(got), err, stateText(row.want))
+		}
+		if got.AdaptedAt.Location() != time.UTC || got.LastAppliedAt.Location() != time.UTC {
+			t.Errorf("web/%s's times read %s and %s; want both in UTC", row.name, got.AdaptedAt.Format(time.RFC3339), got.LastAppliedAt.Format(time.RFC3339))
+		}
+	}
+
+	// The one absent answer: the API server's own 404 Status.
+	if got, err := read("gone"); err != nil || !sameState(got, DeploymentState{}) {
+		t.Errorf("an absent Deployment = %s, %v; want not present and no error", stateText(got), err)
+	}
+
+	// A 404 that is not a Status unwraps to tkube.ErrNotFound as the API
+	// server's does, and proves nothing about the Deployment; a 403 is a
+	// refused read. Neither is absent.
+	google := kube.Status{Status: tkube.Status{Kind: "GoogleError"}}
+	for _, row := range []struct {
+		name string
+		code int
+		st   kube.Status
+		is   error
+	}{
+		{"a 404 that is not a Status", http.StatusNotFound, google, tkube.ErrNotFound},
+		{"an RBAC 403", http.StatusForbidden, kube.Status{}, tkube.ErrForbidden},
+	} {
+		s.Fail(http.MethodGet, prefix+"api", row.code, row.st)
+		got, err := read("api")
+		if err == nil || !errors.Is(err, row.is) || !sameState(got, DeploymentState{}) {
+			t.Errorf("%s = %s, %v; want an error wrapping %v, and nothing read", row.name, stateText(got), err, row.is)
+		}
+	}
+
+	// A request that is set and does not parse: nothing is known of the
+	// application, rather than a request misread as 0.
+	for _, row := range []struct{ name, want string }{
+		{"bad-cpu", `cluster: the Deployment web/bad-cpu's container "bad-cpu" requests cpu "lots", which farcast cannot read as a quantity`},
+		{"bad-mem", `cluster: the Deployment web/bad-mem's container "bad-mem" requests memory "a lot", which farcast cannot read as a quantity`},
+	} {
+		got, err := read(row.name)
+		if !errors.Is(err, kube.ErrUnreadable) || err.Error() != row.want || !sameState(got, DeploymentState{}) {
+			t.Errorf("web/%s = %s, %v; want %q wrapping kube.ErrUnreadable", row.name, stateText(got), err, row.want)
+		}
+	}
+}
+
+// ADR 0023 M2.6 (A23-46, A28-7): JobState is one GET of the Job, its warnings
+// written after it, and reads no pod. A Job that is there is found, with the
+// uid that GET read and whether it succeeded as WaitJob judges it, and never
+// a message. Only the API server's own 404 Status is absent; a 404 that is
+// not a Status and a 403 are errors, with found false.
+func TestJobStateTellsAnAbsentJob(t *testing.T) {
+	const prefix = "/apis/batch/v1/namespaces/farcast-system/jobs/"
+	s := kubetest.New(t, countedWarnings(prefix))
+	var w bytes.Buffer
+	c := openReader(t, s, &w)
+	ctx := t.Context()
+	read := func(name string) (JobResult, bool, error) {
+		var (
+			res   JobResult
+			found bool
+			err   error
+		)
+		onlyRead(t, s, &w, prefix+name, func() { res, found, err = c.JobState(ctx, "farcast-system", name) })
+		return res, found, err
+	}
+
+	s.Put(buildPod("fetch-pod", "2026-11-15T10:00:00Z", terminated("sha256:not-read")))
+	for _, row := range []struct {
+		name   string
+		status map[string]any
+		want   JobResult
+	}{
+		{"succeeded", map[string]any{"succeeded": 1}, JobResult{Succeeded: true, UID: "uid-succeeded"}},
+		{"complete", map[string]any{"conditions": []any{map[string]any{"type": "Complete", "status": "True"}}}, JobResult{Succeeded: true, UID: "uid-complete"}},
+		{"running", map[string]any{"active": 1}, JobResult{UID: "uid-running"}},
+		{"failed", map[string]any{"failed": 1}, JobResult{UID: "uid-failed"}},
+	} {
+		s.Put(withUID(jobObject("fetch", []string{"git"}, row.status), "uid-"+row.name))
+		res, found, err := read("fetch")
+		if err != nil || !found || res != row.want {
+			t.Errorf("%s: %+v, %v, %v; want %+v, found", row.name, res, found, err, row.want)
+		}
+	}
+
+	// The one absent answer: the API server's own 404 Status.
+	if res, found, err := read("gone"); err != nil || found || res != (JobResult{}) {
+		t.Errorf("an absent Job = %+v, %v, %v; want not found and no error", res, found, err)
+	}
+
+	google := kube.Status{Status: tkube.Status{Kind: "GoogleError"}}
+	for _, row := range []struct {
+		name string
+		code int
+		st   kube.Status
+		is   error
+	}{
+		{"a 404 that is not a Status", http.StatusNotFound, google, tkube.ErrNotFound},
+		{"an RBAC 403", http.StatusForbidden, kube.Status{}, tkube.ErrForbidden},
+	} {
+		s.Fail(http.MethodGet, prefix+"fetch", row.code, row.st)
+		res, found, err := read("fetch")
+		if err == nil || !errors.Is(err, row.is) || found || res != (JobResult{}) {
+			t.Errorf("%s = %+v, %v, %v; want an error wrapping %v, not found", row.name, res, found, err, row.is)
+		}
 	}
 }
 

@@ -367,6 +367,15 @@ type RunFact struct {
 	// MeteringAdded is true when the run adds its namespace to what the
 	// kernel counts.
 	MeteringAdded bool `json:"metering_added"`
+	// LimitReached is true when the kernel's ledger reads the instance's
+	// spending at its limit as the plan is made: its level says so, or is
+	// one the plan cannot place, or the ledger cannot be read or is stale. A
+	// deploy plan that binds it true is the consent to deploying at the
+	// limit (ADR 0023 Choices 6, widened 2026-11-17).
+	LimitReached bool `json:"limit_reached"`
+	// LimitReason is "" when LimitReached is false, and otherwise one of
+	// "limit reached", "level unknown", "ledger unreadable" or "ledger stale".
+	LimitReason string `json:"limit_reason"`
 }
 
 // RunApp is one application of a run's manifest.

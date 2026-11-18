@@ -1055,6 +1055,26 @@ func (d Dir) InstanceMTLSExists(name string) (bool, error) {
 	return true, nil
 }
 
+// InstanceCAKeyExists reports whether this machine holds the instance CA's
+// private key, which is what minting an application's storage leaf needs
+// (ADR 0023 M2.6d, A23-47, A28-9): whether ca.key is a regular file with
+// something in it. It stats the file and never opens it, as
+// CheckInstanceMTLS does, so a plan can find the key missing without
+// bringing it into memory (A23-25). An empty file is no key: SaveInstanceMTLS
+// writes one for material that holds no CA key. A directory, a device or a
+// pipe in its place is no key either. A key it reports can still fail the
+// load: one this process may not read, or one removed after the check.
+func (d Dir) InstanceCAKeyExists(name string) (bool, error) {
+	info, err := os.Stat(filepath.Join(d.fatlineDir(name), caKeyFile))
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return info.Mode().IsRegular() && info.Size() > 0, nil
+}
+
 // SaveInstanceMTLS writes the per-instance mTLS material under <instance>/fatline/
 // (dir 0700, files 0600). The CA private key is included here — on the operator's
 // machine — but the caller must never push it to the cluster.

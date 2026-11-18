@@ -1377,6 +1377,57 @@ func TestConfirmNeverWritesAPinThePlanDidNotList(t *testing.T) {
 			t.Errorf("recorded the keyholder %+v (%v) after the pin was refused", after.Keyholder, err)
 		}
 	})
+	// run (A23-48, A28-10, row 86a): the pin its deploy plan listed is
+	// written once, at the version the plan read; another writer's pin is
+	// plan_changed, returned before the workloads are applied.
+	t.Run("run", func(t *testing.T) {
+		r := newStageRig(t, withStorage)
+		mintKeyring(t, r.dir, stageName)
+		r.kh = openerFor(&fakeStateKeyholder{phase: "unsealed"})
+		d := r.deployPlan()
+		other := raise(t, r.ps)
+		_, _, err := r.confirm(d)
+		want := msgPinChangedAtHandOver + "; " + msgPlanAgain
+		if err == nil || err.Error() != want || kindOf(classified(err)) != kindPlanChanged || exitCodeOf(err) != 1 {
+			t.Fatalf("--confirm over another writer's pin = %v (kind %s); want plan_changed, %q", err, kindOf(classified(err)), want)
+		}
+		if r.ps.value != other || r.ps.version != 1 {
+			t.Errorf("the pin is %s at version %d; want the other writer's %s, written once", r.ps.value, r.ps.version, other)
+		}
+		for kind := range appliedKinds(t, r.f) {
+			if strings.HasPrefix(kind, "Deployment/") {
+				t.Errorf("applied %s after the pin was refused", kind)
+			}
+		}
+	})
+	// run, its keyring grown by another scope while it built: the pin decided
+	// over it is not the planned one once the new keys map back, and is
+	// never written.
+	t.Run("run/a keyring grown during the builds", func(t *testing.T) {
+		r := newStageRig(t, withStorage)
+		mintKeyring(t, r.dir, stageName)
+		r.kh = openerFor(&fakeStateKeyholder{phase: "unsealed"})
+		d := r.deployPlan()
+		r.f.onBuild = once(func() {
+			s, err := datasphere.NewAppScope("other", "worker")
+			if err != nil {
+				t.Fatal(err)
+			}
+			k, err := liveKeyring(t, r.dir, stageName).AddScope(s)
+			if err != nil {
+				t.Fatal(err)
+			}
+			saveKeyring(t, r.dir, stageName, k)
+		})
+		_, _, err := r.confirm(d)
+		want := msgPinChangedAtHandOver + "; " + msgPlanAgain
+		if err == nil || err.Error() != want || kindOf(classified(err)) != kindPlanChanged {
+			t.Fatalf("--confirm over a grown keyring = %v (kind %s); want plan_changed, %q", err, kindOf(classified(err)), want)
+		}
+		if r.ps.exists {
+			t.Errorf("the pin %s was written; want none", r.ps.value)
+		}
+	})
 	for _, stage := range []struct {
 		name string
 		n    int // the pin write the other writer comes before
@@ -1563,12 +1614,7 @@ func TestConfirmPinNon409FailureKeepsItsKind(t *testing.T) {
 			t.Fatalf("--confirm whose hold write failed = %v (kind %s); want %s", err, kind, kindClusterRejected)
 		}
 		for name, text := range map[string]string{"stdout": out.String(), "stderr": errb.String()} {
-			for i := 0; i < len(text); i++ {
-				if c := text[i]; c < 0x20 && c != '\n' {
-					t.Errorf("%s carries the control byte %#x: %q", name, c, text)
-					break
-				}
-			}
+			noControlBytes(t, name, text)
 		}
 		if !strings.Contains(out.String(), "the key pin that would hold them could not be written") {
 			t.Errorf("the keyholder line does not name the pin:\n%s", out)

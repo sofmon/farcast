@@ -933,7 +933,7 @@ func (c *keyRotateCommand) rotate(ctx context.Context, env *Env, instance string
 		// Nothing a keyholder holds changed.
 	case merr != nil:
 		result.Active = false
-		result.Keyholder = fmt.Sprintf("not handed the new keys: the instance's metadata could not be read (%v)", merr)
+		result.Keyholder = fmt.Sprintf("not handed the new keys: the instance's metadata could not be read (%s)", output.ErrorText(merr.Error()))
 	case meta.Keyholder == nil || !meta.Keyholder.Deployed:
 		// No replica to split from: the keyholder receives these keys, in
 		// use, when it is deployed and unsealed.
@@ -1028,7 +1028,7 @@ func (c *keyRotateCommand) rotate(ctx context.Context, env *Env, instance string
 			result.Keyholder += ". This machine's keyring stays on the new keys: the instance's key pin has retired the ones it would go back to"
 		default:
 			if err := save(*pushedHeld); err != nil {
-				result.Keyholder += fmt.Sprintf(". This machine's keyring could NOT be put back (%v): it writes under the new keys, which no replica uses", err)
+				result.Keyholder += fmt.Sprintf(". This machine's keyring could NOT be put back (%s): it writes under the new keys, which no replica uses", output.ErrorText(err.Error()))
 			}
 		}
 		switch {
@@ -1218,7 +1218,7 @@ func (c *keyRotateCommand) handPin(ctx context.Context, env *Env, meta *config.I
 	line := fmt.Sprintf("requires %s, retires %s", plural(len(pin.Require), "key", "keys"), plural(len(pin.Retired), "key", "keys"))
 	client, done, err := c.newKeyholder(ctx, env, meta.Name)
 	if err != nil {
-		return line + fmt.Sprintf("; not handed to the replicas live (%v) — each loads it when it next restarts", err)
+		return line + fmt.Sprintf("; not handed to the replicas live (%s) — each loads it when it next restarts", output.ErrorText(err.Error()))
 	}
 	defer done()
 	raised := 0
@@ -1363,8 +1363,9 @@ func (r keyRotateResult) Human(w io.Writer) error {
 			fprintf(w, "so the ones enrolled before this may already refuse. Re-enrol each device once a\n")
 			fprintf(w, "rotation has finished:\n")
 		}
+		// Each line names a keeper device as the record holds it.
 		for _, line := range reenrolLines(r.Instance, r.Reenrol) {
-			fprintf(w, "      %s\n", line)
+			fprintf(w, "      %s\n", terminalText(line))
 		}
 	}
 	if len(r.Scopes) > 0 {
@@ -1437,7 +1438,10 @@ func (c *keyRekeyCommand) Run(ctx context.Context, env *Env, args []string) erro
 	// rekey rewrote nothing, and said "rekeyed".
 	entries, listErr := listForRekey(ctx, session, loc.Key)
 	if listErr != nil {
-		fprintf(env.Err, "Warning: %v\n", listErr)
+		// One line per object a listing could not name, each naming it as
+		// the bucket does: the lines stay, and nothing in them acts on the
+		// terminal (ADR 0023 M2.6d, A28-3).
+		fprintf(env.Err, "Warning: %s\n", output.ErrorText(listErr.Error()))
 	}
 	var bytes int64
 	touched := map[string]bool{}
@@ -1678,7 +1682,10 @@ func (r keyRekeyResult) Human(w io.Writer) error {
 	if r.DryRun {
 		fprintf(w, "would rekey %d object(s) across %d application scope(s), reading and rewriting %s\n", r.Candidates, r.Scopes, humanBytes(r.Bytes))
 		if r.Blocked != "" {
-			fprintf(w, "\nbut a real run would refuse: %s\n", r.Blocked)
+			// Several lines by design (gate): each keeps its line, and
+			// anything else that does not print — an opener's error, say — is
+			// escaped in place (ADR 0023 M2.6d, A28-3).
+			fprintf(w, "\nbut a real run would refuse: %s\n", output.ErrorText(r.Blocked))
 		}
 		return nil
 	}

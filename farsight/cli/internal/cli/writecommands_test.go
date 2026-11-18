@@ -746,16 +746,18 @@ func TestWritersRefuseAnADCInstanceBeforeAnythingCosts(t *testing.T) {
 	// deploy and storage deploy read the registry to plan, so planRegistry
 	// refuses the record before any plan is computed, its blank key read
 	// before the provider opens; kernel deploy and storage deploy have read
-	// the cluster as the reader first, which is all they sent. build plans with no key, so it compares and refuses at
-	// the writer's open. Either way nothing is minted for the writer,
+	// the cluster as the reader first, which is all they sent. build plans
+	// with no key, so it compares and refuses at the writer's open; and so
+	// does run (M2.6d), with its fetch plan's digest, reading nothing, and
+	// with its deploy plan's, read as the reader alone (runDeployDigest
+	// needs no installer key). Either way nothing is minted for the writer,
 	// ensured, looked up or pushed, nothing is printed, and no file changes.
 	for _, row := range confirmingPlans(t) {
 		t.Run(row.String()+"/--confirm", func(t *testing.T) {
 			s, dir := planFixtureKeyed(t, row, false)
 			digest := sampleDigest
-			if row.name == "build" {
-				doc, _ := runPlan(t, dir, row, output.ModeJSON)
-				digest = doc.Digest
+			if row.name == "build" || row.name == "run" {
+				digest = planDigest(t, dir, row)
 			}
 			before := treeFiles(t, string(dir))
 			opened, resolved := row.fakes.opened, len(row.fakes.builder.resolved)
@@ -774,7 +776,7 @@ func TestWritersRefuseAnADCInstanceBeforeAnythingCosts(t *testing.T) {
 			if out.Len()+errb.Len() != 0 {
 				t.Errorf("%s --confirm printed %q %q before refusing", row, out, errb)
 			}
-			onlyThePlansReads(t, row, s)
+			onlyThePlansReads(t, row, s, consentConfirm)
 			sameFiles(t, row.String()+" --confirm on an ADC instance", before, treeFiles(t, string(dir)))
 		})
 	}
@@ -799,15 +801,16 @@ func TestWritersRefuseAnADCInstanceBeforeAnythingCosts(t *testing.T) {
 		if out.Len()+errb.Len() != 0 || row.fakes.keyholders != 0 {
 			t.Errorf("%s --confirm printed %q %q and opened the keyholder %d times before refusing", row, out, errb, row.fakes.keyholders)
 		}
-		onlyThePlansReads(t, row, s)
+		onlyThePlansReads(t, row, s, consentConfirm)
 		sameFiles(t, row.String()+" --confirm on an ADC instance", before, treeFiles(t, string(dir)))
 	})
 }
 
-// confirmingPlans are the planCommands rows of the commands ADR 0023 M2.6b
-// and M2.6c wire that apply, one per state that confirms into a deploy:
-// connect's first deploy and resume, redeploy, build, kernel deploy, and
-// storage deploy.
+// confirmingPlans are the plan rows of the commands that apply, one per
+// state that confirms into a deploy: connect's first deploy and resume,
+// redeploy, build, kernel deploy and storage deploy (ADR 0023 M2.6b and
+// M2.6c); and run's fetch plan, whose --confirm applies the manifest read,
+// and its deploy plan into a metered namespace (M2.6d, A28-11).
 func confirmingPlans(t *testing.T) []planCommand {
 	t.Helper()
 	return []planCommand{
@@ -817,6 +820,8 @@ func confirmingPlans(t *testing.T) []planCommand {
 		planCommandNamed(t, "build", "a named builder"),
 		planCommandNamed(t, "kernel deploy", "the carried image"),
 		planCommandNamed(t, "storage deploy", "the recorded bucket"),
+		planCommandNamed(t, "run", "the images named"),
+		runDeployRowNamed(t, "deploy into a metered namespace"),
 	}
 }
 
@@ -838,6 +843,8 @@ func realWriter(t *testing.T, cmd Command) Command {
 		c.deployer.newCluster, c.newPinStore = nil, nil
 	case *keyPinCommand:
 		c.newPinStore = nil
+	case *runCommand:
+		c.newCluster = nil
 	default:
 		t.Fatalf("%T has no writing seam here", cmd)
 	}
@@ -845,13 +852,23 @@ func realWriter(t *testing.T, cmd Command) Command {
 }
 
 // onlyThePlansReads fails t unless every request s saw is one row's plan
-// may make (design §7.3, A23-20): none for a plan that reads no cluster, and
-// for one that reads it, the reader's token and the reader's GETs.
-func onlyThePlansReads(t *testing.T, row planCommand, s *kubetest.Server) {
+// may make under m (design §7.3, A23-20): none for a plan that reads no
+// cluster, and for one that reads it, the reader's token and the reader's
+// GETs. Under --confirm a row whose --confirm reads the cluster
+// (confirmReadsCluster, run's fetch plan) may make those too.
+func onlyThePlansReads(t *testing.T, row planCommand, s *kubetest.Server, m consentMode) {
 	t.Helper()
-	for _, r := range s.Requests() {
+	onlyThePlansSent(t, row, s.Requests(), m)
+}
+
+// onlyThePlansSent is onlyThePlansReads over reqs: for a test whose server
+// saw a writer's requests too, before the ones it checks.
+func onlyThePlansSent(t *testing.T, row planCommand, reqs []kubetest.Request, m consentMode) {
+	t.Helper()
+	reads := row.readsCluster || (m == consentConfirm && row.confirmReadsCluster)
+	for _, r := range reqs {
 		switch {
-		case !row.readsCluster:
+		case !reads:
 			t.Errorf("%s reads no cluster, and sent %s %s as %q", row, r.Method, r.Path, r.As)
 		case r.As != "reader":
 			t.Errorf("%s sent %s %s as %q; a plan reads as the reader alone", row, r.Method, r.Path, r.As)
@@ -1200,8 +1217,9 @@ func TestCommandsThatApplyRefuseAMachineThatCannotApply(t *testing.T) {
 	// Under --confirm (ADR 0023 M2.6, A23-23): the plan needs no kubectl,
 	// so the command plans and compares, and only then opens the writer,
 	// whose applyReady refuses before anything is minted, ensured, pushed
-	// or sent as the writer, and before any kubectl runs. kernel deploy's
-	// plan reads the cluster as the reader, and that is all it sent.
+	// or sent as the writer, and before any kubectl runs. kernel deploy's,
+	// storage deploy's and run's deploy plans read the cluster as the
+	// reader, and that is all they sent; run's fetch plan sent nothing.
 	for _, row := range confirmingPlans(t) {
 		for _, lack := range []struct {
 			name  string
@@ -1223,9 +1241,9 @@ func TestCommandsThatApplyRefuseAMachineThatCannotApply(t *testing.T) {
 			t.Run(row.String()+"/--confirm/"+lack.name, func(t *testing.T) {
 				s, dir := planFixture(t, row)
 				ran := lack.setup(t, dir)
-				doc, _ := runPlan(t, dir, row, output.ModeJSON)
+				digest := planDigest(t, dir, row)
 				before := treeFiles(t, string(dir))
-				cmd := realWriter(t, withFlags(t, row.cmd(), append(slices.Clone(row.flags), "--confirm", doc.Digest)...))
+				cmd := realWriter(t, withFlags(t, row.cmd(), append(slices.Clone(row.flags), "--confirm", digest)...))
 				env, _, errb := testEnvBoth(dir, output.ModeJSON)
 				err := cmd.Run(t.Context(), env, row.args)
 				if err == nil || !strings.Contains(err.Error(), msgCannotApply+lack.cause) || kindOf(classified(err)) != kindInternal {
@@ -1237,7 +1255,7 @@ func TestCommandsThatApplyRefuseAMachineThatCannotApply(t *testing.T) {
 				if ran() || errb.Len() != 0 {
 					t.Errorf("%s --confirm ran kubectl %v and said %q before refusing", row, ran(), errb)
 				}
-				onlyThePlansReads(t, row, s)
+				onlyThePlansReads(t, row, s, consentConfirm)
 				sameFiles(t, row.String()+" --confirm on a machine that cannot apply", before, treeFiles(t, string(dir)))
 			})
 		}
@@ -1297,10 +1315,12 @@ func TestRunRaisesThePinThroughItsOwnWriter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := preflightNamespace(t.Context(), cl); err != nil {
+	if _, err := preflightUID(t.Context(), cl); err != nil {
 		t.Fatal(err)
 	}
-	c.handScopesToTheKeyholder(t.Context(), env, meta, []string{"web"}, cl)
+	if err := c.handScopesToTheKeyholder(t.Context(), env, meta, []string{"web"}, cl, nil); err != nil {
+		t.Fatal(err)
+	}
 
 	creds, mints, created := 0, 0, 0
 	for _, p := range reads() {
@@ -1342,8 +1362,17 @@ type planCommand struct {
 	flags []string
 	// readsCluster: the plan reads the cluster, as the instance's reader.
 	readsCluster bool
-	cmd          func() Command
-	edit         func(meta *config.InstanceMetadata)
+	// confirmReadsCluster: its --confirm of a digest that is not its own
+	// reads the cluster as the reader, where its --plan reads none: run's
+	// fetch plan, whose --confirm of any other digest reads the fetch Job a
+	// deploy plan would (A23-47, A28-11).
+	confirmReadsCluster bool
+	// stage is run's: "fetch" for its fetch plan, which --plan prints, and
+	// "deploy" for its deploy plan (runDeployRows), which --confirm with the
+	// fetch plan's digest prints; "" for every other command.
+	stage string
+	cmd   func() Command
+	edit  func(meta *config.InstanceMetadata)
 	// prepare, when set, writes what the record alone cannot say: the
 	// instance's mTLS material, for connect's resume and reconnect.
 	prepare func(t *testing.T, dir config.Dir)
@@ -1632,6 +1661,11 @@ func planCommands() []planCommand {
 	noStorage := func(m *config.InstanceMetadata) { m.Storage = nil }
 	rotateHanded, rotateAlone, rotateBelow := fakes(nil), fakes(nil), fakes(nil)
 	noKeyholderDeployed := func(m *config.InstanceMetadata) { m.Keyholder = nil }
+	runNamed, runRecorded, runInto, runNoKernel, runOther, runShared := fakes(nil), fakes(nil), fakes(nil), fakes(nil), fakes(nil), fakes(nil)
+	toolchainRecorded := func(m *config.InstanceMetadata) {
+		m.Toolchain = &config.Toolchain{Fetcher: fetcherDigest, Builder: builderDigest}
+	}
+	intoShop := append(slices.Clone(runFixtureFlags), "--namespace", "shop")
 
 	return []planCommand{
 		{name: "kernel meter", shape: "add", args: []string{writeName, writeNewNamespace}, cmd: meter},
@@ -1702,6 +1736,28 @@ func planCommands() []planCommand {
 			edit: noKeyholderDeployed, fakes: rotateAlone},
 		{name: "storage key rotate", shape: "behind the pin", args: []string{writeName}, readsCluster: true, cmd: keyRotate(rotateBelow),
 			seed: pinSeeded(pinRequiringForeign), fakes: rotateBelow},
+		// run's fetch plans (M2.6d): the manifest read, with both toolchain
+		// images named, both recorded, or into a --namespace; and its blocks,
+		// read from the record and keys.yaml alone: no kernel, a --namespace
+		// recorded under another repository, and a keyring holding the scope
+		// every application once shared. None reads the cluster; the
+		// --confirm of a digest not its own reads the fetch Job a deploy plan
+		// would, as the reader, but for a blocked one's, which reads nothing
+		// (A28-8). Its deploy plans are runDeployRows.
+		{name: "run", shape: "the images named", stage: "fetch", args: runFixtureArgs, flags: runFixtureFlags, confirmReadsCluster: true,
+			cmd: runWithFakes(runNamed), fakes: runNamed},
+		{name: "run", shape: "the images recorded", stage: "fetch", args: runFixtureArgs, confirmReadsCluster: true,
+			cmd: runWithFakes(runRecorded), edit: toolchainRecorded, fakes: runRecorded},
+		{name: "run", shape: "--namespace given", stage: "fetch", args: runFixtureArgs, flags: intoShop, confirmReadsCluster: true,
+			cmd: runWithFakes(runInto), fakes: runInto},
+		{name: "run", shape: "no kernel", stage: "fetch", args: runFixtureArgs, flags: runFixtureFlags,
+			cmd: runWithFakes(runNoKernel), edit: func(m *config.InstanceMetadata) { m.Kernel = nil }, fakes: runNoKernel},
+		{name: "run", shape: "a namespace recorded under another repository", stage: "fetch", args: runFixtureArgs, flags: intoShop,
+			cmd: runWithFakes(runOther), edit: func(m *config.InstanceMetadata) {
+				m.Deployments = map[string]config.Deployment{"shop": {Repository: "https://github.com/example/shop"}}
+			}, fakes: runOther},
+		{name: "run", shape: "a keyring holding the shared application scope", stage: "fetch", args: runFixtureArgs, flags: runFixtureFlags,
+			cmd: runWithFakes(runShared), prepare: func(t *testing.T, dir config.Dir) { saveSharedScopeKeyring(t, dir, writeName) }, fakes: runShared},
 	}
 }
 
@@ -1959,17 +2015,27 @@ func writeTargets(b plan.Bound) []string {
 // a builder (connect's, redeploy's, build's, kernel deploy's, storage
 // deploy's) ensures and deletes no registry, builds and pushes no image (its
 // token and lookups are reads), opens no writer and dials nothing; storage
-// deploy mints no storage, and storage key pin opens no keyholder.
+// deploy mints no storage, and storage key pin opens no keyholder. The
+// shapes are every command's (everyPlanShape, design §28's step 9b), and
+// run's deploy plans among them are computed as --confirm of a digest that
+// is no plan's computes them (runDeployDigest): as the reader alone, with
+// no writer opened and no fetch Job applied.
 func TestPlansWriteNothing(t *testing.T) {
 	ran := strayKubectl(t)
-	for _, row := range planCommands() {
+	for _, row := range everyPlanShape(t) {
 		t.Run(row.String(), func(t *testing.T) {
 			s, dir := planFixture(t, row)
 			before := treeFiles(t, string(dir))
 			reads := observeConfigReads(t)
-			runPlan(t, dir, row, output.ModeJSON)
-			runPlan(t, dir, row, output.ModeHuman)
-			sameFiles(t, row.String()+" --plan", before, treeFiles(t, string(dir)))
+			what := row.String() + " --plan"
+			if row.stage == "deploy" {
+				what = row.String() + "'s plan, computed by --confirm " + zeroDigest
+				runDeployDigest(t, dir, row, nil)
+			} else {
+				runPlan(t, dir, row, output.ModeJSON)
+				runPlan(t, dir, row, output.ModeHuman)
+			}
+			sameFiles(t, what, before, treeFiles(t, string(dir)))
 			for _, p := range reads() {
 				// A plan opens no private key (A23-25): the CA's, FatLine's
 				// server key, or the operator's.
@@ -1989,7 +2055,7 @@ func TestPlansWriteNothing(t *testing.T) {
 						row, f.writers, f.dialled, f.storages, f.keyholders)
 				}
 			}
-			onlyThePlansReads(t, row, s)
+			onlyThePlansReads(t, row, s, consentPlan)
 		})
 	}
 	if ran() {
@@ -1997,17 +2063,19 @@ func TestPlansWriteNothing(t *testing.T) {
 	}
 }
 
-// ADR 0023 M2.6 (A23-25, A23-45, mutation 91e): a plan opens keys.yaml for
-// its key ids and their times, and carries none of its key material. Every
-// plan of the storage commands — storage deploy's, storage key pin's and
-// storage key rotate's — whose fixture holds a keyring, printed in JSON and
-// in text, holds no key of it in base64 (padded or not, standard or URL) or
-// in hex; and none opens the CA's key, a server's key or the operator's.
-// (run's plans join it in ADR 0023 M2.6d.)
+// ADR 0023 M2.6 (A23-25, A23-45, mutations 91e and 91g): a plan opens
+// keys.yaml for its key ids and their times, and carries none of its key
+// material. Every plan of the storage commands — storage deploy's, storage
+// key pin's and storage key rotate's — and run's fetch plans, which read
+// keys.yaml for the shared scope when a keyholder is deployed, whose fixture
+// holds a keyring, printed in JSON and in text, holds no key of it in base64
+// (padded or not, standard or URL) or in hex; and none opens the CA's key, a
+// server's key or the operator's. run's deploy plans (M2.6d) are their own
+// rows.
 func TestPlansCarryNoKeyMaterial(t *testing.T) {
 	rows := 0
 	for _, row := range planCommands() {
-		if !strings.HasPrefix(row.name, "storage ") {
+		if !strings.HasPrefix(row.name, "storage ") && row.name != "run" {
 			continue
 		}
 		t.Run(row.String(), func(t *testing.T) {
@@ -2038,12 +2106,17 @@ func TestPlansCarryNoKeyMaterial(t *testing.T) {
 	if rows == 0 {
 		t.Fatal("no plan of a storage command ran over a keyring")
 	}
+	t.Run("run's deploy plans", runDeployPlansCarryNoKeyMaterial)
 }
 
 // ADR 0023 M2.6 (row 91): a plan does not depend on the terminal. Each is
 // printed in human mode with stdin a character device, which isTerminal
 // takes for a terminal, and with stdin a pipe; the digests are equal, and so
-// are the bound bytes of the two in JSON.
+// are the bound bytes of the two in JSON. The shapes are every command's
+// (everyPlanShape, design §28's step 9b); run's deploy plans among them are
+// computed in human mode as --confirm of a digest that is no plan's
+// computes them (runDeployDigest), with each stdin, and their digests are
+// equal.
 func TestPlanIgnoresTheTerminal(t *testing.T) {
 	tty, err := os.Open(os.DevNull)
 	if err != nil {
@@ -2053,9 +2126,15 @@ func TestPlanIgnoresTheTerminal(t *testing.T) {
 	if !isTerminal(tty) {
 		t.Fatalf("%s is not taken for a terminal here, so this test would prove nothing", os.DevNull)
 	}
-	for _, row := range planCommands() {
+	for _, row := range everyPlanShape(t) {
 		t.Run(row.String(), func(t *testing.T) {
 			_, dir := planFixture(t, row)
+			if row.stage == "deploy" {
+				if inTTY, inPipe := runDeployDigest(t, dir, row, tty), runDeployDigest(t, dir, row, strings.NewReader("")); inTTY != inPipe {
+					t.Errorf("the deploy plan in a terminal is %s, and in a pipe %s", inTTY, inPipe)
+				}
+				return
+			}
 			inTTY, _ := runPlanIn(t, dir, row, output.ModeHuman, tty)
 			inPipe, _ := runPlanIn(t, dir, row, output.ModeHuman, strings.NewReader(""))
 			if inTTY.Digest != inPipe.Digest {
@@ -2072,7 +2151,10 @@ func TestPlanIgnoresTheTerminal(t *testing.T) {
 
 // ADR 0023 M2.6 (row 79): a plan computed twice from the same state is the
 // same bytes, and kernel confirm's two clock readings on one UTC day bind the
-// same plan (design §9.4, the clock).
+// same plan (design §9.4, the clock). run's deploy plans (M2.6d) are printed
+// twice by --confirm with the fetch plan's digest, each running the manifest
+// read again: one that mints a scope, an egress credential and a leaf for
+// each application binds the same bytes both times.
 func TestPlanIsDeterministic(t *testing.T) {
 	for _, row := range planCommands() {
 		t.Run(row.String(), func(t *testing.T) {
@@ -2081,6 +2163,16 @@ func TestPlanIsDeterministic(t *testing.T) {
 			second, _ := runPlan(t, dir, row, output.ModeJSON)
 			if !bytes.Equal(first.Bound, second.Bound) || first.Digest != second.Digest {
 				t.Errorf("two plans from one state differ:\n%s\n%s", first.Bound, second.Bound)
+			}
+		})
+	}
+	for _, row := range runDeployRows(t) {
+		t.Run(row.String(), func(t *testing.T) {
+			_, dir := planFixture(t, row)
+			first, _ := runDeployPlan(t, dir, row, output.ModeJSON)
+			second, _ := runDeployPlan(t, dir, row, output.ModeJSON)
+			if !bytes.Equal(first.Bound, second.Bound) || first.Digest != second.Digest {
+				t.Errorf("two deploy plans from one state differ:\n%s\n%s", first.Bound, second.Bound)
 			}
 		})
 	}
@@ -2200,9 +2292,14 @@ func TestConnectPlanFactsFollowItsState(t *testing.T) {
 // kernel confirm's, reader grant's and storage key pin's plans, have no
 // registry read, and none reads credentials.yaml, nor does a kernel deploy
 // blocked by a missing namespace, or a storage deploy blocked by the pin,
-// which read nothing after their block (A23-18). A plan of the read group on an instance
-// installed without a key (Application Default Credentials) is refused
-// credential_missing, before the provider opens.
+// which read nothing after their block (A23-18). Neither do run's plans
+// (M2.6d): its fetch plan reads the record and keys.yaml, and its deploy
+// plan, computed as --confirm of a digest that is no plan's computes it
+// (runDeployDigest), reads as the reader alone; --confirm with the fetch
+// plan's digest reads the key, for the writer that applies the manifest
+// read, before a deploy plan exists (A28-11). A plan of the read group on
+// an instance installed without a key (Application Default Credentials) is
+// refused credential_missing, before the provider opens.
 func TestPlansStillReadTheInstallerKeyForGoogle(t *testing.T) {
 	// By command, or by command/shape where its shapes differ.
 	readsKey := map[string]bool{
@@ -2210,7 +2307,7 @@ func TestPlansStillReadTheInstallerKeyForGoogle(t *testing.T) {
 		"connect": true, "connect/reconnect": false, "redeploy": true, "build": false,
 		"kernel deploy": true, "kernel deploy/a missing namespace": false,
 		"storage deploy": true, "storage deploy/behind the pin": false, "storage key pin": false,
-		"storage key rotate": false,
+		"storage key rotate": false, "run": false,
 	}
 	groupOf := func(row planCommand) (bool, bool) {
 		if want, ok := readsKey[row.String()]; ok {
@@ -2250,6 +2347,16 @@ func TestPlansStillReadTheInstallerKeyForGoogle(t *testing.T) {
 			})
 		})
 	}
+	for _, row := range runDeployRows(t) {
+		t.Run(row.String(), func(t *testing.T) {
+			_, dir := planFixture(t, row)
+			reads := observeConfigReads(t)
+			runDeployDigest(t, dir, row, nil)
+			if slices.ContainsFunc(reads(), func(p string) bool { return filepath.Base(p) == "credentials.yaml" }) {
+				t.Errorf("%s read credentials.yaml computing the deploy plan (%q)", row, reads())
+			}
+		})
+	}
 }
 
 // ADR 0023 M2.6 (A23-26), mutation 91a: under --plan, a line a command
@@ -2258,7 +2365,9 @@ func TestPlansStillReadTheInstallerKeyForGoogle(t *testing.T) {
 // kernel meter's no-op, kernel confirm's empty window, connect's and
 // redeploy's keepingNote, kernel deploy's dropped namespace, storage
 // deploy's bucket grant, storage key pin --replace's lowering warning, and
-// storage key rotate's rotationScopeWarning, the last three several lines.
+// storage key rotate's rotationScopeWarning, the last three several lines;
+// and run's deploy plan (M2.6d), which --confirm with the fetch plan's
+// digest prints.
 func TestPlanPrintsNoticesOnlyAsFacts(t *testing.T) {
 	keeper := fatlineDeployer{component: components.FatLine, carried: newFakeCarried()}
 	kept := config.SystemImage{Image: imageIn("fatline", "a"), Origin: config.OriginOperator, Go: "go1.27.5",
@@ -2429,6 +2538,7 @@ func TestPlanPrintsNoticesOnlyAsFacts(t *testing.T) {
 			}
 		})
 	}
+	t.Run("run's deploy plan", runDeployNoticesAreFacts)
 }
 
 // planNoticeInstance is TestPlanPrintsNoticesOnlyAsFacts's instance for the
@@ -2848,7 +2958,8 @@ func masked(doc []byte) []byte {
 // rollout, or the build's Job, which kubetest does not hold), which this
 // test does not need. storage deploy, storage key pin and storage key rotate
 // have their own rows (ADR 0023 M2.6c): the keyholder's stream and the
-// bucket, and the pins. FatLine's stream, from connect's first deploy (which
+// bucket, and the pins; and so does run (M2.6d), whose deploy runs to the
+// end: its builds, egress policy, workloads and key pin. FatLine's stream, from connect's first deploy (which
 // mints the material) and from redeploy (which loads it): the plan's write
 // facts are the planned rendering, over placeholder leaves and the plan's
 // images, and the applied documents equal it document for document once a
@@ -2985,6 +3096,7 @@ func TestConfirmWritesThePlannedDocumentsExceptTheirSecrets(t *testing.T) {
 	t.Run("storage deploy", confirmWritesTheKeyholderAsPlanned)
 	t.Run("the key pin", confirmWritesThePinAsPlanned)
 	t.Run("storage key rotate", confirmWritesRotatesPinsAsPlanned)
+	t.Run("run", confirmWritesRunsDocumentsAsPlanned)
 }
 
 // bucketArgument is the keyholder's --bucket= argument, which A23-31 item 6
@@ -3287,9 +3399,25 @@ func readerPlans(t *testing.T) []planCommand {
 // reads it as the instance's reader, and only as it: it succeeds, the cluster
 // sees at least one request, every one of them, every token among them, is
 // the reader's, and its reader seam was asked for the reader. A plan that
-// reads no cluster sends nothing.
+// reads no cluster sends nothing. run's deploy plans (M2.6d) are computed
+// as --confirm of a digest that is no plan's computes them
+// (runDeployDigest): the reader alone, and no writer.
 func TestPlansPresentOnlyTheReaderToken(t *testing.T) {
 	ran := strayKubectl(t)
+	onlyTheReaders := func(t *testing.T, row planCommand, reqs []kubetest.Request) {
+		t.Helper()
+		if len(reqs) == 0 {
+			t.Fatalf("%s reads the cluster, and sent nothing", row)
+		}
+		for _, r := range reqs {
+			if r.As != "reader" {
+				t.Errorf("%s: %s %s?%s as %q; want only the reader", row, r.Method, r.Path, r.RawQuery, r.As)
+			}
+		}
+		if f := row.fakes; f == nil || len(f.readers) == 0 || slices.ContainsFunc(f.readers, func(id kube.Identity) bool { return id != kube.Reader }) {
+			t.Errorf("%s opened its reader seam as %v; want the reader", row, row.fakes.readers)
+		}
+	}
 	for _, row := range planCommands() {
 		t.Run(row.String(), func(t *testing.T) {
 			s, dir := planFixture(t, row)
@@ -3301,16 +3429,16 @@ func TestPlansPresentOnlyTheReaderToken(t *testing.T) {
 				}
 				return
 			}
-			if len(reqs) == 0 {
-				t.Fatalf("%s --plan reads the cluster, and sent nothing", row)
-			}
-			for _, r := range reqs {
-				if r.As != "reader" {
-					t.Errorf("%s --plan: %s %s?%s as %q; want only the reader", row, r.Method, r.Path, r.RawQuery, r.As)
-				}
-			}
-			if f := row.fakes; f == nil || len(f.readers) == 0 || slices.ContainsFunc(f.readers, func(id kube.Identity) bool { return id != kube.Reader }) {
-				t.Errorf("%s --plan opened its reader seam as %v; want the reader", row, row.fakes.readers)
+			onlyTheReaders(t, row, reqs)
+		})
+	}
+	for _, row := range runDeployRows(t) {
+		t.Run(row.String(), func(t *testing.T) {
+			s, dir := planFixture(t, row)
+			runDeployDigest(t, dir, row, nil)
+			onlyTheReaders(t, row, s.Requests())
+			if row.fakes.writers != 0 {
+				t.Errorf("%s opened the writer %d times", row, row.fakes.writers)
 			}
 		})
 	}
@@ -3341,8 +3469,10 @@ func answeredStatuses() (kubetest.Option, func() []string) {
 // makes is one the RBAC 'reader grant' renders allows. kubetest authorizes
 // the reader with exactly renderReaderRBAC's stream for the namespaces the
 // fixture records as metered, and world, ps, costs, usage and logs, and
-// every plan that reads the cluster, read with no 403 and succeed. (run's
-// deploy plan joins them in ADR 0023 M2.6d.)
+// every plan that reads the cluster, read with no 403 and succeed. run's
+// deploy plans (M2.6d, A28-11) are computed through runDeployDigest, the
+// reader's alone; runFixture's record meters the namespace they deploy
+// into, and reading its fetch Job needs the jobs rule.
 func TestEveryReaderReadIsAllowedByTheRenderedRBAC(t *testing.T) {
 	t.Run("world", func(t *testing.T) {
 		email := worldReaderEmail()
@@ -3386,28 +3516,50 @@ func TestEveryReaderReadIsAllowedByTheRenderedRBAC(t *testing.T) {
 			}
 		})
 	}
+	var rows []planCommand
 	for _, row := range planCommands() {
-		if !row.readsCluster {
-			continue
+		if row.readsCluster {
+			rows = append(rows, row)
 		}
+	}
+	for _, row := range append(rows, runDeployRows(t)...) {
 		t.Run(row.String(), func(t *testing.T) {
-			email := readerName(writeName) + "@kubetest.invalid"
-			stream, err := renderReaderRBAC(email, []string{tcdeploy.DefaultNamespace})
-			if err != nil {
-				t.Fatal(err)
-			}
+			email, stream := readerRBACFor(t, row)
 			statuses, refused := answeredStatuses()
 			s, dir := planFixtureWith(t, row, true, kubetest.WithRBAC(email, stream), statuses)
-			if meta, err := dir.LoadInstanceMetadata(writeName); err != nil || !slices.Equal(meta.Kernel.Namespaces, []string{tcdeploy.DefaultNamespace}) {
-				t.Fatalf("the fixture meters %v (%v); the RBAC is rendered for farcast-system", meta.Kernel.Namespaces, err)
+			if row.stage == "deploy" {
+				runDeployDigest(t, dir, row, nil)
+			} else {
+				runPlan(t, dir, row, output.ModeJSON)
 			}
-			runPlan(t, dir, row, output.ModeJSON)
 			onlyTheReader(t, s)
 			if got := refused(); len(got) != 0 {
-				t.Errorf("%s --plan met 403s: %q", row, got)
+				t.Errorf("%s met 403s: %q", row, got)
 			}
 		})
 	}
+}
+
+// readerRBACFor is the RBAC 'reader grant' renders for row's fixture: the
+// email of the reader its record names, bound in every namespace the record
+// meters (A23-50, A28-11), read from a fixture of row's built for the
+// purpose. A plan into a namespace the kernel meters, run's into runTarget,
+// is read there with the binding its record gives it.
+func readerRBACFor(t *testing.T, row planCommand) (string, []byte) {
+	t.Helper()
+	_, dir := planFixture(t, row)
+	meta, err := dir.LoadInstanceMetadata(writeName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.String() == "run/deploy into a metered namespace" && !slices.Equal(meta.Kernel.Namespaces, []string{tcdeploy.DefaultNamespace, runTarget}) {
+		t.Fatalf("the fixture meters %v; want farcast-system and %s", meta.Kernel.Namespaces, runTarget)
+	}
+	stream, err := renderReaderRBAC(meta.Reader.Email, meta.Kernel.Namespaces)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return meta.Reader.Email, stream
 }
 
 // ADR 0023 M2.6 (A23-1, A23-21; rows 85 and 85a): a plan that reads the
@@ -3492,6 +3644,7 @@ func TestPlanWithoutAReaderIsRefused(t *testing.T) {
 			}
 		}
 	}
+	t.Run("run", runWithoutAReaderIsRefused)
 	if ran() {
 		t.Error("a plan ran kubectl")
 	}
@@ -3504,7 +3657,9 @@ func TestPlanWithoutAReaderIsRefused(t *testing.T) {
 // 403 the endpoint's IAM; either is kind forbidden, under --plan and in
 // --confirm's recomputation. Each command that reads the cluster in its
 // plan (readerPlans) meets it at its first read: kernel deploy's namespaces,
-// and the storage commands' key pin (row S-C26-S5 of the M2.6c review).
+// and the storage commands' key pin (row S-C26-S5 of the M2.6c review); and
+// run's deploy plan (M2.6d), under --confirm of a digest that is no plan's,
+// its fetch Job.
 func TestPlanReadErrorsNameTheReader(t *testing.T) {
 	firstRead := map[string]string{
 		"kernel deploy":      "/api/v1/namespaces",
@@ -3545,10 +3700,15 @@ func TestPlanReadErrorsNameTheReader(t *testing.T) {
 					if out.Len() != 0 || row.fakes.writers+row.fakes.opened != 0 {
 						t.Errorf("%s %s printed %q, opened the writer %d times and the provider %d times", row, answer[0], out, row.fakes.writers, row.fakes.opened)
 					}
-					onlyThePlansReads(t, row, s)
+					m := consentPlan
+					if answer[0] == "--confirm" {
+						m = consentConfirm
+					}
+					onlyThePlansReads(t, row, s, m)
 				})
 			}
 		}
+		t.Run("run <D>/"+tc.name, func(t *testing.T) { runPlanReadErrorsNameTheReader(t, tc.status, tc.sentence) })
 	}
 }
 
@@ -3559,6 +3719,8 @@ func TestPlanReadErrorsNameTheReader(t *testing.T) {
 // no farcast-system at all: --confirm refuses, plan_changed, exit 1, naming
 // both uids, once the writer's preflight read it, and before anything is
 // ensured, pushed, recorded or applied; the kubectl stand-in never runs.
+// run's deploy plan (M2.6d) has the same rows, against runFixture
+// (runConfirmChecksTheWritersCluster).
 func TestConfirmChecksTheWritersClusterIsThePlans(t *testing.T) {
 	for _, tc := range []struct {
 		name, writerUID, said string
@@ -3628,6 +3790,7 @@ func TestConfirmChecksTheWritersClusterIsThePlans(t *testing.T) {
 			sameFiles(t, "a confirm against another cluster", before, treeFiles(t, string(dir)))
 		})
 	}
+	t.Run("run <D>", runConfirmChecksTheWritersCluster)
 }
 
 // The storage commands' rows of TestConfirmChecksTheWritersClusterIsThePlans
@@ -3706,22 +3869,13 @@ func (p pinsAt) NamespaceUID(context.Context, string) (string, error) { return p
 // read was answered after the stand-in ran, and the stand-in applied, after
 // the writer's preflight and before its rollout read, exactly the documents
 // the plan bound. (That the apply itself runs as the writer is M2.7's
-// assertion.)
+// assertion.) run's two plans (M2.6d) have their own cases
+// (runConfirmRecomputesAsThePlansIdentity).
 func TestConfirmRecomputesAsThePlansIdentity(t *testing.T) {
 	t.Run("kernel deploy", func(t *testing.T) {
 		calls, runs := succeedingKubectlRuns(t)
-		type answered struct {
-			as, method, path string
-			applied          int
-		}
-		var mu sync.Mutex
-		var seen []answered
-		s := kubetest.New(t, kubetest.WithAnswered(func(r kubetest.Request, _ int) {
-			n := runs()
-			mu.Lock()
-			defer mu.Unlock()
-			seen = append(seen, answered{r.As, r.Method, r.Path, n})
-		}))
+		answered, seen := answeredLog(runs)
+		s := kubetest.New(t, answered)
 		systemNamespace(s)
 		s.Put(map[string]any{
 			"apiVersion": "apps/v1", "kind": "Deployment",
@@ -3753,19 +3907,15 @@ func TestConfirmRecomputesAsThePlansIdentity(t *testing.T) {
 			t.Fatalf("--plan: %v\n%s", err, errb)
 		}
 		doc := printedDocument(t, out.Bytes())
-		mu.Lock()
-		planned := len(seen)
-		mu.Unlock()
+		planned := len(seen())
 
 		env, _, errb = testEnvBoth(dir, output.ModeJSON)
 		if err := kernelDeploy("--confirm", doc.Digest).Run(t.Context(), env, []string{writeName}); err != nil {
 			t.Fatalf("--confirm: %v\n%s", err, errb)
 		}
-		mu.Lock()
-		confirmed := slices.Clone(seen[planned:])
-		mu.Unlock()
+		confirmed := seen()[planned:]
 
-		firstWriter := slices.IndexFunc(confirmed, func(a answered) bool { return a.as == "writer" && a.path == "/token" })
+		firstWriter := slices.IndexFunc(confirmed, func(a answeredRequest) bool { return a.as == "writer" && a.path == "/token" })
 		if firstWriter < 1 {
 			t.Fatalf("the confirm's requests %+v; want the reader's recomputation, then the writer's token", confirmed)
 		}
@@ -3777,7 +3927,7 @@ func TestConfirmRecomputesAsThePlansIdentity(t *testing.T) {
 				t.Errorf("after the writer's token: %s %s as %q; want the writer's", a.method, a.path, a.as)
 			}
 		}
-		var writerReads []answered
+		var writerReads []answeredRequest
 		for _, a := range confirmed[firstWriter+1:] {
 			if a.path != "/token" {
 				writerReads = append(writerReads, a)
@@ -3806,6 +3956,7 @@ func TestConfirmRecomputesAsThePlansIdentity(t *testing.T) {
 			t.Errorf("recorded %+v; want the kernel applied with the carried image", after.Kernel)
 		}
 	})
+	runConfirmRecomputesAsThePlansIdentity(t)
 }
 
 // carriedRegistryRef is a component's carried image in meta's recorded

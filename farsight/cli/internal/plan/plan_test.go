@@ -401,7 +401,7 @@ func TestFactFieldsFollowTheFactTable(t *testing.T) {
 		TypeFetch:    "type repository ref manifest job fetcher",
 		TypeRun: "type job_uid fetch_plan_digest commit manifest_digest namespace replaces_repository " +
 			"apps apps[].name apps[].containerfile apps[].context apps[].external apps[].external[].host apps[].external[].reason " +
-			"other_deployments_kept metering_added",
+			"other_deployments_kept metering_added limit_reached limit_reason",
 		TypeBuild: "type repository ref app containerfile context tag destination",
 		TypeApplicationReset: "type namespace app state stopped_by_cost_guard limit_reached replicas_live replicas_after " +
 			"requests_live requests_live.cpu_milli requests_live.mem_mib requests_after requests_after.cpu_milli requests_after.mem_mib",

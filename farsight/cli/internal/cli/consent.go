@@ -158,18 +158,27 @@ func requireGrantedReader(dir config.Dir, meta *config.InstanceMetadata, command
 		return nil
 	}
 	name := meta.Name
-	state, err := readerStateOf(dir, name, meta)
-	if err != nil {
+	state, err := ungrantedReader(dir, meta)
+	if err != nil || state == "" {
 		return err
-	}
-	if state == readerGranted {
-		return nil
 	}
 	answer := "--plan"
 	if m == consentConfirm {
 		answer = "--confirm"
 	}
 	return refuse(errCredentialMissing, msgPlanNeedsReader, command, answer, name, strings.ReplaceAll(state, "_", " "), readerRemedy(state, name))
+}
+
+// ungrantedReader is the state of the instance's reader when it is not one
+// 'reader grant' has verified, as readerStateOf tells it from the record and
+// the presence of reader.key, never by opening the key; "" when it is one.
+// An error telling it is returned as it is.
+func ungrantedReader(dir config.Dir, meta *config.InstanceMetadata) (string, error) {
+	state, err := readerStateOf(dir, meta.Name, meta)
+	if err != nil || state == readerGranted {
+		return "", err
+	}
+	return state, nil
 }
 
 // readerRemedy is what the operator does about a reader in state, for the
@@ -291,17 +300,26 @@ func refuseBlocked(b plan.Bound) error {
 // (refuseBlocked). The digest is compared first, so a blocked plan that
 // changed says it changed.
 func confirmPlan(b plan.Bound, given string) error {
-	c, err := plan.Canonical(b)
+	now, err := boundDigest(b)
 	if err != nil {
 		return err
 	}
-	if now := plan.DigestOf(c); now != given {
+	if now != given {
 		return planChanged(now, given)
 	}
 	if len(b.Blocked) > 0 {
 		return refuseBlocked(b)
 	}
 	return nil
+}
+
+// boundDigest is the digest of the plan b: of its canonical bytes.
+func boundDigest(b plan.Bound) (string, error) {
+	c, err := plan.Canonical(b)
+	if err != nil {
+		return "", err
+	}
+	return plan.DigestOf(c), nil
 }
 
 // printPlan is --plan's output: the document in JSON, the rendering in human

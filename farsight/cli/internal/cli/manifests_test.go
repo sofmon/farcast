@@ -19,7 +19,6 @@ import (
 	dsdeploy "github.com/sofmon/farcast/datasphere/deploy"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/kube"
-	"github.com/sofmon/farcast/farsight/cli/internal/output"
 	fldeploy "github.com/sofmon/farcast/fatline/deploy"
 	"github.com/sofmon/farcast/fatline/identity"
 	"github.com/sofmon/farcast/manifest/parser"
@@ -99,7 +98,6 @@ func renderedStreams(t *testing.T) []renderedStream {
 	if err := dir.SaveInstanceMTLS(instance, mtls); err != nil {
 		t.Fatal(err)
 	}
-	env, _ := testEnv(dir, output.ModeHuman)
 
 	var out []renderedStream
 	add := func(name string, b []byte, err error, want ...string) {
@@ -186,12 +184,17 @@ func renderedStreams(t *testing.T) []renderedStream {
 	})
 	add("datasphere deploy", b, err, "StatefulSet "+dsdeploy.DefaultNamespace+"/"+dsdeploy.DefaultName)
 
-	// run: the egress policy, as egressPolicy writes it.
+	// run: the egress policy, as egressPolicy writes it over the policy
+	// run read.
 	m, err := parser.Parse([]byte(twoAppManifest))
 	if err != nil {
 		t.Fatal(err)
 	}
-	doc, credentials, err := egressPolicy(ctx, newFakeRun(twoAppManifest), m.Name, *m)
+	existing, _, err := readEgressPolicyAt(ctx, newFakeRun(twoAppManifest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, credentials, err := egressPolicy(existing, m.Name, *m, mintEgressCredential)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,19 +202,23 @@ func renderedStreams(t *testing.T) []renderedStream {
 	add("egress policy", b, err)
 
 	// run: the workloads, through runCommand.translate, without and with a
-	// keyholder to wire storage to.
+	// keyholder to wire storage to, with the leaves a run issues.
 	images := map[string]string{
 		"api": "registry.example/app/my-platform/api@" + sha("e"),
 		"web": "registry.example/app/my-platform/web@" + sha("f"),
 	}
 	rc := runCmd(newFakeRun(twoAppManifest))
-	b, err = rc.translate(env, meta, m.Name, *m, images, credentials, nil)
+	b, err = rc.translate(meta, m.Name, *m, images, credentials, nil, nil, nil)
 	add("translate without storage", b, err,
 		"Secret my-platform/api-egress", "Secret my-platform/web-egress", "Deployment my-platform/api")
 	stored := *meta
 	stored.Keyholder = &config.Keyholder{Deployed: true}
 	scopes := map[string]datasphere.Scope{"api": {Name: "app-my-platform-api"}, "web": {Name: "app-my-platform-web"}}
-	b, err = rc.translate(env, &stored, m.Name, *m, images, credentials, scopes)
+	caCertPEM, issue, err := issueAppLeaves(dir, &stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err = rc.translate(&stored, m.Name, *m, images, credentials, scopes, caCertPEM, issue)
 	add("translate with storage", b, err,
 		"Secret my-platform/api-egress", "Secret my-platform/web-egress", "Deployment my-platform/web")
 
@@ -418,7 +425,11 @@ func TestManifestTextIsRefusedBeforeTheApplyChecks(t *testing.T) {
 				}
 			}
 		}
-		doc, _, err := egressPolicy(ctx, newFakeRun(twoAppManifest), m.Name, *m)
+		existing, _, err := readEgressPolicyAt(ctx, newFakeRun(twoAppManifest))
+		if err != nil {
+			t.Fatal(err)
+		}
+		doc, _, err := egressPolicy(existing, m.Name, *m, mintEgressCredential)
 		if err != nil {
 			t.Fatal(err)
 		}

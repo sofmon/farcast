@@ -115,6 +115,20 @@ func UpgradeManagedFields(entries []ManagedFieldsEntry, csa []string, ssa string
 	return out, nil
 }
 
+// IsLastApply reports whether a managed-fields entry records an apply of the
+// object by farcast: its own server-side apply (FieldManager, Apply), or
+// kubectl's client-side apply (kubectl-client-side-apply, Update), which
+// farcast's Apply runs until ADR 0023 M2.7. KUBERC=off keeps that apply
+// client-side, so an operator's kuberc cannot record it under another pair.
+// Either way the entry is the object's own, never a subresource's: a write
+// to /scale or /status is not an apply of the object. These are the two
+// entries the migration converts and keeps (isSSAEntry, isCSAEntry), one
+// spelling of them, which cluster's DeploymentState reads for an
+// application's last apply and ADR 0023 M2.7's Traces is to share.
+func IsLastApply(e ManagedFieldsEntry) bool {
+	return isSSAEntry(FieldManager)(e) || isCSAEntry(kubectlClientSideApply)(e)
+}
+
 func isSSAEntry(ssa string) func(ManagedFieldsEntry) bool {
 	return func(e ManagedFieldsEntry) bool {
 		return e.Manager == ssa && e.Operation == operationApply && e.Subresource == ""

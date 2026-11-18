@@ -64,7 +64,7 @@ var (
 	}
 )
 
-// resolveToolchainImage settles which image to run, and insists on a digest.
+// resolveToolchainSource settles which image to run, and insists on a digest.
 //
 // The order is flag, then what the instance already recorded. A tag is never
 // accepted: the CLI resolves it, reports the digest, and refuses — because
@@ -72,16 +72,11 @@ var (
 // next run would silently get whatever the tag points at then. ADR 0010
 // decision 10 wants a reviewed constant; this is how the operator obtains one,
 // and recording it is how they stop being asked.
-func resolveToolchainImage(ctx context.Context, env *Env, meta *config.InstanceMetadata, k toolchainKind, flagValue string, newBuilder func(func(string)) imageBuilder) (string, error) {
-	ref, _, err := resolveToolchainSource(ctx, env, meta, k, flagValue, newBuilder)
-	return ref, err
-}
-
-// resolveToolchainSource is resolveToolchainImage, saying where the image
-// came from as a plan's image action names it (ADR 0023 M2.6, A23-33):
-// plan.ImageNamed for the flag's, plan.ImageRecorded for the one the
-// instance recorded. It reads no credential: a tag is resolved anonymously,
-// and only to be refused.
+//
+// It says where the image came from as a plan's image action names it (ADR
+// 0023 M2.6, A23-33): plan.ImageNamed for the flag's, plan.ImageRecorded for
+// the one the instance recorded. It reads no credential: a tag is resolved
+// anonymously, and only to be refused.
 func resolveToolchainSource(ctx context.Context, env *Env, meta *config.InstanceMetadata, k toolchainKind, flagValue string,
 	newBuilder func(func(string)) imageBuilder) (ref, source string, err error) {
 	ref, source = flagValue, plan.ImageNamed

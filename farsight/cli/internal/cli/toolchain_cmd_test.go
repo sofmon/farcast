@@ -219,7 +219,7 @@ func TestAFailedMirrorRecordsNothing(t *testing.T) {
 // used to name stopped answering anonymous pullers on the 4.3 walk.
 func TestTheMissingBuilderRefusalNamesADR0011sImageHonestly(t *testing.T) {
 	meta := &config.InstanceMetadata{Name: "p60"}
-	_, err := resolveToolchainImage(context.Background(), nil, meta, builderKind, "", nil)
+	_, _, err := resolveToolchainSource(context.Background(), nil, meta, builderKind, "", nil)
 	if err == nil {
 		t.Fatal("no builder was refused")
 	}

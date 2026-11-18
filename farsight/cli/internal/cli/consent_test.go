@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -173,9 +174,10 @@ type routedLine struct {
 	confirm *seenValue
 }
 
-// routeLine parses argv exactly as run does, through the default registry.
-// A command that does not register --plan and --confirm yet gets them here,
-// so every command's flags can carry a confirm line.
+// routeLine parses argv exactly as run does, through the default registry,
+// for a command that has a plan: every command a confirm line can name
+// registers --plan and --confirm (ADR 0023 M2.6), and one that does not is
+// refused.
 func routeLine(argv []string) (routedLine, error) {
 	var r routedLine
 	gfs := flag.NewFlagSet("farcast", flag.ContinueOnError)
@@ -200,11 +202,10 @@ func routeLine(argv []string) (routedLine, error) {
 	if g, ok := cmd.(subFlagged); ok {
 		g.SetSubFlags(r.flags, rest[1:])
 	}
-	if r.flags.Lookup("plan") == nil {
-		var c consentFlags
-		c.register(r.flags)
-	}
 	f := r.flags.Lookup("confirm")
+	if f == nil || r.flags.Lookup("plan") == nil {
+		return r, errors.New(r.name + " registers no --plan and --confirm")
+	}
 	r.confirm = &seenValue{Value: f.Value}
 	f.Value = r.confirm
 	args, err := parseInterspersed(r.flags, rest[1:])
@@ -455,30 +456,39 @@ func TestNoticesPrintOnceInTheCommandsWords(t *testing.T) {
 	}
 }
 
-// wiredCommands is every writeCommands row whose fresh flag set defines
-// --plan: the commands wired so far (A23-14). ADR 0023 M2.6a wired kernel
-// meter, kernel confirm and reader grant, M2.6b connect, redeploy and build,
-// and M2.6c kernel deploy, storage deploy, storage key pin and storage key
-// rotate; run registers no consent flag yet, so --plan is an unknown flag on
-// it.
+// wiredCommands is every writeCommands row, each of which registers --plan
+// and --confirm: ADR 0023 M2.6 wired all eleven (M2.6a kernel meter, kernel
+// confirm and reader grant, M2.6b connect, redeploy and build, M2.6c kernel
+// deploy, storage deploy, storage key pin and storage key rotate, M2.6d
+// run). The list is derived, not written here: the rows are checked against
+// the commands with plans that farcast's router reaches (consentCommands),
+// so a row that registers no --plan or no --confirm, a row whose command is
+// not the router's, and a command with a plan that has no row each fail the
+// test that asked (design §28's step 9b).
 func wiredCommands(t *testing.T) []writeCommand {
 	t.Helper()
+	planned := consentCommands(t)
 	var wired []writeCommand
-	var names []string
 	for _, wc := range writeCommands() {
-		fs := flag.NewFlagSet(wc.name, flag.ContinueOnError)
-		fs.SetOutput(io.Discard)
-		wc.cmd().SetFlags(fs)
-		if fs.Lookup("plan") != nil {
-			if fs.Lookup("confirm") == nil {
-				t.Errorf("%s registers --plan without --confirm", wc.name)
-			}
-			wired = append(wired, wc)
-			names = append(names, wc.name)
+		cmd := wc.cmd()
+		fs := commandFlags(cmd)
+		if fs.Lookup("plan") == nil || fs.Lookup("confirm") == nil {
+			t.Errorf("%s writes to the cluster and does not register both --plan and --confirm", wc.name)
+			continue
 		}
+		real, ok := planned[wc.name]
+		switch {
+		case !ok:
+			t.Errorf("writeCommands' %s is no command with a plan that farcast's router reaches", wc.name)
+			continue
+		case reflect.TypeOf(cmd) != reflect.TypeOf(real):
+			t.Errorf("writeCommands' %s runs a %T; farcast's router runs a %T", wc.name, cmd, real)
+		}
+		delete(planned, wc.name)
+		wired = append(wired, wc)
 	}
-	if want := []string{"connect", "redeploy", "build", "kernel deploy", "kernel meter", "kernel confirm", "storage deploy", "storage key pin", "storage key rotate", "reader grant"}; !slices.Equal(names, want) {
-		t.Errorf("the commands with plans are %q; ADR 0023 M2.6a, M2.6b and M2.6c wire %q", names, want)
+	for name := range planned {
+		t.Errorf("%s has a plan and no writeCommands row, so no consent test runs it", name)
 	}
 	return wired
 }
@@ -796,51 +806,74 @@ func planFlagOfATopLevelCommand(t *testing.T) {
 }
 
 // ADR 0023 M2.6 (A23-16): a refusal for want of a terminal names the route
-// that needs none, --plan and then --confirm. The gates among the commands
-// wired so far are reader grant's, connect's (its cost question, and the
-// build question it shares with every deployer command, each of which since
-// M2.6c has a plan; a deployer that registers no consent flags names none
-// (consentFlags.suffix)), redeploy's (its change
-// question, and that build question), build's (its cost question), kernel
-// deploy's (its cost question, below the floor or not, and the build
-// question), storage deploy's (its cost question, and the build question),
-// storage key pin's (lowering the pin with --replace) and storage key
-// rotate's (its question): kernel meter and kernel confirm ask nothing, so a
-// run without a terminal is not refused (A23-9).
+// that needs none, --plan and then --confirm. The gates are reader grant's,
+// connect's (its cost question, and the build question it shares with
+// every deployer command, each of which since M2.6c has a plan; a deployer
+// that registers no consent flags names none (consentFlags.suffix)),
+// redeploy's (its change question, and that build question), build's (its
+// cost question), run's (its review), kernel deploy's (its cost question,
+// below the floor or not, and the build question), storage deploy's (its
+// cost question, and the build question), storage key pin's (lowering the
+// pin with --replace) and storage key rotate's (its question): kernel meter
+// and kernel confirm ask nothing, so a run without a terminal is not
+// refused (A23-9).
+//
+// The gates are derived, not only listed (design §28's step 9b): every
+// usage error in this package's source that names the route
+// (suffixedRefusals) must be a gate here, with the rows that reach it, and
+// every gate here must be one; every command with a plan is gated here or
+// asks nothing; and a method of a command with a plan that asks for --yes
+// without naming the route fails. run's refusal of --yes at the limit
+// (A28-1) is no refusal for want of a terminal: it names --plan in its own
+// words, which TestYesNeverDeploysAtTheLimit pins.
 func TestNonInteractiveRefusalsNameThePlan(t *testing.T) {
-	gates := map[string]string{"reader grant": msgReaderGrantTerminal, "connect": msgConnectCostYes,
-		"redeploy": msgRedeployYes, "build": msgBuildCostYes, "kernel deploy": msgKernelCostYes,
-		"storage deploy": msgKeyholderCostYes, "storage key pin": msgKeyPinLowerYes, "storage key rotate": msgRotateYes}
-	for name, text := range gates {
-		if !strings.HasSuffix(text, consentSuffix) {
-			t.Errorf("%s's non-interactive refusal %q does not end with %q", name, text, consentSuffix)
+	gates := []struct {
+		command string
+		texts   []string // its refusals' formats
+		rows    func(t *testing.T)
+	}{
+		{"connect", []string{msgConnectCostYes, msgBuildYes + consentSuffix}, connectRefusalsNameThePlan},
+		{"redeploy", []string{msgRedeployYes}, redeployRefusalsNameThePlan},
+		{"build", []string{msgBuildCostYes}, buildRefusalNamesThePlan},
+		{"run", []string{msgRunYes}, runRefusalNamesThePlan},
+		{"kernel deploy", []string{msgKernelCostYes, msgKernelBelowFloorYes}, kernelDeployRefusalsNameThePlan},
+		{"storage deploy", []string{msgKeyholderCostYes}, storageDeployRefusalNamesThePlan},
+		{"storage key pin", []string{msgKeyPinLowerYes}, keyPinRefusalNamesThePlan},
+		{"storage key rotate", []string{msgRotateYes}, rotateRefusalNamesThePlan},
+		{"reader grant", []string{msgReaderGrantTerminal}, readerGrantRefusalNamesThePlan},
+	}
+	planned := consentCommands(t)
+	gated := map[string]bool{}
+	var listed []string
+	for _, g := range gates {
+		if _, ok := planned[g.command]; !ok {
+			t.Errorf("%s is gated here and is no command with a plan", g.command)
+		}
+		gated[g.command] = true
+		for _, text := range g.texts {
+			if !strings.HasSuffix(text, consentSuffix) {
+				t.Errorf("%s's non-interactive refusal %q does not end with %q", g.command, text, consentSuffix)
+			}
+			listed = append(listed, text)
 		}
 	}
-	if !strings.HasSuffix(msgKernelBelowFloorYes, consentSuffix) {
-		t.Errorf("kernel deploy's refusal below the floor %q does not end with %q", msgKernelBelowFloorYes, consentSuffix)
+	found := suffixedRefusals(t, planned)
+	for _, text := range found {
+		if !slices.Contains(listed, text) {
+			t.Errorf("the refusal %q names the plan's route and is in no gate here: add it, with the rows that reach it", text)
+		}
 	}
-	t.Run("connect", connectRefusalsNameThePlan)
-	t.Run("redeploy", redeployRefusalsNameThePlan)
-	t.Run("build", buildRefusalNamesThePlan)
-	t.Run("kernel deploy", kernelDeployRefusalsNameThePlan)
-	t.Run("storage deploy", storageDeployRefusalNamesThePlan)
-	t.Run("storage key pin", keyPinRefusalNamesThePlan)
-	t.Run("storage key rotate", rotateRefusalNamesThePlan)
-
-	dir := readerRecordFor(t, grantName, "proj-test1")
-	if _, err := dir.UpdateInstanceMetadata(grantName, func(m *config.InstanceMetadata) error {
-		m.Reader = &config.Reader{Email: readerEmail(grantName, "proj-test1"), KeyID: readerTestKeyID}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
+	for _, text := range listed {
+		if !slices.Contains(found, text) {
+			t.Errorf("the gate %q is no usage error of this package's source", text)
+		}
 	}
-	if _, stderr, code := farcastIn(t, dir, "reader", "grant", grantName); code != 2 ||
-		!strings.Contains(stderr, "farcast reader: reader grant needs a terminal to confirm, or --plan and then --confirm <digest>\n") {
-		t.Errorf("reader grant without a terminal: exit %d, %q", code, stderr)
+	for _, g := range gates {
+		t.Run(g.command, g.rows)
 	}
 
 	for _, wc := range wiredCommands(t) {
-		if _, gated := gates[wc.name]; gated {
+		if gated[wc.name] {
 			continue
 		}
 		t.Run(wc.name+" asks nothing", func(t *testing.T) {
@@ -862,6 +895,23 @@ func TestNonInteractiveRefusalsNameThePlan(t *testing.T) {
 				t.Errorf("%s without a terminal = %v, applying %d streams, saying %q; want it done, unasked", wc.name, err, len(fc.applied), errb)
 			}
 		})
+	}
+}
+
+// readerGrantRefusalNamesThePlan is TestNonInteractiveRefusalsNameThePlan's
+// row for reader grant: with no terminal it refuses, exit 2, naming the
+// plan's route, through the router.
+func readerGrantRefusalNamesThePlan(t *testing.T) {
+	dir := readerRecordFor(t, grantName, "proj-test1")
+	if _, err := dir.UpdateInstanceMetadata(grantName, func(m *config.InstanceMetadata) error {
+		m.Reader = &config.Reader{Email: readerEmail(grantName, "proj-test1"), KeyID: readerTestKeyID}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, stderr, code := farcastIn(t, dir, "reader", "grant", grantName); code != 2 ||
+		!strings.Contains(stderr, "farcast reader: reader grant needs a terminal to confirm, or --plan and then --confirm <digest>\n") {
+		t.Errorf("reader grant without a terminal: exit %d, %q", code, stderr)
 	}
 }
 
@@ -888,9 +938,17 @@ func TestNonInteractiveRefusalsNameThePlan(t *testing.T) {
 // exit 0; storage key rotate with no keyholder mints and saves, exit 0; and
 // with one it mints, saves and cannot open the keyholder, so its rotation is
 // unfinished, exit 1. Each got past the comparison.
+//
+// run's fetch plans (ADR 0023 M2.6d) run through the router as planCommands
+// has them: the line of one that is not blocked opens the reader, then the
+// writer, and stops at applyReady, having sent nothing. Its deploy plan has
+// its own row (runConfirmLinesRunTheSameCommand): the fetch plan's line,
+// run with a kubectl that succeeds, prints the deploy plan, whose line
+// confirms it alone.
 func confirmLineOnTheCommands(t *testing.T) {
 	noKubectl(t)
 	pinPlanClock(t)
+	pinRunClock(t)
 	fakeDeployDefaults(t)
 	realPinOpener(t)
 	var rows []planCommand
@@ -909,7 +967,7 @@ func confirmLineOnTheCommands(t *testing.T) {
 		switch {
 		case row.fakes == nil:
 			rows = append(rows, row)
-		case slices.Contains(readsCluster, row.name):
+		case slices.Contains(readsCluster, row.name) || row.name == "run":
 			row.fakes, row.cmd = nil, nil
 			rows = append(rows, row)
 		}
@@ -922,12 +980,7 @@ func confirmLineOnTheCommands(t *testing.T) {
 			if code != 0 {
 				t.Fatalf("%s --plan: exit %d, %s", row, code, stderr)
 			}
-			var line string
-			for l := range strings.Lines(stdout) {
-				if rest, ok := strings.CutPrefix(l, "To do exactly this: "); ok {
-					line = strings.TrimSuffix(rest, "\n")
-				}
-			}
+			line := confirmLineOf(stdout)
 			if strings.Contains(stdout, "\nblocked: --confirm would refuse this plan") {
 				if line != "" {
 					t.Errorf("a blocked plan offers %q", line)
@@ -967,7 +1020,7 @@ func confirmLineOnTheCommands(t *testing.T) {
 					t.Errorf("%s sent %d requests", row, len(got))
 				}
 			case row.name == "kernel deploy" || row.name == "storage deploy":
-				onlyThePlansReads(t, row, s)
+				onlyThePlansReads(t, row, s, consentConfirm)
 			default:
 				// The recomputation reads as the reader, and only then does
 				// the writer reach the pin.
@@ -985,4 +1038,17 @@ func confirmLineOnTheCommands(t *testing.T) {
 			}
 		})
 	}
+	t.Run("run/its deploy plan", runConfirmLinesRunTheSameCommand)
+}
+
+// confirmLineOf is the command line a printed plan ends with, after "To do
+// exactly this: ", or "" for one that prints none.
+func confirmLineOf(stdout string) string {
+	var line string
+	for l := range strings.Lines(stdout) {
+		if rest, ok := strings.CutPrefix(l, "To do exactly this: "); ok {
+			line = strings.TrimSuffix(rest, "\n")
+		}
+	}
+	return line
 }

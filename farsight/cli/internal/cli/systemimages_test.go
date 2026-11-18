@@ -1064,10 +1064,15 @@ func TestEmbeddedWithFatlineImageGovernsShrikeOnly(t *testing.T) {
 		}
 		return b.String()
 	}
-	refused := func(t *testing.T, err error, fb *fakeBuilder, fc *fakeCluster) {
+	refused := func(t *testing.T, err error, stderr string, fb *fakeBuilder, fc *fakeCluster) {
 		t.Helper()
 		if kindOf(err) != kindVersionSkew {
 			t.Fatalf("err = %v (kind %s), want version_skew", err, kindOf(err))
+		}
+		// Refused before Shrike's decision says anything: a run never
+		// announces a replacement it then refuses (A25-23).
+		if strings.Contains(stderr, "shrike: replacing") {
+			t.Errorf("announced the replacement it refuses:\n%s", stderr)
 		}
 		for _, want := range []string{"shrike runs " + oldShrike, "v0.8.0", testVersion, "go1.27.3", carriedGo, "Pass --embedded to replace it."} {
 			if !strings.Contains(err.Error(), want) {
@@ -1152,7 +1157,7 @@ func TestEmbeddedWithFatlineImageGovernsShrikeOnly(t *testing.T) {
 	t.Run("redeploy", func(t *testing.T) {
 		fb := &fakeBuilder{resolveFn: notFoundForTags}
 		r := redeployProd(t, output.ModeHuman, fb, setup, func(c *redeployCommand) { c.fatlineImage = given })
-		refused(t, r.err, fb, r.fc)
+		refused(t, r.err, r.stderr, fb, r.fc)
 
 		fb = &fakeBuilder{resolveFn: notFoundForTags}
 		r = redeployProd(t, output.ModeHuman, fb, setup, func(c *redeployCommand) { c.fatlineImage, c.embedded = given, true })
@@ -1196,7 +1201,7 @@ func TestEmbeddedWithFatlineImageGovernsShrikeOnly(t *testing.T) {
 	}
 	t.Run("connect", func(t *testing.T) {
 		r := connectProd(t, false, &fakeProvider{})
-		refused(t, r.err, r.fb, r.fc)
+		refused(t, r.err, r.stderr, r.fb, r.fc)
 		if r.meta.FatLineDeployed {
 			t.Error("a refused connect recorded FatLine as deployed")
 		}

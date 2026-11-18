@@ -1,7 +1,9 @@
 // Package cluster is FarCast's operations on an instance's cluster: apply a
 // manifest stream, await a rollout, read a Service's external IP, read the
 // kernel's checkpoint, and create or compare-and-replace the keyholder's key
-// pin.
+// pin. Since ADR 0023 M2.6 it also reads an application Deployment's state,
+// for run's review and plan (DeploymentState), and whether a Job is there
+// (JobState).
 //
 // It is moving from kubectl to the in-process client in internal/kube (ADR
 // 0023 decision 2), in the stages of ADR 0023 M2. Every Client farcast builds
@@ -358,6 +360,10 @@ type JobResult struct {
 	// build reports the digest it pushed. Kubernetes surfaces it in the Pod's
 	// status, so reading it needs no log parsing and no shared volume.
 	Message string
+	// UID is the Job's metadata.uid, as the GET that ended WaitJob's wait, or
+	// JobState's one GET, read it: which Job this result is of, since a Job's
+	// name is deterministic and a Job of the same name may be another one.
+	UID string
 }
 
 // WaitJob blocks until a Job succeeds or fails, reading it every 5 s.
@@ -371,6 +377,22 @@ func (c *Client) WaitJob(ctx context.Context, namespace, name string, timeout ti
 		return JobResult{}, inProcessOnly("WaitJob")
 	}
 	return c.waitJobInProcess(ctx, namespace, name, timeout)
+}
+
+// JobState reads a Job once, and reports whether it is there: its uid, and
+// whether it has succeeded as WaitJob judges it. It reads no pod, so Message
+// is always "", and a Job that has not succeeded may be running or may have
+// failed: a caller uses JobState for a Job's presence and uid, and WaitJob for
+// its outcome.
+//
+// The Job is absent only when the API server says so: a 404 whose body is a
+// Kubernetes Status. A 403, or a 404 from anything else, is an error with
+// found false, and never absent.
+func (c *Client) JobState(ctx context.Context, namespace, name string) (JobResult, bool, error) {
+	if c.kube == nil {
+		return JobResult{}, false, inProcessOnly("JobState")
+	}
+	return c.jobStateInProcess(ctx, namespace, name)
 }
 
 // JobLogs returns a Job's output: a build failure the operator has to read, or
@@ -448,6 +470,54 @@ func (c *Client) Workloads(ctx context.Context, namespace string) ([]Workload, e
 		return nil, inProcessOnly("Workloads")
 	}
 	return c.workloadsInProcess(ctx, namespace)
+}
+
+// DeploymentState is what run's review and plan need of one live application
+// Deployment (ADR 0023 §5.4 and A23-46): whether it is there, the replicas
+// and requests it runs with, and whether the kernel resized it after farcast
+// last applied it. The zero value is an absent Deployment.
+type DeploymentState struct {
+	Present bool
+	// Replicas is spec.replicas, nil when the answer carried none.
+	Replicas *int32
+	// Requests is each container's requests, by container name; a request
+	// that is not set is 0. It is nil only when the Deployment is absent.
+	Requests map[string]Requests
+	// AdaptedAt is the kernel's stamp on the Deployment, the
+	// farcast.sofmon.com/adapted-at annotation (kernel.AdaptedAtLabel), as
+	// the kernel itself reads it (kernel.Target.AdaptedAt), in UTC. It is
+	// zero when the annotation is absent or does not parse: never adapted.
+	AdaptedAt time.Time
+	// LastAppliedAt is the newest time among the Deployment's own
+	// managed-fields entries that record an apply by farcast
+	// (kube.IsLastApply: farcast's Apply, or kubectl's client-side apply
+	// Update), in UTC, zero when there is none. The kernel's scale and resize
+	// writes never move it. Kubernetes moves an entry's time only when that
+	// manager changes a value, so an apply that changed nothing leaves it
+	// where it was.
+	LastAppliedAt time.Time
+	// ResourceVersion is metadata.resourceVersion.
+	ResourceVersion string
+}
+
+// Requests is one container's requests: milli-CPU and MiB, each rounded up as
+// tkube parses a quantity.
+type Requests struct{ CPUMilli, MemMiB int64 }
+
+// DeploymentState reads one Deployment, once, as run's review, its plan and
+// its re-read need it.
+//
+// The Deployment is absent only when the API server says so: a 404 whose
+// body is a Kubernetes Status, which is Present false and no error. A 403, or
+// a 404 from anything else, is an error and never absent: an application
+// read as absent would read as one this deploy creates, never as one it
+// restarts. A set request that does not parse is an error wrapping
+// kube.ErrUnreadable.
+func (c *Client) DeploymentState(ctx context.Context, namespace, name string) (DeploymentState, error) {
+	if c.kube == nil {
+		return DeploymentState{}, inProcessOnly("DeploymentState")
+	}
+	return c.deploymentStateInProcess(ctx, namespace, name)
 }
 
 // ConfigMapValue returns one key from a ConfigMap, and reports whether the

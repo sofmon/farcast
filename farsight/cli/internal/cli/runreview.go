@@ -31,6 +31,13 @@ type review struct {
 	FatLineDeployed bool
 	Limit           config.CostLimit
 	Floor           instanceFloor
+
+	// Live is what run read of the instance: the kernel's ledger and each
+	// application's live Deployment (A23-48, A28-1).
+	Live runLive
+	// Notices are the deploy plan's lines that print once, before the
+	// question (A23-26): the reader's warning.
+	Notices []string
 }
 
 func (r review) print(w io.Writer) {
@@ -49,7 +56,6 @@ func (r review) print(w io.Writer) {
 	}
 	fprintln(w, ":")
 
-	var declared int
 	for _, app := range r.Manifest.Apps {
 		fprintf(w, "\n  %s\n", app.Name)
 		// Paths are the repository's text too, and the parser rules out only
@@ -61,19 +67,58 @@ func (r review) print(w io.Writer) {
 			fprintf(w, "  (context %s)", terminalText(app.Context))
 		}
 		fprintln(w)
-		declared += len(app.External)
 		printDeclared(w, app.External)
 	}
 
 	fprintf(w, "\nThose hosts are the whole of what these applications may reach. FatLine denies\n")
 	fprintf(w, "every other outbound address, and Shrike reports anything that tries.\n")
 
-	if declared > 0 && !r.FatLineDeployed {
-		fprintf(w, "\nWARNING: FatLine is not deployed in %q, and it is the only way out.\n", r.Instance)
-		fprintf(w, "The hosts above will be unreachable until 'farcast connect %s' has run.\n", r.Instance)
+	if line := noWayOutWarning(r.Instance, r.Manifest, r.FatLineDeployed); line != "" {
+		fprintf(w, "\n%s\n", line)
 	}
 
 	r.printCost(w)
+	r.printResets(w)
+	for _, line := range r.Notices {
+		fprintf(w, "\n%s\n", line)
+	}
+}
+
+// noWayOutWarning is the warning that the hosts a manifest declares are
+// unreachable while the instance has no FatLine, or "" when it has one or
+// they declare none. The review prints it in its place, and a deploy plan
+// carries it as a notice (A28-8).
+func noWayOutWarning(instance string, m parser.Manifest, fatlineDeployed bool) string {
+	declared := 0
+	for _, app := range m.Apps {
+		declared += len(app.External)
+	}
+	if declared == 0 || fatlineDeployed {
+		return ""
+	}
+	return fmt.Sprintf("WARNING: FatLine is not deployed in %q, and it is the only way out.\n"+
+		"The hosts above will be unreachable until 'farcast connect %s' has run.", instance, instance)
+}
+
+// printResets says, after the cost, what this deploy resets of what runs
+// now, one line per application (A23-48), and, while the instance's
+// spending reads as at its limit, that this deploy adds to it (A28-1).
+func (r review) printResets(w io.Writer) {
+	first := true
+	for _, a := range r.Live.Apps {
+		line := a.resetLine()
+		if line == "" {
+			continue
+		}
+		if first {
+			fprintf(w, "\nResets:\n")
+			first = false
+		}
+		fprintf(w, "  %s\n", line)
+	}
+	if r.Live.Limit.Reached {
+		fprintf(w, "\n%s\n", limitLine(r.Live.Limit.Reason))
+	}
 }
 
 // printDeclared prints what one application may reach, one host per line with
@@ -118,10 +163,15 @@ func (r review) printCost(w io.Writer) {
 	// The floor check the operator already met at install time, asked again
 	// with the applications in it. This is the first moment the answer can
 	// change, because it is the first moment an instance has applications.
-	with := r.Floor
-	with.add("applications", standing, fmt.Sprintf("%s (TechnoCore adapts these at 5.2)",
+	warnIfBelowFloor(w, r.Limit, withApplications(r.Floor, n), "this instance with these applications")
+}
+
+// withApplications is floor with n translated applications in it, standing:
+// the floor run's review and its deploy plan state.
+func withApplications(floor instanceFloor, n int) instanceFloor {
+	floor.add("applications", applicationsMonthlyUSD(n), fmt.Sprintf("%s (TechnoCore adapts these at 5.2)",
 		plural(n, "translated workload", "translated workloads")))
-	warnIfBelowFloor(w, r.Limit, with, "this instance with these applications")
+	return floor
 }
 
 // plural is "1 application" or "3 applications"; noun is just the word.

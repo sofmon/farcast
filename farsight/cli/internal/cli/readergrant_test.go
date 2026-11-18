@@ -379,8 +379,8 @@ func TestReaderGrantWithdrawsAVerificationThatNoLongerHolds(t *testing.T) {
 	if got := len(f.s.Requests()); got != sent {
 		t.Errorf("a read after the withdrawal sent %d requests", got-sent)
 	}
-	if got := meteredReader(f.env, grantName, meta); got != "" {
-		t.Errorf("a withdrawn reader is still bound by later commands, as %q", got)
+	if got, warning := meteredReaderNote(f.env, grantName, meta); got != "" || warning != "" {
+		t.Errorf("a withdrawn reader is still bound by later commands, as %q (warning %q)", got, warning)
 	}
 }
 

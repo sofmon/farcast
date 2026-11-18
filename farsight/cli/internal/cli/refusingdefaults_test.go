@@ -18,10 +18,12 @@ import (
 // builder of the deployer commands, run and build; connect's dial of the
 // carrier; the deployer's search for a farcast checkout and its question to
 // that checkout's Go, which runs `go env` from PATH; the reader a plan reads
-// the cluster as (openReaderDefault, M2.6c); storage deploy's mint of the
-// bucket and keyring (ensureStorageDefault, M2.6c); and the opener of the
-// keyholder of storage key pin and storage key rotate, which dials the tunnel
-// (openKeyholderDefault, M2.6c). Their defaults refuse here, as defaultPinStore's does
+// the cluster as (openReaderDefault, M2.6c), which run's plan reader wraps,
+// lazily, since M2.6d; storage deploy's mint of the bucket and keyring
+// (ensureStorageDefault, M2.6c); and the opener of the keyholder of storage
+// key pin, storage key rotate and, since M2.6d, run, which dials the tunnel
+// (openKeyholderDefault, M2.6c); run's uses of the two add no ninth seam
+// (A28-11). Their defaults refuse here, as defaultPinStore's does
 // (storagepin_test.go), so no test reaches a real provider, registry,
 // carrier, cluster, bucket or keyholder, runs this machine's Go, or binds
 // the checkout it runs in, through these by forgetting a fake; a test that
@@ -145,6 +147,11 @@ func TestUnsetSeamsRefuseInTests(t *testing.T) {
 			t.Errorf("%s's default plan reader = %v, %v; want the refusing default", name, rd, err)
 		}
 	}
+	// run's, which wraps openReaderDefault when it is called (A28-11), and
+	// so refuses with it, returning no reader.
+	if rd, err := run.newPlanReader(readerRef); !errors.Is(err, errRefusingDefault) || rd != nil {
+		t.Errorf("run's default plan reader = %v, %v; want the refusing default", rd, err)
+	}
 
 	// storage deploy's mint of the bucket and keyring, for an instance this
 	// directory has no record of, so that even the real mint would refuse
@@ -154,7 +161,7 @@ func TestUnsetSeamsRefuseInTests(t *testing.T) {
 	if err := sd.ensureStorage(cancelled, &Env{ConfigDir: config.Dir(empty)}, "atlas"); !errors.Is(err, errRefusingDefault) {
 		t.Errorf("storage deploy's default storage mint = %v, want the refusing default", err)
 	}
-	for name, open := range map[string]keyholderOpener{"storage key pin": kp.newKeyholder, "storage key rotate": kr.newKeyholder} {
+	for name, open := range map[string]keyholderOpener{"storage key pin": kp.newKeyholder, "storage key rotate": kr.newKeyholder, "run": run.newKeyholder} {
 		if _, _, err := open(cancelled, &Env{ConfigDir: config.Dir(empty)}, "atlas"); !errors.Is(err, errRefusingDefault) {
 			t.Errorf("%s's default keyholder = %v, want the refusing default", name, err)
 		}

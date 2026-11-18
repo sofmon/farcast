@@ -657,7 +657,7 @@ func TestKernelDeployPlanBlocksAMissingNamespace(t *testing.T) {
 	if out.Len() != 0 || row.fakes.writers != 0 {
 		t.Errorf("--confirm of the blocked plan printed %q and opened the writer %d times", out, row.fakes.writers)
 	}
-	onlyThePlansReads(t, row, s)
+	onlyThePlansReads(t, row, s, consentConfirm)
 	sameFiles(t, "a blocked kernel deploy", before, treeFiles(t, string(dir)))
 }
 

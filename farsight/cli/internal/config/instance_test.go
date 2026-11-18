@@ -686,6 +686,121 @@ func TestCheckInstanceMTLSReadsNoKey(t *testing.T) {
 	})
 }
 
+// ADR 0023 M2.6d (A28-9): InstanceCAKeyExists is true only for a ca.key that
+// is a regular file with something in it, and it opens nothing. A missing
+// key, a missing fatline directory, a directory in the key's place and an
+// empty key, which SaveInstanceMTLS writes for material with no CA key, are
+// all no key; a key at mode 000 is one, and the read observer sees no path,
+// where LoadInstanceMTLS fails on it. A stat that fails for another reason
+// is an error, never "no key".
+func TestInstanceCAKeyExistsReadsNoKey(t *testing.T) {
+	material := func(t *testing.T, caKey []byte) (Dir, string) {
+		t.Helper()
+		d := testDir(t)
+		if err := d.SaveInstanceMTLS("prod", MTLSMaterial{
+			CACertPEM: []byte("ca"), CAKeyPEM: caKey, ClientCertPEM: []byte("leaf"),
+			ClientKeyPEM: []byte("k"), ServerCertPEM: []byte("s"), ServerKeyPEM: []byte("sk"),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return d, filepath.Join(d.fatlineDir("prod"), caKeyFile)
+	}
+	// exists is InstanceCAKeyExists under the read observer, which must see
+	// nothing.
+	exists := func(t *testing.T, d Dir) (bool, error) {
+		t.Helper()
+		reads := observeReads(t)
+		ok, err := d.InstanceCAKeyExists("prod")
+		if got := reads(); len(got) != 0 {
+			t.Errorf("InstanceCAKeyExists read %v", got)
+		}
+		return ok, err
+	}
+
+	for _, row := range []struct {
+		name  string
+		setup func(t *testing.T) Dir
+		want  bool
+	}{
+		{"a key", func(t *testing.T) Dir {
+			d, _ := material(t, []byte("cakey"))
+			return d
+		}, true},
+		{"no ca.key", func(t *testing.T) Dir {
+			d, path := material(t, []byte("cakey"))
+			if err := os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+			return d
+		}, false},
+		{"no fatline directory", func(t *testing.T) Dir {
+			d := testDir(t)
+			if err := d.CreateInstance("prod"); err != nil {
+				t.Fatal(err)
+			}
+			return d
+		}, false},
+		{"a directory in its place", func(t *testing.T) Dir {
+			d, path := material(t, []byte("cakey"))
+			if err := os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(path, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			return d
+		}, false},
+		{"an empty ca.key", func(t *testing.T) Dir {
+			d, _ := material(t, nil)
+			return d
+		}, false},
+		{"a key at mode 000", func(t *testing.T) Dir {
+			d, path := material(t, []byte("cakey"))
+			if err := os.Chmod(path, 0o000); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.Chmod(path, 0o600) })
+			// The control: the loader, which opens it, fails here, so a
+			// pass below is about opening nothing and not a vacuous one.
+			if _, err := d.LoadInstanceMTLS("prod"); err == nil || !errors.Is(err, fs.ErrPermission) {
+				t.Fatalf("LoadInstanceMTLS with ca.key at mode 000 = %v; the test proves nothing (run as root?)", err)
+			}
+			return d
+		}, true},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			d := row.setup(t)
+			ok, err := exists(t, d)
+			if err != nil || ok != row.want {
+				t.Fatalf("InstanceCAKeyExists = %t, %v; want %t, nil", ok, err, row.want)
+			}
+		})
+	}
+
+	t.Run("a fatline directory it may not search", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root may search a directory at mode 000, so no stat fails here")
+		}
+		d, path := material(t, []byte("cakey"))
+		dir := filepath.Dir(path)
+		if err := os.Chmod(dir, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+		// The control, as the mode-000 row's: the loader fails here with
+		// the permission error, so the stat below fails for the directory's
+		// mode and not for a reason of its own. Root may search it, and then
+		// the stat succeeds and this row would fail for the wrong reason.
+		if _, err := d.LoadInstanceMTLS("prod"); err == nil || !errors.Is(err, fs.ErrPermission) {
+			t.Fatalf("LoadInstanceMTLS under an unsearchable fatline directory = %v; the test proves nothing (run as root?)", err)
+		}
+		ok, err := exists(t, d)
+		if ok || !errors.Is(err, fs.ErrPermission) || !strings.Contains(err.Error(), path) {
+			t.Fatalf("InstanceCAKeyExists under an unsearchable directory = %t, %v; want the stat's permission error, naming the key's path", ok, err)
+		}
+	})
+}
+
 // TestSystemImagesRoundTrip: every origin, with every field a build records,
 // reads back exactly (ADR 0023 decision 4).
 func TestSystemImagesRoundTrip(t *testing.T) {
@@ -842,7 +957,7 @@ func TestServerSideApplyRoundTripsAndMerges(t *testing.T) {
 			t.Errorf("the record does not carry %q:\n%s", want, raw)
 		}
 	}
-	stale.Carrier = &Carrier{Type: "nlb", Endpoint: "34.0.0.5:443", ServerName: "fatline"}
+	stale.Carrier = &Carrier{Type: "nlb", Endpoint: "203.0.113.5:443", ServerName: "fatline"}
 	if err := d.SaveInstanceMetadata("prod", stale); err != nil {
 		t.Fatalf("save over a newer server_side_apply: %v", err)
 	}
@@ -853,7 +968,7 @@ func TestServerSideApplyRoundTripsAndMerges(t *testing.T) {
 	if got.ServerSideApply == nil || !got.ServerSideApply.Since.Equal(since) || got.ServerSideApply.Farcast != "v0.2.0" {
 		t.Errorf("server_side_apply after the merge = %+v", got.ServerSideApply)
 	}
-	if got.Carrier == nil || got.Carrier.Endpoint != "34.0.0.5:443" {
+	if got.Carrier == nil || got.Carrier.Endpoint != "203.0.113.5:443" {
 		t.Errorf("the stale command's own change was lost: carrier = %+v", got.Carrier)
 	}
 

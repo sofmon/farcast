@@ -269,7 +269,7 @@ func TestAWriterReadsInProcessAsTheWriter(t *testing.T) {
 	s.Put(namespace("farcast-system", managed))
 	s.Put(object("v1", "ConfigMap", "farcast-system", "datasphered-pin", map[string]any{"data": map[string]any{"pin": "x"}}))
 	s.Put(rolloutState(1, 1, 1, 1, 1, 1, ""))
-	s.Put(serviceWith(map[string]any{"ip": "34.0.0.5"}))
+	s.Put(serviceWith(map[string]any{"ip": "203.0.113.5"}))
 	s.Put(jobObject("fetch", []string{"git"}, map[string]any{"succeeded": 1}))
 	s.Put(podObject("farcast-system", "fetch-abc", map[string]string{"job-name": "fetch"}, []string{"git"},
 		map[string]string{kubetest.LogAnnotationPrefix + "git": "manifest\n"}))
@@ -312,7 +312,7 @@ func TestAWriterReadsInProcessAsTheWriter(t *testing.T) {
 		}},
 		{"WaitExternalIP", func() (bool, error) {
 			ip, err := c.WaitExternalIP(ctx, "farcast-system", "fatline", time.Minute)
-			return ip == "34.0.0.5", err
+			return ip == "203.0.113.5", err
 		}},
 		{"WaitJob", func() (bool, error) {
 			res, err := c.WaitJob(ctx, "farcast-system", "fetch", time.Minute)
@@ -521,6 +521,16 @@ func TestAKubectlClientHasNoCanI(t *testing.T) {
 		{"WaitJob", func() (bool, error) {
 			res, err := c.WaitJob(ctx, "farcast-system", "build", time.Minute)
 			return res == (JobResult{}), err
+		}},
+		// ADR 0023 M2.6 (A23-46, A28-7): DeploymentState holds a map, so its
+		// zero value is checked field by field.
+		{"DeploymentState", func() (bool, error) {
+			st, err := c.DeploymentState(ctx, "web", "api")
+			return !st.Present && st.Replicas == nil && st.Requests == nil && st.AdaptedAt.IsZero() && st.LastAppliedAt.IsZero() && st.ResourceVersion == "", err
+		}},
+		{"JobState", func() (bool, error) {
+			res, found, err := c.JobState(ctx, "farcast-system", "fetch")
+			return res == (JobResult{}) && !found, err
 		}},
 		{"JobLogs", func() (bool, error) {
 			logs, err := c.JobLogs(ctx, "farcast-system", "fetch", 0)

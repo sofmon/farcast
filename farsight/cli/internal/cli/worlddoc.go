@@ -861,12 +861,7 @@ func (b *worldBuilder) spend() {
 	b.doc.Sections.Spend = sectionStatus{Read: true}
 	b.spendRead = true
 	b.byApp = ledger.ByApp()
-	b.costStops = map[string]bool{}
-	for _, st := range cp.Stops {
-		if st.Reason == kernel.StopReasonCostGuard {
-			b.costStops[tenantOf(st.Namespace, st.Deployment)] = true
-		}
-	}
+	b.costStops = costGuardStops(cp)
 
 	accrual := ledger.Accrued()
 	start, end := ledger.Period()
@@ -901,12 +896,9 @@ func (b *worldBuilder) spend() {
 			"the kernel is enforcing %s %.2f and this machine has %s %.2f recorded; the cluster acts on its own until 'farcast kernel deploy %s' redeploys it",
 			s.Currency, obs.Limit, s.Currency, b.meta.CostLimit.Amount, b.in.Name))
 	}
-	observed := obs.At
-	if observed.IsZero() {
-		observed = cp.Last
-	}
+	observed, stale := checkpointFreshness(cp, b.now)
 	s.ObservedAt = optTime(observed)
-	s.CheckpointStale = observed.IsZero() || observed.UTC().Truncate(time.Second).Before(b.now.Add(-checkpointStaleAfter))
+	s.CheckpointStale = stale
 	for _, d := range accrual.Discrepancies {
 		caveats = append(caveats, "billing disagrees with the model beyond the clamp, and the estimate stands: "+d.String())
 	}

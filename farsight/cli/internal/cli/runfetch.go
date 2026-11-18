@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sofmon/farcast/farsight/cli/internal/cluster"
 	pfetch "github.com/sofmon/farcast/planck/fetch"
 )
 
@@ -14,35 +15,59 @@ import (
 // carries its own, shorter deadline; this is the operator's patience.
 const fetchTimeout = 8 * time.Minute
 
+// fetchDefaultRef is the ref the fetch reads when run is given no --ref, as
+// planck/fetch defaults it (TestTheFetchDefaultsAreFetchs pins the two
+// together). The manifest it reads when given no --manifest is
+// pfetch.DefaultManifest.
+const fetchDefaultRef = "refs/heads/main"
+
 // fetched is a manifest, read inside the instance, with the two facts that
-// make it checkable afterwards.
+// make it checkable afterwards, and the fetch Job it was read from: its name,
+// and its uid, which tells this Job from another of the same name (a Job's
+// name is deterministic, ADR 0023 M2.6d, A23-47).
 type fetched struct {
 	Manifest []byte
 	Report   pfetch.Report
 	Job      string
+	UID      string
 }
 
-// readManifest runs the fetch Job and returns what it read.
+// fetchReader is the slice of the cluster client that reads a fetch Job
+// another call applied: its wait, which ends with the Job's uid, and its
+// logs (A23-47). Under 'run --confirm' the reader reads the Job the writer
+// applied.
+type fetchReader interface {
+	WaitJob(ctx context.Context, namespace, name string, timeout time.Duration) (cluster.JobResult, error)
+	JobLogs(ctx context.Context, namespace, job string, lines int) (string, error)
+}
+
+// applyFetch renders the fetch Job and applies it, the first half of the
+// manifest read: the instance clones the repository and prints the manifest
+// it finds. readFetch is the second.
+func applyFetch(ctx context.Context, env *Env, cl jobWaiter, cfg pfetch.Config) error {
+	manifest, err := pfetch.Render(cfg)
+	if err != nil {
+		return err
+	}
+	if err := cl.Apply(ctx, manifest); err != nil {
+		return fmt.Errorf("start the manifest read: %w", err)
+	}
+	if isInteractive(env) || env.Verbose {
+		fprintf(env.Err, "Reading %s inside %q — the instance clones it, not this machine.\n",
+			cfg.Repo, cfg.Instance)
+	}
+	return nil
+}
+
+// readFetch waits for the fetch Job applyFetch applied and returns what it
+// read, with the Job's uid.
 //
 // The manifest arrives on the Job's stdout and the commit and digest arrive in
 // the Pod's termination message. Two channels, and the caller checks one
 // against the other — see Report.Verify for exactly what that does and does
 // not prove.
-func readManifest(ctx context.Context, env *Env, cl jobWaiter, cfg pfetch.Config) (fetched, error) {
-	manifest, err := pfetch.Render(cfg)
-	if err != nil {
-		return fetched{}, err
-	}
-	if err := cl.Apply(ctx, manifest); err != nil {
-		return fetched{}, fmt.Errorf("start the manifest read: %w", err)
-	}
-
+func readFetch(ctx context.Context, env *Env, cl fetchReader, cfg pfetch.Config) (fetched, error) {
 	job := cfg.Job()
-	if isInteractive(env) || env.Verbose {
-		fprintf(env.Err, "Reading %s inside %q — the instance clones it, not this machine.\n",
-			cfg.Repo, cfg.Instance)
-	}
-
 	res, err := cl.WaitJob(ctx, pfetch.Namespace, job, fetchTimeout)
 	if err != nil {
 		return fetched{}, fmt.Errorf("wait for the manifest read: %w", err)
@@ -84,7 +109,7 @@ func readManifest(ctx context.Context, env *Env, cl jobWaiter, cfg pfetch.Config
 			return fetched{}, err
 		}
 	}
-	return fetched{Manifest: raw, Report: report, Job: job}, nil
+	return fetched{Manifest: raw, Report: report, Job: job, UID: res.UID}, nil
 }
 
 // withoutUserinfo is a repository URL without a user name or credential in it,

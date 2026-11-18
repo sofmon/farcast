@@ -10,13 +10,29 @@ import (
 	"github.com/sofmon/farcast/manifest/parser"
 )
 
-// policyReader is the slice of the cluster client the egress policy needs.
-type policyReader interface {
-	ConfigMapValue(ctx context.Context, namespace, name, key string) (string, bool, error)
+// configMapDataReader is the slice of the cluster client that reads a
+// ConfigMap whole: its data, and the resourceVersion a write at what was
+// read is compared with. run reads the egress policy through it (ADR 0023
+// M2.6d, A23-47, A28-10), and a plan the key pin (pinPlanReader).
+type configMapDataReader interface {
+	ConfigMapData(ctx context.Context, namespace, name string) (map[string]string, string, bool, error)
 }
 
-// egressPolicy mints this deployment's credentials and returns the instance's
-// whole policy with them merged in.
+// credentialMinter gives namespace/app its egress credential: a fresh one
+// when a run deploys (mintEgressCredential), and a placeholder in a plan,
+// which mints nothing (ADR 0023 M2.6d, A23-30, A23-47).
+type credentialMinter func(namespace, app string) (string, error)
+
+// mintEgressCredential is the credentialMinter of a run that deploys: a new
+// random credential for every application, whatever its name.
+func mintEgressCredential(string, string) (string, error) {
+	return policy.NewCredential()
+}
+
+// egressPolicy returns the instance's whole policy, existing as it was read
+// (readEgressPolicyAt), with this deployment's applications in it, each with
+// the credential mint gives it: the document, and the credentials by
+// application.
 //
 // The merge is the point, and it is a lesson this project has already paid for
 // once: one FatLine serves every application on an instance, so a `farcast run`
@@ -26,13 +42,11 @@ type policyReader interface {
 //
 // The cluster's own ConfigMap is the source of truth rather than local state,
 // because an instance may be deployed to from more than one machine and the
-// second machine has never heard of the first one's applications.
-func egressPolicy(ctx context.Context, cl policyReader, namespace string, m parser.Manifest) (*policy.Document, map[string]string, error) {
-	existing, err := readEgressPolicy(ctx, cl)
-	if err != nil {
-		return nil, nil, err
-	}
-
+// second machine has never heard of the first one's applications. So the
+// read, the comparison of what was read under --confirm, and this, which
+// mints, are three steps (A28-10): nothing is minted before the policy read
+// is known to be the one a plan was made over.
+func egressPolicy(existing *policy.Document, namespace string, m parser.Manifest, mint credentialMinter) (*policy.Document, map[string]string, error) {
 	// This deployment is being replaced, so its previous applications go —
 	// including any the manifest no longer declares. An application removed
 	// from a manifest must stop being allowed anything.
@@ -45,7 +59,7 @@ func egressPolicy(ctx context.Context, cl policyReader, namespace string, m pars
 
 	credentials := make(map[string]string, len(m.Apps))
 	for _, app := range m.Apps {
-		credential, err := policy.NewCredential()
+		credential, err := mint(namespace, app.Name)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -67,7 +81,10 @@ func egressPolicy(ctx context.Context, cl policyReader, namespace string, m pars
 // from an empty document would silently revoke every application already
 // running, and "I could not read the policy" is a far better outcome than
 // "your applications stopped reaching anything and nothing said why".
-func readEgressPolicy(ctx context.Context, cl policyReader) (*policy.Document, error) {
+//
+// world reads it so. run reads it with its resourceVersion
+// (readEgressPolicyAt), to the same three outcomes.
+func readEgressPolicy(ctx context.Context, cl configMapReader) (*policy.Document, error) {
 	raw, found, err := cl.ConfigMapValue(ctx, fldeploy.DefaultNamespace, fldeploy.PolicyConfigMap, fldeploy.PolicyKey)
 	if err != nil {
 		if !found {
@@ -75,13 +92,51 @@ func readEgressPolicy(ctx context.Context, cl policyReader) (*policy.Document, e
 		}
 		// Present but missing its key — the same hazard as an unparseable one,
 		// and the same kind: the cluster holds a document that does not read.
-		return nil, withKind(kindDocumentUnreadable, fmt.Errorf("the egress policy in %s/%s has no %q; refusing to replace it, because "+
-			"rewriting it from scratch would revoke every application already running",
-			fldeploy.DefaultNamespace, fldeploy.PolicyConfigMap, fldeploy.PolicyKey))
+		return nil, policyWithoutItsKey()
 	}
 	if !found {
 		return &policy.Document{Version: policy.Version}, nil
 	}
+	return parseEgressPolicy(raw)
+}
+
+// readEgressPolicyAt is readEgressPolicy for run, with the ConfigMap's
+// resourceVersion, which a plan binds on the policy's write and --confirm
+// compares before it mints (ADR 0023 M2.6d, A23-47, A28-10). Its outcomes
+// are readEgressPolicy's: no ConfigMap is an empty document, at no
+// resourceVersion; one without policy.json is document_unreadable; one
+// whose policy.json does not parse is as readEgressPolicy has it.
+func readEgressPolicyAt(ctx context.Context, cl configMapDataReader) (*policy.Document, string, error) {
+	data, rv, found, err := cl.ConfigMapData(ctx, fldeploy.DefaultNamespace, fldeploy.PolicyConfigMap)
+	if err != nil {
+		return nil, "", fmt.Errorf("read the instance's egress policy: %w", err)
+	}
+	if !found {
+		return &policy.Document{Version: policy.Version}, "", nil
+	}
+	raw, ok := data[fldeploy.PolicyKey]
+	if !ok {
+		return nil, "", policyWithoutItsKey()
+	}
+	doc, err := parseEgressPolicy(raw)
+	if err != nil {
+		return nil, "", err
+	}
+	return doc, rv, nil
+}
+
+// policyWithoutItsKey is the refusal of a policy ConfigMap that is there
+// without policy.json: the same hazard as one that does not parse, and the
+// same kind, since the cluster holds a document that does not read.
+func policyWithoutItsKey() error {
+	return withKind(kindDocumentUnreadable, fmt.Errorf("the egress policy in %s/%s has no %q; refusing to replace it, because "+
+		"rewriting it from scratch would revoke every application already running",
+		fldeploy.DefaultNamespace, fldeploy.PolicyConfigMap, fldeploy.PolicyKey))
+}
+
+// parseEgressPolicy is the policy document raw, policy.json's value as read,
+// or the refusal to replace one that does not parse.
+func parseEgressPolicy(raw string) (*policy.Document, error) {
 	doc, err := policy.Parse([]byte(raw))
 	if err != nil {
 		err = fmt.Errorf("the instance's existing egress policy could not be read (%w); refusing to replace "+

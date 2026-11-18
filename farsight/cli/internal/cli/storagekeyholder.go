@@ -16,6 +16,7 @@ import (
 	dskeyholder "github.com/sofmon/farcast/datasphere/keyholder"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/keyholder"
+	"github.com/sofmon/farcast/farsight/cli/internal/output"
 	"github.com/sofmon/farcast/fatline/tunnel"
 )
 
@@ -803,6 +804,15 @@ func (s handOverStep) everyServingReplicaHolds() bool {
 }
 
 // handOverResult is what a hand-over did.
+//
+// Problem and Reason are printed as they are, by run on stderr and by rotate
+// on its keyholder line, so an error whose text this file did not write — an
+// opener's, a hook's, the API server's inside either — goes into them
+// through output.ErrorText (ADR 0023 M2.6d, A28-3): an error keeps its
+// lines, the keyholder opener's three among them, and every other rune that
+// would act on a terminal is escaped in place. Errors built here from parsed
+// key ids, this keyring's own scope names and the validated instance name,
+// with any name a replica supplied already quoted, go in as they are.
 type handOverResult struct {
 	// Problem is set when nothing was pushed at all: the keyholder could not
 	// be reached, or — Unsafe — this keyring cannot be safely pushed to what
@@ -958,7 +968,7 @@ func handOverKeys(ctx context.Context, env *Env, meta *config.InstanceMetadata, 
 
 	client, done, err := open(ctx, env, meta.Name)
 	if err != nil {
-		res.Problem = fmt.Sprintf("the keyholder could not be reached: %v", err)
+		res.Problem = fmt.Sprintf("the keyholder could not be reached: %s", output.ErrorText(err.Error()))
 		return res
 	}
 	defer done()
@@ -994,7 +1004,7 @@ func handOverKeys(ctx context.Context, env *Env, meta *config.InstanceMetadata, 
 	if opts.beforePush != nil {
 		if err := opts.beforePush(client); err != nil {
 			var behind *pinBehind
-			res.Problem, res.Unsafe = err.Error(), errors.As(err, &behind)
+			res.Problem, res.Unsafe = output.ErrorText(err.Error()), errors.As(err, &behind)
 			return res
 		}
 	}
@@ -1011,10 +1021,10 @@ func handOverKeys(ctx context.Context, env *Env, meta *config.InstanceMetadata, 
 				// to push, not a failure to record it.
 				var behind *pinBehind
 				if errors.As(err, &behind) {
-					res.Problem, res.Unsafe = err.Error(), true
+					res.Problem, res.Unsafe = output.ErrorText(err.Error()), true
 					return res
 				}
-				res.Problem = fmt.Sprintf("this machine could not record the keys it was about to hand over: %v", err)
+				res.Problem = fmt.Sprintf("this machine could not record the keys it was about to hand over: %s", output.ErrorText(err.Error()))
 				return res
 			}
 		}
@@ -1114,7 +1124,7 @@ func handOverKeys(ctx context.Context, env *Env, meta *config.InstanceMetadata, 
 				return res
 			}
 			res.Cause = heldUnrecorded
-			res.Reason = fmt.Sprintf("this machine could not save its keyring with them in use: %v", err)
+			res.Reason = fmt.Sprintf("this machine could not save its keyring with them in use: %s", output.ErrorText(err.Error()))
 			return res
 		}
 	}
@@ -1409,7 +1419,7 @@ func (h *handOver) push(keys datasphere.Keyring, states []*keyholder.State) (han
 		// goes — including a push that was refused. A push nobody wrote down is
 		// the one an audit cannot account for later.
 		if lerr := keyholder.AppendLedger(ledgerPath, entry); lerr != nil {
-			fprintf(h.env.Err, "warning: the unseal ledger could not be written: %v\n", lerr)
+			fprintf(h.env.Err, "warning: the unseal ledger could not be written: %s\n", output.ErrorText(lerr.Error()))
 		}
 	}
 	slices.SortFunc(step.Rows, func(a, b replicaState) int { return cmp.Compare(a.Ordinal, b.Ordinal) })
@@ -1454,7 +1464,7 @@ func (h *handOver) record(res *handOverResult) {
 	h.meta.UpdatedAt = time.Now().UTC()
 	if err := h.env.ConfigDir.SaveInstanceMetadata(h.meta.Name, h.meta); err != nil {
 		res.RecordErr = fmt.Errorf("the keyholder took generation %d but recording it failed: %w", h.taken, err)
-		h.warn("warning: %v\n", res.RecordErr)
+		h.warn("warning: %s\n", output.ErrorText(res.RecordErr.Error()))
 	}
 }
 

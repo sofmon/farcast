@@ -43,6 +43,8 @@ type fakeCluster struct {
 	ipErr      error
 	applyErr   error
 	rolloutErr error
+	// onApply runs once each apply has landed.
+	onApply func()
 
 	// namespaces is what the cluster contains. Empty means an empty cluster,
 	// deliberately: a fake that answers "yes, it exists" to everything is what
@@ -68,6 +70,9 @@ func (f *fakeCluster) NamespaceUID(context.Context, string) (string, error) {
 func (f *fakeCluster) Apply(_ context.Context, m []byte) error {
 	checkApplied(m)
 	f.applied = append(f.applied, m)
+	if f.onApply != nil {
+		f.onApply()
+	}
 	return f.applyErr
 }
 
@@ -1559,7 +1564,12 @@ func newRedeployRig(t *testing.T, edits ...rigEdit) *deployRig {
 // components.
 func newConnectRig(t *testing.T, edits ...rigEdit) *deployRig {
 	t.Helper()
-	dir := config.Dir(t.TempDir())
+	return newConnectRigIn(t, config.Dir(t.TempDir()), edits...)
+}
+
+// newConnectRigIn is newConnectRig in a config directory the test chose.
+func newConnectRigIn(t *testing.T, dir config.Dir, edits ...rigEdit) *deployRig {
+	t.Helper()
 	meta := registeredInstance(t, dir, prodName)
 	for _, edit := range edits {
 		edit(t, dir, meta)

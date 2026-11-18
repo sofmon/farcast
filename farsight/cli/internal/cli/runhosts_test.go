@@ -102,7 +102,7 @@ func TestTheResultIsWhatTheReviewShowed(t *testing.T) {
 	var rev, res strings.Builder
 	review{Instance: "p43", Namespace: "ordered", Manifest: *m, FatLineDeployed: true,
 		Limit: config.CostLimit{Amount: 500, Currency: "USD", Period: "monthly"}}.print(&rev)
-	doc, _, err := egressPolicy(context.Background(), newFakeRun(orderedManifest), "ordered", *m)
+	doc, _, err := egressPolicy(&policy.Document{Version: policy.Version}, "ordered", *m, mintEgressCredential)
 	if err != nil {
 		t.Fatal(err)
 	}

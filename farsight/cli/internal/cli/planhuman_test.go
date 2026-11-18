@@ -295,7 +295,7 @@ func renderRows() []renderRow {
 			Namespace: "f-rns", ReplacesRepository: "f-rr",
 			Apps: []plan.RunApp{{Name: "f-app", Containerfile: "f-cf", Context: "f-ctx",
 				External: []plan.RunHost{{Host: "f-host", Reason: "f-reason"}, {Host: "f-host2", Reason: "f-reason2"}}}},
-			OtherDeploymentsKept: []string{"f-other"}, MeteringAdded: true},
+			OtherDeploymentsKept: []string{"f-other"}, MeteringAdded: true, LimitReached: true, LimitReason: "f-lr"},
 			map[string][]string{
 				"type":                     {"run: deploy "},
 				"job_uid":                  {"(Job uid f-uid)\n"},
@@ -311,6 +311,8 @@ func renderRows() []renderRow {
 				"apps[].external[].reason": {"(f-reason)"},
 				"other_deployments_kept[]": {"other deployments kept in f-rns: f-other;"},
 				"metering_added":           {"; f-rns is added to what the kernel meters\n"},
+				"limit_reached":            {"\n  the instance's spending is at its limit ("},
+				"limit_reason":             {"at its limit (f-lr); this deploy adds to it until the kernel's next tick stops its applications\n"},
 			}),
 		factRow("run, into a metered namespace, replacing nothing", plan.RunFact{Type: plan.TypeRun, Namespace: "f-rns2",
 			Apps: []plan.RunApp{{Name: "f-app2"}}},
@@ -319,6 +321,7 @@ func renderRows() []renderRow {
 				"apps[].external[].host":   {"; reaches nothing outside the instance\n"},
 				"other_deployments_kept[]": {"other deployments kept in f-rns2: none;"},
 				"metering_added":           {"; f-rns2 is already metered\n"},
+				"limit_reached":            {"\n  the instance's spending is not at its limit\n"},
 			}),
 
 		factRow("build", plan.BuildFact{Type: plan.TypeBuild, Repository: "f-brepo", Ref: "f-bref", App: "f-bapp",
@@ -523,17 +526,19 @@ func TestEveryBoundFactIsRendered(t *testing.T) {
 	// Every plan a command prints (ADR 0023 M2.6b): each value its facts bind
 	// shows in its rendering, so a renderer that drops one only a command's
 	// own plan holds (connect's second standing cost, a source build's Go,
-	// redeploy's replaced image, rotate's two pins) fails here, not only on
-	// the samples above.
+	// redeploy's replaced image, rotate's two pins, run's resets and the
+	// workloads it keeps) fails here, not only on the samples above. run's
+	// deploy plans (M2.6d) are printed by --confirm with the fetch plan's
+	// digest (runDeployPlan).
 	t.Run("the commands' plans", func(t *testing.T) {
-		for _, row := range planCommands() {
+		for _, row := range everyPlanShape(t) {
 			t.Run(row.String(), func(t *testing.T) {
 				_, dir := planFixture(t, row)
-				doc, _ := runPlan(t, dir, row, output.ModeJSON)
-				_, text := runPlan(t, dir, row, output.ModeHuman)
+				doc, _ := runPrintedPlan(t, dir, row, output.ModeJSON)
+				_, text := runPrintedPlan(t, dir, row, output.ModeHuman)
 				b := decodedBound(t, doc)
-				// A placeholder key id, rotate's, renders as the key it
-				// stands for (A23-32).
+				// A placeholder key id, rotate's and run's, renders as the
+				// key it stands for (A23-32).
 				labels, _ := placeholderKeyLabels(b.Facts)
 				for i, f := range b.Facts {
 					for _, want := range renderedValues(reflect.ValueOf(f), "") {
@@ -811,6 +816,7 @@ func hostileTextOnTheCommands(t *testing.T) {
 			})
 		}
 	})
+	t.Run("run's deploy plan", runDeployHostileText)
 	t.Run("build", func(t *testing.T) {
 		dir := config.Dir(t.TempDir())
 		meteringInstance(t, dir, "p42")
@@ -898,10 +904,11 @@ func TestPlanDocumentCarriesTheBytesItsDigestCovers(t *testing.T) {
 		t.Errorf("the document's members are %v, want %v", keys, want)
 	}
 
-	// Every plan a command prints.
-	for _, row := range planCommands() {
+	// Every plan a command prints, run's deploy plans among them (ADR 0023
+	// M2.6d).
+	for _, row := range everyPlanShape(t) {
 		_, dir := planFixture(t, row)
-		doc, out := runPlan(t, dir, row, output.ModeJSON)
+		doc, out := runPrintedPlan(t, dir, row, output.ModeJSON)
 		if got := plan.DigestOf(doc.Bound); got != doc.Digest {
 			t.Errorf("%s: the printed bound hashes to %s, the document says %s", row, got, doc.Digest)
 		}
@@ -1050,11 +1057,13 @@ func TestABlockedPlanIsRefusedWithItsKind(t *testing.T) {
 				if ran() {
 					t.Errorf("%s ran kubectl for a blocked plan", row)
 				}
-				onlyThePlansReads(t, row, s)
+				onlyThePlansReads(t, row, s, consentConfirm)
 				sameFiles(t, "a blocked "+row.name, before, treeFiles(t, string(dir)))
 			})
 		}
 	})
+
+	t.Run("run", runBlockedPlansAreRefusedWithTheirKind)
 
 	// connect, redeploy and build have no block (A23-35 to A23-37): what
 	// would stop them refuses before any plan is computed, so every plan
@@ -1132,6 +1141,17 @@ func TestBlockKindsAreErrorKinds(t *testing.T) {
 		want := plan.Block{Kind: kindInternal, Message: fmt.Sprintf(msgNoSuchNamespace, "web")}
 		if blocked := decodedBound(t, doc).Blocked; !slices.Equal(blocked, []plan.Block{want}) || !slices.Contains(errorKinds, blocked[0].Kind) {
 			t.Errorf("%s blocks %+v; want %+v, an error kind", row, blocked, want)
+		}
+	}
+
+	// run's blocks (ADR 0023 M2.6d), as its fetch plan and its deploy plan
+	// raise them: each kind an error kind, each message the refusal's own.
+	for _, tc := range runBlocks(t) {
+		_, dir := planFixture(t, tc.row)
+		doc, _ := runPrintedPlan(t, dir, tc.row, output.ModeJSON)
+		blocked := decodedBound(t, doc).Blocked
+		if len(blocked) != 1 || blocked[0].Kind != tc.kind || !slices.Contains(errorKinds, blocked[0].Kind) || !strings.Contains(blocked[0].Message, tc.phrase) {
+			t.Errorf("%s blocks %+v; want one %s block, an error kind, saying %q", tc.row, blocked, tc.kind, tc.phrase)
 		}
 	}
 
@@ -1238,10 +1258,19 @@ func TestConfirmRefusesAChangedPlan(t *testing.T) {
 		{row: planCommandNamed(t, "storage key rotate", "with a keyholder"), change: func(m *config.InstanceMetadata) {
 			m.Keyholder.Replicas = 3
 		}},
+		// run's fetch plan's cost fact binds the limit (ADR 0023 M2.6d). A
+		// digest that is not the fetch plan's is a deploy plan's: --confirm
+		// reads, as the reader, the fetch Job the new fetch plan names, and
+		// no fetch has run, so it says the fetch stage changed or its Job is
+		// gone (A23-47).
+		{row: planCommandNamed(t, "run", "the images named"), change: func(m *config.InstanceMetadata) {
+			m.CostLimit.Amount = 75
+		}},
 	} {
 		t.Run(tc.row.String(), func(t *testing.T) {
 			ran := strayKubectl(t)
 			pinPlanClock(t)
+			pinRunClock(t)
 			fakeDeployDefaults(t)
 			s, dir := planFixture(t, tc.row)
 			wc := writeCommand{name: tc.row.name, args: tc.row.args, flags: tc.row.flags}
@@ -1266,6 +1295,10 @@ func TestConfirmRefusesAChangedPlan(t *testing.T) {
 			stdout, _, code := runLine(commandLine(dir, wc, "-o", "json", "--confirm", given))
 			want := "the plan for this command is now " + now + ", not the " + given + " given to --confirm: " +
 				"something it binds has changed since the plan was made; run it with --plan to review the new one. Nothing was written."
+			if tc.row.stage == "fetch" {
+				want = "the plan's fetch stage changed, or the fetch Job its deploy plan read is gone (a fetch Job is kept 15 minutes after it finishes); " +
+					"run the same command with --plan instead of --confirm"
+			}
 			var envelope struct {
 				Error struct {
 					Message string `json:"message"`
@@ -1278,10 +1311,14 @@ func TestConfirmRefusesAChangedPlan(t *testing.T) {
 			if ran() {
 				t.Error("a changed plan ran kubectl")
 			}
-			onlyThePlansReads(t, tc.row, s)
+			onlyThePlansReads(t, tc.row, s, consentConfirm)
 			sameFiles(t, "a changed plan", before, treeFiles(t, string(dir)))
 		})
 	}
+
+	// run's deploy plan binds the egress policy at the resourceVersion it
+	// read (ADR 0023 M2.6d).
+	t.Run("run's deploy plan", runDeployPlanChangedByThePolicy)
 
 	// connect's and redeploy's image facts bind what the registry's version
 	// tag answered, as a release farcast that carries its components asks
@@ -1368,7 +1405,7 @@ func confirmRefusedAsChanged(t *testing.T, row planCommand, s *kubetest.Server, 
 			"and ensured %d registries, built %d and pushed %d images", row, f.writers, f.storages, f.keyholders, f.dialled,
 			len(f.provider.ensured), len(f.builder.built), len(f.builder.embedded))
 	}
-	onlyThePlansReads(t, row, s)
+	onlyThePlansReads(t, row, s, consentConfirm)
 	sameFiles(t, row.String()+" --confirm of a plan that changed", before, treeFiles(t, string(dir)))
 }
 
@@ -1377,18 +1414,20 @@ func confirmRefusedAsChanged(t *testing.T, row planCommand, s *kubetest.Server, 
 // confirmed against a second that holds a copy of every file of the first,
 // the record's project alone changed: the recomputed plan is another, so
 // --confirm refuses it plan_changed and nothing is opened, sent or written.
-// kernel meter reads no cluster; storage key pin and kernel deploy read it
-// as the reader, both directories naming the same one.
+// kernel meter reads no cluster; storage key pin, kernel deploy and run's
+// deploy plan (ADR 0023 M2.6d) read it as the reader, both directories
+// naming the same one.
 func TestPlanFromAnotherConfigDirIsRefused(t *testing.T) {
 	for _, row := range []planCommand{
 		planCommandNamed(t, "kernel meter", "add"),
 		planCommandNamed(t, "storage key pin", "a pin to write"),
 		planCommandNamed(t, "kernel deploy", "the carried image"),
+		runDeployRowNamed(t, "deploy into a metered namespace"),
 	} {
 		t.Run(row.String(), func(t *testing.T) {
 			ran := strayKubectl(t)
 			s, dir := planFixture(t, row)
-			doc, _ := runPlan(t, dir, row, output.ModeJSON)
+			digest := planDigest(t, dir, row)
 			other := copyConfigDir(t, dir)
 			if _, err := other.UpdateInstanceMetadata(writeName, func(m *config.InstanceMetadata) error {
 				m.Project = "proj-test2"
@@ -1396,7 +1435,7 @@ func TestPlanFromAnotherConfigDirIsRefused(t *testing.T) {
 			}); err != nil {
 				t.Fatal(err)
 			}
-			confirmRefusedAsChanged(t, row, s, other, doc.Digest)
+			confirmRefusedAsChanged(t, row, s, other, digest)
 			if ran() {
 				t.Error("a plan confirmed against another directory ran kubectl")
 			}
@@ -1408,22 +1447,24 @@ func TestPlanFromAnotherConfigDirIsRefused(t *testing.T) {
 // instance released and installed again under the same name, project,
 // region and cluster records a new one, so a plan made before is refused
 // plan_changed by --confirm after, with nothing opened, sent or written.
+// run's deploy plan (M2.6d) is computed again as the reader, and refused.
 func TestPlanAfterReinstallIsRefused(t *testing.T) {
 	for _, row := range []planCommand{
 		planCommandNamed(t, "kernel meter", "add"),
 		planCommandNamed(t, "storage key pin", "a pin to write"),
+		runDeployRowNamed(t, "deploy into a metered namespace"),
 	} {
 		t.Run(row.String(), func(t *testing.T) {
 			ran := strayKubectl(t)
 			s, dir := planFixture(t, row)
-			doc, _ := runPlan(t, dir, row, output.ModeJSON)
+			digest := planDigest(t, dir, row)
 			if _, err := dir.UpdateInstanceMetadata(writeName, func(m *config.InstanceMetadata) error {
 				m.CreatedAt = m.CreatedAt.Add(24 * time.Hour)
 				return nil
 			}); err != nil {
 				t.Fatal(err)
 			}
-			confirmRefusedAsChanged(t, row, s, dir, doc.Digest)
+			confirmRefusedAsChanged(t, row, s, dir, digest)
 			if ran() {
 				t.Error("a plan confirmed after a reinstall ran kubectl")
 			}
@@ -1436,19 +1477,27 @@ func TestPlanAfterReinstallIsRefused(t *testing.T) {
 // replaced between --plan and --confirm — kubetest seeded again with
 // another uid — is another cluster: --confirm, recomputing as the reader,
 // refuses plan_changed before the writer opens, for every command whose plan
-// reads it.
+// reads it: run's deploy plan among them (ADR 0023 M2.6d), whose digest is
+// read as the reader alone (runDeployDigest), and whose binding of the uid
+// TestRunDeployConfirmNeverWritesTheFetchAgain shows.
 func TestPlanAgainstAReplacedSystemNamespaceIsRefused(t *testing.T) {
-	for _, row := range readerPlans(t) {
+	for _, row := range append(readerPlans(t), runDeployRowNamed(t, "deploy into a metered namespace")) {
 		t.Run(row.String(), func(t *testing.T) {
 			ran := strayKubectl(t)
 			s, dir := planFixture(t, row)
-			doc, _ := runPlan(t, dir, row, output.ModeJSON)
-			if got := decodedBound(t, doc).Target.SystemNamespaceUID; got != planSystemUID {
-				t.Fatalf("%s's plan binds farcast-system's uid %q; want %q", row, got, planSystemUID)
+			var digest string
+			if row.stage == "deploy" {
+				digest = runDeployDigest(t, dir, row, nil)
+			} else {
+				doc, _ := runPlan(t, dir, row, output.ModeJSON)
+				if got := decodedBound(t, doc).Target.SystemNamespaceUID; got != planSystemUID {
+					t.Fatalf("%s's plan binds farcast-system's uid %q; want %q", row, got, planSystemUID)
+				}
+				digest = doc.Digest
 			}
 			s.Put(map[string]any{"apiVersion": "v1", "kind": "Namespace", "metadata": map[string]any{
 				"name": tcdeploy.DefaultNamespace, "uid": "00000000-0000-4000-8000-0000000000a2"}})
-			confirmRefusedAsChanged(t, row, s, dir, doc.Digest)
+			confirmRefusedAsChanged(t, row, s, dir, digest)
 			if ran() {
 				t.Error("a plan confirmed against a replaced farcast-system ran kubectl")
 			}

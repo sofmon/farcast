@@ -762,7 +762,7 @@ type deployResult struct {
 
 func (r deployResult) Human(w io.Writer) error {
 	fprintf(w, "Keyholder deployed to %q (%d replicas)\n", r.Instance, r.Replicas)
-	fprintf(w, "  image  %s\n", r.Image)
+	fprintf(w, "  image  %s\n", terminalText(r.Image))
 	fprintf(w, "\nEvery replica is SEALED and will not become ready until you unseal it.\n")
 	fprintf(w, "Run: farcast storage unseal %s\n", r.Instance)
 
@@ -801,6 +801,10 @@ func writeBucketGrant(w io.Writer, project, bucket, namespace, serviceAccount st
 	if project == "" || bucket == "" {
 		return
 	}
+	// The project and the bucket are the record's, printed into commands to
+	// paste, so a value that does not print as it is goes in Go-quoted
+	// (ADR 0023 M2.6d, A28-3); one that does is unchanged.
+	project, bucket = terminalText(project), terminalText(bucket)
 	fprintf(w, "\nBefore this keyholder can start, it needs read/write access to the bucket\n")
 	fprintf(w, "under its own identity. If you have not granted it for this instance yet, run:\n\n")
 	fprintf(w, "  PROJNUM=$(gcloud projects describe %s --format='value(projectNumber)')\n", project)

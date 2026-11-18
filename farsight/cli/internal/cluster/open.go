@@ -16,6 +16,8 @@ import (
 
 	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
+	"github.com/sofmon/farcast/technocore/kernel"
+	tkube "github.com/sofmon/farcast/technocore/kube"
 )
 
 // errReaderKubeconfig is Open's refusal of a reader given a kubeconfig: only
@@ -238,8 +240,9 @@ func (c *Client) externalIPInProcess(ctx context.Context, namespace, name string
 // waitJobInProcess is WaitJob on an Open'd client: GET the Job every 5 s.
 // status.succeeded above zero, or a Complete condition that is True, is
 // success; status.failed above zero, or a Failed condition that is True, is
-// failure. Either way the message is jobMessageInProcess's, whose error is
-// discarded: a missing message is the caller's own "no digest" to report.
+// failure. Either way the uid is the one that GET read, and the message is
+// jobMessageInProcess's, whose error is discarded: a missing message is the
+// caller's own "no digest" to report.
 func (c *Client) waitJobInProcess(ctx context.Context, namespace, name string, timeout time.Duration) (JobResult, error) {
 	end := time.Now().Add(timeout)
 	for {
@@ -249,12 +252,12 @@ func (c *Client) waitJobInProcess(ctx context.Context, namespace, name string, t
 			return JobResult{}, err
 		}
 		switch {
-		case j.Status.Succeeded > 0 || jobCondition(j, "Complete"):
+		case jobSucceeded(j):
 			msg, _ := c.jobMessageInProcess(ctx, namespace, name)
-			return JobResult{Succeeded: true, Message: msg}, nil
+			return JobResult{Succeeded: true, Message: msg, UID: j.Metadata.UID}, nil
 		case j.Status.Failed > 0 || jobCondition(j, "Failed"):
 			msg, _ := c.jobMessageInProcess(ctx, namespace, name)
-			return JobResult{Succeeded: false, Message: msg}, nil
+			return JobResult{Succeeded: false, Message: msg, UID: j.Metadata.UID}, nil
 		}
 		if time.Now().After(end) {
 			return JobResult{}, &deadline{msg: fmt.Sprintf("cluster: job %s/%s neither succeeded nor failed after %s", namespace, name, timeout)}
@@ -263,6 +266,27 @@ func (c *Client) waitJobInProcess(ctx context.Context, namespace, name string, t
 			return JobResult{}, err
 		}
 	}
+}
+
+// jobSucceeded is WaitJob's success: status.succeeded above zero, or a
+// Complete condition that is True.
+func jobSucceeded(j kube.Job) bool {
+	return j.Status.Succeeded > 0 || jobCondition(j, "Complete")
+}
+
+// jobStateInProcess is JobState on an Open'd client: one GET of the Job. It
+// is absent only when the API server says so (statusNotFound); any other
+// failure is an error with found false, never absent.
+func (c *Client) jobStateInProcess(ctx context.Context, namespace, name string) (JobResult, bool, error) {
+	j, err := c.kube.GetJob(ctx, namespace, name)
+	c.flushWarnings()
+	if err != nil {
+		if statusNotFound(err) {
+			return JobResult{}, false, nil
+		}
+		return JobResult{}, false, err
+	}
+	return JobResult{Succeeded: jobSucceeded(j), UID: j.Metadata.UID}, true, nil
 }
 
 // jobCondition reports whether a Job carries the condition of this type with
@@ -410,18 +434,130 @@ func workloadOf(k kube.Kind, md kube.ObjectMeta, spec kube.WorkloadSpec, ready i
 	return w
 }
 
+// deploymentStateInProcess is DeploymentState on an Open'd client: one GET of
+// the Deployment (A23-46, A28-7). It is absent only when the API server says
+// so (statusNotFound), which is Present false and no error; any other failure
+// is an error, never absent. A container's request that is set and does not
+// parse is an error too, wrapping kube.ErrUnreadable: a caller then knows
+// nothing of the application, rather than a request it misread.
+func (c *Client) deploymentStateInProcess(ctx context.Context, namespace, name string) (DeploymentState, error) {
+	d, err := c.kube.GetDeployment(ctx, namespace, name)
+	c.flushWarnings()
+	if err != nil {
+		if statusNotFound(err) {
+			return DeploymentState{}, nil
+		}
+		return DeploymentState{}, err
+	}
+	containers := d.Spec.Template.Spec.Containers
+	st := DeploymentState{
+		Present:         true,
+		Replicas:        d.Spec.Replicas,
+		Requests:        make(map[string]Requests, len(containers)),
+		ResourceVersion: d.Metadata.ResourceVersion,
+		LastAppliedAt:   lastAppliedAt(d.Metadata.ManagedFields),
+	}
+	for _, ct := range containers {
+		r, err := requestsOf(namespace, name, ct)
+		if err != nil {
+			return DeploymentState{}, err
+		}
+		st.Requests[ct.Name] = r
+	}
+	// The kernel's own reading of its stamp: absent or unparseable is never
+	// adapted, so AdaptedAt stays zero.
+	if at, ok := (kernel.Target{Annotations: d.Metadata.Annotations}).AdaptedAt(); ok {
+		st.AdaptedAt = at.UTC()
+	}
+	return st, nil
+}
+
+// requestsOf is one container's requests in milli-CPU and MiB, each rounded
+// up as tkube parses it. A request that is not set is 0; one that is set and
+// does not parse is an error naming the Deployment, the container and the
+// value, each server-supplied text quoted.
+func requestsOf(namespace, name string, ct kube.Container) (Requests, error) {
+	cpu, ok := quantity(ct.Resources.Requests.CPU, tkube.ParseCPUMilli)
+	if !ok {
+		return Requests{}, unreadableRequest(namespace, name, ct.Name, "cpu", ct.Resources.Requests.CPU)
+	}
+	mem, ok := quantity(ct.Resources.Requests.Memory, tkube.ParseMemMiB)
+	if !ok {
+		return Requests{}, unreadableRequest(namespace, name, ct.Name, "memory", ct.Resources.Requests.Memory)
+	}
+	return Requests{CPUMilli: cpu, MemMiB: mem}, nil
+}
+
+// quantity is q through parse, "" as 0: tkube refuses an empty quantity, and
+// a container that requests nothing reserves nothing. ok is false when q is
+// set and parse refuses it.
+func quantity(q string, parse func(string) (int, error)) (int64, bool) {
+	if q == "" {
+		return 0, true
+	}
+	v, err := parse(q)
+	if err != nil {
+		return 0, false
+	}
+	return int64(v), true
+}
+
+// unreadable is an answer farcast could not read: its text is exactly msg,
+// and it unwraps to kube.ErrUnreadable.
+type unreadable struct{ msg string }
+
+func (e *unreadable) Error() string { return e.msg }
+func (e *unreadable) Unwrap() error { return kube.ErrUnreadable }
+
+// unreadableRequest is a container's set request that does not parse. The
+// container's name and the value came from the server, so both are quoted.
+func unreadableRequest(namespace, name, container, resource, value string) error {
+	return &unreadable{msg: fmt.Sprintf("cluster: the Deployment %s/%s's container %q requests %s %q, which farcast cannot read as a quantity", namespace, name, container, resource, value)}
+}
+
+// lastAppliedAt is the newest time among the entries that record an apply of
+// the object by farcast (kube.IsLastApply), zero when there is none. An entry
+// whose time does not parse is passed over: it can only make the last apply
+// read older, and an older apply never gates anything.
+func lastAppliedAt(entries []kube.ManagedFieldsEntry) time.Time {
+	var newest time.Time
+	for _, e := range entries {
+		if !kube.IsLastApply(e) {
+			continue
+		}
+		at, err := time.Parse(time.RFC3339, e.Time)
+		if err != nil {
+			continue
+		}
+		if at.After(newest) {
+			newest = at
+		}
+	}
+	return newest.UTC()
+}
+
+// statusNotFound reports whether err is the API server saying that an object
+// is not there: a 404 whose body is a Kubernetes Status (A18-4's rule). It is
+// the one absence test of every read that tells an absent object from a
+// failed read (configMapInProcess, deploymentStateInProcess and
+// jobStateInProcess). errors.Is(err, tkube.ErrNotFound) is never that test: a
+// 404 from something in front of the API server unwraps to it too, and proves
+// nothing about the object.
+func statusNotFound(err error) bool {
+	var ae *kube.APIError
+	return errors.As(err, &ae) && ae.KubernetesStatus && ae.Status.Code == http.StatusNotFound
+}
+
 // configMapInProcess reads one ConfigMap on an Open'd client. It is absent
-// only when the API server says so, a 404 whose body is a Kubernetes Status.
-// Any other failure is returned with found false and never read as absent: a
-// 403 read as absent would show a refused read as "never checkpointed", and a
-// 404 from something in front of the API server proves nothing about the
-// ConfigMap.
+// only when the API server says so (statusNotFound). Any other failure is
+// returned with found false and never read as absent: a 403 read as absent
+// would show a refused read as "never checkpointed", and a 404 from something
+// in front of the API server proves nothing about the ConfigMap.
 func (c *Client) configMapInProcess(ctx context.Context, namespace, name string) (kube.ConfigMap, bool, error) {
 	cm, err := c.kube.GetConfigMap(ctx, namespace, name)
 	c.flushWarnings()
 	if err != nil {
-		var ae *kube.APIError
-		if errors.As(err, &ae) && ae.KubernetesStatus && ae.Status.Code == http.StatusNotFound {
+		if statusNotFound(err) {
 			return kube.ConfigMap{}, false, nil
 		}
 		return kube.ConfigMap{}, false, err
