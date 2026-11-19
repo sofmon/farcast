@@ -1,0 +1,6833 @@
+# ADR 0023 M2: implementation design (v2)
+
+*(2026-11-19: kept in the repository from here on, at ADR 0023 M2.7's end. It was drafted and amended outside it, so the raw maps, build and review results, digests and backups it names "beside this file", and the scratch paths it gives, were working files and are not kept. Code citations are file:line at the commit each section names, and paths are relative to the repository root.)*
+
+This is the brief for the implementers of [ADR 0023](../adr/0023-one-download-farcast.md) milestone M2, the in-process client. Paths are relative to the repository root at 0cea21f, which equals origin/main. Every name below is pinned. If an implementer finds a name or rule here that cannot work, they stop and report it. They do not invent a variant.
+
+v2 revises v1 (2026-11-14) against 82 review findings (MS security, MC conformance, MF facts) and the triage that decided them. `m2-resolutions.md` says where each finding landed. The four operator decisions, P1 to P4, were answered by the operator on 2026-11-14, each as the form this design had written in. Every place that depends on one is marked **[decided: P1]** to **[decided: P4]**, and §12 keeps the alternatives that were declined.
+
+M2 is defined by these parts of the ADR:
+- the phasing row, ADR 0023:308;
+- decisions 2, 3 and 8, at :83-116 and :207-214;
+- Choices 6 and 7, at :225-226, which M2 must decide.
+
+**Marks.**
+- **[read]**: read in the source at 0cea21f, or in the vendored source, by the designer or the reviser.
+- **[ran]**: run locally, offline. `go doc` on the vendored go-yaml parser API and on go1.27.4's `crypto/x509.SystemCertPool`.
+- **[map]**: taken from the five read-only maps v1 was given, and not re-checked.
+- **[doc]**: fetched, with its URL. Source files fetched on 2026-11-14 at pinned tags, read and not vendored:
+  - kubectl **v0.37.2**, the newest kubectl release tag on 2026-11-14 (v0.37.3 and v0.38.0 answer 404 on raw.githubusercontent.com; kubernetes.io/releases lists 1.37 as the newest minor): `pkg/polymorphichelpers/rollout_status.go`, `pkg/polymorphichelpers/logsforobject.go`, `pkg/util/podutils/podutils.go`, `pkg/util/deployment/deployment.go`, `pkg/cmd/logs/logs.go` and `pkg/cmd/apply/apply.go`, each at `https://raw.githubusercontent.com/kubernetes/kubectl/v0.37.2/<path>`;
+  - client-go v0.37.2 `util/csaupgrade/upgrade.go`;
+  - apimachinery v0.37.2 `pkg/util/managedfields/internal/{managedfields,fieldmanager}.go`;
+  - apiserver v0.37.2 `pkg/endpoints/handlers/{create,patch}.go`.
+  
+  Pages fetched for v1 or v2 carry their URL where cited.
+- **[unverified]**: an external claim made from memory, with no source fetched.
+- **[inf]**: an inference.
+
+**Standing rules for every implementer:**
+- Commit nothing and stage nothing, and never stage `.claude/`.
+- Never run `gofmt -w .` at the root. Format named directories only.
+- Make no cloud calls, and do not run gcloud or kubectl against anything real. Never print or request a token. Never read `~/.config/gcloud`, `~/.kube` or the farcast config directory.
+- Spend nothing.
+- Every go command runs with `GOWORK=off GOTOOLCHAIN=go1.27.4 GOPROXY=off GOFLAGS=-mod=vendor`.
+- Scratch work goes under `…/scratchpad/m2/<your-name>/`. Delete its build outputs when you finish.
+- **Never `git checkout` to undo a mutation.** Reverse the edit by hand, grep for residue, and re-run the full suite.
+- The kubectl, client-go, apimachinery and apiserver files above may be re-read at their pinned tags (Q8, approved). Each port cites its file and tag in a code comment. Nothing fetched is vendored.
+- Three steps need the operator's approval first:
+  - the real-Kubernetes test's run on the keeper VM (§10.6) **[decided: P4]**;
+  - Q9's probe walk;
+  - Q10's billable walk.
+
+---
+
+## 0. Scope and order
+
+### What M2 delivers, and what it leaves for later
+
+When every sub-milestone below has landed, these hold:
+- **The binary.** `farcast` starts no `kubectl`, no `gke-gcloud-auth-plugin` and no `gcloud`. Its only process starts are `image`'s `--source` and development path.
+- **Cluster calls.**
+  - They go to the instance's DNS endpoint with a token farcast minted in memory, scoped to `userinfo.email` only (§3.3).
+  - Writes run as the stored installer service account. The cluster reads of `world`, `ps`, `costs`, `usage` and `logs`, and of every `--plan` but `migrate`'s, run as a per-instance reader service account.
+  - Every write is a server-side apply, except three: the storage pin's create-or-replace, the migration's managed-fields patch, and `git-credential rm`'s delete (§9.8).
+- **The rule "reads never mint an admin token"** (ADR 0023:113) holds in M2 for the cluster reads named above. It does not yet hold for the Google reads of plans (registry, bucket, IAM state), for `migrate --plan`, or for `storage ls`, `storage usage`, `storage cp` downloads and `secret ls`: those still mint from the installer key until M3b (§7.3). The records say exactly that.
+- **Migration.** An instance written by an older farcast is migrated once, by `farcast migrate`. Until then, every other cluster-writing command refuses it.
+- **Consent.** Every command that writes to a cluster has `--plan` and `--confirm <digest>`. Interactive use and `--yes` work as today, except for the acts newly automated by M2, which `--yes` never covers: the migration, `reader grant`, `git-credential set` and `rm`, and the bucket grant **[decided: P2]**.
+
+M2 does not deliver any of these:
+- device keys, WIF or the removal of ADC from Google API calls (M3a and M3b);
+- a scoped identity for the Google reads of plans (M3b);
+- the Mac broker (M5);
+- `--plan` on the gated commands that write to Google only (decided: later, in ADR 0021 step 3);
+- the Swift plan decoder. The app runs no writing command until ADR 0021 step 7.1, so plan vectors are not copied to FarSightKit in M2.
+
+### The sub-milestones
+
+Each one leaves the tree working, with `./check.sh` green, and can be committed on its own.
+
+| # | Sub-milestone | Needs first | Cloud |
+|---|---|---|---|
+| **M2.1** | `farsight/cli/internal/kube`, the wire client, and `kube/kubetest`, the fake API server and token endpoint. Not wired into any command. | — | none |
+| **M2.2** | `data:` Secrets, and the test that sends every rendered and every composed stream through `kube.SplitStream` | M2.1 | none |
+| **M2.3** | The reader identity: `farcast reader init`, `reader record` and `reader grant`; `release`'s reader lines. Also `cli/clusterref.go` with its reader branch, `config.LoadClusterCA`, `cluster.Open` for a reader only, and the process-wide hardening (§3.6). `grant`'s RBAC apply still runs kubectl. | M2.1 | none |
+| **M2.4** | The read path in-process, as the reader: `world`, `ps`, `costs`, `usage` and `logs`. Also: error kinds, both documents at schema 2, the Swift app in lockstep, the rehearsal redesign, and `pin-gcloud` and the gcloud guard retired. | M2.3 | none (the optional **probe walk**, Q9, comes after M2.5) |
+| **M2.5** | The writing commands' reads, and the pin's create and replace, in-process as the writer: `clusterRef`'s writer branch, and `cluster.Open` for a writer. Kinds reach every in-process call. Only `Apply` still runs kubectl. | M2.4 | none |
+| **M2.6** | The consent protocol: `farsight/cli/internal/plan`, and `--plan` and `--confirm` on all 11 cluster-writing commands | M2.5; P1 for `run`'s reset facts | none |
+| **M2.7** | Server-side apply, `farcast migrate`, the refusal of unmigrated instances, and Choice 6. The kernel names its field manager. kubectl is removed: `cluster` no longer imports `os/exec`, the allowlist drops 15 lines, and `kubeconfig.yaml` is retired. Also the no-cost real-Kubernetes test. | M2.6; P1, P4 | none (the test runs locally, §10.6) |
+| **M2.8** | The bucket grant offered through the plan (Choice 7) **[decided: P2]**, the push grant's state as a plan fact, the project number fetched in-process, and `farcast git-credential set` and `rm` | M2.7 | none |
+| **M2.9** | The records sweep and the M2 walk runbook, written and not run | M2.8 | **the billable walk (Q10), separate and approved** |
+
+### Why this order
+
+1. **The wire client comes first and alone.** Every later step depends on it, and it can be tested exhaustively against a fake with nothing wired. It has no effect on operators.
+2. **`data:` Secrets come next.** The change is independent of kubectl: client-side apply handles `data:` exactly as it handles `stringData:`. Landing it early means every object a pre-M2 farcast applies from now on is already in the shape server-side apply wants.
+3. **The reader comes before the read path.** `world` cannot leave the pinned gcloud account until another read identity exists. `reader grant` verifies its grant with one read as the reader, so M2.3 carries the reader half of the plumbing: `clusterref.go`'s reader branch, `LoadClusterCA` and a reader-only `cluster.Open`. The rehearsal fakes exactly `world`'s reads (`farsight/cli/internal/rehearsal/answer.go:20-32`), so the rehearsal, the gcloud guard, the five gcloud-era kinds and both documents all change in one step (M2.4), together with the Swift app, whose vectors check.sh byte-compares (`check.sh:389`).
+4. **The writing commands' reads (M2.5) come before the consent protocol (M2.6).**
+   - A plan is computed from reads, and those reads must run in-process so a plan can be read as the reader.
+   - The plan comes before server-side apply because `migrate` has to ship with its plan (ADR 0023:92).
+5. **Server-side apply, migration and refusal land together (M2.7).** Server-side apply on an unmigrated instance is exactly the co-ownership hazard the migration exists to remove (ADR 0023:92-94). The refusal must therefore exist in the same commit as the first server-side write. kubectl's last use goes in the same commit.
+6. **The grants and the Git credential come last (M2.8).** The bucket grant is a Google write, not a Kubernetes one ([map]: `storagedeploy.go:347-375`). The Git credential is a Secret apply and needs M2.7's apply. Both depend only on the plan.
+
+### Transitional states, pinned
+
+The signatures below are the only ones allowed at each stage.
+
+| After | `cluster` constructors | `cluster.Env` | Command seams | Who acts |
+|---|---|---|---|---|
+| M2.1–M2.2 | `New(kubeconfigPath)`, `NewWithEnv`, `NewWithRunner`, as at 0cea21f | `Env(parent []string, kubeconfig string, gcloud GCloud) []string`, as at 0cea21f | unchanged | as today |
+| M2.3 | adds `Open(cfg kube.Config, warnings io.Writer, legacyKubeconfig string) (*Client, error)`. It refuses `cfg.Identity != kube.Reader` and a non-empty `legacyKubeconfig` with `cluster: until ADR 0023 M2.5 Open builds a reader only`. An `Open`'d reader client implements `NamespacesLabelled` and `CanI` (§2.3, new in M2.3) in-process; every other method returns `cluster: %s is not in-process until ADR 0023 M2.4`, naming the method. | unchanged | `readerGrantCommand.newApplier func(kubeconfigPath string) clusterApplier` (default `cluster.New`) and `readerGrantCommand.newReader func(clusterRef) (readerVerifier, error)` (default through `openCluster`, with `Verifying: true`, §3.5), where `type readerVerifier interface { NamespacesLabelled(ctx context.Context, selector string) ([]string, error); CanI(ctx context.Context, a kube.ResourceAttributes) (bool, error) }` | `reader grant`'s apply runs as the active gcloud configuration; its verifying read and reviews run as the reader |
+| M2.4 | `New(kubeconfigPath)` stays for writing commands; `Open` is still reader-only. `NewWithEnv` and `GCloud` are deleted. An unexported `newWithEnv(kubeconfig string, env []string) *Client` stays until M2.7, for the environment tests that used `NewWithEnv` (§10.2). `NewWithRunner` becomes unexported `newWithRunner`, used only by `cluster`'s own `Apply` tests and, until M2.5, by `TestConfigMapWritesNeverApply`. `ErrKubectlMissing`, `ErrAuthToolMissing` and `ErrSignedOut` become unexported and nothing outside `cluster` reads them; `markOf` stays, for the transitional `Apply`'s error text. | `Env(parent []string) []string`: the unpinned branch only. The `kubeconfig` and `gcloud` parameters go, because only the pinned branch used them [read: `env.go:91-103`]. | read commands: `func(clusterRef) (X, error)` (§2.6) | reads as the reader; writes as today |
+| M2.5–M2.6 | `New` is deleted. `Open` accepts `kube.Writer`. A writer client's `Apply` runs kubectl with `--kubeconfig legacyKubeconfig` and `Env(os.Environ())`; an empty `legacyKubeconfig` makes it fail with `cluster: this client was opened without a kubeconfig, and Apply still runs kubectl until ADR 0023 M2.7`. A reader client's `Apply` fails with `cluster: a reader client never writes`. | `Env(parent []string) []string` | every seam: `func(clusterRef) (X, error)` | writing commands' reads, and the pin, as the writer; `Apply` as the active gcloud configuration |
+| M2.7 | `Open(cfg kube.Config, warnings io.Writer) (*Client, error)`. `Runner`, `Streamer`, `newWithRunner`, `newWithEnv`, `execRunner`, `Env`, `lookPathIn`, `markOf` and the three unexported marks are deleted with `env.go`. `cluster.Client` gains `ListMeta`, `GetMeta`, `PatchManagedFields` and `Traces` (§2.3). | deleted | adds `migrateCommand.newCluster func(clusterRef) (migrateCluster, error)`, whose interface holds `ListMeta`, `GetMeta` and `PatchManagedFields` | every write as the writer |
+| M2.8 | unchanged from M2.7; `cluster.Client` gains `DeleteSecret` (§2.3) | deleted | adds `gitCredentialCommand.newCluster func(clusterRef) (gitCredentialCluster, error)`, whose interface holds `GetMeta`, `Apply` and `DeleteSecret` | every write as the writer |
+
+- **Kinds in the transition.** In M2.5–M2.6 a failure of the transitional kubectl `Apply` carries kind `internal`, as every writing command's kubectl failure does at 0cea21f (`classified`, `kinds.go:72-84`). Every in-process call carries a cluster kind from M2.5 (§8.1). From M2.7 `Apply` is in-process and carries one too.
+- **`kubeconfig.yaml`.** From M2.4 farcast's own client reads no `kubeconfig.yaml`. kubectl keeps reading it for `Apply` until M2.7. `install` stops writing it in M2.7, and `migrate` deletes it.
+- **Who acts between M2.4 and M2.7.** A writing command needs kubectl, the plugin and gcloud for its `Apply`, and the stored key for everything else. Its writes run as the active gcloud configuration, as today, while its in-process reads run as the installer service account (from M2.5).
+- **No live instance exists.** The M1 walk's W0–W7 ran on 2026-11-14 and released its instance (`docs/runbooks/adr-0023-m1-walk.md:5`) [read]. So no operator meets the transitional state.
+
+### Which sub-milestones need a walk or an operator decision
+
+- **Billable:**
+  - the M2 walk, after M2.8 (ADR 0023:308; Q10);
+  - optionally, an earlier probe walk after M2.5 (Q9). It tests what Google's documentation does not cover: that the DNS endpoint accepts farcast's own 2LO token scoped to `userinfo.email` alone, and the reader with `roles/container.clusterViewer` plus RBAC (§10.8).
+- **An operator decision first:**
+  - M2.6's `run` facts and M2.7's apply of applications (P1);
+  - M2.8's bucket grant (P2);
+  - M2.3's reader RBAC (P3);
+  - M2.7's real-Kubernetes test (P4).
+
+---
+
+## 1. Decisions at a glance
+
+| Question | Decision |
+|---|---|
+| Wire package | `farsight/cli/internal/kube`, which imports `technocore/kube` as `tkube` for its sentinels, its `Status`, `ObjectMeta` and the quantity parsers. It declares its own `LabelSelector`, which carries `matchExpressions` (§2.1). `technocore/kube` gains only the kernel's `fieldManager` parameter (§5.4, Q6). |
+| The kernel links none of it | This is structural: `farsight/cli/internal/...` cannot be imported from `technocore` under Go's internal-package rule. A step 1b check also asserts that `technocore/cmd/technocore` links no `farsight/` package (§10.4). |
+| Seam | `cluster.Client` keeps its 13 exported method signatures (`cluster.go:252-652`) and gains `CanI` (M2.3), `NamespaceUID` (M2.5), `DeploymentState` (M2.6), `ListMeta`, `GetMeta`, `PatchManagedFields` and `Traces` (M2.7), and `DeleteSecret` (M2.8) (§2.3). No command reaches `kube.Client` except through it. Its constructor goes from `New` to `Open` in the stages of §0. Command seams change from `func(kubeconfigPath string) X` to `func(clusterRef) (X, error)`. |
+| Endpoint | `metadata.yaml`'s `endpoint` (`config/instance.go:384`, written at `install.go:193`), plus an optional `instances/<n>/cluster-ca.crt`. From M2.4 farcast's own client reads no `kubeconfig.yaml`; kubectl reads it for `Apply` until M2.7; `install` stops writing it in M2.7, and `migrate` deletes it. |
+| Endpoint rule | Google mode: a name under `gke.goog` with one label equal to the instance's region, port 443, system roots, and no `cluster-ca.crt`. Loopback mode: an IP literal in 127.0.0.0/8 or `::1`, an explicit port, and `cluster-ca.crt` as the only roots. Parsing a key file decides nothing; `kube.New` pairs each mode only with a credential of its own origin (§3.2). |
+| Token | The vendored `auth.New2LOTokenProvider` with `TokenURL` fixed in code, the one scope `userinfo.email`, and a discarding logger, behind a FarCast-owned single-token cache in `token.go` with an unexported `invalidate` (§3.3). Held in memory only; never from ADC; never built from `NewCredentialsFromJSON`; never used for a Google API call. |
+| User-Agent | Exactly `farcast` on every cluster and token request. No version, OS, architecture or Go version. |
+| Field manager | `farcast`, sent explicitly on every write, apply or not. The kernel sends `fieldManager=technocore` on its writes from M2.7 (Q6, decided). |
+| Apply | `PATCH` with `Content-Type: application/apply-patch+yaml` and `?fieldManager=farcast&fieldValidation=Strict&force=true`. The body is each document's own rendered bytes, in stream order. It stops at the first failure. |
+| Kinds | ADR 0023:87's 13, plus ClusterRoleBinding restricted to the one name `farcast-reader-namespaces` **[decided: P3]** |
+| Applications | Choice 6: forced, with each reset bound as a review and plan fact, and a stopped application never restarted by `--yes` while the ledger reports the limit reached, checked at the review and again just before the workload apply **[decided: P1]** (§5.4) |
+| Migration | `farcast migrate <instance>`, with interactive consent by typing the name, or `--plan` and `--confirm`. `--yes` is refused. A port of csaupgrade over every client-side manager, plus removal of the annotation, under a resourceVersion guard, verified by reading each object back. Recorded as `server_side_apply` in `metadata.yaml`. |
+| Writer | `credentials.yaml`'s `service_account_key`, parsed mode-free, then paired: in Google mode a `.iam.gserviceaccount.com` email and Google's token URI. A blank key (ADC) is `credential_missing` on the cluster path. |
+| Reader | A per-instance service account, `farcast-reader-<8 hex of sha256(name)>`, its email checked against that derivation on every use. Its RSA-2048 key is made on the device, with a generic certificate (`CN=unused`), and the certificate is uploaded by the human in Cloud Shell. Its IAM role is `roles/container.clusterViewer`, granted project-wide. Its RBAC is per namespace, plus `namespaces list` cluster-wide **[decided: P3]** (§7.2). |
+| Reads | `world`, `ps`, `costs`, `usage` and `logs` read the cluster as the reader, and refuse without one (Q4 (a), decided). Every `--plan` but `migrate`'s reads the cluster as the reader, and `--confirm` recomputes as the plan's read identity. Plans' Google reads and `migrate --plan` read as the installer until M3b (§7.3). |
+| Kinds retired | `kubectl_missing`, `kubectl_failed`, `gcloud_mismatch`, `gcloud_signed_out`, `auth_tool_missing`. They are listed in `retiredKinds` and never emitted again. |
+| Kinds added | `credential_missing`, `credential_refused`, `endpoint_refused`, `cluster_unreachable`, `unauthorized`, `forbidden`, `cluster_rejected`, `document_unreadable`, `rollout_stalled`, `not_migrated`, `plan_changed`. `apply_conflict` exists only under P1's alternative (b). A missing endpoint is `endpoint_refused`, never `not_connected`. |
+| Documents | `instances` and `world` both move to schema 2 (one constant, `worldSchema`). `instances` loses `gcloud_pinned` and gains `reader` and `migrated`. |
+| Plan | `{schema, kind:"plan", generated_at, digest, bound}`. `bound` names its target (provider, project, region, cluster, endpoint, record creation time and, where the plan reads the cluster, the `farcast-system` namespace's uid). The digest is `sha256:` + hex(SHA-256(`"farcast-plan-1\n"` ‖ canonical(bound))). Secret material, key ids and clock values are rendered from placeholders. No file is kept. A `--confirm` recomputes from live state, as the plan's read identity. |
+| `--yes` | Unchanged for today's gates. It never covers the migration, `reader grant`, `git-credential`, or the bucket grant **[decided: P2]**. Under `--confirm`, an `--embedded` replacement is covered by the plan's image fact. |
+
+---
+
+## 2. Package layout and APIs
+
+### 2.1 `farsight/cli/internal/kube` (new; M2.1)
+
+*Amended by §15 (A15-1, A15-9 to A15-11).*
+
+**Files:**
+- `doc.go`
+- `endpoint.go`
+- `credential.go`
+- `token.go`
+- `transport.go`
+- `client.go`
+- `errors.go`
+- `kinds.go`
+- `stream.go`
+- `apply.go` (apply, and `DeleteSecret`)
+- `reads.go`
+- `review.go` (`SelfSubjectAccessReview`)
+- `rollout.go`
+- `logs.go`
+- `fields.go` (FieldsV1)
+- `migrate.go`
+- `readerkey.go`
+- the tests beside each
+
+The package imports only:
+- the standard library;
+- `github.com/sofmon/farcast/technocore/kube` (as `tkube`);
+- `cloud.google.com/go/auth`, the root package only. `httptransport` is not imported: the transport sets `Authorization: Bearer <Token.Value>` itself (§3.4), and so never sends the `x-allowed-locations` header that `httptransport.SetAuthHeader` adds from trust-boundary metadata (`vendor/cloud.google.com/go/auth/httptransport/httptransport.go:252` → `internal/transport/headers/headers.go:27-35`) [read];
+- `github.com/goccy/go-yaml` and its `parser` and `ast`.
+
+All four are already linked into `farcast` ([map]: `go list -deps ./farsight/cli/cmd/farcast`). It adds +0 modules, so `vendor/modules.txt` stays at 31. A test, `TestKubeImportsOnlyItsFour`, lists the package's imports with `go/build` and fails on any other.
+
+**What it takes from `technocore/kube`:**
+- `tkube.ErrNotFound`, `ErrForbidden`, `ErrUnauthorized` and `ErrConflict` (`technocore/kube/client.go:31-34`);
+- the status-to-sentinel mapping, through `(&tkube.APIError{Status: s}).Unwrap()` (`client.go:62-75`);
+- `tkube.Status` (`types.go:182-188`), embedded;
+- `tkube.ObjectMeta` (`types.go:11-26`), embedded.
+
+`tkube.LabelSelector` is **not** used. It has only `matchLabels` (`types.go:191-193`) [read], so a selector with `matchExpressions` would decode silently into a broader one. `kube` declares its own (below), and `SelectorString` refuses any expression.
+
+**What it leaves in `technocore/kube`:** the client (`New`, `do`, `token`). Those carry a 30 s client timeout, a silent 64 MiB truncation and a per-request token file (`client.go:120,137,250-299`), and the CLI's uses break under all three ([map] §3).
+
+**What `technocore/kube` must not gain:** apply, Secrets, logs, watch, or new resources (ADR 0009 decision 3, `docs/adr/0009-technocore-kernel-and-cost-metering.md:59`; revisit trigger 3, `:122`; ADR 0023:84,89). M2 adds one query parameter there, `fieldManager=technocore` on the kernel's existing writes (§5.4).
+
+```go
+package kube
+
+const (
+	FieldManager       = "farcast"
+	UserAgent          = "farcast"
+	GoogleTokenURL     = "https://oauth2.googleapis.com/token"
+	ScopeUserinfoEmail = "https://www.googleapis.com/auth/userinfo.email"
+)
+
+// Mode is where a cluster lives: Google's DNS endpoint, or a loopback test server.
+type Mode int
+
+const (
+	ModeGoogle   Mode = 1
+	ModeLoopback Mode = 2
+)
+
+// Endpoint is a classified API server address (§3.1).
+type Endpoint struct {
+	Mode Mode
+	Host string         // lower-case DNS name (Google) or canonical IP literal (loopback)
+	Port string         // "443" (Google, always) or the recorded port (loopback)
+	CA   *x509.CertPool // nil in Google mode: the system roots
+}
+
+// ParseEndpoint classifies an instance's recorded endpoint (metadata.yaml "endpoint")
+// against its recorded region (metadata.yaml "region", used in Google mode only) and
+// the PEM of its cluster-ca.crt (nil when the file is absent). It refuses everything
+// §3.1 does not accept, with an error wrapping ErrEndpointRefused.
+func ParseEndpoint(recorded, region string, caPEM []byte) (Endpoint, error)
+func (e Endpoint) BaseURL() string  // "https://h" (Google), "https://127.0.0.1:p", "https://[::1]:p"
+func (e Endpoint) TokenURL() string // GoogleTokenURL, or BaseURL()+"/token" in loopback mode
+
+// Credential is one service account's signing key.
+type Credential struct {
+	Email          string
+	PrivateKeyID   string // "" when unknown; sent as the JWT kid
+	PrivateKeyPEM  []byte // RSA, PKCS#1 or PKCS#8
+	TokenURI       string // as the key file recorded it, "" when absent; paired (§3.2), never dialled
+	UniverseDomain string // as the key file recorded it, "" when absent; paired (§3.2)
+}
+
+// ParseServiceAccountJSON reads a service-account key file's JSON (credentials.yaml's
+// service_account_key) without deciding where it may be used (§3.2). It refuses,
+// with ErrCredentialInvalid, anything that is not a service-account key with an
+// email and an RSA private key. Where the key may go is kube.New's pairing rule.
+func ParseServiceAccountJSON(b []byte) (Credential, error)
+
+// Identity is which of an instance's two service accounts a client acts as.
+type Identity string
+
+const (
+	Writer Identity = "writer"
+	Reader Identity = "reader"
+)
+
+type Config struct {
+	Endpoint   Endpoint
+	Credential Credential
+	Identity   Identity
+}
+
+// New checks that the endpoint and the credential pair (§3.2), then builds the
+// transports and the token cache. It dials nothing and mints nothing.
+func New(cfg Config) (*Client, error)
+
+func (c *Client) Identity() Identity
+func (c *Client) Warnings() []string // distinct API Warning header texts seen, in order
+```
+
+`token.go` also declares the unexported seam the in-package tests use: `newClient(cfg Config, mint tokenFunc) (*Client, error)`, where `type tokenFunc func(ctx context.Context) (*auth.Token, error)`. `New` is `newClient` with the 2LO provider of §3.3. The pairing check of §3.2 lives in `newClient`, before it builds a transport or a cache, so it holds for every caller of either. A real-Kubernetes test passes a static `tokenFunc` (§10.6). No exported path takes a token function.
+
+**Errors** (`errors.go`):
+
+```go
+var (
+	ErrEndpointRefused   = errors.New("kube: the cluster endpoint and the credential do not pair")
+	ErrCredentialInvalid = errors.New("kube: the stored credential is not one farcast can use")
+	ErrTokenRefused      = errors.New("kube: Google's token endpoint refused to mint a token")
+	ErrUnreachable       = errors.New("kube: the API server or the token endpoint could not be reached")
+	ErrUnreadable        = errors.New("kube: an answer from the API server could not be read")
+	ErrRefusedDocument   = errors.New("kube: a document is not one farcast applies")
+	ErrTimedOut          = errors.New("kube: timed out waiting")
+	ErrRolloutStalled    = errors.New("kube: the rollout exceeded its progress deadline")
+	ErrNotMigrated       = errors.New("kube: an object did not come back migrated")
+)
+
+// Status is the API server's Status object, with the details tkube.Status leaves out.
+type Status struct {
+	tkube.Status
+	Details *StatusDetails `json:"details,omitempty"`
+}
+type StatusDetails struct {
+	Name   string        `json:"name,omitempty"`
+	Group  string        `json:"group,omitempty"`
+	Kind   string        `json:"kind,omitempty"`
+	Causes []StatusCause `json:"causes,omitempty"`
+}
+type StatusCause struct {
+	Type    string `json:"reason,omitempty"` // the wire name is "reason"
+	Message string `json:"message,omitempty"`
+	Field   string `json:"field,omitempty"`
+}
+
+// APIError is a non-2xx answer. Error() is "kube: <METHOD> <path>: <code> <reason>: <message>".
+// Unwrap derives tkube's sentinel from the code, exactly as tkube.APIError does.
+// KubernetesStatus is false when the body was not a Status object (kind "Status"),
+// which is how a 403 from the endpoint's IAM check is told from an RBAC refusal (§8.3).
+type APIError struct {
+	Method, Path     string
+	Status           Status
+	KubernetesStatus bool
+}
+func (e *APIError) Error() string
+func (e *APIError) Unwrap() error
+
+// FieldConflicts returns the causes of a server-side apply conflict (409 whose
+// causes carry reason "FieldManagerConflict"), and whether err is one.
+func FieldConflicts(err error) ([]StatusCause, bool)
+```
+
+Wire-name checks:
+- `StatusCause.Type` uses the JSON key `reason`, which is the wire name in meta/v1 [unverified]. A fixture in `kubetest` pins it, and the real-Kubernetes test (§10.6) reads one from a real server.
+- A 409 with `reason: AlreadyExists` and one with `reason: Conflict` both unwrap to `tkube.ErrConflict`, as today. Callers that must tell them apart read `Status.Reason`.
+
+**The kind table** (`kinds.go`, §5.1):
+
+```go
+type Kind struct {
+	Kind       string // "Deployment"
+	APIVersion string // "apps/v1"
+	Resource   string // "deployments"
+	Namespaced bool
+	Names      []string // non-nil: the only names allowed (ClusterRoleBinding)
+}
+
+var Kinds = [...]Kind{ /* §5.1, in that order */ }
+
+func KindOf(apiVersion, kind string) (Kind, bool)
+func (k Kind) Path(namespace, name string) string // "/api/v1/namespaces/<ns>/secrets/<name>", url.PathEscape'd
+// ListPath is the collection path. For a namespaced kind an empty namespace
+// is every namespace ("/apis/rbac.authorization.k8s.io/v1/rolebindings").
+func (k Kind) ListPath(namespace string) string
+```
+
+**Documents and streams** (`stream.go`, §5.2):
+
+```go
+type Document struct {
+	Index     int    // position among the non-empty documents, from 0
+	Kind      Kind
+	Namespace string // "" for cluster-scoped
+	Name      string
+	Raw       []byte // the document's own bytes, sent unchanged as the apply body
+}
+
+// SplitStream splits and checks a rendered multi-document stream (§5.2).
+// Any refusal wraps ErrRefusedDocument and names the document's index, kind and name.
+func SplitStream(stream []byte, opts ...SplitOption) ([]Document, error)
+
+type SplitOption func(*splitOptions)
+// AllowResourceVersion lets exactly one document carry metadata.resourceVersion,
+// and only with this value. It exists only if §10.6's
+// TestApplyRefusesAStaleResourceVersion passes (§9.5); until then it is not built.
+func AllowResourceVersion(rv string) SplitOption
+```
+
+**Writes and reads** (`apply.go`, `reads.go`, `review.go`, `logs.go`):
+
+```go
+// Apply is one server-side apply of one document (§5.3). It returns the
+// metadata of the object the server answered with.
+func (c *Client) Apply(ctx context.Context, d Document, force bool) (ObjectMeta, error)
+
+// DeleteSecret deletes one Secret, preconditioned on its uid (§9.8). It is
+// the only delete in the package.
+func (c *Client) DeleteSecret(ctx context.Context, namespace, name, uid string) error
+
+type ObjectMeta struct {
+	tkube.ObjectMeta
+	Generation    int64                `json:"generation"`
+	ManagedFields []ManagedFieldsEntry `json:"managedFields"`
+}
+type ManagedFieldsEntry struct {
+	Manager     string          `json:"manager,omitempty"`
+	Operation   string          `json:"operation,omitempty"`
+	APIVersion  string          `json:"apiVersion,omitempty"`
+	Time        string          `json:"time,omitempty"` // kept as the server wrote it
+	FieldsType  string          `json:"fieldsType,omitempty"`
+	FieldsV1    json.RawMessage `json:"fieldsV1,omitempty"`
+	Subresource string          `json:"subresource,omitempty"`
+}
+
+// LabelSelector is a workload's claim on pods, with both halves of the wire type.
+type LabelSelector struct {
+	MatchLabels      map[string]string          `json:"matchLabels,omitempty"`
+	MatchExpressions []LabelSelectorRequirement `json:"matchExpressions,omitempty"`
+}
+type LabelSelectorRequirement struct {
+	Key      string   `json:"key"`
+	Operator string   `json:"operator"`
+	Values   []string `json:"values,omitempty"`
+}
+
+func (c *Client) ListDeployments(ctx context.Context, namespace string) ([]Deployment, error)
+func (c *Client) ListStatefulSets(ctx context.Context, namespace string) ([]StatefulSet, error)
+func (c *Client) GetDeployment(ctx context.Context, namespace, name string) (Deployment, error)
+func (c *Client) GetStatefulSet(ctx context.Context, namespace, name string) (StatefulSet, error)
+func (c *Client) GetService(ctx context.Context, namespace, name string) (Service, error)
+func (c *Client) GetJob(ctx context.Context, namespace, name string) (Job, error)
+func (c *Client) ListPods(ctx context.Context, namespace, selector string) ([]Pod, error)
+func (c *Client) ListNamespaces(ctx context.Context, selector string) ([]string, error) // sorted
+// NamespaceUID is one namespace's uid, read with the list verb
+// (?fieldSelector=metadata.name%3D<name>), which the reader holds; "" when absent.
+func (c *Client) NamespaceUID(ctx context.Context, name string) (string, error)
+func (c *Client) GetConfigMap(ctx context.Context, namespace, name string) (ConfigMap, error)
+func (c *Client) CreateConfigMap(ctx context.Context, body []byte) error  // POST; body is JSON
+func (c *Client) ReplaceConfigMap(ctx context.Context, body []byte) error // PUT at body's resourceVersion
+func (c *Client) StreamLog(ctx context.Context, namespace, pod string, o LogOptions, w io.Writer) error
+type LogOptions struct {
+	Container string
+	TailLines int // < 0: everything, sent as no tailLines parameter at all (§4)
+	Follow    bool
+	Previous  bool
+}
+
+// SelfSubjectAccessReview asks the API server whether this client's identity
+// may do one thing (§7.2, reader grant). POST
+// /apis/authorization.k8s.io/v1/selfsubjectaccessreviews.
+func (c *Client) SelfSubjectAccessReview(ctx context.Context, a ResourceAttributes) (allowed bool, err error)
+type ResourceAttributes struct {
+	Namespace, Verb, Group, Resource, Subresource, Name string
+}
+
+// Migration's reads and its one write (§6). Lists and gets ask for metadata only
+// (Accept: application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1, and
+// ;as=PartialObjectMetadata for a get) [unverified that every server honours it;
+// §10.6 checks]. A server that answers with the full object is decoded into Object,
+// which declares metadata only, so a Secret's values are discarded unread.
+func (c *Client) ListObjects(ctx context.Context, k Kind, namespace, selector string) ([]Object, error)
+func (c *Client) GetObject(ctx context.Context, k Kind, namespace, name string) (Object, error)
+func (c *Client) PatchJSON(ctx context.Context, k Kind, namespace, name string, patch []byte) (Object, error)
+type Object struct {
+	Kind     Kind       `json:"-"` // set from the request's Kind after decoding, never from the body
+	Metadata ObjectMeta `json:"metadata"`
+}
+```
+
+`Object.Kind` carries `json:"-"`. Without it, `encoding/json` would match the body's `"kind":"Deployment"` to the field case-insensitively and fail to decode a string into the struct, so every single-object answer would be unreadable [read: `go doc encoding/json.Unmarshal`, "accepting a case-insensitive match"]. `kubetest` answers single GETs and PATCHes with `kind` and `apiVersion` present, so the fixture catches it (`TestObjectDecodesAnAnswerThatCarriesKind`).
+
+**The types** carry only the fields this brief names, in `reads.go`:
+- `Deployment`: `metadata` (`ObjectMeta` above, annotations included); `spec.replicas` (`*int32`), `spec.selector` (`*LabelSelector`), `spec.template.spec.{containers,initContainers,ephemeralContainers}[].{name,image,resources.requests.{cpu,memory}}`; `status.{observedGeneration,replicas,updatedReplicas,readyReplicas,availableReplicas,conditions[].{type,status,reason,message}}`.
+- `StatefulSet`: the same, minus `updatedReplicas`, `availableReplicas` and conditions.
+- `Pod`: `metadata`; `spec.{nodeName}`, `spec.{containers,ephemeralContainers}[].name`, `spec.initContainers[].{name,restartPolicy}`; `status.{phase,conditions[].{type,status,lastTransitionTime},containerStatuses[].{name,restartCount,state.terminated.message},initContainerStatuses[].{name,restartCount}}`.
+- `Job`: `metadata`; `spec.selector`; `spec.template.spec.containers[].name`; `status.{succeeded,failed,conditions[].{type,status}}`.
+- `Service`: `status.loadBalancer.ingress[].{ip,hostname}`.
+- `ConfigMap`: `metadata` and `data`.
+
+**Pure helpers** (tested by tables, with no server):
+
+```go
+func RolloutState(d Deployment) (done bool, waiting string, err error) // §4, kubectl v0.37.2's DeploymentStatusViewer
+func PickPod(pods []Pod) (Pod, bool) // §4, kubectl v0.37.2's podutils.ByLogging, first after sorting
+func SelectorString(s *LabelSelector) (string, error) // sorted k=v,k=v; refuses nil, empty, or any matchExpressions
+func UnionFields(a, b json.RawMessage) (json.RawMessage, error)        // §6.3
+func RemoveField(f json.RawMessage, path ...string) (json.RawMessage, error)
+// ClientSideManagers names the managers a migration converts (§6.2): every Update
+// entry that owns the last-applied annotation's path, plus kubectl-client-side-apply.
+func ClientSideManagers(entries []ManagedFieldsEntry) ([]string, error)
+func UpgradeManagedFields(entries []ManagedFieldsEntry, csa []string, ssa string) ([]ManagedFieldsEntry, error) // §6.3
+func MigrationPatch(o Object, csa []string, ssa string) ([]byte, error) // nil when the object needs nothing
+// MigratedEndState checks an object read back after its patch against §6.3's end
+// state, wrapping ErrNotMigrated with what is left. The text names only managers,
+// operations and the annotation's key; it never carries an annotation's value,
+// which on a Secret holds every key (§6.4).
+func MigratedEndState(o Object, ssa string) error
+
+// Reader keys (§7.2).
+func NewReaderKey(rnd io.Reader, notBefore time.Time, days int) (keyPEM, certPEM []byte, err error)
+```
+
+### 2.2 `farsight/cli/internal/kube/kubetest` (new; M2.1)
+
+`kubetest` is a fake API server and token endpoint used by tests and by the rehearsal. It is an ordinary package so the rehearsal binary can use it. A gate check keeps it out of `farcast` (§10.4).
+
+```go
+type Server struct { /* … */ }
+
+// New starts a TLS server on 127.0.0.1:0, with a leaf for IP 127.0.0.1 issued by
+// its own CA (crypto/x509, P-256), and registers t.Cleanup to stop it.
+func New(t testing.TB, opts ...Option) *Server
+// Start is New for the rehearsal: no testing.TB, the caller closes it.
+func Start(opts ...Option) (*Server, error)
+
+type Option func(*options)
+
+// WithAddr listens on addr ("127.0.0.1:<port>") instead of 127.0.0.1:0, so a
+// restarted rehearsal reuses its recorded endpoint.
+func WithAddr(addr string) Option
+// WithIdentity registers an existing public key under id and email, as the
+// rehearsal registers its reader and writer.
+func WithIdentity(id, email string, pub *rsa.PublicKey) Option
+// WithHandler sees every authorized non-token request before the emulation does.
+// handled=false falls through to the emulation.
+func WithHandler(h func(r Request) (status int, body []byte, handled bool)) Option
+// WithTokenAnswer sees every /token request whose assertion verified, keyed by
+// the assertion's iss. handled=false mints as usual.
+func WithTokenAnswer(f func(email string) (status int, body []byte, handled bool)) Option
+// WithDelay is evaluated for every request: its answer is held for the duration
+// f returns, or until the request's context ends; 0 holds nothing.
+func WithDelay(f func(r Request) time.Duration) Option
+// WithAccess answers SelfSubjectAccessReviews. Without it every review answers
+// allowed: false.
+func WithAccess(f func(id string, a kube.ResourceAttributes) bool) Option
+// WithRBAC authorizes every non-token request made by the identity registered
+// under email with the rules of the rendered RBAC stream alone: the ClusterRoles
+// it binds through a ClusterRoleBinding, cluster-wide, and through a RoleBinding,
+// in that RoleBinding's namespace, matched on apiGroup, resource (pods/log as a
+// subresource), verb (a GET of one object is get, of a collection list) and
+// resourceNames. Anything they do not grant gets 403 with a JSON Status, as a
+// real API server answers before it reads storage (§5.4). Other identities are
+// unaffected.
+func WithRBAC(email string, stream []byte) Option
+
+func (s *Server) Endpoint() string             // "127.0.0.1:<port>", as metadata.yaml records it
+func (s *Server) CAPEM() []byte                // cluster-ca.crt's contents
+func (s *Server) Credential(id string) kube.Credential // a fresh RSA key registered under <id>@kubetest.invalid
+func (s *Server) CredentialFor(id, email string) kube.Credential // the same, under a given .invalid email
+// AddKey registers one more public key under id and email on a running server.
+// An email may hold several keys: a /token assertion verifies when any key
+// registered for its iss verifies it, and its token is minted for that key's id.
+func (s *Server) AddKey(id, email string, pub *rsa.PublicKey)
+func (s *Server) Requests() []Request          // every request, in order
+func (s *Server) Put(obj any)                  // seed an object (JSON-marshalled)
+func (s *Server) Fail(method, path string, code int, st kube.Status) // inject an answer
+func (s *Server) Script(path string, objs ...any) // successive GETs of path answer these in turn
+func (s *Server) Revoke(token string)          // the next request carrying this token gets 401
+func (s *Server) Close()
+
+type Request struct {
+	Method, Path, RawQuery, ContentType, UserAgent, Accept string
+	As    string // the id whose token authorized it; "" for none, "?" for an unknown token
+	KeyID string // on /token requests, the assertion header's kid; "" otherwise
+	Body  []byte
+}
+```
+
+The closures given to `WithHandler`, `WithTokenAnswer` and `WithDelay` run per request, so a caller that reads its own state in them, as the rehearsal reads its Spec (§10.1), changes the answers while the server runs.
+
+**What it emulates.** Each behaviour carries a test in `kubetest_test.go`.
+
+- **`POST /token`, form-encoded:**
+  - It requires `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer`.
+  - The `assertion` must be an RS256 JWT whose `iss` is a registered email, whose signature verifies against that key, whose `aud` equals `"https://"+Endpoint()+"/token"`, and whose `scope` is exactly `ScopeUserinfoEmail`.
+  - It requires both `iat` and `exp`, with `0 < exp − iat ≤ 3600` and `iat` within ±5 minutes of the server's clock. The vendored encoder always sends both, with `iat` = now − 10 s and `exp` = `iat` + 3600 (`vendor/cloud.google.com/go/auth/internal/jwt/jwt.go:67,81-86`) [read], and Google allows "a maximum of 1 hour after the issued time" ([doc](https://developers.google.com/identity/protocols/oauth2/service-account)).
+  - It answers `{"access_token":"kubetest:<id>:<n>","token_type":"Bearer","expires_in":3600}`.
+  - Anything else gets 400 `{"error":"invalid_grant"}`.
+- **Auth:** every other path requires `Authorization: Bearer kubetest:<id>:<n>`. A missing, unknown or revoked token gets 401 with a JSON `Status`. Without `WithRBAC` a valid token is allowed everything; with it, the named identity is allowed only what the rendered RBAC grants, checked before the emulation looks up the object, so a forbidden read of an absent object is 403, never 404.
+- **Server-side apply:** `PATCH` with `Content-Type: application/apply-patch+yaml` requires both `fieldManager` and `fieldValidation=Strict`.
+  - It parses the YAML with go-yaml and requires the body's name and namespace to equal the URL's (400 otherwise).
+  - It returns 201 on create and 200 on update.
+  - It keeps one managed-fields entry per manager, `{manager, operation:"Apply", fieldsType:"FieldsV1", fieldsV1:{}}`, with no field-level ownership. Field semantics belong to the real-Kubernetes test (§10.6), not to this fake.
+- **Single-object answers** (GET, PATCH, POST, PUT) carry `kind` and `apiVersion`, as a real server's do. **List items carry no `kind`**, as typed lists' items do [unverified for real servers; §10.6 checks].
+- **ConfigMaps:**
+  - `POST …/configmaps` gives 201, or 409 `AlreadyExists`.
+  - `PUT …/configmaps/<n>` requires the stored resourceVersion: 409 `Conflict` on a stale one, 404 when absent.
+  - `GET` gives 404 when absent.
+- **Lists:** `GET` lists of namespaces, deployments, statefulsets, pods and every kind of §5.1 honour `labelSelector` with equality terms only, and namespaces honour `fieldSelector=metadata.name=<n>`. A namespaced kind's list without a namespace in the path lists every namespace. They page with `limit` and `continue`. An `Accept` asking for `PartialObjectMetadataList` gets metadata-only items.
+- **Status scripts:** `Script` makes a Deployment's or a Job's status move across successive `GET`s, for the rollout and job tests.
+- **Logs:** `GET …/pods/<p>/log` honours `container`, `tailLines`, `follow` and `previous`.
+  - A negative or non-integer `tailLines` gets 400.
+  - The body is chunked and flushed.
+  - With `follow=true` it streams until the request context ends.
+  - `previous=true` for a container with no previous instance gives 400.
+- **Migration:** `PATCH` with `Content-Type: application/json-patch+json` supports `replace` on `/metadata/managedFields` and `/metadata/resourceVersion`, and `remove` on one annotation. A resourceVersion that is not current gives 409 `Conflict`.
+  - **It validates a submitted managedFields list as the real server decodes it:** every entry's `operation` is `Apply` or `Update`, `apiVersion` is non-empty, `fieldsType` is `FieldsV1`, and `fieldsV1` parses. On any failure it **keeps the live list, silently, and still applies the patch's other operations**, as the API server does: "If the managed field is empty or we failed to decode it, let's try the live object" (apimachinery v0.37.2 `fieldmanager.go`, `decodeLiveOrNew`; `managedfields.go`, `DecodeManagedFields`) [doc].
+- **Deletes:** `DELETE …/secrets/<n>` with a body whose `preconditions.uid` is not the stored uid gives 409 `Conflict`; absent gives 404; any other kind gets 405.
+- **SelfSubjectAccessReviews:** `POST /apis/authorization.k8s.io/v1/selfsubjectaccessreviews` answers `status.allowed` from `WithAccess`, keyed by the caller's id.
+- **Warnings and retries:**
+  - Any answer can carry `Warning: 299 - "<text>"` headers.
+  - Failure injection covers 401, 403 (as a JSON `Status` naming the caller's email, as GKE's does [unverified], and as a non-Status body), 404, 409 with `FieldManagerConflict` causes, 410, 422, 429 with `Retry-After: 1`, 500 and 503.
+- **Everything else** gets 405 and is recorded.
+
+### 2.3 `farsight/cli/internal/cluster` after M2
+
+`env.go` and `env_test.go` are deleted in M2.7. The stages before that are §0's table.
+
+```go
+// Package cluster is FarCast's operations on an instance's cluster, over the
+// in-process client in internal/kube (ADR 0023 decision 2). It starts no program.
+package cluster
+
+// Open builds a Client for one identity. warnings receives each distinct API
+// Warning header text, as "Warning (cluster): <text>\n", and the notes Logs
+// writes (§4); nil discards them.
+func Open(cfg kube.Config, warnings io.Writer) (*Client, error)
+
+// The 13 exported methods keep their signatures exactly (cluster.go:252-652):
+func (c *Client) Apply(ctx context.Context, manifests []byte) error
+func (c *Client) RolloutStatus(ctx context.Context, namespace, name string, timeout time.Duration) error
+func (c *Client) WaitExternalIP(ctx context.Context, namespace, name string, timeout time.Duration) (string, error)
+func (c *Client) WaitJob(ctx context.Context, namespace, name string, timeout time.Duration) (JobResult, error)
+func (c *Client) JobLogs(ctx context.Context, namespace, job string, lines int) (string, error)
+func (c *Client) Workloads(ctx context.Context, namespace string) ([]Workload, error)
+func (c *Client) ConfigMapValue(ctx context.Context, namespace, name, key string) (string, bool, error)
+func (c *Client) ConfigMapData(ctx context.Context, namespace, name string) (map[string]string, string, bool, error)
+func (c *Client) CreateConfigMap(ctx context.Context, manifest []byte) error
+func (c *Client) ReplaceConfigMap(ctx context.Context, manifest []byte) error
+func (c *Client) Namespaces(ctx context.Context) ([]string, error)
+func (c *Client) NamespacesLabelled(ctx context.Context, selector string) ([]string, error)
+func (c *Client) Logs(ctx context.Context, out io.Writer, namespace, target string, lines int, follow, previous bool) error
+
+// New in M2.3:
+// CanI is kube.Client.SelfSubjectAccessReview, for reader grant's checks (§7.2).
+func (c *Client) CanI(ctx context.Context, a kube.ResourceAttributes) (bool, error)
+
+// New in M2.5:
+// NamespaceUID is kube.Client.NamespaceUID (plans bind farcast-system's uid, §9.3).
+func (c *Client) NamespaceUID(ctx context.Context, name string) (string, error)
+
+// New in M2.6 [decided: P1]:
+// DeploymentState is what run's review and plan need of one live application
+// Deployment (§5.4). Present is false on a 404.
+func (c *Client) DeploymentState(ctx context.Context, namespace, name string) (DeploymentState, error)
+type DeploymentState struct {
+	Present         bool
+	Replicas        *int32
+	Requests        map[string]Requests // container name → its requests
+	AdaptedAt       time.Time           // the farcast.sofmon.com/adapted-at annotation; zero when absent or unparseable
+	LastAppliedAt   time.Time           // the newest managed-fields time of manager "farcast" (Apply) or "kubectl-client-side-apply" (Update)
+	ResourceVersion string
+}
+type Requests struct{ CPUMilli, MemMiB int64 }
+
+// New in M2.7:
+// Traces lists every object an Apply answered with that still carries a
+// kubectl-client-side-apply entry or the last-applied annotation (§6.6).
+func (c *Client) Traces() []string
+// ListMeta, GetMeta and PatchManagedFields are kube.Client.ListObjects, GetObject
+// and PatchJSON, metadata only (§2.1): migrate's discovery, re-read and patch
+// (§6.2, §6.4), and git-credential's Secret read (§9.8).
+func (c *Client) ListMeta(ctx context.Context, k kube.Kind, namespace, selector string) ([]kube.Object, error)
+func (c *Client) GetMeta(ctx context.Context, k kube.Kind, namespace, name string) (kube.Object, error)
+func (c *Client) PatchManagedFields(ctx context.Context, k kube.Kind, namespace, name string, patch []byte) (kube.Object, error)
+
+// New in M2.8:
+// DeleteSecret is kube.Client.DeleteSecret, for git-credential rm only (§9.8).
+func (c *Client) DeleteSecret(ctx context.Context, namespace, name, uid string) error
+```
+
+Under P1's alternative (b) a separate `ApplyApplication` would apply with `force=false` after a dry run (§5.4). Under the decided (c) it does not exist: `run` applies its application stream with `Apply`. **[decided: P1]**
+
+**What goes, and when:** §0's table. In short:
+- **M2.4:** `NewWithEnv`, `GCloud` and the pinned branch of `Env` go, and an unexported `newWithEnv` stays for the environment tests (§10.2); `NewWithRunner` and the three marks become unexported; `cli` stops reading them.
+- **M2.5:** `New` goes; `Open` accepts the writer.
+- **M2.7:** `Open`'s third argument, `Runner`, `Streamer`, `newWithRunner`, `newWithEnv`, `execRunner`, `Env`, `lookPathIn`, `markOf` and the marks go, with `env.go` and `os/exec`.
+
+### 2.4 `farsight/cli/internal/plan` (new; M2.6)
+
+```go
+const Protocol = "farcast-plan-1"
+
+type Bound struct { /* §9.3, field order fixed */ }
+type Target struct { /* §9.3 */ }
+type Fact interface{ FactType() string }
+type Document struct {
+	Schema      int             `json:"schema"`
+	Kind        string          `json:"kind"`
+	GeneratedAt string          `json:"generated_at"`
+	Digest      string          `json:"digest"`
+	Bound       json.RawMessage `json:"bound"`
+}
+
+func Canonical(b Bound) ([]byte, error)        // §9.3
+func DigestOf(canonical []byte) string         // "sha256:" + 64 lowercase hex
+func ParseDigest(s string) (string, error)     // refuses anything but that shape
+func NewDocument(b Bound, now time.Time) (Document, error)
+```
+
+### 2.5 `farsight/cli/internal/config` additions
+
+- **M2.3:** `InstanceMetadata` gains this field:
+  ```go
+  Reader *Reader `yaml:"reader,omitempty"`
+  type Reader struct {
+  	Email     string    `yaml:"email"`
+  	KeyID     string    `yaml:"key_id,omitempty"`
+  	GrantedAt time.Time `yaml:"granted_at,omitempty"`
+  	Scope     string    `yaml:"scope,omitempty"` // "metered", set with GrantedAt (§7.2) [decided: P3]
+  }
+  ```
+- **M2.3:** new methods, every write through `writeFileAtomic` at 0600 (`instance.go:1169-1199`), every read through `readFile` (`instance.go:61-66`) so `ObserveReads` sees it:
+  - `SaveReaderKey(name string, keyPEM, certPEM []byte) error`, which writes `reader.key` and `reader.crt`;
+  - `SaveNextReaderKey(name string, keyPEM, certPEM []byte) error`, which writes `reader.key.next` and `reader.crt.next` (`reader init --rotate`, §7.2);
+  - `PromoteNextReaderKey(name string) error`, which renames `reader.key.next` over `reader.key` and `reader.crt.next` over `reader.crt`, key first (`reader record`, §7.2);
+  - `LoadReaderKey(name string) ([]byte, error)`;
+  - `LoadReaderCert(name string) ([]byte, error)`;
+  - `ReaderKeyExists(name string) (bool, error)` and `NextReaderKeyExists(name string) (bool, error)`, which use `os.Stat` and never open the file;
+  - `LoadClusterCA(name string) (pem []byte, ok bool, err error)`, which reads `cluster-ca.crt`. Absent is `ok=false`.
+- **M2.4:** `GCloudAccount` (`instance.go:391-396`) is deleted. A record that still carries `gcloud_account` loads as before, because the decode is non-strict (`instance.go:731` [map]). The key is dropped at the record's next save, since `SaveInstanceMetadata` marshals the struct (`instance.go:561-605`).
+- **M2.4 (declared) and M2.7 (written):** `InstanceMetadata` gains this field, written by `migrate` and by `install` (§6.5):
+  ```go
+  ServerSideApply *ServerSideApply `yaml:"server_side_apply,omitempty"`
+  type ServerSideApply struct {
+  	Since   time.Time `yaml:"since"`
+  	Farcast string    `yaml:"farcast"`
+  }
+  ```
+  It is declared in M2.4 so `instances` can report it, and written from M2.7.
+- **M2.7:** `SaveInstanceKubeconfig` and `InstanceKubeconfigPath` (`instance.go:835-843`) are deleted.
+
+### 2.6 How commands get a client (M2.3 reader branch, M2.4 read commands, M2.5 writer branch)
+
+In `farsight/cli/internal/cli/clusterref.go` (new in M2.3):
+
+```go
+// clusterRef is what every command hands its cluster seam.
+type clusterRef struct {
+	Dir      config.Dir
+	Meta     *config.InstanceMetadata
+	Identity kube.Identity
+	Warn     io.Writer // env.Err
+	// Verifying lets a reader that is not yet verified read-only open (§3.5). Only
+	// readerGrantCommand.newReader's default sets it, for reader grant's own
+	// verifying read and reviews (§7.2).
+	Verifying bool
+}
+
+// openCluster is the one place an instance's cluster client is built (§3.5).
+func openCluster(r clusterRef) (*cluster.Client, error)
+```
+
+M2.3 builds the reader branch and returns `errors.New("cli: the writer opens in-process from ADR 0023 M2.5")` for the writer. M2.5 adds the writer branch. In M2.5–M2.6 the writer branch passes `r.Dir.InstanceKubeconfigPath(r.Meta.Name)` to `cluster.Open` as `legacyKubeconfig`, and the reader branch passes `""`.
+
+**Seams that change** (M2.4 for the read commands, M2.5 for the rest):
+
+| Seam | Before | After |
+|---|---|---|
+| `fatlineDeployer.newCluster` | `func(kubeconfigPath string) clusterApplier` (`fatline.go:144`) | `func(clusterRef) (clusterApplier, error)` |
+| `buildCommand.newCluster` | `build.go:42` | the same pattern |
+| `costsCommand.newCluster` | `costs.go:25` | the same pattern |
+| `logsCommand.newCluster` | `logs.go:25` | the same pattern |
+| `psCommand.newCluster` | `ps.go:29` | the same pattern |
+| `runCommand.newCluster` | `run.go:54` | the same pattern |
+| `usageCommand.newCluster` | `usage.go:36` | the same pattern |
+| `worldCommand.newCluster` | `func(kubeconfigPath string, env []string) worldCluster` (`world.go:77`) | `func(clusterRef) (worldCluster, error)` |
+| `pinStoreOpener` | `func(kubeconfigPath string) (pinStore, error)` (`storagepin.go:55`) | `func(clusterRef) (pinStore, error)` |
+| `readerGrantCommand.newApplier` (M2.3) | `func(kubeconfigPath string) clusterApplier` | `func(clusterRef) (clusterApplier, error)` |
+
+**Call sites:** every one passes `clusterRef{Dir: env.ConfigDir, Meta: meta, Identity: <§7.3>, Warn: env.Err}` in place of `env.ConfigDir.InstanceKubeconfigPath(name)`. These are:
+- `build.go:162`;
+- `costs.go:88`;
+- `connect.go:409`;
+- `kernel.go:229`;
+- `kernelconfirm.go:155`;
+- `kernelmeter.go:118`;
+- `logs.go:78`;
+- `redeploy.go:203`;
+- `storagekey.go:456`;
+- `storagedeploy.go:138,275`;
+- `ps.go:76`;
+- `storagepin.go:362`;
+- `run.go:195,544`;
+- `usage.go:115`;
+- `world.go:173-175`;
+- and the new commands' own: `readergrant.go`, `migrate.go`, `gitcredential.go`.
+
+**Test fakes** change mechanically. For example, `c.newCluster = func(string) clusterApplier { return fc }` becomes `c.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }`. The interfaces they implement (`clusterApplier`, `jobWaiter`, `runCluster`, `lister`, `logReader`, `configMapReader`, `policyReader`, `usageReaderIface`, `worldCluster`, `pinStore`) are unchanged, except that `runCluster` (`run.go:35-39`) gains `DeploymentState` in M2.6 **[decided: P1]**, and the plan builders' interfaces gain `NamespaceUID` (§9.3).
+
+---
+
+## 3. Transport and token (M2.1)
+
+### 3.1 The endpoint rule (`kube.ParseEndpoint`)
+
+Input: the recorded `endpoint` string, the recorded `region`, and `cluster-ca.crt`'s PEM (nil if the file is absent). The checks run in this order, and each refusal has its own message, so each check is mutation-tested on its own (§10.3).
+
+1. **Shape.** Refuse an empty string, or one with a scheme, `/`, `?`, `#`, `@`, whitespace, or a trailing `.` on the host. → **E-shape**.
+2. **Host and port.**
+   - A string beginning `[` must be `[<literal>]:<port>`, and `net.SplitHostPort` must succeed.
+   - Otherwise a string with exactly one `:` is split by `net.SplitHostPort`.
+   - Otherwise a string with more than one `:` is a bare IPv6 literal (`::1`, `::ffff:127.0.0.1`), which names no port. → **E-shape**.
+   - Otherwise the host is the whole string and the port is empty.
+   - A `net.SplitHostPort` error is **E-shape**.
+3. **Loopback**, when `netip.ParseAddr(host)` succeeds:
+   - the address must not be IPv4-mapped (`Is4In6()` false). → **E-mapped**. `netip.Prefix.Contains` already answers false for a mapped address, so this check is belt and braces, with its own message;
+   - it must be in `127.0.0.0/8` or be `::1`. → **E-range**;
+   - the port must be present and parse to 1–65535. → **E-port**;
+   - `caPEM` must be non-nil (→ **E-noCA**) and parse to at least one certificate (→ **E-noCert**), and that pool is the only root set;
+   - `Host` is `addr.String()`. The region is not consulted.
+4. **Google**, when the host is not an IP:
+   - lower-case it;
+   - it must match `^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+gke\.goog$`, so at least one label comes before `gke.goog`. → **E-shape**;
+   - one of its labels other than the first must equal the lower-cased recorded region. → **E-region**;
+   - the port must be empty or `443`. → **E-port**;
+   - `caPEM` must be nil. → **E-googleCA**;
+   - `Port` is `"443"`.
+
+   The name `localhost` fails here, because it is not under `gke.goog`, and no DNS lookup is ever made to classify it.
+
+**Why the region check, and its limit.** A record whose endpoint names another FarCast cluster in the same project would otherwise send a writer token that is valid there, and apply this instance's manifests to it. A code comment and the tests give `uid.<region>.gke.goog` (`planck/internal/providers/gke/client.go:58`; `gke_test.go:86`) [read]; `client.go:138` stores whatever GKE returns, and no endpoint recorded from a real cluster is in the repository. Google's page gives one example, `gke-…-518563762004.us-central1-c.autopush.gke.goog`, whose location label is a zone, `us-central1-c`, and defines no format ([doc](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/latest/network-isolation)). That example fails this rule against the region `us-central1`. The rule rests on a regional cluster's endpoint carrying the region itself as a label [inf]; Autopilot clusters are regional [unverified]. A zone label fails closed at the first call (§14, risk 13), and the probe walk records a real endpoint (§10.8). The rule does not tell two clusters in one region apart. The plan's target detects a cluster that was replaced between plan and confirm (§9.3). It does not detect a record that names another FarCast cluster in the same region; that stays open until a uid is recorded (Not settled here).
+
+**Refusal messages** (each wraps `ErrEndpointRefused`; the second `%s` of E-googleCA is `instances/<n>/cluster-ca.crt`):
+- **E-shape:** `the instance records the cluster endpoint %q, which is neither a name under gke.goog nor a loopback IP literal with its port; nothing was sent`
+- **E-mapped:** `the instance records the endpoint %q, an IPv4-mapped IPv6 address, which is never a loopback endpoint; nothing was sent`
+- **E-range:** `the instance records the endpoint %q, an IP literal outside 127.0.0.0/8 and ::1; nothing was sent`
+- **E-port:** `the instance records the endpoint %q with port %q; a Google endpoint is port 443 only, and a loopback endpoint names a port from 1 to 65535; nothing was sent`
+- **E-region:** `the instance records the Google endpoint %q, and none of its labels is the instance's region %q; nothing was sent`
+- **E-googleCA:** `the instance records the Google endpoint %q, and %s exists: a Google endpoint is trusted on the system roots alone, so a cluster CA beside it is refused; nothing was sent`
+- **E-noCA:** `the instance records the loopback endpoint %q with no cluster-ca.crt; a loopback endpoint is trusted only on its own CA; nothing was sent`
+- **E-noCert:** `%s holds no certificate` (`cluster-ca.crt`)
+
+### 3.2 Parsing a key, then pairing it (`kube.ParseServiceAccountJSON`, `kube.New`)
+
+Parsing decides nothing about where a key may go. Pairing does, in `kube.New`, before any token cache or transport exists.
+
+**Parsing, mode-free** (`ParseServiceAccountJSON`): JSON with unknown fields allowed, because Google's key files carry more fields. It requires:
+- `type == "service_account"`;
+- `client_email` present, with exactly one `@`, a non-empty local part and a non-empty domain;
+- `private_key` parsing as RSA, PKCS#1 or PKCS#8;
+- `token_uri`, when present, an absolute `https` URL.
+
+It keeps `private_key_id` as `PrivateKeyID`, `token_uri` as `TokenURI` and `universe_domain` as `UniverseDomain`. Anything else wraps `ErrCredentialInvalid`, with the message `the stored service-account key is not a service-account key farcast uses (%s)`, where `%s` names the field and never its value.
+
+So the installer's Google key and a test's loopback key both parse: `{"type":"service_account","client_email":"writer@rehearsal.invalid","private_key":…,"token_uri":"https://127.0.0.1:<port>/token"}` is a valid parse. Whether it may be used is the next table.
+
+**The pairs `New` accepts:**
+
+| Endpoint mode | Credential email suffix | `TokenURI` | `UniverseDomain` |
+|---|---|---|---|
+| Google | `.iam.gserviceaccount.com` | `""` or `GoogleTokenURL` | `""` or `googleapis.com` |
+| Loopback | `.invalid` | `""` or exactly `Endpoint.TokenURL()` | `""` |
+
+Each refusal wraps `ErrEndpointRefused`:
+- **P-origin:** `a %s credential (%s) does not go to a %s endpoint; nothing was sent`. The first `%s` is Google or loopback, by the email's suffix (any other suffix is "unknown"), the second is the email's domain only, and the third is the endpoint's mode.
+- **P-tokenuri:** `the credential names the token endpoint %q, and a %s endpoint takes its token only from %s; nothing was sent`.
+- **P-universe:** `the credential names the universe %q, and farcast's cluster client works in googleapis.com only; nothing was sent`.
+
+This closes the `token_uri` and `universe_domain` routes that the vendored loader honours (`vendor/cloud.google.com/go/auth/credentials/filetypes.go:132-151`) [read].
+
+So no single field enables either mode:
+- a Google credential with a loopback endpoint is refused;
+- a loopback credential with a `gke.goog` endpoint is refused;
+- a Google endpoint with a CA file is refused;
+- a loopback endpoint without one is refused.
+
+The token URL is never read from a file. It is `Endpoint.TokenURL()`.
+
+### 3.3 The token source and its cache
+
+The token source lives in `token.go` *(2026-11-16: `Scopes` is now `TokenScopes()`, `cloud-platform` then `userinfo.email`; §22 A22-7)*:
+
+```go
+tp, err := auth.New2LOTokenProvider(&auth.Options2LO{
+	Email:        cred.Email,
+	PrivateKey:   cred.PrivateKeyPEM,
+	PrivateKeyID: cred.PrivateKeyID,
+	Scopes:       []string{ScopeUserinfoEmail},
+	TokenURL:     ep.TokenURL(),
+	Client:       tokenHTTPClient(ep), // §3.4
+	Logger:       slog.New(slog.DiscardHandler),
+})
+c.tokens = &tokenCache{mint: tp.Token}
+```
+
+```go
+// tokenCache holds one token for one identity, in memory only.
+type tokenCache struct {
+	mint tokenFunc
+	mu   sync.Mutex
+	tok  *auth.Token
+}
+
+// token returns the cached token. It mints, holding mu, when there is none, when
+// it has expired, or when it is within 225 s of expiring (the vendored cache's
+// own early-expiry default, vendor/cloud.google.com/go/auth/auth.go:49).
+func (c *tokenCache) token(ctx context.Context) (*auth.Token, error)
+
+// invalidate drops the cached token if it is still the one a 401 answered. A
+// token another request has already replaced is kept, so concurrent 401s mint once.
+func (c *tokenCache) invalidate(rejected *auth.Token)
+```
+
+- **Why not `auth.NewCachedTokenProvider`.** It exports only `Token`, and its blocking path returns the cached token for as long as `IsValid()` holds (`vendor/cloud.google.com/go/auth/auth.go:284-312,388-399`) [read]. A re-mint after a 401 would hand back the same rejected token. So `token.go` owns the cache, and `invalidate` is unexported, called only by the transport (§3.4).
+- **The scope.** One scope, `userinfo.email`. GKE's page says the credentials "must include the `userinfo.email` OAuth scope to successfully authenticate", and does not mention `cloud-platform` ([doc](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/api-server-authentication)). A leaked cluster token then reaches no other Google API. Whether the DNS endpoint accepts a token with that scope alone is checked by the probe walk (§10.8). If it refuses, `cloud-platform` is added back with a dated note in ADR 0023 and here. The cluster token is never used for a Google API call: the transport attaches it only to the endpoint's host (§3.4). *(2026-11-16: refused, 401 to `userinfo.email` alone on the probe walk (§22 A22-1). The token now carries `cloud-platform` and `userinfo.email` (§22 A22-7), so "a leaked cluster token then reaches no other Google API" no longer holds: it works for every Google API the account's IAM allows. Built and tested against kubetest only, not walked.)*
+- **Why the logger is set.** A nil `Logger` makes the library read `GOOGLE_SDK_GO_LOGGING_LEVEL` and log the request body (the signed assertion) and the response (the access token) to stderr (`vendor/cloud.google.com/go/auth/auth.go:571,576`; `vendor/github.com/googleapis/gax-go/v2/internallog/internallog.go:48-53`) [read]. A non-nil logger is used as given (`internallog.go:48-50`) [read].
+- **The claims.** `Expires` is left zero. The vendored encoder then sets `iat` to now − 10 s and `exp` to `iat` + 3600, and always sends both: `Exp` has no `omitempty` (`vendor/cloud.google.com/go/auth/internal/jwt/jwt.go:67,81-86`) [read]. `Expires` must stay zero: set to one hour, it would make `exp` now + 1 h against an `iat` of now − 10 s (`auth.go:551-553`) [read], 3610 s apart, past Google's maximum of "1 hour after the issued time" ([doc](https://developers.google.com/identity/protocols/oauth2/service-account)). `TestTokenAssertionClaims` pins `exp − iat == 3600`.
+- **The `kid` header.** It is sent even when empty: the vendored `jwt.Header` has no `omitempty` on `kid` (`jwt.go:46-50`) [read]. Google documents the key id as optional, and "If an an incorrect Key ID is specified, all keys associated with the service account are tried" ([doc](https://developers.google.com/identity/protocols/oauth2/service-account)). Today a wrong key id falls back to trying every key, but the same page says a token is rejected if no valid key is found, and "Google reserves the right to reject tokens with incorrect key IDs" [doc]. So a wrong recorded key id stays a possible cause of `credential_refused`, and the reader records its key id (§7.2). Whether Google accepts `"kid":""` exactly is the one case left to the probe walk (§10.8).
+- **What is never written anywhere:** the access token, the assertion and the private key. They never appear in an error message either. Errors name the identity's email domain and the HTTP status.
+- **Refusals:**
+  - a non-2xx from the token endpoint, which the library reports as `*auth.Error`, wraps `ErrTokenRefused`, with the message `Google refused to mint a token for the %s service account (%d %s)`;
+  - a network failure wraps `ErrUnreachable`.
+
+### 3.4 The transports
+
+*Amended by §15 (A15-2 to A15-5).*
+
+There are two `*http.Client`s per `kube.Client`, one for the API and one for the token.
+
+**Both share:**
+- a fresh `&http.Transport{…}` literal, never `http.DefaultTransport.Clone()`, whose `Proxy` is `http.ProxyFromEnvironment`. `Proxy` is nil, so `HTTPS_PROXY` and the other proxy variables never route a bearer (M0 kept them from kubectl, `farsight/cli/internal/cluster/env.go:47-50`) [read]. `TestTransportsHaveNoProxy` asserts `Proxy == nil` on both transports in both modes, white-box;
+- `TLSClientConfig: {MinVersion: tls.VersionTLS12, RootCAs: ep.CA}`, where nil means the system roots (§3.6);
+- `ForceAttemptHTTP2: true`;
+- `TLSHandshakeTimeout: 10s`;
+- `ResponseHeaderTimeout: 30s`;
+- `IdleConnTimeout: 90s`;
+- `MaxIdleConnsPerHost: 4`;
+- `CheckRedirect` returning `http.ErrUseLastResponse`, so no redirect is followed and a 3xx is an `APIError`;
+- a `User-Agent: farcast` header set by a wrapping `RoundTripper` on every request.
+
+**Differences:**
+- **Timeouts.** The API client has no `Timeout`: following logs must not be cut off. Each non-streaming request runs under `context.WithTimeout(ctx, 60*time.Second)`, or earlier if the caller's context ends first. The token client has `Timeout: 30s`.
+- **The Authorization header.** The API client's wrapper sets `Authorization: Bearer <Token.Value>` itself, only when `req.URL.Scheme == "https"` and `req.URL.Host == ep.Host[:port]` (port omitted in Google mode). A request built for any other host gets no header. The token client never sends one.
+- **The loopback dialer.** In loopback mode both transports use a dialer whose `Control` refuses any `address` other than `ep.Host:ep.Port`, with `kube: loopback client refused to dial %s`.
+
+**Retries:**
+- `GET` and server-side apply `PATCH` are retried on 429 and 503, up to 3 attempts in all. Each wait is the `Retry-After` value in seconds, capped at 10 s, or 1 s when the header is absent.
+- `POST`, `PUT`, `DELETE` and JSON-patch `PATCH` are never retried on 429 or 503 by the transport. Their callers have their own policies (`writePin`, `storagepin.go:184-237`, §9.5; migration, §6.4).
+- **A 401** from the API server calls `invalidate` with the token the request carried, mints once more and retries once, for any method: the server refused the request before processing it [inf]. A second 401 is the error (`tkube.ErrUnauthorized`). `TestUnauthorizedRemintsOnce` uses `kubetest`'s `Revoke` on the first token, and `TestInvalidateForcesOneMint` drives the cache directly.
+
+**Response bodies** are capped at 64 MiB by reading at most 64 MiB + 1 bytes. A larger body is `ErrUnreadable` (`the API server's answer to %s %s is larger than 64 MiB`), never a silent truncation, as in `technocore/kube/client.go:274`. Log streams are not capped.
+
+**Warnings.** Each response's `Warning` headers are parsed per RFC 7234's `299 - "<text>"` format, and each distinct text is kept for `Client.Warnings()`. Today these are thrown away when kubectl succeeds (`cluster.go:161-166`) [read].
+
+### 3.5 `openCluster`
+
+*Amended 2026-11-15 by A17-1 (refusals and their sentinels), A17-2 (fail-closed additions), A17-3 (the loopback rule) and A17-13 (M2.4 must check the record before these refusals).*
+
+`openCluster` lives in `clusterref.go`. Its steps, in order:
+1. `meta.Endpoint == ""` returns `withKind(kindEndpointRefused, fmt.Errorf("instance %q records no cluster endpoint; 'farcast install' records one; nothing was sent", name))`. It is never `not_connected`, which means "no FatLine recorded, so no tunnel" (`farsight/cli/README.md:1157`) and which the app labels "no tunnel" (`World.swift:246`) [read].
+2. `ca, ok, err := Dir.LoadClusterCA(name)`. If it is absent, `ca` is nil.
+3. `ep, err := kube.ParseEndpoint(meta.Endpoint, meta.Region, ca)`.
+4. The credential:
+   - **Writer** (M2.5): `LoadInstanceCredentials(name)` (`instance.go:822-833`). If `ServiceAccountKey == ""`, return `errCredentialMissing` with the message `instance %q was installed without a service-account key (Application Default Credentials), which farcast no longer uses for its cluster (ADR 0023 M2); install a new instance with --credentials`. Otherwise `kube.ParseServiceAccountJSON`.
+   - **Reader** (M2.3):
+     - `meta.Reader == nil` returns `errCredentialMissing` with the message `instance %q has no reader identity; run 'farcast reader init %s'`.
+     - The recorded email must be the one farcast derives (§7.2): in Google mode exactly `readerEmail(name, meta.Project)`; in loopback mode a local part of `readerName(name)` and a domain ending `.invalid`. Otherwise `errCredentialMissing` with `instance %q records the reader %s, which is not the reader farcast derives for it (%s); nothing was sent`. A certificate uploaded to the installer's account, or a hand-edited email, therefore never makes a "reader" read an admin read. `TestReaderEmailMustBeTheDerivedOne` covers both modes; `reader record` makes the same check (§7.2).
+     - `meta.Reader.KeyID == ""` returns `errCredentialMissing` with `instance %q's reader key is not yet uploaded; run the printed Cloud Shell script, then 'farcast reader record %s --key-id <id>'`.
+     - `meta.Reader.GrantedAt.IsZero()` returns `errCredentialMissing` with `instance %q's reader has not been verified read-only; run 'farcast reader grant %s'`, unless `r.Verifying` is set. So `world`, `ps`, `costs`, `usage` and `logs` never read as a reader whose read-only check failed or never ran: an IAM role stronger than clusterViewer, edited into the paste, would otherwise read with write rights. The one exception is `reader grant`'s own verifying read and reviews (§7.2). `TestReadCommandsRefuseAnUnverifiedReader` covers the five commands: with `GrantedAt` zero, the server sees no request.
+     - Otherwise `LoadReaderKey(name)`; a missing file returns `errCredentialMissing` with `instances/%s/reader.key is missing; run 'farcast reader init %s --rotate'`.
+     - The result is `kube.Credential{Email: meta.Reader.Email, PrivateKeyID: meta.Reader.KeyID, PrivateKeyPEM: key}`.
+5. `cluster.Open(kube.Config{Endpoint: ep, Credential: cred, Identity: r.Identity}, r.Warn, legacy)`, where `legacy` is §2.6's transitional argument until M2.7.
+
+`errCredentialMissing` is a package-level sentinel in `cli`, `errors.New("no usable stored credential")`, wrapped with `%w`.
+
+### 3.6 Process-wide hardening (M2.3, with the first in-process call)
+
+*Amended 2026-11-15 by A17-9: the planck harness unsets the same variables.*
+
+`hardenEnvironment` (`cli.go:44-49`) gains three unsets, before anything else runs:
+- `os.Unsetenv("GOOGLE_SDK_GO_LOGGING_LEVEL")`, because the registry and storage token sources use the library's default logger (D14);
+- `os.Unsetenv("SSL_CERT_FILE")` and `os.Unsetenv("SSL_CERT_DIR")`.
+
+**Why the certificate variables.** M0 dropped `SSL_CERT_*` from kubectl's environment on purpose (`farsight/cli/internal/cluster/env.go:44-50`) [read]; the in-process client would inherit them. On go1.27.4, "setting SSL_CERT_FILE or SSL_CERT_DIR will prevent those APIs [macOS's and Windows's] from being used, unless the x509sslcertoverrideplatform=0 GODEBUG setting is used" [ran: `go doc crypto/x509 SystemCertPool`]. The module's `go 1.26` line (`go.mod:3`) keeps the old default, 0, because the setting changed in Go 1.27 (`$GOROOT/src/internal/godebugs/table.go:80`, `Changed: 27, Old: "0"`) [read]. But a `GODEBUG` in the environment overrides a default (`$GOROOT/doc/godebug.md:68-72`) [read], so `GODEBUG=x509sslcertoverrideplatform=1` makes the variables replace the roots on macOS and Windows; on Linux they always do. The roots are what `*.gke.goog`, and the bearer token sent to it, are trusted on. Unsetting them first is effective because the system pool is loaded at its first use, after `hardenEnvironment` [inf]. Google API calls stop honouring them too. With them unset, Google-mode trust no longer depends on `GODEBUG`.
+
+**Tests** (`farsight/cli/internal/cli/harden_test.go`):
+- `TestMainTurnsClientCertificatesAndExecutablesOff` sets all three variables before `Main` and asserts each is unset after.
+- `TestCertFileVariablesCannotAddARoot` re-executes the test binary twice as a child with `GODEBUG=x509sslcertoverrideplatform=1` and `SSL_CERT_FILE` naming a test CA, and has the child verify a leaf for `a.us-central1.gke.goog` signed by that CA against `x509.SystemCertPool()`. The control child skips `hardenEnvironment` and must verify; the real child calls it and must fail. If the control fails too on some platform, the test skips with that reason, because it would prove nothing there.
+
+---
+
+## 4. Each `cluster.Client` method, mapped
+
+`{core}` is `/api/v1` and `{apps}` is `/apis/apps/v1`. Every request sends `Accept: application/json`, `User-Agent: farcast` and the bearer token.
+
+| Method | Requests | Parsing and polling | Errors |
+|---|---|---|---|
+| **Apply** | `kube.SplitStream(manifests)`, then for each document in order `PATCH <k.Path(ns,name)>?fieldManager=farcast&fieldValidation=Strict&force=true` (§5.3) | It records any client-side-apply trace in the response (§6.6). It stops at the first failure. | `deploy document %d of %d (%s %s/%s): %w; %d before it were applied` |
+| **RolloutStatus** | `GET {apps}/namespaces/{ns}/deployments/{name}`, every 2 s until `timeout` | `kube.RolloutState` (rules below) | rule 2 gives `ErrRolloutStalled`; the deadline gives `deployment %s/%s did not finish rolling out within %s: %s (last: <waiting>)` wrapping `ErrTimedOut`; a 404 is an error |
+| **WaitExternalIP** | `GET {core}/namespaces/{ns}/services/{name}`, every 3 s | `status.loadBalancer.ingress[0].ip`; an empty list or IP means wait. The IP is checked with `netip.ParseAddr` and an invalid one is an error. | The deadline gives today's message (`cluster.go:278`) wrapping `ErrTimedOut`; a cancelled context returns `ctx.Err()` as today |
+| **WaitJob** | `GET /apis/batch/v1/namespaces/{ns}/jobs/{name}`, every 5 s | Success: `status.succeeded > 0`, or the condition `Complete` is `True`. Failure: `status.failed > 0`, or the condition `Failed` is `True`. Then `jobMessage`, whose error is discarded as today (`cluster.go:328-331`). | The deadline gives today's message (`cluster.go:335`) wrapping `ErrTimedOut` |
+| jobMessage (unexported) | `GetJob`, then `ListPods(ns, SelectorString(job.spec.selector))` | The newest pod by `creationTimestamp`, then its first `containerStatuses[]` entry with `state.terminated` set, then `.message`, trimmed. Today it reads `items[0]` (`cluster.go:351-353`); the newest pod is FarCast's own choice. | Swallowed, as today |
+| **JobLogs** | `GetJob` and `ListPods` by its selector, `kube.PickPod`, then `StreamLog(pod, {Container: the template's only container, TailLines: lines>0 ? lines : -1})` into a buffer. `TailLines < 0` sends **no** `tailLines` parameter: the API defines everything as the parameter absent ("If not specified, logs are shown from the creation of the container", [doc](https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/)), and kubectl omits it for `-1` (`logs.go:243`, kubectl v0.37.2) [doc]. Otherwise it is sent as a decimal integer. | More than one container in the template is an error (`job %s/%s has %d containers; farcast reads only one`). This holds today: `planck/build/build.go:429-430`, `planck/fetch/workload.go:141` [map]. | No pod: `job %s/%s has no pod to read`. `TestJobLogsAllLinesSendsNoTailLines` pins the wire. |
+| **Workloads** | `ListDeployments(ns)` and `ListStatefulSets(ns)`, each paged | **Kind is stamped per list**: `"Deployment"` for the first, `"StatefulSet"` for the second, never read from the item. Desired is `spec.replicas`, or 1 when absent (`cluster.go:492-495`). Ready is `status.readyReplicas`; images, labels and creationTimestamp as today. Deployments come first, then StatefulSets, each in server order. | A decode failure wraps `ErrUnreadable` |
+| **ConfigMapValue** | `GET {core}/namespaces/{ns}/configmaps/{name}` | A 404 gives `("", false, nil)`. A present ConfigMap without the key gives `("", true, err)`, the pair callers depend on (`world.go:403-407,441-444`; `runpolicy.go:72-80` [map]). | A 403 is forbidden, **never read as absent** |
+| **ConfigMapData** | the same `GET` | `data` and `metadata.resourceVersion`. An empty resourceVersion is an error (`cluster.go:554-556`). | the same |
+| **CreateConfigMap** | `POST {core}/namespaces/{ns}/configmaps?fieldManager=farcast&fieldValidation=Strict`, with `Content-Type: application/json` and the body as given | Namespace and name are read from the JSON (`RenderPin` renders JSON, `datasphere/deploy/deploy.go:225-264`) | A 409 `AlreadyExists` unwraps to `tkube.ErrConflict` |
+| **ReplaceConfigMap** | `PUT {core}/namespaces/{ns}/configmaps/{name}?fieldManager=farcast&fieldValidation=Strict` | The body must carry `metadata.resourceVersion`, else `ErrRefusedDocument` | A 409 `Conflict` unwraps to `tkube.ErrConflict`. `writePin`'s retry loop is §9.5's. |
+| **Namespaces** | `ListNamespaces(ctx, "")`, paged | names | — |
+| **NamespacesLabelled** | `ListNamespaces(ctx, selector)`, paged | names, sorted (`cluster.go:626`) | — |
+| **NamespaceUID** | `GET {core}/namespaces?fieldSelector=metadata.name%3D<name>` | the one item's `metadata.uid`; `""` for no item | more than one item is `ErrUnreadable` |
+| **DeploymentState** **[decided: P1]** | `GetDeployment(ns, name)` | `spec.replicas`; each container's `resources.requests` parsed with tkube's quantity parsers into milli-CPU and MiB; the `farcast.sofmon.com/adapted-at` annotation parsed as RFC 3339; the newest `time` among managed-fields entries of manager `farcast` (Apply) or `kubectl-client-side-apply` (Update); `metadata.resourceVersion` | A 404 is `Present: false`, not an error |
+| **Logs** | The target is `deployment/<n>` or `statefulset/<n>` (`logs.go:91`); any other prefix is an error. `GetDeployment` or `GetStatefulSet`, then `ListPods(ns, SelectorString(spec.selector))`, then `kube.PickPod`, then one `StreamLog` per container. | Containers run init, then main, then ephemeral: a deterministic order FarCast chooses. kubectl builds its requests in that order (`logsforobject.go`), but without `--follow` it consumes them from a map, so its output order is unspecified, and it stops at the first container's error unless `--ignore-errors` (`logs.go`, `sequentialConsumeRequest`, kubectl v0.37.2) [doc]. Without follow they run one after another; with follow at most 5 at once, kubectl's own default (`MaxFollowConcurrency: 5`, `logs.go:166`) [doc], each writing 32 KiB chunks to `out` under one mutex, with no prefix. With follow, a cancelled context returns nil (`cluster.go:401-405`). | More than 5 containers with follow: `following %d containers at once is more than farcast follows (5)` |
+
+**Paging.** Lists send `limit=500` and follow `metadata.continue` until it is empty. A `410 Gone` mid-page restarts the list once.
+
+**Selectors.** Every selector is built by `kube.SelectorString`, which refuses a nil or empty selector and any `matchExpressions` with `the %s %s/%s selects its pods with matchExpressions, which farcast does not read`. A selector with expressions would otherwise read as a broader one, and logs could come from another workload's pod. No FarCast renderer writes expressions [read: the templates of §5.1]. `TestSelectorStringRefusesExpressions` covers it.
+
+**`kube.RolloutState`** is a port of kubectl's `DeploymentStatusViewer.Status` (`pkg/polymorphichelpers/rollout_status.go:59-91`, kubectl v0.37.2) [doc]. kubectl's `revision` argument is not ported: `rollout status` passes none.
+1. If `metadata.generation > status.observedGeneration`: waiting, with `waiting for the deployment spec update to be observed`.
+2. If the condition `Progressing` has reason `ProgressDeadlineExceeded` (kubectl's `TimedOutReason`, `pkg/util/deployment/deployment.go:56`) [doc]: error `deployment %q exceeded its progress deadline` (wraps `ErrRolloutStalled`).
+3. If `spec.replicas != nil && status.updatedReplicas < *spec.replicas`: waiting, `%d out of %d new replicas have been updated` (updated, desired).
+4. If `status.replicas > status.updatedReplicas`: waiting, `%d old replicas are pending termination` (replicas − updated).
+5. If `status.availableReplicas < status.updatedReplicas`: waiting, `%d of %d updated replicas are available` (available, updated).
+6. Otherwise: done.
+
+Rules 2–6 apply only once rule 1 has passed.
+
+**`kube.PickPod`** is a port of `podutils.ByLogging`, the sort `kubectl logs` uses to choose a workload's pod (`logsforobject.go`: `sortBy := func(pods []*corev1.Pod) sort.Interface { return podutils.ByLogging(pods) }`; `pkg/util/podutils/podutils.go:96-125,194-228`, kubectl v0.37.2) [doc]. It sorts stably, FarCast's choice so that ties keep the server's order, and takes the first. Pods compare by these criteria, in order:
+1. a pod with `spec.nodeName` set comes before one without;
+2. phase ordinal Running = 0, Unknown = 1, Pending = 2, and any other phase, Succeeded and Failed included, also 0, so it ties with Running;
+3. Ready = True comes before not ready;
+4. when both are ready, the one with the earlier Ready `lastTransitionTime` comes first, and a zero time counts as latest;
+5. the pod with the higher maximum regular-container `restartCount` comes first; on a tie, the higher maximum `restartCount` among init containers whose `restartPolicy` is `Always` (sidecars);
+6. the earlier `creationTimestamp` comes first, and a zero time sorts last.
+
+This is not reversed `ActivePods`, the order attach and exec use (`podutils.go:133-173`) [doc]: v1's rules 2 and 5 were that order's, and were wrong for logs.
+
+An empty list returns `false`. kubectl then waits for a pod up to `--pod-running-timeout`, default 20 s (`logs.go:118`, `defaultPodLogsTimeout`) [doc]; the port returns at once: `no pod of %s/%s is running yet`.
+
+**`--previous`** uses the same choice, in which restarts are the fifth criterion: an assigned, Running, Ready pod comes first, the longest-ready of those, and restart counts only break a tie that remains (`podutils.go:96-125`, kubectl v0.37.2) [doc]. A crash-looping replica is usually not Ready, so it usually sorts after a ready one, and `--previous` may read a replica with no previous instance [inf]. A container with no previous instance answers 400; the port writes `<pod>/<container>: no previous instance` to the `warnings` writer `Open` was given (`env.Err`), never to `out`, because `logs` keeps stdout for the application's own bytes (`logs.go:88-90`) [read], and goes on to the next container. kubectl would stop there unless `--ignore-errors` [doc], so the skip is FarCast's own choice (D11).
+
+---
+
+## 5. Server-side apply (M2.7, with `SplitStream` from M2.1)
+
+### 5.1 The kind table
+
+`kube.Kinds` holds these, in this order:
+
+| # | Kind | apiVersion | Resource | Scope |
+|---|---|---|---|---|
+| 1 | Namespace | v1 | namespaces | cluster |
+| 2 | ServiceAccount | v1 | serviceaccounts | namespaced |
+| 3 | Secret | v1 | secrets | namespaced |
+| 4 | ConfigMap | v1 | configmaps | namespaced |
+| 5 | Service | v1 | services | namespaced |
+| 6 | Deployment | apps/v1 | deployments | namespaced |
+| 7 | StatefulSet | apps/v1 | statefulsets | namespaced |
+| 8 | Job | batch/v1 | jobs | namespaced |
+| 9 | PodDisruptionBudget | policy/v1 | poddisruptionbudgets | namespaced |
+| 10 | NetworkPolicy | networking.k8s.io/v1 | networkpolicies | namespaced |
+| 11 | Role | rbac.authorization.k8s.io/v1 | roles | namespaced |
+| 12 | RoleBinding | rbac.authorization.k8s.io/v1 | rolebindings | namespaced |
+| 13 | ClusterRole | rbac.authorization.k8s.io/v1 | clusterroles | cluster |
+| 14 | ClusterRoleBinding | rbac.authorization.k8s.io/v1 | clusterrolebindings | cluster; `Names: ["farcast-reader-namespaces"]` **[decided: P3]** |
+
+Row 14 is the one kind beyond ADR 0023:87's 13, restricted to one name, and recorded as a dated note on ADR 0023 decision 2 (§11). Under P3's alternative its one name is `farcast-reader`.
+
+Every pair `apiVersion`/`kind` in today's renderers is in rows 1–13. Checked by a scan of the templates:
+- `fatline/deploy/deploy.go`;
+- `datasphere/deploy/deploy.go`;
+- `technocore/deploy/*.go`;
+- `planck/translate/workload.go`;
+- `planck/build/build.go`;
+- `planck/fetch/workload.go`;
+- `technocore/kernel/{namespaces,confirmations}.go` [read].
+
+M2 adds two renderers, the reader RBAC (§7.2, rows 12–14) and the Git credential Secret (§9.8, row 3).
+
+There is no discovery. `Path` builds `/api/v1/…` for `v1` and `/apis/<apiVersion>/…` otherwise.
+
+### 5.2 Splitting and identifying documents (`kube.SplitStream`)
+
+*Amended by §15 (A15-6, A15-7).*
+
+The YAML library is the vendored `github.com/goccy/go-yaml` v1.19.2, the only one vendored [map]. It is used only to check and identify documents, never to re-encode them.
+
+1. **Refuse:**
+   - a `\r` anywhere;
+   - a line beginning `%` at column 0 (a directive);
+   - a line equal to `...`;
+   - a line beginning `---` that is not exactly `---`, with the reason `a line %q starts a document separator but is not exactly ---`.
+
+   Every renderer today separates documents with a bare `---` line (`fatline/deploy/deploy.go:317,331,519,539,563`; `datasphere/deploy/deploy.go:343-723`; `planck/translate/workload.go:31-215`; `technocore/deploy/deploy.go:223-368`; `planck/build/build.go:306,390`; `planck/fetch/workload.go:39,98`; `kernelmeter.go:145`; `kernel.go:341`) [read].
+2. Split on lines exactly `---`. A chunk whose every line is blank or a comment (optional spaces, then `#`) is skipped. This is what stops go-yaml's `Decoder` from looping on an empty document [map].
+3. `parser.ParseBytes(chunk, 0)` (`vendor/github.com/goccy/go-yaml/parser`; signature confirmed with `go doc` [ran]). It must yield exactly one `DocumentNode` whose `Body` is a mapping. Duplicate keys are refused by default [map]. Then `ast.Walk` over the document refuses any anchor, alias, merge key or explicit tag node (`ast.AnchorType`, `AliasType`, `MergeKeyType`, `TagType`, `vendor/github.com/goccy/go-yaml/ast/ast.go:42-63`) [read], with the reason `it uses a YAML %s, which farcast's renderers never write; the API server reads YAML differently and could see keys this check does not`. A merge key could otherwise hide `stringData` from the check while the server still applies it. FarCast's templates use none of these [read].
+4. Decode the header with `yaml.Unmarshal(chunk, &h)` into this struct, whose tags are explicit: go-yaml lower-cases an untagged field's name (`vendor/github.com/goccy/go-yaml/struct.go:41`) [read], so an untagged `APIVersion` would read the key `apiversion` and never `apiVersion`:
+   ```go
+   type header struct {
+   	APIVersion string         `yaml:"apiVersion"`
+   	Kind       string         `yaml:"kind"`
+   	Metadata   map[string]any `yaml:"metadata"`
+   }
+   ```
+   Name, namespace and annotations are read from `Metadata` as strings. Decode the top-level keys into `map[string]any`.
+5. Then check, in order, each failure with its reason:
+   - `KindOf` finds the pair: `kind %s %s is not one farcast applies (ADR 0023 decision 2's table)`;
+   - `Names` holds the name, when set: `a %s may only be named %s`;
+   - the name is non-empty and at most 253 characters of `[a-z0-9.-]`;
+   - a namespaced kind names a namespace: `a namespaced %s names no namespace`;
+   - a cluster-scoped kind names none: `a cluster-scoped %s names namespace %q`;
+   - a Secret has no top-level `stringData`: `a Secret's stringData does not work well with server-side apply (Kubernetes); render data: with base64 values` (ADR 0023:89; the Kubernetes sentence is "The `stringData` field for a Secret does not work well with server-side apply", [doc](https://kubernetes.io/docs/tasks/configmap-secret/managing-secret-using-config-file/));
+   - there is no top-level `status`: `it carries status, which only the API server sets`;
+   - none of the keys `resourceVersion`, `uid`, `creationTimestamp` and `managedFields` is present in `metadata`, whatever its value: `it carries metadata.%s, which only the API server sets`. Only `AllowResourceVersion(rv)` (§2.1) lets one document carry `resourceVersion`, and only equal to `rv`;
+   - the annotation `kubectl.kubernetes.io/last-applied-configuration` is absent: `it carries kubectl's last-applied annotation`.
+
+Every refusal is `kube: document %d (%s %q) is refused: <reason>` wrapping `ErrRefusedDocument`. `TestSplitStreamRefuses` has one row per reason, and one per server-set key, so each check is mutation-tested on its own.
+
+**Why the rendered bytes are sent unchanged.** go-yaml is YAML 1.2, so `no`, `on` and `off` are strings to it. The API server parses YAML 1.1-style [map; unverified]. Sending the rendered bytes keeps today's meaning, because the server parses them as it parses kubectl's input today [inf]. A name that the two dialects read differently makes the URL and the body disagree, and the server answers 400. That fails closed [inf]. Step 3's refusals close the constructs where the two readers could disagree about which keys exist.
+
+### 5.3 The apply request
+
+*Amended 2026-11-14 by A16-3: the namespace list is the last document of both streams that write it, pinned since M2.2.*
+
+```
+PATCH {base}{Kind.Path(ns,name)}?fieldManager=farcast&fieldValidation=Strict&force=true
+Content-Type: application/apply-patch+yaml
+Accept: application/json
+User-Agent: farcast
+Authorization: Bearer <token>
+<Document.Raw>
+```
+
+- **The `fieldManager` parameter is required on every apply.** The SSA page says "All Server-Side Apply **patch** requests are required to identify themselves by providing a `fieldManager` query parameter" [doc](https://kubernetes.io/docs/reference/using-api/server-side-apply/). A missing object is created ("either creates a new object … or is combined", [doc]).
+- **Ordering:**
+  - documents are applied in stream order, as kubectl applies them [map; unverified];
+  - every renderer puts the Namespace first [read];
+  - NetworkPolicies come after their workloads, as today [map]; the order is not changed in M2.
+- **Failure:** the first non-2xx stops the stream. This is deliberately stricter than kubectl, which carries on past a failure and reports at the end [map; unverified]. The error names how many documents before it were applied. No apply is atomic; `meterManifest`'s comment (`kernelmeter.go:133-136`) [read] gains that sentence.
+- **Admission is not attributed to farcast.** The API server records managed fields before mutating admission runs, and wraps admission so it cannot change them: `UpdateNoErrors`, then `NewManagedFieldsValidatingAdmissionController`, then the mutating `Admit` (apiserver v0.37.2 `pkg/endpoints/handlers/create.go:199-203`, and `patch.go:211-245`) [doc]. Autopilot's admission defaults are therefore owned by no manager [inf].
+- **`force=true` for every document of FarCast's own components:**
+  - FatLine and Shrike;
+  - TechnoCore and its RBAC;
+  - the keyholder;
+  - the build and fetch Jobs, with their ServiceAccounts and NetworkPolicies;
+  - `fatline-egress-policy`, `technocore-namespaces` and `technocore-confirmed`;
+  - the meter RoleBindings;
+  - the reader RBAC;
+  - the Git credential Secrets.
+
+  Nothing co-owns their fields at run time: the kernel stops and resizes the `app` tier only (`technocore/kernel/shutdown.go:92`, `adapt.go:90` [map]). So forcing overrides only hand edits, which client-side apply overrides today too [inf].
+- **The application stream** (`run.go:298`) follows Choice 6 (§5.4).
+
+### 5.4 Applications: Choice 6 **[decided: P1]**
+
+**The facts the options turn on:**
+- The kernel stops an application through the `/scale` subresource with a merge patch, and resizes it with a strategic-merge patch (`technocore/kube/client.go:173-181,336-396`).
+- At 0cea21f it sets no `fieldManager` and no User-Agent (`client.go:234-288`) [read]. Its writes are therefore recorded under a manager the server derives from the User-Agent: "For other updates, the API server infers a field manager identity from the "User-Agent:" HTTP header (if present)" [doc]. Go's default would make it `Go-http-client` [unverified]. **From M2.7 the kernel sends `fieldManager=technocore`** on every write (Q6, decided): its scale and resize patches and its ConfigMap PUTs and POSTs (`technocore/kube/client.go:173-181,213-228,336-396`) [read], with an ADR 0009 dated note (§11). `TestKernelWritesNameTechnocore` asserts all four requests: `Scale`, `SetRequests`, and `SaveConfigMap`'s PUT and POST. That changes TechnoCore's image digest at the next release.
+- The SSA page warns: "Server-Side Apply does not correctly track ownership on sub-resources that don't receive the resource object type. If you are using Server-Side Apply with such a sub-resource, the changed fields may not be tracked" [doc]. `/scale` receives a Scale, not a Deployment, so whether the kernel's `replicas` write is tracked as the kernel's is open [inf]; the real-Kubernetes test records it (§10.6).
+- The application template sets `replicas: 1` (`planck/translate/workload.go:142`) and requests of 100m and 128Mi (`:186-187`; `translate.go:79-80`) [read].
+- Today kubectl's three-way merge sends every field whose live value differs from the manifest, so a `run` resets both [inf; ADR 0016:62 records the requests case].
+
+| | (a) forced | (b) non-forced | (c) forced, with the resets bound as facts *(decided 2026-11-14)* |
+|---|---|---|---|
+| Request | `force=true` | `force=false`. Before any write, every application Deployment is applied once with `dryRun=All` (writer identity), so a conflict is found before the Secret, the ConfigMap and the egress policy rotate. | `force=true` |
+| An application the cost guard stopped (`replicas: 0`) | `run` scales it back to 1. If spending is still over the limit, the next kernel tick stops it again, so it bills for up to one interval [inf]. Nothing says so. | The dry run answers 409 with `FieldManagerConflict` naming `.spec.replicas` and the kernel's manager, if the server tracked the scale write (above). `run` refuses before writing anything (kind `apply_conflict`). There is then no CLI way to bring a stopped application back, unless a force flag is added, and that would itself be a newly automated act and a plan fact. | As (a), stated in the review and the plan: `web: running 0 replicas (stopped by the cost guard); this deploy sets 1`. Gated while the limit is reached (below). |
+| An adapted application | Requests reset to 100m/128Mi; the kernel re-adapts after its cooldown, one extra rollout (ADR 0016:62) | 409, refused as above | As (a), stated (below) |
+| Conflict text | — | Names `technocore` from M2.7 | — |
+| Cost | Today's behaviour | Unknown until walked: Autopilot's own mutations may also conflict [unverified] | One `DeploymentState` per application, read before the review |
+
+**Under (c),** run's review (`runreview.go:36-100`) prints one line per reset, after the cost lines. The deploy plan carries one `application_reset` fact per affected application (§9.4). `run` reads each with `cluster.Client.DeploymentState` (§2.3), added to `runCluster`.
+
+- **Stopped:** the live `spec.replicas` is 0 and the rendered one is 1.
+- **Adapted:** the live Deployment's `AdaptedAt` is later than its `LastAppliedAt`: the kernel resized it after farcast last applied it. Live requests are **not** compared with the rendered ones. On a cluster without bursting, Autopilot raises 100m/128Mi to its 250m/512Mi floor (`planck/translate/translate.go:75-78`) [read], and the 5.2 walk saw Autopilot rewrite a request below its floor in the Deployment's pod template as stored (`technocore/kube/client.go:370-377`) [read]. And the kernel never removes its annotation (`technocore/kernel/adapt.go:31-32,213-216`) [read], so the annotation alone would misfire on every run after the first adaptation.
+- **The adapted line:** `api: requests 250m/512Mi (adapted by the kernel at <time>); this deploy renders 100m/128Mi, which Autopilot raises to its 250m/512Mi floor on a cluster without bursting, until the kernel adapts it again`. `requests_after` is the rendered value; the floor is named, not modelled.
+- **Unknown:** a live Deployment that cannot be read is listed as `unknown`. The review says it could not be read, and does not guess.
+- **A namespace the reader is not bound in** **[decided: P3]**. Kubernetes authorizes a request before it reads storage: authorization is step 2 and the object store step 4, and a request that every authorizer denies gets HTTP 403 ([doc](https://kubernetes.io/docs/concepts/security/controlling-access/)). The reader is bound only in `farcast-system` and the metered namespaces (§7.2), and `run` meters its namespace only after its workload apply (`run.go:298,305`) [read]. A plan's read of an application Deployment anywhere else would answer 403, even for an absent namespace, and every application would show as `unknown`. So the run deploy plan builder first lists the namespaces, which the reader may do cluster-wide:
+  - **the target namespace does not exist:** it reads nothing in it. There are no `application_reset` facts, `other_deployments_kept` is `[]`, and every application is `Present: false`. The re-read before the workload apply (below) expects `Present: false` for every one: under `--confirm` it reads as the writer, and a Deployment found there is `plan_changed`;
+  - **it exists and is not in `meta.Kernel.Namespaces`:** the plan carries a `blocked` entry of kind `forbidden`: `namespace %q exists and is not metered, so its reader cannot read it; run 'farcast kernel meter %s %s' first`;
+  - **otherwise** it reads each application as above.
+
+  `run` refuses an instance without a kernel before any of this (`run.go:163`) [read]. Interactive and `--yes` runs read as the writer (§7.3) and are unaffected. `TestRunPlanIntoANewNamespaceReadsNothingThere` and `TestRunPlanIntoAnUnmeteredNamespaceIsBlocked` cover both, against `kubetest` with `WithRBAC`. Under P3's alternative the reader is bound cluster-wide, and an absent namespace answers 404 by itself.
+
+**The gate on a stopped application, while the limit is reached** (MS-17 option (i)):
+- When a reset's state is `stopped` and the kernel's ledger reports the limit reached, `run --yes` and a non-interactive `run` refuse. The ledger is `technocore-ledger`'s checkpoint. The limit is reached when its `observed.level` equals `cost.LevelReached.String()`, today `limit reached` (`technocore/cost/limit.go:25-26`, written at `technocore/kernel/reconcile.go:546`) [read]; the comparison uses that constant, never a literal. A level that `levelOf` (`farsight/cli/internal/cli/worlddoc.go:788-803`) [read] maps to unknown also counts as reached, so the gate fails closed. The ledger is read with the run's other reads, and again just before the workload apply (below). `TestYesGateReadsTheKernelsOwnLevelString`'s ledger, and `TestYesNeverRestartsAStoppedAppAtTheLimit`'s, are checkpoints written by `technocore/kernel`'s own `ConfigMapStore.Save` (`checkpoint.go:235`) [read] at `cost.LevelReached`, never a hand-written string.
+- The refusal is a usage error (exit 2): `run --yes would restart %s, which the cost guard stopped while the instance's spending is at its limit; confirm it interactively, or review 'farcast run %s … --plan' and pass --confirm <digest>. The manifest was read; nothing was built or deployed.`
+- An interactive run prints, after the reset line, `the cost guard stopped %s at the limit; deploying restarts it, and it bills until the kernel's next tick stops it again`, and asks as today.
+- A `--confirm` restarts it only when its plan's `application_reset` fact names it with `limit_reached: true`.
+- A ledger that cannot be read counts as reached (fail closed). An absent ledger means the kernel has stopped nothing yet, and the gate does not apply.
+
+**The re-read, on every path.** Immediately before the workload stream's `Apply` (after the builds, the policy and the pin), `run` reads `DeploymentState` for every application Deployment again, and the ledger. The builds take minutes, and the kernel can stop an application between its ticks (`technocore/kube/client.go:173-181`) [read], so a check made only at the review would let `--yes` restart an application stopped during the build. It would also let `--yes` restart an application already stopped at the review, while the ledger was below the limit, whose ledger reaches the limit during the build. The kernel never scales an application back up (`technocore/README.md:42`) [read], so a stopped application with the ledger below the limit is a state the review can meet.
+- **Under `--confirm`:** if any one's `Replicas` or `Requests` differ from its fact's `replicas_live` or `requests_live`, or an application with no fact now has a reset, it refuses with `plan_changed`: `%s/%s changed since the plan was made (the kernel stopped or resized it); the builds, the egress policy and the pin were written, and the workloads were not; run 'farcast run … --plan' again`. It also refuses with `plan_changed` for an application that is stopped at the re-read while the ledger now reads reached, and whose fact has `limit_reached: false`. That message is the same, except that its first clause, which would be false here, is replaced: `%s/%s is stopped, and its plan did not record the cost limit as reached; the kernel's ledger now reads it reached, or its level cannot be read; the builds, the egress policy and the pin were written, and the workloads were not; run 'farcast run … --plan' again`.
+- **Under `--yes` and in non-interactive runs:** an application that is stopped at the re-read while the ledger now reads reached (`cost.LevelReached.String()`, a level `levelOf` maps to unknown, or an unreadable ledger) is refused with the gate's message, its last sentence replaced by `The builds, the egress policy and the pin were written, and the workloads were not.` An application in that state at the review was refused there, so this is the gate applied again.
+- **Interactively:** an application that is stopped while the ledger reads reached now, and was not both at the review, is asked about again, with the stopped line printed.
+
+The window left between that read and the apply is one stream apply [inf]. `TestYesNeverRestartsAnAppStoppedDuringTheBuild` covers the `--yes` case in two rows, each with ledgers saved by `ConfigMapStore.Save`: the fake kernel scales an application to 0, with the ledger at reached, between the review and the workload apply; and the application is stopped at the review with the ledger at `90%` (`cost.LevelWarn90`), and the ledger moves to limit reached before the workload apply. Both are refused, and no workload is applied. `TestConfirmRefusesAnAppStoppedAfterTheCompare` (§9.5) has the second case under `--confirm`: the plan's fact is `stopped` with `limit_reached: false`, and the refusal is `plan_changed`.
+
+**Under (a) and (c),** `run` applies its application stream with `Apply`; only (b) adds `ApplyApplication` (§2.3).
+
+**The alternatives, for P1's one local edit:** (c) without the gate (delete the gate paragraph and the `limit_reached` field); (b) (swap the chosen column, add `ApplyApplication`, `apply_conflict` and `TestStoppedAppConflictIsRefusedBeforeAnyWrite`); (a) (drop the facts and the gate).
+
+### 5.5 `data:` Secrets (M2.2)
+
+*Amended 2026-11-14 by A16-1 (values quoted), A16-2 (the live move), A16-4 (the checked fakes) and A16-5 (manifest text constrained at its source).*
+
+The egress Secret, `planck/translate/workload.go:32-67`, changes:
+- `stringData:` (`:50`) becomes `data:`;
+- the values are rendered as standard base64 (`encoding/base64.StdEncoding`) of the exact bytes the application reads today:
+  - `FARCAST_FATLINE_PROXY`: `base64(appData.ProxyURL)`;
+  - `FARCAST_STORAGE_CLIENT_CERT`: `base64(strings.TrimRight(certPEM, "\n") + "\n")`;
+  - `FARCAST_STORAGE_CLIENT_KEY`: the same, from the key PEM.
+
+The trailing `\n` is what a `|` block scalar keeps (YAML clip chomping) [inf]. That is what `indentPEM` (`planck/translate/translate.go:313-323`) produces today.
+
+`appData` gains `ProxyURLB64`, `ClientCertB64` and `ClientKeyB64`, which replace `ProxyURL`, `ClientCert` and `ClientKey` in the template. `indentPEM` stays for `StorageCA` (`workload.go:114`). No `type:` line is added, as today. The template comment at `:42-49` keeps its words, plus one sentence: rendered as `data:` because, in Kubernetes' words, "The `stringData` field for a Secret does not work well with server-side apply" (ADR 0023 decision 2).
+
+**Tests:**
+- `planck/translate`:
+  - `TestEgressSecretCarriesDataNotStringData`;
+  - `TestEgressSecretDataDecodesToTodaysValues`, which base64-decodes each value and compares it with the URL and the PEM plus `\n`;
+  - the cases at `translate_test.go:473,514,649` move from `stringData` to decoded `data`.
+- `farsight/cli/internal/cli/run_test.go:932-937` changes in the same way.
+- `farsight/cli/internal/cli/manifests_test.go` (new) has `TestEveryRenderedStreamPassesTheApplyChecks`. It runs through `kube.SplitStream` every renderer's output **and every stream a command composes and sends**:
+  - `renderWorkload` (`fatline.go:931-944`);
+  - TechnoCore's `deploy.Render` with its appended `technocore-namespaces` seed, exactly as `kernel deploy` composes it (`kernel.go:317-342`);
+  - `meterManifest` (`kernelmeter.go:137-153`), as `kernel meter` and `run` send it;
+  - `RenderConfigMap` (confirmations);
+  - `datasphere/deploy.Render`;
+  - `RenderPolicyConfigMap`;
+  - `translate` with and without storage wired;
+  - `planck/build`'s and `planck/fetch`'s workloads;
+  - from M2.3, the reader RBAC, in each of its compositions (§7.2);
+  - from M2.8, the Git credential Secret.
+
+  It fails on any refusal, so a rendered `stringData`, an unknown kind, a missing namespace or a YAML anchor all fail the build. This is the test ADR 0023:89 and Verification 1 name.
+
+---
+
+## 6. The migration command (M2.7)
+
+### 6.1 Name, flags and modes
+
+```
+farcast migrate <instance> [--plan | --confirm sha256:<64 hex>]
+```
+
+| Mode | Behaviour |
+|---|---|
+| Interactive (a TTY, no flag) | Prints the plan's human rendering (§9.6), then `This cannot be undone. Type the instance name to migrate it:`. The typed name is compared exactly, as `release` does (`release.go:412-439`) [read]. |
+| `--plan` | Prints the plan and writes nothing. It is the one plan read as the **writer**, because it lists Secrets' metadata, which the reader is never granted (§7.3). Its `cluster_identity` is `"writer"`. This is a dated exception to ADR 0023:112-113 (§11). |
+| `--confirm <d>` | Recomputes the plan as the writer and compares digests, then migrates |
+| `--yes` or `-y` | Usage error: `migrate cannot be run with --yes: it rewrites live objects and cannot be undone; review 'farcast migrate %s --plan', then pass --confirm <digest>` |
+| Not interactive, no flag | Usage error: `migrate needs a terminal to confirm, or --plan and then --confirm <digest>` |
+
+**For M5's broker,** which issues writer tokens only to a child started with `--confirm` (ADR 0023:112): `migrate --plan` either stays terminal-only, or the broker issues a writer token to that one plan. M5 decides; the ADR note says so.
+
+Usage text:
+> `Rewrite, once, the cluster objects an older farcast applied with kubectl's client-side apply, so this farcast can manage them with server-side apply (ADR 0023 decision 2). Each object's kubectl-client-side-apply entry is renamed to farcast's, and kubectl's last-applied annotation, which holds a copy of every applied field and of each Secret's keys, is removed. This cannot be undone. Until an instance is migrated, every command that writes to its cluster refuses.`
+
+### 6.2 Which objects need it
+
+**Discovery** runs as the writer. For each kind of §5.1, one cluster-wide list with the label selector, metadata only: `ListObjects(k, "", "app.kubernetes.io/managed-by=farcast")`, which `k.ListPath("")` sends to every namespace at once. `migrate` reaches these calls only through `migrateCommand.newCluster`'s `migrateCluster` (§0), whose `ListMeta`, `GetMeta` and `PatchManagedFields` are `kube.Client`'s `ListObjects`, `GetObject` and `PatchJSON` (§2.3). §6 names the `kube` calls.
+
+Every object FarCast renders carries that label. This was checked for each template document [read], and for the kernel's ConfigMaps at `technocore/kernel/namespaces.go:119` and `confirmations.go:125` [read]. But not every namespace does: only `run`'s namespaces and the system Namespace documents are labelled (`planck/translate/workload.go:21-25`) [read], while `kernel deploy --namespaces` meters any existing namespace (`kernel.go:233-242`) and `kernel meter` renders a RoleBinding into each one it adds (`kernelmeter.go:137-153`; `technocore/deploy/deploy.go:270-290`) [read]. A discovery that listed only labelled namespaces would leave those RoleBindings unmigrated: the next write would see their client-side trace, §6.6 would clear the record, and `migrate` would find nothing and record it again, forever. The writer holds `container.admin` [map], so cluster-wide lists are allowed. `TestMigrationFindsARoleBindingInAnUnlabelledNamespace` covers it.
+
+**An object needs migration** when it carries the label and either of these:
+- `kube.ClientSideManagers` is non-empty: every managed-fields entry with operation `Update` that owns the path `f:metadata.f:annotations.f:kubectl.kubernetes.io/last-applied-configuration`, as kubectl's own migration selects them (`migrateToSSAIfNecessary`: `csaupgrade.FindFieldsOwners(…, ManagedFieldsOperationUpdate, lastAppliedAnnotationFieldPath)`, `pkg/cmd/apply/apply.go:905-926`, kubectl v0.37.2) [doc], plus `kubectl-client-side-apply` by name when it has an `Update` entry;
+- the annotation `kubectl.kubernetes.io/last-applied-configuration` is present.
+
+The label alone never selects an object. The pin and the kernel's own ConfigMaps (`technocore-ledger`, `technocore-profiles`) also carry it, but they were written by create, replace, PUT or POST, own no annotation and have no client-side apply entry [map]. They are therefore left alone. That is required: a rewrite would race the kernel's resourceVersion-guarded PUT.
+
+**Other managers** on a selected object are listed in the plan and never rewritten. They include the kernel's, `kubectl-scale` and `kubectl-label` from runbook edits, and the scale subresource's entry. Fields they own stay theirs.
+
+### 6.3 The managed-fields rewrite
+
+This is a port of `k8s.io/client-go/util/csaupgrade` (`upgrade.go`, client-go v0.37.2) [doc], with `csa` the object's `ClientSideManagers` set and `ssa = "farcast"`, in `kube.UpgradeManagedFields`. Like csaupgrade's `UpgradeManagedFields`, which loops over its `csaManagerNames` (`upgrade.go:80-110`) [doc], it runs these steps once per name in the set, in the set's sorted order:
+1. Copy the entries.
+2. Find the SSA entry: `manager == ssa && operation == "Apply" && subresource == ""`.
+3. If there is none, find the first entry with `manager == name && operation == "Update" && subresource == ""`. If none is found, the entries are returned unchanged. Otherwise set its `operation = "Apply"` and its `manager = ssa`. Its fieldsV1 is kept as is, and so are its `time` and `apiVersion`.
+   - csaupgrade's comment says "managed fields are sorted so that most recent is first in the list" [doc], but the API server sorts them by operation, then by time ascending, then manager, apiVersion and subresource (`sortEncodedManagedFields`, apimachinery v0.37.2 `pkg/util/managedfields/internal/managedfields.go:194-224`) [doc]. So with several matching entries the oldest is converted. FarCast objects carry one client-side entry, at one apiVersion [inf], so the port keeps csaupgrade's first-match rule.
+4. Union the fields: find an entry with `manager == name`, `operation == "Update"`, `subresource == ""` and the same `apiVersion` as the SSA entry. If one exists, the SSA entry's fieldsV1 becomes `UnionFields(ssa.fieldsV1, csa.fieldsV1)`.
+5. Remove every remaining entry with `manager == name`, `operation == "Update"` and `subresource == ""`, including those of another apiVersion, as csaupgrade discards "all other Update managers of the same name" [doc].
+
+**Added by FarCast, and not in csaupgrade:**
+- The SSA entry's fieldsV1 loses the annotation's path through `RemoveField(f, "f:metadata", "f:annotations", "f:kubectl.kubernetes.io/last-applied-configuration")`.
+- The patch also removes the annotation itself. csaupgrade does neither [doc: client-go v0.37.2 `util/csaupgrade/upgrade.go` never touches the annotation].
+
+**csaupgrade's caveat 3**, quoted: "Client-side apply tends to own more fields (including fields that are defaulted), this will possibly remove this defaults, they will be re-defaulted, that's fine" (`upgrade.go:72-73`) [doc]. After the rename, farcast owns the fields defaulted at decode too. The first forced apply after migration, which omits them, releases them and the server re-defaults them. Whether that changes a pod template, and so rolls a workload, is checked by `TestFirstApplyAfterMigrationChangesNoGeneration` (§10.6) and on Autopilot by W3 (§10.7).
+
+**`UnionFields` and `RemoveField`** follow the FieldsV1 trie rules [inf from the format; the real-Kubernetes test verifies them]:
+- A node is a JSON object.
+- An empty object `{}` means the path is a member of the set, with no children.
+- A non-empty object has children keyed `f:`, `k:`, `v:` or `i:`, plus an optional `".":{}` that marks the path itself as a member.
+- **Union** of two nodes: a node is a member when either input is (an empty `{}` counts as one), and its children are the recursive union of both sides' children. It is written as `{}` when it has no children, and otherwise as its children plus `".":{}` when it is a member. Keys are written in sorted order.
+- **Remove:** delete the leaf key. Then walk back up: a parent that is now empty and was not a member (it had no `"."`) is deleted too.
+
+`kube.MigrationPatch(o, csa, ssa)` returns a JSON patch (RFC 6902), or nil when `UpgradeManagedFields` changes nothing and there is no annotation:
+
+```json
+[{"op":"replace","path":"/metadata/managedFields","value":[…]},
+ {"op":"replace","path":"/metadata/resourceVersion","value":"<the read one>"},
+ {"op":"remove","path":"/metadata/annotations/kubectl.kubernetes.io~1last-applied-configuration"}]
+```
+
+The third operation is present only when the annotation is. The resourceVersion `replace`, rather than a `test`, is csaupgrade's own choice: "Use "replace" instead of "test" operation so that etcd rejects with 409 conflict instead of apiserver with an invalid request" (`upgrade.go:165-166`) [doc]. The patch is sent by `PatchJSON` as `PATCH <path>?fieldManager=farcast&fieldValidation=Strict`, with `Content-Type: application/json-patch+json`. It never carries an empty list: "setting the `managedFields` to an empty list will not reset the field" [doc].
+
+**Expected end state.** After the patch, the object shows:
+- no entry of any name in its `ClientSideManagers` set with operation Update;
+- no annotation;
+- exactly one `farcast` entry, with operation Apply;
+- no `farcast` entry with operation Update.
+
+**Why it is read back.** If the submitted managedFields list does not decode, the API server keeps the live list without any error, and still applies the annotation's removal in the same patch: "If the managed field is empty or we failed to decode it, let's try the live object. This is to prevent clients who don't understand managedFields from deleting it accidentally" (apimachinery v0.37.2 `fieldmanager.go`, `decodeLiveOrNew`); `UpdateNoErrors` also keeps the live list on any error [doc]. A decodable list needs, per entry, operation `Apply` or `Update`, a non-empty apiVersion and fieldsType `FieldsV1` (`managedfields.go`, `DecodeManagedFields`) [doc]. So `kube.MigratedEndState` checks the PATCH answer and then a fresh `GetObject`. The SSA page warns: "The `.metadata.managedFields` field is managed by the API server. You should avoid updating it manually" [doc]. That is why the end state is read back and verified (§6.4), and tested on a real API server (§10.6).
+
+Whether removing the annotation in the same request leaves a `farcast`/Update entry is **unverified**. If the real-Kubernetes test finds that it does, the annotation's removal moves to a second request, and this section is revised before M2.7 lands.
+
+### 6.4 The resourceVersion guard and the retry policy
+
+- **The plan's facts.** The plan binds each object as `{api, kind, namespace, name, uid, csa_managers[], csa_fields_sha256, annotation, other_managers[]}`.
+  - `csa_fields_sha256` is the SHA-256 of the client-side entries' fieldsV1 bytes, in list order. FieldsV1 names fields, never their values.
+  - `annotation` is a **boolean**: whether the last-applied annotation is present. Its value is never hashed, printed or bound: on a Secret it holds every key (ADR 0023:59). Discovery asks for metadata only (§2.1); a server that sends more is decoded into metadata only.
+  - It does **not** bind resourceVersions: a Deployment's resourceVersion moves with every status change, so a crash-looping application could never be confirmed [inf].
+- **Per object, under `--confirm`, in discovery order:**
+  1. `GetObject`; check that the uid, the `ClientSideManagers` set and `csa_fields_sha256` still match the plan;
+  2. `MigrationPatch`, then `PatchJSON`;
+  3. `MigratedEndState` on the answer, then on a fresh `GetObject`. Against `kubetest`'s ordinary emulation the answer is the stored object, so the first call already refuses a silently kept list (`TestMigrationRefusesASilentlyIgnoredRewrite`). `TestMigrationReadsBackAfterAnAnswerThatLooksMigrated` proves the read-back on its own: a `WithHandler` (§2.2) answers the PATCH with the migrated object, while the store keeps the client-side entry and the annotation, and only the fresh `GetObject` refuses.
+  - A 409 re-reads and retries, up to **5 attempts per object**, 200 ms apart, as long as the uid and the client-side hash still match.
+  - A mismatch stops the migration, with kind `plan_changed` and the message `%s %s/%s changed since the plan was made (another writer applied it); %d of %d objects were migrated and the rest were not; run 'farcast migrate %s --plan' again`.
+  - An end-state failure stops it, with kind `cluster_rejected` and the message `%s %s/%s did not come back migrated (%s); nothing after it was touched`, wrapping `kube.ErrNotMigrated`. The parenthesis is `MigratedEndState`'s text, which names only managers, operations and the annotation's key, such as `kubectl-client-side-apply/Update still present; annotation kubectl.kubernetes.io/last-applied-configuration still present`, and never an annotation's value. Discovery and every read-back decode the annotation into memory (`ObjectMeta.Annotations`, `technocore/kube/types.go:20`) [read], and metadata-only answers still carry annotations [inf], so no error, human line or `-o json` field is built from that value. `TestMigratePlanCarriesNoSecretByte` covers an end-state failure too: `kubetest` keeps the annotation, with a marker in it, and the marker is absent from the error, the human output and the `-o json` envelope.
+- **Resumable.** Objects already migrated have no client-side entry and no annotation, so a second `migrate` skips them. A migration that stopped partway is finished by running it again.
+- **Recording.** Only when every object's read-back end state has been verified does the record gain `server_side_apply: {since, farcast}`, through `UpdateInstanceMetadata` (`instance.go:790-810`). That write also drops any `gcloud_account` left over (§2.5).
+- **Deleted on success,** each listed in the plan as a `local` fact:
+  - `instances/<n>/kubeconfig.yaml`;
+  - `instances/<n>/gke_gcloud_auth_plugin_cache`, the plugin's token cache beside it, per the test model at `farsight/cli/internal/cli/plugintoken_test.go:94-96` [read].
+
+### 6.5 How the instance records it, and how other commands refuse
+
+- **Recording.**
+  - `metadata.yaml`'s `server_side_apply` is set by `migrate`.
+  - It is also set by `install` (M2.7): a fresh instance has no client-side history, so `install` sets `since` to the record's creation time.
+  - It is a local record, so another machine's copy of the record is refused until that machine runs `migrate`, which finds nothing to rewrite and records it. That fails closed (D4).
+- **Refusal.**
+  - Every cluster-writing command checks it immediately after it loads the record, before any prompt, mint or cluster call. A precheck that needs no record may run before it, as `kernel deploy`'s carried-image precheck does (`kernel.go:198-202`) [read].
+  - The commands are:
+    - `connect`, on a first deploy;
+    - `redeploy`;
+    - `kernel deploy`, `kernel meter` and `kernel confirm`;
+    - `storage deploy`;
+    - `storage key pin` and `storage key rotate`;
+    - `run` and `build`;
+    - `reader grant`;
+    - `git-credential set` and `git-credential rm` (M2.8).
+  - `connect` on a connected instance and `connect --status` write nothing to the cluster, so they never refuse.
+  - The check is `refuseUnmigrated(name string, meta *config.InstanceMetadata) error` in `cli/migrate.go`.
+  - Pin writers refuse too, although their write is not an apply (D6).
+- **The message, kind `not_migrated`:**
+  > `instance %q was last written by kubectl's client-side apply, and this farcast writes with server-side apply; run 'farcast migrate %s --plan' to review the one-time rewrite, then 'farcast migrate %s --confirm <digest>'. Nothing was written.`
+
+### 6.6 The safety net for writes after migration
+
+After M2, a pre-M2 farcast on another machine can still client-side-apply a migrated instance ([map]: risk 6 of the identity map). So:
+- **Detection.** Every `Apply` response is checked for a `kubectl-client-side-apply` entry or the annotation, and `cluster.Client.Traces()` lists each such object.
+- **Reaction.** Each writing command ends with `afterWrites(env, name, cl)` (in `cli/migrate.go`). If any traces exist, it prints `Warning: %s still carries kubectl's client-side apply (another farcast, or kubectl, wrote it since this instance was migrated); the next write will refuse until 'farcast migrate %s' runs again.`, and clears `server_side_apply` with `UpdateInstanceMetadata` (D4).
+
+### 6.7 Irreversibility, stated in the plan
+
+The `migrate` fact carries `"irreversible": true`, and the human rendering prints it first (§9.6). It ends with this paragraph:
+> `This cannot be undone. Which fields kubectl's client-side apply owned is lost when its entry is renamed; csaupgrade, kubectl's own routine for the same rename, says "This operation is not reversible". A farcast older than this one must not write to the instance afterwards: its client-side apply would copy each Secret's keys back into an annotation.`
+
+### 6.8 The stuck-fields test
+
+This is `TestMigrationRemovesAFieldLaterDroppedFromTheManifest`, in the real-Kubernetes suite (§10.6) **[decided: P4]**. For each case it:
+1. seeds v1 as kubectl's client-side apply would leave it: a `POST` with `fieldManager=kubectl-client-side-apply` and the annotation, then a strategic-merge `PATCH` with that manager, emulating a second apply. A runbook variant seeds with a real `kubectl apply` from the test environment's own kubectl (§10.6);
+2. runs the migration on it;
+3. applies v2 with the field removed, `force=true`;
+4. asserts the field is gone from the live object, and the §6.3 end state.
+
+Its cases ([map] §4):
+- a Deployment losing its second container (Shrike) and its volume and mount;
+- a container argument removed from an atomic `args` list (`--adapt`);
+- an `env` entry removed;
+- a label removed (`farcast.sofmon.com/instance`);
+- a Secret `data` key removed, starting from a v1 rendered with `stringData:`, the pre-M2.2 egress Secret;
+- a ConfigMap `data` key removed;
+- a NetworkPolicy egress rule removed.
+
+**Companion cases** are listed in §10.6.
+
+---
+
+## 7. Identity
+
+### 7.1 The writer
+
+- **The token** comes from `credentials.yaml`'s `service_account_key` (`config/instance.go:486-489`), parsed by `kube.ParseServiceAccountJSON` and paired by `kube.New` (§3.2). This is the installer service account, one per project, holding `container.admin` (`docs/runbooks/phase-1-validation.md:64-85` [map]). Its key is a Google-created download (`phase-1-validation.md:86`, `keys create`) [read].
+- **It is project-wide.** A writer token from one instance's key can write every FarCast cluster in the same project. "Bound to the instance" (ADR 0023:109) holds only from M3b, and the README and the ADR's dated note say so. §3.1's region check stops a record from pointing it at a cluster in another region. The plan's target (§9.3) detects a cluster that was replaced between plan and confirm. Neither detects a record that names another FarCast cluster in the same region; that stays open until a uid is recorded (Not settled here). Neither narrows what the token could do elsewhere.
+- **Install refuses a blank key from M2.7** (D13; Q12, decided: accepted). `install` without `--credentials` becomes a usage error: `--credentials is required: since ADR 0023 M2 farcast writes to the cluster as the service account whose key it names, and never as Application Default Credentials`. The prompt text "blank = ADC" (`install.go:56,305` [map]) goes. Google API calls keep their ADC fallback until M3b (`planck/internal/providers/gke/registry.go:518-524`).
+
+### 7.2 The reader: names, commands, key, Cloud Shell step, RBAC
+
+*Amended 2026-11-15 by A17-4 to A17-8: five reviews, a failed review records nothing, the reader opened before consent, what the RBAC binds and where, and the commands as built.*
+
+*Amended by §15 (A15-8).*
+
+**Who creates what:**
+- The human creates the Google service account, its IAM role and the key upload, once per instance, in Cloud Shell (ADR 0023:114, :233).
+- farcast generates the key pair and applies the Kubernetes RBAC.
+
+The installer cannot do the human's part. None of its roles includes `iam.serviceAccounts.create`, `iam.serviceAccountKeys.create` or project `setIamPolicy` [map; unverified].
+
+**Three organization constraints bear on the reader.**
+- **Two block key upload:** the managed constraint `iam.managed.disableServiceAccountKeyUpload`, and the legacy `iam.disableServiceAccountKeyUpload`, of which Google says "If your organization was created on or after May 3, 2024, this constraint is enforced by default" ([doc](https://docs.cloud.google.com/resource-manager/docs/organization-policy/restricting-service-accounts)). They govern the reader and not the installer, whose key is a Google-created download.
+- **The expiry constraint,** `iam.serviceAccountKeyExpiryHours`, governs every key created after it is set, the installer's too: it sets "an expiry time for all newly created keys" ([doc](https://docs.cloud.google.com/resource-manager/docs/organization-policy/restricting-service-accounts)). For an upload Google says: "If the `iam.serviceAccountKeyExpiryHours` organization policy constraint is enforced for your project, then the key that you upload needs to expire within the time period specified in the constraint … If the `-days` value is greater than the time period specified in the constraint, then the command will fail" ([doc](https://docs.cloud.google.com/iam/docs/keys-upload)).
+
+So an instance whose installer key works can still be unable to get a reader, and under Q4 (a) it then has no `world`, `ps`, `costs`, `usage` or `logs`. The init script checks both upload constraints before it changes anything. `--days` fits the expiry constraint when it is 24h or more (step 3). The records' qualifier names both upload constraints (§11).
+
+**Names.** In `farsight/cli/internal/cli/reader.go`:
+- `readerName(name) = "farcast-reader-" + hex(sha256([]byte(name)))[:8]`: 23 characters, within Google's rule that "The ID must be between 6 and 30 characters, and can contain lowercase alphanumeric characters and dashes" ([doc](https://docs.cloud.google.com/iam/docs/service-accounts-create)). Instance names can be 32 characters (`install.go:26` [map]), so the name is hashed, never embedded.
+- `readerEmail(name, project) = readerName(name) + "@" + project + ".iam.gserviceaccount.com"`.
+- **The record is checked before anything is rendered from it**, and again at render time, by one helper in `reader.go`: `checkedReader(meta *config.InstanceMetadata) (project, email, keyID string, err error)`. Every printed Cloud Shell line goes through it: the init and rotate scripts, `reader record`'s delete line, and `release`'s lines (below). It requires:
+  - the instance name passes `validateInstanceName` (`install.go:371-395`) [read];
+  - the project matches Google's project-ID shape `^[a-z][a-z0-9-]{4,28}[a-z0-9]$` [unverified from memory; the probe walk's project passes it];
+  - the email is `readerEmail(name, project)`, rebuilt from those two, never `meta.Reader.Email`'s bytes;
+  - any stored `key_id` matches `^[0-9a-f]{40}$`.
+
+  `install` stores `--project` as given (`install.go:153-157`) [read], and `world`'s `validInstanceName` refuses only path separators (`world.go:245-247`) [read], so without this check a quote or `$(` in a hand-edited record would run in an Owner's shell. `SA` and `EMAIL` are built only from the checked values, and every substituted value on every printed line is single-quoted. Refusal: `instance %q's record holds a %s that is not one Google issues (%q); farcast renders nothing from it`. `release` never refuses on it (below).
+- **The certificate is rendered only from a parsed one.** `LoadReaderCert` (for the rotate script, `reader.crt.next`), then `pem.Decode` must yield exactly one block, of type `CERTIFICATE`, with no headers and nothing after it. (`pem.Decode` leaves nothing after a block that `pem.EncodeToMemory` wrote, and leaves every following line, such as `FARCAST_CERT`, as its rest [ran: go1.27.4].) `pem.Decode` also skips any text before the BEGIN line [ran: go1.27.4], so the parse alone does not remove it; only the re-encoding does. Then `x509.ParseCertificate`: its public key must be RSA-2048 and equal to `reader.key`'s public key (`reader.key.next`'s for the rotate script), and its subject must be exactly `CN=unused`. The script carries `pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})` and nothing else, so no line of the file can end a here-document early and run in the Owner's shell. Otherwise it refuses, rendering nothing:
+  - for `reader.crt`: `instances/%s/reader.crt is not the certificate of this instance's reader key; delete instances/%s/reader.key and reader.crt, then run 'farcast reader init %s' again`;
+  - for `reader.crt.next`: `instances/%s/reader.crt.next is not the certificate of this instance's next reader key; run 'farcast reader init %s --rotate' again`.
+
+**`farcast reader init <instance> [--rotate] [--days N]`** (M2.3) is local only. It writes nothing remote and needs no plan.
+1. **Without `--rotate`:**
+   - if `meta.Reader == nil`, it makes a key (steps 3–4) and records `Reader = {Email: readerEmail(name, meta.Project), KeyID: "", GrantedAt: zero}` through `UpdateInstanceMetadata`;
+   - if `meta.Reader != nil` and `KeyID == ""`, it makes no key and prints the init script again from the stored `reader.crt`, rendered only from a parsed certificate (above). If `reader.key` is absent, nothing was recorded as uploaded from it, so it makes a key (steps 3–4) and keeps the record;
+   - if `KeyID != ""`, it refuses: `instance %q already has a reader (%s); --rotate makes a new key and prints the script that uploads it`.
+2. **With `--rotate`:** it refuses unless `meta.Reader != nil` and `KeyID != ""`. It makes a key and writes it with `SaveNextReaderKey` as `reader.key.next` and `reader.crt.next`. The record is not changed: `KeyID` and `GrantedAt` stay, so every read keeps working with the old key until `reader record` switches over.
+3. `--days N`: the certificate's lifetime in days, default 365, from 1 to 3650. It must fit any `iam.serviceAccountKeyExpiryHours` in force; the init script cannot read that constraint for the operator, so the README says to pass `--days` when it is enforced. The constraint takes only `1h`, `8h`, `24h`, `168h`, `336h`, `720h`, `1440h` or `2160h` ([doc](https://docs.cloud.google.com/resource-manager/docs/organization-policy/restricting-service-accounts)). The default 365 exceeds all of them, so wherever it is enforced the operator passes a `--days` no greater than its days, at most 90. At `1h` or `8h` no reader key can be made, because `--days` counts whole days, and the reader cannot be set up.
+4. `kube.NewReaderKey(crypto/rand.Reader, now − 1h, days)`:
+   - RSA-2048, because the 2LO header is always RS256 (`vendor/cloud.google.com/go/auth/auth.go:71`) [read], and Google takes "an RSA public key that is wrapped in an X.509 v3 certificate" [doc];
+   - PKCS#8 PEM for the key;
+   - a self-signed X.509 certificate whose template sets only `SerialNumber` (128 random bits), `Subject` `CN=unused`, `NotBefore` and `NotAfter = NotBefore + days × 24 h`. No key usage, no extended key usage, no other attribute. Google asks: "use a generic subject, and do not add any optional attributes", with the example `-subj "/CN=unused"` [doc](https://docs.cloud.google.com/iam/docs/keys-upload). `TestReaderCertificateIsGeneric` pins that the subject holds no instance or account name. Whether upload needs a key usage is left to the probe walk (§10.8).
+   - **The key expires with its certificate.** "To set the expiry time of the key, use the `-days` value in the command that you use to generate the X.509 certificate" [doc]. So `credential_refused` after N days is expected, and `reader init --rotate` is its remedy.
+5. It prints the init or the rotate script (below) to stdout, preceded on stderr by `Paste this into Cloud Shell as a project Owner (sha256 %s). It holds only the public certificate.` With `-o json` it prints `{"instance","email","script","script_sha256","script_kind"}`, where `script_kind` is `init` or `rotate`.
+
+**The init script, exactly** (the values are substituted; the comment lines are part of it):
+
+```sh
+sh -s <<'FARCAST_READER'
+# FarCast: the read-only identity for instance <name> (ADR 0023 M2).
+# Public material only. Run once, as an Owner of project <project>.
+set -eu
+PROJECT='<project>'
+SA='<SA>'
+EMAIL="$SA@$PROJECT.iam.gserviceaccount.com"
+retry() {
+  n=0
+  until "$@"; do
+    n=$((n + 1))
+    if [ "$n" -ge 6 ]; then
+      echo "FarCast: gave up after 6 tries: $*" >&2
+      return 1
+    fi
+    sleep $((n * 8))
+  done
+}
+if [ "$(gcloud resource-manager org-policies describe iam.disableServiceAccountKeyUpload \
+    --effective --project "$PROJECT" --format 'value(booleanPolicy.enforced)' 2>/dev/null)" = True ]; then
+  echo "FarCast: project $PROJECT blocks service-account key upload (organization policy iam.disableServiceAccountKeyUpload); its reader cannot be set up until an organization administrator allows it. Nothing was changed." >&2
+  exit 1
+fi
+if [ "$(gcloud org-policies describe iam.managed.disableServiceAccountKeyUpload \
+    --effective --project "$PROJECT" --format 'value(spec.rules[0].enforce)' 2>/dev/null)" = True ]; then
+  echo "FarCast: project $PROJECT blocks service-account key upload (organization policy iam.managed.disableServiceAccountKeyUpload); its reader cannot be set up until an organization administrator allows it. Nothing was changed." >&2
+  exit 1
+fi
+gcloud iam service-accounts describe "$EMAIL" --project "$PROJECT" >/dev/null 2>&1 ||
+  gcloud iam service-accounts create "$SA" --project "$PROJECT" \
+    --display-name 'FarCast reader for <name>'
+retry gcloud projects add-iam-policy-binding "$PROJECT" --condition=None \
+  --member "serviceAccount:$EMAIL" --role 'roles/container.clusterViewer' >/dev/null
+CERT="$(mktemp)"
+cat > "$CERT" <<'FARCAST_CERT'
+<certPEM>
+FARCAST_CERT
+KEY_ID=$(retry gcloud iam service-accounts keys upload "$CERT" \
+  --iam-account="$EMAIL" --project "$PROJECT" --format 'value(name.basename())') || {
+  rm -f "$CERT"
+  echo "FarCast: the key upload was refused. The account $EMAIL and its clusterViewer binding stay; remove them with:" >&2
+  echo "  gcloud projects remove-iam-policy-binding '$PROJECT' --condition=None --member 'serviceAccount:$EMAIL' --role 'roles/container.clusterViewer'" >&2
+  echo "  gcloud iam service-accounts delete '$EMAIL' --project '$PROJECT' --quiet" >&2
+  exit 1
+}
+rm -f "$CERT"
+echo
+echo "Now run, on the machine that holds this instance:"
+echo "  farcast reader record <name> --key-id $KEY_ID"
+FARCAST_READER
+```
+
+The managed constraint's check, `gcloud org-policies describe … --effective` with `value(spec.rules[0].enforce)`, is spelled from memory: its spelling and output are **[unverified]**, like the legacy check's (below), and the probe walk runs both (§10.8).
+
+**The rotate script, exactly.** It creates nothing and grants nothing:
+
+```sh
+sh -s <<'FARCAST_READER'
+# FarCast: a new key for the read-only identity of instance <name> (ADR 0023 M2).
+# Public material only. It creates nothing and grants nothing.
+set -eu
+PROJECT='<project>'
+EMAIL='<email>'
+retry() { <the same function> }
+CERT="$(mktemp)"
+cat > "$CERT" <<'FARCAST_CERT'
+<certPEM of reader.crt.next>
+FARCAST_CERT
+KEY_ID=$(retry gcloud iam service-accounts keys upload "$CERT" \
+  --iam-account="$EMAIL" --project "$PROJECT" --format 'value(name.basename())')
+rm -f "$CERT"
+echo
+echo "Now run, on the machine that holds this instance:"
+echo "  farcast reader record <name> --key-id $KEY_ID"
+FARCAST_READER
+```
+
+What the scripts rest on:
+- **A child shell.** Each runs as `sh -s` on a here-document, never in the operator's interactive Cloud Shell, so `set -eu` and a failure exit only the child, and leave the operator's shell as it was.
+- **Idempotent creation.** `describe || create`, so a second init, or a reinstall under the same name, reuses the account. That `create` fails for an existing account, with 409, is [unverified].
+- **Retries.** "After you create a service account, you might need to wait for 60 seconds or more before you use the service account", and Google advises retrying "with exponential backoff" ([doc](https://docs.cloud.google.com/iam/docs/service-accounts-create)). `retry` waits 8, 16, 24, 32 and 40 s, about two minutes in all. A retried upload whose first attempt landed without an answer could leave a second key; `keys list` shows it [inf].
+- **Flags.** `keys upload KEY_FILE --iam-account=…` is Google's spelling [doc](https://docs.cloud.google.com/iam/docs/keys-upload). Its output format `value(name.basename())`, and the `org-policies describe … --effective` spelling and output, are **unverified**; the probe walk runs both first (§10.8). If a policy check itself fails, its output is empty, the script carries on, and the upload fails with Google's own message. An upload refused anyway, by either constraint or for any other reason, leaves the account and its clusterViewer binding: the script then prints the two lines that remove them (the same lines `release` prints, below) and exits 1.
+- **Tests:**
+  - `TestReaderScriptParses` runs `sh -n` on each rendered script and on its body, skipped when `/bin/sh` is absent;
+  - `TestReaderScriptRunsInAChildShell`: the first line is `sh -s <<'FARCAST_READER'`, the last is `FARCAST_READER`, and `set -eu` appears only between them;
+  - `TestReaderRotateScriptCreatesNothing`: no `service-accounts create` and no `add-iam-policy-binding`;
+  - `TestReaderScriptHoldsNoPrivateKey`;
+  - `TestReaderScriptRefusesAnUnsafeRecord`, with a quote and a `$(` in the project and in the name, and five `reader.crt` rows. Four must render nothing: a file whose block is followed by a line `FARCAST_CERT` and a line `$(id)`; one whose block is followed by a line `FARCAST_READER`; one holding a `PRIVATE KEY` block; and one whose certificate's key is not `reader.key`'s. The fifth, a file whose valid block is preceded by the lines `FARCAST_CERT` and `$(id)`, must render, and its script must be byte-equal to the one rendered from the clean file, with no `FARCAST_CERT` line between the here-document delimiters. (A `FARCAST_READER` line before the block is skipped by `pem.Decode` like the fifth row's lines, and renders the clean script [ran: go1.27.4].);
+  - `TestPrintedCloudShellLinesRefuseAnUnsafeRecord`, for `release` and for `reader record`: a `$(` in the project, a `;` in the stored `key_id`, and a `$(` in the recorded email. No printed line carries the marker; `release` prints its fallback line, and `reader record` refuses before it changes anything. With only the email unsafe, `release` prints the derived email.
+
+**`farcast reader record <instance> --key-id <id>`** (M2.3) is local only.
+- `--key-id` must match `^[0-9a-f]{40}$`. Google's sample key id, `c7b74879da78e4cdcbe7e1bf5e129375c0bfa8d0`, is 40 lowercase hex [doc]; a different shape is refused with `the key id %q is not the 40 hex characters Google prints`.
+- It refuses if `meta.Reader == nil`, or if `meta.Reader.Email` is not `readerEmail(name, meta.Project)` (§3.5), or if `checkedReader` refuses the record, before it changes anything.
+- **After an init:** it sets `Reader.KeyID`.
+- **After a rotate** (`reader.key.next` exists): it refuses an id equal to the current `KeyID` (`that is the key in use; record the id the rotate script printed`). Otherwise it calls `PromoteNextReaderKey`, sets `KeyID`, and keeps `GrantedAt` and `Scope`, because the RBAC subject is the same email. It then prints `The previous key %s still works. Once 'farcast world %s' reads, delete it from Cloud Shell: gcloud iam service-accounts keys delete '%s' --iam-account '%s' --project '%s'`, with the previous key id, the email and the project all from `checkedReader`.
+- `TestRotateKeepsReadsWorkingUntilRecorded` (M2.3): the fixture's reader is granted (`GrantedAt` set, §3.5). After `--rotate`, a read through `openCluster`'s reader branch (`NamespacesLabelled`) against `kubetest` still mints with the old key: the `/token` request's `KeyID` is the old one. The test then registers `reader.crt.next`'s public key with `AddKey`, runs `reader record`, and the next read mints with the new key and its `KeyID`.
+
+**`farcast reader grant <instance>`** (M2.3) is a cluster write, as the writer. It is newly automated: nothing in FarCast grants a Google identity Kubernetes RBAC today; the only RoleBindings it renders bind in-cluster ServiceAccounts (`technocore/deploy/binding.go`) [read]. So `--yes` never covers it (§9.5).
+1. From M2.7, `refuseUnmigrated` (§6.5).
+2. It refuses if `meta.Reader == nil` or `KeyID == ""`, or if the email is not the derived one.
+3. It renders `renderReaderRBAC(email string, namespaces []string) ([]byte, error)` (`farsight/cli/internal/cli/readerrbac.go`), with `farcast-system` and every namespace in `meta.Kernel.Namespaces` **[decided: P3]**. Under P3's alternative it takes no namespaces: `renderReaderRBAC(email string) ([]byte, error)`.
+4. **Consent.**
+   - Interactive: one prompt that prints the `reader` fact (§9.4) **[decided: P3]**: `Grant %s, which the Cloud Shell script gave roles/container.clusterViewer, read access in %q's cluster: namespaces (list); in farcast-system and every namespace the kernel meters, now and later (today %s): deployments, statefulsets, jobs, pods and their logs, and the ConfigMaps %s?`. "Now and later" is the consent to §7.2's later bindings (below). Under P3's alternative: `Grant %s, which the Cloud Shell script gave roles/container.clusterViewer, read access to %q's whole cluster: in every namespace, kube-system and GKE's included, namespaces, deployments, statefulsets, jobs, pods and their logs, and the ConfigMaps %s?`.
+   - `--yes`: usage error, `reader grant cannot be run with --yes: it gives a Google identity read access to the cluster; confirm it in a terminal, or review 'farcast reader grant %s --plan' and pass --confirm <digest>`. Until M2.6 the message ends at "in a terminal".
+   - Not interactive, no flag: usage error, `reader grant needs a terminal to confirm` (from M2.6: `, or --plan and then --confirm <digest>`).
+5. It applies the RBAC: through `newApplier` (kubectl, as the active gcloud configuration) in M2.3–M2.6; server-side, as the writer, from M2.7.
+6. **It verifies as the reader,** through `newReader`, a `readerVerifier` (§0) opened with `Verifying: true`, so it opens whether `GrantedAt` is zero (a first grant) or set (a re-run, below) (§3.5):
+   - one read, `NamespacesLabelled(ctx, "app.kubernetes.io/managed-by=farcast")`. A 401 or 403 is retried with backoff (5, 10, 20, 40, then every 60 s) for up to 8 minutes, and the first retry prints `IAM changes typically take 2 minutes, and can take 7 minutes or longer; checking again until %s`, Google's own figures ("Typically 2 minutes, potentially 7 minutes or longer", [doc](https://docs.cloud.google.com/iam/docs/access-change-propagation));
+   - then four SelfSubjectAccessReviews as the reader, through `CanI`, each of which must answer `allowed: false`: create `deployments` in `farcast-system`; get `secrets` in `farcast-system`; patch `deployments/scale` in `farcast-system`; list `secrets` in every namespace. An `allowed: true` answer refuses: `the reader %s may %s; it is not read-only, so nothing was recorded; check the role the Cloud Shell script granted (roles/container.clusterViewer only)`. GKE authorizes an action "if they have sufficient permissions according to *either* tool", IAM or RBAC ([doc](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/role-based-access-control)), so a stronger IAM role, edited into the paste, would show here [inf: that GKE's reviews consult IAM; the probe walk checks it]. Every authenticated user may make these reviews through `system:basic-user` [doc, the same page].
+   - **A re-run that fails the reviews withdraws the earlier grant.** When `Reader.GrantedAt` is set, as when `reader grant` is run again (it is the remedy for an RBAC `forbidden`, §8.1, and it applies every binding again, below), an `allowed: true` answer first clears `GrantedAt` and `Scope` through `UpdateInstanceMetadata`, so reads refuse until a clean grant (§3.5). Its message is then `the reader %s may %s; it is not read-only, so its earlier verification was withdrawn and reads refuse until a clean grant; check the role the Cloud Shell script granted (roles/container.clusterViewer only)`, because "nothing was recorded" would be false. Any other failure records nothing. `TestReaderGrantWithdrawsAVerificationThatNoLongerHolds`: a granted reader, `WithAccess` allowing `get secrets`, and `reader grant` run again; `GrantedAt` and `Scope` are cleared, the error's message is that text, and a following `world` sends no request.
+7. On success it sets `Reader.GrantedAt = now` and `Reader.Scope = "metered"` **[decided: P3]**. On failure it returns the error with its kind, and records nothing beyond step 6's withdrawal.
+8. It gains `--plan` and `--confirm` in M2.6 (§9.4).
+
+**The reader's Kubernetes RBAC** **[decided: P3]**. Two ClusterRoles, one bound cluster-wide and holding only `namespaces list`, one bound per namespace:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: farcast-reader-namespaces
+  labels:
+    app.kubernetes.io/managed-by: farcast
+    app.kubernetes.io/part-of: farcast-reader
+rules:
+- apiGroups: [""]
+  resources: [namespaces]
+  verbs: [list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: farcast-reader-namespaces
+  labels:
+    app.kubernetes.io/managed-by: farcast
+    app.kubernetes.io/part-of: farcast-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: farcast-reader-namespaces
+subjects:
+- apiGroup: rbac.authorization.k8s.io
+  kind: User
+  name: <reader email>
+---
+# A rule set, never bound cluster-wide: each RoleBinding below grants it in one namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: farcast-reader
+  labels:
+    app.kubernetes.io/managed-by: farcast
+    app.kubernetes.io/part-of: farcast-reader
+rules:
+- apiGroups: [apps]
+  resources: [deployments, statefulsets]
+  verbs: [get, list]
+- apiGroups: [""]
+  resources: [pods]
+  verbs: [list]
+- apiGroups: [""]
+  resources: [pods/log]
+  verbs: [get]
+- apiGroups: [batch]
+  resources: [jobs]
+  verbs: [get]
+- apiGroups: [""]
+  resources: [configmaps]
+  resourceNames: [technocore-namespaces, technocore-ledger, technocore-profiles,
+                  fatline-egress-policy, datasphered-pin]
+  verbs: [get]
+---
+# One per namespace: farcast-system, and every metered namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: farcast-reader
+  namespace: <namespace>
+  labels:
+    app.kubernetes.io/managed-by: farcast
+    app.kubernetes.io/part-of: farcast-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: farcast-reader
+subjects:
+- apiGroup: rbac.authorization.k8s.io
+  kind: User
+  name: <reader email>
+```
+
+**Where each part is applied** **[decided: P3]**:
+- `reader grant`: all of it, with a RoleBinding in `farcast-system` and in every namespace of `meta.Kernel.Namespaces`.
+- `meterManifest` (`kernelmeter.go:137-153`), which `kernel meter` and `run` send: after each added namespace's kernel RoleBinding, a `farcast-reader` RoleBinding there, only when the record holds `Reader.Scope == "metered"`: the scope `reader grant`'s consent named, "every namespace the kernel meters, now and later". Its signature becomes `meterManifest(all, added []string, readerEmail string) ([]byte, error)`, with `""` when no scope is recorded.
+- `kernel deploy`: after its stream (`kernel.go:317-342`), a `farcast-reader` RoleBinding in every metered namespace, under the same condition.
+- `kernel meter`'s, `run`'s and `kernel deploy`'s results print each reader binding they add (`the reader %s may now read %s`), as the `meter` fact's `reader_bindings_created[]` lists them for plans. These commands run under `--yes`, and `kernel meter` has no prompt, so the scope recorded at `reader grant` is the consent they act on. `TestReaderBindingsFollowOnlyAConsentedScope`: with a reader recorded but no scope, `kernel meter`, `run` and `kernel deploy` add no reader binding; with the scope, each adds one per new namespace and prints it.
+- `renderReaderBinding(email, namespace string) ([]byte, error)` renders one. A namespace metered before `reader grant` gets its binding at that grant, which applies all of them again.
+
+Notes on the RBAC:
+- **The ConfigMap names** are exactly the names the read commands and the plan builders pass: `technocore-ledger` (`costs.go:89`, `world.go:440`), `technocore-profiles` (`usage.go:116`), `technocore-namespaces` (`world.go:402`), `fatline-egress-policy` (`runpolicy.go:71`) and `datasphered-pin` (`storagepin.go:149`) [read]. `technocore-confirmed` is not among them: only `kernel confirm` writes it, and nothing reads it (`kernelconfirm.go:151`) [read]. `TestReaderRoleNamesTheConfigMapsReadsUse` pins the rendered list to those call sites' constants.
+- **The subject.** A Google service account reaches GKE RBAC as `kind: User` with its email as the name ([doc](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/role-based-access-control)).
+- **Jobs: `get` only.** `run --confirm <D>` computes the deploy plan as the reader from the fetch Job in `farcast-system`: `GetJob`, then its pods' list and log (`runfetch.go:46,57,72`; `cluster.go:317-366`) [read]. Without the rule the reader could not compute D, and every deploy-stage confirm would end `forbidden`, or would have to open the writer before the compare (§7.3). The binding is per namespace, so this grants `jobs get` in `farcast-system` and the metered namespaces only.
+- **No Secret, Service, write verb or `watch`.**
+- **What it can read.** Workloads, pods and every application's stdout in the metered namespaces and `farcast-system`, through `pods/log`: the price of `logs` running as the reader (ADR 0019:66's dated note, which names "a read-only service account"). It cannot read `kube-system` or GKE's managed namespaces, as the kernel's own RBAC cannot ("A ClusterRoleBinding here would hand it every pod in the cluster, including the managed ones ADR 0003 puts out of bounds", `technocore/deploy/deploy.go:233-239`) [read]. `ps --namespace kube-system` as the reader is `forbidden`.
+- **The IAM side is project-wide.** `roles/container.clusterViewer` "Provides access to get and list GKE clusters" and holds `container.clusters.connect`, `container.clusters.get`, `container.clusters.list`, `resourcemanager.projects.get` and `resourcemanager.projects.list` ([doc](https://docs.cloud.google.com/iam/docs/roles-permissions/container)). The DNS endpoint is authorized by `container.clusters.connect` ([doc](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/latest/network-isolation)), and "The `container.clusters.get` permission is required for users to *authenticate*" ([doc](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/role-based-access-control)). So each instance's reader can connect to and get every cluster in the project; RBAC confines its reads to the clusters that bind it, which is this one. The role holds no in-cluster object permission, which matters because GKE allows what either IAM or RBAC grants. The README says so (§11).
+- **P3's alternative**, for its one local edit: one ClusterRoleBinding `farcast-reader` to the ClusterRole `farcast-reader` with `namespaces list` added, and no RoleBindings; the `jobs get` rule stays in that role; row 14's name becomes `farcast-reader`; `meterManifest` and `kernel deploy` append nothing; `Reader.Scope` is `"cluster"`; the prompt is step 4's alternative. Its cost: the reader then reads pods, logs and workloads in every namespace, `kube-system` and GKE's included, whose pod specs carry arguments such as `--bucket` and `--project` (`datasphere/deploy/deploy.go:487-490`), `--cost-limit` (`technocore/deploy/deploy.go:424`) and the repository URL (`planck/fetch/workload.go:152-156`) [read].
+
+**`release` and the reader** (M2.3). `release` deletes `reader.key` with the instance directory (`release.go:217`; `config/instance.go:528-530`, `os.RemoveAll`) [read], but the account, its uploaded keys and its project-level binding stay in Google. So when `meta.Reader != nil`:
+- the release gate lists `the reader service account %s, which stays in Google until you delete it`;
+- the result prints, for Cloud Shell, with `<project>` and `<email>` from `checkedReader` (above), never from the record's bytes, and every value single-quoted:
+  ```
+  gcloud projects remove-iam-policy-binding '<project>' --condition=None \
+    --member 'serviceAccount:<email>' --role 'roles/container.clusterViewer'
+  gcloud iam service-accounts delete '<email>' --project '<project>' --quiet
+  ```
+  The binding is removed first, because a deleted account's binding stays in the policy [unverified]; deleting the account deletes its keys [unverified].
+- **`release` never refuses on a failed check.** When `checkedReader` refuses the record, the gate and the result print, in place of the email and the lines, `the reader service account recorded for %q cannot be printed safely; in Cloud Shell, list the project's service accounts and delete %s, after removing its roles/container.clusterViewer binding`, where the second `%s` is `readerName(name)`: `farcast-reader-` and 8 hex characters, never a record value. No other value is taken from the record, and `release` goes on.
+- ADR 0023's "What stays outside the app" gains the line (§11). `TestReleaseNamesTheReaderAccount` covers both, and `TestPrintedCloudShellLinesRefuseAnUnsafeRecord` (above) the fallback.
+
+### 7.3 Who reads, the rule's scope, and its tests
+
+| Call | Identity |
+|---|---|
+| `world`, `ps`, `costs`, `usage` and `logs` (their cluster reads) | Reader. Without one they refuse with `credential_missing` (Q4 (a), decided, per ADR 0023 decision 3's heading). `usage` opens no storage: its other half is the tunnel (`usage.go:98-130`, `usagenet.go:38-45`) [read]. |
+| `--plan` of every cluster-writing command but `migrate` | Reader, for the cluster reads. The installer key, for the Google reads (registry, buckets, IAM state), until M3b. |
+| `--confirm` of those | The recomputation reads as the plan's read identity (`cluster_identity`, §9.3). The writer is opened only after the digest comparison, for the writes. |
+| `migrate --plan` and `migrate --confirm` | Writer (it lists Secrets' metadata, §6.1) |
+| Interactive and `--yes` runs of cluster-writing commands | Writer, for reads and writes |
+| `storage ls`, `storage usage`, `storage cp` downloads and `secret ls` | The installer key, through `storage.Open` (`farsight/cli/internal/storage/storage.go:87,97`; `storage.go:307,445`; `secret.go:171-175`) [read], until M3b |
+
+**The rule's scope in M2** (MC-9, option (a), decided). ADR 0023:113 extends "reads never open the CA key" to "reads never mint an admin token". In M2 that holds for the cluster reads of `world`, `ps`, `costs`, `usage` and `logs`, and the cluster reads of every `--plan` but `migrate`'s. It does not yet hold for plans' Google reads, for `migrate --plan`, or for the storage and secret reads in the last row. A dated ADR 0023 note records this, and what M5's broker must do (§11):
+- `migrate` stays terminal-only, or the broker issues a writer token to that one plan;
+- plans' Google reads move to a scoped identity at M3b.
+
+**A plan that reads the cluster needs a granted reader.** Without one it refuses, kind `credential_missing`: `'farcast %s --plan' reads the cluster as instance %q's reader, whose state is %s; run 'farcast reader init %s', the printed Cloud Shell script, 'farcast reader record' and 'farcast reader grant', or run the command in a terminal`. `run --confirm` uses §9.4's own message instead, because run's `--plan` reads no cluster. The state is `instances`' reader state (§8.2). A first `connect --plan` and `reader grant --plan` read no cluster, so they need none (§9.4).
+
+**Tests:**
+- `TestWorldNeverOpensAWriterCredential` (M2.4). It extends `TestInstancesAndWorldNeverOpenTheCAKeyOrTheKeyring` (`farsight/cli/internal/cli/nosecrets_test.go:41-107`):
+  - **Setup.** The fixture is a loopback instance against `kubetest`. It has a writer `credentials.yaml` whose key is registered under id `writer` as `writer@kubetest.invalid`, and a reader key registered under id `reader` with the derived loopback email.
+  - **It asserts:** `credentials.yaml` is never in `config.ObserveReads`' list; `reader.key` is in it; every request the server saw has `As == "reader"`; no `/token` assertion carried the writer's `iss`.
+- `TestReadCommandsPresentOnlyTheReaderToken` (M2.4): the same assertions, all of them, for `ps`, `costs`, `logs` and `usage`.
+- `TestPlansPresentOnlyTheReaderToken` (M2.6): for every `--plan` but `migrate`'s, every request the cluster fake saw has `As == "reader"`, and no `/token` assertion carried the writer's `iss`. It asserts nothing about `credentials.yaml`.
+- `TestPlansStillReadTheInstallerKeyForGoogle` (M2.6) states the documented exception. For the plans with Google facts (`connect`, `redeploy`, `kernel deploy`, `storage deploy`, `run` and `build`), `credentials.yaml` **is** in `ObserveReads`' list; for `kernel meter`, `kernel confirm`, `storage key pin`, `storage key rotate` and `reader grant`, it is not. M3b flips it on purpose.
+- `TestConfirmRecomputesAsThePlansIdentity` (M2.6): `kernel deploy --plan` and then `--confirm` against one `kubetest` server give equal digests; the requests before the comparison carry `As == "reader"`, and the writes after it `As == "writer"`. It has two `run` cases, for the deploy plan D (§9.4): `run --confirm <F>`, where the fetch Job's apply is `As == "writer"` and every read that computes D after it, the Job's `GET` included, is `As == "reader"`; and `run --confirm <D>`, where every request before D's comparison is `As == "reader"`.
+- `TestEveryReaderReadIsAllowedByTheRenderedRBAC` (M2.6) **[decided: P3]**: `kubetest` runs with `WithRBAC(<reader email>, renderReaderRBAC(…))` (§2.2), and `world`, `ps`, `costs`, `usage`, `logs` and every plan whose `cluster_identity` is `reader`, `run --confirm <D>`'s recomputation included, see no 403. A read the role does not grant, such as the fetch Job without the `jobs` rule, fails it.
+
+### 7.4 `pin-gcloud` and the gcloud identity guard, retired (M2.4)
+
+**Deleted:**
+- `farsight/cli/internal/cli/gcloud.go` (287 lines) and `gcloud_test.go`. `envValueOf` (`gcloud.go:87`), which `world.go:226` uses, moves to `world.go` first.
+- `plugintoken_test.go`. Its successor is `TestWorldPresentsOnlyTheReaderToken` (§10.2).
+- From `instances.go`: `pin`, `pinResult`, `--account` and the GCLOUD column (`instances.go:35-77,109,138,180-260` [map]).
+- `cluster.GCloud` and the pinned branch of `cluster.Env` (`env.go:10-18,91-103`).
+- `world.go`'s guard at `:162-176`, the gcloud directory in `localPaths` at `:216-240` (`choice.Dir`), and the account scrub at `worlddoc.go:592-594`. `emailLike` (`worlddoc.go:585`) still scrubs the reader's email.
+
+**`farcast instances pin-gcloud …`** becomes a usage error (exit 2):
+> `pin-gcloud was retired by ADR 0023 M2: farcast reads each instance's cluster as its own read-only service account ('farcast reader init'), so there is no gcloud account to pin.`
+
+The `instances` usage text (`instances.go:31-50`) loses its pin paragraph. "Whether a gcloud account is pinned" becomes "whether a reader identity is recorded".
+
+**Existing records:** `gcloud_account` is ignored on read and dropped at the next save (§2.5). A pre-M2 `world` on the same machine then refuses with `gcloud_mismatch`. That is documented in the CLI README's upgrade note, and is R6.
+
+---
+
+## 8. Error kinds and documents (M2.4)
+
+### 8.1 The kinds
+
+*Amended by §15 (A15-1: `unsafe_environment`).*
+
+The rule is kept: "a kind, once shipped, keeps its meaning, and a new failure gets a new kind" (`kinds.go:12-16`) [read].
+
+**Retired** (never emitted again; their names are never reused): `kubectl_missing`, `kubectl_failed`, `gcloud_mismatch`, `gcloud_signed_out`, `auth_tool_missing`.
+
+```go
+// retiredKinds were shipped and are emitted no longer (ADR 0023 M2). A new kind
+// never takes one of these names.
+var retiredKinds = []string{"kubectl_missing", "kubectl_failed", "gcloud_mismatch", "gcloud_signed_out", "auth_tool_missing"}
+```
+
+**Added**, each with the meaning its README row carries, verbatim:
+
+| Const | Kind | Means |
+|---|---|---|
+| `kindCredentialMissing` | `credential_missing` | the instance holds no usable stored credential for the identity the call needs: no installer key (an ADC install), no reader recorded or uploaded, a reader not yet verified read-only by `reader grant`, a reader email that is not the derived one, a missing `reader.key`, or a key file that is not a service-account key |
+| `kindCredentialRefused` | `credential_refused` | Google's token endpoint refused to mint a token from the stored key: the key is deleted, disabled or expired (a reader key expires with its certificate), its recorded key id is wrong (Google may reject it), or the clock is far off |
+| `kindEndpointRefused` | `endpoint_refused` | the recorded cluster endpoint, its CA file and the credential do not pair (ADR 0023 decision 2's rule), or no endpoint is recorded; nothing was sent |
+| `kindClusterUnreachable` | `cluster_unreachable` | the cluster's API server, or the token endpoint the call needs first, did not answer: DNS, connection or TLS failure |
+| `kindUnauthorized` | `unauthorized` | the API server refused the token (401), after one fresh token |
+| `kindForbidden` | `forbidden` | the API server refused the identity this read or write (403): by RBAC when the answer is a Kubernetes Status, otherwise at the endpoint |
+| `kindClusterRejected` | `cluster_rejected` | the API server answered with any other error: a 4xx other than 401 and 403, a 5xx, or a 429 after retries; or an object did not come back as a write left it |
+| `kindDocumentUnreadable` | `document_unreadable` | the cluster returned, or holds, a document that does not decode. This is the successor of `kubectl_failed`'s second meaning (`costs.go:152`, `runpolicy.go:97`, `world.go:419`). |
+| `kindRolloutStalled` | `rollout_stalled` | a Deployment reported that it exceeded its progress deadline |
+| `kindNotMigrated` | `not_migrated` | the instance was last written with client-side apply; run `farcast migrate` (§6.5) |
+| `kindPlanChanged` | `plan_changed` | a `--confirm` digest is not the plan's digest now, or something the plan bound changed before a write it covers, or the plan's inputs expired |
+| `kindApplyConflict` *(only under P1's alternative (b))* | `apply_conflict` | a non-forced apply met a field another manager owns |
+
+A missing endpoint is `endpoint_refused`, never `not_connected`, whose meaning stays "no FatLine recorded, so no tunnel" (§3.5).
+
+**The order of `errorKinds`, and of the README table:**
+1. `record_unreadable`
+2. `not_found`
+3. `not_connected`
+4. `tunnel_unreachable`
+5. `kernel_absent`
+6. `not_checkpointed`
+7. `version_skew`
+8. `credential_missing`
+9. `credential_refused`
+10. `endpoint_refused`
+11. `cluster_unreachable`
+12. `unauthorized`
+13. `forbidden`
+14. `cluster_rejected`
+15. `document_unreadable`
+16. `rollout_stalled`
+17. `not_migrated`
+18. `plan_changed`
+19. `timeout`
+20. `internal`
+
+That is 20, or 21 with `apply_conflict` inserted after `cluster_rejected` under P1's (b) **[decided: P1]**.
+
+**`clusterKind(err error) string`** replaces `kubectlKind` (`kinds.go:92-108`). The order is significant:
+1. `context.DeadlineExceeded` or `kube.ErrTimedOut` → `timeout`
+2. `errCredentialMissing` or `kube.ErrCredentialInvalid` → `credential_missing`
+3. `kube.ErrEndpointRefused` → `endpoint_refused`
+4. `kube.ErrTokenRefused` → `credential_refused`
+5. `kube.ErrUnreachable` → `cluster_unreachable`
+6. `tkube.ErrUnauthorized` → `unauthorized`
+7. `tkube.ErrForbidden` → `forbidden`
+8. `kube.FieldConflicts` → `apply_conflict` (P1's (b) only)
+9. `kube.ErrUnreadable` → `document_unreadable`
+10. `kube.ErrRolloutStalled` → `rollout_stalled`
+11. `kube.ErrNotMigrated` → `cluster_rejected`
+12. any `*kube.APIError` → `cluster_rejected`
+13. an existing `output.Kinded` → its kind
+14. otherwise `""`
+
+`kube.ErrRefusedDocument` is a FarCast rendering bug, so it maps to `internal`.
+
+**`classified`** (`kinds.go:72-84`) gains one step: if nothing in the chain is Kinded and `clusterKind(err) != ""`, wrap it with that kind. **Writing commands' envelopes stop being `internal` for in-process cluster failures** from M2.5; the transitional kubectl `Apply` stays `internal` until M2.7 (§0).
+
+**`world`'s fatal set** (`world.go:313-314`) becomes `credential_missing`, `credential_refused`, `endpoint_refused`, `unauthorized` and `cluster_unreachable`. `forbidden` is not fatal, because RBAC is per object. `timeout` behaves as today.
+
+**`world`'s reader-related refusals** are section-level, not envelopes. The cluster sections carry the kind, and the tunnel sections read on their own. This replaces `gcloud_mismatch`'s whole-command refusal, so the vector `error_gcloud_mismatch.json` goes (§8.3).
+
+**`kubectlReadTimeout`** (`world.go:31`) is renamed `clusterReadTimeout`, with its value unchanged at 20 s.
+
+**The CLI's message for `forbidden`** appends one sentence by the 403's shape (`kube.APIError.KubernetesStatus`): an RBAC refusal, `run 'farcast reader grant %s'`; anything else, `the cluster's endpoint refused the identity (IAM); if the reader was just set up, IAM changes can take 7 minutes or longer, otherwise check the Cloud Shell step`. The shape of an IAM-level 403 is [unverified]; the probe walk pins it (§10.8).
+
+**Tests:**
+- `TestRetiredKindsAreNeverReused`: `errorKinds ∩ retiredKinds = ∅`, and no `kind*` constant's value is retired.
+- `TestTheREADMEDocumentsEveryErrorKind` (`kinds_test.go:17-43`) is unchanged. The README's new paragraph "Retired kinds" lists the five as a sentence, **not** as table rows beginning `` | ` ``, which that test parses.
+- `TestClusterKindIsFoundByErrorsIs`: every row of the mapping above, built from wrapped errors.
+- `TestAMissingEndpointIsEndpointRefused`.
+
+### 8.2 The documents
+
+`worldSchema` becomes `2` (`worlddoc.go:36`). It is one constant for both documents, as today (`instances.go:83`, `worlddoc.go:531`).
+
+**`instances`, schema 2** (`instances.go:122-140`):
+- `gcloud_pinned` is removed.
+- `reader` is added. It is `"none"`, `"key_missing"`, `"not_uploaded"`, `"not_granted"` or `"granted"`, worked out from `meta.Reader` and `ReaderKeyExists`, which stats the file and never opens it (`instances.go:37-41`'s "opens no credential" holds). The order of the checks:
+  1. `Reader == nil` → `"none"`;
+  2. the key file is absent → `"key_missing"`;
+  3. `KeyID == ""` → `"not_uploaded"`;
+  4. `GrantedAt` is zero → `"not_granted"`;
+  5. otherwise → `"granted"`.
+- `migrated` is added, a boolean: `meta.ServerSideApply != nil`.
+
+The human table's GCLOUD column becomes READER, and a MIGRATED column is added. An unreadable entry still carries only its name and its error (`instances.go:144-153`).
+
+**`world`, schema 2.** No field is added or removed. The bump is semantic: section errors carry the new kinds and never the retired ones. This is ADR 0023:97's "both it and the `world` document change version".
+
+### 8.3 Vectors, in lockstep with FarSightKit (M2.4)
+
+**Go testdata** (`farsight/cli/internal/cli/testdata/`):
+- `kinds/kinds.json`: regenerated with the new set.
+- `instances/empty.json` and `instances/unreadable.json`: schema 2, with `reader` and `migrated` in place of `gcloud_pinned`.
+- `world/*.json`: all at schema 2. Within them:
+  - `nothing_read.json`: its three `gcloud_signed_out` become `credential_refused`.
+  - `account_in_message.json`: `gcloud_signed_out` becomes `unauthorized`, and its two `kubectl_failed` become `forbidden` and `cluster_rejected`. The messages are rewritten to the in-process client's words. Each still names an account, so the scrub regression stays.
+  - `release_incomplete.json`: its three `kubectl_failed` become `cluster_unreachable`.
+  - `error_gcloud_mismatch.json`: deleted, and removed from `TestEveryVectorFileIsProduced`'s list (`kindsvector_test.go:38`) and from `TestWorldErrorVectors` (`cmdvectors_test.go:173-190`).
+  - `reader_missing.json`: new. A connected instance with no reader. Spend, apps and policy carry `credential_missing`; network and seal read. It is produced by `TestWorldVectors`.
+
+**FarSightKit**, in the same commit, because check.sh's `vector_copy` byte-compares them (`check.sh:389`):
+- `CLIDocuments.schema = 2` (`farsight/client/apple/FarSightKit/Sources/FarSightCore/CLI/CLIDocuments.swift:45`).
+- `SectionProblem.Kind` (`World/World.swift:224-260`): the five retired cases are removed, the new ones are added with labels, and `unknown` is kept.
+- `CLIDocuments.kind(_:)` (`CLIDocuments.swift:85-102`): the matching wire table.
+- `WireDocuments.swift:61,69`: `gcloudPinned` is replaced by `reader: String?` and `migrated: Bool?`.
+- `WorldReader.swift:46-49,85,93` and `CLIDocuments.swift:215`: carry them through.
+- `ProblemText.swift`: the gcloud and kubectl remedies go. The new remedies are:
+  - `credential_missing` → `set up the instance's reader in a terminal: farcast reader init <instance>, the printed Cloud Shell script, reader record and reader grant; farcast instances shows the reader's state`. The kind also covers a reader that is uploaded and not yet granted, for which `reader init` refuses (§7.2), so the remedy names every step;
+  - `credential_refused` → `check this machine's clock; then the key id ('farcast reader record'); a reader key expires with its certificate — farcast reader init <instance> --rotate`;
+  - `unauthorized` → `the cluster refused the reader's token: check that the Cloud Shell step granted roles/container.clusterViewer; 'farcast instances' shows the reader's state`;
+  - `forbidden` → `the reader may not read this: farcast reader grant <instance>; if the reader was just set up, IAM changes can take 7 minutes or longer`;
+  - `cluster_unreachable` → `check the network`.
+
+  `unauthorized` is an authentication failure, which `reader grant`, an RBAC fix, cannot fix; and rotation is the last remedy for `credential_refused`, not the first.
+- `CLISettings.swift`: the six fields (`:7-15`) become two, `farcast` and `configDirectory`. Saved values for the removed keys are ignored. Validation (`:107-140`) checks only those two.
+- `ChildEnvironment.swift`: `PATH` becomes `systemDirectories` alone, and `CLOUDSDK_CONFIG` is no longer set (`:44-60`).
+- `FarCast/SettingsView.swift`: the tool rows go, the pin sentence (`:240-256` [map]) becomes the reader state, and `FarCast/SetupView.swift:21`'s pin step becomes `Give each instance its reader from a terminal: farcast reader init <instance>, then the printed Cloud Shell script, reader record and reader grant.`
+- **Tests:**
+  - `VectorTests.swift:438-444`: `wire.count == 20`, or 21 under P1's (b);
+  - `ProblemTextTests`, `PanelWordingTests`, `WorldFeedTests`, `LiveModelTests` and `CLIReaderTests`, wherever they name a retired kind or `gcloudPinned` [map: `PanelWordingTests.swift:58,95-98,112,396`, `ProblemTextTests.swift:12-32`]. `ProblemTextTests`' `credential_missing` row (its `sectionSentences` table, `ProblemTextTests.swift:20-36` [read]) carries the remedy above.
+
+---
+
+## 9. The consent protocol (M2.6)
+
+### 9.1 Scope
+
+Cluster-writing commands:
+- `connect`, on a first deploy; a reconnect has a plan of Google facts only;
+- `redeploy`;
+- `kernel deploy`, `kernel meter` and `kernel confirm`;
+- `storage deploy`;
+- `storage key pin` and `storage key rotate`;
+- `run` and `build`;
+- `reader grant`;
+- `migrate` (§6), from M2.7;
+- `git-credential set` and `git-credential rm` (§9.8), from M2.8.
+
+**Out of scope for M2:** the gated commands that write only to Google or to the device. These are:
+- `install` and `release`;
+- `storage key rekey`, `storage rm -r` and `secret rm`;
+- the ungated Google writers: `storage cp`, `secret set`, `toolchain`, and a single-object `storage rm` [map].
+
+ADR 0021 decision 6 gives them a plan step too. That is ADR 0021 step 3's work (Q13, decided: later).
+
+### 9.2 Flags and modes
+
+On every in-scope command, `consentFlags` (new, `farsight/cli/internal/cli/consent.go`) registers:
+- `--plan`: print the plan of what this would do, and change nothing;
+- `--confirm <digest>`: do exactly what the plan with this digest said, refusing if it has changed.
+
+Existing `--yes` and `-y` flags are kept.
+
+| Combination | Result |
+|---|---|
+| any two of `--plan`, `--confirm` and `--yes` | Usage error (exit 2): `--plan, --confirm and --yes are three different answers; give one` |
+| `--confirm` with a malformed digest | Usage error: `--confirm takes the digest a plan printed: sha256: and 64 lowercase hex characters` |
+| `--plan` | The plan is computed and printed, and nothing is written: no cluster write, no Google write, no mint, no record or keyring write. Exit 0. |
+| `--confirm <d>` | The plan is recomputed from live state, reading as the plan's read identity (§9.3). If its digest is not `d`: kind `plan_changed`, exit 1, `the plan for this command is now %s, not the %s given to --confirm: something it binds has changed since the plan was made; run it with --plan to review the new one. Nothing was written.` If the plan carries `blocked` entries: refuse with the first entry's kind and message. Otherwise the writer is opened, and the command executes **only** from the recomputed decisions, with no prompt, and prints its usual result. |
+| none, interactive | Unchanged: today's prompts and words |
+| `--yes` | Unchanged for today's gates. It never covers a newly automated act (§9.5). |
+| none, not interactive | Unchanged usage error. Each message gains `, or --plan and then --confirm <digest>` after its `pass --yes …` clause. |
+
+`kernel confirm` and `kernel meter` keep accepting an unused `--yes` (`kernelconfirm.go:81`, `kernelmeter.go:58`). They stay ungated when interactive, as today, and gain `--plan` and `--confirm`.
+
+### 9.3 The plan document, its canonical encoding and its digest
+
+```json
+{"schema":1,"kind":"plan","generated_at":"2026-11-14T10:00:00Z","digest":"sha256:<64 hex>","bound":{…}}
+```
+
+**`Bound`**, with its fields in this order and every field always present:
+
+```go
+type Bound struct {
+	Protocol        string   `json:"protocol"`         // "farcast-plan-1"
+	FarCast         Stamp    `json:"farcast"`          // {version, commit}: currentStamp()
+	Command         string   `json:"command"`          // "kernel deploy"
+	Instance        string   `json:"instance"`
+	Target          Target   `json:"target"`
+	Stage           string   `json:"stage"`            // "" except run: "fetch" | "deploy"
+	Options         []Option `json:"options"`          // §9.4; sorted by Flag
+	ClusterIdentity string   `json:"cluster_identity"` // "reader" | "writer" | "none"
+	Facts           []Fact   `json:"facts"`            // in the order the command presents them
+	Blocked         []Block  `json:"blocked"`          // [] when none
+}
+// Target is which instance the plan is about, read from the record, and, where
+// the plan reads the cluster, from the cluster.
+type Target struct {
+	Provider           string `json:"provider"`
+	Project            string `json:"project"`
+	Region             string `json:"region"`
+	Cluster            string `json:"cluster"`
+	Endpoint           string `json:"endpoint"`
+	CreatedAt          string `json:"created_at"`           // the record's creation time, RFC 3339 UTC to the second
+	SystemNamespaceUID string `json:"system_namespace_uid"` // farcast-system's uid; "" when the plan reads no cluster
+}
+type Stamp struct {
+	Version string `json:"version"`
+	Commit  string `json:"commit"`
+}
+type Option struct {
+	Flag  string `json:"flag"`
+	Value string `json:"value"`
+}
+type Block struct {
+	Kind    string `json:"kind"`
+	Message string `json:"message"`
+}
+```
+
+- **`FarCast`** is bound, so a bundled and a terminal farcast cannot confirm each other's plans (ADR 0021 decision 6's skew concern).
+- **`Target`** is bound, so a plan reviewed against one config directory or project cannot be confirmed against another instance of the same name, or against the same name after a release and a reinstall. `Instance` alone is a local name, and `--config` and `FARCAST_CONFIG_HOME` choose the directory (`config/config.go:34`) [read]. The record holds the other fields (`config/instance.go:378-388`) [read]. Every plan that reads the cluster also reads `NamespaceUID("farcast-system")` and binds it. Plan and confirm both read these values from the record and from the cluster the record names, so the target detects a cluster that was replaced between plan and confirm. It does not detect a record that names another FarCast cluster in the same region; that stays open until a uid is recorded (§3.1; Not settled here). Interactive and `--yes` runs check no uid, and no plan whose `cluster_identity` is `none` binds one. `TestPlanFromAnotherConfigDirIsRefused`, `TestPlanAfterReinstallIsRefused` and `TestPlanAgainstAReplacedSystemNamespaceIsRefused` cover it (§10.5, row 77).
+- **`ClusterIdentity`** is the identity the command's `--plan` reads the cluster as: a constant per command, `reader` for every command whose plan reads the cluster, `writer` for `migrate`, and `none` for those that read none (§9.4). Under `--confirm` the recomputation reads as that same identity, so the digests match; the writer is opened only after the comparison, for the writes (§7.3).
+
+**`plan.Canonical(b)`:**
+- `encoding/json` with an `Encoder` that has `SetEscapeHTML(false)`, with the trailing newline stripped;
+- structs only, never a map;
+- no `omitempty` anywhere in `plan`'s types: an optional object is a pointer that encodes as `null`;
+- no floats: money is integer cents through `cents()` (`worlddoc.go:137`), CPU is integer milli, memory is integer MiB;
+- times are RFC 3339 UTC to the second (`wireTime`, `worlddoc.go:106-111` [map]);
+- arrays come in the order the command defines, which is listed per fact.
+
+**`plan.DigestOf(c) = "sha256:" + hex(SHA-256([]byte("farcast-plan-1\n") ‖ c))`.**
+
+**The document** embeds the canonical bytes as `Bound json.RawMessage`. `TestPlanDocumentCarriesTheBytesItsDigestCovers` parses a printed document, hashes its `bound` member's bytes and compares the result with `digest`. Re-encoding a `RawMessage` must therefore keep it byte for byte, and the test pins that.
+
+**No file is kept.** The recomputation itself proves freshness, so a plan has no expiry, except `run`'s deploy stage (§9.4) and a `kernel confirm` across a UTC midnight (below).
+
+### 9.4 What each plan binds
+
+**Options.** Each command binds every flag that changes behaviour, normalized to its string value, with defaults made explicit. It never binds `--plan`, `--confirm`, `--yes`, `-o`, `--config` or `--verbose`. For example, `kernel deploy` binds `adapt`, `adapt-cooldown`, `interval`, `namespaces`, `technocore-image`, `source` and `embedded`. `git-credential set` binds neither `--username` nor `--token-file`: they supply the Secret's data values, which the plan renders from placeholders (below, §9.8).
+
+**A plan's content does not depend on the terminal.** Whether stdin is a terminal is never read while a plan is computed, so `--plan` in a TTY and in a pipe give the same bytes. `TestPlanIgnoresTheTerminal` covers it.
+
+**Placeholders.** While a plan is computed, every value that would be minted, loaded as secret, or drawn from the clock is a fixed placeholder:
+- **Secret material:** the instance CA, minted by `connect.go:242` → `ensureIdentity` (`:332-372`), which in M2.6 moves behind the plan; the FatLine server leaf; the keyholder leaf (`storagedeploy.go:222` [map]); application leaves (`run.go:430` [map]); egress credentials (`runpolicy.go:44-53` [map]); a Git credential's username and token (§9.8). The placeholder is the PEM or text `farcast-placeholder:<what>:<subject>`.
+- **Key ids.** A new keyring entry's id is 8 random bytes (`datasphere/keyring.go:149-157`) [read], typed `datasphere.KeyID`, an 8-byte array rendered as hex (`keyring.go:72-75`) [read]. The pin is those ids (`storagepin.go:76-91`), and `Pin.Marshal` renders them from `[]datasphere.KeyID` (`datasphere/keyholder/pin.go:168-172`) [read], so a placeholder must be a `KeyID`, not a string. Every key-encryption key a command would mint, in `storage deploy`'s first keyring, `storage key rotate` and `run`'s new scopes, gets the placeholder id `datasphere.KeyID(sha256("farcast-placeholder:key:<scope>:<n>")[:8])`, numbered from 1 in mint order. It is held in a `KeyEntry` whose `Created` is one second after the newest key already in its scope, placeholders included, or `time.Unix(0, 0).UTC()` for a scope with no key yet. `pinFor` decides `Retired` from `Created` (`storagepin.go:83-88`) and `NewKey` sets it from the clock (`keyring.go:150`) [read], so with these entries `pinFor` and `Pin.Marshal` run unchanged in both renderings. The `pin` fact and its `write` sha256 are rendered from those, and the human rendering prints such an id as `new key <n> of <scope>`.
+- **The clock.** `kernel confirm` renders `AsOf: now` into the ConfigMap (`kernelconfirm.go:106,135`; `technocore/kernel/confirmations.go:96-97`) [read]. `AsOf` becomes the UTC day the confirmation is made, `dayStart(now)`, on every path. It is informational, "when the provider produced it" (`technocore/cost/ledger.go:58`) [read], so the day is enough. A plan made on one UTC day and confirmed the next is `plan_changed`, the boundary `--to`'s default already has (`kernelconfirm.go:116`) [read]. No other rendered document carries a clock value [read: the renderers of §5.1].
+
+Each `write` fact's `sha256` is taken over its document rendered that way. Under `--confirm`, the plan is computed with the same placeholders and compared. Only then are the real values minted and rendered, and only those documents are written (D9).
+
+**What may differ between the placeholder rendering and the real one** is exactly this list, and nothing else:
+1. a Secret's `data` values;
+2. the pod template annotation `farcast.sofmon.com/mtls-hash` (`fatline/deploy/deploy.go:372`; `datasphere/deploy/deploy.go:445`), a fingerprint of the certificates and keys (`fatline/deploy/deploy.go:208,263-269`; `datasphere/deploy/deploy.go:293-299`) [read];
+3. the key ids in `datasphered-pin`'s data, each 16 hex characters, which the test masks as such; the `require` and `retired` arrays keep their lengths.
+
+`TestConfirmWritesThePlannedDocumentsExceptTheirSecrets` renders every stream both ways, masks only those three, and requires the rest to be byte-equal. Because a new mTLS hash rolls the component's pods, the plan says so: whenever it carries a `mint` of `instance_ca`, `fatline_leaf` or `keyholder_leaf`, it carries a `restart` fact for that component.
+
+`TestPlanIsDeterministic` runs each command's plan twice against the same fakes and compares the canonical bytes. Its cases include `storage key rotate`, a first `storage deploy`, a `run` that mints a scope, and `kernel confirm` across two clock readings on the same day.
+
+**The fact types.** Each struct's first field is `Type string `json:"type"``:
+
+| Type | Fields (in order) |
+|---|---|
+| `cost` | `currency, period, limit_cents, standing[{what, replicas, cpu_milli, mem_mib, month_cents, max_month_cents}], one_off[{what, jobs, cpu_milli, mem_mib, deadline_s}], floor_month_cents, below_floor, pricing{region, as_of}`. `max_month_cents` is null except for the keyholder's figure (`storagedeploy.go:298-311` [map]). `below_floor` is a fact the operator consents to by confirming, never a block. |
+| `image` | `component, action, target, go, current{image, origin, farcast, go}` (or null), `replaces_other_version, source{dir, go_path, go_version}` (or null). `action` is one of `named`, `build_source`, `keep_operator`, `keep_development`, `reuse`, `push`, `push_over_foreign`, `build_development`, following rules 1–6 of `resolveImage` (`fatline.go:440-536`). `target` is `repo@<compiled manifest digest>`, or `farcast-placeholder:source-build:<component>` for a source build, whose digest exists only after compiling. |
+| `write` | `api, kind, namespace, name, method, force, resource_version, sha256`. `method` is `apply`, `create`, `replace` or `delete`. `resource_version` is `""` except for `replace`, and for the merge-base ConfigMaps whose content the rendering depends on, as the pin does at `storagepin.go:148-160` [read]. |
+| `mint` | `what, subject`. `what` is one of `instance_ca`, `fatline_leaf`, `keyholder_leaf`, `keyring`, `key`, `app_leaf`, `egress_credential`, `app_scope`. |
+| `restart` | `component, because`: `because` is `new mTLS material: the pod template's farcast.sofmon.com/mtls-hash changes` |
+| `cloud` | `service, action, target`. `service` is `artifactregistry` or `storage`. `action` is one of `create_repository`, `set_pull_grant`, `push_image`, `create_bucket`, `set_bucket_grant`. |
+| `grant` | `name, target, principal, roles[], state, apply`. `name` is `bucket` or `push`. `state` is `present`, `missing` or `unknown`. M2.8 adds this fact. |
+| `kernel_settings` | `adapt, adapt_cooldown_s, interval_s, namespaces[]` (in command order) |
+| `meter` | `add[], remove[], bindings_created[], bindings_left[], reader_bindings_created[]` (`kernelmeter.go:46-53`; the last **[decided: P3]**) |
+| `confirmation` | `from, to, amount_cents, as_of_day, windows_after[{from, to, amount_cents}]` (`kernelconfirm.go:111-140`) |
+| `pin` | `require[], retired[], lowering` (the pin `writePin` would write) |
+| `rotation` | `new_keys` (a count), `handover_replicas` |
+| `fetch` | `repository, ref, manifest, job, fetcher` |
+| `run` | `job_uid, commit, manifest_digest, namespace, replaces_repository, apps[{name, containerfile, context, external[{host, reason}]}], other_deployments_kept[], metering_added`. Apps and hosts come in manifest order. |
+| `build` | `repository, ref, app, containerfile, context, tag, destination` |
+| `application_reset` **[decided: P1]** | `namespace, app, state, limit_reached, replicas_live, replicas_after, requests_live{cpu_milli, mem_mib}, requests_after{cpu_milli, mem_mib}`. `state` is `stopped`, `adapted` or `unknown`. `limit_reached` is true when the ledger's `observed.level` is `cost.LevelReached.String()`, or a level `levelOf` maps to unknown, and for an unreadable ledger (§5.4). |
+| `reader` | `email, iam_role, scope, namespaces[], resources[], configmaps[]` **[decided: P3]**. `scope` is `metered`: `farcast-system` and every namespace the kernel meters, now and later (§7.2); `namespaces[]` are today's. `resources[]` is the role's per-namespace grant in its rule order: `deployments`, `statefulsets`, `pods`, `pods/log`, `jobs`. Under P3's alternative `scope` is `cluster` and `namespaces[]` is empty. |
+| `migrate` | `objects[{api, kind, namespace, name, uid, csa_managers[], csa_fields_sha256, annotation, other_managers[]}], local[], irreversible`. `annotation` is a boolean (§6.4). |
+| `git_credential` | `action, namespace, name` (`action` is `set` or `rm`). Never the username or the token, nor any hash of either: the plan names the Secret by namespace and name only, never its bytes (§9.8). |
+| `notice` | `text`: the exact words the command prints, such as `keepingNote` (`fatline.go:728-749`) and the replacing note (`:751-770`) |
+
+**Per command:**
+
+| Command | `cluster_identity` | Facts, in order | Cluster reads in `--plan` | Blocked |
+|---|---|---|---|---|
+| `connect` (first deploy) | `none` | `cost`; `image` (fatline); `image` (shrike); `mint`s; `restart` (fatline); `cloud` (registry ensure, pull grant, pushes); `write` ×6 (the stream from `fatline.go:931-944`); `notice`s | none | `not_release` (from `checkCarried`, `fatline.go:333`) |
+| `connect` (connected) | `none` | `cloud` (the registry ensure that `connect.go:252` runs on every non-status connect) | none | — |
+| `redeploy` | `none` | `image` ×2; `mint`s and `restart` when it re-mints; `cloud` (pushes); `write` ×6; `notice`s | none | `not_release` |
+| `kernel deploy` | `reader` | `cost` (with `below_floor`); `image`; `kernel_settings`; `cloud`; `write` ×N (`kernel.go:317-342`, and the reader RoleBindings **[decided: P3]**); `notice`s | `Namespaces`, `NamespaceUID` | a namespace that does not exist (`kernel.go:233-243`). Below the floor is not a block: it is `cost.below_floor`, which today's `--yes` already deploys past (`kernel.go:484-492`) [read]. |
+| `kernel meter` | `none` | `meter`; `write` ×N (`kernelmeter.go:137-153`); with `--remove`, the notice `the cost guard stops counting %s` | none: `kernel meter` reads no namespace today (`kernelmeter.go:61-129`) [read], and its plan adds none | — (a RoleBinding into a missing namespace fails at the apply, as today) |
+| `kernel confirm` | `none` | `confirmation`; `write` ×1 | none | — |
+| `storage deploy` | `reader` | `cost`; `image`; `cloud` (bucket); `mint`s (the keyholder leaf, a first keyring's keys); `restart` (keyholder); `grant` (bucket, M2.8); `write` (pin, `create` or `replace` at its resourceVersion); `write` ×N; `notice`s | `ConfigMapData` (pin), `NamespaceUID` | — |
+| `storage key pin` | `reader` | `pin`; `write` (pin) | `ConfigMapData`, `NamespaceUID` | — |
+| `storage key rotate` | `reader` | `rotation`; `mint` (keys); `write` (pin) | `ConfigMapData`, `NamespaceUID` | — |
+| `run`, stage `fetch` | `none` | `fetch`; `cost` (one-off); `image` (fetcher); `write` ×3 | none | the existing pre-fetch refusals (`run.go:150-185`) |
+| `run`, stage `deploy` | `reader` | the fetch stage's facts; `run`; `cost`; `image` (builder); `grant` (push, M2.8); `mint`s (app leaves, egress credentials, new scopes' keys); `write`s (builds, policy at its resourceVersion, workloads, meter); when storage is wired and scopes are minted, `write` (pin, `create` or `replace` at its resourceVersion) and the notice `the new scopes are handed to the keyholder replicas that are serving; which replicas answer is decided when the deploy runs, outside this plan`; `application_reset`s **[decided: P1]**; `notice`s | the fetch Job and its report in `farcast-system` (`GetJob`, then `ListPods` by its selector and the log of its pod, `runfetch.go:46,57,72`); the policy, the pin, `technocore-namespaces`, `technocore-ledger` **[decided: P1]**; `Namespaces`, then, in the target namespace when it exists and is metered, the live application Deployments (`DeploymentState`, §5.4) **[decided: P3]**; `NamespaceUID` | the existing post-fetch refusals (`run.go:211-226`); a target namespace that exists and is not metered (§5.4) **[decided: P3]** |
+| `build` | `none` | `build`; `cost`; `image` (builder); `grant` (push, M2.8); `write` ×3 | none | — |
+| `reader grant` | `none` | `reader`; `write` ×(3 + 1 per namespace) **[decided: P3]** | none | `Reader == nil`, `KeyID == ""`, or an email that is not the derived one |
+| `migrate` | `writer` | `migrate` | §6.2's discovery | — |
+| `git-credential set` | `none` | `git_credential`; `write` ×1 | none | — (a name FarCast's renderers use is a usage error before any plan is computed, §9.8) |
+| `git-credential rm` | `none` | `git_credential`; `write` (`delete`) | none | — |
+
+`run`'s pin write is the one `raiseScopePin` makes through `writePin` once the hand-over has checked the keyring (`run.go:532-566`, `:607-614`) [read]. Under `--confirm` it is written only if that check passes, as today; if it does not, `run` warns as today and the write is not made.
+
+**Plan builders.** Each command's computation moves into `func (c *<cmd>) plan(ctx context.Context, env *Env, …) (prepared<Cmd>, plan.Bound, error)`. `prepared<Cmd>` holds every decision the run executes. The interactive, `--yes` and `--confirm` paths all call it. The prompts print from `prepared`'s values. Execution reads only `prepared`.
+
+**The image refactor.** `resolveImage` (`fatline.go:459-536`) and `carriedImage` (`:538+`) split into two:
+- `decideImage(…) (imageDecision, error)`, which makes only `Resolve` calls;
+- `realizeImage(ctx, imageDecision) (resolvedImage, error)`, which pushes or builds.
+
+`resolvedImage` (`:434-437`) is unchanged.
+
+**Plans never write.** connect's `ensureIdentity` (`connect.go:242`) and `ensureRegistry` (`:252`), and redeploy's pre-gate pushes (`redeploy.go:162-187`), move into `realize…` steps that run after the gate.
+
+**`run`'s two stages (D7):**
+- `run --plan` prints the `fetch` stage.
+- `run --confirm <d>` computes the fetch plan F.
+  - **If `d == F.digest`:** it applies the fetch Job, waits, reads the report, computes the deploy plan D, and prints D (exit 0). Nothing beyond the fetch is written.
+  - **Otherwise:** it `GetJob`s the fetch Job by the deterministic name F binds (`fetch.go:186-193` [map]). It **never re-applies it**. If the Job is absent, the result is `plan_changed`: `the in-instance read that plan was made from is gone (a fetch Job is kept 15 minutes); run 'farcast run … --plan' again`. If present, it reads the report, computes D, and executes when `d == D.digest`; otherwise `plan_changed`.
+- **D is computed by a reader client in both paths:** after F's writes under `--confirm <F>`, and before the comparison under `--confirm <D>`. Its reads include the fetch Job and its report, which the reader's `jobs get` rule allows (§7.2). Under `--confirm <D>` the writer opens only after D's comparison, for the writes. The fetch Job's apply under `--confirm <F>` is the one write made as the writer before a D exists, so `--confirm <F>` refuses before that apply, and `--confirm <D>` before its `GetJob`, when the instance has no granted reader. §7.3's refusal would name `'farcast run --plan'`, which is the fetch stage and reads no cluster, so both use run's own pinned message, of kind `credential_missing`: `'farcast run --confirm' computes the deploy plan as instance %q's reader, whose state is %s; run 'farcast reader init %s', the printed Cloud Shell script, 'farcast reader record' and 'farcast reader grant', or run 'farcast run' in a terminal. Nothing was written.` The state is `instances`' reader state (§8.2). `TestPlanWithoutAReaderIsRefused` has a `run --confirm <F>` row, which asserts this message and that the fetch Job is not applied, and a `run --confirm <D>` row, which asserts this message and that the server saw no request.
+- So a deploy digest is valid only while its fetch Job exists, which is 900 s (`fetch.go:63` [map]). D binds the Job's `uid`, so a Job re-created by another run changes the digest.
+- Interactive and `--yes` runs are unchanged, except for §5.4's gate **[decided: P1]**.
+
+### 9.5 `--yes`, `--embedded`, and the writes after the comparison
+
+**Newly automated in M2:**
+- the migration;
+- `reader grant`;
+- `git-credential set` and `rm`;
+- the bucket grant (M2.8) **[decided: P2]**;
+- under `--confirm`, the replacement of a component another farcast version deployed.
+
+**`--yes` covers none of the first four.** `migrate --yes`, `reader grant --yes`, `git-credential set|rm --yes` and `storage deploy --grant-bucket --yes` are usage errors (§6.1, §7.2, §9.8, §9.7).
+
+**`--embedded`** (ADR 0023:141):
+- **Under `--confirm`:** the `image` fact's `replaces_other_version: true` is the consent. The skew refusal at `fatline.go:556-571` is lifted when the plan being executed lists the replacement, whether or not `--embedded` is given.
+- **Under `--yes` and interactive runs:** `--embedded` is still required, as today. `--yes` never implies it (`fatline.go:185`).
+- **In the version-skew case alone,** a plan made without `--embedded` and one made with it differ only in `options`, so either can be confirmed. For an operator-built image, `--embedded` stays a behaviour-changing option: without it, rule 4 keeps the recorded image (`fatline.go:493`) [read], so the image fact's `action` differs too. A development build is kept or replaced according to whether this farcast carries components (`fatline.go:494`) [read], never according to `--embedded`.
+
+`TestConfirmCoversTheReplacementItsPlanListed` and `TestYesNeverReplacesAnotherVersionWithoutEmbedded` pin both.
+
+**Writes after the comparison are checked against the plan.** Under `--confirm` a command executes only from the recomputed decisions, so nothing it writes later may fall outside them:
+- **The pin.** `writePin` makes one attempt, at the plan's resourceVersion. A 409 is `plan_changed`, with no union and no retry: `the instance's key pin changed since the plan was made; nothing was written over it; run … --plan again`. A re-read that shows exactly the planned pin counts as success, because that is a write that landed and lost its answer. Interactive and `--yes` runs keep today's three-attempt loop, which unions with a concurrent raise (`storagepin.go:184-233`) [read].
+- **Application Deployments:** §5.4's re-read, immediately before the workload apply **[decided: P1]**.
+- **The egress policy.** Immediately before its apply, `run` reads it again with `ConfigMapData` and refuses with `plan_changed` if its resourceVersion is not the plan's `write` fact's `resource_version`. That leaves a window of one read and one apply [inf]. If §10.6's `TestApplyRefusesAStaleResourceVersion` passes, M2.7 closes it: `fldeploy.RenderPolicyConfigMap` gains a resourceVersion parameter, as `dsdeploy.RenderPin` already takes one (`storagepin.go:215`) [read], and the document is split with `kube.AllowResourceVersion(rv)`. If it does not pass, the window stays, and risk 7 names it.
+- **Tests:** `TestConfirmNeverWritesAPinThePlanDidNotList`, `TestConfirmRefusesAnAppStoppedAfterTheCompare` **[decided: P1]**, `TestConfirmRefusesAPolicyChangedAfterTheCompare`.
+
+**Push access stays a human step.** The plan reports the push grant's state and never applies it (`buildgrant.go:52-61` [read]).
+
+### 9.6 The human rendering of `--plan`
+
+Each fact prints as one to three lines in the command's own words. Most reuse today's prompt text, such as `confirmCost` (`connect.go:458-472`) and `describeRedeploy` (`redeploy.go:278-287` [map]).
+- **The order:** `blocked` entries first; then the header below; then every fact with `irreversible: true`; then the rest in the plan's order.
+- **The header** carries every field of `Bound` outside `facts` and `blocked`, so the operator sees which project and cluster the plan writes to:
+  ```
+  instance %s: provider %s, project %s, region %s, cluster %s, endpoint %s (recorded %s); farcast-system %s
+  farcast %s %s, stage %s, reading the cluster as %s
+  options: --%s=%s, …
+  farcast %s (commit %s), plan protocol %s
+  ```
+  The first line is `Instance`, then `Target`'s fields in order (`provider`, `project`, `region`, `cluster`, `endpoint`, `created_at`); its last `%s` is `system_namespace_uid`, or `not read` when it is `""`. The second is `Command`, `Instance`, `Stage` (`-` when `""`) and `ClusterIdentity`. The third lists `Options` in their bound order, or `options: none`. The fourth is the `FarCast` stamp and `Protocol`.
+- **What must show.** The operator consents by reading this text, so every bound value must appear in it. `TestEveryBoundFactIsRendered` is a table over every fact type and every field, except the `sha256` fields and the placeholders, and over every field of `Bound` outside `facts`: `protocol`, `farcast`, `command`, `instance`, every field of `target`, `stage`, `options`, `cluster_identity` and `blocked`. It asserts that each value appears in the human text. A new fact type or a new `Bound` field without a row fails it.
+
+The rendering ends with:
+
+```
+digest: sha256:…
+To do exactly this: farcast <the same arguments> --confirm sha256:…
+```
+
+`<the same arguments>` is the argv with `--plan` removed, quoted as the shell needs.
+
+### 9.7 The bucket grant through the plan (M2.8; Choice 7) **[decided: P2]**
+
+- **The flag.** `storage deploy` gains `--grant-bucket`. Its help text: `offer the keyholder's bucket grant in the plan, and apply it under --confirm (never with --yes)`.
+  - It is accepted with `--plan` and with `--confirm`.
+  - It is refused otherwise, `--yes` included: `--grant-bucket is applied only under --confirm, from a plan that lists it ('farcast storage deploy %s --plan --grant-bucket'); or run the printed commands yourself`.
+  - `TestBucketGrantNeedsConfirm` covers all four.
+- **The fact, always present.** The plan always carries `grant{name:"bucket", target:"gs://<bucket>", principal, roles:["roles/storage.objectAdmin","roles/storage.legacyBucketReader"], state, apply}`.
+  - `principal` is built as in `storagedeploy.go:365-368`, with the project **number** looked up in-process. `planck/internal/providers/gke/registry.go:670-682`'s `projectNumber` is exported through the provider as `ProjectNumber(ctx) (int64, error)`. The printed command then no longer needs `gcloud projects describe`.
+  - `state` comes from the bucket's IAM policy, read as the installer: `GET https://storage.googleapis.com/storage/v1/b/<bucket>/iam?optionsRequestedPolicyVersion=3`, which needs `storage.buckets.getIamPolicy` ([doc](https://docs.cloud.google.com/storage/docs/json_api/v1/buckets/getIamPolicy)). The version is "Required to be 3 or greater for buckets with IAM Conditions", and for buckets Google says a request for an older version than the policy needs fails [doc]. The repository's registry code asks for 3 because, for a repository, a lower version omits conditional bindings and writing the result back deletes them (`planck/internal/providers/gke/registry.go:82-87`) [read].
+    - `present` when both roles have an unconditioned binding that holds the principal;
+    - `missing` otherwise;
+    - `unknown` on a 403.
+  - `apply` is `--grant-bucket`.
+- **Under `--confirm`, with `apply: true` and state `missing`:**
+  1. Read the policy, version 3, with its `etag`. Bindings are kept as raw JSON.
+  2. Add the principal to each role's unconditioned binding, creating one if needed. A binding that carries a `condition` is never rewritten, and every other binding is written back byte for byte.
+  3. `PUT https://storage.googleapis.com/storage/v1/b/<bucket>/iam` with `version: 3` and the etag. The method "replaces any existing IAM policy set on a bucket", and the etag is "Optional" ([doc](https://docs.cloud.google.com/storage/docs/json_api/v1/buckets/setIamPolicy)).
+  4. A 409 or a 412 is a stale etag [unverified: the page names neither]. It re-reads once. If both bindings are then present, it is done; otherwise it retries once.
+  5. A 403 is `forbidden`, with the message `the stored credential may not change gs://%s's IAM; run the printed commands instead`.
+
+  The two functions are new in `datasphere/internal/providers/gcs`, `BucketPolicy` and `SetBucketPolicy`, reached through `datasphere`'s storage handle.
+- **The printed commands** (`storagedeploy.go:360-376`) stay whenever the grant is not applied.
+- **Tests:** `TestBucketGrantNeedsConfirm`, `TestBucketGrantUsesTheEtag`, `TestBucketGrantAsksForPolicyVersion3`, and `TestBucketGrantKeepsConditionalBindings`, whose fixture holds a conditional binding on one of the two roles.
+- **What Google sees, new:** every `storage deploy` plan reads the bucket's IAM policy (§11).
+
+The M1 walk found that the printed `gcloud storage` commands crash under the walk Mac's Python 3.14, and applied the grant with `gsutil` instead (`docs/runbooks/adr-0023-m1-walk.md:146`) [read]. That is evidence for Choice 7's "offer".
+
+**P2's alternative,** for its one local edit: keep printing only. `--grant-bucket` and the `--confirm` branch are not built; the `grant` fact stays, with `apply` always false.
+
+### 9.8 `farcast git-credential` (M2.8; Q11, decided)
+
+ADR 0023 decision 8 sends the private-repository Secret subcommand through the plan (ADR 0023:213). It is built in M2, so private repositories need no kubectl.
+
+```
+farcast git-credential set <instance> --name <secret> [--namespace farcast-system] \
+    --username <user> --token-file <path|->  [--plan | --confirm <digest>]
+farcast git-credential rm  <instance> --name <secret> [--namespace farcast-system] \
+    [--plan | --confirm <digest>]
+```
+
+- **The name.** `git-credential`, so it cannot be confused with `farcast secret`, which is DataSphere storage and never a Kubernetes Secret (`secret.go:17-23`) [read].
+- **Where it lands.** `--namespace` defaults to `farcast-system`, where the fetch and build Jobs run (`planck/fetch/fetch.go:35`; `planck/build/build.go:29`) [read]; `run --git-secret` and `build --git-secret` name it (`run.go:120`; `build.go:83`) [read]. The namespace is checked with `validNamespace` (`kernelmeter.go:213`) and the name as a DNS-1123 subdomain. A name FarCast's renderers use is refused the same way, as a usage error before any plan is computed: `fatline-mtls` and `datasphered-mtls` in `farcast-system` (`fatline/deploy/deploy.go:40,44`; `datasphere/deploy/deploy.go:54,82`), and any name ending `-egress`, the applications' egress Secrets (`planck/translate/workload.go:35`) [read]. The message: `%s/%s is a Secret FarCast renders, not a Git credential; choose another --name`. It is an argument refusal rather than a `blocked` entry because a usage error carries no kind (`kinds.go:18-19`) [read].
+- **What it renders.** A `data:` Secret whose keys are `username` and `token`, the keys the Jobs read (`planck/fetch/fetch.go:80-81`; `planck/build/build.go:91-92`) [read], labelled `app.kubernetes.io/managed-by: farcast` and `app.kubernetes.io/component: git-credential`, applied server-side with `force=true`.
+- **The username and the token.** The token is read from `--token-file`, or stdin for `-`, never from argv. It is read only after consent: after the digest comparison under `--confirm`, after the prompt interactively. `--username` is likewise used only after consent. The plan names the Secret by namespace and name only, and renders its data from the placeholders `farcast-placeholder:git-username:<namespace>/<name>` and `farcast-placeholder:git-token:<namespace>/<name>`, so it carries neither value and no hash of either. Neither flag is bound (§9.4). The interactive prompt shows the username; a plan does not.
+- **`set` writes only over its own.** After consent and before the apply, `set` reads the Secret's metadata as the writer, with `GetMeta`, as `rm` does. It goes on only on a 404, or when the Secret carries both `app.kubernetes.io/managed-by: farcast` and `app.kubernetes.io/component: git-credential`. Otherwise it refuses: `%s/%s exists and is not a Git credential farcast wrote; nothing was written`. Without the read, a forced apply under the manager `farcast` over another FarCast Secret, such as `fatline-mtls`, would drop the keys and labels that manager applied there before and now omits, and stamp both labels on it [inf from server-side apply's field ownership], and `rm` would then accept it as its own.
+- **`rm`** deletes only a Secret this command wrote. After consent, it reads the Secret's metadata as the writer, with `GetMeta`, refuses unless it carries both labels (`%s/%s is not a Git credential farcast wrote; nothing was deleted`), and calls `DeleteSecret` with the read uid as the precondition. A 404 is success, with the note `%s/%s was not there`. It is the only delete in M2; ADR 0023:35's "no call uses … `delete`" gains a dated note (§11).
+- **Consent.** Interactive: `Write the Git credential %s/%s (user %s) into %q's cluster? Every build and fetch that names it with --git-secret can read it.`, or `Delete …?` for `rm`. `--yes`: usage error, `git-credential cannot be run with --yes; confirm it in a terminal, or review it with --plan and pass --confirm <digest>`. Not interactive, no flag: usage error.
+- **`refuseUnmigrated`** applies to both (§6.5).
+- **The namespace subcommand is not built.** `farcast run` already creates the namespace it is given. `kernel.go:241`'s hint drops its `kubectl create namespace` half and becomes `Deploy into it with 'farcast run', which creates the namespace it is given.` ADR 0023 decision 8 gains a dated note for both (§11).
+- **Tests:** `TestGitCredentialTokenNeverOnArgvOrInThePlan` (a marker token and a marker username are absent from the plan's JSON and human text, and the token from every `Request.RawQuery`), `TestGitCredentialRefusesYes`, `TestGitCredentialSetRefusesAnotherSecret` (a Secret seeded as `fatline-mtls` in namespace `web`, a name not refused there, labelled `app.kubernetes.io/managed-by: farcast` without the component label, is refused after consent and is unchanged; so is an unlabelled operator Secret `registry-pull` in `farcast-system`; `fatline-mtls` in `farcast-system` and `web-egress` are usage errors), `TestGitCredentialRmDeletesOnlyItsOwn`, `TestGitCredentialRmCarriesTheUidPrecondition`.
+
+---
+
+## 10. The rehearsal seam, tests and gates
+
+### 10.1 The rehearsal redesign (M2.4)
+
+The rig stays a dev tool outside `farcast` (`farsight/cli/internal/execgate/execgate.go:104-113`). It keeps its real FatLine, Shrike and keyholder replicas, its directory guard and its scenarios. What changes:
+
+- **The cluster** becomes one `kubetest.Server` (§2.2), started by `serve.go` with these options:
+  - `WithAddr("127.0.0.1:<port>")`, the port kept in the Spec, so a restart reuses the recorded endpoint, as the tunnel's does;
+  - `WithIdentity("reader", "<readerName(inst)>@rehearsal.invalid", <reader public key>)` and `WithIdentity("writer", "writer@rehearsal.invalid", <writer public key>)`;
+  - `WithHandler(h)`, where `h` answers exactly the reads `world` sends, through `ClusterAnswer`:
+    - `GET /apis/apps/v1/namespaces/{ns}/deployments` and `/statefulsets`, with no `kind` on items;
+    - `GET /api/v1/namespaces?labelSelector=app.kubernetes.io%2Fmanaged-by%3Dfarcast`;
+    - `GET /api/v1/namespaces/farcast-system/configmaps/{name}`, which answers 404 when absent;
+  - `WithTokenAnswer` for the `token-refused` scenario;
+  - `WithDelay(f)`, where `f` returns `Spec.SlowSeconds` (default 25, from 0 to 600, `rehearsal/spec.go:43-45,71-72,130-131`) [read] while the current scenario is `slow-cluster`, and 0 otherwise.
+
+  `h`, the `WithTokenAnswer` closure and `f` re-read the Spec on every request, as the fake kubectl does today, so `SetScenario` changes the answers "from its next read" (`spec.go:182`) [read] while the server runs (§2.2).
+
+  A restarted server has a new CA, so the rig rewrites `cluster-ca.crt` from `CAPEM()` at every start. `ClusterAnswer` becomes `ClusterAnswer(spec Spec, method, path, rawQuery string, now time.Time) (status int, body []byte)`. The scenario data at `answer.go:44-239` is unchanged.
+- **Tokens:**
+  - The reader's token is accepted on those reads.
+  - The writer's token is refused with 403, and `calls.log` records `refused: a writer token on a read`.
+  - Anything else gets 405 and `refused: no answer`.
+- **`calls.log` lines** read `<METHOD> <path>[?<query>] as <reader|writer|none> | ok`, or `| refused: <reason>`. They never carry a value or a token.
+- **The record** (`layout.go:183-202`):
+  - `endpoint: 127.0.0.1:<port>`; `region` stays `rehearsal-local`, which loopback mode never consults (§3.1);
+  - `cluster-ca.crt`;
+  - `reader.key`, an RSA-2048 key, and `reader.crt`;
+  - `reader: {email: <readerName(inst)>@rehearsal.invalid, key_id: <40 hex>, granted_at: <start>}`, the derived loopback form (§3.5);
+  - `server_side_apply: {since: <start>, farcast: rehearsal}`;
+  - a writer `credentials.yaml` holding `{"type":"service_account","client_email":"writer@rehearsal.invalid","private_key":<RSA>,"token_uri":"https://127.0.0.1:<port>/token"}`. It parses mode-free and pairs in loopback mode (§3.2). It exists so tests can prove `world` never opens it.
+
+  No `kubeconfig.yaml`, `gcloud/`, `kube/bin` or `sdk/bin` is written, and `GCloudAccount` goes.
+- **Deleted:**
+  - `tools.go`;
+  - the argv0 dispatch in `cmd/farcast-rehearsal/main.go:30-36` [map];
+  - `layout.go`'s kubeconfig (`:170`), tool links and the gcloud decoy (`:25-32,89-96,207-223,308-347` [map]).
+- **`Rig.Path` and the Settings text** (`rehearsal.go:378-417` [map]) become two rows, `farcast` and the configuration directory.
+- **Scenarios:**
+  - Kept: `healthy`, `sealed`, `stale-checkpoint`, `cost-reached`, `at-floor`, `denied` and `slow-cluster`. `slow-cluster` now delays every answer by `Spec.SlowSeconds`.
+  - `signed-out` and `identity-mismatch` are refused: `scenario %q was retired with ADR 0023 M2; use token-refused or forbidden`.
+  - New:
+    - `token-refused`: `/token` answers 400 `invalid_grant`, so `world` shows `credential_refused`;
+    - `unauthorized`: every read answers 401, the re-mint's retry too;
+    - `forbidden`: the ConfigMap reads answer 403 as a Kubernetes Status, so spend and policy show `forbidden` and apps read;
+    - `reader-missing`: `reader.key` is renamed to `reader.key.away`, and back on any other scenario;
+    - `tunnel-down`: the tunnel listener stops while the API server stays up. This replaces R8.1's "Ctrl-C", because the cluster now lives in the harness.
+- **The guard** (`guard.go:12-122`) is unchanged. It still protects `~/.config/gcloud`, `~/.kube`, the default farcast directory and the directories named by `$FARCAST_CONFIG_HOME`, `$CLOUDSDK_CONFIG` and `$KUBECONFIG`.
+
+**Tests** (`rehearsal_test.go`):
+- The five end-to-end tests keep their names and assertions, minus the tool lines: `TestWorldReadsTheRehearsalWhole`, `TestScenariosShowInWorld` (with the new scenario rows), `TestTheAtFloorScenarioShowsWhatTheKernelRecorded`, `TestCAKeyAndKeyringAreUnreadable` and `TestRestartReusesTheDirectory`.
+- The four `ToolMain` tests are replaced by:
+  - `TestTheRigAnswersOnlyWorldsReads`;
+  - `TestTheRigRefusesAWriterTokenOnARead`;
+  - `TestTheRigsTokenEndpointChecksTheAssertion`;
+  - `TestRetiredScenariosAreRefused`.
+- `TestClusterAnswersDecode` (`:833`, which today uses `cluster.NewWithRunner` at `:836`) decodes through `cluster.Client` against the rig's own server.
+- `main_test.go:156-171` checks the two-row Settings text.
+
+### 10.2 How the existing tests move
+
+**`cluster` package: 26 tests, 15 in `cluster_test.go` and 11 in `env_test.go`** (not counting `TestMain`) [read].
+- The 15 in `cluster_test.go` are built on `fakeRunner` or `streamingRunner`. In M2.4 they become `kubetest` tests with the same names where they still apply. `TestApplyPipesManifestToStdin` stays on `newWithRunner` until M2.7, when it is replaced by `TestApplySendsEachDocumentAsServerSideApply`. `TestConfigMapWritesNeverApply` (`cluster_test.go:351`) stays on `newWithRunner` until M2.5 and moves to `kubetest` then (row 70): in M2.4 `Open` builds a reader only, and the pin's in-process create and replace arrive in M2.5.
+- Of `env_test.go`'s 11, `TestNamespacesLabelledReadsJSONAndSorts` (`env_test.go:336`) is a read test: it moves to `cluster_test.go` as a `kubetest` test in M2.4. The other 10 are environment and subprocess tests [read: `env_test.go:87-376`]. Each stage keeps them compiling:
+  - **M2.4,** when `NewWithEnv` and `GCloud` go and `Env` becomes `Env(parent)`: `TestEnvPinnedReplacesTheParentsGCloudSelection` is deleted with the pinned branch, and `TestEnvIsBuiltFromAnAllowlist` is rewritten for `Env(parent)`. The six tests that call `NewWithEnv` call the unexported `newWithEnv` (§0) instead: `TestEveryKubectlRunsWithKubercOff` (its second half), `TestNewWithEnvGivesKubectlExactlyTheEnvironmentItWasHanded`, `TestNewWithEnvFindsKubectlOnTheHandedPath`, `TestKubectlFailuresAreMarkedWithoutChangingTheirText`, `TestAKubectlPastItsDeadlineIsATimeout` and `TestEveryGCloudSignInRequestIsSignedOut`.
+  - **M2.5,** when `New` goes: `TestNewDoesNotInheritTheParentEnvironment`, `TestNewKeepsTheParentsTokenCacheKey` and `TestEveryKubectlRunsWithKubercOff` move from `New(kc)` to `newWithEnv(kc, Env(os.Environ()))`, which is what a writer client's transitional `Apply` runs (§0).
+  - **M2.7:** the nine left are deleted with `env.go`. Their intent moves to `kube`:
+  - `TestTransportsHaveNoProxy`: white-box, `Proxy == nil` on both transports in both modes. A loopback test could not show it: `ProxyFromEnvironment` never proxies a loopback host, and caches the environment once per process [read: `$GOROOT/src/vendor/golang.org/x/net/http/httpproxy/proxy.go:178-185`; `net/http/transport.go:1032-1038`];
+  - `TestAuthorizationOnlyToTheEndpointHost`: it drives the API `RoundTripper` directly with a request for another host, over a recording inner `RoundTripper`, and asserts no `Authorization` header;
+  - `TestNoRedirectIsFollowed`: loopback server A answers 307 to another path on A; the client returns an `APIError` with code 307, and A saw exactly one request. A redirect to another server would prove nothing: the loopback dialer refuses it anyway;
+  - `TestEveryRequestSaysFarcast`;
+  - `TestTokenLoggerDiscardsEvenWithTheDebugVariable`: `GOOGLE_SDK_GO_LOGGING_LEVEL=debug`, with the test's stderr captured, shows no assertion and no token.
+- **New in `cluster`:**
+  - `TestWorkloadsStampsKindPerListNeverFromTheItem`, with the fake omitting `kind`;
+  - `TestConfigMapForbiddenIsNeverAbsent`;
+  - `TestLogsFollowStopsOnCancelWithoutError`;
+  - `TestRolloutStatusFollowsTheSixRules`, a table;
+  - `TestPickPodOrder`, a table, with rows for a Succeeded pod tying with a Running one, for sidecar restarts breaking a tie, and for the more-restarted pod chosen;
+  - `TestApplyStopsAtTheFirstFailingDocumentAndSaysHowManyWent`;
+  - `TestJobLogsAllLinesSendsNoTailLines`;
+  - `TestSelectorStringRefusesExpressions`;
+  - `TestPreviousNoteGoesToWarningsNotOut`;
+  - `TestDeploymentStateReadsTheAdaptationAndTheLastApply` **[decided: P1]**.
+
+**`cli` package.**
+- **Unchanged in shape:** `fakeCluster`, `fakeRunCluster`, `fakeReader`, `fakePinStore`, `fakeWorldCluster`, `fakeJobs` and `blockingCluster` ([map]: 108, 54, 45, 28, 17, 11 and 3 tests). Only their seam closures change (§2.6), and `fakeRunCluster` gains `DeploymentState` **[decided: P1]**.
+- **`fakeGCloudDir` users** (`cmdvectors_test.go:127` [map]: 26 tests):
+  - `gcloud_test.go`'s 8 are deleted;
+  - `world_test.go`'s 14 give their fixtures a reader record and a `kubetest` server instead of a pin; its three uses of `cluster.ErrKubectlMissing`, `ErrSignedOut` and `ErrAuthToolMissing` (`world_test.go:246,262-263`) [read] become the new kinds' errors;
+  - `nosecrets_test.go`'s 1 becomes §7.3's test, and `TestInstancesNeverOpensTheReaderKey` is added: `instances` alone, with `reader.key` at mode 000, reports `"reader":"granted"`, and `ObserveReads` never saw `reader.key`. `world` needs the key readable, so the two cannot share one fixture;
+  - `cmdvectors_test.go`'s gcloud_mismatch case is deleted;
+  - `plugintoken_test.go`'s 2 are replaced by `TestWorldPresentsOnlyTheReaderToken`.
+- **`TestWorldPresentsOnlyTheReaderToken`** plants all of these:
+  - `CLOUDSDK_AUTH_ACCESS_TOKEN`;
+  - `GOOGLE_APPLICATION_CREDENTIALS`, pointing at a file;
+  - `HTTPS_PROXY`;
+  - a `~/.kube/gke_gcloud_auth_plugin_cache` under a temporary `HOME`;
+  - an instance-dir `gke_gcloud_auth_plugin_cache`.
+
+  It asserts that the fake server's only bearer is the reader's `kubetest:reader:*`.
+
+### 10.3 The pairing tests (M2.1)
+
+**`TestEndpointRule`**, a table. Every refused row asserts its refusal's message (§3.1, §3.2) and zero dials on a counting loopback listener. `P` is the listener's port; the region is `us-central1` unless the row says otherwise.
+
+| Credential | Endpoint | CA file | Expected |
+|---|---|---|---|
+| Google | `127.0.0.1:P` | yes | P-origin |
+| Google | `[::1]:P` | yes | P-origin |
+| Google | `localhost:P` | yes | E-shape |
+| Loopback | `localhost:P` | yes | E-shape (ADR 0023:100: never the name `localhost`) |
+| Google | `10.0.0.5:443` | no | E-range |
+| Loopback | `10.0.0.5:443` | yes | E-range |
+| Google | `evil.example` | no | E-shape |
+| Google | `gke.goog` | no | E-shape |
+| Google | `a.gke.goog.evil.example` | no | E-shape |
+| Google | `agke.goog` | no | E-shape |
+| Google | `uid.us-central1.gke.goog.` | no | E-shape |
+| Google | `https://uid.us-central1.gke.goog` | no | E-shape |
+| Google | `uid.us-central1.gke.goog:8443` | no | E-port |
+| Google | `uid.us-central1.gke.goog` | yes | E-googleCA |
+| Google | `uid.europe-west1.gke.goog` | no | E-region |
+| Loopback | `::ffff:127.0.0.1` | yes | E-shape (a bare IPv6 literal) |
+| Loopback | `[::ffff:127.0.0.1]:P` | yes | E-mapped |
+| Loopback | `::1` | yes | E-shape |
+| Loopback | `[::1]` | yes | E-shape (`net.SplitHostPort`: missing port) |
+| Loopback | `127.0.0.1` | yes | E-port |
+| Loopback | `127.0.0.1:P` | yes, with no certificate in it | E-noCert |
+| Loopback | `127.0.0.1:P` | no | E-noCA |
+| Loopback | `uid.us-central1.gke.goog` | no | P-origin |
+| Loopback, `token_uri` on another port | `127.0.0.1:P` | yes | P-tokenuri |
+| Loopback, loaded from `credentials.yaml` JSON with Google's `token_uri` | `127.0.0.1:P` | yes | P-tokenuri |
+| Google, `token_uri` `https://evil.example/token` | `uid.us-central1.gke.goog` | no | P-tokenuri |
+| Google, `universe_domain` `example.com` | `uid.us-central1.gke.goog` | no | P-universe |
+| Loopback, but with a real-shaped `@x.iam.gserviceaccount.com` email | `127.0.0.1:P` | yes | P-origin |
+| Google | `uid.us-central1.gke.goog` | no | accepted |
+| Google | `uid.us-central1.gke.goog:443` | no | accepted |
+| Loopback | `127.0.0.1:P` | yes | accepted |
+| Loopback | `[::1]:P` | yes | accepted |
+| Loopback writer, loaded from `credentials.yaml` JSON (`writer@kubetest.invalid`, `token_uri` = `TokenURL()`) | `127.0.0.1:P` | yes | accepted |
+
+**`TestNoTokenIsMintedForARefusedPair`.** An in-package test passes a counting `tokenFunc` through `newClient` and asserts zero calls for every refused row. **`TestNewDialsAndMintsNothing`** asserts zero calls and zero accepts for every accepted row until the first request.
+
+**`TestServiceAccountJSONIsCheckedExactly`**, mode-free. It refuses: `type: authorized_user` and `external_account`; an EC key; a missing email; an email without `@`; a `token_uri` that is `http://…` or relative; a body that is not JSON. It accepts both a Google-shaped and a loopback-shaped key, because where a key may go is `TestEndpointRule`'s question.
+
+### 10.4 Gates (`./check.sh`)
+
+- **Step 1b (M2.7).** `exec-allowlist.txt` drops its 15 `farsight/cli/internal/cluster` lines:
+  - darwin/amd64: 98, 102, 103;
+  - darwin/arm64: 116, 120, 121;
+  - linux/amd64: 134, 138, 139;
+  - linux/arm64: 152, 156, 157;
+  - windows/amd64: 171, 176, 177.
+
+  It also drops the review note at `:50-52`, so the reviewed lines go from 101 to 86 [read: `grep -c -v '^#' exec-allowlist.txt` gives 101]. No line is added. `kube` uses `net/http` and the already-linked `cloud.google.com/go/auth` [map].
+- **Step 1b gains two link checks (M2.1),** in `execgate.Run`, which already lists every shipped binary's dependencies (`execgate.go:104-113`) [read]:
+  - if any package under `github.com/sofmon/farcast/farsight/cli/internal/rehearsal` or `…/internal/kube/kubetest` is in `farcast`'s dependency list on any of the five platforms, the step exits 1 with `farcast links the test fake %s; it must never be in the product binary`;
+  - if any package under `github.com/sofmon/farcast/farsight/` is in `technocore`'s (`./technocore/cmd/technocore`), it exits 1 with `technocore links %s; the kernel's client stays in technocore/kube (ADR 0009 decision 3)`. That is the gate §1 promises.
+  - `TestListingRefusesALinkedFake` and `TestListingRefusesAKernelThatLinksTheCLI` cover them.
+- **Step 7a.** `vector_copy`'s directory list (`check.sh:389`) is unchanged: `app instances kinds version world`. Plan vectors live at `testdata/plan/` in Go and are not copied in M2.
+- **Plan vectors (M2.6).** These are in `farsight/cli/internal/cli/testdata/plan/`:
+  - `connect_first.json`, `redeploy.json`, `kernel_deploy.json`, `kernel_meter.json`, `kernel_confirm.json`, `storage_deploy.json`, `storage_key_pin.json`, `storage_key_rotate.json`, `run_fetch.json`, `run_deploy.json`, `build.json`, `reader_grant.json`;
+  - from M2.7, `migrate.json`;
+  - from M2.8, `git_credential_set.json` and `git_credential_rm.json`;
+  - `error_plan_changed.json`.
+
+  Each comes from a command against fakes. `TestEveryVectorFileIsProduced` gains the `plan` directory.
+
+### 10.5 Mutations
+
+*Amended by §15 (A15-13).*
+
+How to run one: apply the mutation as an edit, run the named test, and see it fail. Then reverse the edit by hand, grep for residue, and re-run the full suite. Never `git checkout`. Every mutation below is one that can make its test fail: a mutation that changes no behaviour, such as deleting `Proxy: nil` from a struct literal whose zero value is nil, is not listed.
+
+**M2.1 (`kube` and `kubetest`):**
+
+| # | Requirement | Mutation | Must fail |
+|---|---|---|---|
+| 1 | Pairing before any mint | call `mint(ctx)` at the top of `newClient`, before the pairing check | `TestNoTokenIsMintedForARefusedPair`. A mint placed in `New` instead, outside `newClient`, is caught by `TestEndpointRule`'s zero-dial assertion on the refused rows with a loopback endpoint. |
+| 2 | Loopback range | drop the 127.0.0.0/8-or-`::1` check | `TestEndpointRule` (both `10.0.0.5:443` rows) |
+| 3 | No CA in Google mode | ignore `caPEM` in Google mode | `TestEndpointRule` (E-googleCA row) |
+| 4 | Mapped IPv6 refused | drop the `Is4In6` check | `TestEndpointRule` (`[::ffff:127.0.0.1]:P` gets E-range, not E-mapped) |
+| 5 | A bare IPv6 literal is refused | hand a multi-colon string to `netip.ParseAddr` | `TestEndpointRule` (`::1` row) |
+| 6 | Region label | drop the region check | `TestEndpointRule` (E-region row) |
+| 7 | Token URI paired | skip the `TokenURI` pairing check | `TestEndpointRule` (the P-tokenuri rows) |
+| 8 | Parsing is mode-free | make `ParseServiceAccountJSON` require `.iam.gserviceaccount.com` | `TestEndpointRule` (the loopback writer from JSON), `TestServiceAccountJSONIsCheckedExactly` |
+| 9 | No proxy | build the transport from `http.DefaultTransport.(*http.Transport).Clone()` | `TestTransportsHaveNoProxy` |
+| 10 | No redirect | delete `CheckRedirect` | `TestNoRedirectIsFollowed` (A sees a second request) |
+| 11 | Bearer to the endpoint only | set the header unconditionally | `TestAuthorizationOnlyToTheEndpointHost` |
+| 12 | Discarding logger | set `Logger: nil` | `TestTokenLoggerDiscardsEvenWithTheDebugVariable` |
+| 13 | One scope | add `cloud-platform` to `Scopes` | `TestTokenAssertionClaims` (kubetest's scope rule) |
+| 14 | Claims within an hour | set `Expires: time.Hour` | `TestTokenAssertionClaims` (`exp − iat` is 3610) |
+| 15 | No silent truncation | `io.LimitReader(body, 64<<20)` without the +1 check | `TestOversizedAnswerIsUnreadableNotTruncated` |
+| 16 | 401 re-mints once | never call `invalidate`; or retry without bound | `TestUnauthorizedRemintsOnce` |
+| 17 | Only the rejected token is dropped | `invalidate` unconditionally | `TestInvalidateForcesOneMint` (two concurrent 401s mint twice) |
+| 18 | Kind stamped per list | read `kind` from the item | `TestWorkloadsStampsKindPerListNeverFromTheItem` (the Phase 4.3 regression, `cluster.go:427-432`) |
+| 19 | `Object.Kind` is never decoded | drop `json:"-"` | `TestObjectDecodesAnAnswerThatCarriesKind` |
+| 20 | Rule 1 first | evaluate rules 2–6 before rule 1 | `TestRolloutStatusFollowsTheSixRules` |
+| 21 | Rule 4 | delete it | the same |
+| 22 | Pod order: restarts | prefer the pod with fewer restarts | `TestPickPodOrder` (more-restarts row) |
+| 23 | Pod order: phases | sort Succeeded after Pending | `TestPickPodOrder` (Succeeded-ties-Running row) |
+| 24 | Expressions refused | ignore `matchExpressions` | `TestSelectorStringRefusesExpressions` |
+| 25 | Everything is no `tailLines` | send `tailLines=-1` | `TestJobLogsAllLinesSendsNoTailLines` (kubetest answers 400) |
+| 26 | Separator strictness | accept `--- # x` | `TestSplitStreamRefuses` |
+| 27 | Empty documents skipped | do not skip comment-only chunks | `TestSplitStreamSkipsEmptyDocuments` |
+| 28 | Header tags | drop the `yaml:"apiVersion"` tag | `TestSplitStreamIdentifiesEveryKind` |
+| 29 | Server-set keys by presence | test `resourceVersion` by a non-empty value | `TestSplitStreamRefuses` (`resourceVersion: ""` row) |
+| 30 | stringData refused | drop the check | `TestSplitStreamRefuses` |
+| 31 | YAML constructs refused | drop the merge-key refusal | `TestSplitStreamRefuses` (a merge key hiding `stringData`) |
+| 32 | Union keeps membership | plain deep merge (no `"."`) | `TestUnionFields` (`{}` ∪ `{"f:x":{}}` gives `{".":{},"f:x":{}}`) |
+| 33 | csaupgrade step 5 | keep other-apiVersion client-side entries | `TestUpgradeManagedFields` |
+| 34 | The annotation's owners are converted | select client-side managers by name only | `TestClientSideManagersFindsTheAnnotationsOwner` (a `kubectl-edit` Update entry owning the path) |
+| 35 | RV in the patch | drop the resourceVersion `replace` op | `TestMigrationPatchCarriesTheResourceVersion` |
+| 36 | End state checked | make `MigratedEndState` return nil | `TestMigratedEndStateRefusesALeftoverEntry` |
+| 37 | kubetest decodes as the server does | accept an undecodable managedFields list | `TestKubetestKeepsTheLiveListOnAnUndecodableRewrite` |
+| 38 | Fake not linked | import `kubetest` from `cli` in a scratch copy | `./check.sh` step 1b |
+| 39 | Kernel links no CLI | import a `farsight/` package from `technocore` in a scratch copy | `./check.sh` step 1b |
+
+**M2.2:**
+
+| # | Requirement | Mutation | Must fail |
+|---|---|---|---|
+| 40 | Exact bytes | drop the trailing `\n` on the PEM values | `TestEgressSecretDataDecodesToTodaysValues` |
+| 41 | data, not stringData | revert the template line | `TestEveryRenderedStreamPassesTheApplyChecks` |
+| 42 | Composed streams are checked | join `meterManifest`'s documents with `--- ` (a trailing space) | `TestEveryRenderedStreamPassesTheApplyChecks` |
+
+**M2.3:**
+
+| # | Requirement | Mutation | Must fail |
+|---|---|---|---|
+| 43 | Key mode | write `reader.key` with `os.WriteFile(…, 0o644)` | `TestReaderKeyIsWrittenOwnerOnly` |
+| 44 | Script carries public material only | include `keyPEM` | `TestReaderScriptHoldsNoPrivateKey` |
+| 45 | A child shell | drop the `sh -s` wrapper | `TestReaderScriptRunsInAChildShell` |
+| 46 | Rotation creates nothing | print the init script for `--rotate` | `TestReaderRotateScriptCreatesNothing` |
+| 47 | Rotation keeps reads working | write the new key over `reader.key` at `--rotate` | `TestRotateKeepsReadsWorkingUntilRecorded` |
+| 48 | The record is checked before rendering | drop the project-ID check | `TestReaderScriptRefusesAnUnsafeRecord` |
+| 48a | The certificate is rendered only from a parsed one | keep the checks, and render `reader.crt`'s bytes as read | `TestReaderScriptRefusesAnUnsafeRecord` (the leading-text row) |
+| 49 | A generic certificate | set the subject's CN to the account name | `TestReaderCertificateIsGeneric` |
+| 50 | The derived email | skip the email check in `openCluster` | `TestReaderEmailMustBeTheDerivedOne` |
+| 51 | Grant verifies as the reader | skip the verifying read and set `GrantedAt` | `TestReaderGrantVerifiesAsTheReader` (one reader GET; `GrantedAt` unset after a 403 outlasts the backoff, on a fake clock) |
+| 52 | Grant proves the reader read-only | skip the SelfSubjectAccessReviews | `TestReaderGrantRefusesAReaderThatCanWrite` (`WithAccess` allows `get secrets`) |
+| 52a | A failed re-grant withdraws the verification | keep `GrantedAt` after an allowed review | `TestReaderGrantWithdrawsAVerificationThatNoLongerHolds` |
+| 53 | `--yes` never grants | accept `reader grant --yes` | `TestReaderGrantRefusesYes` |
+| 54 | ConfigMap names are the read sites' constants | misspell one, or add `technocore-confirmed` back | `TestReaderRoleNamesTheConfigMapsReadsUse` |
+| 55 | Only `namespaces list` is cluster-wide **[decided: P3]** | bind `farcast-reader` with the ClusterRoleBinding | `TestReaderRBACBindsOnlyNamespacesClusterWide` |
+| 56 | Release names the reader account | drop the reader lines | `TestReleaseNamesTheReaderAccount` |
+| 56a | Printed Cloud Shell lines carry checked values only | print `meta.Reader.Email` as recorded | `TestPrintedCloudShellLinesRefuseAnUnsafeRecord` |
+| 57 | `Open` builds a reader only until M2.5 | accept `kube.Writer` | `TestOpenRefusesTheWriterUntilM25` (deleted in M2.5) |
+| 58 | Certificate variables unset | drop the `SSL_CERT_FILE` unset | `TestMainTurnsClientCertificatesAndExecutablesOff`, `TestCertFileVariablesCannotAddARoot` |
+
+**M2.4:**
+
+| # | Requirement | Mutation | Must fail |
+|---|---|---|---|
+| 59 | Reads never mint an admin token | have `world` open the writer | `TestWorldNeverOpensAWriterCredential` |
+| 60 | Read commands as the reader | have `ps` open the writer; have `usage` open storage | `TestReadCommandsPresentOnlyTheReaderToken` |
+| 60a | A reader reads only once verified read-only | skip the `GrantedAt` check in `openCluster` | `TestReadCommandsRefuseAnUnverifiedReader` |
+| 61 | Kinds not reused | add `kubectl_failed` back to `errorKinds` | `TestRetiredKindsAreNeverReused` |
+| 62 | Forbidden is not absent | map 403 to `("", false, nil)` | `TestConfigMapForbiddenIsNeverAbsent` |
+| 63 | A missing endpoint keeps `not_connected`'s meaning | kind it `not_connected` | `TestAMissingEndpointIsEndpointRefused` |
+| 64 | Schema bumped | leave `worldSchema = 1` | the vector tests; FarSightKit's `VectorTests` |
+| 65 | `instances` opens no key | `os.ReadFile` the key in `ReaderKeyExists` | `TestInstancesNeverOpensTheReaderKey` |
+| 66 | Rig refuses writer tokens | answer them | `TestTheRigRefusesAWriterTokenOnARead` |
+| 67 | pin-gcloud retired | keep the subcommand | `TestPinGCloudIsRetired` |
+| 68 | Notes stay off stdout | write the `--previous` note to `out` | `TestPreviousNoteGoesToWarningsNotOut` |
+
+**M2.5:**
+
+| # | Requirement | Mutation | Must fail |
+|---|---|---|---|
+| 69 | Kinds reach in-process calls | skip `clusterKind` in `classified` | `TestWritingCommandsCarryClusterKinds` |
+| 70 | Pin create stays create | send the pin as an apply | `TestConfigMapWritesNeverApply` (`cluster_test.go:351`, moved to `kubetest`) |
+| 71 | Replace carries the RV | strip it | `TestReplaceConfigMapCarriesTheResourceVersion` |
+
+**M2.6:**
+
+| # | Requirement | Mutation | Must fail |
+|---|---|---|---|
+| 72 | `--plan` writes nothing | call `ensureIdentity` in `connect`'s plan builder | `TestPlansWriteNothing`: the config directory is byte-identical; the fake API saw only `GET`s; the fake registry saw no upload; the GCS and IAM provider seams, routed through fakes, saw no call but a `GET` |
+| 73 | `--plan` writes nothing to Google | call `ensureRegistry` in a plan builder | `TestPlansWriteNothing` |
+| 74 | Confirm refuses changed facts | skip the digest comparison | `TestConfirmRefusesAChangedPlan` |
+| 75 | Execute from recomputed decisions | re-resolve the image after the comparison | `TestConfirmExecutesWhatItCompared` (the fake registry's tag moves between compare and push) |
+| 76 | Recompute as the plan's identity | recompute as the writer | `TestConfirmRecomputesAsThePlansIdentity` |
+| 76a | `run`'s deploy plan is computed as the reader | read the fetch Job as the writer before D's comparison | `TestConfirmRecomputesAsThePlansIdentity` (the `run --confirm <D>` case) |
+| 76b | Every reader read is granted **[decided: P3]** | drop the `jobs` rule from `farcast-reader` | `TestEveryReaderReadIsAllowedByTheRenderedRBAC` |
+| 77 | Target bound | drop `Target.Project`; drop `Target.SystemNamespaceUID` | `TestPlanFromAnotherConfigDirIsRefused`, whose second directory holds a copy of the record with only `project` changed; `TestPlanAgainstAReplacedSystemNamespaceIsRefused`: the same record, and `kubetest` re-seeded with a new `farcast-system` uid between `--plan` and `--confirm` |
+| 78 | Digest covers its bytes | hash the struct, not the printed bytes | `TestPlanDocumentCarriesTheBytesItsDigestCovers` |
+| 79 | Placeholders | render real secrets; real key ids; `AsOf: now` | `TestPlanIsDeterministic` (its secret, rotate and kernel-confirm cases) |
+| 80 | Only the enumerated fields differ | render a non-secret field from a placeholder (the keyholder's `--instance` argument) | `TestConfirmWritesThePlannedDocumentsExceptTheirSecrets` |
+| 81 | Every bound value is shown | drop `application_reset` from the rendering | `TestEveryBoundFactIsRendered` |
+| 81a | The target is shown | drop the target line from the header | `TestEveryBoundFactIsRendered` |
+| 82 | Run's deploy confirm never re-fetches | apply the fetch Job when it is absent | `TestRunDeployConfirmNeverWritesTheFetchAgain` |
+| 83 | `--embedded` is a plan fact | refuse the skew under `--confirm` | `TestConfirmCoversTheReplacementItsPlanListed` |
+| 84 | Plans read as the reader | open the writer in `kernel deploy --plan` | `TestPlansPresentOnlyTheReaderToken` |
+| 85 | A plan needs a granted reader | fall back to the writer when there is none | `TestPlanWithoutAReaderIsRefused` |
+| 86 | The pin under `--confirm` | keep the union loop under `--confirm` | `TestConfirmNeverWritesAPinThePlanDidNotList` |
+| 87 | Apps re-read before the apply **[decided: P1]** | skip the re-read | `TestConfirmRefusesAnAppStoppedAfterTheCompare` |
+| 88 | The policy re-read | skip it | `TestConfirmRefusesAPolicyChangedAfterTheCompare` |
+| 89 | No `--yes` restart at the limit **[decided: P1]** | let `--yes` through | `TestYesNeverRestartsAStoppedAppAtTheLimit` |
+| 89a | The gate is checked again before the workload apply **[decided: P1]** | skip the pre-apply re-read under `--yes` | `TestYesNeverRestartsAnAppStoppedDuringTheBuild` |
+| 89b | The gate reads the kernel's own level **[decided: P1]** | compare `observed.level` with the literal `reached` | `TestYesGateReadsTheKernelsOwnLevelString` |
+| 90 | Below the floor is consented, not blocked | block it when not interactive | `TestKernelDeployPlanCarriesBelowFloorAsAFact` |
+| 91 | A plan ignores the terminal | read `isInteractive` in a plan builder | `TestPlanIgnoresTheTerminal` |
+
+**M2.7:**
+
+| # | Requirement | Mutation | Must fail |
+|---|---|---|---|
+| 92 | Refusal before anything | move `refuseUnmigrated` after the cost prompt | `TestUnmigratedInstanceIsRefusedBeforeAnythingIsAsked` |
+| 93 | Every writer refuses | drop the call in `kernel meter` | `TestEveryClusterWriterRefusesAnUnmigratedInstance`, a table over §6.5's list |
+| 94 | Label and trace both required | select by label alone | `TestMigrationLeavesThePinAndTheKernelsConfigMaps` |
+| 95 | Discovery is cluster-wide | list only labelled namespaces | `TestMigrationFindsARoleBindingInAnUnlabelledNamespace` |
+| 96 | The end state is checked | skip both `MigratedEndState` calls in the migration loop, on the PATCH answer and on the read-back | `TestMigrationRefusesASilentlyIgnoredRewrite` |
+| 96a | Recorded only from verified read-backs | skip the fresh `GetObject` | `TestMigrationReadsBackAfterAnAnswerThatLooksMigrated` (§6.4) |
+| 97 | Recorded only when complete | record after the first object | `TestMigrationRecordsOnlyWhenEveryObjectIsDone` |
+| 98 | The annotation is a boolean | bind the annotation's value | `TestMigratePlanCarriesNoSecretByte` (a marker in a Secret's data and annotation is absent from the plan's JSON and human text) |
+| 99 | `--yes` never migrates | accept `migrate --yes` | `TestMigrateRefusesYes` |
+| 100 | Force on own components | `force=false` | `TestOwnComponentsApplyForced` |
+| 101 | Safety net | ignore `Traces()` | `TestAClientSideTraceAfterMigrationClearsTheRecord` |
+| 102 | Field manager everywhere | omit `fieldManager` on the pin `POST` | `TestEveryWriteNamesFarcast` |
+| 103 | The kernel names itself | drop `fieldManager=technocore` | `technocore/kube`'s `TestKernelWritesNameTechnocore` |
+| 104 | Stuck fields | skip `RemoveField` | the real-Kubernetes `TestMigrationRemovesAFieldLaterDroppedFromTheManifest` (annotation and end-state assertions) |
+| 105 | No kubectl | restore `execRunner` in `Apply` | `./check.sh` step 1b (the cluster lines reappear) |
+
+**M2.8:**
+
+| # | Requirement | Mutation | Must fail |
+|---|---|---|---|
+| 106 | Grant only from a plan **[decided: P2]** | apply it under `--yes`; refuse it with `--plan` | `TestBucketGrantNeedsConfirm` |
+| 107 | Etag honoured **[decided: P2]** | `PUT` without it | `TestBucketGrantUsesTheEtag` |
+| 108 | Policy version 3 **[decided: P2]** | drop `optionsRequestedPolicyVersion` | `TestBucketGrantAsksForPolicyVersion3` |
+| 109 | Conditional bindings kept **[decided: P2]** | add the principal to a conditioned binding | `TestBucketGrantKeepsConditionalBindings` |
+| 110 | Push grant never applied | add a push grant apply | `TestPushGrantIsNeverApplied` |
+| 111 | Token never on argv or in the plan | accept a `--token` flag; bind the real Secret's sha256 | `TestGitCredentialTokenNeverOnArgvOrInThePlan` |
+| 112 | `rm` deletes only its own | skip the label check | `TestGitCredentialRmDeletesOnlyItsOwn` |
+| 112a | `set` writes only over its own | skip the read before `set` | `TestGitCredentialSetRefusesAnotherSecret` (the seeded `web/fatline-mtls` and `farcast-system/registry-pull` cases) |
+| 113 | `rm` is uid-preconditioned | delete without preconditions | `TestGitCredentialRmCarriesTheUidPrecondition` |
+| 114 | `--yes` never writes a credential | accept `git-credential set --yes` | `TestGitCredentialRefusesYes` |
+
+### 10.6 The no-cost test on a real API server (M2.7) **[decided: P4]**
+
+**Where it lives.** `farsight/cli/internal/kube/realapi_test.go`, build tag `realapi`, never run by `./check.sh`.
+
+**What it reads from the environment:**
+- `FARCAST_REALAPI_ENDPOINT`, `127.0.0.1:<port>`: the Mac's end of an `ssh -L` forward to the API server;
+- `FARCAST_REALAPI_CA_FILE`;
+- `FARCAST_REALAPI_TOKEN_FILE`, a static bearer token for a user in `system:masters`, configured on the API server with `--token-auth-file` [unverified that the flag is current at the pinned minor]. It is read from the file and never printed.
+
+**How it connects.** It uses the in-package `newClient` with a static `tokenFunc`, so it needs no 2LO.
+
+**Where it runs (decided 2026-11-14, P4):** an envtest `kube-apiserver` and `etcd` on the Ubuntu keeper VM.
+- They run as an unprivileged user, with no images, and listen on `127.0.0.1` only: etcd's client URL and the API server's `--bind-address` are both loopback. The Mac reaches the API server through `ssh -L`. Nothing else on the VM changes.
+- The envtest asset for the pinned Kubernetes minor is downloaded with its checksum, and the binaries and their data directory are deleted right after the run. Its URL and size are [unverified]; the runbook names them before the operator approves the download. The seeding variant of §6.8 uses the kubectl the same asset carries [unverified that it carries one].
+- The minor is pinned to GKE's current default for new clusters. Google's release schedule page does not state that default ([doc](https://docs.cloud.google.com/kubernetes-engine/docs/release-schedule)), so the probe walk records the real cluster's version (§10.8), and the test is run on that minor. **If Q9 is not run,** the test runs on the newest minor that GKE's release notes list as the Regular channel's default on the run date, and the runbook records that page's URL and the date. W1 of the billable walk records the real minor (§10.7), and the test is re-run on it if the two differ.
+- **What envtest cannot show:** it runs no controllers, so no ReplicaSet is ever made, no Job runs and no Deployment status moves; and it has none of Autopilot's admission. The API server itself still sets `metadata.generation`, validates, allocates Service addresses [inf] and tracks managed fields, which is what these tests need. The billable walk covers the rest (W3).
+- **P4's alternatives,** for its one local edit: k3s on a separate throwaway VM; or k3s on the keeper VM, bound to loopback (`--bind-address 127.0.0.1`) and uninstalled right after. k3s runs as root and by default listens on all interfaces [unverified], on a machine that holds keeper material; envtest needs neither.
+
+**Its tests:**
+- `TestMigrationRemovesAFieldLaterDroppedFromTheManifest`, with §6.8's seven cases.
+- `TestMigrationLeavesAnotherManagersFieldAlone`: a field set with `fieldManager=kubectl-scale` through `/scale` stays, and so does its owner. It records whether the scale manager's entry carries `f:spec.f:replicas` with `subresource: scale`, which the SSA page's sub-resource caveat leaves open (§5.4) and P1's (b) depends on.
+- `TestReapplyingAnUnchangedJobIsANoOp`: the generation is unchanged and the server's selector and labels raise no conflict [unverified, so this case settles it].
+- `TestMigrationIsResumable`: two objects, the second given a conflicting resourceVersion five times, then run again.
+- `TestFirstApplyAfterMigrationChangesNoGeneration`: for a Deployment, a StatefulSet, a Service and a Secret, it migrates, then re-applies the unchanged v1 forced, and asserts that `metadata.generation` is unchanged and that no new managed-fields entry appears. This is csaupgrade's caveat 3 (§6.3). Whether a ReplicaSet is made cannot be seen here; W3 records it.
+- `TestEveryRenderedStreamAppliesOnARealServer`: every stream `TestEveryRenderedStreamPassesTheApplyChecks` renders (§5.5), with placeholder images, applied first with `dryRun=All`, then for real twice. No error, and an unchanged generation on the second apply. This is where server-side apply's own refusals (duplicate list-map keys, Strict validation, Job immutability, Service allocations) would show before the billable walk.
+- `TestApplyRefusesAStaleResourceVersion`: an apply whose body carries a stale `metadata.resourceVersion` answers 409. Its result decides §9.5's policy precondition.
+- `TestMigrationRefusesASilentlyIgnoredRewrite`, against the real server: an undecodable managedFields list keeps the live list while the annotation goes, and `MigratedEndState` refuses.
+- `TestAnnotationRemovalInTheSamePatchLeavesNoUpdateEntry`, which settles §6.3's open question.
+- `TestMetadataOnlyListsCarryNoSecretData`, `TestStatusCauseWireName` and `TestTypedListItemsCarryNoKind`, which settle §2.1's and §2.2's wire claims.
+
+### 10.7 The billable walk (written in M2.9; needs Q10's approval; not run)
+
+**The runbook** is `docs/runbooks/adr-0023-m2-walk.md`. Observation happens from Cloud Shell. The walk probe is built elsewhere with `go test -c` [memory: walk environment]. Little Snitch gains rules for `bin/farcast` to `oauth2.googleapis.com` and `*.gke.goog`.
+
+**Its cost, before approval.** The repository's own floor model puts one instance at about USD 77 a month, about USD 0.11 an hour: the Autopilot cluster line of USD 37 a month (modelled, unverified, `floor.go:21`), the load balancer at USD 0.025 an hour (`technocore/pricing/pricing.go:32-33`), and the five system pods at the rate card (`pricing.go:28-29`; `floor.go:93-105`) [read; the total is inf]. `$OLD` lives from W0 to W6, about 6 hours; `$NEW` from W4 to W6, about 3. That is about 9 instance-hours, about USD 1 by the model, plus the build and fetch Jobs, egress, and any cluster management fee the model's cluster line leaves out [unverified]. The runbook asks for approval of **under USD 5** [inf]. Every install in the walk uses `--cost-limit 100` (USD a month), as the M1 walk did (`docs/runbooks/adr-0023-m1-walk.md:121`) [read], above the model's floor.
+
+**The steps:**
+- **W0.** A release farcast built at 44890cb, the M1 walk's build, on a machine with kubectl, the plugin and gcloud, installs `$OLD` with `--cost-limit 100`. It then runs:
+  - `connect`;
+  - `kernel deploy --adapt --adapt-cooldown 1m`;
+  - `storage deploy`, with the grant applied by hand;
+  - `kernel confirm`;
+  - a `run` with storage wired.
+
+  Wait for one adaptation.
+- **W1.** The M2 release farcast, from a shell with no kubectl, plugin or gcloud on `PATH`:
+  - `world $OLD` gives `credential_missing` on the cluster sections;
+  - `reader init`, then the Cloud Shell paste (its key-upload policy check passes), then `reader record`;
+  - `reader grant` refuses with `not_migrated`;
+  - `migrate --plan`, reviewed, then `--confirm`;
+  - `reader grant`, interactive, and its verification, recording how long IAM took;
+  - `world`, `ps`, `logs` and `costs` read;
+  - the cluster's Kubernetes version is recorded, for §10.6's pinned minor.
+- **W2.** From Cloud Shell, `kubectl get <each listed object> --show-managed-fields -o yaml` shows no `kubectl-client-side-apply`, no annotation, and the `farcast` Apply entries. The kernel's entries after its next write read `technocore`.
+- **W3.** `kernel deploy` without `--adapt`: the `--adapt` argument is gone from the live Deployment. This is the live stuck-field check. Then `redeploy` and a second `run`.
+  - Record whether an unchanged re-apply moves `metadata.generation` under Autopilot, and whether a ReplicaSet is made.
+  - Record the application's requests after `run`, and the review's reset lines (P1).
+- **W4.** A fresh `install $NEW --cost-limit 100` with the M2 farcast, then:
+  - `connect --plan` and `--confirm`;
+  - the reader steps;
+  - `kernel deploy --plan` and `--confirm`;
+  - `storage deploy --plan --grant-bucket` and `--confirm` **[decided: P2]**;
+  - `run --plan`, `--confirm F`, then `--confirm D`;
+  - if a repository-scoped read-only token is to hand, `git-credential set --plan` and `--confirm`, and a `run --git-secret` of a private repository;
+  - `world`.
+- **W5.** Audit: `gcloud logging read` on the Admin Activity entries for `$NEW`'s cluster writes. Record `principalEmail`, which is the installer SA, and `requestMetadata.callerSuppliedUserAgent`, which is expected to be `farcast`.
+- **W6.** Release both instances, run the reader lines each `release` prints, and check the cloud at zero.
+
+**What only this walk settles:**
+- that Autopilot's mutations converge under forced apply;
+- whether a re-apply after migration rolls a workload on Autopilot;
+- the audit's caller identity and user agent.
+
+### 10.8 The probe walk (Q9; after M2.5; needs approval; not run)
+
+Google documents that the DNS endpoint accepts an access token minted from a service-account key by `gke-gcloud-auth-plugin` with Application Default Credentials, and that the DNS endpoint needs no CA step ([doc](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/api-server-authentication), "Environments without gcloud"). What is not documented, and what this walk tests first, is farcast's own 2LO token with `userinfo.email` alone, and the reader with `roles/container.clusterViewer` plus RBAC.
+
+**Its cost:** one instance, `--cost-limit 100`, for about 2 hours: about USD 0.25 by the model of §10.7, under USD 1 [inf].
+
+**It records:**
+1. whether the DNS endpoint accepts the **writer's** token scoped to `userinfo.email` only (M2.5's in-process reads, such as `kernel deploy`'s namespace read). If it refuses, `cloud-platform` is added back with a dated note (§3.3);
+2. the same for the **reader**, through `reader init`, the paste, `reader record`, `reader grant` and `world`;
+3. the init script: the `org-policies describe` spelling and output, for the legacy `iam.disableServiceAccountKeyUpload` and the managed `iam.managed.disableServiceAccountKeyUpload` both, `--format 'value(name.basename())'`, the retry against a fresh account, and whether upload needs a key usage on the certificate;
+4. whether GKE's SelfSubjectAccessReviews consult IAM: a second, throwaway account with `roles/container.developer` and no RBAC asks whether it may create deployments;
+5. whether Google accepts `"kid":""`: the walk probe mints once with an empty key id;
+6. the body of a 403 from the endpoint's IAM check, against a Kubernetes Status (§8.1);
+7. the recorded endpoint's form, for §3.1's region check, and whether its location label is the region or a zone; and the cluster's Kubernetes version, for §10.6's pinned minor.
+
+It ends with `release` and its printed reader lines.
+
+---
+
+## 11. Records to update
+
+Each record is updated when its sub-milestone lands, and says no more than is built or walked.
+
+- **M2.1–M2.2.** `planck/translate/workload.go:42-49`'s comment (§5.5). The ADR 0023 status line adds: `M2.1 and M2.2 built <date>: the in-process client exists, unwired, and Secrets render as data:.`
+- **M2.3:**
+  - **`farsight/cli/README.md`** gains a "The reader identity" section. It says:
+    - that the reader's IAM role is project-wide: it can connect to and get every cluster in the project, and RBAC confines its reads to this one;
+    - that its key is an upload, which the managed constraint `iam.managed.disableServiceAccountKeyUpload` and the legacy `iam.disableServiceAccountKeyUpload` can each forbid (the legacy one is enforced by default in organizations created on or after 2024-05-03);
+    - that `iam.serviceAccountKeyExpiryHours` governs every key created after it is set, the installer's download too, and that the reader's `reader init --days` fits it only when it is `24h` or more, with `--days` at most its days and at most 90;
+    - that the key expires with its certificate, and `reader init --rotate` is the remedy;
+    - that `release` leaves the account in Google and prints the lines that delete it;
+    - that the `keys upload` output format and the policy checks' spelling are unverified until walked.
+  - **`farsight/cli/README.md`'s command table** (`:94-116` [read]) gains a `reader` row: `init`, `record` and `grant`, the instance's read-only identity.
+  - **ADR 0023**, dated notes:
+    - on decision 2: the 14th kind, ClusterRoleBinding, restricted to the one name `farcast-reader-namespaces` **[decided: P3]**;
+    - on "What stays outside the app": deleting a released instance's reader account, from Cloud Shell.
+  - **`docs/runbooks/phase-1-validation.md`** gains the per-instance reader step, marked `not yet walked`.
+- **M2.4:**
+  - **ADR 0021 decision 9**, a dated note: the pinned gcloud rules and the three kinds are retired by ADR 0023 M2.4; `world` reads as the instance's reader service account; "reads never mint an admin token" holds for the cluster reads of `world`, `ps`, `costs`, `usage` and `logs`, tested by `TestWorldNeverOpensAWriterCredential` and `TestReadCommandsPresentOnlyTheReaderToken`; *it does not yet hold for plans' Google reads, `migrate --plan`, or the storage and secret reads, which use the installer key until M3b*; *the DNS endpoint's acceptance of the reader's token is not walked*.
+  - **ADR 0023**, a dated note on decision 3 (MC-9, option (a)): the rule's M2 scope, as above, and what M5's broker must do: `migrate` stays terminal-only or gets a one-plan writer token, and plans' Google reads move to a scoped identity at M3b. Also: decision 3's "which GKE requires" applies to `userinfo.email` only; GKE's page does not mention `cloud-platform`, and M2 mints cluster tokens with `userinfo.email` alone (§3.3).
+  - **ADR 0021** Verification 5, the same.
+  - **"What Google sees", new in M2**, in the CLI README and ADR 0019's dated note: tokens are held in memory only and each command is one process, so every read command and every plan that reads the cluster mints a token at `oauth2.googleapis.com`. Google can therefore time each operator read, and records each key's last use [inf]. The plugin's file cache minted about once an hour [inf].
+  - **`farsight/cli/README.md`** (line numbers at 0cea21f [read]; ADR 0023:337-340's are 6b62d3f's):
+    - `:112` and `:1065-1087` (`pin-gcloud`, `gcloud_pinned`, the `instances` example);
+    - the `world` sections' "through kubectl" sentences;
+    - the error-kind table (`:1149-1170`), with `endpoint_refused`'s and `credential_refused`'s meanings as in §8.1, plus the retired paragraph;
+    - "The gcloud identity guard" (`:1172-1200`), which is replaced by "The reader identity";
+    - the rehearsal (`:1202-1230`);
+    - the layout lines `:1271` and `:1281`.
+  - **`docs/runbooks/phase-7-connected-view.md`**: Part R's R1, R3, R4, R5–R7, R8.1 and R9, and Part L, rewritten for the reader. Part L was never walked (`:242` [map]), and it stays marked not walked.
+  - **`farsight/client/apple/README.md`**: the Settings paths.
+  - **`AGENTS.md`**'s control-plane line: the calls go to the provider's API server *"through kubectl for writes, and in-process for reads (ADR 0023 M2.4)"*.
+- **M2.5:** the CLI README's statement that writing commands' envelopes carry cluster kinds for in-process calls, and `internal` for the transitional kubectl `Apply` until M2.7.
+- **M2.6:**
+  - **ADR 0021 decision 6**, a dated note: every cluster-writing command has `--plan` and `--confirm`; the scope is still narrower than "every command with an operator gate" (Q13, decided: ADR 0021 step 3).
+  - **`farsight/cli/README.md`** gains "Plans and confirmation", which names what `--yes` never covers and the plan's target.
+  - **`farsight/cli/README.md`'s `run` section** gains the review's reset lines (§5.4) and the refusal of a `--yes` or non-interactive restart of an application the cost guard stopped at the limit, with its text **[decided: P1]**.
+  - **PLAN.md `:457`**: M2 is partly built, with the sub-milestones named.
+- **M2.7:**
+  - **ADR 0006**: the status note becomes *superseded (decisions 1, 2 and 4) by ADR 0023 M2.7 on <date>; decision 3 is kept and is now trivially true.*
+  - **ADR 0004 decision 2** (`:56`) and its negative consequence (`:80`): the exec credential is gone.
+  - **ADR 0009**: revisit trigger 3 (`:122`) gets a dated note. Server-side apply lives in the CLI's own package, not the kernel's, so the trigger did not fire for the kernel. Decision 3 gets a dated note (Q6, decided): the kernel sends `fieldManager=technocore` on every write, its scale and resize patches and its ConfigMap PUTs and POSTs (`technocore/kube/client.go:173-181,213-228,336-396`), a query parameter on its existing writes and not a new verb, and TechnoCore's digest changes at the next release.
+  - **ADR 0023 Choices, 6**, a dated note **[decided: P1]**: `Answered <date>: (c) forced, each reset a review and plan fact, and no --yes restart of a stopped application while the limit is reached.`
+  - **ADR 0016 Consequences** (`:62`), a dated note **[decided: P1]**: `farcast run` still re-renders an application at 100m/128Mi, and from ADR 0023 M2 its review and plan state the reset and that the kernel re-adapts after its cooldown.
+  - **ADR 0023 `:94` and `:308`**, a dated note **[decided: P4]**: the real-API test runs on an envtest `kube-apiserver` and `etcd`, not on k3s, and it shows no controllers and no Autopilot admission (§10.6).
+  - **`farsight/cli/README.md`'s command table** gains a `migrate` row, and the README gains a "`farcast migrate`" section: its modes (interactive by typing the name, `--plan`, `--confirm`; `--yes` refused), that it cannot be undone, and that every cluster-writing command refuses an unmigrated instance (§6).
+  - **ADR 0019 decision 6** (`:66`): `logs` reads the log subresource in-process as the reader. The user agent is `farcast`, *not yet walked*.
+  - **`AGENTS.md`**:
+    - `:33` and `:49-50`: "the bundled CLI still needs `kubectl`, the GKE auth plugin and `gcloud`" becomes "needs none of them where service-account key upload is allowed (neither `iam.disableServiceAccountKeyUpload` nor `iam.managed.disableServiceAccountKeyUpload` enforced), since ADR 0023 M2 *(built <date>; its walk has not run)*".
+    - the data-plane paragraph's "`kubectl` subprocess".
+    - the control-plane line: "through kubectl" becomes "in-process".
+  - **`README.md`** `:280` and `:300`, with the same qualifier.
+  - **`farsight/cli/README.md`**: `:289` (ADC when `--credentials` is omitted), `:609` (the kubectl-subprocess wrapper), decision 8 at `:1376`, every "requires kubectl and the plugin" sentence (grep `kubectl`), and the directory layout (`kubeconfig.yaml` gone).
+  - **The kubeconfig's retirement in code:** `planck/internal/providers/gke/kubeconfig.go` is deleted, with its comment (`:5-12`); `planck.Cluster.Kubeconfig` (`planck/types.go:59`, its redaction at `:73-76`) goes; `gke.go:261` stops building it; `install.go:201` stops saving it, and `healthCheck`'s `len(cluster.Kubeconfig) == 0` refusal (`install.go:340`) goes, leaving the endpoint check; `planck/cmd/planck/main.go:97`'s message drops the byte count; `config.SaveInstanceKubeconfig` and `InstanceKubeconfigPath` (`config/instance.go:835-843`) go [read].
+  - **Code comments**: `cluster.go:1-14` (the package doc); `rehearsal.go:1-21`.
+  - **User-facing kubectl hints** are rewritten without kubectl: `build.go:192`, `run.go:386`, `runfetch.go:61`, `kernel.go:241` (§9.8), `redeploy.go:222`, `storagepin.go:331`, `storagekey.go:399` [map].
+- **M2.8:**
+  - **ADR 0023 decision 8**, dated notes: the bucket grant is offered through the plan **[decided: P2]**; `farcast git-credential set` and `rm` are built, plan-gated and never covered by `--yes` (Q11, decided); the namespace subcommand is not built, because `farcast run` creates its namespace.
+  - **ADR 0023:35**, a dated note: `git-credential rm`'s Secret delete is the one delete farcast makes.
+  - **`storagedeploy.go:347-352`'s comment**: it no longer says "deliberately never asks for". ADR 0023:212 cites it as `:328-334`; the citation is stale [read].
+  - **"What Google sees", new:** every `storage deploy` plan reads the bucket's IAM policy (`getIamPolicy`) as the installer.
+  - **`docs/runbooks/phase-3-validation.md`'s grant step.**
+  - **Runbooks 4.2 and 4.3** (`phase-4-2-validation.md:224`, `phase-4-3-validation.md:208`): `kubectl create secret` becomes `farcast git-credential set`.
+  - **`farsight/cli/README.md`**: a `git-credential` row in the command table and a "`farcast git-credential`" section (§9.8); and `--grant-bucket` in the `storage deploy` section (`:816-820` [read]) **[decided: P2]**.
+- **M2.9:**
+  - **ADR 0023's M2 row** (`:308`), with *built, walk not run* until Q10's walk.
+  - **ADR 0023 `:34`'s "15 methods (`cluster.go:234-613`)"**, now 13 exported methods at `:250-652`, plus the four M2 adds.
+  - **PLAN.md `:436-457`.**
+  - **The new runbook.**
+
+ADR 0023's status line (`:3`) and its `M1 as built` line (`:135`), which at 0cea21f still say M1's walk has not run, are corrected by the main session directly: W0–W7 walked on 2026-11-14, and R0 has not run (`docs/runbooks/adr-0023-m1-walk.md:5`) [read]. This design cites only that corrected state.
+
+**Qualifier rule.** No record says "farcast needs no kubectl" without *where service-account key upload is allowed* (neither `iam.disableServiceAccountKeyUpload` nor `iam.managed.disableServiceAccountKeyUpload` enforced), and without *not yet walked* until the walk runs. No record says that cluster writes are bound to the instance before M3b. No record says that reads never mint an admin token without M2's scope.
+
+---
+
+## 12. What is still the operator's
+
+Two things are still the operator's: Q9 and Q10, approvals asked when due. P1–P4 were decided by the operator on 2026-11-14, each as written here; each place that depends on one is marked **[decided: P<n>]**.
+
+| # | Question | Decided 2026-11-14 (operator) | Alternatives declined, and what they would have cost | Marked in | Blocks |
+|---|---|---|---|---|---|
+| **P1** | **Choice 6: how `run` applies applications** (v1's Q1, with MS-17) | (c) forced, with each reset bound as a review and plan fact, **plus** a gate: while the ledger reports the limit reached, `--yes` and non-interactive runs refuse to restart an application the cost guard stopped; only an interactive confirmation or a `--confirm` of a plan that names the reset may (§5.4) | (c) without the gate: `run --yes` restarts a stopped application silently, as today, from a script, every time it runs. (b) non-forced with a dry run: no silent reset, but no CLI way to restart a stopped application without a new force flag, and its conflict rests on the server tracking the `/scale` write. (a) forced and silent: today's behaviour. | §1, §2.3, §2.6, §4, §5.4, §8.1, §9.4, §9.5, §10.2, §10.5, §11 | M2.6 (`run`'s facts), M2.7 |
+| **P2** | **Choice 7: the bucket grant** (v1's Q2) | Offer it: `storage deploy --plan --grant-bucket`, then `--confirm` (§9.7). Push access stays human. | Keep printing it only. The printed `gcloud storage` command crashed on the M1 walk's Mac (`adr-0023-m1-walk.md:146`). | §0, §1, §9.5, §9.7, §10.5, §10.7, §11 | M2.8 |
+| **P3** | **The reader's RBAC** (v1's Q3, with MS-10 and MC-16) | Narrow: `namespaces list` alone cluster-wide, through the 14th kind restricted to `farcast-reader-namespaces`; everything else per namespace, by RoleBindings in `farcast-system` and every metered namespace, applied with the kernel's meter bindings. No project-wide custom IAM role. (§7.2) | One ClusterRoleBinding to the full read role: one object instead of one per namespace, but the reader then reads pods, logs and workloads in every namespace, `kube-system` and GKE's included, whose pod specs carry bucket, project, cost-limit and repository arguments. The repository refuses exactly this for the kernel (`technocore/deploy/deploy.go:233-239`). | §1, §2.5, §5.1, §5.4, §7.2 (the RBAC, where each part is applied, and `reader grant` steps 3–4 and 7), §7.3, §9.4, §10.5, §11 | M2.3 |
+| **P4** | **Where the real-Kubernetes test runs** (v1's Q7, with MS-31) | An envtest `kube-apiserver` and `etcd` on the Ubuntu keeper VM, as an unprivileged user, on 127.0.0.1 only, reached by `ssh -L`, and deleted right after. Its minor pinned to GKE's current default (§10.6). It shows no controllers and no Autopilot admission. | k3s on a separate throwaway VM: faithful controllers, root on a machine that holds nothing. k3s on the keeper VM, bound to loopback and uninstalled after: root, and by default every interface [unverified], on a machine that holds keeper material. | standing rules, §6.8, §10.6, §11, §13, §14 | M2.7's test; its run needs approval |
+| **Q9** | **An early probe walk after M2.5** | Approve when M2.5 is green | One instance for about 2 hours, `--cost-limit 100`, under USD 1 [inf]. It tests what Google's pages do not cover (§10.8). Without it, farcast's own token and the reader are first tested at the end. | §0, §10.8 | — (de-risks M2.6 onwards) |
+| **Q10** | **The full M2 walk** (§10.7) | Approve when M2.8 is green | Two instances, about 9 instance-hours in all, `--cost-limit 100` each, under USD 5 [inf] | §0, §10.7 | M2's "walked" |
+
+**Decided questions,** no longer the operator's:
+
+| # | Decision | Source |
+|---|---|---|
+| Q4 | (a): `ps`, `costs`, `usage` and `logs` run as the reader and refuse without one. v1's (b) and (c) would have contradicted ADR 0023 decision 3's heading, "reads run as a separate read-only identity". | triage; ADR 0023:107 |
+| Q5 | `roles/container.clusterViewer`, which carries `container.clusters.connect` and `container.clusters.get` [doc]. A project custom role with those two is a contingency only, if the probe walk shows clusterViewer refused. Certificate lifetime 365 days, with `reader init --days N` to fit `iam.serviceAccountKeyExpiryHours`; that constraint and both upload constraints, the legacy and the managed one, are named (§7.2). | triage; MF-5, MF-7 |
+| Q6 | Yes: the kernel sends `fieldManager=technocore` on its writes, in M2.7, with an ADR 0009 dated note. | triage |
+| Q8 | Approved. The reviser fetched the files on 2026-11-14 at kubectl v0.37.2; §4's ports are [doc]. The implementer re-reads them at that tag and cites it in code comments. Nothing is vendored. | triage |
+| Q11 | Built, in M2.8: `farcast git-credential set` and `rm`, plan-gated and never covered by `--yes` (§9.8). The namespace subcommand is not built: `farcast run` creates its namespace. A dated ADR 0023 note on decision 8. | triage; ADR 0023 decision 8; MC-19 |
+| Q12 | Accepted: `install` requires `--credentials` from M2.7 (D13). No live instance is affected. | triage |
+| Q13 | Later, in ADR 0021 step 3. M2 stays at "every command that writes to a cluster". | triage |
+| MC-9 | Option (a): the rule's scope in M2 is the cluster reads of the read commands and of every plan but `migrate`'s; the exceptions are recorded in a dated ADR 0023 note, with what M5's broker must do (§7.3). | triage; MS-2 |
+| Scopes | `userinfo.email` only, for both identities' cluster tokens (§3.3). If the probe walk shows the DNS endpoint refuses it, `cloud-platform` is added back with a dated note. | triage; MS-29, MF-8 |
+| Order | The sub-milestone order is kept, with `clusterref.go`'s reader branch, `LoadClusterCA` and a reader-only `cluster.Open` moved into M2.3, and the Git credential in M2.8. | triage; MC-11 |
+
+**Decisions taken here that the operator may veto cheaply:**
+
+| # | Decision |
+|---|---|
+| D1 | The endpoint comes from `metadata.yaml` plus an optional `cluster-ca.crt`. From M2.4 farcast's own client reads no `kubeconfig.yaml`; from M2.7 nothing writes it, and `migrate` deletes it and the plugin cache. |
+| D2 | The User-Agent is exactly `farcast`. |
+| D3 | Apply stops at the first failing document, which is stricter than kubectl. |
+| D4 | The migration marker is local, in `metadata.yaml`. Another machine's record refuses until that machine runs `migrate`. Client-side traces seen after migration clear it. The alternative is an in-cluster ConfigMap marker, which is one more object the provider sees. |
+| D5 | The migration plan binds uids, client-side managers and their field hashes, not resourceVersions, and the patch carries the freshly read resourceVersion. |
+| D6 | Pin-only writers (`storage key pin`, `storage key rotate`) refuse an unmigrated instance too. The alternative exempts them, because their write is not an apply. |
+| D7 | `run`'s deploy-stage `--confirm` reads the existing fetch Job and never re-applies it, so a deploy digest lives 15 minutes. |
+| D8 | A plan binds its target (provider, project, region, cluster, endpoint, the record's creation time, and `farcast-system`'s uid where it reads the cluster) and each fact's own record values, not the record file's hash, so a keeper's or another command's unrelated record write does not invalidate it. |
+| D9 | Secret material, key ids and clock values are rendered from placeholders in plans; exactly three kinds of field may differ between a plan's rendering and what is written (§9.4). |
+| D10 | Both documents move to schema 2 together, through one constant. |
+| D11 | `logs --previous` keeps kubectl's pod choice, `podutils.ByLogging`: assigned, running and ready first, longest-ready first, then more restarts (§4). A container with no previous instance is skipped with a note on stderr, where kubectl would stop: FarCast's own choice. |
+| D12 | The retry policy is: `GET` and apply retried on 429 and 503 (3 attempts, at most 10 s apart); a 401 re-mints once, for any method, through a FarCast-owned token cache; no other retries. |
+| D13 | `install` requires `--credentials` from M2.7 (Q12). |
+| D14 | `GOOGLE_SDK_GO_LOGGING_LEVEL`, `SSL_CERT_FILE` and `SSL_CERT_DIR` are unset process-wide. |
+| D15 | `kubetest` is a non-test package. A step 1b check keeps it and the rehearsal out of `farcast`, and another keeps every `farsight/` package out of `technocore`. |
+| D16 | Plan vectors are produced in Go, but not copied to FarSightKit until 7.1. |
+| D17 | The reader's email is derived from the instance name and project, and checked on every use; a record that names another account is refused. |
+| D18 | Migration discovery lists each kind cluster-wide by label, and converts every Update manager that owns the last-applied annotation, as kubectl's own migration does. |
+| D19 | `kernel confirm`'s `AsOf` is the UTC day of the confirmation. |
+| D20 | A missing endpoint is `endpoint_refused`; `not_connected` keeps its meaning. |
+| D21 | `logs`' container order (init, main, ephemeral) and `jobMessage`'s newest pod are FarCast's own choices, not ports. |
+| D22 | The Google-mode endpoint must carry the instance's region as one of its labels (§3.1). |
+
+---
+
+## 13. Size [inf]
+
+Re-estimated after the revision. The figures include the tests and mutations the reviews added, and exclude the walks and the waits for approval.
+
+| Sub-milestone | Go lines (code + tests) | Other | Days |
+|---|---|---|---|
+| M2.1 `kube` + `kubetest` | ~1,600 + ~2,100 | — | 6.5–8 |
+| M2.2 `data:` Secrets and composed streams | ~60 + ~250 | — | 0.5–1 |
+| M2.3 reader identity, its scripts and rotation, `clusterref.go`'s reader branch, `release`'s lines, hardening | ~800 + ~900 | runbook step, README section | 4–6 |
+| M2.4 read path, kinds, documents, rehearsal | ~750 + ~950, the rehearsal −700/+650 | Swift ~300 + tests | 5–6 |
+| M2.5 writing commands' reads | ~300 + ~450 | — | 1.5–2 |
+| M2.6 consent protocol, the plan's target, placeholders, re-reads, P1's gate | ~2,000 + ~2,200 | 13 vectors | 9–12 |
+| M2.7 SSA, migration, kubectl and the kubeconfig out, the kernel's field manager | ~900 + ~1,100, plus the real-Kubernetes suite ~700 | allowlist; envtest runbook **[decided: P4]** | 6–8 |
+| M2.8 the grants and `git-credential` | ~550 + ~650 | 2 vectors | 3–4 |
+| M2.9 records and the walk runbook | — | ~20 records | 2–3 |
+| **Total** | about 7,000 + 9,300 | | **about 38–50 working days, 8–10 weeks** |
+
+v1 estimated 29–36 days. This is about 2.5 times ADR 0023:308's "3–4 weeks", and the Go is well past :104's "800–1,000 lines plus as many test lines". The difference is the consent protocol across 14 commands, the image-resolution split, the rehearsal, the reader's lifecycle (rotation, release, verification), and the checks the reviews found missing. The wire client alone, without `kubetest`, is about 900 lines, near the ADR's figure. Q9 adds about half a day of operator time and Q10 one to two days.
+
+---
+
+## 14. Risks
+
+1. **farcast's own token, and the reader, may not be accepted.** Google documents that the DNS endpoint accepts an access token minted from a service-account key by the auth plugin ([doc](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/api-server-authentication)). That farcast's own 2LO token with `userinfo.email` alone, and the reader with `roles/container.clusterViewer` plus RBAC, are accepted is not yet walked. Q9 tests it first.
+2. **Every live object's managed fields are rewritten**, on the strength of csaupgrade's algorithm, a FieldsV1 implementation inferred from the format, and an end state the SSA page discourages producing by hand [doc]. The read-back and the real-Kubernetes test settle the semantics. Only the walk settles Autopilot.
+3. **The first apply after migration may roll workloads.** csaupgrade's caveat 3: "Client-side apply tends to own more fields (including fields that are defaulted), this will possibly remove this defaults, they will be re-defaulted, that's fine" [doc]. After the rename farcast owns them, and a forced apply that omits them releases them. Admission is not the cause: the API server records managed fields before mutating admission runs (apiserver v0.37.2 `create.go:199-203`) [doc], so a field admission adds is owned by no manager, and a field farcast applied stays farcast's even when admission rewrites its value [inf]. `TestFirstApplyAfterMigrationChangesNoGeneration` and W3 check it.
+4. **The kernel's manager name.** Until M2.7 the kernel writes under a derived name, `Go-http-client` [unverified]; from M2.7 it is `technocore`. Whether the server tracks the kernel's `/scale` write as owned at all is open: the SSA page says sub-resources that do not receive the object's type may not be tracked [doc]. §10.6 records it.
+5. **Removed applications keep billing.** Neither server-side apply nor M2 prunes: an application removed from a manifest keeps running (`runpolicy.go:36-44` [map]), and with kubectl gone, nothing in farcast deletes it. This is not in M2's scope, and it is a revisit candidate that a record must name.
+6. **Two farcast versions on one machine.** A pre-M2 `world` refuses after an M2 save drops the pin, and a pre-M2 writer re-applies client-side. §6.6 catches the second only on the next M2 write.
+7. **The egress policy's read-modify-write** has no resourceVersion guard in interactive and `--yes` runs (`runpolicy.go:30-61`, `run.go:256-270` [map]), so two concurrent `run`s still lose one update. Under `--confirm` it is re-read just before the apply, which leaves one read-and-apply window, closed in M2.7 only if `TestApplyRefusesAStaleResourceVersion` passes (§9.5).
+8. **M5's broker.** It hands out reader tokens for plans, yet M2's plans still read Google (the registry, buckets and IAM state) with the installer key, and `migrate --plan` reads as the writer. The dated ADR 0023 note says what M5 must do (§7.3).
+9. **A fetch read can be stale.** A second `run` of the same branch within 15 minutes reads the previous fetch Job's commit (`fetch.go:186-193`, TTL `:63` [map; not walked]). M2 inherits this, and `--confirm` makes it the intended behaviour within a deploy digest's life.
+10. **An organization can forbid the reader.** Two constraints block key upload: the managed `iam.managed.disableServiceAccountKeyUpload`, and the legacy `iam.disableServiceAccountKeyUpload`, which is enforced by default in organizations created on or after 2024-05-03 [doc]. And `iam.serviceAccountKeyExpiryHours`, which governs every newly created key, the installer's too, leaves no reader at `1h` or `8h`, because `--days` counts whole days [doc; inf] (§7.2, step 3). There, under Q4 (a), an instance has no `world`, `ps`, `costs`, `usage` or `logs` until an administrator allows upload or a longer expiry, or until M3b's impersonated reader. M2 has no fallback: one to the writer would break ADR 0023 decision 3.
+11. **The reader's IAM role is project-wide.** It can connect to and get every cluster in the project [doc]. RBAC confines its reads to the cluster that binds it.
+12. **The real-Kubernetes test shows no controllers and no Autopilot admission** **[decided: P4]**. Rollouts, ReplicaSets and Autopilot's defaults are seen first in the billable walk.
+13. **The region check rests on an inferred endpoint form** (§3.1). If GKE ever records an endpoint without the region as a label, every Google-mode call refuses, which fails closed and shows at the first read. An endpoint whose location label is a zone, as in Google's one example, fails closed in the same way. The probe walk records a real endpoint.
+
+---
+
+## Not settled here
+
+- **kubectl's behaviour.** Its rollout rules, its pod choice for logs, its `--all-containers` order, its follow limit and its migration's manager selection are now [doc] at kubectl v0.37.2. Its carrying on past a failing document in `apply` is still [map; unverified].
+- **The reader's identity setup.** Settled by the probe walk:
+  - `keys upload`'s output format, `value(name.basename())`;
+  - the `org-policies describe … --effective` spelling and output, for the legacy and for the managed upload constraint;
+  - whether upload needs a key usage on the certificate;
+  - `kid:""`;
+  - whether GKE's SelfSubjectAccessReviews consult IAM;
+  - the body of an IAM-level 403;
+  - the project-ID shape farcast checks.
+  - whether a clean reader is answered no for `list pods` in `kube-system` (the fifth review, A17-5);
+  - whether Google's token endpoint refuses a freshly uploaded key for a while, which `reader grant` does not retry (A17-6);
+  - whether Autopilot admits a RoleBinding in a `gke-*` or `gmp-*` namespace (A17-7).
+- **The reader's binding after `kernel meter --remove`** (A17-7). It stays, and still grants workload, pod and log reads in a namespace the kernel no longer meters; delete it once deletes exist (M2.7 or later).
+- **API details.** Unverified, and settled by the real-Kubernetes test:
+  - the wire name of `StatusCause`'s reason;
+  - a typed list's missing `kind`;
+  - whether a metadata-only `Accept` is honoured on lists, gets and patches;
+  - whether `resourceVersion` in an apply body is honoured. The SSA page only says it "doesn't have to be specified" [doc];
+  - whether `--token-auth-file` is current at the pinned minor, and what the envtest asset carries.
+- **Google details.** Unverified: the status code of a stale bucket-policy etag (409 or 412); that deleting a service account deletes its keys, and that its binding outlives it.
+- **Whether removing the annotation in the same JSON patch leaves a `farcast`/Update entry.** The real-Kubernetes test settles it before M2.7 lands (§6.3).
+- **The DNS endpoint's form,** and whether its location label is the region or a zone (§3.1).
+- **A record that names another FarCast cluster in the same region.** §3.1's region check does not catch it, and the plan's target detects only a cluster replaced between plan and confirm (§9.3). It stays open until a uid is recorded. The alternative is MS-25's optional half: `connect` records `system_namespace_uid` in `metadata.yaml` when it creates `farcast-system`, and every writing command compares it on its first cluster read, refusing with `endpoint_refused` on a mismatch.
+
+## 15. Amendments from M2.1's build (2026-11-14)
+
+M2.1 was built, reviewed twice and mutation-tested. Where the code differs from the sections above, this section governs, and later sub-milestones build on it. The first round's deviations (about 45, all fail-closed tightenings or additions) are listed in `m21-build-report.md` under each slice's "deviations"; the ones a later sub-milestone must know are A15-9 to A15-12 below.
+
+**A15-1 (§2.1, §8.1): a new sentinel, `ErrUnsafeEnvironment`** ("kube: the process environment would print a secret"). `GODEBUG=http2debug=1` or `=2` refuses every client with it, not with `ErrEndpointRefused`, because nothing about the endpoint is wrong. M2.4's `clusterKind` maps it to a new kind, `unsafe_environment` ("the process environment would make farcast print a credential; nothing was sent"), placed before `endpoint_refused` in §8.1's order. The kinds-added row in §1 gains it.
+
+**A15-2 (§3.4): three HTTP clients, not two.** `api` and `token` keep `ResponseHeaderTimeout: 30s`. A third, `follow`, has the same shape (no proxy, the same TLS config, the loopback dialer in loopback mode, the bearer transport, no redirects, no `Timeout`) but no `ResponseHeaderTimeout`, so `logs --follow` on a quiet container is not cut off at 30 s. Only a followed `StreamLog` uses it. A non-followed log read keeps the header bound and stays outside the 60 s per-attempt deadline (it is streamed).
+
+**A15-3 (§3.4): the per-attempt deadline is a field**, `Client.attemptTimeout`, 60 s, named in the unreachable text ("no answer within 60s"). Unreachable is classified on `errors.Is(actx.Err(), context.DeadlineExceeded)`, before the attempt's context is cancelled.
+
+**A15-4 (§3.4): `Retry-After` is capped before it is multiplied**, so a huge value waits 10 s, never a negative or wrapped duration; an out-of-range value falls back to 1 s.
+
+**A15-5 (§3.3): the token cache compares wall time.** Its clock is `time.Now().Round(0)`, as the vendored `Token.IsValid` does, so a Mac that slept past the token's hour mints rather than sending an expired bearer.
+
+**A15-6 (§5.2 step 1): a line that is not valid UTF-8 is refused first** ("it is not UTF-8; …"), never quoted. This closes the UTF-16 byte-order-mark polyglot; the UTF-8 BOM rule stays.
+
+**A15-7 (§5.2 step 3): four more constructs are refused**, because go-yaml and the API server's yaml.v2 tokenize them differently and can disagree about which keys exist:
+- a value written directly after its colon (`a:"x"`);
+- inside a flow collection, any plain scalar that is not one word of `[A-Za-z0-9._/-]` (everything else there is quoted);
+- a block sequence entry with nothing after its `-` on that line;
+- outside a flow collection, a plain scalar starting with one of `?:,[]{}#&*!|>'"%@` or a backtick (`-` is allowed).
+
+Block-scalar text is not walked. A differential fuzz against `sigs.k8s.io/yaml` v1.6.0 over `go.yaml.in/yaml/v2` v2.4.4 (25M inputs, scratch only, nothing vendored) found no smuggled key under these rules. Every rendered document at 0cea21f that goes through `SplitStream` passes, except `translate`'s two `stringData` Secrets, which M2.2 changes. `RenderPin`'s JSON would now be refused, but it goes through `CreateConfigMap`/`ReplaceConfigMap` (§4), not `SplitStream`. The sentence "Step 3's refusals close the constructs where the two readers could disagree" now holds for these too. M2.2's `TestEveryRenderedStreamPassesTheApplyChecks` pins the renderers inside this subset. (For fixed inputs; A16-5 extends it to the text a manifest supplies.)
+
+**A15-8 (§7.2): an `evaluationError` is not a no.** `SelfSubjectAccessReview` returns true for `allowed: true`; for `allowed: false` with a non-empty `status.evaluationError` it returns `ErrUnreadable` ("the API server could not fully evaluate the review of <verb> <resource>; its answer proves nothing"), never quoting the server's words; otherwise false.
+
+**A15-9: refusals before identification omit `(%s %q)`**, since no kind or name is known yet; `.` and `..` are refused as names, and namespaces are checked like names. Every method checks its names before sending.
+
+**A15-10: the 401 re-mint is counted apart from the three 429/503 attempts.** `force=false` is sent explicitly on a non-forced apply.
+
+**A15-11: `Deployment` and `StatefulSet` carry `Kind Kind \`json:"-"\``**, and `Mode` has a `String` method; M2.4's `world` reads them.
+
+**A15-12: kubetest's** `requestinfo`, RBAC rule matching, forbidden message and warning quoting were ported from the v0.37.2 sources; a list or watch is authorized by the first exact `metadata.name` term of its sorted `fieldSelector`, as the real server does. It does not refuse a server-set field in an apply body, does not validate request options with the real codes (400 vs 422), and accepts `force` on a JSON patch; §10.6's real-server test covers these.
+
+**A15-13 (§10.5): mutation rows added** (each killed): `InsecureSkipVerify: true` → `TestTransportsHaveNoProxy`, `TestAServerOffTheClusterCAIsRefused`; the token client following redirects → `TestTheTokenClientFollowsNoRedirect`; no per-attempt deadline → `TestANonStreamingAttemptHasADeadline`; a follow on the API client or with a header timeout → `TestFollowWaitsForAQuietContainer`, `TestTransportsHaveNoProxy`; `StreamLog` not streamed → `TestFollowOutlivesTheRequestDeadline`; `Retry-After` multiplied first → `TestRetryWaitsHonourRetryAfterCappedAtTenSeconds`; a monotonic token clock → `TestTheTokenClockHasNoMonotonicReading`; `evaluationError` ignored → `TestSelfSubjectAccessReview`; each of A15-6 and A15-7's rules dropped → `TestSplitStreamRefuses`, `TestApplyRefusesADocumentSplitStreamWouldNot`; block-scalar text walked → `TestSplitStreamAcceptsTheShapesRenderersWrite`; the import check run with cgo off or without the CgoFiles refusal → `TestTheImportCheckReadsCgoFilesWithCgoOff`.
+
+## 16. Amendments from M2.2's build (2026-11-14)
+
+Built, reviewed in three lenses (bytes and the live move, coverage of every applied stream, mutation), each finding put to a skeptic, then fixed. Seven findings were confirmed and fixed; six were refuted (§16.8).
+
+**A16-1 (§5.5): the egress Secret's `data:` values are double-quoted.** §5.5 did not say. Standard base64 holds no character a double-quoted scalar treats specially, `EncodeToString` writes no line break, and a quoted scalar is always a string to yaml.v2, where a plain one could in principle resolve to a bool or a number. For the values `translate` can produce the quotes are defence in depth: the proxy value always starts `aHR0cDovL` and each PEM value ends in `K` or `=`, so no resolver reads either as anything but a string (mutation N5 survives as equivalent). Each value decodes to exactly what the `stringData` scalar read as: the proxy URL; and for each PEM `TrimRight(pem, "\n") + "\n"` (clip chomping). That last holds for a PEM as `encoding/pem` writes it, which is the only kind `run` passes (LF line ends, no leading whitespace); a CRLF PEM or one of only newlines would have read differently, and `blockScalarText`'s comment says so.
+
+**A16-2 (§6, the move on a live instance).** kubectl's client-side three-way merge from a `stringData` last-applied to a `data` one was emulated with apimachinery v0.37.2's strategic merge patch (scratch only): HEAD with storage to M2.2 with storage, and no storage to storage, both end with the right `data` and a base64 last-applied; M2.2 to M2.2 with storage dropped deletes both keys. The one stale-key case (storage dropped in the very first M2.2 deploy) is no regression, HEAD leaves the same keys, and it is unreachable: `Keyholder.Deployed` is only ever set true and `run` errors rather than render without storage when the CA key is missing. No live instance exists today. §6.8's migration case still covers a `stringData`-seeded Secret.
+
+**A16-3 (§5.3, ordering): `kernelManifests` and the list last.** `kernel deploy`'s stream is now composed by `kernelManifests(tcdeploy.Config)` in `kernel.go`, so the test checks exactly what the command sends. In both streams that write it, `kernelManifests` and `meterManifest`, the `technocore-namespaces` ConfigMap is the last document, after every RoleBinding it names: a stream stopped between them (kubectl interrupted today, the client at its first failure from M2.7) must not tell the kernel to meter a namespace it cannot read. `TestTheMeteredListIsAppliedAfterItsBindings` pins this now, so it no longer waits for M2.7. `kernelManifests`' "same namespaces" holds for the non-empty `Meter` `kernel deploy` always passes.
+
+**A16-4 (§5.5 tests): the checked fakes.** Every test fake's `Apply` (`fakeJobs`, `fakeCluster`, `fakeRunCluster`) calls `checkApplied`, and the cli package's `TestMain` goes through `finishTests`, which fails the package on any refused stream and writes the report whatever else failed. Each entry names the test and the line that applied it, for example `TestOnlyNewNamespacesGetABinding, applied at kernelmeter.go:119 (cli.(*kernelMeterCommand).Run)`. `TestEveryRenderedStreamPassesTheApplyChecks` no longer counts documents: once `SplitStream` has accepted a stream the count cannot differ, because `SplitStream` refuses every line that starts with `---` and is not exactly `---`.
+
+**A16-5 (A15-7, new manifest rules 31–33): manifest text is constrained at its source.** A15-7's "M2.2's test pins the renderers inside this subset" held only for fixed inputs. A manifest's `containerfile` and `context` reached the build Job's arguments unquoted and unchecked, so a newline in one added whole documents to a stream applied with the operator's credential (pre-existing, found by lens B, reproduced). And a `reason` holding U+0085 or U+FEFF stayed unescaped in the policy JSON, so `run`'s policy stream would be refused at apply time, after the builds had billed. Now:
+- **The parser** (`manifest/README.md`, "Characters"): rule 31, `containerfile` is UTF-8, every rune passes `unicode.IsPrint`, and it holds no `"` or `\`; rule 32, the same for `context`; rule 33, `reason` is UTF-8 and every rune prints (quotes and backslashes allowed). Messages name the code point and never echo the value. `run` stops at parse, before any build.
+- **`planck/build.Render`** applies the same check (`plain`) to every value it writes: repository, ref, containerfile, context, destination, git secret and each egress host.
+- **The four Kaniko value arguments** (`--context`, `--context-sub-path`, `--dockerfile`, `--destination`) are double-quoted, so a printable ` #` or `: ` in a path is built as written. The rendered bytes change; the decoded arguments do not. Build Jobs are recreated on every run, so §6's migration and §5.3's force list are unaffected.
+- **What it costs the operator:** a manifest with such characters, or `farcast build` flags carrying them, that used to be accepted is now refused. `print.go`'s `terminalText` stays as the second layer, and `runhosts_test.go`'s `TestADeclaredReasonCannotRewriteTheTerminal`, whose own note said to drop it once the parser refuses, is replaced by `TestAManifestThatWouldRewriteTheTerminalIsRefused`.
+- **Pinned by** `TestManifestTextIsRefusedBeforeTheApplyChecks` (`manifests_test.go`): each hostile value is refused by its own rule and by `pbuild.Render`; a printable sweep (` #`, `: `, a trailing `:`, `- x`, YAML indicators, Cyrillic, spaces) parses, renders, passes `SplitStream`, and reaches Kaniko as written; a reason with quotes, a backslash, an em dash and CJK goes through the policy stream and is accepted.
+
+**A16-6 (an observation on A15-7, no change).** Mutation N41 wrote `FARCAST_FATLINE_PROXY:"…"` with no space. In the no-storage Secret `SplitStream` accepted it: both readers take that line as one plain scalar, so `data` is a string and no key is smuggled. The API server would refuse a string `data` (inferred, not run). The adjacent-value refusal fires only where go-yaml reads a mapping, which is where the readers can disagree, so this is as designed.
+
+**A16-7 (§10.5): mutation rows.** Design rows 40–42 are killed: 40 by `TestEgressSecretDataDecodesToTodaysValues`; 41 by `TestEveryRenderedStreamPassesTheApplyChecks`' translate rows; 42 by its `meterManifest two added` row, at `SplitStream`'s refusal. Added and killed: N2 (unpadded base64), N3 (proxy unencoded), N4/N4b (a key dropped), N6 (seed dropped), N7 (seed without its separator), N8 (seed from a fixed list), N9 (`kernel deploy` bypassing `kernelManifests`), N12a, N17 (storage keys outside the `if`), N19, N20, N21, N22 (`checkApplied` a no-op), N24, N25, N33, N41; from the fix, parser rules 31/32/33 dropped, the quote/backslash refusal dropped, `plain` disabled or allowing quotes, Kaniko arguments unquoted, `finishTests` reporting only on success, a report without its caller, N23 (seed before workload) and N26 (list before bindings). Equivalent survivors, with their proofs in the review: N1 (URL base64; no reachable value differs), N5 (unquoted values), N18/N18b (`HasStorage` reductions), N37 (a seed error that cannot occur). Accepted survivors, all in test scaffolding: N10a–c (a fake's `checkApplied` deleted) and N11 (`TestMain` bypassing `finishTests`); the design never pins that a gate stays wired, and each fake was shown to fail the package when it fires.
+
+**A16-8: refuted findings.** The names M2.1 and M2.2 are not defined in the repo; every record that uses one says what was built, as §11 prescribes. A renderer dropping a document passes the cli table; each renderer's own package test requires its documents. The other refutations are A16-7's accepted survivors.
+
+## 17. Amendments from M2.3's build (2026-11-15)
+
+Built 2026-11-14 in four steps (plumbing; `reader init` and `record` with `release`'s lines; `reader grant`, the RBAC and the later bindings; records), reviewed in three lenses (security, conformance and records, mutation), each finding put to a skeptic, then fixed 2026-11-15. Sixteen findings were confirmed and fixed, one of them major (A17-4); twelve were refuted (seven of them A17-12's accepted survivors, the rest A17-13). Nothing was walked against Google: every Google-behaviour claim below is as unverified as §7.2 says.
+
+**A17-1 (§0, M2.3's decisions).** No error kinds are added in M2.3: they land in M2.4 with the Swift app, whose vectors `./check.sh` byte-compares. `openCluster`'s refusals, and `reader record`'s and `reader grant`'s, are a `refusal{msg, sentinel}` type: `Error()` is exactly the pinned text and `Unwrap()` returns `errCredentialMissing` (or `kube.ErrEndpointRefused` for step 1, no endpoint), so M2.4's `clusterKind` maps them with `errors.Is` without editing a text. The later reader bindings (`kernel meter`, `kernel deploy`, `run`) land in M2.3, not M2.4, because `reader grant`'s consent says "now and later". `reader grant`'s apply still runs kubectl through `newApplier` (`cluster.New`) until M2.7. Linking `internal/kube` into `farcast` left `farcast-release execsites` equal to `exec-allowlist.txt` (101 lines), and the module count at 31.
+
+**A17-2 (§2.5, §2.6, §3.5): APIs as built.**
+- `config` also has `LoadNextReaderKey` and `LoadNextReaderCert`, which the rotate script needs (§7.2 renders it from a parsed `reader.crt.next` whose key must equal `reader.key.next`'s). `SaveReaderKey` and `SaveNextReaderKey` refuse an empty half and write the key, then the certificate, each through `writeFileAtomic` at 0600; `PromoteNextReaderKey` stats both `.next` files before renaming either, then renames the key first. There is still no writer for `cluster-ca.crt`; M2.4's rehearsal needs one.
+- `cluster.Open` refuses any `cfg.Identity != kube.Reader` (the empty identity too) and a non-empty `legacyKubeconfig` with the pinned text. An Open'd client has no runner: `NamespacesLabelled` and `CanI` run in-process, and every other method returns `cluster: %s is not in-process until ADR 0023 M2.4`. `CanI` on a kubectl client refuses (`in-process only`). A warning that fails `output.Printable` is written Go-quoted (`strconv.QuoteToGraphic`), so `cluster` imports `internal/output` (standard library only).
+- `openCluster` refuses a nil record, and an identity that is neither reader nor writer, as fail-closed additions. The writer is refused at step 4, after steps 1–3.
+- §3.1's `E-googleCA` text names `cluster-ca.crt`, not `instances/<n>/cluster-ca.crt`, as kube (M2.1) prints it; `ParseEndpoint` does not know the instance's name.
+
+**A17-3 (§3.5): the loopback rule is narrower.** In loopback mode the derived reader is `readerName(name)` at a domain matching `^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+invalid$`, DNS labels under `.invalid`, not any domain ending in `.invalid`. `derivedReader` and the RBAC renderers' `readerSubjectShape` share the pattern (`loopbackReaderDomain`), so a hostile loopback domain (a quote, a `$(`, a space) is refused by `openCluster`, `reader record` and `reader grant` alike, and never reaches a printed Cloud Shell line. In a refusal the loopback reader is named `readerName(name)+"@<a name under .invalid>"`. Google mode is unchanged: exact equality with `readerEmail(name, project)`.
+
+**A17-4 (§7.2 step 6): a review that fails records nothing.** Found by mutation (O54, major): skipping a SelfSubjectAccessReview that errors survived the whole suite, and would have recorded a reader whose read-only proof never completed. The code was already right; the test was missing. A review that errors, or whose "no" carries an `evaluationError` (A15-8, `kube.ErrUnreadable`), refuses the grant and leaves `GrantedAt` and `Scope` exactly as they were, neither refreshed nor withdrawn. Pinned by `TestReaderGrantRecordsNothingWhenAReviewFails` (a 500 on the first review; an `evaluationError` on `list secrets`; each with the reader granted before and not). New row 52b: "skip a failed review" and "withdraw on a failed review" must each fail it.
+
+**A17-5 (§7.2 step 6): five reviews.** The fifth is `list pods` in `kube-system`, where no farcast RBAC ever binds the reader, so a yes shows a read-only IAM role stronger than clusterViewer, which the four write and Secret reviews cannot. Its refusal reads `the reader %s may list pods in kube-system; it reads beyond the RBAC farcast applied, so nothing was recorded; check the role …`: `msgReaderNotReadOnly` and `msgReaderWithdrawn` take the reason as a third `%s`, so the four pinned texts are byte-identical. The reviews sample: a role whose only extra powers are, for example, `pods/exec`, `serviceaccounts/token` or `rolebindings` does not show, and that GKE's reviews consult IAM at all, and that a clean reader is answered no for `kube-system`, are [inf] until walked. A withdrawal clears `GrantedAt` and `Scope` when the loaded record had either set, so a stray `Scope` never keeps the later bindings binding.
+
+**A17-6 (§7.2 steps 4–6): the reader is opened before consent.** `newReader` (`openCluster` as the reader, `Verifying`) is opened after the terminal check and before the prompt, so its local refusals (the endpoint rule, the cluster CA, a missing `reader.key`) come before a Google identity is given RBAC; opening sends nothing. It stays after the terminal check because M2.6's `reader grant --plan` reads no cluster. `--yes` and `-y` are refused right after the argument count, before the record is read. New row 53b: "open the reader after the apply" must fail `TestReaderGrantOpensTheReaderBeforeItAsks`. The schedule as built: attempts at 0, 5, 15, 35 and 75 s, then every 60 s, the last wait cut short so the last attempt is at exactly 8 minutes; the pinned line's `%s` is the deadline as `HH:MM:SS` in the clock's location. A token-endpoint refusal (`kube.ErrTokenRefused`) is not retried: whether Google refuses a freshly uploaded key for a while is a walk question.
+
+**A17-7 (§7.2, the RBAC and where it is applied).**
+- The email the RBAC binds is the recorded `Reader.Email`, used only after `checkedReader` accepts the record and the mode-aware derived check accepts the email (`readerSubject`). In Google mode it is byte-equal to `readerEmail(name, project)`; in loopback mode it is the identity that authenticates.
+- `readerSubject`'s not-derived refusal ends `no RBAC was rendered for it`, because the later bindings print it in a stderr warning while their own stream is still applied. `openCluster`'s §3.5 text keeps `nothing was sent`, true there. `reader record`'s %q-quotes the email and ends `nothing was changed`.
+- `resourceNames` is rendered on one line, joined from the read sites' own constants (`kernel.DefaultNamespacesName`, `DefaultCheckpointName`, `DefaultProfilesName`, `fldeploy.PolicyConfigMap`, `dsdeploy.PinConfigMapName("")`); `TestReaderRoleNamesTheConfigMapsReadsUse` evaluates each read site's name argument from the source.
+- `kernelManifests(cfg, readerEmail)` puts the reader bindings after TechnoCore's workload and before the `technocore-namespaces` seed, not "after its stream", so the list stays last (A16-3); `meterManifest(all, added, readerEmail)` orders kernel binding, reader binding, per added namespace, then the list. Results gain `reader` and `reader_bindings_created` (omitempty).
+- **What it can read, corrected:** the reader is never bound in a `kube-` namespace (`validNamespace`, as for the kernel). GKE's other managed namespaces (`gke-*`, `gmp-*`) are not refused, and are bound exactly when the operator meters one, as the kernel's binding is. The texts that promised "never … GKE's managed namespaces" now say this; `TestReaderTextsPromiseOnlyTheNamespacesItRefuses` ties them to the renderers. Whether Autopilot admits a RoleBinding there is not walked.
+- **`kernel meter --remove`** deletes neither the kernel's binding nor the reader's, and a re-run of `reader grant` prunes nothing; its prompt names today's metered namespaces only. On an instance that records a reader, `--remove`'s result says the `farcast-reader` binding may stay and still grants workload, pod and log reads (`ReaderBindingMayStay`). Added to *Not settled*: delete the reader's RoleBinding in a namespace `--remove` stops metering, once deletes exist (M2.7 or later).
+
+**A17-8 (§7.2, the commands).**
+- Both reader commands load through `loadReaderRecord`: `checkedReader`, then the recorded name must equal the name given, since paths use one and rendered lines the other.
+- `reader record` decides the mode from `kube.ParseEndpoint` with the instance's CA: loopback only when that accepts the endpoint as loopback; anything else, unparsable included, is held to the Google rule. After an init it sets `KeyID` whatever it held, so a mistyped id can be corrected. A write that fails after the promotion says `reader.key` is already the new key and that re-running record recovers.
+- **The previous-key line, until M2.4:** `The previous key %s still works. Once 'farcast reader grant %s' has read with the new key, delete it from Cloud Shell: %s`, because no other command reads as the reader yet. M2.4 restores `Once 'farcast world %s' reads`.
+- `reader init` prints the stderr preamble in human mode only; with `-o json` stderr is empty and the digest is in `script_sha256`. An explicit `--days` on a reader whose key exists but is not uploaded prints a `Note:` that no key was made. `readerCertificate` compares `RawSubject` with the DER of `CN=unused` exactly, so a subject with any other attribute is refused too (new row 48b: drop the check, or check the CN only, must fail `TestReaderScriptRefusesAnUnsafeRecord`'s own-key rows).
+- `release` gains a `reader` JSON field, `{email, cloud_shell}` or `{unprintable}`; its gate prints `  reader:      <text>` after the keeper lines. Its lines are built from the record (`checkedReader(meta)`), the account that record's init created; the fallback's name is the one given.
+- `farcast reader`'s help says reads are to run as the reader from M2.4, not that they do.
+
+**A17-9 (§3.6): hardening, both binaries.** `farcast` unsets `GOOGLE_SDK_GO_LOGGING_LEVEL`, `SSL_CERT_FILE` and `SSL_CERT_DIR`; so does the planck harness's twin (`planck/cmd/planck/main.go`), which calls Google with a key, and `TestHarnessHardensItsEnvironment` asserts all five variables. `TestCertFileVariablesCannotAddARoot` runs a child of the test binary (`FARCAST_TEST_CERT_CHILD`, checked first in `TestMain` in `plugintoken_test.go`); it ran on darwin/arm64 only. When M2.4 deletes `plugintoken_test.go`, `TestMain` with that switch and `finishTests` moves to another test file, or the children run the whole suite.
+
+**A17-10 (§11): records as written.** The CLI README's reader section, command-table row, on-disk layout lines and a pointer from `kernel meter`'s section; ADR 0023's status line and two dated notes; AGENTS.md, PLAN.md and the root README; the phase-1 runbook's step 7b, not yet walked. A sentence that a certificate uploaded to another account "is refused before anything is sent" was corrected: `openCluster` checks the email, not the key id, so a mint request is sent and the refusal is Google's. The source-tree directory layout's `internal/kube` and the M2.3 files stay for M2.4, as §11 assigns.
+
+**A17-11 (M2.6 and M2.7 notes).** M2.6 appends ` or review 'farcast reader grant %s --plan' and pass --confirm <digest>` to `msgReaderGrantYes`, and `, or --plan and then --confirm <digest>` to `msgReaderGrantTerminal`; its plan fact needs `resources[]` in rule order (deployments, statefulsets, pods, pods/log, jobs). M2.5 makes `newApplier` `func(clusterRef) (clusterApplier, error)`. M2.7 puts `refuseUnmigrated` at grant's step 1, before the reader is opened.
+
+**A17-12 (§10.5): mutation rows.** Design rows 43–58 (with 48a, 52a and 56a) are each killed by their named test; 49 was run with kube's common name and cli's `CN=unused` check both changed, and `TestReaderCertificateIsGeneric` killed it alone. Of 63 more mutants (O1–O62, some split), 49 were killed outright and O15a by the test timeout. O11 is equivalent: `readerBoundNamespaces` runs only on a list `validNamespace` already checked. Twelve survived. O54, O32/O52, O35 and O40 are now killed (A17-4; a no-kernel grant test, `TestReaderGrantWithNoKernelNamesFarcastSystem`; row 48b; the loopback rows of `TestPrintedCloudShellLinesRefuseAnUnsafeRecord`). The fixer's 21 re-runs were all killed. O30 (`CanI` clearing `Subresource`) is killed only in cli, by the `patch deployments/scale` review row. Accepted survivors, unreachable from farcast's own writes: O18 (grant's email-changed check), O31 (the `Scope` clause on a first grant), O34 (the recorded-name guard), O36 (RSA size), O39 (PEM headers, an equivalent render), O48 (`--remove` consulting the reader, output only), O57 (init's concurrent-record guard).
+
+**A17-13: refuted findings.** A concurrent `reader grant` can re-verify a reader another grant just withdrew: refuted, since a grant is a point-in-time check and IAM edited after a clean grant reaches the same state. `openCluster`'s refusals print the record with `%s`: unreachable in M2.3, where its one caller has run `checkedReader` and `readerSubject` first; **M2.4's read commands call it directly, so M2.4 must check the record (`checkedReader`, the name given) and `%q`-quote the email before those refusals.** `release` printing the record's name rather than the one given: refuted, the record's name is the account that exists. `reader init` recording the Google-form email on a loopback instance: settled by §10.1's rehearsal record. The withdrawal test reading through `openCluster` rather than `world`: row 60a covers `world` in M2.4. The command table's status cell: the row already says "not yet walked against Google".
+
+## 18. Amendments before M2.4's build (2026-11-15)
+
+M2.4 was mapped against the code at 6a09adf in five read-only lanes (the cluster package; the read commands, kinds and documents; the rehearsal; the Swift app; the records), with a completeness critic over them. The raw map is `m24-map-result.json` beside this file: its facts and line numbers are the mappers', unverified unless this section repeats them. Where this section and an earlier one differ, this section governs. Where it is silent, the earlier sections govern, and a mapper's proposal in the map is advice, not a decision.
+
+### P5, decided by the operator on 2026-11-15
+
+**P5: a namespace the reader is not bound in.** P3 binds the reader in `farcast-system` and the metered namespaces only. `world` also reads every namespace labelled `app.kubernetes.io/managed-by=farcast`, every namespace the record names, and every `meta.Deployments` key (`world.go:361-377`), and today it drops the whole apps section at the first namespace that fails (`world.go:381-388`). A labelled namespace that is not metered then answers 403, and because `groupsAndApps` groups the labelled namespaces only when the apps section is read (`worlddoc.go:1003-1008`), the `unmetered_namespace` alert, the warning that exists for exactly that namespace, would disappear. The operator chose **"read the rest, mark it"** over widening the reader's bindings (which would reverse P3) and over accepting the gap.
+
+**A18-1 (P5): the per-group mark.**
+- `worldGroup` gains `AppsError *sectionProblem` with the JSON key `apps_error`, written as `null` when the group's workloads were read, the way the group's `metered` and `provenance` are written as `null`. It is `{kind, message}` otherwise, and the group's `apps` is then `[]`.
+- In `gatherer.apps`, the per-namespace loop: a `Workloads` failure that is `forbidden` (`errors.Is(err, tkube.ErrForbidden)`) on a namespace other than `farcast-system` sets that namespace's mark (kind `forbidden`, message `the workloads in <ns>: <message>`, scrubbed as today) and goes on to the next namespace. Every other failure, and any failure in `farcast-system` or of the namespace list, fails the apps section as today.
+- The apps section stays `read: true` when only marks were set. Each marked namespace is still grouped, so `unmetered_namespace` and the other per-namespace alerts fire.
+- The Swift app decodes `apps_error` into its group model (`WireGroup` gains `appsError`, the model's group gains `appsProblem: SectionProblem?` through the same kind table) and draws that group's applications as not read, with the kind's label.
+- A new vector, `world/namespace_unread.json`: a labelled, unmetered namespace the reader may not read, with its `apps_error` and its `unmetered_namespace` alert, while the other groups read. It is produced by `TestWorldVectors` and copied to FarSightKit with the others.
+- Tests: `TestWorldReadsTheNamespacesTheReaderMay` (kubetest with `WithRBAC(<reader>, renderReaderRBAC(...))`, one labelled namespace without a binding: the section reads, that group carries `forbidden`, the alert is present, the other groups have their apps); a Swift `VectorTests` row for the new vector. Mutation row 68a: "fail the section on a forbidden namespace" must fail `TestWorldReadsTheNamespacesTheReaderMay`.
+
+### The cluster package
+
+**A18-2: every read method is in-process on an Open'd client in M2.4,** not only the ones the read commands call: `Workloads`, `ConfigMapValue`, `ConfigMapData`, `Namespaces`, `NamespacesLabelled`, `RolloutStatus`, `WaitExternalIP`, `WaitJob` (with `jobMessage`), `JobLogs` and `Logs`, each as §4 maps it. §10.2's kubetest tests need them, and M2.5 then only opens the writer. On an Open'd client, `Apply`, `CreateConfigMap` and `ReplaceConfigMap` refuse with `cluster: a reader client never writes` before anything is sent (M2.5's text, adopted early). The M2.3 text `cluster: %s is not in-process until ADR 0023 M2.4` and `kubectlOnly` go. `TestAnOpenedReaderRunsNothingElse` becomes `TestAReaderClientNeverWrites`: the three writes refuse and kubetest sees no request.
+
+**A18-3: the kubectl branches in the transition.** A kubectl client (`New`) keeps kubectl for the seven methods writing commands still call until M2.5: `RolloutStatus`, `WaitExternalIP`, `WaitJob`, `JobLogs`, `ConfigMapValue`, `ConfigMapData` and `Namespaces`. Each converted test of those seven keeps a `t.Run("kubectl", …)` half on `newWithRunner` until M2.5, so the branch a writer still runs stays tested; §0's `newWithRunner` list widens to those halves. `Workloads`, `NamespacesLabelled` and `Logs` have no kubectl caller after M2.4: on a kubectl client each refuses, as `CanI` does, with `cluster: %s is in-process only, and this client runs kubectl` (the method name), and their kubectl code and its runner-only tests go. `TestFollowingNeedsAStreamer` is deleted; `Streamer` stays until M2.7, as §0 says.
+
+**A18-4: the in-process methods, details §4 left open.**
+- `Workloads` refuses an empty namespace before sending (`kube.ListDeployments("")` lists every namespace).
+- A ConfigMap is absent only on a 404 whose body is a Kubernetes Status (`APIError.KubernetesStatus`). Any other 404 is an error with `found=false`. `TestConfigMapForbiddenIsNeverAbsent` gains that row.
+- `RolloutStatus`'s deadline: `fmt.Errorf("deployment %s/%s did not finish rolling out within %s: %w (last: %s)", ns, name, timeout, kube.ErrTimedOut, waiting)`.
+- `Logs`' `lines` is passed as `TailLines` unchanged: negative reads everything, `0` is sent as `0`.
+- The `--previous` note is `"%s/%s: no previous instance\n"` (pod, container), each name `strconv.QuoteToGraphic`'d when it would not print, written under the warnings mutex, and nothing for a nil writer. Only a Kubernetes-Status 400 to a `previous=true` request is skipped; any other error stops `Logs`.
+- Warnings are flushed after the `GET` and the `ListPods`, before the streams start. With follow, the first error that is not the context's cancels the other streams and is returned.
+- **With follow, each stream writes whole lines.** A per-container buffer writes to `out` only complete lines, under the one mutex; a line longer than 32 KiB is written in 32 KiB pieces, and what remains is flushed when the stream ends. kubectl's own line behaviour is [inf]; this is FarCast's choice (with D21). Test: `TestFollowedLogsInterleaveWholeLines`.
+- The poll intervals (2 s, 3 s, 5 s) become an unexported field so cluster's tests drive several polls quickly.
+
+**A18-5: tests already in kube are not duplicated.** `TestWorkloadsStampsKindPerListNeverFromTheItem`, `TestRolloutStatusFollowsTheSixRules`, `TestPickPodOrder`, `TestJobLogsAllLinesSendsNoTailLines` and `TestSelectorStringRefusesExpressions` exist in kube (M2.1). cluster's converted tests cover cluster's own mappings instead: the kind stamped per list, `lines <= 0`, the polling, and the `the %s %s/%s` selector prefix. `TestNamespacesLabelledReadsJSONAndSorts` is deleted, because `TestAnOpenedReaderListsNamespacesInProcess` (`open_test.go`) already is it. `TestAKubectlClientHasNoCanI` is rewritten over `New` and `newWithEnv`.
+
+**A18-6: config.** `config.SaveClusterCA(name string, pem []byte) error` is added (A17-2), through `writeFileAtomic` at 0600, refusing an empty PEM; `ServerSideApply` is declared (§2.5). `GCloudAccount` is deleted in the step that deletes its last user; `config/connected_test.go`'s uses go with it.
+
+**A18-7: kubetest gains two options for the rehearsal.** `WithAnswered(f func(r Request, status int))` is called once after every answer, the API's and `/token`'s, the refused ones included. `WithoutRecording()` keeps no request log (`Requests` returns nil), because a rehearsal lives up to 25 days and each `/token` body holds a signed assertion. Both carry tests in `kubetest_test.go`.
+
+### The read commands, kinds and documents
+
+**A18-8: the record check (A17-13).** `openCluster`'s reader branch runs `checkedReader(meta)` after step 1 (no endpoint) and before step 2, so a hostile project, email or key id is refused before any path is built from the record or any value is printed. Each read command's `Run` checks `meta.Name == name` before its seam, because `openCluster` builds paths from `meta.Name`. Both refusals are `refusal{sentinel: errCredentialMissing}`, kind `credential_missing`, whose README meaning gains `, or a reader record whose values farcast does not accept`. The recorded email is `%q`-quoted in `openCluster`'s refusals. An unreadable `cluster-ca.crt` (any error but absent) wraps `kube.ErrEndpointRefused`. Test: `TestReadCommandsRefuseAnUnsafeRecord`, through the default seams: a hostile email, project or name sends nothing and prints only quoted values.
+
+**A18-9: the kinds are 21.** §8.1's 20 plus `unsafe_environment` (A15-1), which sits after `credential_refused` and before `endpoint_refused` in `errorKinds`, the README table and FarSightKit's wire table; `clusterKind` maps `kube.ErrUnsafeEnvironment` before `ErrEndpointRefused`. P1 was decided (c), so `apply_conflict` is never added. `world`'s fatal set gains `unsafe_environment`. In `world`, a failure `clusterKind` does not know is `internal`, never an empty kind, and the error of `readEgressPolicy` for a present policy missing its key is kinded `document_unreadable`. The README rows of `rollout_stalled`, `plan_changed` and `not_migrated` say `(nothing emits it before ADR 0023 M2.5)`, `(… M2.6)` and `(… M2.7)`, and `not_migrated`'s says `farcast migrate` arrives in M2.7.
+
+**A18-10: the forbidden sentence** (§8.1) is appended in the five read commands' `Run` and in `world`'s section problems, which know the instance and the identity, for the reader only. `classified` has no instance name and does not append it; M2.5 words it for writers.
+
+**A18-11: envelopes keep their chain.** `logs`' `findApp` keeps each namespace's error in the chain (`%w`, or `errors.Join`), so `classified` finds the sentinel. When every namespace's read failed, `ps` returns the first failure, so its envelope carries the cluster kind; a partial failure stays a row with exit 0, as today.
+
+**A18-12: `pin-gcloud`.** `--account` stays registered until M2.9 so the documented form `instances pin-gcloud <instance> --account <email>` reaches §7.4's text (the router parses flags before `Run`). `--account` with or without `pin-gcloud`, and `pin-gcloud` alone, give that usage error, exit 2, nothing on stdout, the record unchanged. `TestPinGCloudIsRetired` runs both forms through the router.
+
+**A18-13: `instances`' reader state.** A `ReaderKeyExists` error other than absent makes the entry unreadable, reported as an unreadable record is (`record_unreadable`, with a relative path).
+
+**A18-14: vectors.**
+- `account_in_message.json`: apps becomes `forbidden`, keeping an IAM-shaped text that names an account; spend becomes `cluster_rejected`, with a non-403 text that names an account; policy becomes `unauthorized`, with a literal newline in its message so the app's escaping check (`VectorTests.swift`) still has one.
+- `nothing_read.json` and `release_incomplete.json`: every message is rewritten in the in-process client's words (kube's `msgTokenRefused` and its unreachable text), not only the kinds.
+- `error_gcloud_mismatch.json` is deleted and no envelope vector replaces it: the Swift tests that used it take `error_not_found.json` where a vector envelope is the point, and a synthesized `version_skew` failure where a refused read is.
+
+**A18-15: the token tests.** `TestWorldPresentsOnlyTheReaderToken` keeps `HTTPS_PROXY` planted, with a comment that it proves nothing on loopback; `TestTransportsHaveNoProxy` (M2.1) carries that guarantee. `TestWorldNeverOpensAWriterCredential` and `TestReadCommandsPresentOnlyTheReaderToken` also assert that the reads succeeded (spend, apps and policy read; `ps`, `costs`, `usage` and `logs` return their seeded data), because in M2.4 a writer mutation sends nothing and the "every request is the reader's" assertions alone would pass. `usage`'s fixture records no carrier: its tunnel half reads `ca.key` (`usagenet.go`), which `usage` has always done and no rule forbids.
+
+**A18-16: the previous-key line** (A17-8) is restored: `The previous key %s still works. Once 'farcast world %s' reads, delete it from Cloud Shell: %s`.
+
+**A18-17: `TestMain`** moves out of `plugintoken_test.go` before that file is deleted, into a new `main_test.go` in package `cli`, with the certificate-child switch first and `os.Exit(finishTests(m.Run(), os.Stderr))` (A17-9). The fake-kubectl branch goes.
+
+### The rehearsal
+
+**A18-18: the rig, details §10.1 left open.**
+- **`calls.log`** is written from `WithAnswered`. Its lines keep today's prefix: `<RFC 3339 time> cluster <METHOD> <path>[?<query>] as <reader|writer|none|unknown> | ok` or `| refused: <reason>`; `/token` requests are logged as `<time> token POST /token as <reader|writer|unknown> | ok` or `| refused: <reason>`, the identity taken from the registered key that verified. No line carries a value, a body or a token.
+- **The writer is checked first:** a writer token gets 403 and `refused: a writer token on a read` whatever it asks for; then the reader's reads are answered; anything else gets 405, `refused: no answer`.
+- **`ClusterAnswer` parses the raw query** with `url.ParseQuery`: the namespaces list requires `labelSelector` to be exactly `app.kubernetes.io/managed-by=farcast` and accepts `limit`; the workload lists accept `limit` only; any other key, `continue` included, gets 405.
+- **Answers:** each workload list is per kind and its items carry no `kind`; an absent ConfigMap is a 404 Kubernetes Status; an expired rehearsal answers every read with a 500 Status carrying `errExpired` (never 503, which kube retries). The data tables are unchanged.
+- **`forbidden`** answers 403 on `technocore-checkpoint` and the egress policy only; `technocore-namespaces` answers normally, so spend and policy show `forbidden` and apps read.
+- **`tunnel-down`:** FatLine runs under its own cancel; a watcher polls `rehearsal.json` about every 100 ms, stops FatLine on entering `tunnel-down` and starts a new one on the same address on leaving it. Start-up brings the tunnel up for its keeper check even in `tunnel-down`, then stops it. It takes effect within a moment, not at the next read, and its test polls until the port refuses.
+- **Addresses:** a restart reads the cluster's address from `metadata.yaml`'s `endpoint`, which must be `127.0.0.1:<port>`, as the tunnel's comes from the carrier; no Spec field is added.
+- **Keys:** the reader's public key comes from `reader.crt`, which never moves; the writer's public key is kept under `harness/` at the first start, so a restart never reads `credentials.yaml`. A rehearsal started in `reader-missing` writes `reader.key.away`.
+- **Scenarios:** one exported check, `CheckScenario(name string) error`, gives the retired text for `signed-out` and `identity-mismatch` and `unknown scenario` otherwise, at every site that takes a scenario name.
+- **A directory made before M2.4** (it has `kube/bin`, `sdk/bin` or `gcloud/`, and no `cluster-ca.crt`) is refused at start: `this rehearsal was made before ADR 0023 M2.4 moved its cluster into the harness; start a new one in a new directory`.
+- **The project** is held to `checkedReader`'s project shape at creation.
+- **`summarize`** knows the 21 kinds, and `main_test.go` expects `schema 2`.
+- **`Rig.Path`** is the app's system directories joined (`/usr/bin:/bin:/usr/sbin:/sbin`); the Settings text has the two rows, titled as Swift's `Field.title`s, and the reader state in the app's words; the emulated child environment sets no `CLOUDSDK_CONFIG`.
+- **Tests:** a slow-cluster test is kept (`SlowSeconds` 0.05: an API `GET` and a `/token` each held at least 50 ms); the expired check moves to the server; the ledger tests take the new `ClusterAnswer`. `TestClusterAnswersDecode` reads through `cluster.Open` against the rig's own server. The comments at `rehearsal.go:1-21` and `cmd/farcast-rehearsal/main.go:1-7` are rewritten in M2.4.
+- The rig keeps `WithoutRecording` on (A18-7).
+
+### The Swift app
+
+**A18-19: kinds and words.**
+- `wire.count == 21`. `SectionProblem.Kind` gains `unsafeEnvironment` with the label `environment refused` and no remedy: the app's child environment never carries `GODEBUG`, and in a terminal the CLI's message says what to unset. The step 7a source gate refuses the bare word `unsafe` on any Swift line, so no label, test string or comment may hold it.
+- The labels of the new kinds: `credential missing`, `credential refused`, `environment refused`, `endpoint refused`, `cluster unreachable`, `unauthorized`, `forbidden`, `cluster rejected`, `document unreadable`, `rollout stalled`, `not migrated`, `plan changed`.
+- The remedies are §8.3's, with an inner ` — ` replaced by `: ` and their single quotes dropped, as the app's other remedies are written: `credential_refused` → `check this machine's clock; then the key id (farcast reader record); a reader key expires with its certificate: farcast reader init <instance> --rotate`; `unauthorized` → `the cluster refused the reader's token: check that the Cloud Shell step granted roles/container.clusterViewer; farcast instances shows the reader's state`.
+- The read refused as a whole is `.versionSkew` alone.
+- `instances`' `reader` is a closed set mapped through an explicit table into `ReaderState` (`none`, `keyMissing`, `notUploaded`, `notGranted`, `granted`, `unknown`), never carried raw; `migrated` is carried as `Bool?`.
+- Hand-written schema-1 documents in the Swift tests move to schema 2; skew cases use 1 and 3, with the message `farcast wrote schema 3 and this FarCast reads schema 2; build both from the same commit`.
+- No Swift line holds a literal email (the step 7a gate reads `@word` as an attribute); tests compare against messages decoded from the vectors.
+- `CLISettings`' rule against a `:` or an unprintable character stays, reworded, since no Settings path reaches `PATH` any more. `SetupView`'s step writes its commands in backticks.
+- Files §8.3 did not name change in the same step: `FarSightUITests/RenderHarness.swift`, `FileProbeTests.swift`, `CLITestSupport.swift`, `CLISettingsTests`, `ChildEnvironmentTests`, `CLIDocumentsTests`, `CountedByTests`, `SettingsView.swift`'s introduction (`:50`), `ProblemText.swift`'s refused grouping, and `FarCast/ProcessExecutor.swift`'s comment.
+
+### The records
+
+**A18-20: §11's M2.4 list, widened.**
+- **The scope sentence in M2.4's notes** (ADR 0021 decision 9, ADR 0023 decision 3, the CLI README) names the exceptions that exist in M2.4: the writing commands, whose reads run kubectl as the active gcloud configuration until M2.5 and as the installer key from then; and `storage ls`, `storage usage`, `storage cp` downloads and `secret ls`, which use the installer key until M3b. The plan and `migrate` exceptions are added by M2.6's and M2.7's notes, because neither exists yet. Only ADR 0023's note may say "is to" about M3b and M5's broker.
+- **AGENTS.md's control-plane line:** since ADR 0023 M2.4 the cluster reads of `world`, `ps`, `costs`, `usage` and `logs`, and `reader grant`'s check, are in-process as the instance's reader; the commands that write still use kubectl, their reads included, until M2.5 and M2.7. The same in `README.md:280`. AGENTS.md's ADR 0023 paragraph: writes are to run as an identity bound to the instance (from M3b; in M2 the stored installer service account, one per project), and reads as a separate read-only one; since M2.4 the cluster reads of the five read commands never mint an admin token, and the writing commands' reads and the storage and secret reads still can.
+- **Moved into M2.4 from M2.7:** ADR 0019 decision 6's note (`logs` reads the log subresource in-process as the reader; user agent `farcast`; not yet walked), with its riders at `:17` and `:94`; the comments `cluster.go:1-21`, `open.go` and `rehearsal.go:1-21`, except their kubectl-removal sentences, which stay M2.7's.
+- **Added:** the status lines M2.3 wrote that M2.4 falsifies (AGENTS.md's ADR 0023 paragraph and control-plane line, `README.md`, `PLAN.md`'s M2 lines, ADR 0023's status line, the CLI README's reader section and its M2.3 sentences, `phase-1-validation.md`'s step 7b note); ADR 0021's explicit-environment passage, "What a Refresh tells", "Walked before" and Verification 5 (Settings records two paths; the child environment is `HOME`, `TMPDIR`, `LANG`/`LC_*` and `PATH` of the system directories, with no `CLOUDSDK_*`); the Apple README's passages on kubectl, gcloud, `CLOUDSDK_CONFIG` and pinning, not only its Settings paths.
+- **The CLI README's guard section** is replaced by `### Who the cluster reads run as`, pointing to the existing `## \`farcast reader\` — the reader identity (ADR 0023 M2.3)` heading, whose anchor other documents link and which keeps its text.
+- **Walked runbooks** that run `world`, `ps`, `costs`, `usage` or `logs` live (phase 4.3, 5.1, 5.2, Session A, the M1 walk) gain a dated prerequisite note: from M2.4 these need phase-1 step 7b's reader, which is not walked, and `pin-gcloud` is gone. Their walked results are not rewritten. Part L of the phase-7 runbook gains L4: after `release`, the two Cloud Shell lines it prints.
+
+### The build order
+
+1. **The cluster package and config,** with no caller changed: A18-2 to A18-7. Green on its own.
+2. **`ps`, `costs`, `usage` and `logs` as the reader,** with the record check (A18-8), the moved `TestMain` (A18-17), and their tests from §7.3. Their envelopes stay `internal` until step 3, as today. Green on its own.
+3. **The lockstep,** green only when all three parts are in: (a) the Go side of the kinds, `world` in-process, the gcloud guard and `gcloud.go` deleted, `pin-gcloud` retired, `GCloudAccount` deleted, schema 2, P5's mark, the cluster API trimmed (`NewWithEnv`, `GCloud`, the pinned `Env`, the marks), and every Go vector regenerated; then, in parallel on disjoint files, (b) the rehearsal and (c) FarSightKit with its vector copies.
+4. **The records.**
+
+## 19. Amendments from M2.4's build (2026-11-15)
+
+Built 2026-11-15 in six steps (the cluster package, config and kubetest; `ps`, `costs`, `usage` and `logs` as the reader; the Go lockstep; the rehearsal and the Swift app in parallel; the records). Reviewed in four lenses (security; conformance of the Go core; the rehearsal, the Swift app and the records; mutation), with a skeptic for each finding and then one fixer. 34 findings were reported. 30 were confirmed and fixed, all with tests or record edits. One was major: A19-9's `ps`, which printed an API server's text raw. Four were refuted (A19-12). The raw results are `m24-build-result.txt` and `m24-review-result.txt` beside this file.
+
+**A19-1 (§4, A18-2 to A18-4): the cluster package as built.**
+- `Logs` refuses on a kubectl client from step 1, and `streamingRunner` and `TestFollowingNeedsAStreamer` are gone. `Workloads` and `NamespacesLabelled` refuse from step 3(a), when `world` left `NewWithEnv`.
+- In-process `JobLogs` refuses a template with any container count other than one: `job ns/x has 0 containers; farcast reads only one`.
+- `WaitExternalIP` also refuses an IP that carries a zone: `cluster: service %s/%s reports a load-balancer IP that is not one: %q`.
+- The in-process `WaitExternalIP` and `WaitJob` deadlines keep today's text through a `deadline` type whose `Unwrap` is `kube.ErrTimedOut`. The kubectl loops are unchanged until M2.5.
+- One unexported `Client.poll` overrides all three waits. Otherwise `rolloutPoll` is 2 s, `servicePoll` 3 s and `jobPoll` 5 s. The kubectl loops honour it too, which reaches tests only.
+- Followed logs: `maxFollowed` = 5 and `logPiece` = 32 KiB. Each `Write` sends everything up to its last newline as one locked write, plus whole 32 KiB pieces of a line that has no end yet. Another container's output can come between those pieces only, never inside a line.
+- `logPod` flushes the cluster's warnings after the deployment `GET` and after the pod list, before any log. `TestLogWarningsComeBeforeTheLog` pins this, including a `GET` that fails.
+- `newWithEnv`'s missing-kubectl text speaks of deploying, not reading.
+
+**A19-2 (§2.6, §3.5, A18-8, A18-10, A18-11): the read commands as built.**
+- **The name check.** One helper, `recordNamed(meta, name)`, serves the five Runs and `loadReaderRecord`. Its text is `instance %q's record names the instance %q; farcast renders nothing from it`, and it unwraps to `errCredentialMissing`. Each Run checks right after loading the record, before anything is built from it.
+- **The cluster CA.** An unreadable `cluster-ca.crt` reads `instance %q's cluster-ca.crt exists and cannot be read (%v); nothing was sent` and unwraps to `kube.ErrEndpointRefused` only.
+- **The ordering test.** `TestOpenClusterRefusesInOrder` step 1b requires that no config file is read before the record's shapes are checked.
+- **The forbidden sentence.** It is joined with `; `. `forbiddenByRBAC` walks the whole error tree, so an RBAC 403 anywhere among several namespaces' failures wins. In `ps` the sentence also goes on each refused namespace's row. `TestLogsFindsAnRBACRefusalAmongSeveralNamespaces` pins this.
+- **`ps`.** When every namespace failed, it returns `<ns>: <err>` for the first, with `%w`.
+- **`logs`.** Its `findApp` joins errors through `namespaceErrors`, whose `Error()` keeps the old `; `-joined text and whose `Unwrap()` returns `[]error`.
+- **Tests.** The §7.3 and A18-8 tests are in `readcommands_test.go`. `TestMain` is in `main_test.go`.
+- **`logs --previous`.** Through the default seam, the note reaches stderr and never stdout: `TestLogsWritesThePreviousNoteToStderr`.
+
+**A19-3 (§8.1, A18-9): kinds as built.**
+- `kube.ErrRefusedDocument` maps to `internal` by an explicit step, after `ErrNotMigrated` and before the `*kube.APIError` step.
+- `classified`'s cluster step applies to every command, and that is accepted (A19-12). A writing command's non-kubectl failure that wraps `context.DeadlineExceeded` is `timeout`, and `reader init`'s, `record`'s and `grant`'s refusals are `credential_missing`. No kubectl call has a deadline in M2.4, so no kubectl failure changes kind.
+- Joined 401 and 403 errors, in either order, are `unauthorized`.
+- An open failure that no kind names (an unreadable `reader.key`) is `internal` in `world`'s sections, through `kindOfCluster`, never an empty kind.
+
+**A19-4 (§8.2, A18-1, P5): `world` as built.**
+- `recordNamed` and every `openCluster` refusal are section-level. `spend`, `apps` and `policy` carry the refusal, the tunnel sections still read, and `world` exits 0.
+- `apps_error` is written after `apps` in each group.
+- A marked group's `apps` holds no workload. An application that a policy or monitor line names there is listed with state `unknown`, not `not_deployed`, and gets no not-running caveat. "apps is `[]`" holds only when no line names one. `TestAnAppInAnUnreadGroupIsUnknown` pins this.
+- **The mark's remedy** is chosen by `namespaceRefused` (`cli/clusterref.go`) and said once. The mark is never built from the section problem's message, so the sentence cannot appear twice.
+  - An RBAC 403 in a namespace this machine does not record as metered (`meta.Kernel.Namespaces`) appends `; the reader may read only farcast-system and the namespaces this machine records as metered: run 'farcast kernel meter <instance> <ns>', which meters <ns> and binds the reader there`. Under P3, `reader grant` binds nothing there.
+  - An RBAC 403 in a recorded namespace keeps `; run 'farcast reader grant <instance>'`.
+  - A 403 that is not a Status keeps the IAM sentence.
+- **The human reading.** An unread group is marked ` — applications not read (<kind>)`, and the apps line adds `; N namespace(s) not read`. `TestWorldReadsTheNamespacesTheReaderMay` checks this in human mode too.
+- **The wire rule (§7.4).** `scrubMessage` first replaces the recorded `meta.Reader.Email`, ignoring case, both as written and in its `%q` form, and only when the value holds `@`. Then `emailLike` runs as before. `emailLike` is not widened, because a pattern matching any token around `@` would also eat image references (`name@sha256:…`). Without this, a dotless, IDN or control-character email that `openCluster`'s `records the reader %q` printed reached `world.json`. `TestWorldNamesNoRecordedReader` pins this.
+
+**A19-5 (§8.2, A18-12, A18-13): `instances` as built.**
+- A `ReaderKeyExists` error gives a `record_unreadable` entry: `instances/<n>/reader.key could not be checked: <stat error>`.
+- The states are checked in §8.2's order, the key file before the key id.
+- `--account` is registered with `fs.Func`, so the flag given with any value, an empty one or `--account=` included, is the retirement usage error (exit 2).
+- The human `READER` column prints the state with spaces (`not granted`), and `MIGRATED` prints `yes` or `no`.
+- **Tests.** `TestInstancesReportsEachReaderState` covers the five states, a key id with a missing key, and a self-referential `reader.key` symlink, which gives `record_unreadable`. `TestInstancesNeverOpensAFIFOReaderKey`, and config's `TestReaderKeyExistsNeverOpensAFIFO`, replace `reader.key` with a FIFO, so a read whose result is thrown away still hangs and fails.
+
+**A19-6 (§7.3, terminal safety): `ps` quotes what the cluster said.** The human listing passes each workload's namespace and name, and each unreadable row, through `terminalText`, as `world` and `instances` do. `--json` carries them as they came. `TestPsQuotesWhatTheClusterSaid` pins this.
+
+**A19-7 (§10.1, A18-18): the rehearsal as built.**
+- **Pre-M2.4 directories.** `SetScenario` refuses them as `Start` does, so a new `farcast-rehearsal scenario` never rewrites an old harness's `rehearsal.json`. The marker is `rehearsal.json` plus `kube/bin`, `sdk/bin` or `gcloud/`, with no `cluster-ca.crt` under `config/instances/*/`.
+- **The project.** `Spec.validate`, which every `LoadSpec` runs, checks the project's shape as well as `Start`.
+- **Scenarios.** `RetiredScenarios()` sits beside `CheckScenario`, and `ValidScenario` is gone.
+- **The reader record** is `{email, key_id, granted_at}`, with no scope. `key_id` is 40 hex characters: the first 20 bytes of the SHA-256 of the SPKI.
+- **`ClusterAnswer`'s order:**
+  1. not one of `world`'s reads → 405;
+  2. expired → 500 `errExpired`;
+  3. `unauthorized` → 401;
+  4. `forbidden` on `technocore-checkpoint` or the egress policy → 403, an RBAC-shaped Status naming the reader;
+  5. otherwise, the answer.
+
+  A ConfigMap read takes no query key.
+- **Answers.** Lists and ConfigMaps carry `apiVersion` and `kind`, and containers are named `<workload>-<i>`.
+- **calls.log.** An absent ConfigMap's 404 is logged `| ok`. Refusal reasons are fixed texts derived from the status, and a `/token` line prints its own method.
+- **`summarize`.** The groups line counts marked groups by kind, for example `groups 2 (1 not read: forbidden 1)`. Its closed kind set is pinned to `testdata/kinds/kinds.json` by `TestErrorKindsAreTheCLIs` and `TestSummarizeKnowsEveryKind`: the 21 print as themselves, the five retired as `other`.
+- **Settings text.** `Instance: <name> · reader granted · scenario <s>`, or `reader key missing` in `reader-missing`.
+- **The rig.**
+  - `Rig.ClusterAddr` is exported.
+  - An unexported `Rig.cluster` holds the kubetest server, so `TestTheRigsClusterKeepsNoRequestLog` can check that `WithoutRecording` holds.
+  - `Listeners()` is `[tunnel, cluster, shrike, kh0, kh1]`. The tunnel stays listed while `tunnel-down` has it stopped.
+- **`tunnel-down`.** The `scenario` command says `the instance shows it within a moment`.
+
+**A19-8 (§8.3, A18-19): the Swift app as built.**
+- `InstanceListing.reader` is `ReaderState?`. It is nil for an unreadable record and for an entry with no `reader` key, and `.unknown` for a word this build does not know.
+- `ChildEnvironment.build(parent:)` and the static `ChildEnvironment.path`.
+- `ProblemText.groupNotRead(_:)`, which gives `applications not read · <why>`, and `GroupHeader.notRead(_:)`. A marked group gets a dashed warning frame. No remedy is drawn on the group, and the CLI's message for it is shown nowhere in the app (see "Not settled here").
+- **Reader-state words:**
+  - `reader granted`;
+  - `reader recorded, not yet granted — …` with `farcast reader grant <name>`;
+  - `its key id is not recorded — …` with `farcast reader record <name> --key-id <id>`;
+  - `no reader — …`;
+  - for `key_missing`: `reader key missing, not on this Mac — copy reader.key from the Mac that made it, or in a terminal (without --rotate if its key id was never recorded):` with `farcast reader init <name> --rotate`. `key_missing` is reported before the key-id check, so it usually means a key id is recorded, which plain `reader init` refuses.
+- `AppGroup.appsProblem` is an init parameter defaulting to nil.
+- `SetupView`'s step 2 is the design's wording with backticks.
+- Of the three commands the app runs, only `world` reads a cluster (README, `ChildEnvironment.swift`).
+
+**A19-9 (review, major): `ps` printed the API server's text raw.** The unreadable row came from the server's `Status.Message`, and the columns were printed with plain `%s`. A hostile or compromised API server could put escape sequences on the operator's terminal. The kind of problem is older than M2.4, since the row used to carry kubectl's stderr, but M2.4 rewrote the line and the bytes now come straight from the server. The fix is A19-6.
+
+**A19-10 (§10.5): mutation rows added.** All were killed after the fix, as overlays (`go test -overlay`); the worktree was never mutated.
+- 65b: `os.ReadFile` of `reader.key` with its result discarded.
+- 65d: the key id checked before the key file.
+- 65e: `ReaderKeyExists`' error ignored.
+- 65f: `not_granted` reported as granted.
+- O6c: the shape check moved after `LoadClusterCA`.
+- O9d: `forbiddenByRBAC` looking at the first joined error only.
+- O11: 401 and 403 swapped in `clusterKind`.
+- O19 and O19a–c: warnings flushed after the streams.
+- O23: an unread group's named app reported as `not_deployed`.
+- O33: `refused` using `clusterKind`, not `kindOfCluster`.
+- O40: the rig dropping `WithoutRecording`.
+- O44 and O44b: the human mark dropped.
+- O45 and O45b: `summarize`'s kinds.
+- O49: `logs` handing `openCluster` a nil `Warn`.
+- SEC-1 and SEC-2.
+
+The fix's 31 mutants were all killed. Rows 59–68, 60a and 68a were killed in the review, or during the build where noted in `m24-build-result.txt`.
+
+**A19-11 (records, after the review).**
+- The CLI README's on-disk paragraph no longer says a status-only command never opens the CA key. `instances` and `world` never do. `usage`'s network half loads it, and FatLine's server key, as `storage state` does.
+- That sentence moved out of "What the writing commands do not yet get" into its own paragraph.
+- The layout line says kubetest is never linked into farcast, and that `./check.sh` step 1b refuses it: `execgate`'s fake trees include kubetest, tested by `TestListingRefusesALinkedFake`.
+
+**A19-12: refuted findings.**
+- **`usage` loads `ca.key` and `server.key`.** Not M2.4's (unchanged `usagenet.go`), and A18-15 accepts it. Moving `instanceTunnel`'s callers to `LoadDialIdentity` is hardening left for later. The wording nit is A19-11.
+- **`classified` kinds writing commands early.** No kubectl call has a deadline in M2.4, and no record says writing commands' envelopes are `internal`.
+- **The status line omits that `reader grant` needs kubectl.** `reader grant` writes, and the line already says writing commands still need the tools.
+- **ADR 0004 decision 2's note.** "Until M2 lands" is still true, since M2 has not landed. Its note stays at M2.7 (§11).
+
+**Not settled here (added).**
+- The CLI's message for a P5-marked group, with its remedy, is shown nowhere in the app. Only the kind's label is drawn on the group.
+- Whether the owed Phase 5 Session A re-walk, and any 4.3 or 5.x re-walk, runs at a pre-M2.4 commit or includes phase-1 step 7b first. 7b changes IAM in the project, so this is the operator's call.
+- Switching `usage`'s network half, and the other tunnel reads, to `LoadDialIdentity`.
+- **Walk questions M2.4 adds:**
+  - the IAM 403's body and which sentence it gets;
+  - that an unbound labelled namespace answers 403, not 404;
+  - that the token endpoint accepts the reader's assertion with `userinfo.email` alone;
+  - that a GKE 404 for an absent ConfigMap is a Status;
+  - the 400 for a missing previous instance;
+  - the log stream's chunking.
+
+## 20. Amendments before M2.5's build (2026-11-15)
+
+M2.5 was mapped against the code at 353fc59 in three read-only lanes: the cluster package; the writing commands and `openCluster`'s writer branch; the records and the tests outside them. A completeness critic then went over the three maps. The raw map is `m25-map-result.json` beside this file, and its digest is `m25-map-digest.txt`. Where this section differs from §0–§19, it wins. Line numbers are at 353fc59.
+
+### Decided by the operator on 2026-11-15
+
+**A20-1 (Q12/D13 moved): `install` refuses a missing `--credentials` from M2.5, not M2.7.**
+- **Why.** From M2.5 every cluster-writing command reads as the installer key. An install made with Application Default Credentials (ADC) could then never be connected or deployed into, only released.
+- **What goes.** The usage line's `omit to use ADC` (`install.go:56`) and the prompt's `(blank = ADC)` (`install.go:305`) both go. The flag reads `Path to a service-account key JSON (required)`.
+- **Refusals.** A blank prompt answer, or the flag absent in a non-interactive run, is a usage error:
+  `--credentials is required: since ADR 0023 M2.5 farcast reads an instance's cluster, and writes its storage key pin, as the service account whose key --credentials names, never as Application Default Credentials`
+- **M2.7.** It restores §7.1's text, which says every write runs as that account. In M2.5–M2.6 the applies still run kubectl as the active gcloud configuration, so that text would be false.
+- **Records.** ADR 0023 gets a dated note (Q12's timing changed, and why), and the CLI README's install section changes.
+
+**A20-2 (Q9's tooling): M2.5 writes the probe walk's runbook and its walk-tagged probes.** Neither is run: the walk needs its own approval, asked when M2.5 is green.
+- **The runbook** is `docs/runbooks/adr-0023-m2-probe-walk.md`, marked written 2026-11-15 and not walked. It follows `adr-0023-m1-walk.md`'s conventions:
+  - the cost, approval and teardown gate before any billable step;
+  - the operator's own gcloud configuration only, and `--credentials` on every command;
+  - never paste raw output, never print a token, `KUBECONFIG` pinned;
+  - the probe built once with `go test -c`;
+  - an outbound-firewall rule for farcast and `walkprobe.test` to `*.gke.goog:443` and `oauth2.googleapis.com:443`.
+- **Its steps** cover §10.8's seven items in order:
+  1. a writing command's reads, which run as the writer;
+  2. the reader end to end, through `reader init`, the paste, `reader record`, `reader grant` and `world`;
+  3. what the init script prints;
+  4. a review as a throwaway account;
+  5. an empty key id;
+  6. the IAM 403's body;
+  7. the endpoint's form and the cluster version, read in Cloud Shell.
+- **The throwaway account** (items 4 and 6) is created in Cloud Shell. Its key is downloaded only into the walk's scratch directory, outside the checkout. The account is deleted, with its key, at teardown.
+- **The walk ends** with `release` and the printed reader lines.
+- **The probes** are new modes of `TestWalkProbe` (`farsight/cli/internal/cli/walkprobe_test.go`, `//go:build walk`), so they are never linked into farcast:
+  - `mint-empty-kid` (item 5) mints once with the reader's key and `kid` `""`, through the vendored 2LO provider. It prints only whether the mint was accepted and, if not, the OAuth error code.
+  - `review` (item 4) asks one SelfSubjectAccessReview. The identity is `FARCAST_WALK_IDENTITY=writer|reader|key`; `key` reads `FARCAST_WALK_KEY_JSON`, resolved against `FARCAST_WALK_CWD`. The attributes come from `FARCAST_WALK_VERB`, `_RESOURCE`, `_GROUP` and `_NAMESPACE`. It prints allowed or denied and the reason.
+  - `forbidden-body` (item 6) sends one `GET` as such an identity. It prints the status, the Content-Type, whether the body is a Kubernetes Status, and its reason and code. It prints the message only after emails, the project and addresses are replaced.
+
+  None prints a token, key, email, project id or address.
+
+### The cluster package
+
+**A20-3: `Open` builds the reader or the writer.** Before `kube.New`, sending nothing, `Open` refuses:
+- an identity that is neither `kube.Reader` nor `kube.Writer`: `cluster: Open builds an instance's reader or writer, and %q is neither`;
+- a reader with a non-empty `legacyKubeconfig`: `cluster: a reader client runs no kubectl, so Open takes no kubeconfig for it`.
+
+A writer client holds a kubectl runner over `legacyKubeconfig`, with `Env(os.Environ())` and `New`'s missing-kubectl text. An empty `legacyKubeconfig` opens, and its `Apply` returns §0's text.
+
+`errReaderOnly` and `TestOpenRefusesTheWriterUntilM25` are deleted. `TestOpenBuildsTheReaderOrTheWriter` succeeds the latter: the two refusals, `""`, an unknown identity, and a writer's `Apply` with no kubeconfig.
+
+**A20-4: a writer client.**
+- Its `Apply` runs kubectl `--kubeconfig <legacy> apply -f -`. `TestAWriterAppliesThroughKubectlWithItsKubeconfig` pins the argv and stdin, and that no API request is made.
+- Every read, `CreateConfigMap`, `ReplaceConfigMap` and `NamespaceUID` run in-process (§4), each followed by `flushWarnings`.
+- `neverWrites` keys on the identity: a reader client refuses the three writes, a writer does not.
+- **`NamespaceUID`** is `kube.Client.NamespaceUID`. It has no caller in M2.5 except the preflight read (A20-11).
+
+**A20-5: the build order inside cluster.**
+- **First, additive.** `New` and every kubectl branch stay while `cli` still calls `New`.
+- **Then, after `cli` has moved,** these go:
+  - `New`;
+  - the seven kubectl read branches;
+  - `serviceExternalIP`, `durArg` and the kubectl `jobMessage`;
+  - the kubectl create and replace;
+  - the `encoding/json` import.
+- **Every in-process method** then begins `if c.kube == nil { return inProcessOnly("<Method>") }`, and `inProcessOnly`'s doc is rewritten. Until M2.7 a kube-less client is test-built only (`newWithEnv`, `newWithRunner`), and it must refuse, not nil-dereference.
+- **Kept until M2.7:** `Runner`, `execRunner` (its `command` stays in `cluster.go`, so `exec-allowlist.txt` stays at 101 lines), `Streamer`, `markOf`, the marks and `env.go`.
+- **Deleted with the branches:** `funcRunner` and the `t.Run("kubectl")` halves A18-3 kept.
+
+**A20-6: the moved tests (§10.2).**
+- `TestNewDoesNotInheritTheParentEnvironment`, `TestNewKeepsTheParentsTokenCacheKey` and `TestEveryKubectlRunsWithKubercOff` run on an `Open`'d writer, `Open(loopbackConfig(t, s, "writer", kube.Writer), nil, kc)`, through `kubectlSaw`. `newWithEnv` alone would not catch a mutation in `Open`. They may be renamed for the writer, keeping their intent.
+- `TestAKubectlClientHasNoCanI` is rewritten over `newWithEnv` alone, covering every in-process method.
+
+**A20-7: rows 70 and 71, in cluster on kubetest.**
+- **`TestConfigMapWritesNeverApply`** (row 70) uses `dsdeploy.RenderPin` output for both bodies: the old `a` and `b` bodies would be refused before anything is sent. It asserts a `POST`, then a `PUT`, each with:
+  - `fieldManager=farcast&fieldValidation=Strict` and `Content-Type: application/json`;
+  - a body equal byte for byte to what was given;
+  - `As == "writer"`.
+
+  It also asserts that `AlreadyExists` unwraps to `tkube.ErrConflict`, that no `PATCH` or apply-patch is sent, and that no kubectl runs.
+- **`TestReplaceConfigMapCarriesTheResourceVersion`** (row 71) checks three cases:
+  - the `PUT` body carries the resourceVersion that was read, byte for byte;
+  - a stale one is `tkube.ErrConflict`, with the stored data unchanged;
+  - a missing one is `kube.ErrRefusedDocument`, with nothing sent.
+
+### The writing commands and `openCluster`'s writer branch
+
+**A20-8: the writer branch (§3.5).**
+- **Step 1**, writer only: `validateInstanceName(meta.Name)`. Before any path is built, it refuses with `refuse(errCredentialMissing, msgUnsafeRecord, meta.Name, "name", meta.Name)`.
+- **Steps 2–3** are unchanged.
+- **Step 4, the writer's credential:**
+  - `LoadInstanceCredentials`' `fs.ErrNotExist` gives `instances/%s/credentials.yaml is missing; this machine holds no installer key for instance %q; nothing was sent`.
+  - Any other read failure gives `instance %q's credentials.yaml cannot be read (%v); nothing was sent`, naming the system error only.
+  - A parse failure gives `instance %q's credentials.yaml does not parse (%s); nothing was sent`, with `config.ParseFault`'s fault. It never includes the YAML library's text, which can echo source lines, and that file holds the private key.
+  - A blank key gives `instance %q was installed without a service-account key (Application Default Credentials), which farcast no longer uses for its cluster (ADR 0023 M2); release it ('farcast release %s') and install a new instance with --credentials`.
+  - A `kube.ParseServiceAccountJSON` failure keeps kube's text only if that text holds no key bytes. A test with a corrupt key-bearing file proves it.
+
+  All of these are refusals unwrapping to `errCredentialMissing`.
+- **Step 5:** `legacy = r.Dir.InstanceKubeconfigPath(meta.Name)` for the writer, and `""` for the reader.
+- **The tests** live in `clusterref_test.go`: each refusal sends nothing, and no message holds key bytes.
+
+**A20-9: the writer's forbidden sentence (A18-10's M2.5 half).** `writerRefused(err, meta)` appends one sentence when `errors.Is(err, tkube.ErrForbidden)`:
+- an RBAC-shaped 403 (`forbiddenByRBAC`): `; the cluster refused instance %q's installer service account (RBAC); check that it still holds roles/container.admin in project %q`;
+- any other 403: `; the cluster's endpoint refused instance %q's installer service account (IAM); check that it still holds roles/container.admin in project %q`.
+
+It is applied once, to the error each writing command's `Run` returns, never in `classified`. What an IAM 403 looks like on the wire is unverified; the probe walk pins it, item 6. The kubectl `Apply`'s errors never carry `tkube.ErrForbidden`.
+
+**A20-10: open the writer early.** Opening sends nothing, so local refusals come before any consent or side effect, as A17-6 did for `reader grant`'s reader.
+- **`kernel meter` and `kernel confirm`** open before the record save (`kernelmeter.go:127`, `kernelconfirm.go:147`). On an open refusal `metadata.yaml` stays byte-identical, and nothing is applied.
+- **`connect`** opens right after its precheck, only when `!statusOnly && !connected`, so reconnect and `--status` still need no key. That is before `ensureIdentity` mints, `ensureRegistry`, the load-balancer prompt and the pushes. The client is passed into the bootstrap.
+- **`redeploy`, `build` and `run`** open before `ensureRegistry`, `resolveBuilder` or `resolveToolchainImage`, any push, and their confirm.
+- **`reader grant`'s applier** opens beside `newReader`: after the terminal check, before the prompt.
+- **`storage deploy`** reuses one writer client for both of its uses, `storagedeploy.go:138` and `:275`.
+- **`storage key rotate`** keeps its documented proceed-without-the-pin behaviour.
+- **M2.6's `--confirm`** still opens the writer only after the digest comparison (§7.3).
+
+**A20-11: a preflight read.** `connect`'s deploying path, `redeploy`, `build` and `run` each call `NamespaceUID(ctx, "farcast-system")` right after the open, before any prompt, mint, Google write or apply. The result is discarded: `""` for a namespace not yet made is fine. A failure is returned through `writerRefused`.
+- **Why.** These four would otherwise make their first in-process call only after a kubectl `Apply` had landed. A DNS endpoint that refuses the installer's `userinfo.email` token (unwalked, §10.8 item 1) would then fail them after the write. On a first `connect`, that leaves a billable load balancer recorded with no carrier IP.
+- `kernel deploy` (its `Namespaces` read) and `storage deploy` (its pin read) already read first.
+
+**A20-12: the name check for writers.** Each writing `Run` calls `recordNamed(meta, name)` right after loading the record: `connect`, `redeploy`, `build`, `run`, `kernel deploy`, `kernel meter`, `kernel confirm`, `storage deploy`, `storage key pin` and `storage key rotate`. `reader grant` already does, through `loadReaderRecord`.
+
+**A20-13: server text on the terminal.** The writing commands' warning lines that print an in-process error pass it through `terminalText`, as A19-6 did for `ps`:
+- `run.go:317` (the rollout);
+- `kernel.go:382` (the rollout);
+- `run.go:556` (the pin raise);
+- `storagekey.go:696-697` (rotate's `NOT written (%v)` line);
+- any other `fprintf` of a cluster error with `%v` in a writing command.
+
+**A20-14: seams and fakes, not all mechanical.**
+- **The five default seams change:** `build.go:92`, `fatline.go:158`, `run.go:133`, `readergrant.go:174` and `storagepin.go:59-68`. `openPinStore`'s kubeconfig stat and its text go.
+- **The test pin-store registry** (`storagepin_test.go:31-48`, `pinStoreOf`, 17 uses including `handover_test.go:1718`) is keyed by `string(r.Dir)+"/"+r.Meta.Name`.
+- **Other test seams.** `model_test.go:420`'s `pinOpener` changes. `readergrant_test.go:657` asserts `Identity == kube.Writer` and `Meta.Name`, no longer the kubeconfig path.
+- **A test through the real pin opener** saves `defaultPinStore`'s test override and restores it with `t.Cleanup`. It runs `storage key pin` as a loopback writer against kubetest, holding an existing pin at a resourceVersion: the `PUT` body carries it, `As == "writer"`, and nothing is `PATCH`ed.
+
+**A20-15: tests never run a real kubectl.** Every `cli` test that drives a writing command through its default seams past the open pins `PATH` with `t.Setenv`, to an empty directory or a directory holding a fake kubectl. The parent's `CLOUDSDK_*` must not matter there.
+
+**A20-16: `TestWritingCommandsCarryClusterKinds` (row 69).** Its rows:
+- the eleven commands with a keyless `credentials.yaml` give `credential_missing`, with zero kubetest requests;
+- `kernel deploy`'s `Namespaces` answering 403 gives `forbidden` (and A20-9's sentence);
+- two 401s give `unauthorized`;
+- a refused mint gives `credential_refused`;
+- `storage deploy`'s and `storage key pin`'s first pin read answering 500 gives `cluster_rejected`, while rotate stays `internal` by design;
+- for `connect`, `redeploy`, `build` and `run`, fakes returning kube-shaped errors after `Apply` give `rollout_stalled`, `timeout` and `cluster_rejected`;
+- the preflight read refused gives `forbidden`, before any `Apply`;
+- kubectl missing from a pinned `PATH` gives `internal`;
+- `writePin`'s three attempts exhausted by 409s give `cluster_rejected`.
+
+Only failures that reach an envelope are claimed. `run`'s and `kernel deploy`'s rollout waits, `build`'s `JobLogs`, `run`'s pin raise and rotate's pin failure warn or are swallowed by design.
+
+**A20-17: help texts that become false in M2.5.** These are rewritten in M2.5, not M2.7:
+- `storagepin.go:331-332` and `storagekey.go:399-400`: the pin is reached in-process with the instance's stored service-account key and needs no kubectl;
+- `reader.go:101-103`, with its assertion at `readerinit_test.go:665-670`.
+
+The other five kubectl hints (`build.go:192`, `run.go:387`, `runfetch.go:61`, `kernel.go:241`, `redeploy.go:222`) stay until M2.7, because their applies still run kubectl.
+
+**A20-18: who acts, stated.** In M2.5–M2.6, §7.3's "Writer, for reads and writes" is the M2.7 end state. A writing command acts as two identities:
+- the installer key, for its reads and the storage pin's create and replace;
+- the active gcloud configuration, through kubectl, for its applies.
+
+It needs both a usable `credentials.yaml` and kubectl, the plugin and a signed-in gcloud. The exceptions are `storage key pin` and `storage key rotate`, which apply nothing. `kernel meter`, `kernel confirm` and `reader grant` open the writer and make no in-process call with it: the open is the one constructor.
+
+### Mutation rows added (§10.5, M2.5)
+
+Rows 69–71 stand. They are run as overlays (`go test -overlay`), never by editing the tree.
+
+| # | Requirement | Mutation | Must fail |
+|---|---|---|---|
+| 69a | A writing call site keeps the chain | `%w` → `%v` at `kernel.go:165` (and, separately, at `storagepin.go:151`) | `TestWritingCommandsCarryClusterKinds` |
+| 69b | The writer's sentence, once | append `writerRefused` twice; drop it | `TestWritingCommandsCarryClusterKinds` |
+| 70a | `Open` refuses unknown identities | accept `""` | `TestOpenBuildsTheReaderOrTheWriter` |
+| 70b | The writer's kubectl gets the allowlisted environment | raw `os.Environ()` in `Open` | the moved env tests (A20-6) |
+| 70c | The writer's kubectl gets its kubeconfig | `""` in place of `legacyKubeconfig` | `TestAWriterAppliesThroughKubectlWithItsKubeconfig` |
+| 71a | Open before the record save | `kernel meter` opens after `SaveInstanceMetadata` (and `kernel confirm`) | the ADC-instance record test (A20-10) |
+| 71b | Open before consent and side effects | `connect` opens after the load-balancer prompt (and `redeploy` after its pushes) | the ADC-instance ordering tests (A20-10) |
+| 71c | The writer's name check | skip `validateInstanceName` in the writer branch; skip `recordNamed` in one writing `Run` | `clusterref_test.go`'s writer rows; the writing commands' record rows |
+| 71d | No key bytes in a refusal | return the YAML library's error for a corrupt `credentials.yaml` | the corrupt-file test (A20-8) |
+| 71e | install refuses ADC | accept a blank `--credentials` | the install refusal test (A20-1) |
+| 71f | The preflight read | drop it in `connect` | the `connect` preflight row of row 69's test |
+| 71g | Server text quoted on warning paths | print `run.go:317`'s error raw | a hostile-Status warning test (A20-13) |
+
+### The records (§11's M2.5 list, widened)
+
+**A20-19.** As A18-20 widened M2.4's list, this one covers every record that states the pre-M2.5 state.
+- **Status lines and help:**
+  - AGENTS.md (the ADR 0023 paragraph and the control-plane line);
+  - `README.md:280,300`;
+  - PLAN.md's M2 lines;
+  - ADR 0023's status line and its notes on decisions 3 and 7 and on the install refusal (A20-1);
+  - ADR 0021's `:220` and `:294`;
+  - the CLI README at `:299` (install), `:621` (the cluster module), `:1108` (`reader grant` needs the installer key too), `:1237` (`rollout_stalled` is emitted since M2.5 by `connect`'s and `redeploy`'s returned waits only), `:1260` and `:1267` (the exceptions, now "the writing commands' applies"), `:1275-1276` ("What Google sees") and `:1379-1383` (the layout);
+  - the help texts of A20-17;
+  - `phase-4-3-validation.md:23`, `phase-1-validation.md` step 7b.4 and phase-7 L1.
+- **ADR 0019's `:74` and `:95`** get M2.5 riders. Each writing command mints the installer's token at `oauth2.googleapis.com`, and its reads and the pin's writes name the installer service account as the audit caller. Its applies keep the gcloud identity until M2.7. Not walked.
+- **The writer's token is project-wide (§7.1).** The CLI README's writing-commands paragraph and ADR 0023 decision 3's dated note say so.
+- **The wording rule:**
+  - every apply still runs kubectl as the active gcloud configuration until M2.7;
+  - the reads and the storage pin's create and replace run in-process as the stored installer key;
+  - `storage key pin` and `rotate` need no kubectl, plugin or gcloud for an instance installed with `--credentials`, where service-account keys are allowed (not yet walked);
+  - never claim that applies, or writes in general, are in-process.
+- **The test comments** at `nosecrets_test.go:54-55` and `readcommands_test.go:185-186` are reworded: from M2.5 the fixture's writer opens, so the tests are stronger, not weaker.
+
+### The build order
+
+1. **Cluster, additive** (A20-3, A20-4, A20-7). `New` and the kubectl branches stay. Green on its own.
+2. **`cli`, in one step:** the writer branch, every seam, the early opens, the preflight read, the name checks, the credential refusals, `writerRefused`, `terminalText`, the install refusal (A20-1), the help texts and row 69's test (A20-8 to A20-18). Green on its own; afterwards `cluster.New` has no caller.
+3. **Cluster cleanup** (A20-5, A20-6). It can never come before step 2. Green on its own.
+4. **Two parts in parallel:** (a) the probes and the runbook (A20-2); (b) the records (A20-19).
+
+## 21. Amendments from M2.5's build (2026-11-15 to 2026-11-16)
+
+**How it was built.** Four steps: the cluster package, additive; package `cli`; the cluster cleanup; then the probe walk's tooling and the records, in parallel.
+
+**How it was reviewed.** Four lenses, each with a skeptic, then one fixer: security and cost safety; conformance of the Go code; the records, the runbook and the probes; mutation.
+
+**Findings.** 35 were reported, 23 confirmed and fixed, 12 refuted (A21-9). Two were major:
+- install's empty key file (A21-1);
+- the runbook's first step, which expected output that cannot occur (A21-6).
+
+The raw results are `m25-build-result.txt` and `m25-review-result.txt` beside this file. Their digests are `m25-build-digest.txt` and the review summary in `m25-build-report.md`.
+
+**A21-1 (A20-1, review, major): install refuses an empty or unparsable key file.**
+- **What went wrong.** Planck reads empty `Credentials` as "use Application Default Credentials" (`planck/types.go:94`; the gke client adds the key only when `len > 0`). `install --credentials /dev/null`, or any zero-byte file, therefore installed as the machine's ADC. It stored an empty key, and every writing command then refused the instance.
+- **The fix.** `readCredentials` refuses, as usage errors before `planck.Open`:
+  - a file whose `bytes.TrimSpace` is empty, with `msgCredentialsEmpty`;
+  - a file that `kube.ParseServiceAccountJSON` refuses.
+
+  Neither refusal quotes the file. A non-key file is now exit 2, no longer planck's `validate credentials: …` (internal).
+- **Mutation row 71h:** drop either check. It must fail `TestInstallRefusesAMissingCredentials`.
+
+**A21-2 (new, review): `applyReady` before anything costs or changes.**
+- **What went wrong.** M2.5 moved `kernel deploy`'s and `storage deploy`'s first cluster calls in-process. A missing kubectl or `kubeconfig.yaml` then surfaced only at their final `Apply`. By then the cost confirmation had passed, the registry had been ensured, images pushed, and, for storage deploy, the key pin written and the keyholder recorded.
+- **The new call.** `cluster.Client.ApplyReady()` runs nothing and sends nothing, and adds no exec site. In order it checks:
+  1. `neverWrites`;
+  2. `errNoKubeconfig`;
+  3. kubectl on the writer environment's `PATH`, through `lookPathIn`;
+  4. `os.Stat` of the legacy kubeconfig.
+- **Where it runs.** Every command that applies calls `applyReady` right after the writer opens. That is every writing command except `storage key pin` and `rotate`. Its refusal is internal: `this machine cannot apply to the instance's cluster, so nothing was changed: …`.
+- **New behaviour for seven commands.** For `connect`, `redeploy`, `build`, `run`, `kernel meter`, `kernel confirm` and `reader grant` this is new: they now refuse before the preflight mint, the prompt or the record save.
+- **Rows:** drop it in `kernel deploy` or `storage deploy`, which must fail `TestCommandsThatApplyRefuseAMachineThatCannotApply`; and `ApplyReady` returning nil, which must fail `TestApplyReadySaysWhatApplyWouldRefuseRunningNothing`.
+- **A20-11 is corrected:** the preflight read comes after the open and `applyReady`.
+
+**A21-3 (A20-10, review): one writer per process.**
+- `run`'s pin raise reaches the pin through the writer `run` opened. It is passed down through `handScopesToTheKeyholder`, then `pinScopes`, then `raiseScope`.
+- `storage deploy` reuses its writer through the shared `pinStoreFor`, which tries the test seam first, then the opened writer when it implements `pinStore`, then `defaultPinStore`.
+- So every writing command opens one writer, reads `credentials.yaml` once and mints once. The records' "one per process" holds.
+- A compile-time assertion, `_ pinStore = (*cluster.Client)(nil)`, guards the interface lookup.
+- **Tests:** `TestRunRaisesThePinThroughTheWriterItOpened`, `TestRunRaisesThePinThroughItsOwnWriter` and `TestStorageDeployOpensOneWriter`.
+
+**A21-4 (A20-16 and §10.5, review): rows added.**
+- **Forbidden rows.** Row 69's test gains RBAC- and IAM-shaped 403s on `storage deploy`'s and `storage key pin`'s pin read. Each asserts:
+  - the kind `forbidden`;
+  - the matching writer sentence exactly once, and the other sentence never;
+  - one mint.
+
+  These kill row 69b for those two commands.
+- **Its kubectl-missing row** expects `applyReady`'s refusal. Its `PATH` holds a stand-in kubectl that must never run.
+- **Row 70d:** the writer's kubectl keeps the parent's `CLOUDSDK_CONFIG` and `CLOUDSDK_ACTIVE_CONFIG_NAME`, and not `CLOUDSDK_CORE_ACCOUNT`. Its test is `TestAWritersKubectlKeepsTheParentsGcloudSelection`.
+- **Row 69b's negative:** `writerRefused` applied in `reader grant` must fail its 403 subtest.
+
+**A21-5 (records, review).**
+- **The installer's token's reach.** It can write every cluster in the project, FarCast's or not, not only every FarCast cluster. This is stated in AGENTS.md, ADR 0023 decision 3's note and the CLI README.
+- **ADR 0008** gets an M2.5 rider on the pin's POST and PUT.
+- **`RenderPin`'s comment** describes an in-process create or replace.
+- **The CLI README's `connect` bootstrap** gains the open, `applyReady` and the preflight before the CA, the registry, the cost question, the pushes and the applies. Reconnect and `--status` skip them.
+- **"Decisions 3 and 7" in A20-19 was a slip.** The notes went to decisions 2, 3 and 5, and decision 7 needs none.
+
+**A21-6 (A20-2, review): the runbook as fixed.**
+- **P1.1** expects exit 2, nothing on stdout, and the refusal on stderr: farcast has no `usage` kind, and a usage error has no envelope. It writes to files, not through a pipe. It also checks `--credentials /dev/null`.
+- **Item 7's endpoint form** is read at P1.3, right after the install, and a zone label is a stop. P6 keeps only the cluster version.
+- **P2.5** is timed with zsh's `time`. Whether the wait saw a 401 or a 403 comes from P2.4, just before it.
+- **On P1.3's hard stop,** P2.4 still answers item 2: a Status 403 means the token was accepted, a 401 refused, and an IAM 403 is no answer yet.
+- **The approval gate** names P4.4's project-wide `roles/container.developer` grant, held from P4.4 to P7.1 with its key on the Mac. From P4.2 on, any stop runs P7.1 first.
+- **P0.9** sets `INSTANCE` in Cloud Shell.
+- **P5** lists all five outcomes of the empty-kid mint.
+
+**A21-7: deviations from the build accepted as built.**
+- **`storage key rotate` on an ADC instance** keeps rotating, and its envelope is internal, not credential_missing. A20-10's proceed-without-the-pin wins over A20-16's row.
+- **`reader grant` gets no `writerRefused` sentence.** Its in-process calls are the reader's.
+- **A `kube.ParseServiceAccountJSON` failure** is `refuse(errCredentialMissing, "%s", err)`. `errors.Is(err, kube.ErrCredentialInvalid)` is no longer true, and the kind is still `credential_missing`.
+- **`preflighter`**, holding `NamespaceUID`, is embedded in `clusterApplier` and `jobWaiter`. It reaches `runCluster` through `jobWaiter`. This is in place of §2.6's "interfaces unchanged until M2.6", because the preflight read needs it.
+- **`preflightNamespace`'s wrapper text** is `before changing anything, read the instance's cluster as its installer service account: %w`.
+- **`openWriter(r)`** forces `Identity` to the writer and `Verifying` false. Every writing default uses it.
+- **`writerRefused`** is applied through a deferred call on each writing `Run`'s named result.
+- **`readCredentials("")`** is a second guard beside the input checks.
+- **The rotate line.** Rotate's `NOT written (%s)` line is quoted when it is built, so the JSON `pin` field carries the quoted sentence.
+- **The env tests.** Two are renamed for the writer: `TestAWritersKubectlDoesNotInheritTheParentEnvironment` and `TestAWritersKubectlKeepsTheParentsTokenCacheKey`. `TestEveryKubectlRunsWithKubercOff` keeps its name.
+- **`TestConfigMapWritesNeverApply`** had a kubectl half until step 3 deleted it with the branch.
+- **`parentKubectl`** was inlined into `Open` when `New` went.
+- **The guards.** All 14 in-process methods begin with the `inProcessOnly` guard. In `CreateConfigMap` and `ReplaceConfigMap` it comes before `neverWrites`.
+- **The probes** live in `walkcluster_test.go` (`//go:build walk`), and `walkprobe_test.go` holds only their switch cases and header.
+  - They send their one request themselves. `openCluster` and `kube.New` are the gates, and the token comes from the vendored 2LO provider with kube's options. kube exposes no review reason, raw refusal body or OAuth error code, which is what they must print.
+  - `forbidden-body`'s `GET` is fixed: it is the preflight's request.
+  - The reader opens with `Verifying: true`, as `reader grant`'s own open does.
+  - Every printed server string passes `walkScrubber`.
+
+**A21-8: mutation.**
+- The design rows 69–71g were killed in the build or the review, all as overlays.
+- The review's mutation lens killed 50 more, and its 11 survivors became findings.
+- The fixer re-ran its 17 mutants, and all were killed.
+- The worktree was never mutated.
+
+**A21-9: refuted findings.**
+- **The writer's pairing refusals can echo `token_uri`, `universe_domain` or the email domain from `credentials.yaml`.** That takes copying key lines into those fields deliberately, while the key itself still parses. The text goes only to the operator's own stderr. Those values are the diagnostic.
+- **The walk shell keeps `HOME`, so ADC is findable.** No walk step reaches ADC once A21-1 holds, and P1.1 pins `GOOGLE_APPLICATION_CREDENTIALS`.
+- **The throwaway account's project-wide `container.developer`.** The design asks for it, and the same Mac already holds the installer's `container.admin` key. The gate now names it (A21-6).
+- **Rotate's second record read is not name-checked.** Reaching it needs a mid-command rewrite of `metadata.yaml`, and HEAD had no check at all.
+- **Failed Jobs' logs are printed raw.** This is log content, unchanged from HEAD, and like `farcast logs`. A later hardening across `logs` and Job output may escape it.
+- **No test that `storage deploy` reuses one client.** Equivalent in M2.5, since only `Apply`, which is kubectl, used the other. A21-3's test now covers the credential read anyway.
+- **The rotate line quoted in JSON.** A20-13 names it.
+- **The cluster paragraph's opening.** It is dated history, and §11 schedules it for M2.7.
+- **The walk probe absent from the README's Testing section.** It is a Phase 5 file, documented in the runbook.
+- **No unit test that the probes never print a token.** A20-2 asks for none, and `check.sh` vets them. That is a scope choice for later.
+- **The preflight's namespace unpinned.** Every name sends the same request and gets the same authorization.
+- **The whitespace key's remedy text.** It is still a refusal matching `errCredentialMissing`, with nothing sent.
+
+**Not settled here (added).**
+- Whether the walk probes get non-live unit tests (a token never printed, the scrubber's coverage) before the probe walk is approved.
+- Escaping Job logs and `farcast logs`' container output on a terminal: a hardening across both.
+- `storage key rotate` re-checking its second record read.
+- **Walk questions M2.5 adds:**
+  - that the DNS endpoint accepts the installer's `userinfo.email` token for reads and the pin's POST and PUT (item 1);
+  - the 403 body the writer gets when it lacks `container.admin`.
+
+## 22. The probe walk (Q9), walked 2026-11-16
+
+The walk ran at 2482810, with the two walk-time probe options described below. The operator approved the full gate. The instance lived 83 minutes, about USD 0.15. It has been released, and the project is back to its counts. The scrubbed results are `m2-probe-walk-results.md` beside this file. The repository's record is the runbook `docs/runbooks/adr-0023-m2-probe-walk.md` (Results), with dated notes in ADR 0023, ADR 0019, ADR 0021, the CLI README, AGENTS.md, README.md, PLAN.md and the walked runbooks.
+
+**A22-1 (§3.3, major): `userinfo.email` alone is refused.**
+- **What the walk found.** GKE's DNS endpoint answers **401, an HTML page**, to a token scoped to `userinfo.email` alone. That held for the writer's key and for a second account's key. It accepts `cloud-platform`, alone or together with `userinfo.email`.
+- **What it means.** §3.3's fallback applies: `cloud-platform` comes back, with a dated note. Until then every in-process cluster call fails against GKE as built: M2.4's reads and `reader grant`'s check, and M2.5's writer reads and pin writes.
+- **The trade-off.** A leaked cluster token then works for every Google API the account's IAM allows, not only for the cluster.
+- **Still open:** whether to send `cloud-platform` alone or both scopes; this needs a decision before the fix.
+- **Owed with the fix:**
+  - the Swift app's `unauthorized` remedy text (`ProblemText.swift:77`), which points at the IAM grant;
+  - the Go remedy text, if it does the same;
+  - this section's §3.3 note.
+
+**A22-2 (§7.2, product): key upload can be blocked.**
+- **The finding.** The walk's organization enforces `iam.disableServiceAccountKeyUpload`, so no reader could be set up. In such an organization, which Google makes the default for newer ones, the five read commands read no cluster. Key creation was allowed there.
+- **The options**, each the operator's to choose:
+  - allow upload for the project;
+  - a new command that imports a Google-created reader key. That is a design change: Google generates the private key, and it travels as a download;
+  - ADR 0023 M3a/M3b, Workload Identity Federation, which needs no service-account key.
+- Item 2 (the reader end to end) was not walked.
+
+**A22-3 (§7.2, minor): the script's managed check needs `orgpolicy.googleapis.com`.** Silenced and non-interactive, the check reads "not enforced" when that API is off. The walk enabled the API (an interactive prompt) and turned it off again at teardown.
+
+**A22-4 (confirmed):**
+- GKE's SelfSubjectAccessReviews consult IAM. An account with `roles/container.developer` and no RBAC was `ALLOWED`: "access granted by IAM permissions", settled within 1.5 minutes. So `reader grant`'s reviews see an IAM role stronger than `clusterViewer`.
+- The endpoint's IAM refusal is a 403 HTML page, not a Status, so `forbiddenByRBAC`'s rule holds.
+- `"kid":""` is accepted, for a Google-created key; an uploaded key was not tested.
+- The endpoint carries the region label.
+- The cluster runs 1.36.4-gke, so §10.6's no-cost test pins minor 1.36.
+
+**A22-5 (the probe as walked).** `walkcluster_test.go` and `walkprobe_test.go` gained two options during the walk, both documented in the probe's header, and the walk-tag vet passes:
+- `FARCAST_WALK_SCOPE` (`userinfo.email`, the default; `cloud-platform`; `cloud-platform+userinfo.email`);
+- `mint-empty-kid` taking `FARCAST_WALK_IDENTITY`.
+
+The probe printed only the byte count of a non-JSON body, not its first line: a minor gap against A20-2.
+
+**A22-6 (runbook).** It is corrected in place with dated notes:
+- a firewall that holds the probe shows as `NOT ANSWERED: EOF`;
+- buckets are counted in Cloud Shell;
+- every cluster probe needs `FARCAST_WALK_SCOPE` until the fix;
+- P7 gains the step that turns the Org Policy API off again;
+- `release` prints the reader's lines even when the account was never made.
+
+**A22-7 (§3.3, decided 2026-11-16): the cluster token carries `cloud-platform` and `userinfo.email`.**
+- **The scopes.** `kube` exports `ScopeCloudPlatform` (`https://www.googleapis.com/auth/cloud-platform`) beside `ScopeUserinfoEmail`. A function `TokenScopes() []string` returns a fresh `{ScopeCloudPlatform, ScopeUserinfoEmail}`, in that order, which is the walk's probe's *(2026-11-16, after the fix: this said "gcloud's and the walk's"; the walk never observed gcloud's request, and gcloud's own scope list, in its installed source, puts `userinfo.email` before `cloud-platform` and has more)*. `twoLegged` mints with `TokenScopes()`.
+- **kubetest** requires the assertion's `scope` claim to be exactly `strings.Join(kube.TokenScopes(), " ")`. Either scope alone, the reverse order, or any extra scope is `invalid_grant`.
+- **Why both.**
+  - `cloud-platform` is what the DNS endpoint's IAM check needs: the probe walk's item 1 got 401 with `userinfo.email` alone.
+  - `userinfo.email` keeps the account's email in the identity GKE derives from the token. The reader's RoleBindings name that email, so without it RBAC might see another name. This is inferred, not walked: no reader could be set up.
+- **The trade-off, stated in every record that names the scope.** A leaked cluster token works for every Google API the account's IAM allows, not only the cluster:
+  - for the reader, `roles/container.clusterViewer`;
+  - for the writer, everything the installer holds.
+
+  The token is held in memory only, one per process, and is sent only to the endpoint's host and the token URL (`TestAuthorizationOnlyToTheEndpointHost`).
+- **The walk probe's default** becomes farcast's own pair. `FARCAST_WALK_SCOPE=userinfo.email` keeps the old scope for comparison.
+- **Tests.** `TestTokenCarriesTheEndpointsScopes`, or the existing wire test renamed, pins the claim. kubetest's tests refuse each scope alone, the reverse order and an extra scope.
+- **Mutation rows:**
+  - 3.3a: mint with `userinfo.email` alone;
+  - 3.3b: mint with `cloud-platform` alone;
+  - 3.3c: kubetest accepting any order.
+- **Records.** The probe walk's "fix pending" notes become: fixed 2026-11-16, not walked. For the writer, the walk's 200 with exactly this pair is the evidence; for the reader, there is none, since item 2 was not walked. The Swift and Go `unauthorized` remedies stay: with the fix, a 401 again means the identity was refused, not the scope.
+
+## 23. Amendments before M2.6's build (2026-11-16)
+
+M2.6 was mapped against the code at 39ca9e3 in six read-only lanes: the plan package, the consent flags and the rendering; `connect`, `redeploy`, `build` and the image refactor; `kernel deploy`, `kernel meter`, `kernel confirm` and `reader grant`; `storage deploy`, `storage key pin` and `storage key rotate`; `run` and P1; the cross-cutting tests and the records. A completeness critic then went over the six maps. The raw map is `m26-map-result.json` beside this file, and its digest is `m26-map-digest.txt`. Where this section differs from §0–§22, it wins. Where it is silent, the earlier sections govern, and a mapper's proposal in the map is advice, not a decision. Line numbers are at 39ca9e3. In the bold leads, **Cn** is the critic's n-th confirmed conflict and **Mn** its n-th missing item (both 1-based, in the map's order), and **Ln.k** is the k-th conflict of lane n, the lanes numbered 1–6 in the order above. Every lane conflict is folded into the amendment whose lead names it, except the ones the critic refuted (the list at the end).
+
+### Decided by the operator on 2026-11-16
+
+**A23-1 (O1; L3 question, L6 question): no reader, no consent path for the reader plans.** M2.6 is built as designed. There is no writer fallback, and row 85 stands.
+- **Where no reader can be granted** (key upload blocked by `iam.disableServiceAccountKeyUpload` or `iam.managed.disableServiceAccountKeyUpload`, A22-2):
+  - `--plan` and `--confirm` refuse with `credential_missing` (§7.3's text as A23-21 words it) for `kernel deploy`, `storage deploy`, `storage key pin`, and `storage key rotate` with a keyholder deployed;
+  - `run --plan` prints the fetch stage, which reads no cluster; `run --confirm`, in both forms, refuses with run's own text before anything is written;
+  - `reader grant --plan` prints a blocked plan (its key id is never recorded there), and its `--confirm` refuses;
+  - `connect`, `redeploy`, `build`, `kernel meter`, `kernel confirm`, and `storage key rotate` with no keyholder plan and confirm normally;
+  - interactive and `--yes` runs of all eleven are unchanged.
+- **A22-2's choice** (allow upload for the project; a command that imports a Google-created reader key; M3a/M3b) is decided separately, before the billable M2 walk (Q10). Until then, in such an organization, Q10 can walk only the reader plans' refusals, not the plans themselves; the reader and its scope pair stay unwalked.
+- **Pinned by** `TestPlanWithoutAReaderIsRefused` (A23-21). The records say it (A23-52).
+
+**A23-2 (O2; C30, L5.3, L5.14): P1's re-read moves before the egress policy.** On every path (`--confirm`, `--yes`, non-interactive, interactive), the re-read of each application's `DeploymentState` and the ledger, and, under `--confirm`, the egress policy's resourceVersion (with the pin's, A23-48), runs after the builds and before the egress policy is read and applied (`run.go:284-296`), not before the workload apply (`run.go:326`). A refusal there leaves only the builds written.
+- §5.4's "immediately before the workload stream's `Apply` (after the builds, the policy and the pin)" is replaced. Its "one stream apply" window becomes: the policy apply, the new scopes' mint and hand-over, and the pin, a few seconds [inf], in which the kernel can stop an application unseen. That is accepted.
+- The other texts that place it before the workload apply read "before the egress policy (A23-2)": §1's Applications row, §5.4's two other mentions (the absent target namespace, and the ledger read again), §9.5's Application Deployments bullet, and the Requirement column of §10.5's rows 87 and 89a.
+- `TestYesNeverRestartsAnAppStoppedDuringTheBuild`'s fake kernel acts during the builds, before the re-read, in both rows (§5.4 had it act "between the review and the workload apply").
+- The resourceVersion comparisons, the policy's and the pin's, are made under `--confirm` only. The other paths re-read the Deployments and the ledger.
+- The texts are A23-48's. **Pinned by** `TestConfirmRefusesAnAppStoppedAfterTheCompare` and `TestYesNeverRestartsAnAppStoppedDuringTheBuild`, which also assert that the stand-in kubectl (A23-49) received no egress policy and no workloads. Mutation row 87a.
+
+**A23-3 (O3; C32, L4.14): `storage key pin --replace` under `--confirm`.** The bound option `replace=true`, with the plan's notice below, is the consent to lowering both the ConfigMap's pin and any live replica found enforcing a different pin. `confirmLower` (`storagepin.go:440-452`) is never called under `--confirm`. Without `--replace`, nothing is lowered.
+- **The notice** (chosen here): `with --replace, a keyholder replica found enforcing a pin other than this one is handed this one in its place, which lowers what it enforces; which replicas are found is decided when the command runs, outside this plan`.
+- **Pinned by** `TestKeyPinReplaceConfirmLowersReplicasWithoutAsking`. Mutation row 91c.
+
+**A23-4 (O4; M1): plans carry raw values.** A plan binds and prints the provider, project, region, cluster, endpoint, the record's creation time, the reader's email, the registry prefix and the bucket, unscrubbed, in JSON and in text. `scrubMessage` and `emailLike` are not applied to plans.
+- The CLI README's "Plans and confirmation" says (pinned): `A plan names the instance's project, cluster, endpoint, image registry, bucket and reader account. Handle a plan document like the instance's metadata.yaml.`
+- Plan vectors hold only the atlas fixture's values (`vectorMeta`, `worldvectors_test.go:118-155`: the project `proj-atlas`, the endpoint `gke-1a2b3c.europe-west4.gke.goog`, the registry `europe-west4-docker.pkg.dev/proj-atlas/farcast-atlas`, the bucket `farcast-atlas-5f3a9c21`, and the reader derived for `proj-atlas`). All are fixture values; none names a real project. This is a record; no test pins it beyond the vectors.
+
+### Decided by the orchestrator on 2026-11-16
+
+**A23-5 (D1; C31, L2.3): no plan deploys FatLine without Shrike.** *Reason: no new automated path may deploy the boundary without its monitor.*
+- Under `--plan` and `--confirm`, `connect` and `redeploy` refuse before any plan is computed whenever `--fatline-image` is given without `--embedded` and `planRegistry` fails (no prefix recorded, the installer key refused, the provider not opened or not a `RegistryProvider`). In the plan-time model, that is when today's ensure-failed break-glass applies: `resolveSidecarImage` (`fatline.go:893-915`) breaks glass only when `reg == nil`, that is, when the ensure failed (`:906-910`).
+- A token-mint or `Resolve` failure inside decide (A23-34) stays the error it is today, in every mode.
+- **The text** (chosen here): `--plan and --confirm never deploy FatLine without its Shrike monitor, and instance %q's image registry could not be read (%v); deploying FatLine alone is a break-glass step: run the command without --plan or --confirm, interactively or with --yes`. Its kind is `kindOf(classified(err))` of the registry failure. Where both apply, it takes precedence over A23-24's missing-registry text.
+- Break-glass stays an interactive or `--yes` act, printing today's two lines. The `image` fact has no `omitted` action.
+- `TestConnectExplicitImageSurvivesRegistryFailure` (`connect_test.go:871`) keeps its interactive and `--yes` rows, with its registry reads failing too (A23-24 moves the read into `plan()`). It gains a row for A23-24's failed realize-step ensure: a plan that read the registry and decided Shrike, then an ensure that fails after consent, is refused with nothing pushed or deployed. **Pinned by** `TestPlanNeverDeploysFatLineWithoutShrike`: `connect` and `redeploy`, `--plan` and `--confirm`, with that text, nothing written. Mutation row 91b.
+
+**A23-6 (D2; L5 question 2): P1's gate fails closed on an unread application.** *Reason: P1's own rule counts an unreadable ledger as reached.*
+- While the ledger reads reached (`cost.LevelReached.String()`, a level `levelOf` maps to unknown, or an unreadable ledger), `--yes` and non-interactive runs refuse an application whose state is `unknown`, as they refuse a stopped one, at the review and at the re-read. Interactive runs ask, with A23-48's unknown line.
+- Under `--confirm`, an `unknown` fact is satisfied at the re-read by a Deployment showing no reset, and refused (`plan_changed`) when it shows stopped or adapted, or cannot be read (C24).
+- **Pinned by** `TestYesNeverDeploysOverAnUnreadAppAtTheLimit`. Mutation row 89c.
+
+**A23-7 (D3; L1.8): a blocked plan.**
+- `--plan` of a blocked plan exits 0. Its human text prints the blocks first, each as `blocked (<kind>): <message>`, then the rest as §9.6 orders it. It keeps the `digest:` line and replaces the `To do exactly this:` line with `blocked: --confirm would refuse this plan (<kind>)`, the first block's kind. Its JSON is the document, with `blocked` non-empty.
+- `--confirm` of it recomputes and compares the digest first (a change is `plan_changed`), then refuses with the first block's kind and message (`refuseBlocked`, A23-16), exit 1.
+- **Pinned by** `TestABlockedPlanIsRefusedWithItsKind` (human and JSON; exits 0 and 1). Mutation row 74d.
+
+**A23-8 (D4; C17, L1.16, L2.16, L3.5, L3.14): modes that write nothing.**
+- **Usage errors (exit 2), raised with `consent.mode` right after the argument count** (texts chosen here):
+  - `connect --status` with `--plan` or `--confirm`: `--status only dials the bound carrier and reports; it writes nothing, so it has no plan to print or confirm`;
+  - `kernel meter <instance>` with no namespaces, with `--plan` or `--confirm`: `kernel meter --plan and --confirm need namespaces to add or remove; with none it only reports what is metered`.
+- **Plans with no write facts:** `kernel confirm`'s empty window (`kernelconfirm.go:128-135`) and `kernel meter`'s "Already metering" (`kernelmeter.go:113-117`). Each carries its fact and today's line as a `notice`, and is computed and compared before the early return. Under `--confirm`, after the comparison, it prints today's result and exits 0.
+- **Pinned by** `TestConnectStatusHasNoPlan`, `TestKernelMeterPlanNeedsNamespaces`, `TestKernelMeterConfirmOfANoOpIsComparedFirst` and `TestKernelConfirmPlanChangesAcrossUTCMidnight` (A23-40). Mutation rows 90a and 90c.
+
+**A23-9 (D5; L1.15): the unused `--yes` of `kernel confirm` and `kernel meter`.** They keep it for interactive scripts. `--yes` beside `--plan` or `--confirm` is §9.2's three-way usage error. Their help (`kernelconfirm.go:83`, `kernelmeter.go:67`) becomes `unused; accepted so scripts can pass it uniformly, except beside --plan or --confirm`. **Pinned by** `TestConsentAnswersAreExclusive`'s rows for both.
+
+**A23-10 (D6; C3, L1.6, L2.4, L3.8): no `not_release` kind.** *Reason: the kinds are a closed wire contract, and every precheck runs before any plan exists.*
+- `checkCarried`'s precheck (`connect.go:250`, `redeploy.go:129`, `kernel.go:204`, `storagedeploy.go:120`) stays a refusal raised before any plan is computed, in every mode, `--plan` included, with kind `internal` as today.
+- §9.4's Blocked column is `—` for `connect` and `redeploy`; `kernel deploy` and `storage deploy` gain no such block. The kinds stay 21.
+- **Pinned by** `TestPlanOfANonReleaseIsRefusedBeforeAnyPlan` (one `--plan` row per command).
+
+**A23-11 (D7; C13, L4.2, refuted 7): rotate's unplanned hand-over outcomes.** Under `--confirm`, the hand-over can end in an outcome the plan did not describe: the replicas never took the held keys, this machine was put back on its old keys, or a replica refused. Then rotate writes no further pin and exits non-zero with the keys held, with the kind it has today (`internal`, through `rotationUnfinished`), never `plan_changed`. A23-45 says when a pin is written.
+- **The line** (chosen here). Today `not moved` prints only when the hand-over did not check (`storagekey.go:680`), and the put-back and refused cases go on to `finishPin`. Under `--confirm` the result's `pin` field is, in each of the three cases: `not moved: the rotation ended in a state its plan did not describe (%s); 'farcast storage key pin %s' writes it once the keys settle`. The first `%s` is the outcome (`the replicas never took the held keys`, `this machine was put back on its old keys`, `a replica refused the new keys`), the second the instance. It is quoted when it is built, as A21-7's rotate line is.
+- **Pinned by** `TestRotateConfirmPutBackWritesNoUnplannedPin`, which asserts the line. Mutation row 80b.
+
+**A23-12 (D8; C12, L4.7, refuted 8): a first storage deploy's bucket.** Its random bucket name is D8's fourth placeholder difference, item 6 of A23-31's list once C10 and C11 add items 4 and 5, rendered as `farcast-placeholder:bucket:<instance>`. The plan's `create_bucket` cloud fact is the consent to the billable bucket. **Pinned by** `TestConfirmWritesThePlannedDocumentsExceptTheirSecrets`, which masks it, and `TestPlanIsDeterministic`'s first-storage-deploy case. Mutation row 80a.
+
+**A23-13 (D9; L2 question 3): a source-build plan.** It applies to `--source`, or a farcast that carries no components. *Reason: minimal machine dependencies.*
+- The `image` fact's `source` binds `{dir, go_path, go_version}`: the checkout directory `findSource` found, and the Go `findToolchain` found (A23-34). There is no git and no tree hash.
+- The plan carries the notice (chosen here): `the build compiles whatever %s holds when --confirm runs; this plan binds the directory, not its content`.
+- A different Go found under `--confirm` changes the digest (`plan_changed`).
+- **Pinned by** `TestPlanIsDeterministic`'s `connect --source` case (with `findToolchain` stubbed) and `TestEveryBoundFactIsRendered`'s `image.source` row.
+
+**A23-14 (D10; M10): four parts.** M2.6 is built and committed in four parts, each green on its own with `./check.sh`. They follow the critic's ordering: steps 1–3, 4–5, 6–7, then 8a–10.
+- **M2.6a:** the plan package; the consent core; `kernel confirm`, `kernel meter` and `reader grant`; their vectors and records.
+- **M2.6b:** the image and identity refactor; `connect`, `redeploy` and `build`.
+- **M2.6c:** `kernel deploy`, `storage deploy`, `storage key pin` and `storage key rotate`; the reader-identity tests.
+- **M2.6d:** `DeploymentState`; P1's review and gate; `run`'s two stages; the completeness tests over all eleven commands; the final records.
+
+The build order at the end of this section gives each part's files, tests and records.
+
+### The plan package
+
+**A23-15 (§2.4, §9.3; C25, L1.12, L1.13, L1.19, L1.22, C27): `farsight/cli/internal/plan`.**
+- **Files.** `plan.go` and `facts.go`, with the standard library only. The package imports nothing from `cli`. It owns `Stamp`, its encoder, and `func Time(t time.Time) string`, which is `wireTime`'s rule (`worlddoc.go:108-115`): UTC, whole seconds, RFC 3339. `Time` is used for `created_at` and `generated_at`. `cli` converts money with `cents()` (`worlddoc.go:141`) before it builds a fact, and gets the stamp through `planStamp` (A23-29).
+- **Constants:** `Protocol = "farcast-plan-1"`, `Schema = 1`, `Kind = "plan"`.
+- **`Canonical(b Bound) ([]byte, error)`:**
+  - it encodes with `SetEscapeHTML(false)` and strips the trailing newline;
+  - first, on a deep copy, it turns every nil slice reachable from `b` into an empty one (a reflect walk);
+  - it refuses, each with `plan: …` (kind `internal`): `b.Protocol != Protocol`; `Options` not strictly ascending by `Flag`; and a fact whose `Type` field is not its `FactType()`.
+- **`ParseDigest`** accepts `^sha256:[0-9a-f]{64}$` only.
+- **The 17 fact structs** (names chosen here): `CostFact`, `ImageFact`, `WriteFact`, `MintFact`, `RestartFact`, `CloudFact`, `KernelSettingsFact`, `MeterFact`, `ConfirmationFact`, `PinFact`, `RotationFact`, `FetchFact`, `RunFact`, `BuildFact`, `ApplicationResetFact`, `ReaderFact`, `NoticeFact`.
+  - Each has `Type string` first, `FactType()` returning §9.4's type word, no `omitempty`, no map and no float.
+  - Each enumeration (`action`, `what`, `state`, `method`, `service`) is a set of exported constants.
+  - M2.7 adds `MigrateFact`; M2.8 adds `GrantFact` and `GitCredentialFact`.
+- **`irreversible`.** No M2.6 fact has it. The renderer hoists any fact implementing `interface{ Irreversible() bool }` that returns true; in M2.6 none does.
+- **`write.force`** is `false` in M2.6. kubectl's client-side apply has no force, and the pin's create and replace are not applies. M2.7 binds `true` for applies; the bound `farcast` stamp already separates the two milestones' digests.
+- **Tests** (`plan_test.go`): `TestCanonicalIsCompactUnescapedAndOrdered`, `TestCanonicalWritesEmptyArraysNotNull`, `TestCanonicalRefusesUnsortedOptionsAndAMistypedFact`, `TestFactTypesAreCanonical` (a reflect walk: no map, no float, no `omitempty`, `Type` first), `TestDigestOfIsDomainSeparated`, `TestParseDigest` (uppercase, `SHA256:`, 63 or 65 hex, a space and `""` refused), `TestNewDocumentStampsSchemaKindAndTime`. Mutation rows 78a and 78b.
+
+### The consent core
+
+**A23-16 (§9.2; C2, L1.5, L3.18, C28 in part): flags and modes, in `farsight/cli/internal/cli/consent.go`.**
+- **The flags.** `type consentFlags struct{ plan bool; confirm string; confirmGiven bool }`, and `func (f *consentFlags) register(fs *flag.FlagSet)`:
+  - `--plan` is a `BoolVar`;
+  - `--confirm` is an `fs.Func` whose callback only stores the value and sets `confirmGiven`. It never fails, so the router never prints the flag package's own text for a value (a bare `--confirm` with no value is still the flag package's "needs an argument" usage error, exit 2).
+- **The mode.** `type consentMode int`, with `consentNone`, `consentPlan` and `consentConfirm`. `func (f *consentFlags) mode(yes bool) (consentMode, string, error)` counts parsed values: `plan` true, `confirmGiven`, `yes` true. So `--yes=false --plan` is one answer.
+  - Two or more answers give §9.2's three-way text.
+  - `confirmGiven` with a failing `plan.ParseDigest` gives §9.2's malformed-digest text. That covers `--confirm=` and `--confirm ''`.
+- **Where it runs.** Every in-scope `Run` calls `mode` right after its argument-count check, before the record is read. `reader grant` calls it before its `--yes` refusal (`readergrant.go:227-229`), so the three-way text wins there.
+- **Who registers it.** `fatlineDeployer` gains `consent consentFlags`. Each command registers its consent flags (`c.deployer.consent.register(fs)`, or its own for `run`, `build`, `storage key pin`, `storage key rotate` and `reader grant`) in its `SetFlags`, in the part that wires it (A23-14), never inside `setYesFlag`. Until then `--plan` is an unknown flag (exit 2), so no committed part accepts `--plan` on a command that does not call `mode`.
+- **Pinned helpers.**
+  - `consentSuffix = ", or --plan and then --confirm <digest>"`.
+  - `planChanged(now, given string) error`: `withKind(kindPlanChanged, …)` of §9.2's text.
+  - `refuseBlocked(b plan.Bound) error`: `withKind(b.Blocked[0].Kind, errors.New(b.Blocked[0].Message))`.
+  - `msgPlanAgain = "run the same command with --plan instead of --confirm"` (chosen here). It ends every `plan_changed` raised after the comparison, in place of §5.4's and §9.5's `run 'farcast … --plan' again`.
+- **The suffix.** `consentSuffix` follows each non-interactive `pass --yes …` clause: `connect.go:489`, `redeploy.go:285`, `fatline.go:933` (`confirmBuild`), `kernel.go:543` and `:548`, `storagedeploy.go:324`, `storagepin.go:445` (`confirmLower`), `storagekey.go:434`, `run.go:850` and `build.go:284`. Each part adds it only for the commands it wires.
+- **Usage.** The eleven `Usage` texts gain `[--plan | --confirm <digest>]` and say what `--yes` never covers.
+- **Tests:**
+  - `TestConsentAnswersAreExclusive`: a table over `writeCommands()` (`writecommands_test.go:102-122`) through `run()`. Every pair and the triple drawn from {`--plan`, `--confirm <d>`, `--yes`}, each repeated with `-y` for `--yes`, gives exit 2, the pinned text, an empty stdout under `-o json`, and a byte-identical config directory. `--yes -y` together is one answer, since both bind one bool. `--yes=false --plan` is a plan.
+  - `TestConfirmRefusesAMalformedDigest`: `--confirm=`, `--confirm ''`, uppercase hex and 63 hex each give exit 2, the malformed-digest text, and nothing read. `--confirm '' --yes` gives the three-way text: the count is checked before the digest.
+  - `TestAPlanFlagIsNeverIgnored` (chosen here): for every `writeCommands()` row whose fresh `FlagSet` defines `plan`, `--plan --yes` gives the three-way usage error with `config.ObserveReads` empty, so `consent.mode` runs before the record is read. It runs in every part, over the commands wired so far.
+  - `TestNonInteractiveRefusalsNameThePlan`: every gate's text above ends its `--yes` clause with the suffix.
+- **Mutation rows** 74a and 74e.
+
+**A23-17 (§9.6; C1, M5, L1.1–L1.4, L2.20, L5.16): the confirm line.**
+- **`Env`** (`env.go:12-22`) gains `Argv []string` (`args[1:]` verbatim, global flags included) and `Flags *flag.FlagSet` (the command's `cfs`). Both are set at `cli.go:158`.
+- **`confirmLine(env *Env, digest string) string`:**
+  - the root-flag prefix, up to the command name, is kept verbatim;
+  - each later token is classified with `env.Flags.Lookup`, `IsBoolFlag`, and the one-token `--` rule of `parseInterspersed` (`cli.go:188-206`);
+  - every token that sets `plan` or `confirm` is dropped, in any spelling (`-plan`, `--plan`, `--plan=<bool>`, `--confirm <v>`, `--confirm=<v>`), with `confirm`'s value token;
+  - every other token is kept, and `--confirm <digest>` is appended.
+
+  So `run --confirm <F>`'s line for D carries D's digest only.
+- **`shellWord(s string) string`**: bare when `s` matches `^[A-Za-z0-9_@%+=:,./-]+$`; otherwise single-quoted, with `'` written `'\''`.
+- **The fallback.** When `Argv` is nil (every direct `Run` in tests) or any token fails `output.Printable`, the line is `To do exactly this: run the same command with --confirm <digest>` (chosen here).
+- **Pinned by** `TestTheConfirmLineRunsTheSameCommand`. It shell-splits the printed line and feeds it to `run()`. Its cases: `--plan` in every spelling; `--source --plan`; `-- --plan`; a global `--config` before the command; a path with a space and a quote; `run --confirm <F>`; an unprintable token, which gives the fallback. Mutation row 81d.
+
+**A23-18 (§9.2, §9.4 Blocked column; C3, C4, L1.6, L1.7, L3.9, L3.16, L4.15, L5.12): blocks, one rule.**
+- **Raised as errors before any plan is computed, in every mode:**
+  - usage errors;
+  - the precheck (A23-10);
+  - the record's load and `recordNamed`;
+  - the no-reader refusal (A23-21);
+  - the ADC refusal and the missing-registry refusal (A23-24);
+  - D1's refusal (A23-5);
+  - `checkedReader`'s refusals in `reader grant`'s `loadReaderRecord` (`readerinit.go:226`);
+  - any error a plan builder meets while it computes, such as an image decision's error.
+- **Blocks are exactly these** (none other), each `plan.Block{Kind: kindOf(classified(err)), Message: err.Error()}`, with today's text, and the kubectl hint where A20-17 keeps one until M2.7:
+  - `kernel deploy`: requested namespaces that do not exist (`kernel.go:254-259`), `internal`;
+  - `reader grant`: no reader, no key id (`grantableReader`, `readergrant.go:325-334`), and a reader that is not the derived one (`readerSubject`), each `credential_missing`;
+  - `storage deploy`: a keyring behind the pin (`storagedeploy.go:166-173`), `internal`;
+  - `storage key pin`: a keyring behind the pin without `--replace` (`storagepin.go:380-382`), `internal`;
+  - `decidePin`'s two refusals, a pin the keyring itself fails and an oversize pin (`storagepin.go:208-216`), each `internal`. They are blocks for `storage key pin` and `storage deploy`, which refuse on them today, and, under `--plan` and `--confirm` only, for `storage key rotate` (either pin) and `run` D. Interactive and `--yes` runs of those two keep going on without the pin as today (rotate's `NOT written` line; `run`'s warning, `run.go:584-586`);
+  - `storage key rotate`: a keyring missing a key the pin requires (`storagekey.go:478-481`), `internal`;
+  - `run`'s fetch stage F: `requireKernel` (`run.go:177`), `refuseSharedAppScope` (`:182-188`) and `refuseOtherRepository` for `--namespace` (`:195`). `deployableNamespace(--namespace)` (`:191`) and `repoURL` stay usage errors. The missing registry (`:171`) stays a pre-plan error, as A23-24 has it for the others;
+  - `run`'s deploy stage D: a manifest that does not parse (`:238`), the manifest's name not deployable (`:251`), `refuseOtherRepository` after the read (`:255`), an unmetered target namespace (§5.4's text, `forbidden`), and no CA key while storage is wired (A23-47);
+  - `connect`, `redeploy`, `build`, `kernel meter` and `kernel confirm` have none.
+- **Computation stops at the first block.** Facts are `[]`, and nothing more is read, Google included. `Target` and `Options` are still bound.
+- **Pinned by** `TestBlockKindsAreErrorKinds` (every `Block.Kind` produced is in `errorKinds`) and `TestKernelDeployPlanBlocksAMissingNamespace` (facts `[]`, no `Resolve` after the block). Mutation rows 74b and 74c.
+
+**A23-19 (L3.5): a recomputation that refuses.** Under `--confirm`, an error met while recomputing is returned as it is, before the digest is compared, with nothing written. That covers a usage error from recomputed values (`kernel confirm`'s window outside the period, `kernelconfirm.go:136-140`, or an overlap, `:251-255`) and a read failure. `plan_changed` belongs only to the digest comparison and to the checks after it.
+
+**A23-20 (§2.6, §7.3; C6, C22 in part, L3.1, L4.5, L4.6, L5.6, L6.3, refuted 2): the reader seams.**
+- **`openReader`.** Beside `openWriter` (`fatline.go:71-74`): `func openReader(r clusterRef) (*cluster.Client, error)`, which sets `r.Identity, r.Verifying = kube.Reader, false` and calls `openCluster`.
+- **One seam per reader-identity plan**, defaulting to `openReader`, never to `openWriter`, whose interface holds only that plan's reads (names chosen here):
+  - `kernelDeployCommand.newPlanReader func(clusterRef) (kernelPlanReader, error)`, with `type kernelPlanReader interface { Namespaces(ctx context.Context) ([]string, error); preflighter }`. `existingNamespaces` (`kernel.go:163`) takes `interface{ Namespaces(context.Context) ([]string, error) }`;
+  - `storageDeployCommand.newPlanReader`, `keyPinCommand.newPlanReader` and `keyRotateCommand.newPlanReader`, each `func(clusterRef) (pinPlanReader, error)`, with `type pinPlanReader interface { ConfigMapData(ctx context.Context, namespace, name string) (map[string]string, string, bool, error); preflighter }`. `readPin` (`storagepin.go:150`) takes a `pinPlanReader`;
+  - `runCommand.newPlanReader func(clusterRef) (runPlanReader, error)`, with `type runPlanReader interface` holding `NamespaceUID`, `Namespaces`, `ConfigMapData`, `ConfigMapValue`, `JobState`, `WaitJob`, `JobLogs` and `DeploymentState`. This meets C22's "run's default seam honours `Identity`" with a separate seam; `run`'s `newCluster` stays the writer.
+- **Interactive and `--yes` runs** pass the writer they opened as the plan's reader, so they read as the writer (§7.3): the cluster client, or, for the three storage commands, their `pinStore`. `*cluster.Client` satisfies every interface above.
+- **`pinStore`** (`storagepin.go:47-51`) embeds `pinPlanReader`, so the writer's `NamespaceUID` is reachable through it. `_ pinStore = (*cluster.Client)(nil)` still holds.
+- **`pinStoreFor`** (`fatline.go:114-122`) refuses a ref whose `Identity` is not `kube.Writer`, with `cli: the key pin is written only as the instance's writer` (internal, chosen here). No plan calls it.
+- **Test fakes** record the `clusterRef.Identity` they were opened with. The storage plan-reader fake is a read-only view of the same per-instance `fakePinStore`.
+- Mutation row 85c.
+
+**A23-21 (§7.3, §9.4 run's refusal; C7, L3.20, L4.22, L4.23, L6.5, L6.17): the no-reader refusal.**
+- **The check.** `requireGrantedReader(dir config.Dir, meta *config.InstanceMetadata, command string, m consentMode) error`, in `consent.go`. Under `--plan` and `--confirm`, every reader-identity plan calls it before its reader seam, and before `credentials.yaml` or any provider is opened.
+  - When `readerStateOf` (`instances.go:138`) is `granted`, it returns nil, and `openCluster`'s own refusals stand (a non-derived email, an unsafe record, an unreadable `reader.key`, all `credential_missing`).
+  - An error from `readerStateOf` is returned as it is.
+- **The text.** Otherwise it is `refuse(errCredentialMissing, …)` of `'farcast %s %s' reads the cluster as instance %q's reader, whose state is %s; %s, or run the command in a terminal`:
+  - the first `%s` is `Bound.Command`, the second `--plan` or `--confirm`;
+  - the state is printed with spaces, as `instances` prints it: `none`, `key missing`, `not uploaded`, `not granted`;
+  - the remedy depends on the state (texts chosen here, from `readerCredential`'s, `clusterref.go:194-226`, and A19-8's):
+    - none: `run 'farcast reader init %s', the printed Cloud Shell script, 'farcast reader record' and 'farcast reader grant'`;
+    - key missing: `copy reader.key from the machine that made it, or run 'farcast reader init %s --rotate'`;
+    - not uploaded: `run the printed Cloud Shell script, then 'farcast reader record %s --key-id <id>' and 'farcast reader grant %s'`;
+    - not granted: `run 'farcast reader grant %s'`.
+- **`run --confirm`, both forms,** uses §9.4's own text with the same state words and remedy: `'farcast run --confirm' computes the deploy plan as instance %q's reader, whose state is %s; %s, or run 'farcast run' in a terminal. Nothing was written.` It is checked right after F is computed, and after F's comparison when that matches, before any client opens.
+- **`storage key rotate`** needs it only when its plan reads the cluster (A23-45).
+- **`TestPlanWithoutAReaderIsRefused`** (row 85):
+  - for each reader plan, one row per state (none, key missing, not uploaded, not granted), each giving `credential_missing`, the exact text, zero kubetest requests, no `credentials.yaml` in `ObserveReads`, and the provider never opened;
+  - a granted reader with a non-derived email gives `openCluster`'s text;
+  - `run --confirm <F>`: run's text, the stand-in kubectl never ran, zero requests;
+  - `run --confirm <D>`: run's text, zero requests.
+- Mutation rows 85a and 85b.
+
+**A23-22 (A20-9; C5, L1.9, L3.2, L5.7): reader-phase errors are not the installer's.**
+- `clusterref.go` gains `type readerPhaseError struct{ err error }`, whose `Error` and `Unwrap` are `err`'s, and `func readerPhase(err error, name string) error`. For a non-nil `err`, that is `&readerPhaseError{readerRefused(err, name)}`. For `run` D's reads in the target namespace, `namespaceRefused(err, name, ns, meta)` takes `readerRefused`'s place.
+- `writerRefused` (`clusterref.go:282-290`) returns `err` unchanged when `errors.As` finds a `*readerPhaseError`.
+- Every error a plan's reader reads return, under `--plan` and in `--confirm`'s recomputation, is wrapped by `readerPhase` once. In interactive and `--yes` runs the reader is the writer, nothing is wrapped, and `writerRefused` applies as today.
+- **Pinned by** `TestPlanReadErrorsNameTheReader`: `kernel deploy --plan` and `run --confirm <D>` answered with an RBAC 403 carry `run 'farcast reader grant <instance>'` once, never `installer service account`, kind `forbidden`. Mutation row 76e.
+
+**A23-23 (§9.2, A20-10, A20-11, A21-2; C16, L3.10, L4.13, L6.13): the writer after the comparison.**
+
+Under `--confirm`, right after the digest comparison and the block check, and before any mint, Google write, push, keyring save or record save:
+1. The writer opens through the command's existing writing seam.
+2. Every command that applies runs `applyReady`; `storage key pin` and `rotate` do not.
+3. `preflightUID(ctx context.Context, cl preflighter) (string, error)` reads `farcast-system`'s uid as the writer (`preflightNamespace`, `fatline.go:59-64`, becomes a wrapper that discards it). It runs in `connect` (first deploy and resume), `redeploy`, `build`, `run`, `kernel deploy`, `storage deploy`, `storage key pin`, and `storage key rotate` with a keyholder.
+   - In a plan whose `cluster_identity` is `reader`, the uid must equal `Target.SystemNamespaceUID`. Otherwise (text chosen here, kind `plan_changed`): `instance %q's cluster is not the one its plan read: farcast-system's uid is %s, not %s; nothing was written; ` + `msgPlanAgain`, with `""` printed `absent`.
+   - In a `none` plan the uid is discarded, as A20-11's preflight is today.
+   - `kernel meter`, `kernel confirm` and `reader grant` make no preflight, as today (A20-18).
+4. `storage deploy`, `storage key pin` and `storage key rotate` read the pin as the writer and require the plan's pin `write` fact's `resource_version` (`""` for an absent pin). When the plan carries no pin write, the writer's read must show a present, valid pin `Equal` to the plan's `pin` fact. Otherwise they refuse with A23-42's pin text.
+
+`--plan` opens no writer and runs neither `applyReady` nor a preflight. A `--plan` on a machine without kubectl therefore succeeds, and its `--confirm` refuses after the comparison, having only read. A plan does not bind kubectl's presence.
+
+Interactive and `--yes` runs keep M2.5's order (open, `applyReady`, preflight, then everything else), and row 71b's tests still hold.
+
+**Pinned by:**
+- `TestConfirmChecksTheWritersClusterIsThePlans`: `kernel deploy --confirm`, where the reader seam answers uid `u1` and the writer's kubetest `u2`, gives `plan_changed`, and the stand-in never ran.
+- `TestConfirmChecksTheWriterBeforeAnythingIrreversible`:
+  - `storage deploy --confirm` with the writer refused, or with the pin's resourceVersion moved after the comparison, leaves no bucket, keyring, registry ensure or push, and no record change;
+  - `rotate --confirm` leaves `keys.yaml` unchanged and opens no tunnel.
+- `--confirm` rows in `TestWritersRefuseAnADCInstanceBeforeAnythingCosts` (`writecommands_test.go:646`): for `connect` (first deploy, resume), `redeploy`, `kernel deploy` and `storage deploy`, the ADC record is refused before any plan, by `planRegistry`'s blank-key check, with the provider never opened. For the others it is refused after the comparison, at the writer's open. In every row nothing is minted, ensured or pushed.
+- `--confirm` rows in `TestCommandsThatApplyRefuseAMachineThatCannotApply` (`:987`): each refuses after the comparison, before any mint, ensure or push.
+
+Mutation rows 76c and 76d.
+
+**A23-24 (§7.3, §9.4 "Plans never write"; C8, C9, C19, L2.1, L2.10, L2.14, L3.3, L5.9, L6.2, L6.4, L6.18): Google reads in plans.**
+- **`planRegistry`.** `planRegistry(ctx context.Context, env *Env, name string, meta *config.InstanceMetadata) (*registryAccess, error)` sits beside `ensureRegistry` (`fatline.go:460-516`). In order:
+  1. With no prefix recorded, it refuses (text chosen here, after `run.go:171`'s): `instance %q has no image registry recorded; run 'farcast connect %s' interactively or with --yes, which ensures it`.
+  2. It reads the installer key through `loadInstallerKey(dir config.Dir, name string) (*config.InstanceCredentials, error)`, a new helper that `writerCredential` (`clusterref.go:164-191`) also calls, so the missing, unreadable, unparsable and blank-key (ADC) refusals are one text, each `errCredentialMissing`. A blank key is refused before the provider opens.
+  3. It opens the provider, asserts `RegistryProvider`, and builds the access from `meta.Registry` (`registryRefFor`).
+
+  It never calls `EnsureRegistry`, `recordRegistry` or `SaveInstanceMetadata`.
+- **Every mode's `plan()` uses it:** `connect` (first deploy and resume), `redeploy`, `kernel deploy` and `storage deploy`. `kernel deploy` and `storage deploy` call it in every plan, rule 1 included, as they ensure unconditionally today (`kernel.go:324-327`, `storagedeploy.go:220-223`); `connect` and `redeploy` need it for Shrike whatever `--fatline-image` names. So a rule-1 plan with no prefix recorded refuses with step 1's text. The exception: an interactive or `--yes` run with no registry recorded first runs `ensureRegistry` (today's idempotent create-and-record), its failure handled as today (`connect.go:278-291`, `redeploy.go:185-192`), and then plans. So a first `connect` after a failed install ensure still works outside `--plan`.
+- **The ensure is a realize step** after consent in every mode. If its prefix differs from the planned one, the command refuses before any push: `instance %q's image registry is now %s, not the %s this command planned with; the registry was ensured, and nothing was pushed or deployed` (chosen here). The kind is `plan_changed` under `--confirm` (with `msgPlanAgain` appended) and `internal` otherwise.
+- **A realize-step ensure that fails** after consent refuses the command before any push or apply, with the ensure's error and kind and `nothing was pushed or deployed`. It never drops an image the consented plan listed. Only a plan computed with no registry access (an interactive or `--yes` break-glass, A23-5) deploys FatLine alone, printing today's two lines.
+- **The cloud facts** state the ensure unconditionally, then the pushes:
+  - `cloud{artifactregistry, create_repository, <repository>}`, then `cloud{artifactregistry, set_pull_grant, <repository>}` (the target is the repository until M2.8 fetches the project number), then one `push_image` per decision that pushes or builds;
+  - `storage deploy` adds `create_bucket` only when `meta.Storage.Bucket` is `""`;
+  - a reconnect carries the two ensure facts only.
+- **§7.3's Google-read scope.** The table's "(registry, buckets, IAM state)" reads "(the registry)" in M2.6. M2.8 adds the bucket and IAM reads.
+- **`TestPlansStillReadTheInstallerKeyForGoogle`'s groups** (C19):
+  - read: `connect` first deploy and resume, `redeploy`, `kernel deploy`, `storage deploy`, from a release farcast (`asRelease`) with no image flag, and `kernel deploy` and `storage deploy` with their image flag;
+  - not read: `kernel meter`, `kernel confirm`, `storage key pin`, `storage key rotate`, `reader grant`, `run` (both stages), `build` and `connect`'s reconnect, and none other;
+  - an ADC-record row gives `credential_missing`, with the provider opener never called.
+
+  M2.8 moves `run` and `build` into the read group. M3b flips the read group.
+- **Pinned also by** `TestPlanNeedsARecordedRegistry` and `TestConfirmRefusesAMovedRegistry`. Mutation rows 73a, 73b and 75b.
+
+**A23-25 (§9.2 "no mint"; C27, M6, L3.19, L6.9, L4.8): what a plan may mint and open.**
+- **"No mint"** means: no secret material, key or credential is minted, and no keyring entry is made. A plan does mint in-memory access tokens for its own reads: the reader's cluster token (reader plans) and the installer's registry token (plans that read the registry). Neither is saved.
+- **The keyring.** A plan opens `keys.yaml` (`keyringOf`) for key ids and `Created` times only (`storage deploy`, `storage key pin`, `rotate`, `run` F for `refuseSharedAppScope` when a keyholder is deployed, `run.go:182-188`, and `run` D). No key byte reaches a fact, a placeholder, a notice or stderr. No narrower loader is added in M2.6.
+- **Keys a plan never opens:** `ca.key` and any server key. It reads the CA certificate through `LoadInstanceCACert` (`config/instance.go:1088`), and presence through `InstanceMTLSExists` (`:1047`) and `InstanceCAKeyExists` (A23-47).
+- **Pinned by** `TestPlansCarryNoKeyMaterial`. It runs the `rotate`, `storage key pin`, `storage deploy`, `run` F (with a keyholder deployed) and `run` D plans against a fixture keyring:
+  - neither the JSON nor the human text holds any key's material, in base64, base64url or hex;
+  - `config.ObserveReads` lists no `ca.key`, `server.key` or keyholder key.
+
+  Mutation rows 91e and 91g.
+
+**A23-26 (§9.4 notice, §9.6; M11, L3.15, L2 change 5): notices.**
+- **Under `--plan`**, every line today's code prints in mid-computation becomes a `notice` fact and is not also printed. These are:
+  - `keepingNote` (`fatline.go:814`), `replacingNote` (`:837`), the development-rebuild line, the foreign-tag warning, provenance-ignored (`:781`);
+  - `kernel.go:279`, `:309` and `:312`;
+  - `rotationScopeWarning` (`storagekey.go:431`);
+  - `meteredReader`'s warning (`readerrbac.go:250`), which a new `meteredReaderNote(env *Env, name string, meta *config.InstanceMetadata) (email, warning string)` returns to its callers instead of printing it. `meteredReader` stays, as a wrapper that prints the warning, for the callers not yet moved (`kernel.go:336` until M2.6c, `run.go:732` until M2.6d), and goes in M2.6d with `readergrant_test.go:381` moved to the note;
+  - "Nothing to confirm" and "Already metering".
+- **In interactive, `--yes` and `--confirm` runs** they print once, from `prepared`, in today's words: before the prompt, or, under `--confirm`, right after the comparison.
+- **Exceptions:**
+  - the bucket-grant lines (`writeBucketGrant`, `storagedeploy.go:293`) print after the bucket exists, with its real name, as today;
+  - the progress lines (`fatline.go:669`, `:689`) and their `isInteractive` check move to realize;
+  - the break-glass lines print only outside plans (A23-5).
+- **Pinned by** `TestPlanPrintsNoticesOnlyAsFacts`: under `--plan`, stderr holds no notice text, in rows for `keepingNote`, `rotationScopeWarning` and `meteredReader`'s warning. Mutation row 91a.
+
+**A23-27 (§9.6; C25, L1.11, L1.20, L6.15): the rendering, in `planhuman.go`.**
+- **`planResult`** embeds `plan.Document`, so its JSON is exactly the document, and also holds the typed `Bound` and the confirm line. Those extra fields are named so they shadow nothing (for example `typed plan.Bound`, `confirm string`; `Document` carries `Bound json.RawMessage`, §9.3) and are tagged `json:"-"`. `TestPlanDocumentCarriesTheBytesItsDigestCovers` runs on `planResult`'s printed JSON.
+- **Order:**
+  1. blocks, each `blocked (<kind>): <output.ErrorText(message)>`;
+  2. §9.6's four header lines;
+  3. hoisted irreversible facts (none in M2.6);
+  4. the facts in bound order;
+  5. `digest: …`;
+  6. the confirm line, or A23-7's blocked line.
+- **Header.**
+  - The uid prints `not read` when `cluster_identity` is `none`, `absent` for a reader plan whose uid is `""` (`farcast-system` not yet made), and the uid otherwise.
+  - Options print as `--<flag>=<value>`, and as `--<flag> (not given)` when the value is `""`.
+- **Values.** Money prints as `<currency> %d.%02d` from cents, exactly. The cost prompts (`connect.go:484-498`, `kernel.go:531-558`, `storagedeploy.go:319-336`) become string builders that take cents, shared by the prompts and the rendering. Every rendered value passes through `terminalText` (`print.go:43`). A placeholder key id prints as `new key <n> of <scope>`.
+- **Tests:**
+  - `TestEveryBoundFactIsRendered` (rows 81, 81a): each fact type's sample has a distinct printable sentinel per field, and a map from JSON path to expected text (cents as `%d.%02d`, booleans as words, stage `""` as `-`). Exemptions: the `sha256` fields and the placeholders. A reflect walk requires an entry or an exemption for every path. A `go/parser` scan of `plan/*.go` for `FactType` methods requires a row for every type.
+  - `TestPlanRenderingQuotesHostileText`: an ESC or a bidi override in an app's reason, a host or a record field prints Go-quoted.
+- Mutation rows 81b and 81c.
+
+**A23-28 (§9.4 Options; C25, L1.14, L3.21): what an option binds.**
+- `Option.Value` is the parsed flag's `Value.String()`, with these exceptions:
+  - `kernel deploy`'s `--adapt`, `--adapt-cooldown` and `--interval`, when not given, bind `""`; their effective values are in `kernel_settings`;
+  - `kernel confirm`'s `--amount` binds `strconv.FormatFloat(amount, 'f', -1, 64)`;
+  - `--from` and `--to` bind the resolved dates (`2006-01-02`).
+- Never bound: `plan`, `confirm`, `yes`, `y`, `o`, `config` and `verbose`.
+- **Pinned by** `TestEveryBehaviourFlagIsBound`: for each in-scope command, `VisitAll` over a fresh `FlagSet` from the leaf command's `SetFlags` (the `writeCommands()` row's `cmd()`), minus `plan`, `confirm`, `yes` and `y`, equals the bound flags.
+
+**A23-29 (§9.3, §10.4; C17 in part, L1.17, L1.18, L3.6, L6.14): clock, stamp and vectors.**
+- **The stamp.** `var planStamp = func() plan.Stamp`, built from `currentStamp()` (`worlddoc.go:103-106`), in `consent.go`.
+- **The clock.** The six deployer commands use `fatlineDeployer.now` (`fatline.go:228`); `kernel confirm` uses `c.deployer.now()` at `kernelconfirm.go:113` in place of `time.Now()`. `run`, `build`, `storage key pin`, `rotate` and `reader grant` gain `now func() time.Time` where they lack one (default `time.Now`). `Document.GeneratedAt` is `plan.Time(now())`.
+- **Plan vectors** come from the commands through their seams and fakes, never through kubetest. They use:
+  - the atlas fixture's record (`vectorMeta`, `worldvectors_test.go:118-155`);
+  - reader seams answering the uid `00000000-0000-4000-8000-000000000026` (chosen here);
+  - `planStamp = func() plan.Stamp { return plan.Stamp(vectorStamp) }` and the clock `vectorNow` (`vectorStamp` and `vectorNow` at `worldvectors_test.go:38-39`; `buildStamp` and `plan.Stamp` share their fields, so the conversion is legal).
+
+  kubetest serves only the identity and RBAC tests.
+- **`error_plan_changed.json`** is produced by running `kernel confirm` directly, with these seams and `--confirm sha256:` followed by 64 zeros, and printing with `env.Printer.PrintError(classified(err), exitCodeOf(err))`, as `cli.go:169-178` does.
+- **Tests.** `TestPlanVectors` runs a `planVectors()` table; `TestPlanErrorVectors` writes the error vector. `TestEveryVectorFileIsProduced`'s directory list (`kindsvector_test.go:44`) gains `plan` in M2.6a, with its first files, since a missing directory is fatal. Each part adds its own files to `produced`.
+
+### Placeholders, and what may differ
+
+**A23-30 (§9.4 Placeholders; C10, C18 in part, L2.2, L2.17, L4.19, L5.1): the placeholder strings.**
+- **Secret material**, as `farcast-placeholder:<what>:<subject>:cert` and `…:key`:
+  - a CA the command would mint: `farcast-placeholder:instance_ca:<instance>:cert` (the CA key is rendered nowhere);
+  - FatLine's server leaf: `farcast-placeholder:fatline_leaf:<server name>:cert` and `:key`;
+  - the keyholder's leaf: `farcast-placeholder:keyholder_leaf:<keyholder server name>:cert` and `:key`;
+  - an application leaf: `farcast-placeholder:app_leaf:<ns>/<app>:cert` and `:key`;
+  - an egress credential: `farcast-placeholder:egress_credential:<ns>/<app>`.
+- **Loaded material.** A plan renders a placeholder for every leaf and key it would mint, and for every leaf and key it would load (`redeploy`, `connect`'s resume, `storage deploy`), so it never opens a key (A23-25). An existing CA certificate is rendered as itself, read through `LoadInstanceCACert`; only a CA the command would mint is a placeholder.
+- **Build digests.**
+  - A system component built from source renders as `<repo>@sha256:` followed by hex(SHA-256(`farcast-placeholder:build:<component>`)).
+  - A `run` application renders as `<destination without its tag>@sha256:` followed by hex(SHA-256(`farcast-placeholder:build:<ns>/<app>`)).
+  - The `image` or `build` fact's `target` and its `push_image` cloud fact carry the same string. `tcdeploy.Render`, `dsdeploy.Render` and `translate.Render` accept it, because it is digest-shaped.
+- **The bucket:** `farcast-placeholder:bucket:<instance>` (A23-12), in the `create_bucket` fact, the bucket-grant notice and the planned render.
+- **Key ids:** A23-32.
+
+**A23-31 (§9.4's list; C10, C11, C12, L5.2): what may differ, replaced.** Between the placeholder rendering and the real one, exactly these may differ:
+1. a Secret's `data` values;
+2. the pod template annotation `farcast.sofmon.com/mtls-hash`;
+3. the key ids in `datasphered-pin`'s data (16 hex each; the arrays keep their lengths);
+4. the 64 hex after `@sha256:` in an image reference whose fact is a build (`build_source`, `build_development`, or a `run` application's build);
+5. in `fatline-egress-policy`, the `credential_sha256` values of this deployment's applications (64 hex each; `fatline/policy/policy.go:56-59`, `runpolicy.go:55-56`);
+6. on a first `storage deploy`, the bucket name in the keyholder StatefulSet's `--bucket=` argument.
+
+`TestConfirmWritesThePlannedDocumentsExceptTheirSecrets` masks exactly these six and requires the rest to be byte-equal. It reads the applied streams from the succeeding stand-in kubectl (A23-49), and the pin's body from kubetest. Row 80's mutation stands.
+
+**A23-32 (§9.4 key ids; C14, L4.3, L4.4, L4.18, refuted 6): key-id placeholders, and the clock.**
+- **datasphere is unchanged.** In `cli` (`storagepin.go`):
+  - `type scopeKEKs struct{ Name string; KEKs []datasphere.KeyEntry }`, active first;
+  - `kekLists(k datasphere.Keyring) []scopeKEKs`;
+  - `pinOfKEKs(lists []scopeKEKs) dskeyholder.Pin`, `heldOf(lists []scopeKEKs) map[string][]string` and `verdictOf(cur dskeyholder.Pin, lists []scopeKEKs) *pinBehind`.
+
+  `pinFor` (`:78-94`), `heldKeys` (`storagekeyholder.go:1731`) and `pinVerdict` (`storagepin.go:117`) become adapters over `kekLists`, with their rules unchanged.
+- **`placeholderKeyID(scope string, n int) datasphere.KeyID`** is the first 8 bytes of SHA-256(`farcast-placeholder:key:<scope>:<n>`), with `n` counted from 1 per scope, over key-encryption keys only.
+- **The instance key space's new key** never reaches a pin (`pinFor` skips it), so it gets only `mint{key, ""}`, rendered `a new key for the instance key space`.
+- **`placeholderEntry(scope string, n int, list []datasphere.KeyEntry) datasphere.KeyEntry`** has the placeholder id, and a `Created` one second after the newest in `list` (`time.Unix(0, 0).UTC()` for an empty list). The plan prepends it to that scope's list.
+- **Under `--confirm`** (`rotate`, and `run` D's new scopes), before minting:
+  - the command waits, on its own clock, until the current second is strictly after the newest `Created` in every scope it mints into, at most 1 s;
+  - with the clock further behind, it refuses: `this machine's clock is behind the newest key in scope %q (%s); nothing was minted` (chosen here, `internal`);
+  - as it mints, it records `map[datasphere.KeyID]datasphere.KeyID` from real ids to placeholders. A pin it would write is compared with the planned one by `Equal` after mapping its ids back.
+- **The `pin` fact.** `lowering` is a `[]string` of the 16-hex ids the current pin requires or retires that the written one does not (`[]` when raising). `repairing` (bool) follows it: true when an unreadable pin is replaced (`storagepin.go:226`).
+- **Pinned by** `TestRotateWaitsForTheClockPastTheNewestKey`, and `TestEveryBoundFactIsRendered`'s two-scope sample (`new key 1 of api`, `new key 1 of web`). Mutation row 79b.
+
+### Facts
+
+**A23-33 (§9.4's fact table; C18, C24, C27, C28 in part, C29, L2.7–L2.9, L2.11, L2.12, L2.15, L2.18, L3.12, L3.13, L3.22, L3.23, L4.19, L4.24, L5.17–L5.19): the fact table, amended.**
+- **`image`.**
+  - `action` gains `recorded` (a toolchain image from `meta.Toolchain`); `named` also covers a toolchain image from its flag. There is no `omitted` (A23-5).
+  - `target` per action: `named` is the flag's reference; `recorded` is the recorded reference; `keep_operator` and `keep_development` are the recorded image; `reuse`, `push` and `push_over_foreign` are `<repo>@<compiled manifest digest>`; `build_source` and `build_development` are A23-30's build placeholder.
+  - A toolchain image binds `go ""`, `current` as `{image: <recorded ref>, origin: "", farcast: "", go: ""}` (null when none is recorded), `replaces_other_version false` and `source null`.
+- **`mint.what`** gains `operator_leaf`: `identity.Mint`'s client leaf, `client.crt`, which is rendered nowhere.
+- **`restart`**, replacing "whenever it carries a mint … it carries a restart":
+  - `fatline` only when `connect` mints over a deployed FatLine (its resume, A23-35);
+  - `datasphered` only when `storage deploy` re-mints the keyholder leaf and `meta.Keyholder.Deployed`;
+  - never on a first deploy, and never for `redeploy`.
+- **`write.force`** is `false` in M2.6 (A23-15).
+- **`cost`.**
+  - `floor_month_cents` and `below_floor` come from the command's own floor: `kernel deploy` uses `floorFull`; `run` uses `floorNow` plus its applications, as its review does; `storage deploy` uses its prompt's; `connect` and `build` use `floorFull(meta).Total`, with `below_floor` as `warnIfBelowFloor`'s condition (`floor.go:132-134`), computed without printing.
+  - `pricing.region` is the rate card's `pricing.Region`, not the instance's.
+- **`kernel_settings`** is `adapt, adapt_cooldown_s, interval_s, namespaces[], reader, reader_bindings_created[]`.
+  - `adapt_cooldown_s` and `interval_s` are the recorded knobs as `metadata.yaml` stores them (0 means the default); the rendering prints the effective values, as the result does.
+  - `reader` is `meteredReader`'s email, or `""`.
+  - `reader_bindings_created` is `readerBindingsFor(reader, the namespaces bound)`.
+- **`meter`** is `add[], remove[], bindings_created[], bindings_left[], reader, reader_bindings_created[], metered_after[]`:
+  - `add` or `remove` holds the arguments in argument order; the other is `[]`;
+  - `bindings_created` is `added`, as `applyMeterChange` returns it;
+  - `bindings_left` is `removedFrom(previous, next)` under `--remove`, and `[]` otherwise;
+  - `reader_bindings_created` is `readerBindingsFor(reader, added)`;
+  - `metered_after` is `next`.
+- **`confirmation`.** `as_of_day` is `dayStart(now)`, and `amount_cents` is `cents(amount)`.
+- **`pin`** is `require[], retired[], lowering[], repairing` (A23-32).
+- **`rotation`.** `new_keys` is 1 plus the number of scopes. `handover_replicas` is `replicaCount(meta)` when the plan reads the cluster and there are scopes, and 0 otherwise.
+- **`run`** gains `fetch_plan_digest` after `job_uid` (A23-47).
+- **`application_reset`** is `namespace, app, state, stopped_by_cost_guard, limit_reached, replicas_live, replicas_after, requests_live{cpu_milli, mem_mib}, requests_after{cpu_milli, mem_mib}`.
+  - `replicas_live` (`*int32`) and `requests_live` (a pointer) are null when `state` is `unknown`.
+  - `stopped_by_cost_guard` is true when the checkpoint's `Stops` (`technocore/kernel/checkpoint.go:102`) names `<ns>/<app>` (A23-48).
+- **`reader`.** `iam_role` comes from `readerIAMRole = "roles/container.clusterViewer"`, and `resources` from `readerResources = []string{"deployments", "statefulsets", "pods", "pods/log", "jobs"}`, both new in `readerrbac.go`. `msgReaderGrantPrompt` (`readergrant.go:51`) uses `readerIAMRole`. `TestReaderResourcesFollowTheRoleRuleOrder` ties `readerResources` to `readerRoleTemplate`'s rules (`readerrbac.go:164-189`).
+
+### Per command
+
+**A23-34 (§9.4 "The image refactor"; L2.13, L2 changes 3–7): the image refactor, behaviour unchanged.**
+- **`imageDecision`** holds: the component, the action, the repository, the target, the tag reference, the carried artifact, the provenance and whether there is one, the previous image, `replacesOther`, the stored skew error, `source{dir, goPath, goVersion}`, the record template and the notices.
+- **Deciding.** `func (d *fatlineDeployer) decideImage(ctx context.Context, env *Env, reg *registryAccess, meta *config.InstanceMetadata) (imageDecision, error)`, and `decideSidecarImage` with the same signature.
+  - They make the registry token mint and `Resolve` calls, and run `findSource`, `checkCarried` and `Lookup`, and a new seam, `fatlineDeployer.findToolchain` (`image.FindToolchain`'s signature, `image/recipe.go:74`).
+  - They never push, prompt, print, call `Layer`, or read `isInteractive`.
+- **Realizing.** `func (d *fatlineDeployer) realizeImage(ctx context.Context, env *Env, reg *registryAccess, dec imageDecision) (resolvedImage, error)` runs `Layer`, `PushEmbedded` and the pushed-reference check, or `BuildAndPush` with `BuiltAt` from `d.now()`. For `named`, `keep_*` and `reuse` it makes no registry call and no second `Resolve`.
+- **Rules to actions:**
+  - rule 1 is `named`; rule 3 is `build_source`; rule 4 found is `keep_operator` or `keep_development`;
+  - rule 4's missing development build is a notice, then rule 6's `build_development`;
+  - rule 5c's NotFound is `push`, an equal tag is `reuse`, and a foreign tag is `push_over_foreign`, with its warning as a notice;
+  - rule 5b sets `replaces_other_version`;
+  - rule 4's missing operator build, rule 2 and a missing `Lookup` stay errors returned by decide.
+- **The skew refusal** (`fatline.go:645-657`) moves to the callers. Interactive and `--yes` runs return the stored `version_skew` error when `replacesOther && !embedded`, before any prompt; `--plan` binds it; `--confirm` executes it (§9.5).
+- **`confirmBuild`** (`fatline.go:927-950`) is called from each command's prompt step with `prepared`'s source, never from decide, and never under `--confirm`. Its `FindToolchain` call moves into decide.
+- **`resolveImage` and `resolveSidecarImage`** stay as decide-then-realize wrappers for `kernel.go:328` and `storagedeploy.go:224`, and go in M2.6c.
+- **Pinned by** a decide/realize table in `systemimages_test.go`: every action against rules 1–6, with decide making 0 pushes and realize 0 `Resolve`s. `systemimages_test.go:704`, `:1106` and `:1111` move to the new calls.
+
+**A23-35 (§9.4 connect rows; C18, M7, L2.7, L2.8): `connect`.**
+- **Three states:**
+  - **first deploy** (`!FatLineDeployed`): `cost`; `image` (fatline); `image` (shrike); `mint`s of `instance_ca`, `fatline_leaf` and `operator_leaf` when `InstanceMTLSExists` is false; `cloud` (A23-24); `write` ×6; `notice`s;
+  - **resume** (`FatLineDeployed && Carrier == nil`, `connect.go:206`): the same facts without `cost` (the bootstrap has no cost gate there, `connect.go:409`). Mints happen only when the material is missing, and then `restart{fatline}` follows;
+  - **reconnect**: the two ensure facts. It never opens a writer.
+- **`decideIdentity`** uses `InstanceMTLSExists`, and for existing material `LoadInstanceCACert` and `RequireP256CA`, never `LoadInstanceMTLS`. Its refusals (`connect.go:363-373`, and the P-256 refusal) stay errors (A23-18).
+- **`realizeIdentity`** runs first after the writer checks, as `ensureIdentity` (`connect.go:358`) runs before the ensure today. It re-checks `InstanceMTLSExists` before `SaveInstanceMTLS`, which overwrites (`config/instance.go:1061`). Material that appeared where the plan said mint refuses (text chosen here): `instance %q's mTLS material appeared after the plan was made, and its plan would mint over it; nothing was written`. The kind is `plan_changed` under `--confirm` (with `msgPlanAgain`), and `internal` otherwise.
+- **`bootstrap`** (`connect.go:407`) executes only from `prepared`: identity, the ensure, the images, the real material rendered, then `Apply`, the record, the rollout, the IP and the carrier, as today.
+- **A reconnect under `--confirm`** ensures after the comparison, then dials and prints the status as today. When the ensure fails, the warning prints, the status prints, and the command exits 1 with `the registry ensure this plan bound did not succeed: %v; the connection status above was read, and nothing else was written` (chosen here). Interactive and `--yes` reconnects keep the warning and exit 0.
+- **Pinned by** `TestConfirmRefusesACAMintedAfterThePlan`, `TestReconnectConfirmFailsWhenItsEnsureFails`, `TestConnectStatusHasNoPlan`, `TestPlansWriteNothing`'s three `connect` rows, and `TestPlanIsDeterministic` (a first deploy with mints, and `--source`). Mutation rows 75a and 91f.
+
+**A23-36 (§9.4 redeploy row; C18, L2.5, L2.6, L2.19): `redeploy`.**
+- **No mint and no restart.** `redeploy` only loads (`redeploy.go:175`). Its facts are `image` ×2, `cloud` (the ensure, then pushes), `write` ×6 rendered over placeholder leaves and the real CA certificate, and `notice`s.
+- **Order.** `ensureRegistry` (`:185`), `resolveImage` (`:194`) and `resolveSidecarImage` (`:202`) become decide steps before the gate (`:212`) and realize steps after it, so pushes come after consent.
+- **`describeRedeploy`** (`redeploy.go:300-309`) gains two source-build cases, whose digest is not yet known (chosen here):
+  - with a previous image: `this replaces the image %q runs: %s → a source build of %s, pushed once it is built`;
+  - with none: `this redeploys %q with a source build of %s; local state does not record what it runs today`.
+
+  The comment at `redeploy.go:208-211` is rewritten.
+- **Pinned by** `TestRedeployAsksBeforeItPushes` (interactive: the fake builder saw no push before the answer).
+
+**A23-37 (§9.4 build row; C19): `build`.**
+- **The plan.** `cluster_identity` is `none`. Facts: `build`; `cost`, with `one_off` from `build`'s own constants (its prompt's vCPU, MiB and deadline), `standing` `[]`, and the floor of A23-33; `image` (builder: `named` or `recorded`); `write` ×3.
+- **Options:** `app`, `builder-image`, `containerfile`, `context`, `git-secret`, `ref`, `repo` and `tag`.
+- **No Google read in M2.6.** `resolveToolchainImage` resolves anonymously (`toolchain.go:85-94`). There is no grant fact until M2.8.
+- **`--confirm`:** compare, then open, `applyReady`, `preflightUID` (discarded), `Apply`, and `WaitJob` as today.
+
+**A23-38 (§9.4 kernel deploy row; C16, L3.1, L3.4, L3.9, L3.25): `kernel deploy`.**
+- **The plan.** It reads as the reader (A23-20): `Namespaces` and `NamespaceUID`. Its facts follow §9.4 with A23-33's `kernel_settings`; its options follow A23-28; its block follows A23-18.
+- **Under `--plan`** there is no `newCluster` (`kernel.go:237`), no `applyReady` (`:244`), no `EnsureRegistry` or its record save (`:324`), and no record saves.
+- **Under `--confirm`**, in order:
+  1. recompute as the reader;
+  2. compare the digest, then check blocks;
+  3. open the writer (`:237`), run `applyReady` (`:244`), and `preflightUID`, which must equal the target's uid;
+  4. realize: the ensure and its record save, then the push or build, with no re-resolve and no build prompt;
+  5. the record, `Apply` (`:385`), `Applied`, and `RolloutStatus`.
+- **`confirmCost`** (`kernel.go:531-558`) prints from `prepared`'s cost fact. Its `isInteractive` read stays outside `plan()`.
+- **Pinned by** `TestKernelDeployPlanCarriesBelowFloorAsAFact` (row 90), `TestKernelDeployPlanBlocksAMissingNamespace`, and the cross-cutting tests' `kernel deploy` rows.
+
+**A23-39 (§9.4 kernel meter row; C29, L3.13–L3.15): `kernel meter`.**
+- **The plan.** `cluster_identity` is `none`. Facts: `meter` (A23-33), then `write` × each document of `meterManifest` (`kernelmeter.go:125`), then `notice`s:
+  - under `--remove`: `the cost guard stops counting %s against the instance's cost limit` (chosen here, `%s` the namespaces joined with `, `);
+  - under `--remove` with `meta.Reader != nil` (`kernelmeter.go:164`'s condition), the three `ReaderBindingMayStay` lines (`kernelmeter.go:326-328`) as one notice;
+  - `meteredReader`'s warning, when there is one;
+  - `Already metering %s.` for the no-op (A23-8).
+- **Under `--plan`:** no open, no `applyReady`, no save and no apply.
+- **Under `--confirm`:** compare before the "Already metering" return; then open, `applyReady`, save, and apply with today's rollback (`kernelmeter.go:151`). Row 71a holds.
+- **Pinned by** `TestKernelMeterPlanNamesReaderBindings` and `TestKernelMeterAndConfirmOpenTheWriterOnlyAfterTheCompare`.
+
+**A23-40 (§9.4 the clock; C17, L3.6, L3.7): `kernel confirm`.**
+- **The clock** is `c.deployer.now()` (A23-29). `AsOf` is `dayStart(now)` on every path, in the record and in the ConfigMap.
+- **`--amount`.** NaN and ±Inf are refused at the existing check (`kernelconfirm.go:109-111`), before the record is touched: `--amount must be a finite number, got %v` (chosen here, a usage error).
+- **The plan.** `cluster_identity` is `none`. Its options follow A23-28. Facts: `confirmation`, then `write` ×1. `RenderConfigMap` moves into `plan()`, before the comparison and the save; today it runs after the save, with no rollback if it fails (`kernelconfirm.go:166-173`). The empty window is A23-8's.
+- **Under `--confirm`:** compare, then open, `applyReady`, save, and `Apply` with today's rollback.
+- **Pinned by:**
+  - `TestPlanIsDeterministic`'s case of two clock readings on one day;
+  - `TestKernelConfirmPlanChangesAcrossUTCMidnight`: a day boundary, and a month boundary whose recomputed window is empty, each `plan_changed`;
+  - `TestKernelConfirmAsOfIsTheUTCDay`;
+  - `TestKernelConfirmRefusesANonFiniteAmount`, with the record unchanged.
+
+  Mutation rows 79a and 90b.
+
+**A23-41 (A17-11, §7.2; C28, L1.23, L3.16, L3.17, L6.10): `reader grant`.**
+- **The `--yes` refusal.** `msgReaderGrantYes` becomes §7.2 step 4's text, with its comma: `reader grant cannot be run with --yes: it gives a Google identity read access to the cluster; confirm it in a terminal, or review 'farcast reader grant %s --plan' and pass --confirm <digest>`. A17-11's text without the comma is replaced.
+  - It is called as `usagef(msgReaderGrantYes, name)`, with `name` printed as `<instance>` when `validateInstanceName` refuses it.
+  - The comment at `readergrant.go:54-55` goes.
+- **`msgReaderGrantTerminal`** is `reader grant needs a terminal to confirm, or --plan and then --confirm <digest>`.
+- **The plan.** `cluster_identity` is `none`. It reads no cluster and no terminal. Facts: `reader`, then `write` × (3 + bound namespaces), from `SplitStream(renderReaderRBAC(…))`. `checkedReader`'s refusals stay pre-plan errors; `grantableReader`'s are blocks with facts `[]` (A23-18).
+- **Under `--plan`,** the terminal check (`:258`) and the opens (`:266-279`) are skipped.
+- **Under `--confirm`**, in order:
+  1. recompute, compare, check blocks;
+  2. `newReader` with `Verifying` (`:266`), `newApplier` (`:273`), `applyReady` (`:277`);
+  3. no prompt; `Apply` (`:292`);
+  4. `verifyRead` (`:297`) and `verifyReadOnly` (`:300`), as the reader;
+  5. the record (`:305-316`).
+- **Pinned by** `TestReaderGrantRefusesYes` (`readergrant_test.go:465`) and `TestReaderGrantNeedsATerminal` (`:494`), which assert the texts exactly; `TestReaderGrantPlanReadsNoClusterAndNeedsNoTerminal`; `TestReaderGrantPlanBlocks`; and `TestReaderGrantConfirmVerifiesAsTheReaderAfterTheCompare`.
+
+**A23-42 (§9.5 "The pin"; L4 change 3, L4.22, L4.27): the pin under `--confirm`.**
+- **`writePin`** (`storagepin.go:186-235`) splits into three:
+  - **`decidePin(cur dskeyholder.Pin, present bool, rv string, invalid error, lists []scopeKEKs, withRetired, replace bool) (pinDecision, error)`**, which is pure. It returns the desired pin, the method (`create`, `replace` or `none`), the rv, `Created` and `Repaired`, or a refusal (`*pinBehind`, the `Admits` failure, an oversize pin).
+  - **`writePinLoop`** is today's three-attempt union loop, for interactive and `--yes` runs.
+  - **`writePinOnce(ctx context.Context, ps pinStore, planned dskeyholder.Pin, rv string) (pinWrite, error)`** renders `RenderPin` at `rv`, and creates when `rv` is `""`, replaces otherwise. On failure it re-reads:
+    - a present, valid pin `Equal` to `planned` counts as success;
+    - otherwise `errors.Is(err, tkube.ErrConflict)` gives `withKind(kindPlanChanged, …)` of `the instance's key pin changed since the plan was made; nothing was written over it; ` + `msgPlanAgain`;
+    - any other error keeps its own kind.
+- **`pinOnDeploy`'s empty-pin branch** follows the once rule under `--confirm`.
+- **`fakePinStore`** (`storagepin_test.go:115-119`) wraps `tkube.ErrConflict` on AlreadyExists and Conflict, as the real client does (A20-7).
+- **Pinned by** `TestConfirmNeverWritesAPinThePlanDidNotList` (row 86), with cases for `key pin`, `storage deploy`, rotate's hold stage, rotate's final pin and `run`; `TestConfirmPinThatLandedButLostItsAnswerSucceeds`; and `TestConfirmPinNon409FailureKeepsItsKind` (a 500 is `cluster_rejected`). Mutation row 86d.
+
+**A23-43 (§9.4 storage deploy row; C12, C16, L4.8, L4.9, L4.16, L4.19, L4.20, L4.25): `storage deploy`.**
+- **Reads.** As the reader: `NamespaceUID` and `readPin`. The keyring through `keyringOf`, for ids only (A23-25). A behind keyring is a block (A23-18).
+- **Facts:**
+  - `cost`, with `max_month_cents`;
+  - `image`;
+  - `cloud`: the ensure, `push_image`, and `create_bucket` when no bucket is recorded;
+  - `mint{keyholder_leaf}`, and `mint{keyring, <instance>}` when no bucket is recorded and `InstanceKeyringExists` is false (`ensureStorage` mints both; with a bucket recorded and no `keys.yaml`, nothing mints a keyring, and `pinOnDeploy` writes the empty pin). A first keyring has no scopes, so it gets no key-id placeholders;
+  - `restart{datasphered}` when `meta.Keyholder.Deployed`;
+  - `pin`, from `decidePin`, or the empty pin with no keyring;
+  - `write` for the pin: `create`, or `replace` at its rv;
+  - `write` ×N: `dsdeploy.Render` with the placeholder leaf, the real CA certificate, and, on a first deploy, the bucket placeholder;
+  - `notice`: `writeBucketGrant`'s text, with the placeholder.
+- **A first deploy's provider and location.** `meta.Storage` is nil until `ensureStorage` runs, and today's render reads `meta.Storage.Provider` and `.Location` (`storagedeploy.go:246-249`), which `mintAndRecord` sets (`storage/storage.go:288-298`). On a first deploy the plan renders them as `mintAndRecord` will record them: an exported `storage.ProviderFor(meta)` (`storageProviderFor`, `storage/storage.go:189`, renamed) and `meta.Region`.
+- **`--plan` writes nothing.** It makes no `ensureStorage`, `ensureRegistry`, push or `IssueKeyholderServer` call, does not load `LoadInstanceMTLS` (`ca.key`), and writes no pin, record or stream.
+- **Under `--confirm`**, in order:
+  1. compare;
+  2. open the writer, run `applyReady` and `preflightUID`, and read the pin at the plan's rv (A23-23);
+  3. `ensureStorage` (`:212`), then the record re-read (`:215`);
+  4. the ensure and `realizeImage`;
+  5. `IssueKeyholderServer` (`:237`);
+  6. `pinOnDeploy`, once;
+  7. the record;
+  8. `Apply` (`:298`).
+- **The record re-read** under `--confirm`: `recordNamed`, and `Keyholder.Deployed` and `Keyholder.Replicas` must equal `prepared`'s. `Storage.Bucket` must equal `prepared`'s, or, when the plan carried `create_bucket`, be non-empty. `Storage.Provider` and `Storage.Location` must equal the planned values. Otherwise it refuses (text chosen here, `plan_changed`): `instance %q's record changed while the command ran (its %s is not what the plan read); the bucket and the keyring were ensured, and nothing else was written; ` + `msgPlanAgain`.
+- **A21-3, qualified.** Under `--confirm` the process opens one reader and one writer and mints one token each. `TestStorageDeployOpensOneWriter` (`writecommands_test.go:1051-1080`) keeps the interactive path.
+- **Pinned by** `TestConfirmRefusesARecordChangedDuringTheCommand`. Mutation row 91d.
+
+**A23-44 (§9.4 storage key pin row; C32, L1.24, L4.16): `storage key pin`.**
+- **The plan.** It reads as the reader: `NamespaceUID` and `readPin`, plus the keyring's ids. Its options are `[{replace, true|false}]`, and its `cluster_identity` is `reader`.
+- **Facts:**
+  - `pin`, from `decidePin(withRetired=true, replace=false)`; when that returns `*pinBehind` and `--replace` is given, from `decidePin(withRetired=true, replace=true)`, with `lowering` the behind ids (`behind.Missing`, then `behind.RetiredActive`: `storagepin.go:377-393`'s order). Without `--replace` the `*pinBehind` is the block of A23-18. So `--replace` on a keyring that is not behind writes the union, as interactive runs do;
+  - `write` for the pin, only when the pin changes;
+  - `notice`s:
+    - with `--replace` and a lowering, the warning at `storagepin.go:384-386`, as one notice;
+    - always, chosen here: `the pin is handed to the keyholder replicas that are serving; which replicas answer is decided when the command runs, outside this plan`;
+    - with `--replace`, A23-3's notice.
+- **Under `--confirm`:** compare; the writer checks of A23-23; `writePinOnce`; then `raisePins`. With `--replace`, it lowers replicas without `confirmLower` (A23-3).
+- **Interactive and `--yes` runs** keep the loop and `confirmLower`.
+- **Pinned by** `TestPlanIsDeterministic`'s `key pin --replace` case on a keyring that is not behind: the planned pin and the pin `--confirm` writes are the union with the current pin, as an interactive `--replace` writes, and `lowering` is `[]`.
+
+**A23-45 (§9.3 ClusterIdentity, §9.4 rotate row; C13, C15, L4.1, L4.2, L4.10–L4.12, L4.16, L4.20, L4.21): `storage key rotate`.**
+- **`cluster_identity`** is `reader` when the record loads and `pinMeta(meta)` (`storagepin.go:530`) holds, and `none` otherwise, with no reader and no uid. §9.3's "a constant per command" becomes: fixed per command and state, and bound.
+- **`--plan` and `--confirm` need a readable record**, from which `Target` is bound. A record that cannot be loaded gives today's `load instance %q: %w`. Interactive and `--yes` runs still rotate without one.
+- **Facts, with a keyholder:**
+  - `rotation`;
+  - `mint{key, ""}` (the instance key space) and `mint{key, <scope>}` per scope;
+  - `pin` and `write` for the hold stage: `create` or `replace` at the read rv; `require` is the union with the current pin, and `retired` is the current pin's;
+  - `pin` and `write` for the final pin: `replace`, with `resource_version` `""`, rendered `the version the hold-stage write produced`; `require` and `retired` are taken over the planned hold-stage pin;
+  - `notice`s: `rotationScopeWarning`, and (chosen here) `which keyholder replicas take the new keys is decided when the rotation runs, outside this plan`.
+
+  Without a keyholder: `rotation`, the mints and `rotationScopeWarning`.
+- **Going on without the pin** (A20-10, A21-7) is for interactive and `--yes` runs only. Under `--plan`, a reader refusal or a failed pin read fails the plan: it is kinded and prints no document.
+- **Under `--confirm`:**
+  1. compare;
+  2. the writer checks of A23-23;
+  3. the clock wait (A23-32);
+  4. mint, recording the real-to-placeholder ids;
+  5. in `beforeActivate` (`storagekey.go:587-596`), the hold-stage write with `writePinOnce`, made only when the pin, with its ids mapped back, `Equal`s the planned hold pin. A `plan_changed` there sets `Cause` to `heldChanged`: the keys are held and not activated, never with `heldUnrecorded`'s text. Today `handOverKeys` keeps only a `Cause` and a `Reason` string (`storagekeyholder.go:1070-1083`), so:
+     - `rotate` keeps `beforeActivate`'s `plan_changed` error in a variable it owns;
+     - `handOverKeys` maps an error whose kind is `plan_changed` to `Cause` `heldChanged`, as it does `*pinBehind`;
+     - after the result prints, `rotate` returns that error in place of `rotationUnfinished`, whatever `Unfinished` says;
+  6. in `finishPin` (`:703-722`), a re-read that must show exactly the hold-stage pin, whose rv is then the final write's; then `writePinOnce`, only when `lastK`'s pin, with its ids mapped back, `Equal`s the planned final pin. Otherwise there is no write: A23-11.
+- **Either 409** is returned with kind `plan_changed`, never as `rotationUnfinished`. A20-16's `internal` applies outside `--confirm` only.
+- **The record re-read** (`storagekey.go:544`) under `--confirm`: `recordNamed`, and `Keyholder.Deployed` and `Replicas` must equal `prepared`'s. Otherwise A23-43's text, with `the new keys were minted and saved in keys.yaml, and no pin was written` in place of its middle clause. This closes A21-9's open item for `--confirm`.
+- **Pinned by** `TestRotateConfirmWritesTheHoldPinThenTheFinalPin` (the hold write at the plan's rv, the final at the rv read back, both as the writer after the comparison, both mapped-back pins equal to the plan's) and `TestRotateConfirmSurfacesPlanChanged`. Mutation rows 86b and 86c.
+
+**A23-46 (§2.3, §2.6; C22, L5.5, L4 changes): the cluster package for `run`.**
+- **`DeploymentState`** is as §2.3 gives it, with these details:
+  - it begins with the `inProcessOnly` guard, makes kube's Deployment `GET`, then `flushWarnings`;
+  - `Present` is false only on a 404 that is a Kubernetes Status (A18-4's rule);
+  - `Replicas` comes from `spec.replicas`;
+  - `Requests` holds each container's requests through `tkube.ParseCPUMilli` and `ParseMemMiB`, with `""` as 0;
+  - `AdaptedAt` parses `kernel.AdaptedAtLabel` (`technocore/kernel/adapt.go:31`) as RFC 3339, and is zero on a parse failure;
+  - `LastAppliedAt` is the newest managed-fields time over entries of (`farcast`, `Apply`) or (`kubectl-client-side-apply`, `Update`). A scale-subresource entry is ignored;
+  - kube's Deployment decoding gains the annotations and managed fields if it lacks them.
+- **Jobs.** `JobResult` (`cluster.go:355-361`) gains `UID string`, filled by `WaitJob`'s `GET`. A new `func (c *Client) JobState(ctx context.Context, namespace, name string) (JobResult, bool, error)` makes one `GET`, and returns false on a 404 that is a Kubernetes Status.
+- Both new methods begin with the `inProcessOnly` guard, and each gets a row in `TestAKubectlClientHasNoCanI` (`cluster/open_test.go:467`).
+- **Pinned by** `TestDeploymentStateReadsTheAdaptationAndTheLastApply` (kubetest seeded with a `kubectl-client-side-apply` Update, a `farcast` Apply, a scale entry, an unparseable annotation, a non-Status 404, and empty requests) and `TestJobStateTellsAnAbsentJob`.
+
+**A23-47 (§9.4 run's two stages; C22, M2, M3, M8, L5.4, L5.12, L5.20, L6.17): `run`'s stages and reads.**
+- **`runCluster`** (`run.go:35-39`) gains `DeploymentState`, `Namespaces`, `ConfigMapData` and `JobState`, for the writer's interactive and `--yes` reads. D reads through `runPlanReader` (A23-20).
+- **`readManifest`** (`runfetch.go:31-89`) splits in two:
+  - `applyFetch(ctx context.Context, env *Env, cl jobWaiter, cfg pfetch.Config) error` renders and applies, and prints the "Reading %s inside %q" line with its `isInteractive` check;
+  - `readFetch(ctx context.Context, env *Env, cl fetchReader, cfg pfetch.Config) (fetched, error)` runs `WaitJob`, `JobLogs` on failure, the report, `JobLogs(0)` and `Verify`, and returns the Job's uid in `fetched`. `type fetchReader interface` holds `WaitJob` and `JobLogs`.
+
+  Interactive and `--yes` runs call both with the writer.
+- **The paths:**
+  - **`--plan`:** F, with no client opened, no `applyReady` and no preflight.
+  - **`--confirm <d>`, with `d` equal to F's digest:** `requireGrantedReader` (run's text), then open the reader; open the writer, run `applyReady` and `preflightUID` (discarded), and `applyFetch` as the writer; `readFetch` as the reader; compute D as the reader, print it, and exit 0.
+  - **`--confirm <d>`, otherwise:** `requireGrantedReader`, then open the reader; `JobState` as the reader; `readFetch`; compute D, then compare (a mismatch is §9.2's text) and check blocks; open the writer, run `applyReady` and `preflightUID`, which must equal D's uid; execute from `preparedDeploy` only.
+  - **An absent Job** (chosen here, `plan_changed`): `the plan's fetch stage changed, or the fetch Job its deploy plan read is gone (a fetch Job is kept 15 minutes after it finishes); ` + `msgPlanAgain`. §9.4's "valid only while its fetch Job exists, which is 900 s" becomes "while its fetch Job exists: 15 minutes after it finishes" (`ttlSecondsAfterFinished`, `planck/fetch/fetch.go:63`, `workload.go:117`).
+- **D's facts:** `fetch` (F's), `run` (with `fetch_plan_digest` and `job_uid`), `cost`, `image` (builder), `mint`s (app leaves, egress credentials, the new scopes' keys), `write`s (the builds, the policy at its rv, the workloads, the meter, and the pin when storage is wired and scopes are minted), `application_reset`s and `notice`s.
+  - D carries none of F's `write` facts. Its rendering prints `fetched by the plan <F digest> (Job uid <uid>)`. `TestRunDeployConfirmNeverWritesTheFetchAgain` also asserts that D's rendering lists no fetch write.
+- **D's reads:** the fetch Job and its report; the policy (`ConfigMapData`); the pin, when storage is wired; the ledger (`ConfigMapValue`); `Namespaces`, then `DeploymentState` per app in a metered target namespace (§5.4); `NamespaceUID`.
+  - `technocore-namespaces` is dropped. `metering_added` comes from `meta.Kernel.Namespaces` (`run.go:720-728`), as execution does.
+- **The CA key.** D reads the CA certificate through `LoadInstanceCACert`, for `FARCAST_STORAGE_CA`. It checks presence through a new `func (d Dir) InstanceCAKeyExists(name string) (bool, error)` (`os.Stat`, never opening the file). With storage wired and the key absent, D carries a block, with `translate`'s text (`run.go:450-453`) and kind `internal`.
+- **Options** for F and D: `ref`, `git-secret`, `namespace`, `manifest`, `fetcher-image`, `builder-image` (the resolved values) and `replace-repository`.
+- **The egress policy.** `egressPolicy` (`runpolicy.go:30`) takes a `credentialMinter` (`func(namespace, app string) (string, error)`): `policy.NewCredential` when real, A23-30's placeholder in a plan. It reads through `ConfigMapData` and returns the resourceVersion. `readEgressPolicyAt` keeps `readEgressPolicy`'s three outcomes: absent is an empty document; present without `policy.json` is `document_unreadable`; unparseable is as today. `world` keeps `readEgressPolicy`.
+- **Pinned by** `TestRunConfirmOfAChangedFetchPlanSaysSo` and `TestRunPlanBlocksWithoutTheCAKey`. Mutation rows 82a and 82b.
+
+**A23-48 (§5.4 [decided: P1], as amended; C23, C24, O2, D2, L5.10, L5.11, L5.13–L5.15, L5.17): `run`'s review, gate and re-read.**
+- **Review lines** (`runreview.go`), one per reset, after the cost lines:
+  - stopped: `<app>: running 0 replicas (stopped by the cost guard); this deploy sets 1` when `stopped_by_cost_guard`, and otherwise `… (scaled to 0 replicas) …`. The gate still keys on `replicas == 0`, which fails safe;
+  - adapted: §5.4's line;
+  - unknown: `<app>: its live state could not be read (<kind>); what this deploy changes there is not known` (chosen here).
+- **The gate's message** replaces §5.4's: `run --yes would restart %s while the instance's spending is at its limit; confirm it interactively, or run the same command with --plan in place of --yes and confirm the plans it prints. The manifest was read; nothing was built or deployed.`
+  - `%s` lists the apps in manifest order, each as `<ns>/<app> (stopped by the cost guard)`, `<ns>/<app> (scaled to 0 replicas)` or `<ns>/<app> (not read)`, joined with `, `.
+  - At the re-read, its last sentence is `The builds were written, and nothing after them was.`
+- **Interactive lines**, per app, while the limit reads reached (chosen here, except the first, which is §5.4's):
+  - `the cost guard stopped %s at the limit; deploying restarts it, and it bills until the kernel's next tick stops it again`;
+  - `%s is scaled to 0 replicas while the instance's spending is at its limit; deploying restarts it, and the kernel may stop it again at its next tick`;
+  - `%s could not be read while the instance's spending is at its limit; if the cost guard stopped it, deploying restarts it`.
+- **The re-read** (A23-2) runs after the builds, before `egressPolicy`'s read (`run.go:284`), on every path. It covers `DeploymentState` for every app (`Present: false` expected for every app when the target namespace was absent), the ledger, and, under `--confirm`, the pin's resourceVersion when the plan carries a pin write. `egressPolicy`'s own read then supplies the policy's resourceVersion, compared under `--confirm` with the policy `write` fact's.
+- **Refusals under `--confirm`** (each `plan_changed`, each ending `the builds were written, and nothing after them was; ` + `msgPlanAgain`):
+  - `%s changed since the plan was made (the kernel stopped or resized it); …`. A failed re-read counts as a change. An `unknown` fact is satisfied by a re-read that shows no reset;
+  - `%s is stopped or could not be read, and its plan did not record the cost limit as reached; the kernel's ledger now reads it reached, or its level cannot be read; …`;
+  - `the instance's egress policy changed since the plan was made; …`;
+  - `the instance's key pin changed since the plan was made; …`.
+
+  `%s` is the `<ns>/<app>` list, joined with `, `.
+- **Interactive runs.** An app stopped or unknown while the ledger now reads reached, and not both at the review, is asked about again at the re-read, with its line.
+- **The pin under `--confirm`** (C23). `raiseScopePin` (`run.go:572-595`) uses `writePinOnce` at the plan's rv. `pinScopes` (`:565-570`) returns its `plan_changed`, which stops the hand-over before any push. `handScopesToTheKeyholder` (`:636`) gains an `error` result, nil outside `--confirm`, and `run` returns it before the workload apply: `the instance's key pin changed since the plan was made; nothing was written over it; the builds, the egress policy and the new storage scopes (saved in keys.yaml, not handed to the keyholder) were written, and the workloads were not: until a run succeeds, this namespace's running applications hold egress credentials the new policy does not list; ` + `msgPlanAgain`. Interactive and `--yes` runs keep the loop and the warning; `storagepin_test.go:629` and `:663` are unchanged.
+- **Pinned by:**
+  - `TestYesNeverRestartsAStoppedAppAtTheLimit`;
+  - `TestYesNeverRestartsAnAppStoppedDuringTheBuild` (both rows; no policy and no workloads reach the stand-in);
+  - `TestYesGateReadsTheKernelsOwnLevelString`;
+  - `TestYesNeverDeploysOverAnUnreadAppAtTheLimit`;
+  - `TestRunReviewSaysWhoStoppedAnApp`;
+  - `TestConfirmRefusesAnAppStoppedAfterTheCompare` (no policy reached the stand-in);
+  - `TestConfirmRefusesAPolicyChangedAfterTheCompare`;
+  - `TestConfirmRefusesAPinChangedAfterTheCompare`;
+  - `TestRunPlanIntoANewNamespaceReadsNothingThere`;
+  - `TestRunPlanIntoAnUnmeteredNamespaceIsBlocked`.
+
+  Mutation rows 86a, 87a, 88a, 89c and 89d.
+
+### Tests and harness
+
+**A23-49 (M4, C20, C21; L6 changes 7–9, L4.27): the harness.**
+- **Refusing defaults.** Package variables `openProviderDefault = defaultProviderOpener` and `newBuilderDefault` (chosen here) replace the inline defaults at `fatline.go:244-252`, `run.go:143-147` and `build.go`'s `ensureDefaults`. A new `_test` file's `init()` sets both to refusing fakes, as `storagepin_test.go:52-54` does for `defaultPinStore`. Every plan row fakes them explicitly. This lands in M2.6a, before any `--plan` exists.
+- **The succeeding stand-in.** `succeedingKubectl(t *testing.T) func() []kubectlCall`, with `type kubectlCall struct{ Args []string; Stdin []byte }` (chosen here). It is a `/bin/sh` script that exits 0 and writes each invocation's argv and stdin to numbered files under `t.TempDir()`, modelled on `cluster/open_test.go`'s recording kubectl. With `PATH` pinned to it (A20-15), a `--confirm` passes `applyReady` and reaches its apply. `strayKubectl` (`writecommands_test.go:165`) stays for "never runs".
+- **The `run` kubetest fixture**, `runFixture(t)`, seeds:
+  - `farcast-system` with a uid, and the target namespace, labelled and metered;
+  - a completed fetch Job named `pfetch.Config.Job()`, whose pod's termination message is the report and whose log annotation holds the manifest;
+  - the ledger, `technocore-namespaces`, the egress policy and the pin ConfigMaps;
+  - the live app Deployments, with managed fields and the adapted-at annotation;
+  - a rolled-out `technocore` Deployment.
+- **`planCommands()`**, beside `writeCommands()`, has one row per `--plan` shape, with fakes for `openProvider`, `newBuilder`, `findSource`, `findToolchain`, `asRelease`, and counting fakes for `ensureStorage`, `newKeyholder` and `connect`'s dial. Each row says whether it reads the cluster. `runPlan(t, dir, row, mode)` returns the parsed `plan.Document` and the human text.
+- **Fakes:**
+  - `fakePinStore` gains `NamespaceUID`, with a settable uid and failure (and A23-42's `ErrConflict`);
+  - `fakeCluster` (`connect_test.go:33-57`) gains a settable uid;
+  - `fakeRunCluster` (`run_test.go:54-170`) gains `DeploymentState`, `ConfigMapData` (from its `configMaps`, with an rv), `Namespaces` and `JobState`;
+  - every fake records the `clusterRef.Identity` it was opened with.
+
+**A23-50 (§7.3, §10.5; C19–C21, C26, L1.10, L1.21, L3.11, L3.24, L5.8, L5.20, L6.1, L6.6–L6.8, L6.16, refuted 1): the cross-cutting tests, restated.**
+- **`TestPlansWriteNothing`** (rows 72, 73) runs over `planCommands()`, with one row per shape (`connect` first, resume and reconnect; `rotate` with and without a keyholder; a first `storage deploy`). It asserts:
+  - `treeFiles` before equals after;
+  - every kubetest request outside `/token` is a `GET`, and every `/token` request is `As == "reader"`;
+  - `fakeProvider.ensured` and `regDeleted` are empty;
+  - `fakeBuilder.built` and `embedded` are empty (`RegistryToken` and `Resolve` are allowed);
+  - `ensureStorage`, `newKeyholder` and the dial were never called;
+  - the stand-in kubectl never ran.
+- **`TestPlansPresentOnlyTheReaderToken`** (row 84).
+  - Reader plans (`kernel deploy`, `storage deploy`, `key pin`, `rotate` with a keyholder): the plan succeeds, the server sees at least one request, every request is `As == "reader"`, no `/token` is the writer's, and the fakes recorded `kube.Reader`.
+  - `none` plans: zero requests.
+  - Row 84's mutation becomes "read `Namespaces` and `NamespaceUID` through the writer in `kernel deploy --plan`".
+- **`TestPlansStillReadTheInstallerKeyForGoogle`:** A23-24's groups.
+- **`TestConfirmRecomputesAsThePlansIdentity`** (rows 76, 76a), as M2.6 can see it, since kubectl's applies never reach kubetest until M2.7:
+  - every reader request comes before the first writer `/token`;
+  - every later in-process request is `As == "writer"`;
+  - the succeeding stand-in received the planned streams only after the comparison, checked against `WithAnswered`'s order.
+
+  The applies themselves `As == "writer"` are M2.7's assertion. Cases:
+  - `kernel deploy`, whose `RolloutStatus` answers from the fixture's rolled-out `technocore`;
+  - `run <F>`: the fetch apply follows F's comparison and the writer's preflight, and `WaitJob`, the pod list and the log are the reader's;
+  - `run <D>`: everything before D's comparison is the reader's.
+- **`TestEveryReaderReadIsAllowedByTheRenderedRBAC`** (row 76b). The fixture meters every labelled namespace and every recorded deployment namespace, so P5's marks do not arise. kubetest runs `WithRBAC(email, renderReaderRBAC(email, meta.Kernel.Namespaces))`. It covers `world`, `ps`, `costs`, `usage`, `logs`, every reader plan, and `run --confirm <D>`, and sees no 403. Dropping the `jobs` rule fails it through `run <D>`.
+- **`TestConfirmRefusesAChangedPlan`** (row 74): `--plan`, then a change (a kubetest write to the pin or a namespace, a record edit, or a moved `Resolve` answer), then `--confirm <old>`. Expected: `plan_changed`, exit 1, §9.2's text with both digests, no writer `/token`, and the stand-in never ran.
+- **`TestPlanIgnoresTheTerminal`** (row 91) runs each plan in human mode (`Printer.Mode = ModeHuman`), since `isInteractive` is false in JSON mode whatever `env.In` is (`connect.go:598-600`), with `env.In` as an `*os.File` of `/dev/null`, a character device that `isTerminal` takes for a terminal, and then as a `strings.Reader`. The two runs' digests, read from the printed `digest:` line, must be equal, and so must their canonical bytes from a JSON re-run. No production seam is added (refuted 1). Row 91's mutation becomes "in `kernel deploy`'s plan builder, refuse below the floor when `!isInteractive(env)`".
+- **`TestPlanDocumentCarriesTheBytesItsDigestCovers`** (row 78): its fixture holds a notice with `<`, `>` and `&`, so a `json.Marshal` mutation fails it.
+- **`TestPlansCarryNoKeyMaterial`:** A23-25.
+
+### Behaviour changes outside `--plan` and `--confirm`
+
+**A23-51 (M12, L3.25, L4.21): the interactive and `--yes` changes, in one list.** The records name each, and row 71b's tests still hold.
+1. `connect` (first deploy and resume), `redeploy`, `kernel deploy` and `storage deploy` mint the installer's registry token and `Resolve` inside `plan()`, before their cost or change question (`connect.go:278` against `:409`; `kernel.go:315` against `:324-332`; `storagedeploy.go:186` against `:220-224`). The registry ensure, a Google write, moves after the question, except when no registry is recorded (A23-24).
+2. `redeploy` pushes after its consent (`redeploy.go:185-219`).
+3. `storage key rotate` reads the pin before its prompt (`storagekey.go:432-444` against `:461-484`): the read, then `rotationScopeWarning`, then the prompt. `TestStorageKeyRotateWarnsBeforeItAsks` (`storagekey_test.go:799-835`) runs with no keyholder and is unaffected.
+4. A source build's `go env` (`FindToolchain`) runs in decide, so it runs under `--yes` too.
+5. `run`'s review gains reset lines. `--yes` and non-interactive runs refuse a stopped or unread app while the limit is reached. The re-read moves before the policy. A missing CA key with storage wired refuses before the builds.
+6. The cost prompts print exact cents, where they printed `%.0f`.
+7. Notices print once, from `prepared`, before the prompt (A23-26).
+8. `kernel confirm`'s `AsOf` is the UTC day, and a non-finite `--amount` is refused.
+9. Every non-interactive refusal gains `consentSuffix`.
+10. `reader grant`'s `--yes` refusal names the plan route.
+
+### Records
+
+**A23-52 (§11's M2.6 list, widened; C33, M1, M8, M9, O1, O4, L4.25, L5.21, L6.11, L6.12, L6.18, L6.19).** As A20-19 did for M2.5, this covers every record M2.6 would otherwise falsify. Each part updates what it falsifies. Every M2.6 record says "built, not walked", and §11's qualifier rule holds.
+- **`farsight/cli/README.md`:**
+  - `:19`: a dated note. The commands that have plans take `--plan` and `--confirm <digest>`: M2.6a's note names its three, each later part widens it, and M2.6d's says the eleven commands that write to a cluster. The Google-only gated commands wait for ADR 0021 step 3. Progress events are not built.
+  - `:1111` (`reader grant`): built; the new `--yes` text; its plan reads no cluster and is blocked without a recorded and uploaded reader; under `--confirm` the reader is opened and verified after the comparison.
+  - `:1235`: `credential_missing`'s row gains `, or a plan that reads the cluster with no reader that reader grant has verified`.
+  - `:1246`: `plan_changed`'s row reads `(emitted since ADR 0023 M2.6, by --confirm)`.
+  - **A new `### Plans and confirmation`**, between `:1305` and `:1306`, says:
+    - which commands have plans, with §9.2's combinations and texts;
+    - the document, the digest and the protocol;
+    - the target;
+    - the placeholders and A23-31's six differences, in words;
+    - that no file is kept;
+    - a run deploy digest's life (15 minutes after the fetch Job finishes), and that a `kernel confirm` plan does not survive a UTC midnight;
+    - what `--yes` never covers in M2.6 (`reader grant`), and `--embedded` under `--confirm`;
+    - who reads: the reader, for cluster reads; the installer key, for the registry only, until M3b; no bucket or IAM read until M2.8;
+    - that a granted reader is required, with no fallback, and O1's consequence where key upload is blocked;
+    - that the writer opens only after the comparison;
+    - that until M2.7 three identities act under `--confirm`: the reader, the installer key, and kubectl as the active gcloud configuration;
+    - that kubectl writes where `kubeconfig.yaml` points, which `install` wrote for the same cluster, while the plan binds the record's endpoint (M9; no code compares the two);
+    - that under `--confirm` a writing command mints a reader token and a writer token, and opens one writer (A21-3, qualified);
+    - that a `--plan` cannot check for kubectl;
+    - A23-4's sentence;
+    - not walked.
+  - `:1273-1281`: the rule's M2.6 scope, and O1 under "Where there is no reader".
+  - `:1287-1312`: the identities of `--plan` and `--confirm`; every plan that reads the cluster mints the reader's token, and every plan with registry facts mints the installer's registry token; not walked.
+  - **A subsection beside `:1314`**, headed **`run`'s review: resets, and applications the cost guard stopped**: A23-48's lines, the refusal, the re-read's place, and the `plan_changed` texts.
+  - `:1320`: the `plan/` vectors, produced in Go and not copied to FarSightKit until ADR 0021 step 7.1.
+  - `:1410`: the layout gains `internal/plan/`, `cli/consent.go`, `cli/planhuman.go` and `testdata/plan/`.
+  - `:1498-1512`: a "The plans (ADR 0023 M2.6)" testing bullet, and the succeeding `/bin/sh` kubectl among the tests' process starts.
+  - Each command's section: its plan's facts and read identity, A23-51's changes, and A23-13's sentence for source builds.
+- **ADR 0021:** decision 6's dated note (`:212-217`) and the rider at `:221`; `:264` (step 3 partly built); `:393` (Verification 4 holds for the cluster writers, in Go); `:466` (Consequences).
+- **ADR 0023:**
+  - the status line (`:3`);
+  - decision 3's note (`:118`): plans' cluster reads are the reader's; plans' registry reads mint the installer's token until M3b; a plan needs a granted reader, with no fallback; O1;
+  - decision 4 (`:146`): `--embedded` is a plan fact;
+  - decision 8 (`:212-214`): built for the eleven. `:213`'s "Today `--yes` skips every gate" gets a dated rider: since M1, `--yes` never implies `--embedded`, and since M2.3, `reader grant` refuses `--yes`;
+  - Verification (`:366`);
+  - **Choices 6, an M2.6 note:** the review and the plan state each reset; `--yes` and non-interactive runs never restart a stopped or unread application at the limit; the re-read sits before the egress policy. The M2.7 note keeps only the forced server-side apply.
+- **ADR 0016 `:62`**, an M2.6 note: `farcast run`'s review and plan state the reset and the kernel's re-adaptation. The M2.7 note keeps the server-side apply part. §11's M2.7 bullets shrink to match.
+- **ADR 0019 `:95`**, an M2.6 rider: each plan that reads the cluster mints the reader's token; a plan with registry facts mints the installer's registry token; a `--confirm` of a reader plan mints both, and the writer's after the comparison. Not walked.
+- **`AGENTS.md`:** `:48` (the status, and one sentence on plans), `:52` (the token bullet's scope gains plans' cluster reads, keeping the registry exception), `:53` (Consent: built at M2.6 for the eleven), and `:70` (plans' cluster reads are the reader's). Also every status line that names M2.5 as the newest built sub-milestone (`grep -rn 'M2\.5' AGENTS.md README.md PLAN.md docs/`).
+- **`PLAN.md`** `:436`, `:447`, `:454` and `:457`.
+- **§7.3's table**, as A23-24 has it.
+- **Each command's `Usage`**, as A23-16 has it.
+
+**A23-53 (§13; M10): size.** §13's M2.6 row becomes about 4,900 + 7,800 Go lines before overlap [map: the lanes' sums], 13 vectors, and about 20–28 working days [inf], in four parts (A23-14). The total moves accordingly.
+
+**A23-54 (C34; L1.25, L2.21, L3.26, L4.26): citations.** The builders cite lines at 39ca9e3. Where §9 cites 0cea21f:
+
+| Symbol | §9's citation | At 39ca9e3 |
+|---|---|---|
+| `cents` | `worlddoc.go:137` | `worlddoc.go:141` |
+| `wireTime` | `worlddoc.go:106-111` | `worlddoc.go:108-129` |
+| `confirmCost` (connect) | `connect.go:458-472` | `connect.go:484-498` |
+| `ensureIdentity` | `connect.go:332-372` | `connect.go:358-401` |
+| connect's ensure | `connect.go:252` | `connect.go:278` |
+| `describeRedeploy` | `redeploy.go:278-287` | `redeploy.go:300-309` |
+| redeploy's pre-gate steps | `redeploy.go:162-187` | `redeploy.go:175-212` |
+| `resolveImage` | `fatline.go:459-536` | `fatline.go:545-618` |
+| `carriedImage` | `fatline.go:538+` | `fatline.go:624-714` |
+| the skew refusal | `fatline.go:556-571` | `fatline.go:645-657` |
+| `checkCarried` | `fatline.go:333` | `fatline.go:419-449` |
+| `keepingNote`, `replacingNote` | `fatline.go:728`, `:751` | `fatline.go:814`, `:837` |
+| kernel deploy's missing namespaces | `kernel.go:233-243` | `kernel.go:254-259` |
+| `kernel confirm`'s, `kernel meter`'s `--yes` | `kernelconfirm.go:81`, `kernelmeter.go:58` | `:83`, `:67` |
+| the meter result | `kernelmeter.go:46-53` | `kernelmeter.go:287-302` |
+| `pinFor` | `storagepin.go:76-91` | `storagepin.go:78-94` |
+| `readPin`'s resourceVersion | `storagepin.go:148-160` | `storagepin.go:150-163` |
+| the `writePin` loop | `storagepin.go:184-233` | `storagepin.go:186-235` |
+| storage deploy's writer, apply | `storagedeploy.go:138,275` | `storagedeploy.go:148`, `:298` |
+| the keyholder leaf | `storagedeploy.go:222` | `storagedeploy.go:237` |
+| the bucket grant | `storagedeploy.go:347-375` | `storagedeploy.go:372-400` |
+| rotate's `NOT written` line | `storagekey.go:696-697` | `storagekey.go:712-713` |
+| run's pre-fetch refusals | `run.go:150-185` | `run.go:154-198` |
+| run's post-fetch refusals | `run.go:211-226` | `run.go:238-256` |
+| run's pin raise | `run.go:532-566` | `run.go:565-595` |
+| run's fetch reads | `runfetch.go:46,57,72` | `runfetch.go:31-89` |
+
+A citation not listed is found by its symbol.
+
+### Mutation rows added (§10.5, M2.6)
+
+Rows 72–91 stand, with row 84's and row 91's mutations reworded (A23-50). All rows are run as overlays (`go test -overlay`), never by editing the tree.
+
+| # | Requirement | Mutation | Must fail |
+|---|---|---|---|
+| 72a | `--plan` opens no keyholder session | call `raisePins` in `key pin`'s plan | `TestPlansWriteNothing` |
+| 73a | Plans refuse an ADC record before the provider opens | drop `planRegistry`'s blank-key check | `TestPlansStillReadTheInstallerKeyForGoogle` (its ADC row) |
+| 73b | Plans never ensure a missing registry | call `EnsureRegistry` in `planRegistry` when no prefix is recorded | `TestPlanNeedsARecordedRegistry` |
+| 74a | `--confirm ''` is malformed | register `--confirm` with `fs.StringVar` | `TestConfirmRefusesAMalformedDigest` |
+| 74b | A block refuses with its kind | refuse a blocked plan as `internal` | `TestABlockedPlanIsRefusedWithItsKind` |
+| 74c | Computation stops at the first block | keep computing after `kernel deploy`'s block | `TestKernelDeployPlanBlocksAMissingNamespace` |
+| 74d | A blocked `--plan` offers no confirm line | print `To do exactly this:` for a blocked plan | `TestABlockedPlanIsRefusedWithItsKind` |
+| 74e | Exclusivity reads parsed values | count `--yes` as given, whatever its value | `TestConsentAnswersAreExclusive` (`--yes=false --plan`) |
+| 75a | Realize never mints over material that appeared | skip `realizeIdentity`'s re-check | `TestConfirmRefusesACAMintedAfterThePlan` |
+| 75b | The ensured registry is the planned one | skip the prefix comparison | `TestConfirmRefusesAMovedRegistry` |
+| 76c | The writer's cluster is the plan's | skip the uid comparison after `preflightUID` | `TestConfirmChecksTheWritersClusterIsThePlans` |
+| 76d | The writer is checked before anything irreversible | run `ensureStorage` before the writer's pin read in `storage deploy --confirm` | `TestConfirmChecksTheWriterBeforeAnythingIrreversible` |
+| 76e | A reader's 403 is never blamed on the installer | make `writerRefused` ignore `readerPhaseError` | `TestPlanReadErrorsNameTheReader` |
+| 78a | Empty arrays encode as `[]` | drop `Canonical`'s nil normalization | `TestCanonicalWritesEmptyArraysNotNull` |
+| 78b | A fact's type is its `FactType` | drop the check | `TestCanonicalRefusesUnsortedOptionsAndAMistypedFact` |
+| 79a | `kernel confirm`'s `AsOf` is the UTC day | `AsOf: now` on the interactive path | `TestKernelConfirmAsOfIsTheUTCDay` |
+| 79b | Rotate waits past the newest key | skip the clock wait | `TestRotateWaitsForTheClockPastTheNewestKey` |
+| 80a | A first deploy's bucket is a placeholder | render a minted bucket name in the plan | `TestPlanIsDeterministic` (first `storage deploy`) |
+| 80b | A pin is written only when it is the planned one | drop the mapped-back `Equal` in `finishPin` | `TestRotateConfirmPutBackWritesNoUnplannedPin` |
+| 81b | Rendered values are quoted | drop `terminalText` in `planhuman.go` | `TestPlanRenderingQuotesHostileText` |
+| 81c | Money is exact | render cents with `%.0f` | `TestEveryBoundFactIsRendered` |
+| 81d | The confirm line reruns the command | drop only tokens equal to `--plan` | `TestTheConfirmLineRunsTheSameCommand` |
+| 82a | D lists no fetch write | append F's `write` facts to D | `TestRunDeployConfirmNeverWritesTheFetchAgain` |
+| 82b | A changed fetch stage is not called "gone" | restore §9.4's old absent-Job text | `TestRunConfirmOfAChangedFetchPlanSaysSo` |
+| 85a | The remedy follows the reader's state | one remedy for every state | `TestPlanWithoutAReaderIsRefused` |
+| 85b | `run` checks its reader before any open | check it after the writer's preflight in `run --confirm <F>` | `TestPlanWithoutAReaderIsRefused` (its `<F>` row) |
+| 85c | A plan never reaches the pin through the writer | read `key pin`'s plan through `pinStoreFor` | `TestPlansPresentOnlyTheReaderToken` |
+| 86a | `run`'s pin under `--confirm` is one attempt | keep the loop under `run --confirm` | `TestConfirmNeverWritesAPinThePlanDidNotList` (its `run` case) |
+| 86b | Rotate's 409 is `plan_changed` | return `rotationUnfinished` | `TestRotateConfirmSurfacesPlanChanged` |
+| 86c | A hold-stage 409 leaves the keys held | set `Cause` to `heldUnrecorded` | `TestRotateConfirmSurfacesPlanChanged` |
+| 86d | A pin that landed counts | treat every write error as a failure | `TestConfirmPinThatLandedButLostItsAnswerSucceeds` |
+| 87a | The re-read precedes the egress policy (O2) | move it after the policy apply | `TestConfirmRefusesAnAppStoppedAfterTheCompare` |
+| 88a | `run`'s pin rv is re-read with the others | skip it | `TestConfirmRefusesAPinChangedAfterTheCompare` |
+| 89c | An unread app fails closed at the limit (D2) | let `--yes` through on `unknown` | `TestYesNeverDeploysOverAnUnreadAppAtTheLimit` |
+| 89d | The review says who stopped an app | always print `(stopped by the cost guard)` | `TestRunReviewSaysWhoStoppedAnApp` |
+| 90a | `kernel confirm`'s no-op is compared first | print "Nothing to confirm" before the comparison | `TestKernelConfirmPlanChangesAcrossUTCMidnight` |
+| 90b | A non-finite amount is refused | drop the check | `TestKernelConfirmRefusesANonFiniteAmount` |
+| 90c | `kernel meter`'s no-op is compared first | print "Already metering" before the comparison | `TestKernelMeterConfirmOfANoOpIsComparedFirst` |
+| 91a | Notices are only facts under `--plan` | print `keepingNote` from `decideImage` | `TestPlanPrintsNoticesOnlyAsFacts` |
+| 91b | No plan drops Shrike (D1) | bind Shrike as omitted and go on | `TestPlanNeverDeploysFatLineWithoutShrike` |
+| 91c | `--replace` under `--confirm` asks nothing (O3) | call `confirmLower` under `--confirm` | `TestKeyPinReplaceConfirmLowersReplicasWithoutAsking` |
+| 91d | The record re-read is checked | skip `storage deploy`'s comparison | `TestConfirmRefusesARecordChangedDuringTheCommand` |
+| 91e | No key material in a plan | put a KEK's bytes in a `mint` fact's subject | `TestPlansCarryNoKeyMaterial` |
+| 91f | A reconnect's failed ensure fails `--confirm` | exit 0 after the warning | `TestReconnectConfirmFailsWhenItsEnsureFails` |
+| 91g | A plan opens no CA key | call `LoadInstanceMTLS` in `run` D's builder | `TestPlansCarryNoKeyMaterial` (its `ObserveReads` check) |
+
+### Refuted, kept out
+
+The critic refuted these lane claims. They are not amendments.
+1. L1.10, "`isTerminal` must become a package seam": `/dev/null` is a character device, so `TestPlanIgnoresTheTerminal` needs no production change (A23-50).
+2. "§2.6's 'plan builders' interfaces gain `NamespaceUID`' is stale": it still applies to `pinStore` (A23-20).
+3. "A new shipped kind `not_release`": no plan exists when the precheck refuses (A23-10).
+4. "A blocked plan's exit code is the operator's": §9.2 decides it; only the last line needed pinning (A23-7).
+5. "`kernel meter` and `kernel confirm` should ignore an unused `--yes` beside a plan": §9.2's rule covers them; only the help changes (A23-9).
+6. L4.17, "The instance key space's new key needs a placeholder id": it never reaches a pin (A23-32).
+7. "Rotate's unplanned hand-over outcomes are the operator's": §9.5's principle decides them (A23-11).
+8. "A first storage deploy's bucket is the operator's": a placeholder plus the `create_bucket` fact fits §9.4 (A23-12).
+9. "Only `readergrant_test.go:466` and `:495` compare these texts": it holds, and it confirms the suffix breaks no other test (A23-16).
+
+### The build order
+
+Each part is green on its own with `./check.sh`, runs its mutation rows as overlays, updates the records it would otherwise falsify, and is committed on its own. Commits follow §0's standing rules.
+
+**M2.6a: the plan package, the consent core, and the three commands with no image, no Google read and no reader read** (the critic's steps 1–3).
+- **Files:**
+  - `farsight/cli/internal/plan/{plan.go,facts.go,plan_test.go}`: A23-15;
+  - `cli/consent.go`: A23-16, A23-17, `planStamp` (A23-29);
+  - `cli/planhuman.go`: A23-27, with renderers for all 17 fact types;
+  - `cli/env.go` and `cli/cli.go`: `Argv` and `Flags`;
+  - `cli/fatline.go`: the `consent` field on `fatlineDeployer` (registered only by `kernel meter` and `kernel confirm` in this part), `openProviderDefault` and `newBuilderDefault`;
+  - `cli/run.go` and `cli/build.go`: the swap to `newBuilderDefault` only (A23-49);
+  - `cli/kernelconfirm.go`, `cli/kernelmeter.go` and `cli/readergrant.go`: A23-39 to A23-41, A23-8, and the two `--yes` help strings (A23-9);
+  - `cli/readerrbac.go`: `readerResources`, `readerIAMRole`, and `meteredReaderNote` beside the `meteredReader` wrapper (A23-26), so `kernel.go` and `run.go` are unchanged here;
+  - tests: the refusing-defaults `_test` file, `consent_test.go`, `planhuman_test.go`, `planvectors_test.go`, `kindsvector_test.go`, `kernelconfirm_test.go`, `kernelmeter_test.go`, `readergrant_test.go` (`:465`, `:494`), `readerrbac_test.go`, and `writecommands_test.go` (`planCommands()` with the three commands' rows, and `runPlan`);
+  - vectors: `testdata/plan/{kernel_confirm,kernel_meter,reader_grant,error_plan_changed}.json`.
+- **Tests:**
+  - the plan package's;
+  - `TestConsentAnswersAreExclusive`, `TestConfirmRefusesAMalformedDigest`, `TestAPlanFlagIsNeverIgnored` and `TestNonInteractiveRefusalsNameThePlan`, each with the three commands' rows;
+  - `TestTheConfirmLineRunsTheSameCommand`, `TestABlockedPlanIsRefusedWithItsKind`, `TestBlockKindsAreErrorKinds`, `TestPlanDocumentCarriesTheBytesItsDigestCovers`, `TestEveryBoundFactIsRendered` and `TestPlanRenderingQuotesHostileText`;
+  - `TestConfirmRefusesAChangedPlan`, `TestPlanIsDeterministic`, `TestPlansWriteNothing`, `TestPlanIgnoresTheTerminal`, `TestPlansStillReadTheInstallerKeyForGoogle` (the not-read group) and `TestPlanPrintsNoticesOnlyAsFacts`, each with the three commands' rows;
+  - A23-39 to A23-41's own tests;
+  - `TestPlanVectors` and `TestPlanErrorVectors`.
+- **Mutation rows:** 74, 74a, 74b, 74d, 74e, 78, 78a, 78b, 79a, 81, 81a–81d, 90a–90c.
+- **Records:**
+  - the CLI README's `:1246`, `:1111` and `:19` (naming the three commands that have plans);
+  - "Plans and confirmation", begun, naming the three commands that have plans;
+  - the `kernel meter` and `kernel confirm` sections;
+  - the ADR 0023 status line, `AGENTS.md:48` and `PLAN.md`: M2.6 begun, plans on `kernel confirm`, `kernel meter` and `reader grant`.
+- **Left for later:** the image refactor and the other eight commands, which register no consent flags yet, so `--plan` is an unknown flag on them. No other command gains the consent suffix yet. The reader seams (`openReader`, `readerPhaseError` and `readerPhase` with `writerRefused`'s pass-through, and `requireGrantedReader`) have no caller here and land in M2.6c, so `golangci-lint`'s `unused` stays clean.
+
+**M2.6b: the image and identity refactor, then `connect`, `redeploy` and `build`** (steps 4–5). The refactor lands first inside the part, with no behaviour change and the existing suite green, then the three commands.
+- **Files:**
+  - `cli/fatline.go`: A23-34, `planRegistry` (A23-24), the notices (A23-26);
+  - `cli/clusterref.go`: `loadInstallerKey`;
+  - `cli/connect.go`: A23-35, A23-8's `--status`;
+  - `cli/redeploy.go`: A23-36;
+  - `cli/build.go`: A23-37;
+  - `cli/toolchain.go`: the image's source, `named` or `recorded`;
+  - tests: `systemimages_test.go`, `connect_test.go` (`:842`, `:871`), `redeploy_test.go` (`:287`), `build_test.go`, and `writecommands_test.go` (`succeedingKubectl`, `planCommands()`'s rows for these, `:646`, `:987`);
+  - vectors: `testdata/plan/{connect_first,redeploy,build}.json`.
+- **Tests:**
+  - the decide/realize table;
+  - `TestPlansWriteNothing` (`connect` first, resume, reconnect; `redeploy`; `build`) and `TestPlansStillReadTheInstallerKeyForGoogle` (its groups for these, and the ADC row);
+  - `TestConfirmExecutesWhatItCompared`, `TestConfirmRefusesAChangedPlan`, `TestConfirmCoversTheReplacementItsPlanListed` and `TestYesNeverReplacesAnotherVersionWithoutEmbedded`;
+  - `TestPlanIsDeterministic` and `TestConfirmWritesThePlannedDocumentsExceptTheirSecrets` (FatLine's stream; `build`'s three documents byte-equal);
+  - `TestConfirmRefusesACAMintedAfterThePlan`, `TestConfirmRefusesAMovedRegistry` and `TestPlanNeedsARecordedRegistry`;
+  - `TestPlanNeverDeploysFatLineWithoutShrike`, `TestReconnectConfirmFailsWhenItsEnsureFails`, `TestConnectStatusHasNoPlan`, `TestRedeployAsksBeforeItPushes` and `TestPlanOfANonReleaseIsRefusedBeforeAnyPlan`;
+  - the three commands' rows in M2.6a's cross-cutting tests.
+- **Mutation rows:** 72, 73, 73a, 73b, 75, 75a, 75b, 80 (FatLine's stream), 83, 91a, 91b, 91f.
+- **Records:** the `connect`, `redeploy` and `build` sections, with A23-51's items 1, 2, 4, 6, 7 and 9 for them; "Plans and confirmation" and the CLI README's `:19`, widened; the status lines.
+- **Left for later:** `kernel deploy` and `storage deploy` keep calling the `resolveImage` wrappers; the reader plans.
+
+**M2.6c: `kernel deploy`, `storage deploy`, `storage key pin` and `storage key rotate`, and the reader-identity tests** (steps 6–7). `rotate` lands last inside the part.
+- **Files:**
+  - `cli/kernel.go`: A23-38, its reader seam, and `meteredReaderNote` in place of `meteredReader` (`:336`);
+  - `cli/storagedeploy.go`: A23-43;
+  - `cli/storagepin.go`: A23-32, A23-42, A23-44, `pinStore` embedding `pinPlanReader`, the reader seams;
+  - `cli/storagekey.go`: A23-45, with the kept `plan_changed` returned after `Print`;
+  - `cli/storagekeyholder.go`: `heldChanged` for an error of kind `plan_changed`, at `:1070-1083`;
+  - `storage/storage.go`: `ProviderFor` exported (A23-43);
+  - `cli/fatline.go`: `openReader` (A23-20); the `pinStoreFor` guard; the `resolveImage` and `resolveSidecarImage` wrappers deleted;
+  - `cli/clusterref.go`: `readerPhaseError`, `readerPhase`, and `writerRefused`'s pass-through (A23-22);
+  - `cli/consent.go`: `requireGrantedReader` (A23-21);
+  - tests: `kernel_test.go`, `storagepin_test.go` (`fakePinStore`, the read-only view), `storagekey_test.go`, `handover_test.go` and `writecommands_test.go` (rows; `:350-433` hold);
+  - vectors: `testdata/plan/{kernel_deploy,storage_deploy,storage_key_pin,storage_key_rotate}.json`.
+- **Tests:**
+  - `TestPlansPresentOnlyTheReaderToken`, `TestEveryReaderReadIsAllowedByTheRenderedRBAC` (without `run`), `TestPlanWithoutAReaderIsRefused` (four commands), `TestConfirmRecomputesAsThePlansIdentity` (`kernel deploy`) and `TestPlanReadErrorsNameTheReader` (`kernel deploy`);
+  - `TestConfirmChecksTheWritersClusterIsThePlans` and `TestConfirmChecksTheWriterBeforeAnythingIrreversible`;
+  - `TestKernelDeployPlanCarriesBelowFloorAsAFact` and `TestKernelDeployPlanBlocksAMissingNamespace`;
+  - A23-42's three tests, A23-45's tests, `TestKeyPinReplaceConfirmLowersReplicasWithoutAsking` and `TestConfirmRefusesARecordChangedDuringTheCommand`;
+  - the storage rows of `TestPlansCarryNoKeyMaterial`, `TestConfirmWritesThePlannedDocumentsExceptTheirSecrets` (pins and the bucket) and `TestPlanIsDeterministic` (`rotate`, a first `storage deploy`, `key pin --replace`);
+  - the four commands' rows in the earlier cross-cutting tests;
+  - `TestStorageDeployOpensOneWriter`, unchanged.
+- **Mutation rows:** 72a, 74c, 76, 76c, 76d, 76e, 77, 79, 79b, 80, 80a, 80b, 84, 85, 85a, 85c, 86, 86b, 86c, 86d, 90, 91 (as reworded), 91c, 91d, 91e.
+- **Records:**
+  - the `kernel deploy` and storage sections, with A23-51's item 3;
+  - the CLI README's `:19`, widened;
+  - "Plans and confirmation": the reader identity, O1, and the three identities under `--confirm`;
+  - the CLI README's `:1235` and `:1273-1312`;
+  - ADR 0019's rider, ADR 0023 decision 3's note, and `AGENTS.md:52` and `:70`.
+- **Left for later:** `run`, `DeploymentState`, the completeness guards.
+
+**M2.6d: `DeploymentState`, P1's review and gate, `run`'s two stages, the completeness tests over all eleven, and the final records** (steps 8a–10). Inside the part, in order:
+1. **8a:** the cluster methods (A23-46); `runCluster`; the review lines, the gate and the re-read before the policy, for interactive and `--yes` runs (A23-48 without `--confirm`).
+2. **8b:** `run`'s stages (A23-47); `runPlanReader`; the `readManifest` split; `egressPolicy`'s minter and rv; `run`'s pin once; D's blocks; `InstanceCAKeyExists`.
+3. **9:** the "every" guards.
+4. **10:** the records.
+
+- **Files:**
+  - `cluster/cluster.go`, `cluster/open.go`, `cluster/open_test.go` (`:467`);
+  - `config/instance.go` and its test;
+  - `cli/run.go` (with `meteredReaderNote` at `:732`), `cli/runfetch.go`, `cli/runpolicy.go`, `cli/runreview.go`;
+  - `cli/readerrbac.go`: the `meteredReader` wrapper deleted, and `readergrant_test.go:381` moved to `meteredReaderNote` (A23-26);
+  - tests: `run_test.go`, `manifests_test.go` (`:194`, `:421`), `runhosts_test.go` (`:105`), `model_test.go` (`:484`), the `runFixture` file, `writecommands_test.go`, and `plancomplete_test.go` (`TestEveryBehaviourFlagIsBound`);
+  - vectors: `testdata/plan/{run_fetch,run_deploy}.json`.
+- **Tests:**
+  - A23-46's and A23-47's;
+  - A23-48's list;
+  - `run`'s rows in every cross-cutting test, `TestEveryReaderReadIsAllowedByTheRenderedRBAC`'s `run <D>` row among them;
+  - the guards: `TestConsentAnswersAreExclusive` and `TestAPlanFlagIsNeverIgnored` cover every `writeCommands()` row; `TestPlansWriteNothing` and `TestPlanIgnoresTheTerminal` cover every `planCommands()` row; `TestNonInteractiveRefusalsNameThePlan` covers every gate; `TestEveryBehaviourFlagIsBound`.
+- **Mutation rows:** 76a, 76b, 82, 82a, 82b, 85b, 86a, 87, 87a, 88, 88a, 89, 89a, 89b, 89c, 89d, 91g. Then every row from 72 to 91, and every row added here, is run again as an overlay (A21-8's practice). The worktree is never mutated.
+- **Records:** the rest of A23-52 (the CLI README's `:19`, now naming the eleven, the `run` subsection, ADR 0016, Choices 6, ADR 0021, ADR 0023's decisions 4 and 8 and Verification, `PLAN.md`, `AGENTS.md:53`) and A23-53.
+- **Left for M2.7:** the forced server-side apply and `write.force: true`; the applies asserted `As == "writer"` in `TestConfirmRecomputesAsThePlansIdentity`; `migrate`; the kubectl hints that A20-17 kept.
+
+## 24. Amendments after M2.6a's build (2026-11-16)
+
+M2.6a was built by workflow wf_a7c9a8f2-00b in four steps, then reviewed by wf_2c44e072-b27: four lenses, each with a skeptic, then one fixer. The fixer was cut off once by a network error and resumed from cache. 37 findings were reported: 23 confirmed and fixed, 14 refuted. Raw results: m26a-build-result.txt and m26a-review-result.txt. Backup before this section: m2-design-v2.before-m26a-post.md. Where §24 differs from §23, §24 is the authority.
+
+### Settled by the build (the builders' choices, accepted)
+**A24-1 (s3): ConfirmationFact's dates.** `from`, `to`, `as_of_day` and `windows_after`'s `from`/`to` are `YYYY-MM-DD` (time.DateOnly). The write fact's sha256 still covers the full times. For an empty window, `windows_after` is the record's windows unchanged, earlier periods included. Pinned by TestKernelConfirmEmptyWindowBindsTheRecordedWindows.
+
+**A24-2 (s2, s3): when the consent texts land.** `consentSuffix` lands with its first user, reader grant's no-terminal text, in M2.6a. `msgPlanAgain` lands in M2.6b with the first plan_changed raised after the comparison. Nothing unused is kept, so golangci-lint's unused check stays clean.
+
+**A24-3 (s2): placeholderKeyID** lives in planhuman.go, where the renderer is its first user. M2.6c's storagepin.go calls it and defines no second.
+
+**A24-4 (s2): the confirmation fact's money.** Its amounts print as `%d.%02d` with no currency, because the fact binds none and a rendering shows only bound values. Every other amount prints as `<currency> %d.%02d`.
+
+**A24-5 (s2): the fallback line.** A fact type with no renderer prints `fact <type>: <its JSON>` through terminalText. TestEveryBoundFactIsRendered still requires a row for each of the 17 types.
+
+**A24-6 (s2): confirmWords.** A bare trailing `--` is dropped from the confirm line. A token that cannot be classified gives the fallback line.
+
+**A24-7 (s2, C-L9-1): clocks.** consent.go has no package-level clock. Each command uses its own now, and `planStamp` is the only package-level seam there. `deployerNowDefault` (fatline.go) joins `openProviderDefault` and `newBuilderDefault` as a package variable. Tests that run kernel confirm through run() pin it with `pinPlanClock`, and planCommands' kernel confirm rows use `planNow` and dates in its month, so no plan test can flake across a UTC midnight or a month boundary.
+
+**A24-8 (s2): the header's uid.** A writer-identity plan with an empty uid prints farcast-system as "absent", as a reader plan does. Only migrate (M2.7) reads as the writer.
+
+**A24-9 (s3): kernel meter's notices outside a plan.** Outside --plan, kernel meter prints only what it printed before M2.6, while it works: "Already metering …" and the meteredReader warning. The --remove notices (the cost guard stops counting, and the reader binding stays) appear only in plans; the result already prints the reader-binding lines, through the one constant `msgReaderBindingStays`. The --remove notice's `%s` is the namespaces as given, in argument order. A --remove of a namespace that is not metered is never the add's no-op.
+
+**A24-10 (s1): CloudSetBucketGrant** is defined now, with §9.4's enumeration, though no M2.6 plan carries it.
+
+**A24-11 (s3): the deferred rows.** TestPlansWriteNothing's provider, builder, storage, keyholder and dial counters, and TestPlansStillReadTheInstallerKeyForGoogle's ADC row, arrive with M2.6b and M2.6c. TestNonInteractiveRefusalsNameThePlan's gates map has only reader grant's row, because the kernel commands are ungated (A23-9). The commands' rows are subtests inside the pinned tests.
+
+**A24-12 (s3, A-REC-3): plan vectors.** They are made against the world vectors' fixture record with `CreatedAt` 2026-11-01T09:00:00Z (planVectorMeta). kernel_confirm's record holds one earlier window, and kernel_meter adds "web". The app decodes none of them yet, and ./check.sh does not copy them to FarSightKit until ADR 0021 step 7.1.
+
+### Changed by the review (confirmed findings)
+**A24-13 (S-R5-1, major): the group router refuses a mismatch.** `group.SetSubFlags` records the word whose flags it registered (`flagged`). `group.Run` refuses a line whose subcommand is another word, with `msgGroupFlagsMismatch`: "the subcommand is %q, but %q came before it, so the line was read with %q's flags; put global flags before %q or after the subcommand". It is a usage error, exit 2. Without it, a global flag's value naming a sibling (`kernel --config confirm meter … --plan`, with a config directory named confirm) made --plan write, made --confirm skip the comparison, and let --plan slip past an unwired command. The refusal applies to every group (kernel, storage, reader and the rest). Pinned by TestAPlanFlagIsNeverIgnored's "through the router" subtest. The README's global-flags note records it.
+
+**A24-14 (S-R5-2, C-L9-3): A23-17's bare word.** shellWord leaves a word bare only when it matches `^[A-Za-z0-9_@%+:,./-][A-Za-z0-9_@%+=:,./-]*$`. A word that begins with `=` is single-quoted, because zsh, the macOS default shell, expands an unquoted leading `=word` to a command's path. TestShellWordIsReadAsItself gains the rows `=ls`, `=` and `a=ls`, and its splitter fails on an unquoted leading `=`.
+
+**A24-15 (S-R5-4): A23-15's Canonical refuses invalid UTF-8.** The error is `plan: <json path> is not valid UTF-8`, and it never quotes the bytes. encoding/json writes such bytes as U+FFFD, so two values could share a digest; a hand-edited record (`!!binary`) can carry them, and so will argv-bound options from M2.6b. Pinned in TestCanonicalRefusesUnsortedOptionsAndAMistypedFact, with TestKernelMeterPlanRefusesARecordThatIsNotUTF8 for the route.
+
+**A24-16 (S-R5-3): A23-40's amount cap.** `maxAmount` is 1e13. At that bound cents stay below 2^53, so float64 and int64 hold them exactly on every platform.
+- An `--amount` of maxAmount or more is a usage error: `--amount must be less than 10000000000000, got %v`.
+- A recorded window that is not finite, or is maxAmount or more in absolute value, is refused with `msgWindowNotStated`, kind internal, in every mode. `confirmationWindows` now returns an error.
+- The reason: above about 9.2e16, `cents()` saturates on arm64 and wraps on amd64, so the plan would state an amount other than the one it pushes.
+- Pinned by TestKernelConfirmRefusesAnAmountItCannotState. The README's kernel confirm section records it.
+
+**A24-17 (M-M26A-MUT-01 to -08, -11, C-L9-2): tests added.**
+- TestKernelMeterAndConfirmApplyExactlyThePlannedWrites: what --confirm applies equals the plan's write facts, in order.
+- TestKernelMeterRemovePlanNamesWhatStays: A23-39's --remove notices, with and without a reader, and a remove of an unmetered namespace.
+- TestKernelConfirmPlanStatesTheAmountItPushes: --amount bound exactly; cents rounded, not truncated.
+- TestKernelConfirmEmptyWindowBindsTheRecordedWindows.
+- TestPlanRenderingQuotesHostileText, widened: it now walks every fact's strings by reflection.
+- TestKernelMeterPlanQuotesARecordedNamespace.
+- TestReaderGrantPlanNamesTheNamespacesItBinds.
+
+**A24-18 (A-REC-1 to -9): records.** The CLI README's Testing section names the only two seams that refuse in tests: the deployer's provider opener, and the image builder of the deployer commands, run and build. Other seams keep their real defaults. Every M2.6 record carries "built, not walked". A no-op --confirm (kernel meter's already-metering, kernel confirm's empty window) needs neither the installer key nor kubectl. reader grant's Usage gives --confirm's real order: recompute and compare, open the reader and the writer, apply without asking, verify as the reader, record.
+
+### Refuted, kept out
+- **S-R5-5:** raw C1, DEL and bidi characters under -o json. This is the documented JSON policy (README:161).
+- **S-R5-6:** kubeconfig.yaml is not bound by a plan. This was decided, and A23-52 records it.
+- **C-L9-4:** toolchain's real defaults. toolchain is outside M2.
+- **A-REC-5, -7, -10 to -14:** decisions already taken, M2.6d's records, or style only.
+- **M-M26A-MUT-09, -10:** contrived stdin reads. The plausible mutant, prompting under --confirm, is killed.
+- **M-M26A-MUT-12:** the same as A17-12's accepted survivor O48, output only.
+- **M-M26A-MUT-13:** local-zone AsOf. Run converts to UTC twice, and the cli package has no `time.Local`.
+
+## 25. Amendments after M2.6b's build (2026-11-17)
+
+M2.6b was built by workflow wf_8801b9d2-478 (four steps and the records) and reviewed by wf_e719511f-2ad (lenses S, C, A and M, each with a skeptic, then one fixer). 25 findings were reported, 18 confirmed and fixed, 7 refuted. The orchestrator's O-1 to O-4 went straight to the fixer. These amendments win over §23 and §24 where they differ.
+
+### From the build (accepted)
+**A25-1 (s1): the skew path's extra lookup.** decideImage resolves the action whatever --embedded says (§9.5), so on the skew path it looks the version tag up before the caller refuses: one more registry HEAD than HEAD made. Output, kind, exit code and precedence are unchanged.
+
+**A25-2 (s1): two tokens for a push or build.** realizeImage mints its own registry token for a push or a build, so such a run mints two: decide's for the lookups and realize's for the push. Named, keep_* and reuse runs mint only decide's. An imageDecision holds no secret, because it is printed and bound, and a token from decide could expire behind a prompt.
+
+**A25-3 (s1): findToolchain moves into decide.** image.FindToolchain (`go env`) runs in decide for every source build, in every mode, not only inside the interactive prompt. Its failure is not an error: imageSource gains goErr, which keeps the prompt's "could not be asked (%v)" line word for word. A plan binds dir, go_path and go_version, empty on a failure.
+
+**A25-4 (s1): imageDecision.replacing.** The replacement note has its own field beside the notices. For kernel deploy and storage deploy, settleImage prints it after realize, as before. On an error, decide returns a partial decision holding the notices met so far and any skew refusal. For connect and redeploy, the note now prints before the cost prompt and the push (A25-22).
+
+**A25-5 (s1): the sidecar break-glass and the build prompt.** The break-glass path returns a decision with no action (""); realizeSidecarImage turns it into no image and an empty record, and no plan can hold it (A23-5). confirmBuild is now confirmBuild(env, dec), and buildConsent(env, dec) wraps it with "Aborted." and the declined error. decideImage keeps the env parameter A23-34 pins, unused.
+
+**A25-6 (s2): consentFlags.registered.** register sets it, and suffix() returns consentSuffix only for a command that registered the flags, so confirmBuild's refusal, shared with kernel deploy and storage deploy, names the plan only where one exists. M2.6c's kernel deploy and storage deploy get the suffix by registering.
+
+**A25-7 (s2, s3): the shared helpers.** planRegistry is a fatlineDeployer method and opens the provider through d.openProvider; its ctx is unused. registryForPlan, withoutRegistry, realizeRegistry, readyWriter and the generic openReady[W preflighter] live on the deployer, and connect and redeploy share the workloadImages type (decide, facts, say, refusal, buildConsents, realize). resolveSidecarImage is deleted; resolveImage stays for kernel deploy and storage deploy until M2.6c. preflightUID is not added: every M2.6b plan has cluster_identity none, so the uid is discarded (A23-23), and the reader plans of M2.6c add it.
+
+**A25-8 (s2, s3): the double ensure.** An interactive or --yes run on a record with no registry calls EnsureRegistry twice: the pre-ensure (A23-24's exception), then the realize-step ensure after consent. Both are idempotent. A break-glass plan holds no registry access, so its realize step ensures nothing.
+
+**A25-9 (s2): msgPlanNeedsShrike wraps with %w.** The printed text equals A23-5's; the registry failure stays in the chain, so classified(err) gives its kind and errors.Is(err, errCredentialMissing) holds.
+
+**A25-10 (s2): the registry facts' target.** create_repository and set_pull_grant name the recorded prefix (location-docker.pkg.dev/project/repository), the identity the moved-registry check compares. Only a reconnect's plan, which reads no registry, can fall back to location/name when no prefix is recorded.
+
+**A25-11 (s2): open values A23-33 left.** ImageFact.go is the decision's recorded Go: the carried image's, a kept image's recorded Go, and "" for a named image or a build. current is the component's deploy record, with its provenance when that names the same image. The A23-13 source notice is emitted once per checkout directory.
+
+**A25-12 (s2): msgReconnectEnsureFailed wraps with %w**, so its kind is the ensure's (internal for a plain error).
+
+**A25-13 (s2): connect's cost question and Usage.** The question and the refusal print exact cents (~$18.25 for the carrier; the limit as `USD 50.00/monthly`). Usage gains `[--plan | --confirm <digest>]`, their help, and says --yes never implies --embedded. TestAPlanFlagIsNeverIgnored checks each wired command's usage line.
+
+**A25-14 (s3): redeploy.** consented asks the skew refusal, then the build questions, then the change; nothing is pushed or built until every answer is in. decideIdentity runs before registryForPlan, and plan() takes identity, carrier and registry. describeRedeploy is (name, previous, imageDecision), and the two A23-36 source-build texts put the checkout directory in the %s.
+
+**A25-15 (s3): build.** BuildFact binds repository, ref, containerfile and context as the raw flag values (empty when not given), so pbuild's defaults keep one source; tag and destination are the effective values. one_off is {"the build Job", 1, 1000 m, 2048 MiB, 1800 s}. fullFloorCost holds the limit, floor and below_floor, shared by connectCost and buildCost. A value in build's argv that is not UTF-8 is refused by the renderer (pbuild.Render's plain(), or kube.SplitStream for --builder-image) before plan.Canonical, which stays the backstop.
+
+**A25-16 (s3): toolchain.** resolveToolchainSource returns (ref, named | recorded); resolveToolchainImage wraps it for run, whose code is unchanged until M2.6d. toolchainImageFact's component is the kind's name, "builder".
+
+**A25-17 (s4): the vectors.** connect_first edits the fixture record to a first connect (no FatLine, no carrier, no system images); the vectors' deployer is the release v0.0.0-vector at the vector stamp, Revision 0e54eb1 padded to 40 hex. redeploy's record runs system/ images from an earlier farcast, is planned with --embedded, and its config holds a stand-in installer key and a fixed public P-256 test CA, so the vector is stable.
+
+**A25-18 (s3, s4): mutation row 80 for M2.6b.** Row 80 names the keyholder's --instance argument, which is M2.6c's. M2.6b ran it transposed: 80m (renderWorkload derives a non-secret route from the server certificate's length), 80c and 80r (realize renders for the ClusterIP carrier, connect and redeploy) and 80b (build applies an altered stream). All killed. Row 80's own form stays with M2.6c.
+
+**A25-19 (s4): tests the build added.**
+- kernel deploy and storage deploy rows in TestEmbeddedOverAnotherVersionNeedsTheFlag. They kill step 1's M6, which survived once connect and redeploy left resolveImage.
+- TestAPlanFlagIsNeverIgnored's top-level subtest: a global flag whose value names another command (`--config build connect …`).
+- TestABlockedPlanIsRefusedWithItsKind: connect, redeploy and build are never blocked and always end with a confirm line.
+- TestConfirmRefusesAChangedPlan's "tag moved" rows run on deployRigs, because through the router a test binary carries no components.
+- A23-23's --confirm rows for connect (first deploy, resume), redeploy and build.
+
+### Changed by the review (confirmed findings)
+**A25-20 (O-1, S-CSEC-1, A-R-1): five seams refuse in tests.** Supersedes A23-49's two and A24-18's sentence. The provider opener, the image builder, connect's carrier dial (connectDialDefault), the deployer's findSource (findSourceDefault) and its findToolchain (findToolchainDefault) refuse when a test leaves them unset; TestUnsetSeamsRefuseInTests has a row for each. fakeDeployDefaults fakes all five for router-driven tests, so their plans no longer bind the checkout the test runs in. testKernelDeploy and testStorageDeploy set findToolchain = fakeToolchain. Fixtures' carrier endpoints are 192.0.2.10:8443 (RFC 5737), never a routed address; world's markers moved with them. Why: during the build a router-driven row dialled the old fixture's public address once, and A23-34 runs `go env` from PATH while deciding. Pre-existing and left: world's, usage's and keeper's tunnel dials keep their real defaults in tests.
+
+**A25-21 (O-2): connect decides its identity before the registry.** Run calls decideIdentity before registryForPlan, as redeploy does and as connect did before M2.6, so an unreadable or non-P-256 ca.crt is refused before a record with no registry is pre-ensured (a Google write), in --yes and --plan alike. Pinned by TestConnectRefusesItsTrustRootBeforeTheRegistry. Left open: a missing ca.key is still found only at realizeIdentity, after consent and after any pre-ensure, because decide never opens it; decideIdentity could stat the other five material files without opening them (A23-25).
+
+**A25-22 (C-F1): say before refusing.** Outside --plan, connect and redeploy print each decision's said() lines, FatLine's first, through workloadImages.say, which returns a standing version-skew refusal before that decision's own lines. refusal goes through say too. Under --confirm the skew never refuses, so every line prints right after the comparison. An interactive or --yes run never announces a replacement, or a push over a foreign tag, that it then refuses, as at HEAD. Pinned by TestYesNeverReplacesAnotherVersionWithoutEmbedded and TestSkewBeatsAFailedTagLookup.
+
+**A25-23 (C-F2): settleImage refuses the skew before its notices**, restoring HEAD's empty output for kernel deploy and storage deploy with a foreign tag. M2.6c's decide and realize for those two keep that order and print through terminalText, which the wrapper still does not, as at HEAD.
+
+**A25-24 (S-CSEC-4): terminal safety outside a plan.** The lines connect, redeploy and kernel meter print outside a plan, and describeRedeploy's previous image, target and checkout, go through terminalText. Printable text is unchanged. TestPlanRenderingQuotesHostileText gains --confirm rows and a hostile-registry row. Pre-existing and left: confirmBuild's interactive lines print the checkout and the Go path raw.
+
+**A25-25 (C-F3, A-R-2, -3, -6, -7, -9, -10): records.**
+- redeploy's Usage and the README say FatLine deploys alone only when the registry cannot be had (none recorded and its ensure failing, the key refused, the provider not opened); a registry read but failing its ensure after consent refuses the redeploy with nothing pushed or deployed.
+- Redeploy step 10 and redeploy.go's comment say two replicas (maxUnavailable 0, maxSurge 1).
+- A reconnect's --confirm opens no writer and runs no kubectl, and needs the installer's key only for its registry ensure.
+- version_skew is never emitted by connect or redeploy under --plan or --confirm.
+- build's and connect's "what changed" lists name the stream check before the question.
+- The token rider says which images mint.
+
+**A25-26 (M-M26B-MUT-01 to -06): tests added.**
+- TestConfirmBuildsTheSourceItsPlanBound: connect and redeploy --confirm build the bound checkout without asking, with no terminal and with /dev/null.
+- TestConnectAsksBeforeItEnsures: with a registry recorded, nothing is ensured, pushed, built or applied before the cost question is answered.
+- TestConnectPlanFactsFollowItsState: a first deploy binds one cost and three mints and no restart; a resume none of them; a resume whose material is lost three mints then restart{fatline}.
+- TestSkewBeatsAFailedTagLookup.
+
+**A25-27 (O-3, O-4): dates and the qualifier.** M2.6b's notes are dated 2026-11-17. The status lines say the two commands decide both images "before any question or, under --confirm, before the recomputed plan is compared", and ensure, push and build only after consent.
+
+### Refuted, kept out
+- **S-CSEC-2:** a reconnect's registry ensure, under --confirm as under --yes, opens the provider with an ADC install's blank key. Pre-existing at HEAD; A23-24 puts the reconnect in the not-read group, no plan names a Google identity, and ADC's removal is M3b. Carried as an open point for the operator.
+- **S-CSEC-3:** a reconnect's --confirm accepting a moved prefix. The GKE adapter computes the prefix locally from the project, region and instance, all three bound by the plan; only a hand-edited prefix differs, and the reconnect corrects it.
+- **S-CSEC-5:** a source build re-finds its Go after the comparison. A23-13 binds the Go for the recomputation only, the plan's notice says the build compiles what the directory holds when --confirm runs, and the Go used is checked against go.mod's floor and recorded truthfully.
+- **A-R-4, -5, -8:** style; the qualifiers are present or covered by O-4.
+- **M-M26B-MUT-07:** output-only survivor (a constant prefix on planRegistry's refusal), as A17-12's O48.
+
+## 26. Decided before M2.6c's build (2026-11-17)
+
+The operator took both of §25's open points into M2.6c (question asked 2026-11-17, answer "Both"). They touch connect, redeploy, fatline.go and the config package, outside §23's M2.6c file list, and land first inside the part, before kernel deploy. Everything else in M2.6c is §23's build order as amended by §24 and §25.
+
+**A26-1 (S-CSEC-2): a reconnect never ensures as ADC.**
+- `(*fatlineDeployer).ensureRegistry` checks the installer key with `loadInstallerKey` before it opens the provider. A missing, unreadable, unparsable or blank (ADC) key is then `credential_missing` in the writer's own words, and the provider opener is never called. The package-level `ensureRegistry` stays as it is, so `toolchain`, which is outside M2, is unchanged; ADC there goes at M3b.
+- **Interactive and --yes reconnect:** the refusal is the warning it already prints for a failed ensure, then "Continuing: …", the status, and exit 0, as for any failed ensure today.
+- **Reconnect under --confirm:** the status prints, then exit 1 through `msgReconnectEnsureFailed`, whose `%w` keeps `credential_missing`.
+- **The plan:** a reconnect's plan still reads no key (A23-24's not-read group). Only the realize-step ensure checks it.
+- **The other callers:** the pre-ensure (`registryForPlan`) and the realize-step ensure (`realizeRegistry`) gain the same check. planRegistry has already refused a blank key on those paths, so the check adds no new refusal there. kernel deploy and storage deploy take the same check through the deployer.
+- **Tests:** an ADC row in `TestReconnectConfirmFailsWhenItsEnsureFails` (kind `credential_missing`, exit 1, the status printed, the provider never opened). A new `TestReconnectNeverEnsuresAsADC` covers the interactive and --yes rows (warning, exit 0, provider never opened), plus a row with a stand-in key in which the ensure runs once.
+- **Mutation row A26-1m:** drop the check, and the provider opens with a blank key. Must be killed.
+- **Records:** the CLI README's reconnect paragraph and its ADC notes. ADR 0023's M3b text is unchanged.
+
+**A26-2 (A25-21): a missing identity file is refused before anything is asked.**
+- **The new check:** `config.Dir.CheckInstanceMTLS(name string) error`. It stats, without opening, the six files `LoadInstanceMTLS` reads, in its order: ca.crt, ca.key, client.crt, client.key, server.crt, server.key. A file that is missing or not a regular file returns the error `LoadInstanceMTLS` would return for it (`read <file>: <cause>`). It never reads a private key (A23-25).
+- **decideIdentity:** on its load path (ca.crt present), after `requireP256`, it calls the check. The refusal is `load identity for %q: %w`, the same text realizeIdentity's load gives. It is an error in every mode (A23-18): never `plan_changed`, never blocked.
+- **The effect:** connect and redeploy refuse a missing ca.key, or any other missing file, before the registry pre-ensure, any question, any Google write and any plan output. That is the order `TestConnectRefusesItsTrustRootBeforeTheRegistry` pins for ca.crt. Anything removed after the check is still caught by realizeIdentity's load, as today.
+- **storage deploy:** where M2.6c's storage deploy decides its identity with connected=true (A23-43), the check applies there too.
+- **Tests:**
+  - a missing-ca.key row and a missing-server.key row in `TestConnectRefusesItsTrustRootBeforeTheRegistry`: no ensure, no provider opened, nothing printed but the error;
+  - the same rows for redeploy in `TestRedeployNeverMintsIdentity`, or a sibling test;
+  - in the config package, `TestCheckInstanceMTLSReadsNoKey`: every missing file gives its own error, a directory in place of a file is refused, and no file is opened. Prove the last with a key file at mode 0o000 that the check still passes, where LoadInstanceMTLS fails.
+- **Mutation row A26-2m:** decideIdentity skips the check, and the missing-ca.key row then ensures the registry before refusing. Must be killed.
+- **Records:** the CLI README's connect and redeploy flows. The trust-root step names the six files.
+
+## 27. Amendments after M2.6c's build (2026-11-17)
+
+M2.6c was built by workflow wf_9466fe45-40f in six steps:
+1. §26;
+2. the reader seams and kernel deploy;
+3. storage deploy and key pin;
+4. rotate;
+5. the cross-cutting rows, vectors and mutation rows;
+6. the records.
+
+It was reviewed by wf_72d7dac5-65e: lenses S, C, A and M, each with a skeptic, then one fixer. 42 findings were reported, 38 confirmed and fixed (A-R-14 in part), 4 refuted. The orchestrator's O-1 to O-4 went straight to the fixer. The builders ran 114 mutants and the fixer 32, all killed, each behind the tunnel guard, with no dial leaving the machine. These amendments win over §23 to §26 where they differ.
+
+### From the build (accepted)
+**A27-1 (s1): CheckInstanceMTLS's cause names stat.** The refusal keeps LoadInstanceMTLS's `read <file>: ` prefix, but the cause is the stat's: `stat <path>: no such file or directory`, or `stat <path>: not a regular file` (errNotAFile). The check opens nothing, so an `open` cause would misstate it. A26-2's "the error LoadInstanceMTLS would return" now reads "LoadInstanceMTLS's prefix, with a stat cause". mtlsFiles is the one file order that save, load and check share.
+
+**A27-2 (s1): ensureRegistryAs.** The deployer's ensureRegistry ensures with the key loadInstallerKey has just checked, through ensureRegistryAs, so credentials.yaml is not read twice. The package-level ensureRegistry, which toolchain uses, now calls the same tail; its behaviour and its 'load credentials for %q' error are unchanged.
+
+**A27-3 (s2): kernel deploy's plan order.**
+- **The order:**
+  1. Namespaces;
+  2. NamespaceUID;
+  3. the missing-namespace block;
+  4. planRegistry;
+  5. decideImage.
+- **What it means for an ADC install:** under --plan or --confirm, an ADC install is refused by planRegistry after the reader's two GETs. That is before any plan prints and before the provider opens. A23-18 (blocks first) forces this order.
+- **The rows:** A23-23's ADC row reads "only the reader's reads", not "no request". storage deploy's ADC refusal likewise comes after its reader reads and blocks.
+
+**A27-4 (s2): kernel deploy before any identity opens.**
+- The knob bounds, and the whole-second rule (A27-20), are checked from the flags and the record before any reader or writer opens.
+- A bad knob therefore beats a missing namespace: it is a usage error, exit 2, where HEAD gave exit 1, internal. The 'no longer metering' line no longer prints before it. A23-51 gains this.
+- An interactive run has no separate preflight: the plan's Namespaces read as the writer is its first in-process call, as at M2.5.
+
+**A27-5 (s2): kernel deploy's and storage deploy's interactive and --yes consent order.**
+- **The order:**
+  1. say: the notices, the skew refusal, the image notices and the reader warning;
+  2. the cost question (the floor breakdown, then the prompt);
+  3. the build question;
+  4. the registry ensure, then the push or build;
+  5. the replacement note.
+- **A23-51 gains:** the build question moves before the ensure; the foreign-tag and reader warnings print before the floor breakdown and before a no-terminal refusal; refusals end with consentSuffix.
+- **A25-8 widened:** its double, idempotent EnsureRegistry on a record with no registry now names kernel deploy and storage deploy too.
+
+**A27-6 (s2): helpers.**
+- New: planRead (readerPhase under --plan and --confirm, the identity's own error otherwise), readerRemedy, openReadyAt, openConfirmed[W], confirmedCluster, uidText, msgOtherCluster and the openReaderDefault seam.
+- Moved: kernel deploy's registry() moved to the deployer as deployRegistry; imageDecision.say and realizeAndNote are shared by kernel deploy and storage deploy.
+- Deleted: resolveImage and settleImage.
+- For M2.6d: run reuses readerRemedy and the state words (`strings.ReplaceAll(state, "_", " ")`).
+
+**A27-7 (s3, s4): interactive key pin and rotate compute no plan.**
+- **Which runs:** storage key pin's and storage key rotate's interactive and --yes runs keep M2.5's code: writePinLoop, confirmLower and the hand-over. Only --plan and --confirm call plan().
+- **A23-20 narrowed:** "interactive runs pass their pinStore as the plan reader" holds for storage deploy only.
+- **Rotate's pin read:** it now runs before rotationScopeWarning and the question (A23-51 item 3). A keyring behind the pin is refused before the warning prints, and a run with no terminal reads the pin as the writer before it refuses.
+
+**A27-8 (s3): storage deploy's plan order.**
+- **The order:**
+  1. the pin;
+  2. NamespaceUID;
+  3. the keyring and the pin decision, with their blocks;
+  4. decideIdentity(connected=true);
+  5. deployRegistry;
+  6. decideImage;
+  7. the render.
+- **What moved:** an unparsable keys.yaml, a pin that refuses the keyring itself, and an oversize pin are now refused before the cost question, with HEAD's msgDeployPinUnwritten text. HEAD refused them after the cost question, an ensure and a push. A missing material file is refused before anything (A26-2).
+
+**A27-9 (s3): keyholderCost's floor.** It is fullFloorCost (floorFull, the instance fully provisioned), as connect, build and kernel deploy use. A23-33's "storage deploy uses its prompt's" floor reads floorFull, since storage deploy's prompt states none. Standing is keyholderMonthlyUSD in cents, max_month_cents keyholderMonthlyUSDMax.
+
+**A27-10 (s3): storage deploy's texts and re-read.**
+- **Its identity texts:** they are decideIdentity's and realizeIdentity's (`load identity for %q: …`), as A26-2 requires. HEAD's realize-step 'load the mTLS identity for %q' is gone.
+- **The record re-read** (sameRecord) runs only on the mint path, where A23-43's re-read sits. It compares the keyholder, the storage bucket, the storage provider and the storage location.
+- **The bucket-grant notice** is writeBucketGrant's lines with the blank lines at either end trimmed.
+- **Pin facts** list require and retired sorted, once each (Pin.Marshal's order). Lowering keeps Missing, then RetiredActive.
+
+**A27-11 (s3, s4): eight seams refuse in tests.**
+- A25-20's five gain openReaderDefault, ensureStorageDefault (storage deploy's mint) and openKeyholderDefault (key pin's and rotate's keyholder).
+- TestUnsetSeamsRefuseInTests has a row for each, and fakeDeployDefaults sets openReaderDefault to loopbackReader.
+- **Pre-existing and left:** the deployer's newCluster (openWriter) keeps its real default. A full cli run with every non-loopback endpoint refused at openCluster found only one test reaching it, TestReaderEmailMustBeTheDerivedOne/google, and that test builds a client without sending.
+
+**A27-12 (s4): rotate's two pins.**
+- **The hold** is decided over the rotated lists, with each scope's placeholder active. These give the same ids as the held lists whenever the plan is not blocked. A retired active key under --confirm is caught first by beforeHold's pinVerdictAt, as at HEAD.
+- **The final pin** is decidePin over the planned hold, with its method forced to replace at rv "". Its write fact's sha256 covers the document with no resourceVersion. A23-31's "may differ" list gains the final pin's metadata.resourceVersion.
+
+**A27-13 (s4): rotate's --confirm errors.**
+- **Hold stage.** Every failure is kept and returned after the result prints, in place of rotationUnfinished:
+  - plan_changed maps to heldChanged;
+  - msgRotateHoldUnplanned is plan_changed, through changedAfterPlan;
+  - any other failure keeps its own kind, now with heldUnpinned (A27-17).
+- **Final stage.** A read or write failure keeps its own kind under --confirm. Outside --confirm it is rotationUnfinished, internal, through finishPin, as at HEAD.
+
+**A27-14 (s4): A23-11's three outcomes.**
+- Keys put in use and then taken back: 'this machine was put back on its old keys'.
+- The hold written, or a replica refusing the held push, with the keys never put in use: 'a replica refused the new keys'.
+- Otherwise: 'the replicas never took the held keys'.
+
+The final pin is written only when the pin, with the new keys mapped back to their placeholders, Equals the plan's. msgRotateRecordUnread (internal) is --confirm's refusal of a record that cannot be read again after the mint.
+
+**A27-15 (s4): rotate needs an application scope for its pins.**
+- **When the pin machinery applies:** the clock wait, the pin check, the hold and the final pin, and the hand-over notice apply only with a keyholder deployed and at least one application scope. The wait covers the application scopes' KEKs only.
+- **A keyholder but no scopes:** the plan reads the pin and the uid (cluster_identity reader), may block on a keyring behind the pin, and carries rotation{1, 0}, mint{key, ""} and rotationScopeWarning, with no pin facts and no hand-over notice. Its --confirm checks the writer's uid and writes no pin.
+- **No keyholder:** the plan reads no cluster and needs no reader.
+- **The wording:** A23-45 and A23-32 say "with a keyholder and an application scope".
+
+**A27-16 (s5): tests and vectors.**
+- **Row 77's tests are M2.6c's:** TestPlanFromAnotherConfigDirIsRefused, TestPlanAfterReinstallIsRefused and TestPlanAgainstAReplacedSystemNamespaceIsRefused.
+- **The confirm-line router rows:** TestTheConfirmLineRunsTheSameCommand's rows for key pin and rotate use realPinOpener against the fixture's kubetest. Rotate with a keyholder exits 1, unfinished, because the router leaves the keyholder at its refusing default.
+- **How the four vectors are made:** they read vectorCluster, an in-memory reader that refuses any identity but the reader's, and vectorKeyring, a hand-written keys.yaml with a counted test pattern for its key bytes. TestPlanVectors plans each twice and checks that no encoding of the keyring's keys appears.
+
+### Changed by the review (confirmed findings)
+**A27-17 (O-1, S-C26-S1): heldUnpinned.**
+- **The cause:** under --confirm, a hold-stage pin write that fails with anything but plan_changed or *pinBehind reaches handOverKeys wrapped in unwrittenHold. It maps to a new hand-over cause, heldUnpinned. This is a cause, not an error kind.
+- **Its texts:** the reason is 'the key pin that would hold them could not be written (<terminalText(err)>)'. describeRotation says to run rotate again once the pin can be written, and that the keys minted now stay held and unused.
+- **The kind:** the command still returns the error with its own kind.
+- **The plan_changed reason** quotes its cause with terminalText too.
+- **Why:** heldUnrecorded's 'could not save its keyring' was false for a pin failure. It also carried the API server's Status message raw to the terminal, a raw case M2.6c introduced.
+- **Pinned by:** TestConfirmPinNon409FailureKeepsItsKind's hold-stage row, and a hostile-message row asserting that no control byte reaches stdout or stderr.
+
+**A27-18 (S-C26-S2): msgRotateFinalPinChanged.**
+- **When:** rotate's final pin is plan_changed, either the re-read is not the hold or the final write gets a 409.
+- **The pin line says:**
+  - nothing was written over the changed pin;
+  - a replica that restarts may still admit a bundle from before this rotation;
+  - run 'farcast storage key pin <name>' once the keys settle, then rekey. The name is quoted.
+- **The error** stays msgPinChanged, plan_changed. result.Next is unchanged.
+- **Why:** the keys are already in use, so re-planning the whole rotation was the wrong advice.
+
+**A27-19 (O-2, M-O34): rotate's clock is a seam.**
+- **The seam:** keyRotateCommand.sleep defaults to sleepContext, and waitPastNewestKey is (ctx, now, sleep, lists). M2.6d's run D reuses it.
+- **The bound:** the wait is at most one second, inclusive; more is msgClockBehind, internal, with nothing minted.
+- **The test:** TestRotateWaitsForTheClockPastTheNewestKey runs on an injected clock whose sleep advances it and checks that nothing was minted before each wait. Its cases:
+  - a key 0.4 s into its second gives one 600 ms wait;
+  - a key at the start of the second gives one 1 s wait;
+  - a key 1.5 s ahead is refused;
+  - a key in the past gives no wait.
+
+  Its real-clock subtest stays; it can fail only if the clock goes backwards. Rows 79b and O34 are killed with no real-time margin.
+
+**A27-20 (O-3): the kernel's knobs are whole seconds.**
+- **The flags:** kernel deploy refuses an --interval or --adapt-cooldown that is not a whole number of seconds, as a usage error in every mode.
+- **A recorded knob:** a knob that is not whole seconds, which an earlier kernel deploy could record, is refused only under --plan and --confirm. The refusal is internal, through msgKernelKnobNotWhole, which names the knob, its value and the flag that replaces it.
+- **Interactive and --yes runs** show no fact and deploy the recorded value unchanged, so no record is stranded.
+- **kernel_settings:** adapt_cooldown_s and interval_s are exact whole seconds.
+- **Why:** the plan showed a truncated value while the digest bound the exact one.
+- **Pinned by:** TestKernelDeployKnobsAreWholeSeconds. No vector changed, because kernel_deploy binds 0 and 0.
+
+**A27-21 (C-R1): the pre-ensure runs only for a run that can pass the gate.**
+- **The rule:** Run computes `ensure := mode == consentNone && (assumeYes || isInteractive(env))` outside plan() (A23-38), and passes it to deployRegistry(ctx, env, meta, ensure). This narrows A23-24's exception for kernel deploy and storage deploy.
+- **The effect:** a run with no terminal and no --yes, on a record with no registry, is refused by planRegistry's msgNoRegistryRecorded, exit 1, internal. Nothing is ensured, the provider is not opened, and the record is unchanged. At HEAD the same run was refused at the cost question, exit 2, with nothing written.
+- **Why:** the build ensured, a Google write, before that refusal.
+- **Pinned by:** TestNonInteractiveRefusalsNameThePlan's kernel deploy and storage deploy rows.
+
+**A27-22 (C-R5): the vectors' uid.** vectorSystemUID is A23-29's 00000000-0000-4000-8000-000000000026. The four M2.6c vectors were regenerated and differ only in system_namespace_uid and digest. error_plan_changed's digest still equals kernel_confirm's.
+
+**A27-23 (O-4): RFC 5737 only.**
+- The cli tests' WaitExternalIP answers moved:
+  - 34.0.0.1, 34.0.0.2 and 34.0.0.9 to 203.0.113.1, .2 and .9;
+  - 1.2.3.4 to 198.51.100.4.
+- 10.0.0.5, private and used by the endpoint-rule tests, stays.
+- A grep of every IPv4 literal in the cli tests finds only RFC 5737 addresses, 127.x and 10.0.0.5.
+
+**A27-24 (S-C26-S5, C-R2, C-R3, M-O30, -O31, -O52 to -O55): the cross-cutting rows cover the four commands.**
+- **TestPlanReadErrorsNameTheReader** iterates readerPlans and fails each command's first reader GET: Namespaces for kernel deploy, the pin ConfigMap for the three storage commands. It runs the RBAC and the endpoint 403 rows under --plan and --confirm.
+- **kernel deploy's and storage deploy's rows** are added, through singleImageCommands over kernelRig and storageRig, to:
+  - TestConfirmExecutesWhatItCompared: one lookup, nothing pushed or built, and the compared reference applied and recorded when the tag moves after the comparison;
+  - TestConfirmCoversTheReplacementItsPlanListed (row 83);
+  - TestConfirmRefusesAMovedRegistry: plan_changed with msgPlanAgain under --confirm, internal under --yes.
+- **planCommands** gains 'storage deploy/a named image', so TestPlansStillReadTheInstallerKeyForGoogle covers the image flag.
+- **A storage key pin --confirm ADC row:** credential_missing at the writer's open, after the comparison.
+
+**A27-25 (M-O09, -O16, -O17, -O24, -O32, -O33, -O37, -O40, -O45, -O51): the tests added.**
+- **TestConfirmChecksTheWriterBeforeAnythingIrreversible:** two rows in which the plan writes no pin and another writer replaces it as the writer opens; checkPlannedPin's Equal.
+- **writePinOnce's read-back:** an empty-pin create that fails with a 500 is cluster_rejected, with nothing deployed. An absent pin no longer passes as the planned empty one.
+- **Key pin --replace:** a lowering row with RetiredActive, and TestKeyPinPlanBindsReplace.
+- **TestFirstStorageDeployStatesTheKeyringItMints.**
+- **TestKernelSettingsFactCarriesTheRecordedKnobs:** adapt and interval_s come from the decided knobs, not the flags.
+- **Rotate:** a row where the record cannot be read again after the mint.
+- **storage deploy:** a lost-trust-root row (ca.crt gone) proving it decides with connected=true.
+
+**A27-26 (A-R-1 to A-R-14): records.**
+- **Rotate's riders and Usage** split the cases:
+  - before the hold, the keys are held and unused;
+  - after the hold or at the final pin, the keys are in use and the final pin is unwritten, and the line names key pin, then rekey.
+- **Rotate's pins** need a keyholder and an application scope. A writer that will not open refuses a --confirm before anything is minted.
+- **The version_skew row and the M2.6 note** name kernel deploy and storage deploy beside connect and redeploy.
+- **plan_changed's lists** gain the hold that is not the plan's.
+- **The token bullet** says which images mint a registry token, and that --confirm mints the reader's token, then the writer's after the comparison, then one for each push or build. A review overlay counted the cluster tokens: one reader under --plan; one reader, then one writer, under --confirm.
+- **The kubectl note** names key pin's and rotate's --confirm, which apply nothing.
+- **kernel deploy's namespace block is quoted.**
+- **A26-1's warning** is quoted for an ADC install, and A26-2's cause names stat.
+- **The M2.5 sentence** about the writing commands' reads is qualified where M2.6c's follows it (AGENTS.md, PLAN.md, ADR 0023's status line, README.md).
+- **Readability:** long sentences in PLAN.md:457 and AGENTS.md:48 and :52 were split, and the README's 'two identities' then 'a third' riders were reconciled.
+- **Test comments** that M2.6c made false were corrected.
+
+### Refuted, kept out
+- **C26-S3:** under --confirm, a hand-over that never reached a replica prints the interactive 'not moved: the hand-over did not check this keyring…' line, not A23-11's line. The behaviour is correct (no pin, internal, exit 1). A23-11 aims its new line at the outcomes of a checked hand-over. The remedy beside the unchecked line, to rotate again, is the right one there.
+- **C26-S4:** storage deploy --confirm's msgPinChanged, for a pin moved after the ensures, does not list the idempotent ensures before it. A23-42 fixes that text. Nothing is recorded or applied, and the re-plan shows the state.
+- **C26-S6:** TestPlansCarryNoKeyMaterial does not search for reader.key, credentials.yaml or the tokens. It matches A23-25's pin, and no fact is built from them (checked). A possible later hardening.
+- **C-R4:** storage deploy's identity refusals changed wording. That is the wording A26-2 prescribes (A27-10).
+
+### Left open
+- **A-R-14's optional restructuring** of the README: a table for the 'needs' paragraph, and moving the rotate and key pin riders out of their bullets.
+- **Text printed raw since before M2.6c:**
+  - the hand-over's other Reason and Problem sites that print err.Error();
+  - writeBucketGrant's project;
+  - the reconnect's 'Warning: %v';
+  - handPin's and key pin's '(%v)' of a keyholder-open error.
+
+## 28. Decided before M2.6d's build (2026-11-17)
+
+M2.6d was mapped against the code at 73f43c0 by workflow wf_4c4db857-df7: four read-only lanes (the cluster package and the kernel's ledger; `run`; the cross-cutting tests and guards; the records), then a completeness critic. The raw map is `m26d-map-result.txt` beside this file, and the critic's digest is `m26d-map-critic.txt`. Builders read both; where a lane's proposal and this section differ, this section wins. The operator answered three questions on 2026-11-17, each as recommended. This section wins over §23 to §27 where they differ.
+
+### Decided by the operator on 2026-11-17
+
+**A28-1: at the limit, `run --yes` refuses any deploy (widens P1's gate).**
+- **Why:** P1's gate refused only a restart of an application the cost guard stopped. At the limit, a `run --yes` whose applications are all new still ran every build (1 vCPU / 2 GiB each, up to 30 minutes; the kernel scales only Deployments, so it never stops a build) and started the new Deployments until the kernel's next tick. A script looping `run --yes` kept spending.
+- **"At the limit"** is A28-4's ledger rule: the level reads `cost.LevelReached.String()`, a level `levelOf` maps to unknown, the ledger is unreadable, or it is stale (A28-2). An absent ledger (found false, no error) is not at the limit.
+- **A new field on the run fact.** `plan.RunFact` gains `limit_reached bool` and `limit_reason string`, after `metering_added`. `limit_reason` is `""` when the limit is not reached, otherwise one of `limit reached`, `level unknown`, `ledger unreadable` or `ledger stale`. The renderer prints `the instance's spending is at its limit (<reason>); this deploy adds to it until the kernel's next tick stops its applications`. Each `application_reset` fact's `limit_reached` equals the run fact's.
+- **`--yes` at the review.** It refuses after the review prints and before `Approved with --yes`, with nothing built. It is a usage error (exit 2), with the text: `run --yes would deploy %q while the instance's spending is at its limit (%s)%s; confirm it interactively, or run the same command with --plan in place of --yes and confirm the plans it prints. The manifest was read; nothing was built or deployed.`
+  - The first `%s` is the reason.
+  - The second is `""`, or `, and would restart <list>` with A23-48's list form (`<ns>/<app> (stopped by the cost guard)`, `(scaled to 0 replicas)`, `(not read)`).
+  - A run with no terminal and no `--yes` keeps `msgRunYes` and the consent suffix.
+- **Interactive runs.** When the limit is reached, the review prints the line above, then A23-48's per-app lines for stopped or unread apps, and asks as today.
+- **The re-read** (A23-2, after the builds, before the policy):
+  - **`--yes`:** if the limit is reached now, it refuses with the same text, ending `The builds were written, and nothing after them was.` instead.
+  - **Interactive:** if the limit was not reached at the review and is now, it prints the line and asks again. A decline prints `Aborted. The builds were written, and nothing after them was.` and exits 0.
+  - **`--confirm`:** if the limit is reached now and D's run fact has `limit_reached: false`, it refuses with `plan_changed`: `the instance's spending reached its limit, or its kernel's ledger became unreadable or stale, since the plan was made; the builds were written, and nothing after them was; ` + `msgPlanAgain`. A D with `limit_reached: true` proceeds; that is the consent.
+- **A23-48's per-app gate** is subsumed under `--yes` (any deploy at the limit is refused). Its reset lines, the per-app interactive lines, and the `--confirm` per-app comparisons (replicas and requests changed; Present changed) stay as they are.
+- **Pinned by:**
+  - `TestYesNeverDeploysAtTheLimit`: every app new, the limit reached; refused at the review, no build Job applied;
+  - `TestYesNeverRestartsAStoppedAppAtTheLimit`, `TestYesNeverRestartsAnAppStoppedDuringTheBuild` and `TestYesGateReadsTheKernelsOwnLevelString`, as A23-48;
+  - `TestConfirmRefusesALimitReachedAfterThePlan`;
+  - `TestConfirmAtTheLimitDeploysWhatItsPlanStated`.
+- **Mutation rows:**
+  - **89e:** let `--yes` through at the limit when no app is stopped. Killed by `TestYesNeverDeploysAtTheLimit`.
+  - **89f:** drop `limit_reached` from the re-read comparison under `--confirm`. Killed by `TestConfirmRefusesALimitReachedAfterThePlan`.
+- **Records:** P1's widening in ADR 0023 Choices 6's answered note: `(c) forced, each reset a review and plan fact; and while the limit is reached, no --yes deploy at all (widened 2026-11-17)`. Also the CLI README's run section and AGENTS.md's cost-control paragraph, only where it already describes run.
+
+**A28-2: a stale ledger counts as at the limit.**
+- **The rule:** the checkpoint's observation time is `Observed.At`, or `Last` when that is zero, exactly as `worlddoc.go:904-909` computes it. The ledger is stale when that time is zero or before `now − checkpointStaleAfter` (15 minutes). The gate then reads `limit_reached: true` with reason `ledger stale`.
+- **One definition:** the gate and `world` share one helper and the one constant, not two copies.
+- **The clock** is run's own `now` seam (A23-29's stamp), so plans stay deterministic.
+- **Why:** the gate fails closed. A kernel that stopped reporting no longer guards spending.
+- **Pinned by:** `TestYesGateCountsAStaleLedgerAsReached`, with a ledger saved 16 minutes before the clock, and one saved 14 minutes before, which passes. Mutation row **89g:** drop the staleness clause.
+
+**A28-3: the older raw texts are quoted.** These predate M2.6c and are now quoted through `terminalText` (or `%q` where a name is quoted today):
+- the hand-over's remaining `Reason` and `Problem` sites that format `err.Error()` or `%v` (`storagekeyholder.go`);
+- `writeBucketGrant`'s project (`storagedeploy.go`);
+- the reconnect's `Warning: %v` (`connect.go`);
+- `handPin`'s and key pin's `(%v)` of a keyholder-open error (`storagepin.go`, `storagekey.go`).
+
+Each gets a hostile-text row (a value or error carrying ESC, OSC and a bell), asserting that no byte below 0x20 other than `\n` reaches stdout or stderr. Printable text is unchanged. This is the first step of the build.
+
+### Decided by the orchestrator (from the map's critic)
+
+**A28-4: the ledger rule.**
+- **Absent:** the ledger is absent only when the read returns found false and no error. The gate then does not apply.
+- **Unreadable** counts as reached:
+  - any read error (a 403, a non-Status 404, a transport error);
+  - the key missing (`configMapValueInProcess` returns found true with an error, `cluster/open.go:432-442`);
+  - an empty or whitespace value;
+  - a `DecodeCheckpoint` or version error;
+  - a `cost.Restore` error.
+
+  Reuse `decodeCheckpoint` (`costs.go:159-174`).
+- **Reached:** `Level == cost.LevelReached.String() || levelOf(Level) == stateUnknown`, compared with the constant, never a literal. A28-2's staleness is added to this.
+- **The tests' checkpoints** are saved through `kernel.ConfigMapStore.Save`, through an in-memory `kernel.ConfigMapClient` that answers `tkube.ErrNotFound` until saved, with `Ledger = cost.NewLedger(start, end).Snapshot()`. A zero Ledger is unreadable and would make every row read reached. Assert that the 90% row passes the review.
+- **Ledger rows:** a 403, the key missing, an empty value, version 9, an unknown level, a zero Ledger, stale, fresh.
+
+**A28-5: an application's state.**
+- **The precedence:**
+  1. `unknown`: a read error, or no container named after the app (`requests_live = Requests[app.Name]`);
+  2. `stopped`: `replicas_live == 0`, adapted or not;
+  3. `adapted`: `AdaptedAt` after `LastAppliedAt`.
+- **What the checks key on:** every gate and re-read keys on `replicas_live == 0 || unknown`, never on the state word.
+- **`stopped_by_cost_guard`** needs `replicas_live == 0` and a Stop with `Reason == kernel.StopReasonCostGuard` and `tenantOf(s.Namespace, s.Deployment) == <ns>/<app>`, matching `world` (`worlddoc.go:864-868`, `:945`).
+- **Pinned by:** an adapted-and-stopped row in `TestYesNeverRestartsAStoppedAppAtTheLimit`. The mutant "adapted before stopped" must fail it.
+
+**A28-6: errors in D's reads.**
+- **Namespaces and Workloads:** an error from these is a read error through `planRead(m, err, name)` in every mode, never "namespace absent". A row whose Namespaces call fails must be refused.
+- **DeploymentState:** an error becomes `unknown(<kind>)`. The exception is a `tkube.ErrForbidden` under `--plan` or `--confirm`, which is returned through `planRead`. `namespaceRefused` is not used for D: under P3's block it equals `readerRefused`, and wrapping it in `readerPhase` would print the remedy twice.
+
+**A28-7: the cluster package (A23-46, amended).**
+- `statusNotFound(err)` is extracted from `configMapInProcess` (`cluster/open.go:419-430`) and used there and in `DeploymentState` and `JobState`. The absence test is never `errors.Is(err, tkube.ErrNotFound)`, which a non-Status 404 also satisfies.
+- `Requests{CPUMilli, MemMiB int64}`: `""` is 0, tested before parsing. A non-empty quantity that does not parse is a `DeploymentState` error wrapping `kube.ErrUnreadable`, so the app is unknown and the check fails closed.
+- `AdaptedAt` uses `kernel.Target{Annotations}.AdaptedAt()` (`technocore/kernel/reconcile.go:287-297`). The annotation is `kernel.AdaptedAtLabel`.
+- `LastAppliedAt` uses one exported predicate in kube (for example `kube.IsLastApply(entry)`, from `kube/migrate.go`'s `isSSAEntry`/`isCSAEntry`), shared later by M2.7's `Traces`. `KUBERC=off` keeps kubectl's apply client-side.
+- **`JobResult.UID`** is filled from `waitJobInProcess`'s GET.
+- **`TestAKubectlClientHasNoCanI`'s new rows:** the `DeploymentState` row compares field by field (the struct holds a map), and the `JobState` row checks `res == (JobResult{}) && !found`.
+- **Mutation:** `TestDeploymentStateReadsTheAdaptationAndTheLastApply` has a non-Status-404 row, with the mutant `errors.Is(ErrNotFound)`.
+
+**A28-8: the shape of run's plan.**
+- **F's blocks first.** F's blocks (`requireKernel`, `refuseSharedAppScope`, `refuseOtherRepository` for `--namespace`) read only the record and keys.yaml, and are evaluated first in every mode. Then, interactively, `openReady`; then both toolchain images are resolved; then the render. `consent.mode` runs right after the argument count, before `repoURL`.
+- **Options** bind the raw flag values (A23-28, build's precedent). F resolves both toolchain images, so a builder tag is refused before the fetch bills. F binds the fetcher's `image` fact, D the builder's.
+- **`deployPlan` takes the consent mode:**
+  - the unmetered-namespace block and the pin blocks apply under `--plan` and `--confirm` only;
+  - in `consentNone` it skips D's pin read and keeps `writePinLoop`, so an interactive or `--yes` run into an unmetered, existing namespace still deploys and meters it;
+  - the CA-key block applies in every mode;
+  - in `consentNone` a block is refused with its original error, so a manifest named like a system namespace keeps exit 2. Only `--confirm` uses `refuseBlocked`.
+- **`other_deployments_kept`:** the target namespace's Deployments and StatefulSets that the manifest does not declare, sorted, read with `Workloads` only when the namespace exists (and, under `--plan` and `--confirm`, is metered). `runPlanReader` and `runCluster` gain `Workloads`.
+- **The `--confirm <D>` path when F is blocked:** if F carries blocks and the digest given is not F's, refuse `planChanged(F.digest, d)` before any reader check or open.
+- **Notices:** the review's FatLine-not-deployed warning becomes a D notice. On `--confirm <F>`, D's notices are facts only. Under `--confirm <D>` they print once after the comparison, and the review is not printed.
+
+**A28-9: the CA key.** `InstanceCAKeyExists` is true only for a regular file with `Size() > 0`, through `Stat` alone, following `CheckInstanceMTLS`'s pattern. `SaveInstanceMTLS` writes empty files, and the old refusal was `len(CAKeyPEM) == 0`. Its config test covers a missing file, a directory, an empty file and a 0o000 key. `run_deploy`'s vector writes a non-empty stand-in `ca.key`, which is never read. `TestRunRefusesStorageWithoutTheCAKey` also asserts that no build Job was applied. The residual stays recorded: another missing mTLS file still fails at translate's `LoadInstanceMTLS`, after the builds.
+
+**A28-10: run's pin, egress policy and scopes under `--confirm`.**
+- **The pin:**
+  - `writePinOnce` at D's rv, and the mapped-back pin must Equal the planned one, otherwise `plan_changed`;
+  - the `plan_changed` is captured through a `*error` that `handScopesToTheKeyholder` owns, as rotate does with `holdErr`;
+  - `handScopesToTheKeyholder` gains an `error` result, nil outside `--confirm`. On `plan_changed` it skips its notices and returns A23-48's long text before the workload Apply;
+  - a non-conflict pin failure warns, as the interactive run does (§9.4).
+- **No clock wait.** run never calls `waitPastNewestKey`: it mints only fresh scopes and raises the pin with `withRetired=false`, so `Created` never enters the pin. This amends A23-32's "and run D's new scopes".
+- **New scopes in the plan:** each emits `mint{app_scope, <scope>}`, then `mint{key, <scope>}`, under `datasphere.AppScopeName(ns, app)` with n = 1, so `placeholderKeyLabels` names it "new key 1 of <scope>".
+- **The egress policy:** under `--confirm` its rv is compared before any credential is minted, by splitting `egressPolicy` into three steps:
+  1. `readEgressPolicyAt` (`ConfigMapData`: data and rv);
+  2. compare the rv with the policy write fact;
+  3. build the document with the minter.
+
+  The pin's rv is re-read with the apps and the ledger, after the builds and before the policy.
+- **The scopes:** under `--confirm`, `ensureAppScopes` refuses with `plan_changed`, before `SaveInstanceKeyring`, when the scopes it would mint differ from D's planned set.
+- **The re-read checks Present:** it compares each app's `Present` with `preparedDeploy`'s, not only with its `application_reset` fact, so a Deployment found in a namespace that was absent at the plan is `plan_changed`.
+
+**A28-11: seams and harness.**
+- **Defaults:** run's `newPlanReader` lazily wraps `openReaderDefault`, and its `newKeyholder` defaults to `openKeyholderDefault`. No new refusing seam is added.
+- **Compile fix:** `runWriterWithPin` (`run_test.go:1495-1502`) gains an explicit `ConfigMapData` in the same edit that adds it to `runCluster`, since `fakePinStore` already has one. The pin's name goes to `fakePinStore`, everything else to `fakeRunCluster`.
+- **Registration lands with its tests.** Registering run's consent flags lands in the same step as:
+  - `wiredCommands` gaining `"run"` after `"build"` (`consent_test.go:480`);
+  - `gates["run"] = msgRunYes` with its subtest;
+  - run's Usage carrying `[--plan | --confirm <digest>]`.
+- **`planCommands`** carries F only. `runDeployRows` adds two helpers:
+  - `runDeployDigest` runs `--confirm sha256:0…0`, the "otherwise" path: it reads only as the reader, writes nothing, and its `plan_changed` text names D's digest. It serves the write, terminal, token, RBAC and installer-key tests;
+  - `runDeployPlan` runs `--plan`, then `--confirm <F>` under `succeedingKubectl`, and returns D. It serves rendering, vectors, key material and determinism.
+- **The changed-plan tests:** run F's rows expect A23-47's absent-Job text when no Job is seeded. `planCommand` gains `confirmReadsCluster`, which allows the reader's Job GET.
+- **`runFixture`** seeds:
+  - `farcast-system` with a uid, and the target namespace, labelled and metered;
+  - the completed fetch Job and its pod;
+  - a completed build Job and pod per app, with fixed digests and uids;
+  - the rolled-out app Deployments (`replicas`, `updatedReplicas` and `availableReplicas` equal; `observedGeneration` equal to `generation`), with managed fields and the adapted-at annotation;
+  - a valid ledger (A28-4), the policy and the pin.
+
+  It drops `technocore-namespaces` and the technocore Deployment. The P1 tests run on `fakeRunCluster` with a build-time hook; kubetest serves the identity, RBAC and stage rows.
+- **The RBAC test:** `TestEveryReaderReadIsAllowedByTheRenderedRBAC` renders from the fixture's `meta.Kernel.Namespaces`, with the target namespace metered, and drives `run <D>` through `runDeployDigest`.
+- **Installer-key rows:** `run --plan` is in the readsKey group as false. D's row goes through `runDeployDigest`. The README says `--confirm <F>` reads the installer key for the fetch apply.
+
+**A28-12: the gate's position and exit codes.**
+- **Under `--yes`:** the gate is a usage error (exit 2), at the review and at the re-read.
+- **At the review:** it refuses after `rev.print` (the reset lines included) and before `confirm()` prints `Approved with --yes; nothing was asked.`
+
+**A28-13: the mutation rerun (step 9c).**
+- **The generator:** one generator over every earlier table (`m26c/mk-step*.py`, `fixer-m26c/mk.py`, `mut-m26c-scripts/muts.py` and M2.6a's and M2.6b's), with three duties:
+  - it checks that each anchor occurs exactly once;
+  - stale anchors are re-anchored by hand once M2.6d's code is final;
+  - the tunnel guard goes into every overlay.
+- **Renames:** the two rows named 80b become `80b-rotate` and `80-build`.
+- **How it runs:**
+  - `FARCAST_UPDATE_VECTORS` is unset, so `TestPlanVectors` never rewrites testdata;
+  - PATH is pinned;
+  - rows 72 to 91 and the new rows run by named test, and the new rows' forms also run against the full package.
+- **The end state:** `git status` is unchanged from before the rerun.
+
+**A28-14: records.**
+- **The list:** lane 4's change list is M2.6d's records list.
+- **ADR 0021:** its two lines were swapped in A23-52: Verification 4 is at `:466` and Consequences at `:393`.
+- **Status sentences:** these are false and get dated riders:
+  - ADR 0023's status line, which says Choices 6 and 7 stay open until M2;
+  - ADR 0021's status line, which says nothing else is built;
+  - ADR 0021 `:221`, which says M2 is not yet built.
+- **The CLI README:**
+  - it gains `## farcast run` before `## farcast build`, holding the plans, review and gate subsections; the existing run subsection at `:1451` moves into it unchanged;
+  - the placeholder list is rewritten whole: the CA, the leaves, `app_leaf`, `egress_credential`, key ids and the bucket;
+  - it states every difference, A27-12's seventh included, in place of A23-31's "six".
+- **Residuals the run section records:**
+  - another missing mTLS file still fails after the builds;
+  - the adapted line can repeat while a run changes no value;
+  - an absent ledger (a kernel that has never saved one) does not gate.
+- **AGENTS.md:** with M2.6 complete, its ADR 0023 paragraph replaces M2.6's per-part dates with one sentence (M2.6 built 2026-11-16 to 2026-11-17, not walked, plans on all eleven commands), losing no qualifier.
+
+### Refuted in the map, kept out
+- **"kube's Deployment decoding gains the annotations and managed fields":** `kube.ObjectMeta` already carries them (`kube/reads.go:26-42`).
+- **The `job_uid` pairing race** between `WaitJob`'s and `jobLogs`' GETs: it fails safe as `plan_changed`.
+- **"The adapted line can repeat":** accurate, but the adapted state never gates. It is recorded as a limitation (A28-14).
+- **Exporting `translate.Replicas`:** an optional cleanup outside cli.
+- **A non-409 pin failure under `run --confirm`:** §9.4 already decides it: it warns.
+- **"No ninth refusing seam":** run's lazy defaults are covered by the existing rows.
+- **"requireGrantedReader's generic text":** A23-21 pins run's own text.
+
+### The build order (M2.6d, one commit)
+- **R:** A28-3, the raw texts.
+- **8a-1:** the cluster package (A23-46, A28-7).
+- **8a-2:** P1 for interactive and `--yes` runs. A new `runreset.go` holds the ledger rule (A28-2, A28-4), the states (A28-5), the review lines, the gate (A28-1, A28-12) and the re-read, on `fakeRunCluster`.
+- **8b-1:** refactors that change no behaviour, plus the early CA-key refusal:
+  - `applyFetch` and `readFetch`;
+  - `readEgressPolicyAt` and the minter;
+  - translate's issuer;
+  - `ensureAppScopes`' id map;
+  - `meteredReaderNote` (the wrapper deleted);
+  - `InstanceCAKeyExists` (A28-9);
+  - `runCluster` gaining `ConfigMapData` and `Workloads`, with the `runWriterWithPin` fix.
+- **8b-2:** run's stages:
+  - the consent flags with the `consent_test` edits (A28-11);
+  - F, D and the three paths (A23-47, A28-8);
+  - the pin, the policy and the scopes under `--confirm` (A28-10);
+  - run's stage tests and the vectors `run_fetch` and `run_deploy`;
+  - the new P1 rows.
+- **9a:** `runFixture`, `runDeployRows`, and run's rows in every cross-cutting test.
+- **9b:** the "every" guards:
+  - `TestEveryBehaviourFlagIsBound` (exempt: the global flags, `plan`, `confirm`, `yes`, `y`);
+  - a check that every `writeCommands()` name has a `planCommands` row;
+  - `wiredCommands` derived rather than listed;
+  - `TestPlansWriteNothing` and `TestPlanIgnoresTheTerminal` over every row, plus D through `runDeployDigest`.
+- **9c:** the mutation rerun (A28-13).
+- **10:** the records (A28-14).
+
+## 29. Amendments after M2.6d's build (2026-11-18)
+
+M2.6d was built by workflow wf_6c1ed51b-a22 in nine steps: R, 8a-1, 8a-2, 8b-1, 8b-2, 9a, 9b, 9c and 10 (§28's build order). It was reviewed by wf_9ce3be8b-41c: lenses S, C, A and M, each with a skeptic, then one fixer. 31 findings were reported, 20 confirmed and fixed (S-COST-2, A-R-3 and A-R-6 in part), 11 refuted. The orchestrator's O-1 to O-4 went straight to the fixer. The builders ran 148 mutants and the fixer 27, all killed. Step 9c re-ran every earlier table (773 rows as 617 mutants): 758 killed, 11 proved equivalent, and 3 survivors the design had already accepted. Every run went behind the tunnel guard, with no dial leaving the machine. These amendments win over §23 to §28 where they differ. With M2.6d, M2.6 is complete in the code; none of it is walked.
+
+### From the build (accepted)
+**A29-1 (8a-1): the cluster package.**
+- `JobState` fills `JobResult.Succeeded` by WaitJob's own rule (`jobSucceeded`, now shared) and never `Message`. A Job that has not succeeded may be running or may have failed.
+- `DeploymentState.AdaptedAt` and `LastAppliedAt` are normalized to UTC. An unparseable managed-fields time is skipped, not an error: it can only make an app look not adapted, which never gates.
+- An unreadable quantity is an `unreadable` error unwrapping to `kube.ErrUnreadable`, with the text `cluster: the Deployment <ns>/<name>'s container %q requests <cpu|memory> %q, which farcast cannot read as a quantity`.
+- `kube.IsLastApply` is `isSSAEntry(FieldManager) || isCSAEntry(kubectl client-side apply)`, each with `Subresource == ""`.
+
+**A29-2 (8a-2): P1.**
+- `classifyApp` treats a Deployment with no `spec.replicas`, or with no container named after the app, as unknown (`document_unreadable`). An unknown app has `Present` false; every caller checks `Err` first.
+- The reset lines print under a `Resets:` heading, after the cost. A28-1's limit line prints in the review in every mode. Interactive per-app lines name `<ns>/<app>`.
+- `readLive` errors end `; the manifest was read, and nothing was built or deployed` at the review and `; the builds were written, and nothing after them was` at the re-read.
+- `limit_reason` takes the first that applies of: ledger unreadable, limit reached, level unknown, ledger stale.
+- world's cost-guard stop loop is `costGuardStops` in `runreset.go`, shared by world and run. world's behaviour is unchanged.
+- `runCommand.interactive` is a test seam defaulting to `isInteractive`.
+
+**A29-3 (8b-1): the refactors.**
+- The egress policy is `readEgressPolicyAt(ctx, configMapDataReader) (doc, rv, err)` plus `egressPolicy(existing, ns, m, mint)`. The rv comparison is in deploy, under `--confirm` only. `policyReader` folded into `configMapReader`.
+- translate takes the CA certificate and an issuer and no longer takes env; execution builds them with `issueAppLeaves`.
+- `ensureAppScopes` returns the id map (each fresh scope's first KEK to `placeholderKeyID(scope, 1)`), empty and never nil.
+- `InstanceCAKeyExists`: a non-regular file is false with a nil error; any other Stat error is an error, never "no key".
+- `refuseNoCAKey` runs after the fetch, the parse and the manifest-namespace checks, and before `readLive`, the review and the builds.
+- `meter` prints `meteredReaderNote` itself, at the same point and in the same words as the deleted wrapper.
+
+**A29-4 (8b-2): run's stages.**
+- D is computed in every mode. Interactive and `--yes` runs therefore read the egress policy, the target namespace's workloads, `keys.yaml` and `ca.crt` before the review, and refuse an unreadable one before the builds with `msgNothingDeployed`. The metered-reader warning prints with the review's notices.
+- In consentNone, D binds the farcast-system uid the writer's preflight read (`openReadyAt`) and does not read it again; under `--confirm` it reads the uid as the reader.
+- `other_deployments_kept` entries are `<lowercased kind>/<name>`, sorted, excluding manifest apps; StatefulSets are always kept.
+- **run's cost facts:** F's one_off is the manifest read (1 Job, 200m, 512 MiB, 300 s) over `floorNow`. D's standing is one entry per app (1 replica, 100m, 128 MiB, month cents) and its one_off is the builds (n Jobs, 1000m, 2048 MiB, 1800 s).
+- **Under `--confirm`:** a re-read Namespaces list that fails is its own error (internal) with the builds-written suffix, not plan_changed; a failed per-app read is a change. The re-read's order is apps, ledger, pin rv.
+- The scope-set check sits in `ensureAppScopes`, after the policy apply and before `SaveInstanceKeyring`, with `msgScopesChangedSince`. `runPinPlan.write` decides the pin again over the real keyring from the plan's pin; a mapped-back mismatch or a `writePinOnce` conflict is plan_changed, kept in `*failed` and returned before the workload apply.
+- The `--confirm <D>` JobState failure reads `read the fetch Job farcast-system/<job>: %w`, through planRead.
+- `runCommand.mintCredential` is a seam (`credentialMinter`, defaulting to `mintEgressCredential`, local crypto/rand); it needs no refusing default.
+- `resolveToolchainImage` and `preflightNamespace` were deleted, with no production caller left.
+
+**A29-5 (9a): the fixtures.** `runWithFakes` uses the real `openWriter`, counted, because `--confirm <F>` must apply the fetch. The run `<D>` writer-uid row serves a different farcast-system uid to the writer alone through kubetest's `WithHandler`. `TestEveryReaderReadIsAllowedByTheRenderedRBAC` renders every row's RBAC from its own fixture's record.
+
+**A29-6 (9b): the guards.**
+- `TestEveryBehaviourFlagIsBound` counts a flag as bound only as an option whose value equals the parsed flag's `String()`. The exempt set is derived from `registerCommon` plus `plan`, `confirm`, `yes` and `y`.
+- `everyPlanShape` (planCommands then `runDeployRows`) feeds `TestEveryWritingCommandHasAPlanRow`, `TestPlansWriteNothing`, `TestPlanIgnoresTheTerminal` and `TestEveryBehaviourFlagIsBound`.
+- `wiredCommands` is derived: every `writeCommands` row registers both flags, with the type `defaultRegistry` builds.
+- `routeLine` refuses a command that lacks `--plan` and `--confirm`, instead of registering them for it.
+- `msgRunYesAtTheLimit` is a `--yes` refusal outside the `consentSuffix` rule, and names `--plan` in its own words.
+
+**A29-7 (9c): the rerun.** One overlay per distinct mutant; each row judged by its own named jobs, and every M2.6d row also against its whole package. 66 stale anchors re-anchored by hand. Four rows added (O34-say, O34-say-only, O07c-say, O07r-say); `TestEmbeddedWithFatlineImageGovernsShrikeOnly` now also checks stderr. m26a/s1-mutfacts:unsampled is killed in a scratch copy, because its test reads the source from disk. The accepted survivors m21b, m26 and O20 stay accepted; their killers were drafted under the rerun's `kill/` and not landed.
+
+**A29-8 (10): the records.** The CLI README's run section is `## \`farcast run\` — deploy a repository (Phase 4.3)`, matching its other H2s. The "since M2.6c" qualifiers became "since M2.6", naming run's deploy plan. ADR 0021:3's rider also names M1's skew guard.
+
+### Changed by the review (confirmed findings)
+**A29-9 (O-1): run's clock in the router rows.** `runNowDefault = time.Now` is a package seam that `ensureDefaults` uses, as `deployerNowDefault` does for the deployer. Router-driven run rows set it through `pinRunClock`, and the router's deploy plan row asserts `limit_reached` false. Otherwise what those rows test would depend on the wall-clock date.
+
+**A29-10 (O-2): the fetch fact's rendering.** The fact binds `--ref` and `--manifest` as given (`""` when absent, A28-8). Its rendering says `refs/heads/main (the default)` and `farcast (the default)`. `fetchDefaultRef` is pinned to planck/fetch's own default by a test.
+
+**A29-11 (O-3, A-R-2): the staleness wording.** Everywhere in prose, the gate's staleness is "the kernel last looked (its observation's time, or else its last accrual's) more than 15 minutes before run's clock, or never", never "last written".
+
+**A29-12 (O-4).** `TestInstanceCAKeyExistsReadsNoKey`'s permission rows skip as root and carry a `LoadInstanceMTLS` control.
+
+**A29-13 (S-COST-2): a keyring behind the pin.** It is not a block. D writes no pin and carries `msgRunHandOver` beside `behindWarning`, which now reads `warning: <why>; if any keyholder replica has loaded this pin, the hand-over is refused.` `--confirm` hands the scopes over as an interactive run does. Why: replicas load the pin at start, so an older fleet takes the keys, and D had stated a refusal that need not happen. `msgRunHandOver` stays plan-only, like `msgKeyPinHandOver` and `msgRotateHandOver`.
+
+**A29-14 (C-RV-1, replaces sR's deviation on multi-line errors): errors and values.** An error goes through `output.ErrorText` (lines and tabs kept, everything else escaped in place); a single value goes through `terminalText`. M2.6d's error sites (connect 508 and 742; storagekey 936, 1031 and 1221; storagepin 886; storagekeyholder 971, 1007, 1024, 1027, 1127, 1422 and 1467) use ErrorText, so printable multi-line errors print as they did at 73f43c0, as A28-3 requires. JSON fields carrying those texts hold the ErrorText form. A28-3's assertion reads "no byte below 0x20 other than `\n` and `\t`", the project's documented rule for error text.
+
+**A29-15 (S-TERM-2): run's own raw sites.** A28-3's list adds run's `keys.yaml` backup path (terminalText), its sealed notice of `keyringOf`'s error (ErrorText) and its re-enrol lines (terminalText), as rotate's.
+
+**A29-16 (C-RV-2): a CA key that cannot be checked.** `refuseNoCAKey` returns `(noKey, err)`. Only a missing or empty `ca.key` is D's block. Any other Stat error (`check for this machine's CA key for %q: %w`) is an error met while computing (A23-18): `--confirm <F>` exits 1 and prints no plan, and `--confirm <D>` returns it before the comparison.
+
+**A29-17 (A-R-1, A-R-3, A-R-6, A-R-7, A-R-8): records.**
+- The root README no longer says a front end need never pass `--yes`. It names the five reader plans and says that where key upload is blocked they are refused, so those five commands still run only in a terminal or with `--yes`.
+- "run's plans read no registry and no Google" is qualified: a toolchain image given by tag is looked up anonymously at its own registry (Kaniko's is on gcr.io), which tells that registry the source address and the time; neither plan reads Google with a farcast credential.
+- The plan_changed uid clause names run's deploy plan; the README's 'Not covered' residual names the CA certificate beside `ca.key`; PLAN.md's status line says the plans are part of step 3.
+
+**A29-18 (lens M): tests and mutation rows added.**
+| Mutant | Killed by |
+|---|---|
+| O09: a no-terminal run let through at the limit | `TestNoTerminalAtTheLimitKeepsItsRefusal` |
+| O11: the interactive re-read not asking again for an app unreadable after the builds | `TestAnInteractiveRunIsAskedAgainAfterTheBuilds` (another application unreadable after the build) |
+| O11c, O27, O28: `unchangedAt` dropping the unreadable case, the requests comparison, or the unknown-then-stopped case | `TestConfirmRefusesAnAppTheReReadCannotMatch` (three subtests) |
+| O12: `limit_reached` compared both ways | `TestConfirmAtTheLimitDeploysWhenTheLimitIsNoLongerReached` |
+| O17: the scope check by count only | `TestConfirmRefusesAnotherScopeSetOfTheSameSize` |
+| O31: the policy rv checked in every mode | `TestAYesRunMergesAPolicyWrittenDuringTheBuilds` |
+| O47: the pin read in a consentNone D | `TestAYesRunReadsNoPinInItsPlan` |
+| O51: the at-the-limit lines naming a running app | `TestAnInteractiveRunAtTheLimitNamesOnlyWhatItMayRestart` |
+
+Each fix above also has its own row, all 27 killed.
+
+**A29-19 (orchestrator, after the review).** Nine routed addresses that predate M2.6 in the cluster and config tests (34.0.0.5, and the invalid 34.0.0.256) moved to 203.0.113.5 and 203.0.113.256. Fixtures use RFC 5737 addresses only; none was dialled.
+
+**A29-20 (orchestrator, after the review): run's help.** The gate's paragraph in run's Usage, left as one over-long run-on sentence by O-3's edit, is its own paragraph of short sentences: the limit, an unreadable ledger, or a kernel that last looked more than 15 minutes ago or never; then that -y deploys nothing, an interactive run is told what it would restart and asked, and confirming a plan made at the limit is the consent. `TestRunUsageStatesTheStalenessRule` follows the wording.
+
+### Refuted, kept out
+- **COST-1:** under `--confirm`, a `keys.yaml` changed by another command during the builds is caught only after the egress policy is applied with fresh credentials. A28-10 places the scope check before `SaveInstanceKeyring`, and A23-48 accepts this end state with its own text. Nothing D did not list is written.
+- **TERM-1:** ErrorText keeps a TAB. A TAB cannot erase, move up or set a title, and keeping tabs is the documented rule (A29-14).
+- **RV-3:** the completeness guards are relative to `writeCommands()`. A heuristic "writes to a cluster" guard was never asked for; every production writer is among the eleven rows. M2.7's migration command gets its own rows.
+- **RV-4:** the unsuffixed `--yes` scan covers only consent command methods; `TestScanRefusalsReadsEveryRoute` pins that scope, and `msgBuildYes` is covered by the gate table.
+- **R-4, R-5:** A28-14 asked AGENTS.md to replace M2.6's per-part dates with one sentence, not to shorten the paragraph; the README table is A-R-14's, still open.
+- **MUT-O20:** `refuseNoCAKey` after the reads still refuses before any build, with only read-only GETs between.
+- **MUT-O37:** a refused `--confirm <D>` printing the recomputed notices first is output-only, as §24's M-M26A-MUT-12 and §25's M-M26B-MUT-07.
+- **MUT-O03:** staleness from Last first is equivalent on every checkpoint FarCast writes (Last and Observed.At are set in the same tick).
+- **MUT-O04a, MUT-O04b:** the 15-minute boundary inclusive, or shrunk to 14m01s, refuse more and never less.
+
+### Left open
+- **A keys.yaml change during `run --confirm`'s builds** is reported with `msgPinChangedAtHandOver` ("the instance's key pin changed") when only the keyring grew (COST-1's second half). A wording imprecision in A23-48's text; it needs another farcast command to add a scope during this run's builds.
+- **A ledger observed in the future** is never stale under A28-2's literal rule, so an operator clock behind the cluster's delays the stale gate by the skew. world shares the rule. The kernel enforces the limit in-cluster regardless.
+- **A-R-14's optional README restructuring**, still.
+- **A writer guard derived from production** (RV-3) for M2.7, when a twelfth writer appears.
+- **A23-53's size** was not met: M2.6 since 39ca9e3 is about 8,600 code and 17,600 test lines added, with 13 vectors. M2.6d alone (against 73f43c0): code +2,240/−306, tests +5,666/−283, records +213/−73.
+
+## 30. Decided before M2.7's build (2026-11-18)
+
+M2.7 was mapped against the code at 2461bf1 by workflow wf_ba921dea-a2b: five read-only lanes, then a completeness critic. The lanes were: Apply in-process, kubectl and the kubeconfig out, and the kernel's field manager; `migrate`, the refusal of unmigrated instances, the `server_side_apply` record and the safety net; the eleven writing commands under a forced apply; the real-API suite and its envtest runbook; the records. The raw map is `m27-map-result.json` beside this file. The operator answered two questions on 2026-11-18, and the orchestrator settled the rest the same day. This section wins over §0–§14 and over §15–§29 wherever it differs. Where it is silent, the earlier sections govern, and a lane's proposal in the map is advice, not a decision.
+
+Line numbers are at 2461bf1. Builders find each site by its symbol and confirm the line. In the bold leads:
+- **Cn** is the critic's n-th confirmed conflict and **Mn** its n-th missing item, both 1-based in the map's order;
+- **ODn** is the critic's n-th orchestrator decision, all sixteen adopted;
+- **Ln.k** is the k-th conflict of lane n, the lanes numbered 1–5 in the order above.
+
+Every lane conflict is folded into the amendment whose lead names it. Those the critic refuted are in the list near the end.
+
+### Decided by the operator on 2026-11-18
+
+**A30-1 (O1; L3.4, L4.5, L5.15): the real-API suite runs before M2.7's atomic commit.**
+- **The order:**
+  1. M2.7a is built: the inert groundwork, the suite and its runbook (the build order below). It is green and committable alone.
+  2. The operator brings the keeper VM up, and the suite runs there by `docs/runbooks/adr-0023-m2-realapi.md` (A30-19).
+  3. Its scrubbed results are written into this design as **§31** and into the runbook's Results.
+  4. Only then is the migration built, in M2.7b.
+- **What §31 decides:**
+  - §6.3: one JSON patch, or the annotation's removal in a second request (TestAnnotationRemovalInTheSamePatchLeavesNoUpdateEntry);
+  - whether `AllowResourceVersion` and the egress policy's resourceVersion precondition ship (§2.1, §9.5, risk 7; step 3, A30-40);
+  - mutation row 104 (re-pointed in the mutation table below);
+  - any rendered stream the real server refuses, fixed in its renderer in M2.7b step 1a.
+- **A re-run, before M2.7b's commit.** Any §31 outcome that changes code the suite exercises is run again by the same runbook, with the operator's approval. That code is a renderer, §6.3's request shape and `migrateOne`, or the emulated seed.
+  - The re-run's binaries are built from a named tree: an "M2.7a fix" commit on the branch, or M2.7b's tree before it is committed, recorded by its tree hash.
+  - §31 records the second run beside the first.
+  - If no re-run happens, the records name each such path as not run against a real server.
+- **The download:** `envtest-v1.36.2-linux-arm64.tar.gz`, 45.1 MB, from `https://github.com/kubernetes-sigs/controller-tools/releases/download/envtest-v1.36.2/envtest-v1.36.2-linux-arm64.tar.gz`.
+  - Its sha512 is the one published in controller-tools' `envtest-releases.yaml`. It begins `2d72ee985a8e262a` and ends `c6d824dd9c6649ac`.
+  - Before anything is extracted, the operator compares the computed value with the full value in that file and with the release's `.sha512` asset.
+- **The run:** on 127.0.0.1 only, reached by `ssh -L`, about 45 minutes. Nothing is billed, and everything is deleted at teardown.
+- **If the run cannot happen** (the VM is unavailable, the checksum does not match, the server will not start), M2.7b is not built. The question goes back to the operator. Committing M2.7b with the suite unrun is not this design's fallback.
+
+**A30-2 (O2; L4.16): the binaries run as the keeper VM's existing `farcast` user.** The operator declined a throwaway user.
+- **The consequence, stated in the runbook:** the three downloaded binaries (`kube-apiserver`, `etcd`, `kubectl`) run with read access to that user's files, keeper material included.
+- **The mitigations the runbook pins:**
+  - the archive's sha512 is checked before extraction;
+  - everything lives in one fresh directory, `~/realapi-<YYYYMMDD>`, which teardown deletes; etcd's data directory is inside it;
+  - every listener binds 127.0.0.1;
+  - no `sudo`, no systemd unit, and no change outside that directory;
+  - the agent never types the VM's sudo password.
+
+### Decided by the orchestrator on 2026-11-18
+
+**A30-3 (Q3 of the critic): envtest v1.36.2 for linux/arm64, and the kubectl seeding variant once.**
+- **Why this archive:** one download with a published checksum, carrying `kube-apiserver`, `etcd` and `kubectl`. The design pins the minor only: the probe walk recorded `1.36.4-gke` (A22-4), and 1.36.2 is the newest 1.36 in the envtest index.
+- **The variant.** §6.8's kubectl seeding runs once, on the VM, against the loopback server only. It validates the emulated client-side seed that the other stuck-field cases rely on. If the two seeds differ, §31 records how. The emulated seed is then corrected, and the stuck-field cases run again under A30-1's re-run rule.
+
+**A30-4 (OD1): two commits, and the run between them.**
+- **M2.7a, "begin M2.7":** the critic's steps 0a, 0b and 0c (the build order below), the real-API suite (written and vetted, never run by `./check.sh`) and its runbook. It is green and committable alone.
+  - No command's behaviour changes, except the kernel's `fieldManager` query parameter (A30-11) and the order of two rendered streams (A30-17).
+- **The run** (A30-1, A30-19), then §31.
+- **M2.7b is one commit:** steps 1a–1e and the records (step 2), plus step 3 only if the run passed `TestApplyRefusesAStaleResourceVersion` (A30-40).
+  - Never commit an intermediate state: neither the refusal with kubectl's `Apply`, nor server-side apply without the refusal (§0 item 5).
+  - No live instance exists, and that does not relax the rule.
+  - Commit only when the operator asks.
+
+**A30-5 (lane questions not put to the operator): each settled as its lane recommended.**
+- **storage key rotate** refuses only when it would write the pin (lane 2's (b); A30-20).
+- **The Job-log hints** drop their kubectl clause and point at the tail already printed (lane 1 and lane 3's (a); A30-35). A `farcast logs <instance> job/<name>` reader, read as the reader, is named in the CLI README's run and build sections as a later candidate.
+- **Walk observation** moves to Cloud Shell (lane 5's (a); A30-39).
+- **Risk 5** is named, with a revisit trigger (lane 5's (b); A30-38).
+
+### Step 0a: kube, kubetest and the kernel
+
+**A30-6 (C4, L1.4, L2.9, OD2): the trace predicate, apart from farcast's own apply.**
+- **The cause.** `kube.IsLastApply` (`kube/migrate.go:128-130`) is also true for farcast's own Apply entry, which every server-side apply answer carries. Traces built on it would flag every object.
+- **`kube/migrate.go` gains** (names chosen here):
+  - `func IsOwnApply(e ManagedFieldsEntry) bool`, which is `isSSAEntry(FieldManager)(e)`: farcast's Apply entry on the main resource;
+  - `func ClientSideTrace(md ObjectMeta) bool`. It is true when any of these holds:
+    - `md.Annotations` has the key `kubectl.kubernetes.io/last-applied-configuration` (its value is never read);
+    - `ClientSideManagers(md.ManagedFields)` is non-empty, which already names `kubectl-client-side-apply`;
+    - `ClientSideManagers(md.ManagedFields)` returns an error (fail closed).
+- **`IsLastApply` stays** for `DeploymentState`'s `lastAppliedAt` (A28-7), written as `IsOwnApply(e) || isCSAEntry(kubectlClientSideApply)(e)`.
+  - Its doc loses "which farcast's Apply runs until ADR 0023 M2.7", the KUBERC sentence and "Traces is to share".
+  - It says instead that kubectl's client-side entry still marks the last apply of an object an older farcast wrote.
+- **Pinned by** `TestClientSideTraceIsNotFarcastsOwnApply`, a table in `migrate_test.go`:
+  - true: the annotation alone; `kubectl-client-side-apply`/Update; another Update manager owning the annotation's path; an Update entry whose `fieldsType` is not `FieldsV1`;
+  - false: `farcast`/Apply alone; `kubectl-client-side-apply`/Update with subresource `scale` (A30-7).
+
+  `TestIsLastApplyIsFarcastsOwnApplyOfTheObject` keeps its rows. Mutation row 101b.
+
+**A30-7 (C9, L2.8, OD7): `ClientSideManagers` ignores subresource entries.** Its by-name branch (`migrate.go:59-62`) requires `e.Subresource == ""`, as `isCSAEntry` does. Otherwise a subresource-scoped `kubectl-client-side-apply` entry is selected, never converted, and refuses for good. **Pinned by** `TestClientSideManagersIgnoresSubresourceEntries`. Mutation row 94a.
+
+**A30-8 (C8, L2.7, OD7): the end state of an object with the annotation alone.**
+- **The signature** (chosen here): `func MigratedEndState(o Object, csa []string, ssa string, hadApply bool) error`.
+  - `hadApply` says whether the object, as read before the patch, carried an `ssa`/Apply entry on its main resource. The caller computes it with `slices.ContainsFunc(read.Metadata.ManagedFields, kube.IsOwnApply)`; every caller passes `kube.FieldManager` as `ssa`.
+- **The rule.** The `ssa`/Apply count must be exactly 1 when `len(csa) > 0 || hadApply`, and 0 otherwise. Every other check is unchanged.
+- **Why.** An operator's `kubectl apply --server-side` leaves `kubectl`/Apply and the annotation. Its migration only removes the annotation, adds no `farcast`/Apply, and under the old rule refused on every run, so `migrate` never recorded.
+- The other Apply owner is listed in `other_managers` (A30-12) and keeps its fields.
+- **Pinned by** `TestMigratedEndStateAllowsAnAnnotationOnlyObject`:
+  - `csa` empty, no `farcast`/Apply before or after, the annotation gone: nil;
+  - `csa` empty, `hadApply` true, and the entry gone after: refused, `farcast/Apply present 0 times, not once`;
+  - `csa` non-empty: today's rule.
+
+  The existing callers in `migrate_test.go` and `migrate_wire_test.go` pass what their fixtures imply. Mutation rows 96b and 96c.
+
+**A30-9 (C23, L2.23, L4.12, OD14): `PatchJSON` asks for metadata only, and every kube write names farcast.**
+- It sends `Accept: acceptPartial`, as `GetObject` does. The decode stays metadata-only.
+- kubetest's PATCH answer honours `acceptPartial` as its GET does.
+- `PatchJSON`'s doc reads: never retried on 429 or 503, because `migrate`'s loop retries a 409 only and stops on anything else (A30-23).
+- **Pinned by** `TestPatchJSONAsksForMetadataOnly` (`migrate_wire_test.go`): the request's Accept is `acceptPartial`, and a Secret's answer carries no `data`. The suite checks the real server (A30-18).
+- **Row 102's test.** `TestEveryWriteNamesFarcast` does not exist at 2461bf1; it is written here, in `kube/apply_test.go`, against kubetest.
+  - It sends `Apply`, `CreateConfigMap`, `ReplaceConfigMap` and `PatchJSON` as the writer.
+  - Each request's `RawQuery` carries `fieldManager=farcast`.
+  - `DeleteSecret` is exempt until M2.8.
+
+**A30-10 (C1, C2 in part, C5, L1.1, L1.5, L3.2, OD3): kubetest settles workloads and refuses one apply.**
+- **`func WithSettledWorkloads() Option`** (chosen here). After each write that leaves an object stored (apply, POST, PUT, JSON patch):
+  - **a Deployment or StatefulSet** gets `status.observedGeneration` equal to `metadata.generation`, and `status.replicas`, `updatedReplicas`, `readyReplicas` and `availableReplicas` equal to `spec.replicas` (1 when absent);
+  - **a Service of type LoadBalancer** with no ingress gets `status.loadBalancer.ingress: [{ip: 203.0.113.10}]` (RFC 5737, A29-19);
+  - **a Job:**
+    - an apply keeps the stored `spec.selector`, and the stored `spec.template.metadata.labels` keys that the body omits;
+    - a create with no selector gets `spec.selector.matchLabels` of `{batch.kubernetes.io/controller-uid: <uid>}`, and the template gains the labels `batch.kubernetes.io/controller-uid`, `batch.kubernetes.io/job-name`, `controller-uid` and `job-name`. That is the API server's own Job defaulting [unverified; `TestReapplyingAnUnchangedJobIsANoOp` records it].
+
+  Without the option, kubetest behaves as today.
+- **`func (s *Server) FailNextApply(code int, st kube.Status)`** (chosen here).
+  - The next apply-patch PATCH, whatever its path, answers `code` with `st`, after authentication and RBAC, and stores nothing. The answer follows `Fail`'s rules.
+  - It is one-shot, and composes with `WithHandler` and `Fail`. It is A30-31's stop point.
+- **The recorder** is kubetest's existing Request log. No apply sink is added.
+- **The apply's doc records a gap.** kubetest rebuilds an applied object from the body. From the stored one it keeps only uid, creationTimestamp, resourceVersion, status, and other managers' managed-fields entries. A real server keeps every field another manager owns: kubectl's last-applied annotation, the kernel's adapted-at annotation, and replicas set through `/scale`. So the annotation branch of Traces is tested through `WithHandler` (A30-28).
+- **Pinned by:**
+  - `TestSettledWorkloadsRollOutAndGetAnAddress`:
+    - an applied Deployment reads rolled out by `kube.RolloutState`;
+    - a created LoadBalancer Service gets the address;
+    - an applied Job keeps a seeded selector, and a created one gets the default;
+    - without the option, none of this happens;
+  - `TestFailNextApplyRefusesOneApply`: the first apply answers `code` and stores nothing, a GET is unaffected, and the second apply lands.
+
+**A30-11 (§5.4, Q6): the kernel names its writes.**
+- `technocore/kube/client.go` gains `const FieldManager = "technocore"`.
+- `do()` (`:234`) builds `url.Values`: `labelSelector` when one is set, and `fieldManager=FieldManager` for every method but GET. That covers `Scale`, `SaveConfigMap`'s PUT and POST, and `SetRequests`. Their docs say so.
+- **Pinned by** `TestKernelWritesNameTechnocore`, one recording server for four writes, each with `RawQuery` exactly `fieldManager=technocore`:
+  - `Scale`: a merge-patch PATCH to `…/deployments/web/scale`;
+  - `SetRequests`: a strategic-merge PATCH, answered with a Deployment;
+  - `SaveConfigMap`: a PUT, then a POST after a 404 Status.
+
+  The exact-query read tests (`client_test.go:83`, `metrics_test.go:36`) keep GETs free of the parameter. Mutation rows 103 and 103a.
+- TechnoCore's image digest changes, and the next release's `kernel deploy` replaces the kernel. The ADR 0009 note lands with M2.7b's records.
+
+### Step 0b: plan, config and cluster additions
+
+**A30-12 (L2.11, L2.19, OD15): the migrate fact.** In `plan/facts.go`:
+```go
+const TypeMigrate = "migrate"
+
+type MigrateFact struct {
+	Type           string          `json:"type"`
+	Objects        []MigrateObject `json:"objects"`
+	Local          []string        `json:"local"`
+	CannotBeUndone bool            `json:"irreversible"`
+}
+
+func (MigrateFact) FactType() string     { return TypeMigrate }
+func (f MigrateFact) Irreversible() bool { return f.CannotBeUndone }
+
+type MigrateObject struct {
+	API             string   `json:"api"`
+	Kind            string   `json:"kind"`
+	Namespace       string   `json:"namespace"`
+	Name            string   `json:"name"`
+	UID             string   `json:"uid"`
+	CSAManagers     []string `json:"csa_managers"`
+	CSAFieldsSHA256 string   `json:"csa_fields_sha256"`
+	Annotation      bool     `json:"annotation"`
+	OtherManagers   []string `json:"other_managers"`
+}
+```
+- **The field's name** is chosen here. Go refuses a field and a method of one name, and the renderer finds `Irreversible()` by its method (`planhuman.go:120-123`).
+- **The values:**
+  - `csa_managers` is `ClientSideManagers`' sorted, distinct names (A30-7).
+  - `csa_fields_sha256` is the lowercase hex SHA-256 of the raw `FieldsV1` bytes, concatenated in list order, of every entry the rewrite converts or removes: operation Update, subresource `""`, and a manager in `csa_managers`. An object with the annotation alone hashes the empty input.
+  - `annotation` says whether the last-applied annotation's key is present. Its value is never bound.
+  - `other_managers` holds every other managed-fields entry as `manager/operation`, plus `/subresource` when it is set, distinct, in list order. That includes `farcast`/Apply when present, and an operator's `kubectl`/Apply.
+  - `local` is exactly `LegacyKubectlFiles`' result (A30-14).
+  - `irreversible` is always true in production.
+- **The facts' comment** (`facts.go:10`) says that M2.7 added `MigrateFact`.
+- **Tests:** `TestFactTypesAreCanonical` and the canonical tests cover the new fact.
+
+**A30-13 (L2.11, L2.18, M6, OD15): its rendering.** `factLines` gains a `plan.MigrateFact` case. Its lines, chosen here:
+- **First line:** `migrate %d object(s) on the cluster; then delete %s; irreversible: %s`. The first `%s` is `local` joined by `, `, or `no local file`. The second is `yes` or `no`.
+- **One line per object:** `  %s (%s, uid %s): client-side managers %s become farcast/Apply; their fields' sha256 %s; last-applied annotation %s; other managers kept: %s`.
+  - The first `%s` is `describeObject` (below).
+  - Then come the api; the uid, through `terminalText`; the `csa_managers` list, through `listText`; the hash; `present, removed` or `absent`; and the `other_managers` list, through `listText` (`none` when empty).
+- **Then, when irreversible,** §6.7's paragraph verbatim. It closes the fact's own lines, so it sits before the digest.
+- **`describeObject(kind, namespace, name string) string`** (chosen here) is defined in this step, in `planhuman.go`. It names an object as `writeLine` does: `<Kind> <namespace>/<name>`, or `<Kind> <name>` when the namespace is `""`, with the namespace and the name each through `terminalText`. It names an object in this rendering, in the blocks (A30-22) and in every `migrate` error (C12). `migrate.go` (step 1b) reuses it.
+- **Quoting.** Every string the server sent (namespace, name, uid and manager names) goes through `terminalText` (`print.go:43-48`), and every list through `listText` (`planhuman.go:222-231`), as every other fact line does. `terminalText` Go-quotes only text that would not print as it is, as `cluster` does a server's Warning (`printable`, `open.go:786-793`). The kind and the api come from `kube.Kinds`.
+- **Tests:**
+  - `TestEveryBoundFactIsRendered` moves to 18 types. Its `MigrateFact` rows render `irreversible` as yes and as no, and an object with `annotation` true and false.
+  - `TestIrreversibleFactsComeFirst` gains a real `MigrateFact`.
+  - `TestMigratePlanQuotesServerNames` (chosen here): a manager name carrying ESC, a newline and a quote, and an object name with a control byte, render escaped. No byte below 0x20 but `\n` reaches the text. Mutation row 98b.
+
+**A30-14 (C6, L1.6, L2.15): the legacy files, named by config.**
+- `config/instance.go` keeps `kubeconfigFile` (`:77`) unexported, and adds `pluginCacheFile = "gke_gcloud_auth_plugin_cache"`.
+- **`func (d Dir) LegacyKubectlFiles(name string) ([]string, error)`:**
+  - it uses `os.Lstat` only, so `ObserveReads` sees nothing;
+  - it returns the present ones, `instances/<name>/kubeconfig.yaml` then `instances/<name>/gke_gcloud_auth_plugin_cache`, as slash-separated paths relative to the config directory;
+  - any error other than not-exist is returned.
+- **`func (d Dir) RemoveLegacyKubectlFiles(name string) (removed []string, err error)`** removes each present file, ignoring `fs.ErrNotExist`.
+  - `removed` lists the ones it removed, in the same form and order as `LegacyKubectlFiles`.
+  - `err` is the first failure, naming the path of the file it was deleting. It still tries the other file.
+- `SaveInstanceKubeconfig` and `InstanceKubeconfigPath` (`:848-857`) go in step 1d (A30-34).
+- §6.4's cache citation becomes `worldreader_test.go:199-200`, because `plugintoken_test.go` was deleted in M2.4.
+- **Pinned by** `TestLegacyKubectlFilesStatsAndRemoves`: none, each alone, and both present; `ObserveReads` empty; removing an absent file is nil; `removed` lists exactly what went.
+
+**A30-15 (C10 in part): cluster's migration methods.** `ListMeta`, `GetMeta` and `PatchManagedFields` are as §2.3 has them.
+- Each calls `flushWarnings`.
+- `PatchManagedFields` calls `neverWrites` first.
+- Until step 1d each carries the `c.kube == nil` guard every method carries.
+- **Pinned by:**
+  - `TestListMetaGetMetaPatchManagedFieldsAreKubes`: paths, Accept, and the PATCH's `fieldManager=farcast&fieldValidation=Strict`, all as the writer;
+  - `TestReaderNeverPatchesManagedFields`: nothing is sent, `/token` included.
+
+### Step 0c: renderer safety
+
+**A30-16 (M2): every rendered document carries farcast's label.**
+- **Why.** §6.2's discovery selects by `app.kubernetes.io/managed-by=farcast`. If a template dropped the label, its objects would never be migrated, and §6.6 would clear the record after every migration.
+- **Pinned by** `TestEveryRenderedDocumentIsManagedByFarcast` (chosen here) in `cli/manifests_test.go`. It runs over `renderedStreams` and asserts the label on every document, the kernel's seed `technocore-namespaces` and the confirmations ConfigMap included. Mutation row 95a.
+
+**A30-17 (M3, OD9): every NetworkPolicy before the workload it selects.**
+- **Why.** D3 stops at the first failing document. With today's order, a failed Service or PDB apply leaves the pods running with their policy never applied, so egress is not denied by default. kubectl's carrying on hid this. This amends §5.3's "the order is not changed in M2".
+- **The new order:**
+  - **`planck/translate/workload.go`**, per application: Secret, ConfigMap, NetworkPolicy, Deployment, Service. Today the NetworkPolicy is at `:220`, after the Deployment at `:131` and the Service at `:198`.
+  - **`datasphere/deploy/deploy.go`:** Namespace, ServiceAccount, Secret, NetworkPolicy, StatefulSet, PodDisruptionBudget, then the three Services. Today the NetworkPolicy is at `:608`, after the StatefulSet at `:386` and the PDB at `:589`.
+  - `planck/build` and `planck/fetch` already put theirs first.
+  - Each template gains one comment sentence saying why.
+- **Pinned by** `TestEveryNetworkPolicyPrecedesItsWorkload`, over `renderedStreams`. For each Deployment, StatefulSet and Job, every NetworkPolicy in the same stream and namespace whose `spec.podSelector.matchLabels` are all among the workload's pod-template labels comes before it. In a stream that renders any NetworkPolicy, every workload has at least one such policy before it. Mutation row 100d.
+- **Vectors.** `run_deploy.json` and `storage_deploy.json` are regenerated; only the write order and the digests move. §5.3's ordering bullet now reads: every NetworkPolicy before the workload it selects (A30-17), because D3 stops at the first failure.
+
+### Step 0c: the real-API suite and its runbook
+
+**A30-18 (C19–C22, L4.1–L4.4, L4.8–L4.11, L4.13, L4.14, L4.18): the suite.** This is §10.6 as amended here.
+- **Two files, tag `realapi`:**
+  - `farsight/cli/internal/kube/realapi_test.go`, package `kube`, which uses the in-package `newClient`;
+  - `farsight/cli/internal/cli/realapi_test.go`, package `cli`, for the one test over `renderedStreams`. `kube` cannot import `cli`, and `cli` cannot reach `newClient` (C19).
+- **check.sh.** Steps 4 and 5 gain the tag: `go vet -tags=integration,walk,realapi` (`check.sh:301`) and `--build-tags=integration,walk,realapi` (`:308`). The header (`:30-31`) and the step-4 comment say that these files are type-checked and linted, never run. Step 6 stays untagged (C22).
+- **The environment.**
+  - It reads `FARCAST_REALAPI_ENDPOINT` (`127.0.0.1:<port>`), `FARCAST_REALAPI_CA_FILE` and `FARCAST_REALAPI_TOKEN_FILE`.
+  - Without all three, every test fails; none skips, so a tagged run cannot pass vacuously. The one exception is the kubectl variant's test, which skips with its reason when `FARCAST_REALAPI_KUBECTL_NAMESPACE` is unset.
+  - The token is read once and trimmed. It is never printed and never put in a message.
+  - The suite starts no process. R6 runs its tests by name (A30-19), so none of the package's unit tests runs beside them; `token_wire_test.go:200` re-executes the test binary.
+- **The kube client:**
+  - `ParseEndpoint(endpoint, "", caPEM)`;
+  - `newClient(Config{Endpoint: ep, Credential: Credential{Email: "realapi@realapi.invalid"}, Identity: Writer}, <a static tokenFunc>)`;
+  - a wait of up to 60 s for `GET /readyz` through `c.do`.
+- **In-package helpers.** Each one that bypasses `Apply` says so in a comment:
+  - `rawGet`: `c.do` GET of a path, decoded into `map[string]any`, for value assertions;
+  - `seedClientSide(k, ns, v1JSON, v1bSMP)`: a POST to `k.ListPath(ns)` with `fieldManager=kubectl-client-side-apply`, carrying the annotation. Then a `application/strategic-merge-patch+json` PATCH under that manager, which changes one field (an image or a label value) and carries the updated annotation, as kubectl's second apply would (L4.4);
+  - `migrateOne`: §6.4's steps 1–3 over `GetObject`, `ClientSideManagers`, `MigrationPatch`, `PatchJSON`, `MigratedEndState` on the answer, then `GetObject` and `MigratedEndState` again (C20);
+  - `rawApply(ctx, k Kind, ns, name string, body []byte, manager string, force bool)`: `c.decode` with `mediaApplyPatch` and its own query (`fieldManager=<manager>`, `fieldValidation=Strict`, `force`), for bodies `Apply` refuses (a stale `resourceVersion`) and for a second applier;
+  - `runNamespace`: a per-run unique suffix, so a second run against the same server works. kube deletes nothing but Secrets.
+  - **The kernel's client** is `technocore/kube.New("https://"+endpoint, tokenFile, ns, &http.Client{…})`, its roots from the CA file.
+- **No dryRun pass** (C21).
+- **Its tests, in `kube`:**
+  - `TestMigrationRemovesAFieldLaterDroppedFromTheManifest`: §6.8's seven cases, one subtest each.
+    - Each: `seedClientSide`, `migrateOne`, then `Apply` of v2 (split by `SplitStream`, `force=true`).
+    - Then `rawGet` asserts the field is gone, and `MigratedEndState` holds on the read-back. That assertion's message begins `stuck field: ` (chosen here), so R6 can tell it from any other failure.
+    - v1, v1b and v2 are hand-written YAML in the renderers' shape, carrying marker values only.
+    - The Secret case seeds with `stringData` as POST JSON, since `SplitStream` refuses `stringData`.
+    - It kills row 104 as re-pointed (the mutation table below).
+  - `TestAnnotationRemovalInTheSamePatchLeavesNoUpdateEntry`: after `migrateOne`, there is no `farcast`/Update entry, and `farcast`/Apply no longer owns the annotation's path. It decides §6.3 (A30-1).
+  - `TestRealAPIKeepsTheLiveListOnAnUndecodableRewrite` (renamed here, so that row 96's cli test keeps its name alone): the patch carries an entry whose `apiVersion` is `""`. The real server keeps the live list and removes the annotation, and `MigratedEndState` refuses on the answer and on the read-back.
+  - `TestMigrationIsResumable`, at the level of the primitives:
+    - a patch at a stale rv is a 409 that unwraps to `tkube.ErrConflict`, and the object is unchanged;
+    - a fresh read then migrates it;
+    - a second pass gives `MigrationPatch` nil.
+
+    The five-attempt loop is a cli kubetest test (A30-23).
+  - `TestFirstApplyAfterMigrationChangesNoGeneration`, for a Deployment, a StatefulSet, a Service and a Secret.
+    - The baseline is the read after `migrateOne`, and the migration's own generation move is recorded: a Deployment's annotation change bumps it [doc: lane 4's v1.36.2 read].
+    - It asserts that the forced re-apply of v1 leaves the generation unchanged and adds no entry. It records whether the resourceVersion moved.
+  - `TestReapplyingAnUnchangedJobIsANoOp`.
+  - `TestApplyRefusesAStaleResourceVersion`, through `rawApply`.
+    - It records 409 or 200 for a stale `metadata.resourceVersion`.
+    - It also records what an apply carrying an rv answers for a Secret deleted since it was read (`DeleteSecret`): 404 or 409.
+    - It decides step 3 (A30-40).
+  - `TestMetadataOnlyListsCarryNoSecretData`:
+    - `ListObjects` on secrets and a raw partial list carry no `data` or `stringData` bytes, while the annotation is still present;
+    - a `PatchJSON` answer for a Secret carries no `data` (A30-9).
+  - `TestStatusCauseWireName`. A second applier, `rawApply` with manager `realapi-other`, sets a label value. Then a non-forced `Apply` with another value is answered 409, and `FieldConflicts` reads its cause with that label's field path. The kernel's `/scale` is not used for this, because whether it is tracked is itself recorded below.
+  - `TestTypedListItemsCarryNoKind`: a raw typed list's items carry no kind. It records the kind of a partial list's items (`PartialObjectMetadata` [doc]); kubetest's comment (`store.go:420-424`) is corrected in M2.7b.
+  - `TestMigrationLeavesAnotherManagersFieldAlone` and `TestKernelWritesAreTrackedAsTechnocore`, reframed (L4.10).
+    - They drive the kernel's real `Scale` to 0, `SetRequests`, and `SaveConfigMap`'s POST and PUT, through `technocore/kube.Client`.
+    - They record each entry's manager, operation and subresource, and assert `technocore`, which A30-11 lands in M2.7a.
+    - `migrateOne` leaves the scale entry and its owner.
+    - A forced `farcast` apply of `replicas: 1` takes the field, which is P1 (c)'s reset.
+    - The P1 (b) framing is dropped.
+  - `TestEmulatedSeedMatchesKubectl`, run only when `FARCAST_REALAPI_KUBECTL_NAMESPACE` is set.
+    - It compares kubectl's seed in that namespace with its own emulated seed of the same documents: each entry's manager, operation, subresource and `fieldsV1`, and the annotation's presence.
+    - Then it migrates both and applies v2.
+    - Both seeds come from `farsight/cli/internal/kube/testdata/realapi/kubectl-seed-v1.yaml` and `kubectl-seed-v1b.yaml`, which the test reads and the runbook copies to the VM.
+- **Its test, in `cli`: `TestEveryRenderedStreamAppliesOnARealServer`.**
+  - **Its sender** is its own, built as `walkcluster_test.go` builds its requests:
+    - the bearer comes from the token file, and the roots from the CA file;
+    - it dials only the endpoint, with User-Agent `farcast`;
+    - for each `kube.SplitStream` document it sends exactly `kube.Apply`'s request: `PATCH Kind.Path?fieldManager=farcast&fieldValidation=Strict&force=true`, `application/apply-patch+yaml`, body `d.Raw`.
+  - **First**, it applies a Namespace document for every namespace a stream names and does not create: `my-platform`, `alpha` and `beta` today.
+  - **Each stream is applied twice:** no error, and an unchanged generation on the second apply. It records whether the resourceVersion moved.
+
+**A30-19 (L4.15, L4.17, L5.14, A30-2, A30-3): the runbook, `docs/runbooks/adr-0023-m2-realapi.md`.**
+- **Its shape** mirrors `adr-0023-m2-probe-walk.md`: Status (`Written <date> against M2.7a; not run.`), what it records, the approval, R0–R9, and Results.
+- **Flags.** Every flag below that was taken from documentation, not run, is marked *to be confirmed on the VM*. A flag that has to change is recorded in §31, and the runbook is corrected in place with a dated note.
+- **Variables.** Each VM step is one fresh shell, so it runs as one `ssh "$VM" 'set -eu; umask 077; D=$HOME/realapi-<YYYYMMDD>; B=$D/controller-tools/envtest; K="env KUBERC=off $B/kubectl --kubeconfig $D/kubeconfig --cache-dir $D/kube-cache"; …'`, the date written out. From R3 on, each also starts with `cd "$D"`. `RUN`, on the Mac, is a fresh `mktemp -d` directory, mode 0700. Every go command runs with `GOWORK=off GOTOOLCHAIN=go1.27.4 GOPROXY=off GOFLAGS=-mod=vendor`.
+- **The VM's name.** `VM`, on the Mac, is the keeper VM's ssh destination (`<account>@<host>`), the account being O2's existing one. The runbook and every record name it only as `$VM`, never by host or account name (the scrub rule).
+- **kubectl writes only under `$D`.** Every kubectl call is `$K`, whose `--cache-dir` keeps its discovery and HTTP caches out of the `farcast` user's `~/.kube/cache` (A30-2: no change outside that directory).
+
+**R0. Approval.** On 2026-11-18 the operator decided to run the suite on the keeper VM before M2.7b (O1), as the `farcast` user (O2). The orchestrator chose the envtest v1.36.2 archive and the one kubectl variant (A30-3).
+- Before R2 the agent presents the URL, the 45.1 MB size, the checksum's first and last 16 hex characters, the account, the loopback ports (2379, 2380 and 6443 on the VM, 16443 on the Mac), about 45 minutes and USD 0.
+- It then waits for the operator's yes in this session. Approval does not carry over, as in `adr-0023-m2-probe-walk.md`.
+- The "What this exposes" paragraph states O2's consequence and its mitigations.
+
+**R1. Preflight, on the Mac.**
+1. The operator starts the keeper VM.
+2. `ssh "$VM" true`. If this fails with "No route to host" or "Undefined error: 0", the operator grants Local Network to the Claude Code bundle, then retries.
+3. `ssh "$VM" 'uname -m; . /etc/os-release; echo "$VERSION_ID"; command -v curl sha512sum tar openssl ss pgrep'` shows `aarch64`, `26.04` and every tool.
+4. `ssh "$VM" "ss -ltnH '( sport = :2379 or sport = :2380 or sport = :6443 )'"` prints nothing, and on the Mac `lsof -nP -iTCP:16443 -sTCP:LISTEN` prints nothing. If a port is taken, choose another and record that a port moved, not which.
+5. `ssh "$VM" 'if test -e ~/.kube; then ls -A ~/.kube; else echo absent; fi' >"$RUN/kube-before.txt"`: whether the `farcast` user's `~/.kube` exists, and its names only. It stays in `$RUN` and is never recorded; R9 compares against it.
+6. Write row 104's mutant, under `$RUN` only, from the repository root. The tree is never edited.
+   ```
+   mkdir -m 700 "$RUN/row104"
+   cp farsight/cli/internal/kube/migrate.go "$RUN/row104/migrate.go"
+   perl -0pi -e 's/(\t\tmf\[target\]\.Manager = ssa\n)/$1\t\tmf[target].FieldsV1 = json.RawMessage("{}")\n/' "$RUN/row104/migrate.go"
+   diff farsight/cli/internal/kube/migrate.go "$RUN/row104/migrate.go"
+   printf '{"Replace":{"%s":"%s"}}\n' "$PWD/farsight/cli/internal/kube/migrate.go" "$RUN/row104/migrate.go" >"$RUN/row104/overlay.json"
+   ```
+   - The one edit is in `upgradeOne`, right after the conversion inside `if target < 0`: the converted entry's `fieldsV1` becomes `{}`. That is row 104 as re-pointed (the mutation table below).
+   - `diff` must print exactly that one added line. Anything else stops the run before R2.
+7. Build the test binaries once, at the M2.7a commit, from the repository root. A re-run builds from the tree A30-1 names. One binary per suite means one Little Snitch rule each, should loopback dials ever need one [inf: they do not].
+   ```
+   go test -c -tags realapi -o "$RUN/kube-realapi.test" ./farsight/cli/internal/kube/
+   go test -c -tags realapi -o "$RUN/cli-realapi.test"  ./farsight/cli/internal/cli/
+   go test -c -tags realapi -overlay "$RUN/row104/overlay.json" -o "$RUN/kube-realapi-row104.test" ./farsight/cli/internal/kube/
+   ```
+
+**R2. Download, on the VM.**
+```
+umask 077; mkdir -m 700 "$D" && cd "$D"
+curl -fL --proto '=https' --tlsv1.2 -O https://github.com/kubernetes-sigs/controller-tools/releases/download/envtest-v1.36.2/envtest-v1.36.2-linux-arm64.tar.gz
+curl -fL --proto '=https' --tlsv1.2 -O https://github.com/kubernetes-sigs/controller-tools/releases/download/envtest-v1.36.2/envtest-v1.36.2-linux-arm64.tar.gz.sha512
+stat -c %s envtest-v1.36.2-linux-arm64.tar.gz
+sha512sum envtest-v1.36.2-linux-arm64.tar.gz
+cat envtest-v1.36.2-linux-arm64.tar.gz.sha512
+```
+- The sidecar's name is to be confirmed on the VM.
+- **The operator compares**, before anything is extracted:
+  - the computed sha512;
+  - the sidecar's;
+  - the full value for v1.36.2 linux/arm64 in controller-tools' `envtest-releases.yaml`, read in their own browser.
+
+  All three must be equal, beginning `2d72ee985a8e262a` and ending `c6d824dd9c6649ac`. The size must be about 45.1 MB.
+- **On any mismatch:** stop, `rm -rf "$D"`, and record it.
+
+**R3. Extract.**
+- `tar -tvzf envtest-v1.36.2-linux-arm64.tar.gz` must list only regular files `controller-tools/envtest/kube-apiserver`, `etcd` and `kubectl`, and their directories. The prefix is to be confirmed on the VM.
+- Any absolute path, `..`, link or other entry stops the run.
+- Then `tar -xzf envtest-v1.36.2-linux-arm64.tar.gz --no-same-owner --no-same-permissions -C "$D"`, and `B=$D/controller-tools/envtest`.
+- Record `"$B/kube-apiserver" --version`, `"$B/etcd" --version` and `"$B/kubectl" version --client`.
+
+**R4. Material, with `umask 077`.** Nothing here is echoed, and the token is never on an argv.
+```
+mkdir -p "$D/certs" "$D/etcd-data" "$D/logs"
+openssl genrsa -out "$D/sa.key" 2048 2>/dev/null
+head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$D/token"
+{ cat "$D/token"; printf ',realapi,realapi,system:masters\n'; } > "$D/tokens.csv"
+wc -c < "$D/token"
+```
+- `wc` prints `64`, the byte count only.
+- `$D/kubeconfig` names the server `https://127.0.0.1:6443`, `certificate-authority: $D/certs/apiserver.crt`, and a user with `tokenFile: $D/token`. So the kubeconfig holds no token. `tokenFile` is to be confirmed on the VM.
+- The static-token CSV format (`token,user,uid,group`) and `system:masters`' bypass under `--authorization-mode RBAC` are [doc], to be confirmed on the VM.
+
+**R5. etcd, then kube-apiserver, on 127.0.0.1**, as envtest starts them, with its client certificates replaced by a static token. Every flag is to be confirmed on the VM.
+```
+nohup "$B/etcd" --name realapi --data-dir "$D/etcd-data" \
+  --listen-client-urls http://127.0.0.1:2379 --advertise-client-urls http://127.0.0.1:2379 \
+  --listen-peer-urls http://127.0.0.1:2380 --initial-advertise-peer-urls http://127.0.0.1:2380 \
+  --initial-cluster realapi=http://127.0.0.1:2380 --unsafe-no-fsync \
+  </dev/null >"$D/logs/etcd.log" 2>&1 & echo $! >"$D/etcd.pid"
+
+nohup "$B/kube-apiserver" --etcd-servers http://127.0.0.1:2379 \
+  --bind-address 127.0.0.1 --advertise-address 127.0.0.1 --secure-port 6443 \
+  --cert-dir "$D/certs" --service-cluster-ip-range 10.0.0.0/24 \
+  --service-account-issuer https://127.0.0.1:6443 \
+  --service-account-key-file "$D/sa.key" --service-account-signing-key-file "$D/sa.key" \
+  --token-auth-file "$D/tokens.csv" --anonymous-auth=false \
+  --authorization-mode RBAC --disable-admission-plugins ServiceAccount --profiling=false \
+  </dev/null >"$D/logs/apiserver.log" 2>&1 & echo $! >"$D/apiserver.pid"
+```
+- **What differs from envtest's own start** [doc: lane 4's read of controller-runtime's `apiserver.go`]:
+  - `--allow-privileged` is not passed, so privileged pods are refused, as Autopilot refuses them;
+  - `--token-auth-file` replaces envtest's client-certificate authentication, and `--anonymous-auth=false` is added;
+  - `--profiling=false` is added;
+  - `--advertise-address 127.0.0.1` is added; it is not in lane 4's list of envtest's flags;
+  - `--bind-address`, which envtest passes too, is set to 127.0.0.1 here, because its default is `0.0.0.0` [doc];
+  - etcd's client and peer URLs are 127.0.0.1, where envtest's peer URL uses `localhost`.
+- **The serving certificate** is self-signed into `$D/certs/apiserver.crt`, with the bind address as an IP SAN [doc]. Confirm on the VM:
+  - `grep -c 'BEGIN CERTIFICATE' "$D/certs/apiserver.crt"` (2: the leaf and its CA);
+  - `openssl x509 -in "$D/certs/apiserver.crt" -noout -ext subjectAltName` names `IP Address:127.0.0.1`.
+- **Checks:**
+  - `$K get --raw /readyz` prints `ok`;
+  - `ss -ltnpH` shows etcd and kube-apiserver listening on 127.0.0.1 only.
+
+**R6. The forward, and the run, on the Mac.**
+```
+ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:16443:127.0.0.1:6443 "$VM"   # in the background; its pid in "$RUN/ssh.pid"
+scp "$VM":realapi-<YYYYMMDD>/certs/apiserver.crt "$RUN/apiserver.crt"
+scp "$VM":realapi-<YYYYMMDD>/token "$RUN/token"; chmod 600 "$RUN/token" "$RUN/apiserver.crt"
+export FARCAST_REALAPI_ENDPOINT=127.0.0.1:16443 FARCAST_REALAPI_CA_FILE="$RUN/apiserver.crt" FARCAST_REALAPI_TOKEN_FILE="$RUN/token"
+REALAPI='^(TestMigrationRemovesAFieldLaterDroppedFromTheManifest|TestAnnotationRemovalInTheSamePatchLeavesNoUpdateEntry|TestRealAPIKeepsTheLiveListOnAnUndecodableRewrite|TestMigrationIsResumable|TestFirstApplyAfterMigrationChangesNoGeneration|TestReapplyingAnUnchangedJobIsANoOp|TestApplyRefusesAStaleResourceVersion|TestMetadataOnlyListsCarryNoSecretData|TestStatusCauseWireName|TestTypedListItemsCarryNoKind|TestMigrationLeavesAnotherManagersFieldAlone|TestKernelWritesAreTrackedAsTechnocore)$'
+(cd farsight/cli/internal/kube && "$RUN/kube-realapi.test" -test.run "$REALAPI" -test.v -test.count=1 -test.timeout=30m >"$RUN/kube.out" 2>&1); echo "exit $?"
+(cd farsight/cli/internal/cli && "$RUN/cli-realapi.test" -test.run '^TestEveryRenderedStreamAppliesOnARealServer$' -test.v -test.count=1 -test.timeout=15m >"$RUN/cli.out" 2>&1); echo "exit $?"
+(cd farsight/cli/internal/kube && "$RUN/kube-realapi-row104.test" -test.run '^TestMigrationRemovesAFieldLaterDroppedFromTheManifest$' -test.v -test.count=1 >"$RUN/row104.out" 2>&1); echo "exit $?"
+grep -E '^(=== RUN|--- (PASS|FAIL|SKIP)|PASS$|FAIL$)' "$RUN/kube.out" "$RUN/cli.out"
+grep -E '^ *--- (PASS|FAIL)|stuck field: ' "$RUN/row104.out"
+```
+- **The kube run names its tests.** `REALAPI` is every top-level test in `kube/realapi_test.go` but `TestEmulatedSeedMatchesKubectl` (R7), anchored at both ends, so the unit test `TestStatusCauseWireNameIsReason` is not matched. `kube.out` must hold exactly 12 unindented `--- PASS` or `--- FAIL` lines; any other count stops the run, because a test was missed.
+- **Row 104 counts as killed only when both hold:**
+  - `TestMigrationRemovesAFieldLaterDroppedFromTheManifest` passed in the unmutated `kube.out`;
+  - the mutant's failure is the stuck-field assertion (a `stuck field: ` line), recorded by its subtest name.
+
+  Any other failure (a missing variable, a setup error, the end-state check) is recorded by its assertion and does not count: row 104 is then not verified (What §31 records).
+- Each binary runs in its package directory, as `go test` would, so `testdata/` resolves.
+- Outputs go only to `$RUN`. Nothing else is printed but the lines above.
+- The Mac's farcast config directory and `~/.kube` are never read.
+
+**R7. The kubectl variant, once.**
+```
+scp farsight/cli/internal/kube/testdata/realapi/kubectl-seed-v1.yaml farsight/cli/internal/kube/testdata/realapi/kubectl-seed-v1b.yaml "$VM":realapi-<YYYYMMDD>/
+# on the VM, with K as the Variables define it (--cache-dir "$D/kube-cache" included):
+$K create namespace realapi-kubectl
+$K apply -n realapi-kubectl -f "$D/kubectl-seed-v1.yaml"
+$K apply -n realapi-kubectl -f "$D/kubectl-seed-v1b.yaml"
+# on the Mac:
+(cd farsight/cli/internal/kube && FARCAST_REALAPI_KUBECTL_NAMESPACE=realapi-kubectl "$RUN/kube-realapi.test" -test.run '^TestEmulatedSeedMatchesKubectl$' -test.v -test.count=1 >"$RUN/kubectl.out" 2>&1); echo "exit $?"
+```
+- kubectl's apply is client-side by default at 1.36, so the object should show `kubectl-client-side-apply`/Update. That is to be confirmed on the VM.
+
+**R8. Results, scrubbed.** The runbook's Results and §31 hold only:
+- versions, the archive's byte count, and that its sha512 matched both published values;
+- each test's PASS or FAIL, and row 104's mutant killed or not;
+- the facts each test records: managers, operations, subresources, field paths, HTTP codes, kinds and generation moves.
+
+**The scrub rule:**
+- no address, host name or account name, loopback and the VM's own included, and no port;
+- no path under the operator's home, on the Mac or the VM;
+- no uid, resourceVersion, pid, key id or token byte;
+- no time of day (dates only).
+
+Raw outputs and logs are never copied into a record.
+
+**R9. Teardown.**
+1. On the VM:
+   - `kill "$(cat "$D/apiserver.pid")"`, then `kill "$(cat "$D/etcd.pid")"`;
+   - poll `pgrep -u "$(id -u)" -x 'etcd|kube-apiserver|kubectl'` until it prints nothing, for at most 30 s;
+   - `rm -rf "$D"`.
+2. Check on the VM:
+   - `ss -ltnH '( sport = :2379 or sport = :2380 or sport = :6443 )'` prints nothing;
+   - `pgrep -u "$(id -u)" -x 'etcd|kube-apiserver|kubectl'` prints nothing;
+   - `test ! -e "$D"`;
+   - `~/.kube`'s state, taken as in R1 step 5, equals `$RUN/kube-before.txt`;
+   - `test ! -e ~/.kube/cache/discovery/127.0.0.1_6443` holds.
+
+   A difference is recorded as a change outside `$D` (A30-2), and the operator decides what is removed.
+3. On the Mac:
+   - `kill "$(cat "$RUN/ssh.pid")"`;
+   - `lsof -nP -iTCP:16443 -sTCP:LISTEN` prints nothing;
+   - `rm -rf "$RUN"`, which removes the binaries, the token, the CA copy and the outputs;
+   - `test ! -e "$RUN"`.
+4. The operator may stop the VM.
+
+**What §31 records** (the run's scrubbed outcome, and what each part decides):
+- **§6.3:** a `farcast`/Update entry after the same-patch removal, or none.
+  - None: the single patch stands.
+  - One: §31 pins the revision of §6.3, and the operator approves it before M2.7b. A second request is not built speculatively. Once built, it runs again under A30-1's re-run rule.
+- **The stale-rv apply** (409 or 200), and the deleted-object apply with an rv (404 or 409).
+  - 409: step 3 is built in M2.7b (A30-40).
+  - 200: it is not built, and risk 7 stays.
+- **Row 104's mutant.**
+  - Killed, by R6's rule: row 104 is verified.
+  - Survived, or failed anywhere but the stuck-field assertion: stop; the operator decides before M2.7b.
+- **Every rendered stream applied twice.** Each refusal, with its document and reason, is scrubbed. M2.7b step 1a fixes the renderer and regenerates its vectors, and the stream runs again under A30-1's re-run rule.
+- **The generation moves:** the migration's own, and the forced re-apply's. A re-apply that moves one confirms risk 3, and W3 watches it.
+- **The Job re-apply:** a no-op, or a conflict.
+- **The kernel's entries:** manager, operation and subresource per write, whether `/scale`'s `replicas` is tracked, and the forced reset taking it back.
+- **The wire facts:** metadata-only lists, gets and patches; the StatusCause key; typed and partial list item kinds.
+- **The kubectl variant:** equal, or how it differs (A30-3).
+- **Any flag** that had to change from this runbook.
+- **A re-run** (A30-1): the tree it was built from, by its tree hash, and its outcome beside the first run's.
+
+### Step 1b: the refusal, `migrate`, and `install`'s record
+
+**A30-20 (C13, C14, L2.12, L2.13, L3.11, OD10, A30-5): the refusal, and where each writer raises it.**
+- **The function.** `refuseUnmigrated(name string, meta *config.InstanceMetadata) error`, in `cli/migrate.go`.
+  - It returns nil when `meta.ServerSideApply != nil`.
+  - Otherwise it returns `withKind(kindNotMigrated, …)` of §6.5's text.
+- **It is raised as an error in every mode, `--plan` included, never as a block.** A23-18's list of errors raised before any plan is computed gains it. A plan binds no field for it, so no vector moves.
+- **Placement**, right after `recordNamed` unless stated otherwise:
+  - `connect`: the first statement inside `if !connected {` (`connect.go:334`), before `c.precheck`. A resume refuses; a reconnect and `--status` never do.
+  - `redeploy` (`:184-190`), `kernel deploy` (`:301-307`), `kernel confirm` (`:137-143`) and `storage deploy` (`:198-204`).
+  - `storage key pin` (`:756-762`), before `keyringOf`.
+  - `run` (`:292-298`), before F's blocks (A28-8).
+  - `build` (`:234-240`), before its `--repo`/`--app` check.
+  - `kernel meter`: after the list-only return (`kernelmeter.go:132-136`). The list-only form writes nothing.
+  - `storage key rotate`, only when `pinMeta` holds:
+    - interactively, first inside `if lerr == nil && pinMeta(m)` (`storagekey.go:565`), before the pin store opens;
+    - in `planned()`, right after `recordNamed` (`:619-625`), when `pinMeta(meta)`.
+
+    With no keyholder it writes nothing to the cluster, and never refuses (A30-5).
+  - `reader grant`: after `loadReaderRecord` (`readergrant.go:259-262`), before `c.plan`.
+  - `migrate`: never.
+- **The fixtures (C13).** One helper, `recordMigrated(m *config.InstanceMetadata)` (chosen here), sets a fixed `ServerSideApply` on every base fixture in the same step:
+  - `writeInstance`, `readerInstance`, `installedInstance`, `connectedInstance`, `runnableInstance`, `meteringInstance`, `kernelInstance` and `meteredInstance`;
+  - `buildableInstance`, `newGrantFixture`, `newStorageRig`, `newKernelRig`, `newStageRig`, `deployableInstance`, `handOverInstanceIn` and `planNoticeInstance`;
+  - every other literal a writer runs on.
+
+  `vectorMeta` already sets it. Only the refusal tests build unmigrated records, and one more:
+  - `TestInstancesNeverOpensTheReaderKey` (`nosecrets_test.go:128-159`) builds `readerInstance(t, s, "atlas", true)` and asserts that `instances` reports it not migrated (`instances.go:114`);
+  - it saves that one record again with `ServerSideApply` cleared, so its assertion stands and `instances`' unmigrated column stays covered.
+- **Pinned by:**
+  - `TestUnmigratedInstanceIsRefusedBeforeAnythingIsAsked` (row 92). It covers each `writeCommands()` row but `migrate`, with `--yes` or its interactive seam and again with `--plan`, on an unmigrated fixture; rotate's fixture has a keyholder. Each gives:
+    - `not_migrated` and exit 1;
+    - zero kubetest requests, `/token` included;
+    - no `credentials.yaml` or `ca.key` in `ObserveReads`;
+    - the provider never opened, and no `[y/N]`;
+    - the config tree byte-identical.
+  - `TestEveryClusterWriterRefusesAnUnmigratedInstance` (row 93). Its table is A30-26's derived writer set, plus `connect`'s resume. It also has rows that must not refuse: `connect`'s reconnect and `--status`, `kernel meter`'s list-only form, and rotate with no keyholder.
+
+  Mutation rows 92a, 93a and 93b.
+
+**A30-21 (C10, C11, L2.1–L2.3, L2.17, M9, OD15): `migrate`'s surface.**
+- **The command:**
+  ```go
+  type migrateCommand struct {
+  	newCluster  func(clusterRef) (migrateCluster, error)  // default: openWriter
+  	interactive func(*Env) bool                           // default: isInteractive
+  	now         func() time.Time                          // default: time.Now
+  	sleep       func(context.Context, time.Duration) error // default: a ctx-aware sleep
+  	consent     consentFlags
+  	yes         bool
+  }
+
+  type migrateCluster interface {
+  	ListMeta(ctx context.Context, k kube.Kind, namespace, selector string) ([]kube.Object, error)
+  	GetMeta(ctx context.Context, k kube.Kind, namespace, name string) (kube.Object, error)
+  	PatchManagedFields(ctx context.Context, k kube.Kind, namespace, name string, patch []byte) (kube.Object, error)
+  	preflighter
+  }
+  ```
+  It is registered in `defaultRegistry` after `releaseCommand`. `SetFlags` registers the consent flags, `--yes` and `-y`.
+- **Usage.** Its first paragraph is `Usage: farcast migrate <instance> [--plan | --confirm <digest>]`, as `TestAPlanFlagIsNeverIgnored` requires (C11). Then §6.1's paragraph. Then one more paragraph:
+  - `--yes` is refused;
+  - it is the one plan read as the writer, because it lists Secrets' metadata;
+  - an instance installed without `--credentials`, possible only before ADR 0023 M2.5, cannot be migrated, only released.
+- **The order of `Run`:**
+  1. the argument count;
+  2. `consent.mode(c.yes)`, so the three-way text comes first;
+  3. `--yes`: `usagef(msgMigrateYes, shown)`, where `shown` is `<instance>` for an invalid name, as A23-41 has it;
+  4. `consentNone` and not interactive: `usagef(msgMigrateTerminal)`;
+  5. load the record, `recordNamed`, and refuse a releasing one;
+  6. `defer func() { err = writerRefused(err, meta) }()`;
+  7. `openReadyAt(ctx, env, meta, c.newCluster)`: the open, then `preflightUID` (C10). Until step 1c deletes `applyReady` from it (A30-30), it also runs that check;
+  8. the plan;
+  9. by mode.
+- **The texts:**
+  - `msgMigrateYes` is §6.1's. It is a `--yes` refusal outside the `consentSuffix` rule, as `msgReaderGrantYes` is, and names `--plan` in its own words.
+  - `msgMigrateTerminal = "migrate needs a terminal to confirm" + consentSuffix`.
+- **The plan.** It is `newBound("migrate", meta, "writer", uid)`. `uid` is `farcast-system`'s, as the writer's preflight read it (C10); `""` prints `absent` (A24-8). It has no options, and exactly one `MigrateFact` with `CannotBeUndone: true`.
+- **The interactive prompt.**
+  - The plan's `planResult.Human` goes to `env.Err`.
+  - Then `newPrompter(env.In, env.Err).line("This cannot be undone. Type the instance name to migrate it")`, with no trailing colon, because `line` adds `": "` (`prompt.go:37-41`).
+  - It is compared as `strings.TrimSpace(typed) == meta.Name`. Otherwise `Aborted.` goes to stderr, exit 0, and nothing is written.
+- **The output.** `--plan` prints the plan document (`printPlan`). After a migration, interactive or confirmed, stdout carries a `migrateResult` (chosen here):
+  ```go
+  type migrateResult struct {
+  	Instance     string   `json:"instance"`
+  	Migrated     int      `json:"migrated"`      // objects this run rewrote
+  	Since        string   `json:"since"`         // server_side_apply.since, wireTime
+  	LocalDeleted []string `json:"local_deleted"` // config-relative, [] when none
+  }
+  ```
+  Its human form is `Migrated %d object(s) of instance %s to server-side apply; recorded since %s.`, then `Deleted %s.` per file.
+- **A blocked plan** (A30-22):
+  - `--plan` prints it and exits 0 (A23-7);
+  - `--confirm` refuses with `refuseBlocked`;
+  - an interactive run prints it to stderr and returns the first block's error before the prompt, as a block is refused outside `--confirm` (A28-8).
+- **Nothing to do.** On a record that is already migrated, when the plan has no object and no local file, an interactive run prints `migrateResult` (0, the existing `since`) and asks nothing. `--plan` and `--confirm` behave as they do for any plan.
+- **No installer key (M9).** An open that fails with `credential_missing` is wrapped, keeping its kind:
+  - `%w; migrate runs as the installer service account whose key 'farcast install --credentials' stored, so this machine cannot migrate instance %q; an instance installed without one (possible only before ADR 0023 M2.5) cannot be migrated, only released`;
+  - the README's `migrate` section says the same.
+- **Tests:**
+  - `TestMigrateRefusesYes` (row 99): `--yes` and `-y`; `--yes --plan` gives the three-way text;
+  - `TestMigrateNeedsATerminalOrAPlan`;
+  - `TestMigrateInteractiveComparesTheTypedName`: a match migrates; a mismatch gives `Aborted.`, exit 0, and no PATCH;
+  - `TestMigratePlanReadsAsTheWriterAndNeedsNoReader`: every request is `As == "writer"` and a GET or `/token`; `credentials.yaml` is read; no reader key is opened;
+  - `TestMigrateWithoutAnInstallerKeySaysSo`.
+
+**A30-22 (M5, OD7, L2.19): discovery, the blocks, and how an object is named.**
+- **Discovery.** For each kind of `kube.Kinds`, in table order: `ListMeta(k, "", "app.kubernetes.io/managed-by=farcast")`. An object is selected when `kube.ClientSideTrace(md)` holds (A30-6). Objects keep the kinds' order, then the server's list order.
+- **Blocks.** A selected object is a block, kind `internal`, and is never patched, when either holds:
+  - its kind's `Names` is set and does not hold its name: a ClusterRoleBinding not named `farcast-reader-namespaces`;
+  - its namespace is `kube-system`, or begins with `kube-` (`validNamespace`'s rule), `gke-` or `gmp-`.
+
+  `internal` is the kind `kube.ErrRefusedDocument` carries; it is chosen here.
+- **The block's message** (chosen here): `%s carries farcast's label and kubectl's client-side apply, but it is not an object farcast writes (%s); migrate never rewrites it: remove its app.kubernetes.io/managed-by label, or delete it, from Cloud Shell, then run 'farcast migrate %s --plan' again`.
+  - The parenthesis is `a ClusterRoleBinding farcast writes is named farcast-reader-namespaces`, or `namespace %q is the provider's`.
+  - A blocked object is named only in its block, never among the fact's objects.
+- **A consequence, recorded in the README's `migrate` section.** `kernel meter` can meter a `gke-` or `gmp-` namespace (`readerrbac.go:21-25`). If Autopilot admitted farcast's RoleBindings there, they are blocked too: the kernel's, and the reader's when it holds the metered scope, both farcast-labelled.
+  - The operator deletes them in Cloud Shell and migrates.
+  - Then `farcast kernel deploy <instance>` re-applies the kernel's RoleBinding in every metered namespace, and the reader's where the reader holds the metered scope (`kernelManifests`, `kernel.go:774-795`).
+  - Metering again does not: `kernel meter` on a namespace already metered is a no-op that applies nothing (`kernelmeter.go:253-258`, `:171-172`).
+
+  No live instance exists.
+- **Objects are named by `describeObject`** (A30-13, step 0b): in the blocks, the rendering and every `migrate` error (C12).
+- **Pinned by:**
+  - `TestMigratePlanBlocksObjectsFarcastNeverWrites`: both cases, one block per object; `--confirm` refuses, and nothing is patched;
+  - `TestMigrateNamesClusterScopedObjectsWithoutASlash`;
+  - `TestMigrationLeavesThePinAndTheKernelsConfigMaps` (row 94) and `TestMigrationFindsARoleBindingInAnUnlabelledNamespace` (row 95).
+
+  Mutation row 94b.
+
+**A30-23 (C12, L2.4–L2.6, OD15): the loop over the plan's objects.** In both interactive and confirmed runs, for each object in the plan's order:
+1. **Re-read.** `GetMeta`. A 404, or a uid, `ClientSideManagers` set or `csa_fields_sha256` that differs from the plan's, gives `changedAfterPlan(mode, …)` of `msgMigrateChanged`: `plan_changed` ending `msgPlanAgain` under `--confirm`; `internal` interactively.
+2. **Patch.** `hadApply := slices.ContainsFunc(o.Metadata.ManagedFields, kube.IsOwnApply)`; `kube.MigrationPatch(o, csa, kube.FieldManager)`; then `PatchManagedFields`.
+   - **A 409** (`errors.Is(err, tkube.ErrConflict)`): `c.sleep(200 ms)` and back to step 1, at most **5 attempts** in all. After the fifth, the 409's own error is wrapped (`cluster_rejected`).
+   - **Any other error**, 429 and 503 included, stops the run. The run is resumable. `PatchJSON` itself retries nothing (`TestPatchJSONConflictIsTheCallers` stands).
+3. **Verify.** `MigratedEndState(answer, csa, kube.FieldManager, hadApply)`, then `GetMeta` and the same check again. A failure is §6.4's text, wrapping `kube.ErrNotMigrated` (`cluster_rejected`).
+
+**The texts** (chosen here; `%s` is `describeObject`, and `%d of %d` counts the objects verified so far against the plan's total):
+- `msgMigrateChanged`: `%s changed since the plan was made (another writer applied or deleted it); %d of %d objects were migrated and the rest were not`.
+- Five 409s: `%s kept changing while it was rewritten (5 attempts, each answered 409): %w; %d of %d objects were migrated and the rest were not, and running migrate again finishes them`. The cause comes before the consequence, as in the sibling `rewrite %s: %w; …`.
+- Any other patch error: `rewrite %s: %w; %d of %d objects were migrated and the rest were not, and running migrate again finishes them`.
+- The end state: `%s did not come back migrated (%s); nothing after it was touched` (§6.4).
+
+**Pinned by:**
+- `TestMigrateConfirmRecomputesAndRefusesAChangedObject`: a uid, a manager set, a hash and a 404, each changed after the plan; `%d of %d`; `plan_changed` under `--confirm` and `internal` interactively;
+- `TestMigrateRetriesOnlyAConflictFiveTimes`:
+  - 409 four times, then success, migrates;
+  - 409 five times is `cluster_rejected` after exactly 5 PATCHes;
+  - one 503 stops after 1 PATCH;
+  - each sleep is 200 ms;
+- §6.4's `TestMigrationRefusesASilentlyIgnoredRewrite` (row 96), `TestMigrationReadsBackAfterAnAnswerThatLooksMigrated` (96a), `TestMigrationRecordsOnlyWhenEveryObjectIsDone` (97) and `TestMigratePlanCarriesNoSecretByte` (98).
+
+Mutation rows 99a and 99b.
+
+**A30-24 (M8, OD6, OD10, L2.14, L4.6, L4.7): recording, after a fresh discovery.**
+- **Discovery again.** Once every object is verified, discovery runs again: every kind, cluster-wide, by the label, selected by `ClientSideTrace`. That is about 14 metadata-only lists.
+- **If it selects anything:** `changedAfterPlan(mode, …)` of `after %d of %d objects were migrated, %s still carries kubectl's client-side apply (written during the migration); nothing was recorded`.
+- **Only when it selects nothing**, `UpdateInstanceMetadata` sets `server_side_apply: {since: <now, UTC>, farcast: buildinfo.Get().Version}`. An existing record's `since` is kept.
+- **Then the local files.** `RemoveLegacyKubectlFiles` runs (A30-14). Its error prints `Warning: could not delete %s (%s); nothing reads it` for the file it names, through `output.ErrorText`. `local_deleted` is its `removed`, so it lists only what went.
+- **Why a `farcast`/Update entry does not block the record:** the pin's create and replace leave one on the pin ConfigMap, legitimately (row 102's POST).
+- **§6.3's "UpdateNoErrors also keeps the live list on any error"** becomes: on an error, the managed-fields updater keeps the live list or, by lane 4's v0.36.2 reading (not checked offline; refuted 7), clears it. `MigratedEndState` refuses either way.
+- **A residual, recorded in risk 2 and the README's `migrate` section.** A cleared list leaves an object no later discovery selects. The run that met it stopped with `cluster_rejected` naming it, but a second run records the instance.
+- **Pinned by:**
+  - `TestMigrateRecordsOnlyAfterAFreshDiscoverySelectsNothing`: a `WithHandler` puts a trace back on a verified object before the final list. Nothing is recorded, and the error is the text above;
+  - `TestMigrateRecordsAndDeletesTheLocalFiles`: `since`, `farcast`, both files gone; `--plan` touches nothing;
+  - `TestMigrateOnAMigratedRecordKeepsSince`.
+
+  Mutation rows 97a and 97c.
+
+**A30-25 (M1, OD8, L2.22, refuted 5): `install` records only a cluster it created.**
+- **`planck.Cluster` gains `Created bool`** (chosen here; its zero value fails closed). It is set by a provider whose `CreateCluster` created the cluster in that call, and false when the provider found one under the name and returned it.
+  - GKE's `CreateCluster` (`gke.go:103-112`) sets it when `api.get` found none.
+  - The cluster name is deterministic (`install.go:98`), so `install x` on a second machine adopts the first machine's cluster.
+- **The record.** `install` sets `meta.ServerSideApply = &config.ServerSideApply{Since: meta.CreatedAt, Farcast: buildinfo.Get().Version}` only at its finalizing save (`install.go:220`), and only when `cluster.Created`. The first record (`:155-166`, saved at `:173`) carries none.
+- **An adopted cluster** stays unmigrated. Stderr gets (chosen here): `Warning: cluster %q already existed, so this farcast cannot tell what wrote to it; run 'farcast migrate %s --plan' before any command that writes to it.`
+- **The two `--credentials` texts** (`msgCredentialsRequired` and `msgCredentialsEmpty`, `install.go:358`, `:367`) become, chosen here:
+  - `--credentials is required: since ADR 0023 M2.7 the commands that write to an instance's cluster read and write it as the service account whose key --credentials names, never as Application Default Credentials`;
+  - `--credentials names an empty file: since ADR 0023 M2.7 the commands that write to an instance's cluster read and write it as the service account whose key --credentials names, never as Application Default Credentials`.
+  - They name the writing commands only: `world`, `ps`, `costs`, `usage`, `logs` and the five reader plans read as the reader.
+- **Pinned by:**
+  - `TestInstallRecordsServerSideApply`: `since` equals `CreatedAt`, `farcast` is the build's version, and the first save carries none;
+  - `TestInstallOnAnAdoptedClusterLeavesItUnmigrated`: `Created` false gives no record, the warning, and exit 0;
+  - GKE's `TestCreateClusterSaysWhetherItCreated` (chosen here): new is true, existing is false;
+  - `TestInstallRefusesAMissingCredentials` and the empty-file test follow the texts.
+
+  Mutation row 97b.
+
+**A30-26 (C16, L2.10, RV-3): the twelfth writer in the harness, and a guard derived from production.**
+- **`writeCommands()`** gains `{name: "migrate", args: []string{writeName}, cmd: func() Command { return &migrateCommand{interactive: func(*Env) bool { return true }} }}`. `runWrite`'s `y` answer aborts the typed-name prompt.
+- **`planCommand` gains `identity string`**: `"reader"`, `"writer"` or `"none"`. It is asserted equal to `Bound.ClusterIdentity` in `TestEveryWritingCommandHasAPlanRow`.
+  - `readsCluster` keeps meaning "as the reader". `migrate`'s rows are `identity: "writer"`, with `readsCluster` false.
+  - The writer branches:
+    - `onlyThePlansSent` and `TestPlansPresentOnlyTheReaderToken`: every request is `As == "writer"`, a GET or `/token`;
+    - `TestPlansWriteNothing`: one writer open is allowed;
+    - `TestPlansStillReadTheInstallerKeyForGoogle`: `migrate` is true;
+    - `confirmLineOnTheCommands`.
+  - Its two `planCommands` rows are "objects to migrate", seeded with client-side-applied objects, and "nothing to migrate".
+  - `factTypes` (`writecommands_test.go:1929`) gains `plan.TypeMigrate`, and `realWriter` gains `migrate`'s case.
+- **`TestNonInteractiveRefusalsNameThePlan`** gains the gate `{"migrate", []string{msgMigrateTerminal}, migrateRefusalNamesThePlan}`, the shape of its gates (`consent_test.go:830-844`). `migrateRefusalNamesThePlan` runs `migrate` with no terminal and no flag, and asserts the usage error.
+- **`TestEveryProductionWriterIsAWriteCommand`** (chosen here; RV-3's guard).
+  - **The walk.** By reflection, over every command `defaultRegistry` reaches, descending into each `group`'s `subs`, nested groups included (`storage key`). Groups registered in `cli.go:205-232` (`newKernelCommand`, `newStorageCommand`, `newReaderCommand` and the rest) hold most of the writers.
+  - **The fields.** For each command struct: its func-kinded fields, and those of every field of type `fatlineDeployer`, embedded or named. Named func types count, such as `pinStoreOpener` (`storagepin.go:84`).
+    - `connect` (`connect.go:50`) and `redeploy` (`redeploy.go:37`) embed `fatlineDeployer`.
+    - `kernel deploy` (`kernel.go:46`), `kernel meter` (`kernelmeter.go:31`), `kernel confirm` (`kernelconfirm.go:33`) and `storage deploy` (`storagedeploy.go:47`) hold it as a named field, `deployer`.
+    - Their writer seam is `fatlineDeployer.newCluster` (`fatline.go:288`).
+  - **The selection.** A field is selected when its first result is an interface whose method set holds `Apply`, `CreateConfigMap`, `ReplaceConfigMap` or `PatchManagedFields`. The commands with a selected field, by the names the walk reaches them under (`kernel meter`, `storage key pin`), must equal `writeCommands()`' names.
+  - **Its own test** has a row naming `kernel meter`, which proves the named-field path is walked.
+  - An AST check: every such type but `migrateCommand` has a method calling `refuseUnmigrated`.
+  - Row 93's table is that set.
+- **The vector.** `testdata/plan/migrate.json` comes from a fake `migrateCluster`, on `planVectorMeta` with `ServerSideApply` cleared. It holds a Deployment, a Secret with a marker in its data and annotation, a RoleBinding in an unlabelled namespace, and `kubeconfig.yaml` present.
+
+  Mutation row 93c.
+
+### Step 1c: Apply in-process
+
+**A30-27 (C7, L1.9, D3, §5.3): `cluster.Client.Apply`.**
+```go
+func (c *Client) Apply(ctx context.Context, manifests []byte) error {
+	if err := c.neverWrites(); err != nil {
+		return err
+	}
+	docs, err := kube.SplitStream(manifests)
+	if err != nil {
+		return err
+	}
+	if len(docs) == 0 {
+		return fmt.Errorf("cluster: the stream holds no document, so nothing was sent: %w", kube.ErrRefusedDocument)
+	}
+	for i, d := range docs {
+		md, err := c.kube.Apply(ctx, d, true)
+		c.flushWarnings()
+		if err != nil {
+			return fmt.Errorf("cluster: %d of %d documents were applied before %s failed: %w", i, len(docs), traceName(d), err)
+		}
+		c.noteTrace(d, md)
+	}
+	return nil
+}
+```
+- **The signature is unchanged.** `force` is always true: for FarCast's own components by §5.3, and for applications by P1 (c).
+- **The doc** says: no kubectl; stream order; it stops at the first failure; no apply is atomic. `meterManifest`'s comment gains that last sentence (§5.3).
+- **Pinned by:**
+  - `TestApplySendsEachDocumentAsServerSideApply`, which replaces `TestApplyPipesManifestToStdin`:
+    - one mint, then one PATCH per document in stream order;
+    - `application/apply-patch+yaml`;
+    - `RawQuery` exactly `fieldManager=farcast&fieldValidation=Strict&force=true`;
+    - the body equals `d.Raw`, and `As == "writer"`;
+  - `TestApplyStopsAtTheFirstFailingDocumentAndSaysHowManyWent`, which replaces `TestRunnerErrorPropagates`: `Fail` on document 2 gives `1 of 3`; the error unwraps to `*kube.APIError`, and document 3 is never sent;
+  - `TestApplyRefusesBeforeSendingAnything`: a `SplitStream` refusal, and an empty stream, each send zero requests, `/token` included;
+  - `TestAWritersApplyWritesItsWarnings`.
+
+  Mutation rows 100b and 100c.
+
+**A30-28 (C15, C5, L2.16, L3.12, M4, OD2, §6.6): Traces and `afterWrites`.**
+- **`cluster.Client` gains** `traceMu sync.Mutex` and `traces []string`.
+  - `noteTrace(d, md)` appends `traceName(d)` once, when `kube.ClientSideTrace(md)` holds.
+  - `traceName(d)` is `<Kind> <namespace>/<name>`, or `<Kind> <name>` when cluster-scoped. It is built from the Document, whose names `SplitStream` validated, never from the answer.
+  - No annotation value is ever kept.
+- **`func (c *Client) Traces() []string`** returns a copy, in apply order, each object once.
+- **`afterWrites(env *Env, name string, w any)`**, in `cli/migrate.go`:
+  - only when `w` implements `tracer` (`interface{ Traces() []string }`, chosen here) and `Traces()` is non-empty: it prints §6.6's Warning once per object on stderr, then clears `ServerSideApply` through `UpdateInstanceMetadata`;
+  - otherwise it does nothing and reads nothing;
+  - a failure to clear prints `Warning: could not clear instance %q's server_side_apply record (%s); run 'farcast migrate %s --plan' before its next write`, through `output.ErrorText`;
+  - it returns nothing, and never replaces the command's error.
+- **Where it runs.** `defer afterWrites(env, name, cl)` follows every successful writer open in the nine commands that apply: `connect` (both opens), `redeploy` (both), `build`, `run` (every open, its `--confirm` paths included), `kernel deploy` (both), `kernel meter`, `kernel confirm`, `storage deploy` (both), and `reader grant` (its applier). Pin, rotate and `migrate` take none.
+- **The compile guard.** `_ tracer = (*cluster.Client)(nil)` replaces `applyReadier`'s line in `fatline.go`'s var block.
+- **Pinned by:**
+  - `TestTracesListsEveryClientSideTrace` (cluster):
+    - the entry branch comes from a `kubectl-client-side-apply` entry seeded with `Put`, which kubetest's apply keeps;
+    - the annotation branch comes through `WithHandler`;
+    - `farcast`/Apply alone is no trace, and duplicates appear once;
+  - `TestAClientSideTraceAfterMigrationClearsTheRecord` (row 101): the Warning is printed, the record cleared, and the next writer refuses with `not_migrated`;
+  - `TestAPartialApplyStillReportsItsTraces` (chosen here): document 1 carries a trace and document 2's apply fails. The command fails `cluster_rejected`, prints the Warning, and clears the record;
+  - `TestTracesCarryNoSecretByte` (M4, chosen here):
+    - `connect`'s first deploy runs on a migrated fixture;
+    - `farcast-system/fatline-mtls`'s apply is answered through `WithHandler` with a `kubectl-client-side-apply` entry and the annotation holding a marker;
+    - the marker is absent from stderr, from any error and from the `-o json` envelope;
+    - the Warning names `Secret farcast-system/fatline-mtls`.
+
+  Mutation rows 98a, 101, 101a and 101b.
+
+**A30-29 (C18, L1.10, L3.9, OD14): every apply is forced, in the plan too.**
+- **`applyFacts`** (`consent.go:236-255`) binds `Force: true`. Its doc reads "forced (§5.3, Choice 6 (c)) and at no resourceVersion".
+- **`WriteFact.Force`'s doc** (`plan/facts.go:149-151`) reads: "true for every apply since M2.7; false for the pin's create and replace, which are not applies". `storagepin.go` and `storagekey.go` keep false.
+- **The vectors.** These are regenerated with `FARCAST_UPDATE_VECTORS=1`: `build`, `connect_first`, `kernel_confirm`, `kernel_deploy`, `kernel_meter`, `reader_grant`, `redeploy`, `run_fetch`, `run_deploy` and `storage_deploy`, plus `error_plan_changed`, which embeds `kernel_confirm`'s digest.
+  - Only `force` and the digests move.
+  - `storage_key_pin.json` and `storage_key_rotate.json` stay byte-identical.
+- **The tests' expectations.** `wantWrites` builds `Force: true`, and `readergrant_test.go:791` reads `force: yes`.
+- **Row 100 is `TestEveryApplyIsForced`:**
+  - in `cluster`: every apply-patch request carries `force=true`;
+  - in `cli`: for every plan row with applies, `--plan`, then `--confirm` against kubetest:
+    - every apply-patch PATCH is `As == "writer"` with the pinned `RawQuery`;
+    - their bodies, in order, equal the plan's write facts (sha256, with A23-31's masks);
+    - every apply write fact binds `force: true`.
+
+  Mutation rows 100 and 100a.
+
+**A30-30 (C3, L1.3, L3.1, L5.12, OD4): `applyReady` goes.**
+- **Deleted:**
+  - `cluster.Client.ApplyReady` (`cluster.go:312-335`) and `errNoKubeconfig` (`open.go:34`);
+  - `applyReadier`, its `_ applyReadier` line, and `applyReady` (`fatline.go:94-125`);
+  - its six calls: `fatline.go:764` (in `openReadyAt`), `kernel.go:359`, `kernelconfirm.go:193`, `kernelmeter.go:184`, `readergrant.go:302` and `storagedeploy.go:238`.
+- **`openReadyAt`** is the open, then `preflightUID`.
+- **Comments** that say "before kubectl applies" read "before anything is applied": `build.go:257`, `redeploy.go:210`, `run.go:318` and `fatline.go:61`.
+- **Comments that name `applyReady`**, rewritten in this step so that none names a deleted symbol:
+  - `fatline.go:743-751` (`openReady`: "applyReady finds a machine…", "before kubectl applies anything");
+  - `fatline.go:780-789` (`openConfirmed`: "applyReady runs");
+  - `fatline.go:806-808` (`confirmedCluster`: "without applyReady");
+  - `storagekey.go:613` ("no applyReady: rotate applies nothing").
+- **Deleted tests:** `TestApplyReadySaysWhatApplyWouldRefuseRunningNothing`, `TestCommandsThatApplyRefuseAMachineThatCannotApply`, and the `kernel confirm/no kubectl` row (`writecommands_test.go:477`). A21-2's mutation rows and A20-16's "kubectl missing from a pinned PATH" row are retired.
+- **Also in this step, so that 1c builds and passes alone:**
+  - `TestAWriterAppliesThroughKubectlWithItsKubeconfig` (`open_test.go:174`) is deleted, because `Apply` no longer runs kubectl;
+  - `TestOpenBuildsTheReaderOrTheWriter` loses its bare writer's `Apply` assertions (`open_test.go:152-164`), which expect `errNoKubeconfig`'s text. Its legacy column goes in 1d;
+  - `execRunner.ready`, which only `ApplyReady` calls, is deleted, or golangci-lint finds it unused. `missingText` stays until 1d deletes `execRunner`, because `command`, `failure` and `Stream` still call it.
+
+**A30-31 (C1, C2, L1.2, L3.2, OD3): the cli harness moves to kubetest's applies.**
+- **The server.** Every kubetest server that a writing test applies to runs `WithSettledWorkloads()`.
+- **The recorder.** `appliedRequests(s *kubetest.Server) []kubetest.Request` (chosen here) is `s.Requests()` filtered to apply-patch PATCHes, in order. Each is checked per document: `As == "writer"`, the pinned `RawQuery`, and `Body` equal to the Document's `Raw`.
+- **The stop point after the comparison** is `s.FailNextApply(http.StatusInternalServerError, kube.Status{})`.
+  - The command sends one refused apply, and stops with `cluster_rejected`.
+  - Each "sent nothing" claim becomes "sent one refused apply, and stored nothing".
+  - A row whose command writes something else before its first apply (a registry push through its fakes, the pin's create) asserts that write as its plan lists it.
+- **What it replaces.** `succeedingKubectl`, `succeedingKubectlRuns`, `kubectlCall` and `appliedStreams` are replaced. `noKubectl`, `strayKubectl`, `msgCannotApply`, `msgKubectlMissing` and `msgNoKubeconfig` are deleted.
+- **The stop points that move:** `consent_test.go:543` and `:949`, the `--yes -y` route at `:586`, `runfixture_test.go:959` and `:1114`, and `writecommands_test.go:478` and `:1152-1265`.
+- **`TestConfirmRecomputesAsThePlansIdentity` and `runConfirmRecomputesAsThePlansIdentity`** assert the applies themselves:
+  - every apply-patch PATCH is `As == "writer"`, after the writer's preflight;
+  - `kernel deploy`'s come between the preflight and the rollout read;
+  - `run <F>` sends one fetch apply after the preflight, then only the reader reads;
+  - `run <D>` applies the builds, then the policy, then the workloads;
+  - `answeredLog` counts PATCHes;
+  - the writer's non-token requests are the preflight, N applies, then the rollout reads.
+- **`TestConfirmWritesThePlannedDocumentsExceptTheirSecrets`** and its three sub-rows compare per-document PATCH bodies.
+- **`TestAWriterOpensAsTheInstallerKey`** (`clusterref_test.go:760-810`) asserts one apply-patch as the writer.
+- **§10.2's "unchanged in shape"** still holds for the fakes (`fakeCluster`, `fakeRunCluster` and the rest), and no longer for M2.6's stand-in tests.
+
+**A30-32 (C17, L1.12, L3.8): `reader grant`'s apply carries the writer's sentence.**
+- **The change.** `readergrant.go:321` becomes `return fmt.Errorf("apply instance %q's reader RBAC: %w; nothing was recorded", name, writerRefused(err, meta))`. The verification errors are left as they are.
+- **The comment.** `clusterref.go:331-332` reads: from M2.7 an apply's 403 carries `tkube.ErrForbidden`, so the writer's sentence applies to applies too.
+- **Pinned by** new rows in `TestWritingCommandsCarryClusterKinds`, over the nine commands that apply. Each checks the record as the command's rollback leaves it:
+  - an apply answered 500 gives `cluster_rejected`;
+  - an RBAC-shaped and an IAM-shaped 403 give `forbidden`, with the writer's sentence exactly once, `reader grant` included;
+  - a token refusal before the PATCH gives `credential_refused`.
+
+  Mutation row 102a.
+
+### Step 1d: kubectl and the kubeconfig out
+
+**A30-33 (C3 cont., L1.7, refuted 1, §10.4): what goes with kubectl.**
+- **`cluster` loses:**
+  - `env.go`, and `env_test.go` with its 10 tests and `TestMain` (refuted 1's count);
+  - `Runner`, `errKubectlMissing`, `errAuthToolMissing`, `errSignedOut`, `subprocessError`, `markOf`, `execRunner`, `envValue`, `lookPathIn`, `Streamer` and its `Stream`;
+  - `newWithEnv`, `newWithRunner`, the `runner` field, `errReaderKubeconfig`, `inProcessOnly`, and all 16 `c.kube == nil` guards (L1 fact 2).
+- **`Open(cfg kube.Config, warnings io.Writer) (*Client, error)`.** The reader/legacy check and the writer's runner branch go.
+- **`neverWrites`** is `if c.kube.Identity() != kube.Writer { return errNeverWrites }`.
+- **The docs.** The package doc is lane 5 change 40's text, and `Client.kube`'s doc says it is never nil.
+- **Tests:**
+  - deleted: `fakeRunner`, `TestAKubectlClientHasNoCanI`, `recordingKubectl` and `kubectlRecord` (`TestAWriterAppliesThroughKubectlWithItsKubeconfig` went in 1c, A30-30);
+  - `openWriter` (`open_test.go:66`) loses its `legacyKubeconfig`, at its 11 call sites;
+  - `TestOpenBuildsTheReaderOrTheWriter` loses the legacy column;
+  - `TestAWriterReadsInProcessAsTheWriter` and `TestConfigMapWritesNeverApply` lose `PATH` and kubectl;
+  - `rehearsal_test.go:1279` passes two arguments.
+
+  The env tests' intents already have kube tests (L1 fact 11), so none is written anew.
+- **`clusterref.go`** loses the legacy variable and argument, and its comments are rewritten.
+- **`exec-allowlist.txt`** drops its 15 cluster lines and the review note at `:50-52`. The reviewed lines go from 101 to 86, and none is added. `./check.sh` step 1b passes (row 105).
+
+**A30-34 (C6, L1.11, D1): the kubeconfig is retired.**
+- **`install`** no longer calls `SaveInstanceKubeconfig` (`install.go:203-205`; comment `:193`). `healthCheck` checks the endpoint and `ClusterStatus` only, and its doc (`:342-345`) says so.
+- **`config`** deletes `SaveInstanceKubeconfig` and `InstanceKubeconfigPath`. `kubeconfigFile` stays, for A30-14.
+- **`planck`:**
+  - `Cluster.Kubeconfig` is deleted;
+  - `String()` prints `Ref`, `Status` and `Endpoint`, and redacts nothing;
+  - `gke/kubeconfig.go` is deleted, and `gke.go` stops building it (`:257-262`, comment `:234`);
+  - `gke_test.go:112-114` and `TestBuildKubeconfig` are deleted;
+  - in `integration_test.go`: `:76`'s "with a kubeconfig" goes; the kubeconfig-length check (`:116-118`) and the `certificate-authority-data` check (`:125-127`) are deleted; the `.gke.goog` check (`:122-124`) stays, and keeps ADR 0004's intent; its comment (`:119-121`) drops "the kubeconfig must not pin the cluster CA";
+  - `client.go:19`'s comment is corrected;
+  - `cmd/planck/main.go:110` prints `cluster %q ready at %s`.
+- **Tests:**
+  - `TestInstallSuccess` asserts that `kubeconfig.yaml` is absent; its mode check over `kubeconfig.yaml` (`install_test.go:219`) changes here, in 1d, with it;
+  - `TestClusterStringRedactsKubeconfig` becomes `TestClusterStringNamesRefStatusAndEndpoint`;
+  - `writeInstance` (`writecommands_test.go:84`) writes a legacy `kubeconfig.yaml` with `os.WriteFile`, for `migrate`'s local fact;
+  - `installedInstance` (`connect_test.go:397`) does the same with `os.WriteFile`, since `SaveInstanceKubeconfig` is gone.
+
+### Step 1e: texts
+
+**A30-35 (C24, L1.8, L3.6, L3.7, L5.13, M7, OD11, refuted 3): hints and help without kubectl, cited by symbol.**
+- **The texts**, chosen here except `kernel.go`'s, which is §9.8's:
+  - `build.go:322`: `the build of %s/%s failed; the end of its log, when it could be read, is printed above`;
+  - `run.go:1309-1310`: `the build of %s failed; nothing was deployed. The end of its log, when it could be read, is printed above`;
+  - `runfetch.go:85-87`: `could not read %s from %s; the end of the read's log, when it could be read, is printed above`;
+  - `redeploy.go:318`: `Inspect it with: farcast logs %s fatline --previous`, where `%s` is the instance;
+  - `kernel.go:221-224`: `msgNoSuchNamespace`'s last sentence becomes `Deploy into it with 'farcast run', which creates the namespace it is given.`;
+  - `usage.go:61`: the compute sentence reads `…collected on its reconcile tick from the cluster's resource metrics (metrics.k8s.io).`;
+  - `reader.go:102-105`: `The commands that write read and write the cluster in-process as the installer's stored service-account key. The 'storage' and 'secret' reads use the installer's key too.`;
+  - `readergrant.go:175-176`: `The RBAC is applied in-process, with server-side apply, as the instance's installer service account (the key 'farcast install --credentials' stored).`;
+  - `storagepin.go:694` and `storagekey.go:436` drop their "needs no kubectl" clause.
+- **The comments:**
+  - `readergrant.go:109` and `:319-320`;
+  - `clusterref.go:88-91`, `:113-116`, `:145-148` and `:331-332`;
+  - `cli.go:45-46`, which drops "kubectl never saw them either (cluster.Env drops them)";
+  - `kernel.go:345` and `storagedeploy.go:235-236`;
+  - `config/instance.go:398-401`, which reads "farcast migrate and farcast install write it";
+  - `plan/facts.go:10` and `:149-151`;
+  - `fatline.go:74-78` (`openWriter`: "until ADR 0023 M2.7 its Apply runs kubectl as the active gcloud configuration"), which says its Apply runs in-process as the same key;
+  - `storagepin.go:92` (`openPinStore`) and `:809`, which drop "need no kubectl".
+- **Tests:**
+  - `build_test.go:182` asserts the new text;
+  - `readerinit_test.go:665-673` asserts the new sentence;
+  - `TestPinHelpSaysThePinNeedsNoKubectl` becomes `TestNoCommandHelpNamesKubectl` (chosen here): no Synopsis or Usage of any `defaultRegistry` command, and none of the five error texts above, contains `kubectl`.
+
+  Mutation row 105a.
+
+### Step 2: the records
+
+**A30-36 (C25, L5.6, OD16): the qualifier rule, replaced.** §11's rule now reads:
+- **What farcast starts.** A record says `farcast starts no kubectl, plugin or gcloud (since ADR 0023 M2.7, built <date>, not walked)`. Never "since M2", because M2 is not complete at M2.7.
+- **Where key upload is blocked.** The qualifier "where service-account key upload is allowed" attaches to the reader's reads and plans: `world`, `ps`, `costs`, `usage`, `logs`, and the five reader plans. They read nothing where upload is blocked. The writes need the installer's key, which `install --credentials` stores.
+- **The grants farcast prints** are run by hand, in Cloud Shell: `build`'s push grant, and `storage deploy`'s bucket grant until M2.8.
+- **The real-API suite:** `run <date> on a loopback envtest kube-apiserver 1.36.2 and etcd (no controllers, none of Autopilot's admission)`, with §31's outcome. Any path changed after the run and not run again (A30-1's re-run rule) is named as not run against a real server.
+- **Unchanged:**
+  - "bound to the instance" only from M3b;
+  - "reads never mint an admin token" only with M2's scope, which names `migrate --plan` (read as the writer).
+- **AGENTS.md** takes lane 5's changes 1–7 (`maps[4].changes`), with this rule and with the suite's sentence above in place of "written and not run".
+
+**A30-37 (L3.10, L5.1–L5.18 not folded elsewhere): M2.7b's records.** They are lane 5's change list (`maps[4].changes` 1–43), amended as follows:
+- **Dates and qualifiers.** The dates are M2.7b's build date, "not walked" is kept, and the suite's line is A30-36's.
+- **Texts and refutations.** The hint texts are A30-35's. Lane 5 C13's Cloud Shell kubectl hint is refuted (refuted 3).
+- **Choices 6 and ADR 0016:62** gain only the forced-server-side-apply sentence (L5.5). §11's narrower "no --yes restart" wording is never written back over A28-1's widened gate.
+- **Supersession.** Dated notes go at ADR 0023:9 and :109, ADR 0004:56, and ADR 0006:3 ("built, not walked") (L5.7). ADR 0023:9 is the "Supersedes, when M2 lands" line; lane 5 cited :21, which is the ADR 0019 "Constrained by" bullet. ADR 0006 and ADR 0023:97 name `kube/kubetest` as the test seam (L5.8).
+- **Who acts (L5.9, L3.10).** `kernel meter`, `kernel confirm` and `reader grant` now mint the installer's token for their applies. A20-18 is restated: a writing command acts as one identity, the writer, for its reads and every write. The CLI README deletes §23's kubeconfig-versus-endpoint note (`:1548`), the "--plan cannot check for kubectl" note (`:1547`), and the three-identities sentences (`:1083`, `:1490-1501`, `:1542`).
+- **The kubeconfig and the counts.** Lane 5's kubeconfig records (L5.10) are updated. Present-tense counts go from eleven to twelve (L5.11).
+- **ADR 0019 and ADR 0023.** ADR 0019 gains riders at :74, :75 and :95 (L5.2). ADR 0023 gains notes at :95 and :313 (L4.19).
+- **The reordered templates (A30-17).** M2.7a moves each NetworkPolicy before its workload, so the line citations into `planck/translate/workload.go` go stale. They are re-cited by symbol, or with the new line range: ADR 0022:28 (`:217-288`, the NetworkPolicy), ADR 0022:141 and :283 (`:233-235`, its ingress comment), and ADR 0021:98 (`:204-237`).
+- **The CLI README's `migrate` section** also states:
+  - A30-24's residual;
+  - A30-22's `gke-`/`gmp-` consequence;
+  - M9's "only released".
+- **The CLI README's run and build sections** name the later `farcast logs <instance> job/<name>` reader as a candidate (A30-5).
+- **The install texts** are A30-25's.
+- **The sweep.** The records sweep (lane 5 test 6) runs before the commit.
+
+**A30-38 (C26, OD13): risk 5 is named.**
+- **The CLI README's run section** gains, chosen here: `**Removed applications keep billing.** An application removed from a manifest keeps running, and billing. run drops it from the egress policy, so it reaches no external service, but farcast deletes no application object in a cluster: neither kubectl's client-side apply nor server-side apply prunes. Its namespace stays metered while a kernel is deployed, so the cost guard still counts it and stops it at the limit. Delete its Deployment, Service, ConfigMap, Secret and NetworkPolicy by hand, from Cloud Shell.`
+- **ADR 0023's revisit triggers** gain: `An application removed from a manifest keeps running and billing: farcast deletes no application object in a cluster, and nothing prunes. If operators meet it, the candidate is a plan-gated delete, a newly automated act and so never covered by --yes.`
+- **Not built.** No prune is built in M2.
+
+**A30-39 (OD12, L5.18): dated notes in the walked runbooks.**
+- **Those that pin `KUBECONFIG` to `kubeconfig.yaml`:**
+  - `phase-2:305`, `phase-3-2:27`, `phase-4-1:29`, `phase-4-2:28`, `phase-4-3:37`, `phase-4-4:30` and `phase-5-session-a:30`;
+  - `adr-0023-m1-walk:95` and `:106`, and `adr-0023-m2-probe-walk:79` and `:91`.
+
+  Each gains: `(<date>, ADR 0023 M2.7, built, not walked) Neither install nor connect writes kubeconfig.yaml any more, and farcast migrate deletes it. A re-walk observes with kubectl from Cloud Shell (ADR 0023 Phasing), not over a file farcast wrote; an exported KUBECONFIG naming the absent file fails rather than falling back to ~/.kube/config [inf].`
+- **Those that client-side-apply farcast objects:** `phase-2:391-393`, `phase-4-1:143`, `phase-4-2:183`, and `phase-4-4:174` and `:200`. Each gains: `(<date>, ADR 0023 M2.7) On an instance migrated to server-side apply, a kubectl apply here leaves kubectl's client-side apply on the object. farcast's next write warns and clears the record, and every write then refuses until farcast migrate runs again (the CLI README's migrate section).`
+- **No convenience file.** farcast writes no kubeconfig for convenience.
+
+### Step 3: only if the run passed `TestApplyRefusesAStaleResourceVersion`
+
+**A30-40 (OD5, refuted 2, L3.3–L3.5): the egress policy's resourceVersion precondition.** This is built in M2.7b only when §31 records a 409 for a stale rv. Otherwise none of it is built, and risk 7 stays as written.
+- **kube.** `AllowResourceVersion(rv string) SplitOption`:
+  - exactly one document may carry `metadata.resourceVersion`, and it must be a YAML string equal to `rv`;
+  - any other value, a non-string, or a second carrier is refused;
+  - `Document` gains an unexported allowed-rv field, set by `SplitStream` and honoured by `rawFault`, so `kube.Apply` accepts that one document.
+- **cluster.** `func (c *Client) ApplyAt(ctx context.Context, manifest []byte, resourceVersion string) error` requires exactly one document. `runCluster` gains it.
+- **The renderer.** `fldeploy.RenderPolicyConfigMap` gains a resourceVersion parameter, rendered quoted (`resourceVersion: "<rv>"`) when non-empty.
+- **run.**
+  - The plan renders the policy at the rv it read, through `applyFactsAt(stream, rv)`, which replaces the override loop (`run.go:819-824`).
+  - Execution renders at the rv just re-read and calls `ApplyAt`.
+  - A 409, or §31's answer for a deleted object, is `changedAfterPlan(m, msgPolicyChangedSince)`, in every mode, one attempt. Chosen here: a retry loop would re-merge with credentials the run already minted, for a race only two concurrent runs meet.
+  - An absent policy (rv `""`) carries no rv and no guard, because server-side apply cannot express create-only. Risk 7 keeps that residual.
+- **kubetest.** An apply whose body carries a `metadata.resourceVersion` other than the stored one answers 409 and stores nothing. A current one applies.
+- **The fake.** `fakeRunCluster.ApplyAt` uses an rv-aware `checkApplied`, and appends to `f.applied`.
+- **Pinned by:**
+  - `TestAllowResourceVersion`, a table: a match, another value, a second carrier, a non-string, and `Apply` accepting the allowed document;
+  - `TestApplyAnswersConflictOnAStaleResourceVersion` (kubetest);
+  - `TestConfirmRefusesAPolicyChangedAfterTheCompare`'s new row: the policy changes between the re-read and the apply, `ApplyAt` answers 409, the command is `plan_changed`, and no workload is applied;
+  - `TestAYesRunMergesAPolicyWrittenDuringTheBuilds` still passes.
+
+  Mutation rows 88b, 88c and 88d.
+
+### Earlier sections, as amended
+
+**A30-41 (C24, L1.8, L2.21, L4.19, L5.3; text only).** These replace the earlier text where it differs:
+- **§0's M2.7 row and §2.3's "What goes":**
+  - the deletion list gains A30-30's and A30-33's;
+  - M2.7 is built as M2.7a and M2.7b (A30-4);
+  - `Traces`' doc is A30-28's.
+- **§2.5's M2.7 bullet** gains `LegacyKubectlFiles` and `RemoveLegacyKubectlFiles` (A30-14), and its citation is `instance.go:848-857`.
+- **§5.3:** the NetworkPolicy order (A30-17); "applied in stream order" is now `cluster.Apply`'s own (A30-27, built in M2.7b).
+- **§6.1:** the usage line and the prompt (A30-21).
+- **§6.2:** selection through `ClientSideTrace`, and the blocks (A30-22).
+- **§6.3:**
+  - the end state (A30-8);
+  - the `UpdateNoErrors` sentence (A30-24);
+  - "unverified" becomes "decided by §31" (A30-1).
+- **§6.4:**
+  - the texts and the loop (A30-23); the local fact (A30-14); recording (A30-24);
+  - its citations become `UpdateInstanceMetadata` at `instance.go:803-823`, and the cache's model at `worldreader_test.go:199-200`.
+- **§6.5:** the placement (A30-20); `install` (A30-25).
+- **§6.6:** `afterWrites` is deferred (A30-28).
+- **§6.8:** the seeding route (A30-18).
+- **§7.1:** `install`'s texts (A30-25).
+- **§10.2:** `env_test.go` holds 10 tests and `TestMain` (refuted 1); the cli harness (A30-31).
+- **§10.4:** steps 4 and 5 gain the tag; `migrate.json`.
+- **§10.6:** as A30-18 and A30-19. P4's "unprivileged user" is A30-2's `farcast` user.
+- **§11:**
+  - the citations are by symbol: `install.go:203` and `:347`, `cmd/planck/main.go:110`, the hints of A30-35, `cluster.go:1-34`, and ADR 0023:95 and :313;
+  - `rehearsal.go:1-21` and the CLI README's ADC line are no-ops (refuted 5 and 6).
+- **§14:**
+  - risk 2 gains A30-24's residual;
+  - risk 4: `technocore` names the kernel's writes from M2.7a;
+  - risk 5 is recorded (A30-38);
+  - risk 7 follows step 3.
+- **"Not settled here":** these are settled by §31: the `StatusCause` key; typed and partial list kinds; metadata-only lists, gets and patches; an rv in an apply body; `--token-auth-file` and what the asset carries; and the same-patch Update entry.
+
+### Mutation rows (§10.5, M2.7)
+
+Rows 92, 94–99, 101, 103 and 105 stand as written. The rows below are added or changed. Each runs as an overlay (`go test -overlay`), never by editing the tree. After M2.7b, A28-13's generator runs every earlier table again by named test:
+- stale anchors are re-anchored by hand;
+- rows whose code is deleted are listed as retired: A21-2's, A20-16's kubectl row, and the env tests'.
+
+| # | Requirement | Mutation | Must fail | Run |
+|---|---|---|---|---|
+| 92a | Refused under `--plan` too | refuse only outside `--plan` | `TestUnmigratedInstanceIsRefusedBeforeAnythingIsAsked` (its `--plan` rows) | check.sh |
+| 93 *(changed)* | Every writer refuses | drop the call in `kernel meter` | `TestEveryClusterWriterRefusesAnUnmigratedInstance`, its table derived (A30-26) | check.sh |
+| 93a | Rotate without a keyholder never refuses | refuse whenever a record loads | `TestEveryClusterWriterRefusesAnUnmigratedInstance` (rotate-without-keyholder row) | check.sh |
+| 93b | The list-only meter never refuses | refuse before the list-only return | the same test (its list-only row) | check.sh |
+| 93c | Every production writer is a row | delete `migrate`'s `writeCommands` row | `TestEveryProductionWriterIsAWriteCommand` | check.sh |
+| 94a | Subresource entries are not client-side managers | drop `Subresource == ""` from the by-name branch | `TestClientSideManagersIgnoresSubresourceEntries` | check.sh |
+| 94b | Objects farcast never writes are blocks | patch them | `TestMigratePlanBlocksObjectsFarcastNeverWrites` | check.sh |
+| 95a | Every rendered document carries the label | drop it from the keyholder's PDB | `TestEveryRenderedDocumentIsManagedByFarcast` | check.sh |
+| 96b | An annotation-only object can end migrated | require one `farcast`/Apply always | `TestMigratedEndStateAllowsAnAnnotationOnlyObject` | check.sh |
+| 96c | An Apply entry the object had stays | accept zero when `hadApply` | the same test | check.sh |
+| 97a | Recorded only after a fresh discovery | skip it | `TestMigrateRecordsOnlyAfterAFreshDiscoverySelectsNothing` | check.sh |
+| 97b | `install` records only what it created | ignore `Created` | `TestInstallOnAnAdoptedClusterLeavesItUnmigrated` | check.sh |
+| 97c | `since` is kept | overwrite it on a migrated record | `TestMigrateOnAMigratedRecordKeepsSince` | check.sh |
+| 98a | No annotation value in a trace | build `traceName` from the answer and append its annotation | `TestTracesCarryNoSecretByte` | check.sh |
+| 98b | Server names are quoted | print managers raw | `TestMigratePlanQuotesServerNames` | check.sh |
+| 99a | Only a 409 is retried, five attempts | retry every error; or allow a sixth attempt | `TestMigrateRetriesOnlyAConflictFiveTimes` | check.sh |
+| 99b | A changed object is `plan_changed` under `--confirm` | return it unkinded | `TestMigrateConfirmRecomputesAndRefusesAChangedObject` | check.sh |
+| 100 *(renamed)* | Every apply forced | `force=false` in `cluster.Apply` | `TestEveryApplyIsForced` | check.sh |
+| 100a | The plan binds the force | `applyFacts` binds false | `TestEveryApplyIsForced`, `TestPlanVectors` | check.sh |
+| 100b | An empty stream is refused | return nil | `TestApplyRefusesBeforeSendingAnything` | check.sh |
+| 100c | The stream stops at the first failure | carry on past it | `TestApplyStopsAtTheFirstFailingDocumentAndSaysHowManyWent` | check.sh |
+| 100d | Each NetworkPolicy before its workload | render translate's after the Deployment | `TestEveryNetworkPolicyPrecedesItsWorkload` | check.sh |
+| 101a | Traces are reported on every return | call `afterWrites` at the end, not deferred | `TestAPartialApplyStillReportsItsTraces` | check.sh |
+| 101b | farcast's own Apply is no trace | build Traces on `IsLastApply` | `TestTracesListsEveryClientSideTrace`, `TestClientSideTraceIsNotFarcastsOwnApply` | check.sh |
+| 102 *(widened)* | Field manager on every write | omit `fieldManager` on the pin POST, or on `PatchJSON` | `TestEveryWriteNamesFarcast` (A30-9, written in step 0a: Apply, CreateConfigMap, ReplaceConfigMap, PatchJSON; DeleteSecret exempt until M2.8) | check.sh |
+| 102a | `reader grant`'s apply names the writer | drop `writerRefused` there | `TestWritingCommandsCarryClusterKinds` (its 403 rows) | check.sh |
+| 103a | Reads carry no field manager | send it on GETs too | `client_test.go:83`'s and `metrics_test.go:36`'s exact-query tests | check.sh |
+| 104 *(re-pointed)* | Stuck fields | `upgradeOne` gives the converted entry `fieldsV1` `{}` | the real-API `TestMigrationRemovesAFieldLaterDroppedFromTheManifest`, at its stuck-field assertion (R6's rule) | **the run (R1, R6)** |
+| 104a | The annotation's path leaves the Apply entry | skip `RemoveField` | `TestUpgradeManagedFields` | check.sh |
+| 105a | No help or hint names kubectl | restore `build.go`'s kubectl clause | `TestNoCommandHelpNamesKubectl` | check.sh |
+| 88b | The policy carries its rv (step 3 only) | render it without the rv | `TestConfirmRefusesAPolicyChangedAfterTheCompare` (its 409 row) | **only if step 3** |
+| 88c | One carrier, the planned rv (step 3 only) | accept another value or a second carrier | `TestAllowResourceVersion` | **only if step 3** |
+| 88d | kubetest refuses a stale rv (step 3 only) | ignore the body's rv | `TestApplyAnswersConflictOnAStaleResourceVersion` | **only if step 3** |
+
+**What depends on the run:**
+- **Row 104** is verified only by the run's mutant binary (R1, R6). §31 records it killed or not. Until then it is unverified.
+- **Rows 88b–88d** exist only if the run passes `TestApplyRefusesAStaleResourceVersion`.
+- **A second-request revision of §6.3**, if §31 needs one, brings its own rows in §31, and runs again under A30-1's re-run rule.
+
+Every other row is run against M2.7a's or M2.7b's tree, with no cluster.
+
+### Refuted in the map, kept out
+- **Refuted 1 (L1.7):** `env_test.go` holds 10 tests and `TestMain`, not 11. All are deleted with the file (A30-33).
+- **Refuted 2 (L3.3, L3.5):** `AllowResourceVersion`, `ApplyAt`, kubetest's 409 and run's 409 path are not built before a passing run. They are step 3 (A30-40).
+- **Refuted 3 (L5.13's text):** a Cloud Shell `kubectl … logs job/` hint. The failure paths already print the log's tail (A30-35).
+- **Refuted 4 (L2.20):** `gcloud_account`'s drop needs no build. Every save already drops it.
+- **Refuted 5 (L5.1):** the CLI README's ADC line is done since M2.5. Only the two `--credentials` texts remain (A30-25).
+- **Refuted 6 (L5.2, L5.4):** ADR 0019 :66 and `rehearsal.go:1-21` are no-ops. The ADR 0019 sentences M2.7 falsifies are :74, :75 and :95 (A30-37).
+- **Refuted 7 (L4.5, L4.6):** lane 4's offline-uncheckable reading of apimachinery is not relied on. The run decides §6.3 (A30-1), and recording re-discovers (A30-24).
+- **Refuted 8:** forced apply opens no new way to restart a stopped application. P1's gate sits before `Apply`, unchanged, and `migrate` never touches `spec`.
+
+### The build order
+
+**M2.7a: one commit ("begin M2.7"), green on its own with `./check.sh`.**
+
+**Step 0a, the groundwork in kube, kubetest and the kernel** (A30-6 to A30-11).
+- **Files:**
+  - `farsight/cli/internal/kube/migrate.go`, `migrate_test.go`, `migrate_wire_test.go` and `apply_test.go`;
+  - `kube/kubetest/writes.go`, `kubetest.go`, `store.go` and `kubetest_test.go`;
+  - `technocore/kube/client.go` and `client_test.go`.
+- **New tests:** `TestClientSideTraceIsNotFarcastsOwnApply`, `TestClientSideManagersIgnoresSubresourceEntries`, `TestMigratedEndStateAllowsAnAnnotationOnlyObject`, `TestPatchJSONAsksForMetadataOnly`, `TestEveryWriteNamesFarcast` (A30-9), `TestSettledWorkloadsRollOutAndGetAnAddress`, `TestFailNextApplyRefusesOneApply` and `TestKernelWritesNameTechnocore`.
+- **Stays green:** every kube test, with `MigratedEndState`'s callers updated. No command calls anything new.
+
+**Step 0b, the plan, config and cluster additions** (A30-12 to A30-15).
+- **Files:**
+  - `plan/facts.go` and `plan_test.go`;
+  - `cli/planhuman.go` and `planhuman_test.go`;
+  - `config/instance.go` and `instance_test.go`;
+  - `cluster/open.go` and `cluster_test.go`.
+- **Additions:** `MigrateFact`, its rendering, `describeObject` (A30-13), the legacy-file functions and the cluster's migration methods. `describeObject` is defined here, so `planhuman.go` compiles alone; `migrate.go` (1b) and the blocks reuse it.
+- **New and changed tests:** `TestEveryBoundFactIsRendered` (18 types), `TestIrreversibleFactsComeFirst`, `TestMigratePlanQuotesServerNames`, `TestLegacyKubectlFilesStatsAndRemoves`, `TestListMetaGetMetaPatchManagedFieldsAreKubes` and `TestReaderNeverPatchesManagedFields`.
+- **Stays green:** everything. Nothing calls the additions yet.
+
+**Step 0c, renderer safety, the suite and the runbook** (A30-16 to A30-19).
+- **Files:**
+  - `cli/manifests_test.go`;
+  - `planck/translate/workload.go` and `translate_test.go`;
+  - `datasphere/deploy/deploy.go` and its test;
+  - `cli/testdata/plan/run_deploy.json` and `storage_deploy.json`;
+  - `kube/realapi_test.go`, `kube/testdata/realapi/kubectl-seed-v1.yaml` and `kubectl-seed-v1b.yaml`, and `cli/realapi_test.go`;
+  - `check.sh`;
+  - `docs/runbooks/adr-0023-m2-realapi.md` (Status: written, not run).
+- **New tests:** `TestEveryRenderedDocumentIsManagedByFarcast` and `TestEveryNetworkPolicyPrecedesItsWorkload`. The realapi files are vetted and linted, never run.
+- **Stays green:** all of `./check.sh`. `run` and `storage deploy` apply their reordered streams through kubectl as before.
+- **Then:** mutation rows 94a, 95a, 96b, 96c, 98b, 100d, 102, 103, 103a and 104a as overlays. `git status` is unchanged after them.
+
+**M2.7a's records.** The runbook, and the code comments its own changes falsify (`IsLastApply`, `PatchJSON`, kubetest's apply, `check.sh`'s header). Nothing else: the ADRs, READMEs, PLAN.md and AGENTS.md move with M2.7b.
+
+**The run, by the operator and the agent** (A30-1, A30-19).
+1. The operator brings the keeper VM up and grants Local Network if needed.
+2. R1–R9: preflight, download, the three-way checksum comparison by the operator, extraction, material, the servers, the forward, the two suites, row 104's mutant, the kubectl variant, scrubbed results, and teardown with its checks.
+3. §31 is written into this design, and the runbook's Results and Status are filled.
+4. Each "to be confirmed on the VM" mark is resolved there, with a dated note where a flag changed.
+5. §31's decisions are made, with the operator where §31 says so.
+6. M2.7b starts only after this. A §31 outcome that changes code the suite exercises runs again before M2.7b's commit (A30-1's re-run rule).
+
+**M2.7b: one commit, steps 1a–1e and 2, with 3 only if §31 allows it.**
+- **Each step is built to leave the tree green**, so a builder can check it alone; where it cannot, the step says so. The commit's gate is 1f.
+- Never commit an intermediate state (A30-4).
+
+**Step 1a, migrated fixtures and §31's renderer fixes.**
+- **Files:** `writecommands_test.go`, `clusterref_test.go`, `connect_test.go`, `run_test.go`, `kernelmeter_test.go`, `kernelconfirm_test.go`, `kernel_test.go`, `build_test.go`, `readergrant_test.go`, `storagepin_test.go`, `storagekeyholder_test.go`, `runstages_test.go`, `ps_test.go`, `handover_test.go` and `nosecrets_test.go`.
+- **What:** `recordMigrated` (A30-20), and any renderer §31 found refused, with its vectors. A fixed renderer runs again before the commit (A30-1's re-run rule).
+- **`nosecrets_test.go`:** `TestInstancesNeverOpensTheReaderKey` saves its record again unmigrated (A30-20).
+- **Stays green:** everything. Until 1b it is inert for every command but `instances`, whose migrated column the fixtures now set.
+
+**Step 1b, the refusal, `migrate` and `install`'s record** (A30-20 to A30-26).
+- **Files:**
+  - new: `cli/migrate.go` and `migrate_test.go`;
+  - the writers: `cli.go`, `connect.go`, `redeploy.go`, `kernel.go`, `kernelmeter.go`, `kernelconfirm.go`, `storagedeploy.go`, `storagepin.go`, `storagekey.go`, `run.go`, `build.go` and `readergrant.go`;
+  - `install.go`, `install_test.go`, `planck/types.go`, `planck/internal/providers/gke/gke.go` and `gke_test.go`;
+  - `consent_test.go`, `plancomplete_test.go`, `writecommands_test.go`, `planvectors_test.go` and `testdata/plan/migrate.json`.
+- **Tests:** rows 92–99 and every A30-20 to A30-26 test.
+- **`migrate`'s tests until 1c.** `migrate` opens through `openReadyAt`, which still calls `applyReady` (`fatline.go:764`) until 1c. So in 1b its tests run with the harness's kubectl stub (`succeedingKubectl`) on `PATH`, and 1c removes the stub with `applyReady`.
+- **Not committed alone:** `Apply` still runs kubectl here.
+
+**Step 1c, Apply in-process** (A30-27 to A30-32).
+- **Files:**
+  - `cluster/cluster.go`, `open.go`, `cluster_test.go` and `open_test.go`;
+  - `cli/fatline.go`, `consent.go`, `plan/facts.go`, `readergrant.go` and `storagekey.go` (its `applyReady` comment);
+  - the deferred `afterWrites` in the nine writers;
+  - `writecommands_test.go`, `runfixture_test.go`, `consent_test.go`, `planhuman_test.go`, `plancomplete_test.go`, `clusterref_test.go`, `readergrant_test.go`, `migrate_test.go` and `testdata/plan/*.json` (the ten vectors and `error_plan_changed`).
+- **Tests:** rows 100–102 and their letters, the apply-kind rows, the `As == "writer"` assertions, and `TestTracesCarryNoSecretByte`.
+- **Also here, so that 1c stays green (A30-30):** `TestAWriterAppliesThroughKubectlWithItsKubeconfig` is deleted, `TestOpenBuildsTheReaderOrTheWriter` loses its `Apply` assertions (`open_test.go:152-164`), `execRunner.ready` is deleted, and `migrate`'s tests drop the kubectl stub.
+- **The first server-side write** lands here. 1b's refusal is already in the tree.
+
+**Step 1d, kubectl and the kubeconfig out** (A30-33, A30-34).
+- **Files:**
+  - `cluster/env.go` and `env_test.go` (deleted), `cluster.go`, `open.go` and `open_test.go`;
+  - `cli/clusterref.go`, `rehearsal/rehearsal_test.go` and `exec-allowlist.txt`;
+  - `cli/install.go`, `install_test.go` (`TestInstallSuccess`, `:219`), `connect_test.go` (`installedInstance`, `:397`) and `writecommands_test.go` (`writeInstance`, `:84`);
+  - `config/instance.go` and `instance_test.go`;
+  - `planck/types.go` and `planck_test.go`;
+  - `planck/internal/providers/gke/kubeconfig.go` (deleted), `gke.go`, `gke_test.go` and `integration_test.go`;
+  - `planck/cmd/planck/main.go`.
+- **Gate:** `./check.sh` step 1b passes at 86 reviewed lines (row 105).
+
+**Step 1e, texts** (A30-35).
+- **Files:**
+  - `build.go`, `run.go`, `runfetch.go`, `kernel.go`, `redeploy.go`, `reader.go`, `readergrant.go`, `storagepin.go`, `storagekey.go`, `usage.go`, `cli.go` and `fatline.go` (`openWriter`'s comment);
+  - `kube/migrate.go` and kubetest's `store.go` comment;
+  - `build_test.go`, `readerinit_test.go` and `writecommands_test.go`.
+- **Tests:** `TestNoCommandHelpNamesKubectl` (row 105a).
+
+**Step 1f, verification; changes nothing.**
+- `./check.sh` is green.
+- Every M2.7 row above runs as an overlay, then A28-13's rerun of the earlier tables, with the retirements listed.
+- The records sweep (A30-37).
+- `git status` is the same before and after.
+
+**Step 2, the records** (A30-36 to A30-39), in the same commit.
+- **Files:**
+  - `AGENTS.md`, `README.md`, `PLAN.md` and `farsight/cli/README.md`;
+  - ADRs 0004, 0006, 0009, 0016, 0019, 0021, 0022 and 0023;
+  - the walked runbooks of A30-39, and `docs/runbooks/adr-0023-m2-realapi.md`'s scrubbed Results and Status;
+  - `technocore/README.md`, `planck/README.md` and `fatline/README.md`.
+- They carry "built <date>, not walked", and the suite's run date and outcome.
+
+**Step 3, only if §31 records a 409 for a stale rv** (A30-40).
+- **Files:** `kube/stream.go`, `cluster/cluster.go`, `cli/run.go`, `fatline/deploy/deploy.go`, `kube/kubetest/writes.go`, and their tests.
+- **Rows:** 88b, 88c and 88d.
+- **Records:** risk 7's closure. Otherwise risk 7 stays, and the records say the run found the rv ignored.
+
+### Amendments after M2.7a's build (2026-11-18)
+
+M2.7a was built by four builders (steps 0a, 0b, 0c-1 and 0c-2), then reviewed in four lenses: S (safety), C (conformance, with a rehearsal of the suite against kubetest on loopback), A (the runbook and the records) and M (mutation). Each lens had a skeptic, and one fixer applied the result. 33 findings were reported: 21 were confirmed and fixed (S-4 in part), and 12 were refuted. The orchestrator's O-1 and O-2 went straight to the fixer. These amendments win over §30's text above. §31 stays reserved for the run (A30-1).
+
+**A30-42 (O-1): row 104 re-pointed again.**
+- **The mutant.** It adds one line in `upgradeOne`'s `if target < 0` block, right after `mf[target].Manager = ssa`:
+  `if f, err := RemoveField(mf[target].FieldsV1, "f:metadata", "f:labels"); err == nil { mf[target].FieldsV1 = f }`.
+  The converted entry then owns no label but keeps its spec.
+- **When it counts as killed.** Only on a `stuck field: ` line in the subtest `a label leaves` of `TestMigrationRemovesAFieldLaterDroppedFromTheManifest`, with that test passing in the unmutated run (R6's rule).
+- **Why.** §30's `fieldsV1 {}` entry may be pruned by the server *[inf]*. The end-state check would then refuse first, and row 104 could never be scored. The kill still rests on server-side apply's removal rule, which removes only a field the applier owned *[inf]*. The run decides it.
+- **Where.** R1 step 6 and R6, and `scratchpad/m2/fixer-m27a/row104/verify-row104-label.sh`. That script checks the perl edit adds one line inside the block, and that the overlaid package vets and builds with `-tags realapi`.
+
+**A30-43 (O-2, RB-14): records M2.7a's reorder makes false are fixed in M2.7a.**
+- `planck/README.md:253` states the new order. It says why in one sentence: a stream stopped part-way never leaves pods running without their policy.
+- The line citations A30-37 gave to M2.7b are re-pointed now:
+  - ADR 0022:28 to `workload.go:135-206`;
+  - ADR 0022:141 and :283 to `:153-155`;
+  - ADR 0021:98 to `:285-289` and `:152-157`;
+  - ADR 0023:59 to `datasphere/deploy/deploy.go:389`.
+- A30-37 keeps the rest. ADR 0023:349's `workload.go:50` has been stale since M2.2 and stays M2.7b's.
+- Reviewer C's R-3 was refuted as A30-37's own scope. Lens A's RB-14 was confirmed because M2.7a's own change makes the citations false. RB-14 is taken.
+
+**A30-44 (S-5): the cluster's metadata reads blank the last-applied value.**
+- `ListMeta`, `GetMeta` and `PatchManagedFields` return each object's `kubectl.kubernetes.io/last-applied-configuration` with its key and an empty value (`cluster.blankLastApplied`).
+- On a Secret that kubectl applied, the value is a copy of the Secret's data. Every consumer reads only the key: `ClientSideTrace`, `MigrationPatch` and `MigratedEndState`.
+- The doc comments say data and stringData are never decoded, and that the annotation's value is blanked.
+- Pinned by `TestListMetaGetMetaPatchManagedFieldsAreKubes`. §6.4's "decoded into memory" now holds only inside the cluster package.
+
+**A30-45 (R-1, R-2): step 3's gate and the deleted-Secret answer.**
+- **The gate.** Step 3 (A30-4, A30-40) is gated on the subtest `TestApplyRefusesAStaleResourceVersion/a_stale_resourceVersion` alone: a 409 builds it, and any other answer does not.
+- **The deleted-Secret subtest.** It records 404, 409, or a 2xx. After a 2xx it GETs the Secret and records whether it was recreated, comparing the uid without printing it. It fails only on another answer, or on a 2xx that left the deleted Secret in place.
+- **The status code.** `rawApply` returns the answer's own 2xx status, so a create is recorded as 201.
+- **A30-40.** It gains "recreated (2xx)" as a possible answer for a deleted object. The precondition cannot detect that case.
+
+**A30-46 (R-4, RB-4, RB-5): what the run records.**
+- **Refusals.** Each refusal in the cli suite is its own `fact:` line: stream, document, code, Status reason, and the causes' field paths, never the server's message. The per-stream fact counts the documents applied twice out of the total.
+- **Where facts are.** Fact lines carry `fact: ` after the `realapi_test.go:<line>: ` prefix. R8 extracts them on the terminal with grep and sed. FAIL text is not scrubbed and is never copied.
+- **The counts.** R6 counts `grep -cE '^--- (PASS|FAIL)'`: 12 in kube.out and 1 in cli.out. It also greps the stale-rv subtest lines.
+
+**A30-47 (RB-1, RB-2, RB-7, RB-10, RB-12, S-4): the runbook's shell discipline.**
+- **R2.** `umask 077; mkdir -m 700 "$D"; cd "$D"` are separate commands, so an existing `$D` stops the step; the operator then finishes that run's R9 first. `stat` and `sha512sum` run before the sidecar's curl. The size is a sanity check only (45.1 MB read as 45.1 to 47.3 million bytes, *[inf]*); the sha512 binds.
+- **R9.**
+  - Each kill is `2>/dev/null || echo "<name>: not running"`.
+  - `$D` is removed only when pgrep finds nothing; otherwise it prints STOP and deletes nothing.
+  - In step 2, each check prints its own verdict.
+  - Step 3 polls lsof for 5 s, unsets `FARCAST_REALAPI_*`, and confirms `$RUN` is gone.
+- **The Mac steps.**
+  - Each code block begins `: "${VM:?}" "${RUN:?}"`.
+  - `RUN` is echoed once, and set again by value in a new shell, never by a second mktemp.
+  - R6's forward writes its stdio to `$RUN/ssh.log`, with a 10 s lsof poll.
+  - R7 re-exports the three variables and checks the forward.
+- **R1 step 7.** It builds only from a clean tree and records `git rev-parse HEAD`. R8 records that commit.
+- **S-4's other parts were not taken:** a `/proc/<pid>/exe` check (pid reuse within one run is negligible), and a recursive listing of `~/.kube` (A30-19's `ls -A` stands).
+
+**A30-48 (orchestrator, after the fixer): the runbook never names the VM's account.** It says "the keeper VM's existing account, the one `$VM` names", in the five places that named it. The scrub rule covers the committed runbook too. §30's R0 text, here in the design, may name it.
+
+**A30-49 (A30-6, A30-10, A30-14, M-F1–F5, F7, F8): pinned in M2.7a's own tests.**
+- **`TestSettledWorkloadsRollOutAndGetAnAddress` gains three rows:**
+  - a ClusterIP Service gets no address;
+  - a LoadBalancer Service's existing ingress is kept;
+  - a JSON patch settles a Deployment seeded with Put.
+- **FailNextApply.** It is checked after authentication and after WithRBAC's check of the request's own verb (patch). A caller allowed patch but not create is answered with the injection on an apply that would create, because kubetest checks create inside the apply, as the API server does (`as_patch.go:214-243`). Pinned in `TestFailNextApplyComesAfterRBAC`.
+- **`ClientSideTrace`.** Its true rows include "the annotation's key with an empty value".
+- **`RemoveLegacyKubectlFiles`.** Its error text is exactly `delete <config-relative path>: <cause>`. The cause is os.Remove's error unwrapped, so no absolute path appears.
+
+**A30-50 (RB-13): comments say "from M2.7b, is to".** The comments at `config/instance.go:78-80`, `plan/facts.go:486` and `cluster/open.go` (PatchManagedFields) say what M2.7b is to do. So does the runbook's opening sentence. None says it is done.
+
+**A30-51: the builders' deviations, accepted.** Each is now the design's text.
+- **s0a:**
+  - `MigratedEndState`'s none-otherwise refusal reads `farcast/Apply present %d times, where the object had none`;
+  - `TapAnswers` lives in `export_test.go`;
+  - FailNextApply sits before WithHandler and Fail (with A30-49's RBAC order);
+  - kubetest answers both PATCH kinds as PartialObjectMetadata when asked, and answers 406 before writing when the Accept cannot be served;
+  - `settle()` runs after kubetest's ConfigMap POST and PUT.
+- **s0b:**
+  - three `TestAKubectlClientHasNoCanI` rows (deleted with that test in 1d);
+  - the kind, api and hash go through terminalText;
+  - writeLine uses describeObject;
+  - §6.7's paragraph is the fact's last line, indented two spaces;
+  - the `*fs.PathError` error form;
+  - PatchManagedFields calls neverWrites before the kube guard;
+  - factTypes gains `TypeMigrate` in 1b.
+- **s0c-1:**
+  - translate.Render's doc states the new order;
+  - the Deployment's YAML comment changes from "below" to "above", which moves the two Deployment writes' sha256 in run_deploy.json;
+  - the "why" sentences are Go doc comments;
+  - no translate or datasphere test pinned the old order;
+  - the order guard refuses matchExpressions and fails when no stream holds a policy and a workload;
+  - the label guard fails without technocore-namespaces or technocore-confirmed.
+- **s0c-2:**
+  - the VM steps run as `ssh "$VM" bash -s <<'REMOTE'` heredocs;
+  - clearJob deletes a Job a stream names before its first apply (DELETE, Background, polled to 404);
+  - the first-apply test re-applies the manifest as kubectl last applied it;
+  - the Job is re-applied unforced, then forced;
+  - the same-patch test runs for a Deployment, a stringData Secret and a ConfigMap;
+  - migrateOne always reads back;
+  - seedClientSide sends fieldValidation=Strict, and refuses a list in v1b's patch;
+  - TestStatusCauseWireName records the path rather than pinning it;
+  - the suite stamps a marker annotation, not `AdaptedAtLabel`;
+  - the seed files hold four namespace-less documents, with v2 derived through JSONToYAML;
+  - the helpers are methods of `realAPI`;
+  - the runbook gains R4's heredoc, R5's readyz loop, R9's diff, and R1 step 7's env prefix;
+  - check.sh's header wording is the builder's.
+
+**Refuted in the review, kept out.**
+- **S-1.** "The suites are tied to nothing but loopback." A write goes only to a server whose certificate chains to `FARCAST_REALAPI_CA_FILE` and carries a 127.x IP SAN, with a bearer it accepts. That takes all three variables set deliberately. A Node-list check is not added.
+- **S-2.** The operator's by-eye compare of the sha512 is A30-1's own decision. R3 extracts exactly the listed members.
+- **S-3.** Its harm is folded into A30-47.
+- **RB-3.** Forcing `--server-side=false` would test a seed farcast's own invocation may not make. The variant records any difference.
+- **RB-6.** By R3 the bytes are the published ones, and extraction stays in `$D`.
+- **RB-8.** The discovery and HTTP caches share `--cache-dir`, and R9 checks the discovery cache by name.
+- **RB-9.** Both suites wait for /readyz themselves and fail loudly.
+- **RB-11.** dash's `command -v` can only under-report, which stops the run.
+- **RB-15.** Readability points; each consequence fails loudly.
+- **F6.** No Job renderer emits a selector.
+- **F9.** The runbook sets all three variables together, and kube.out's count catches a skip.
+
+**Mutation.**
+- **The builders:** 52 mutants, all killed.
+- **Lens M:** every M2.7a design row (94a, 95a, 96b, 96c, 98b, 100d, 101b in its present form, 102 in every form, 103, 103a, 104a), plus 25 or more of its own. Eight non-equivalent survivors became F1–F5, F7 and F8 (all fixed) and F6 (refuted). keepJobSelector's label override is equivalent in practice, because a Job's template is immutable *[inf]*.
+- **The fixer:** 13 mutants for its fixes, all killed.
+- **The tunnel guard:** no run hit it.
+
+**Left open.**
+- **Row 104's kill rests on the run** (A30-42). So does every [unverified] server behaviour in §30.
+- **The loopback rehearsal.** Lens C ran the suite against kubetest, extended with a create entry, SMP, /scale and a DELETE mark. Every plumbing path worked. The failures left were kubetest's known gaps: apply rebuilds the object, the rv is ignored, there are no conflicts, POST and PUT record no entry, and an apply's entry owns `{}`.
+
+## 31. The real-API run (2026-11-18)
+
+The suite ran once on 2026-11-18, by `docs/runbooks/adr-0023-m2-realapi.md` (A30-1, A30-19). It ran against envtest v1.36.2's `kube-apiserver` and `etcd` on the keeper VM's loopback, reached from the Mac through `ssh -L`, as the VM's existing account (A30-2). No controllers ran, and none of Autopilot's admission. The binaries were built from 2728e5f (M2.7a), on a clean tree whose tree hash is 8bde46e9807fbe09518e95bd04ff1fc1fdbc8c23. The operator approved the run at R0, compared the three checksums at R2, and approved one SIGKILL at R9.
+
+The record was then reviewed in three lenses (accuracy, scrub and procedure, and consequences for M2.7b), each followed by a skeptic. 30 findings were reported and 25 stood; all 25 are applied below. A one-agent check then confirmed the fixes and found 11 more problems, all applied. These amendments win over §30, and over the earlier sections they name, wherever they differ (the wording of CON-8, which was refuted as having no consequence, is taken all the same).
+
+Everything below follows the scrub rule. Facts come from the suites' `fact:` lines. FAIL lines were read and not copied. Two checks beyond the runbook, made against the same server with the run's own kubectl in a namespace of their own, are marked **[diag]**.
+
+### The run
+
+- **Versions:** `kube-apiserver` v1.36.2, `etcd` 3.6.8, `kubectl` v1.36.2.
+- **The archive:** 47,304,572 bytes, which is 45.11 MiB, so GitHub's "45.1 MB" is binary. Its computed sha512 equalled the release's `.sha512` asset, and the operator found the same value in `envtest-releases.yaml`.
+- **Every "to be confirmed on the VM" mark ran without error, and none had to change:**
+  - the sidecar's name, `….tar.gz.sha512` (its line names the file with a leading `/`, so `sha512sum -c` would not read it as is; R2 does not use `-c`);
+  - the archive's prefix, `controller-tools/envtest/`: one directory and three regular files, with no link, absolute path or `..`;
+  - every R5 flag. The serving certificate holds two certificates and names the bind address as an IP SAN. Both servers listened on loopback only;
+  - `tokenFile`, the static-token format and `system:masters` (the RBAC streams applied);
+  - `--cache-dir`: no discovery cache landed outside the run directory;
+  - `KUBERC=off`: every kubectl call ran with it and succeeded, but what it suppresses was not observed;
+  - kubectl's plain `apply` is client-side at 1.36.
+- **Agent-side variations, none changing what was tested:**
+  - the forward ran as a background job of the agent's shell tool, as `exec ssh …` with that shell's own pid in `ssh.pid`, and with `-o ServerAliveInterval=30` added. R9 stopped it by that pid;
+  - `curl -s` and `scp -q` quietened progress output;
+  - R1 step 7 also recorded the tree hash;
+  - the three R6 runs ran in one background job, with their outputs in `$RUN` only.
+- **Teardown.**
+  - R9 stopped `kube-apiserver` and `etcd` together. `kube-apiserver` then kept retrying etcd for over 90 s after its SIGTERM, so R9 stopped at its `STOP` line with nothing deleted.
+  - With the operator's approval, it was sent SIGKILL, after its pid was checked to be the run's own binary.
+  - R9 then deleted the run directory, and every check passed: the ports were free, no process ran, the directory and any outside discovery cache were gone, and the account's kubectl directory listed as it did before the run.
+  - On the Mac the forward closed and the run directory was deleted.
+  - The runbook's R9 is corrected in place with a dated note (A31-9).
+
+### The results
+
+| Test | Result |
+|---|---|
+| `TestMigrationRemovesAFieldLaterDroppedFromTheManifest` | PASS, all seven cases |
+| `TestAnnotationRemovalInTheSamePatchLeavesNoUpdateEntry` | PASS |
+| `TestRealAPIKeepsTheLiveListOnAnUndecodableRewrite` | PASS |
+| `TestMigrationIsResumable` | PASS |
+| `TestFirstApplyAfterMigrationChangesNoGeneration` | PASS |
+| `TestReapplyingAnUnchangedJobIsANoOp` | PASS |
+| `TestApplyRefusesAStaleResourceVersion` | PASS, both subtests |
+| `TestMetadataOnlyListsCarryNoSecretData` | PASS |
+| `TestStatusCauseWireName` | PASS |
+| `TestTypedListItemsCarryNoKind` | PASS |
+| `TestKernelWritesAreTrackedAsTechnocore` | FAIL, in `Scale` only (A31-5) |
+| `TestMigrationLeavesAnotherManagersFieldAlone` | FAIL, at its premise only (A31-5) |
+| `TestEveryRenderedStreamAppliesOnARealServer` | FAIL: 19 of 23 streams pass; build and fetch (A31-4) |
+| Row 104's mutant | killed |
+| `TestEmulatedSeedMatchesKubectl` | PASS, all four kinds |
+
+R6's counts held: 12 top-level results for the kube suite and 1 for the cli suite.
+
+**What each test recorded:**
+- **The seven stuck-field cases.** After the migration and v2's forced apply, each object's only entry is `farcast/Apply`, and each dropped field is gone.
+- **The same-patch annotation removal.** For a Deployment, a Secret and a ConfigMap, in the patch's answer and in the read-back:
+  - the only entry is `farcast/Apply`, with no `farcast`/Update entry;
+  - `farcast/Apply` does not own the annotation's path;
+  - the annotation is gone.
+- **An undecodable managed-fields rewrite** is answered 200. The answer and the read-back both keep the live list, `kubectl-client-side-apply/Update`, while the same patch's annotation removal does take effect.
+- **The resumable migration.** A migration patch read at a moved resourceVersion is answered 409. After the resumed migration the entries are `farcast/Apply` and `realapi-other/Apply`.
+- **The generation moves:**
+
+  | Kind | Seeded | After the migration | After the first apply |
+  |---|---|---|---|
+  | Deployment | 2 | 3 | 3 |
+  | StatefulSet | 1 | 1 | 1 |
+  | Service | 0 | 0 | 0 |
+  | Secret | 0 | 0 | 0 |
+
+  The first apply added no entry, and it moved every object's resourceVersion.
+- **The Job.**
+  - The server added the selector key `batch.kubernetes.io/controller-uid`, and the template labels `controller-uid`, `job-name`, `batch.kubernetes.io/controller-uid` and `batch.kubernetes.io/job-name`, beside farcast's two. The only entry is `farcast/Apply`.
+  - The unchanged Job applied again, forced and unforced, is answered 200 with the generation at 1, the resourceVersion unmoved, and the entries unchanged.
+- **The stale resourceVersion:**
+  - an apply carrying a stale `metadata.resourceVersion` is answered 409, and the object is not written;
+  - an apply carrying the resourceVersion of a Secret deleted since it was read is answered 201, and the Secret is recreated.
+- **The metadata-only answers.**
+  - `ListObjects` and a raw partial list answer `PartialObjectMetadataList`. `GetObject` and `PatchJSON` answer `PartialObjectMetadata`, and so does `GetObject` after the migration.
+  - Every object in them has only `apiVersion`, `kind` and `metadata` at the top level.
+- **The conflict.** An unforced apply of a label another applier owns is answered 409. `FieldConflicts` reads true, with one cause of type `FieldManagerConflict` whose field is `.metadata.labels.realapi.farcast.sofmon.com/owner`.
+- **List kinds.** A typed `ConfigMapList`'s items carry no kind. A partial list's items are `PartialObjectMetadata`.
+- **The kernel's writes:**
+  - `SetRequests`, a strategic-merge PATCH on the Deployment, stored 100m and 128Mi. It is recorded as `technocore/Update`, which does not own `spec.replicas`;
+  - `SaveConfigMap`'s POST and its PUT are each recorded as `technocore/Update`;
+  - `Scale` to 0, a merge PATCH on `/scale` with `fieldManager=technocore`, set `spec.replicas` to 0 and left no `technocore` entry. The entries read `farcast/Apply` only.
+- **The other manager's field.**
+  - After the kernel's `Scale` to 0 on a kubectl-seeded Deployment, the entries read `kubectl-client-side-apply/Update`. After the migration they read `farcast/Apply`.
+  - A forced farcast apply of `replicas: 1` then gives `farcast/Apply` ownership of `spec.replicas`, and the value reads 1.
+- **The rendered streams.**
+  - Every stream applied twice with no refusal: 23 streams, with the Namespaces `alpha`, `beta` and `my-platform` created first.
+  - In 19 of them the second apply moved no resourceVersion and no generation.
+  - In the four build and fetch streams (`gitSecret` false and true), the second apply moved the NetworkPolicy's generation: 1 to 2, then 3 to 4 when the same name was applied by the `gitSecret=true` stream.
+  - Before each `gitSecret=true` stream, the earlier stream's Job of the same name was deleted, as the TTL controller would delete a finished one.
+- **The kubectl variant.** For a Deployment, a Secret, a ConfigMap and a NetworkPolicy, kubectl's seed and the emulated seed are each `kubectl-client-side-apply/Update` with the annotation, and their `fieldsV1` are equal.
+
+**[diag] The build and fetch policies.**
+- A NetworkPolicy carrying `ingress: []`, server-side applied unchanged three times, moved its generation 1, 2, 3.
+- The same policy without that line stayed at 1.
+- Either way, the stored object has no `ingress` field.
+- Of every renderer, only `planck/build/build.go:387` and `planck/fetch/workload.go:65` render `ingress: []`.
+- Why *[inf: the strategy's comparison was not read]*: storage does not keep an empty list, so each apply sets it again, and the update strategy counts that as a change of spec.
+
+**[diag] The `/scale` subresource, at v1.36.2.** Every `/scale` write here set 0:
+- a merge PATCH on `/scale` with a named `fieldManager`, on an object made by an apply and on one made by a create, and `kubectl scale --replicas=0` on an object made by an apply, each set `replicas` to 0 and recorded no entry for the writer;
+- each also removed `spec.replicas` from every existing entry, the Apply entry included, so nothing owned it afterwards;
+- the same merge PATCH on the Deployment itself recorded its manager as an Update entry that owns `spec.replicas`;
+- after a `/scale` write of 0, an unforced apply carrying `replicas` was accepted with no conflict. Its manager owned `spec.replicas` again, and the generation moved.
+
+A `/scale` write of a non-zero count was not tried. Why a write of 0 leaves no owner *[inf: autoscaling/v1's `ScaleSpec.replicas` is `omitempty`, so a Scale of 0 carries no `replicas` field and its writer owns nothing, while the change still takes the field from the other managers; from apimachinery's source in another checkout, not run]*. On that reading, a non-zero `/scale` write would be recorded as its writer's Update with subresource `scale`.
+
+**[diag] Reading managed fields with kubectl.** `kubectl get -o json` leaves out `metadata.managedFields` unless `--show-managed-fields` is given.
+
+### Decided by the run
+
+**A31-1: §6.3's single patch stands.** No `farcast`/Update entry appears after the same-patch annotation removal. A second request is not built.
+
+**A31-2: step 3 is built in M2.7b (A30-40), with its deleted-object case narrowed.**
+- The stale-rv apply is answered 409 and nothing is written, so `AllowResourceVersion`, `ApplyAt` and the policy's precondition ship, with rows 88b, 88c and 88d.
+- A deleted object is answered 201 and recreated (A30-45). The run deleted a Secret; for the policy's ConfigMap the same answer is *[inf: server-side apply's create path does not depend on the kind]*. So A30-40's "§31's answer for a deleted object" bullet is replaced:
+  - only a 409 is `changedAfterPlan`;
+  - a policy deleted between the re-read and the apply is recreated from the run's merge, undetected.
+- **The emulation follows the server:**
+  - kubetest answers an apply that carries a resourceVersion, for an object that is absent, by creating it with 201. `TestApplyAnswersConflictOnAStaleResourceVersion` gains that row;
+  - `fakeRunCluster.ApplyAt` accepts an absent policy the same way.
+- **The real-API suite gains one row,** so step 3's own path runs against a real server at the re-run. `TestApplyRefusesAStaleResourceVersion` renders the policy with `RenderPolicyConfigMap` at a stale rv, splits it with `AllowResourceVersion`, and expects `Apply` to fail with `ErrConflict` and write nothing.
+- Risk 7 is closed for a concurrent change. Its residual now names two cases: an absent policy, and one deleted after the re-read.
+
+**A31-3: row 104 is verified.** The mutant failed only in `a_label_leaves`, on its `stuck field: ` line, and its other six cases passed. The unmutated test passed.
+
+**A31-4: the build and fetch policies drop `ingress: []` (M2.7b step 1a).**
+- **What:** delete the line at `planck/build/build.go:387` and `planck/fetch/workload.go:65`. `policyTypes` keeps `Ingress`, so both policies still deny all ingress, and the stored object is the same with or without the line **[diag]**.
+- **Tests:**
+  - `planck/build/build_test.go:188` asserts `ingress` is absent, not an empty list, with `policyTypes` still `[Ingress Egress]`. `fetch_test.go` gains the same assertion;
+  - a new guard over `renderedStreams`, `TestNoRenderedDocumentCarriesAnEmptyList`, refuses any rendered `[]` value. Empty maps are left alone, because `podSelector: {}` and `emptyDir: {}` carry meaning. Once the two lines go, no rendered stream carries an empty list (the review's grep of every template).
+- **Mutation rows:**
+
+  | # | Requirement | Mutation | Must fail | Run |
+  |---|---|---|---|---|
+  | 100e | The fetch policy carries no empty list | restore `ingress: []` in `planck/fetch/workload.go` | `TestNoRenderedDocumentCarriesAnEmptyList`, `fetch_test.go`'s ingress assertion | check.sh |
+  | 100f | The build policy carries no empty list | restore `ingress: []` in `planck/build/build.go` | `TestNoRenderedDocumentCarriesAnEmptyList`, `build_test.go`'s ingress assertion | check.sh |
+
+  Rows 100e and 100f join §30's M2.7 table ("Mutation rows (§10.5, M2.7)") and run in step 1f.
+
+- **Vectors:** `build.json`, `run_fetch.json` and `run_deploy.json` (its two `build-*` policies) move in their policies' sha256 and in their digests.
+- **The re-run:** a renderer changed, so A30-1's re-run rule applies (below).
+
+**A31-5: the kernel's `/scale` write of 0 is not tracked, and risk 4 is settled for it.**
+- **The fact.** The kernel's main-resource writes are recorded as `technocore/Update`. Its `/scale` write, which only ever sets 0 (`technocore/kernel/shutdown.go:95`), records no entry, and it leaves `spec.replicas` owned by no one **[diag]**. This was seen on a loopback envtest kube-apiserver 1.36.2 with none of Autopilot's admission (A30-36's qualifier). The likely cause is the *[inf]* under the `/scale` [diag] above. Whether the SSA page's sub-resource caveat also applies stays open until the re-run's Scale to 2 *[inf: likely not; apimachinery's `ScaleHandler` records a scale manager that owns `replicas`]*.
+- **What does not change:**
+  - `fieldManager=technocore` is still sent on every non-GET, `/scale` included (A30-11). `TestKernelWritesNameTechnocore` still pins the query;
+  - P1 (c)'s stopped fact compares the live `replicas` with the rendered 1, so it stands. After a `/scale` write of 0, farcast's next apply takes `replicas` back with or without force;
+  - kube's `ClientSideManagers` keeps ignoring subresource entries (A30-7), and the unit fixtures that carry a `scale` entry stay. A non-zero `/scale` write would make one *[inf]*.
+- **The adapted fact.** P1 (c)'s adapted fact compares the kernel's `AdaptedAt` with the time of farcast's Apply entry (`cluster/open.go:599-613`), and a `/scale` write rewrites that entry **[diag]**. Whether its time moves was not recorded *[inf: apimachinery's `ScaleHandler.ToParent` keeps each entry's time]*. It matters only for an application no longer at 0, because stopped takes precedence (`runreset.go:170-177`). The re-run records it (below).
+- **The suite, in M2.7b:**
+  - `TestKernelWritesAreTrackedAsTechnocore/Scale`:
+    - records the entries, and asserts `replicas` 0 and no foreign manager. It no longer requires a `technocore` entry;
+    - asserts that no entry owns `spec.replicas` after the Scale to 0, so a server that starts tracking it shows up;
+    - records, as a boolean, whether farcast's Apply entry's time moved, with the Scale sent at least a second after the apply;
+    - then scales to 2 and records whether a `technocore/Update` entry with subresource `scale` appears and owns `spec.replicas`. That settles the `/scale` [diag]'s *[inf]*.
+  - `TestMigrationLeavesAnotherManagersFieldAlone` takes its other manager from a merge PATCH on the Deployment itself, which the server records **[diag]**. The order is pinned, because a `/scale` write of 0 strips every owner of `replicas`:
+    1. the client-side seed;
+    2. the kernel's `Scale` to 0, recorded only;
+    3. `realapi-other`'s merge PATCH of `spec.replicas` to 3, a value that differs from the live one; assert that `realapi-other/Update` owns `spec.replicas`;
+    4. `migrateOne`; assert that the entry is unchanged and `replicas` reads 3;
+    5. the forced apply of `replicas: 1`; assert that `farcast/Apply` owns it and it reads 1.
+
+    No `/scale` write follows the PATCH.
+- **Text, in M2.7b (step 1e for code, step 2 for records):**
+  - `technocore/kube/client.go:27-31` (`FieldManager`'s doc) and `client_test.go:191-194`: the server records the kernel's main-resource writes under technocore. Its Scale names technocore too, but a Scale of 0, the only one the kernel makes, was recorded under no manager on v1.36.2;
+  - `kubetest/writes.go:397-399` and A30-10 read: "A real server keeps every field another manager owns (kubectl's last-applied annotation, the kernel's adapted-at annotation). It also keeps `replicas` set through /scale, which no manager owns after a `/scale` of 0, against an apply that omits it; an apply that carries it takes it back.";
+  - §6.2's "the scale subresource's entry" is kept as a defensive case, with "on v1.36.2 a `/scale` write of 0 leaves no entry". `kubectl-scale` stays listed as another manager, because a non-zero `kubectl scale` was not tried;
+  - risk 4 and the ADR 0009 note (M2.7b step 2) say: the kernel's main-resource writes are recorded as `technocore`. Its `/scale` write of 0 was recorded under no manager and left `replicas` unowned, on a loopback envtest kube-apiserver 1.36.2 with none of Autopilot's admission.
+
+**A31-6: the generation moves.**
+- The migration moves a Deployment's generation by one, because the annotation changes, as A30-18 expected for `TestFirstApplyAfterMigrationChangesNoGeneration`.
+- No generation moved on the first apply after it, so risk 3 was not seen on this server.
+- W3 still watches it on Autopilot, where its mutating admission (with Autopilot's own defaults) and the controllers, both absent here, run. Whether a ReplicaSet follows the migration's own move is W3's to record.
+
+**A31-7: the Job re-apply is a no-op.** The server's selector and labels raise no conflict, forced or not.
+
+**A31-8: the wire facts close §30's "not settled here" list.**
+- The StatusCause type is `FieldManagerConflict`, with the field path as its field.
+- Typed list items carry no kind. Partial list items are `PartialObjectMetadata`. kubetest's comment (the doc of `(*Server).list`, `kubetest/store.go:428-433` at 2728e5f, which §30 cited as `:420-424` at 2461bf1) is corrected in M2.7b, as §30 planned.
+- The metadata-only answers carry `apiVersion`, `kind` and `metadata` and nothing else.
+- An undecodable rewrite is answered 200 with the live list kept, while the same patch's annotation removal takes effect. `MigratedEndState` refuses it on the PATCH answer, and again on the read-back. A second migration of that object finds its client-side entry with no annotation, which `ClientSideTrace` already counts as a trace (A30-6).
+
+**A31-9: the runbook, corrected 2026-11-18.**
+- **R9 step 1:**
+  - stop `kube-apiserver` first and wait up to 30 s for it to exit, then stop `etcd` the same way;
+  - if `kube-apiserver` outlives its 30 s, the step prints `STOP`, leaves `etcd` running and deletes nothing. The step never sends SIGKILL itself;
+  - the dated note names the remedy for the operator to approve: SIGKILL to the pid in `apiserver.pid`, sent only when `/proc/<pid>/exe` is the run's own `kube-apiserver`.
+- **R1 step 7, for a re-run on an uncommitted tree** (A30-1 names M2.7b's tree before its commit):
+  - where the clean-tree check would print `STOP`, the agent records the working tree's hash with a throwaway index under `$RUN`, never the real index or the stash: `git read-tree HEAD`, `git add -A` and `git write-tree`, each with `GIT_INDEX_FILE` set to it. `.claude/` is gitignored, so `git add -A` leaves it out; a `':!.claude'` pathspec would make `git add` fail on the ignored path. Tested 2026-11-18 on this worktree: the real index, `git status` and the stash were unchanged;
+  - after the builds it hashes the tree again the same way, and the run stops unless the two hashes are equal;
+  - R0 names that tree to the operator, and R8 records the tree hash and the HEAD it sits on.
+- **The marks:** each "to be confirmed on the VM" mark is resolved: confirmed, except that `KUBERC=off` ran without error and its effect was not observed. The size note states the measured byte count.
+- **Status and Results** are filled from this section.
+- **Walk observation:** any later step that reads managed fields with kubectl passes `--show-managed-fields` **[diag]**, as W2 already does, and so do A30-39's Cloud Shell re-walks.
+
+### The re-run (A30-1)
+
+- **Why it is due:** A31-4 changes two renderers, and step 3 (A31-2) changes `RenderPolicyConfigMap` and kube's `SplitStream` and `Apply`, which both suites exercise. It runs before M2.7b's commit, on M2.7b's tree, recorded by its tree hash (A31-9). A31-5's two reframed tests and A31-2's new row run in the same pass.
+- **What it takes:**
+  - the operator's approval at that time;
+  - a fresh download of the same archive (same URL, size and sha512);
+  - R0–R6, R8 and R9, with all twelve kube tests and the cli test.
+- **Only if needed:**
+  - row 104's mutant (R1 step 6, R1 step 7's `-overlay` build, and R6's mutant run and its grep) runs only if M2.7b changes `upgradeOne`;
+  - R7, the kubectl variant, runs only if the emulated seed changes;
+  - R8's grep then leaves out the outputs that were not made.
+- **This section records the second run beside the first.** If the re-run does not happen, the records name these as not run against a real server:
+  - the build and fetch renderers;
+  - step 3's rv-carrying policy apply;
+  - A31-5's two reframed tests.
+- **Any FAIL among R6's counted tests stops M2.7b's commit** (A32-16, A32-23), and the operator decides; the cause is recorded from fact lines only. A fix runs again under the re-run rule, whose list of code adds either reframed test's own code (A32-25).
+
+### The re-run's results (2026-11-19)
+
+**The run.** R0–R6, R8 and R9, on 2026-11-19, with the operator's approval in this session. The binaries were built from M2.7b's tree before its commit, on HEAD 0397826; its tree hash through a throwaway index is babeda086cf07d429a43e5c815684507cc49396f, the same after the builds. The same archive (47,304,572 bytes; sha512 equal to the sidecar and, by the operator's comparison, to `envtest-releases.yaml`), the same versions, the same account. Row 104's mutant and R7 did not run: `kube/migrate.go`, the seed files and the suite's seed functions are byte-identical to 2728e5f's. R9, in its corrected order, passed at the first try, with no SIGKILL.
+
+**The results.** The kube suite counted 12 and the cli suite 1, and all 13 passed, the three subtests of `TestApplyRefusesAStaleResourceVersion` included. Every fact Run 1 recorded for the tests that passed then recurred. The new facts:
+- the egress policy as `run` renders it, split with `AllowResourceVersion`: 409 at a stale resourceVersion with nothing written; 200 and written at the stored one;
+- all 23 rendered streams applied twice with nothing moved on the second apply, the build and fetch policies included;
+- `Scale` to 0: entries `farcast/Apply` alone, no entry owning `spec.replicas`, and that entry's time not moved;
+- `Scale` to 2: no entry added, no `technocore/Update` with subresource `scale` among them, and `replicas` read 2;
+- `realapi-other`'s merge PATCH of `spec.replicas` is `realapi-other/Update`, owning it; the migration left it unchanged; a forced `farcast` apply of `replicas: 1` took it back.
+
+**A31-10: step 3's precondition holds on this server.** The policy as `run` renders it (`RenderPolicyConfigMap`, through A32-6's pinned testdata), split as `cluster.ApplyAt` splits it and sent by `kube.Client.Apply`, is refused at a stale resourceVersion and applied at the stored one. `cluster.ApplyAt` itself, and `run`'s path through it, ran against kubetest only. A31-2's deleted-object residual stands.
+
+**A31-11: A31-4 holds.** No rendered stream moves on an unchanged apply.
+
+**A31-12: a `/scale` write is untracked at 2 as at 0 (the suite's fact lines).** The `/scale` [diag]'s *[inf]* (autoscaling/v1's `omitempty` at 0) does not explain it, nor does A31-5's *[inf]* that `ScaleHandler` records a scale manager. On this server no `/scale` write tried recorded an entry for its writer: the kernel's merge PATCH at 0 and at 2, and Run 1's writes at 0. The cause is not known. Nothing changes: the kernel only ever sets 0, `run`'s stopped fact compares the live `replicas`, and a forced apply takes `replicas` back. `ClientSideManagers` keeps ignoring subresource entries, and the unit fixtures that carry a `scale` entry stay as a defensive case; `kubectl-scale` stays listed, because `kubectl scale` was not tried at 2.
+
+**A31-13: on this server, the adapted fact is undisturbed.** A `/scale` write of 0 leaves the time of farcast's Apply entry as it was (the suite's fact line), as A31-5's *[inf]* expected (`ScaleHandler.ToParent` keeps each entry's time), though the same reading's scale manager did not appear (A31-12), so the reading is not confirmed. The kernel's stop therefore does not change what P1 (c)'s adapted fact reads.
+
+**What follows.** Nothing in M2.7b's code changes. The four records' clause (A30-36) becomes one sentence naming the second run; ADR 0009's decision 3 note and the CLI README's `run` review add the write of 2, and the review the unmoved time; the runbook's Results hold Run 2 beside Run 1, and its Status names both.
+
+### Left open
+
+- **Autopilot:** none of this ran under GKE's admission or controllers. W3 and M2's billable walk cover that.
+- **A `/scale` write of a non-zero count** was not tried. Why a write of 0 leaves no owner is the `/scale` [diag]'s *[inf]*, and the re-run's Scale to 2 settles it. *(2026-11-19: tried at 2, and untracked too (A31-12). Why the `/scale` writes tried record no entry on this server is not known.)*
+- **kubetest's known gaps** stay where no M2.7b test depends on them:
+  - its POST and PUT record no entry, where the server records `technocore/Update`;
+  - it serves neither a `/scale` subresource nor a strategic-merge PATCH, and answers each as not emulated.
+
+## 32. Amendments after M2.7b's build (2026-11-19)
+
+M2.7b was built by workflow wf_97373908-72b in nine steps: 1a, 1b-1, 1b-2, 1c, 1d-1e, 3, 2, and the rerun in two halves, A and B (§30's build order, as §31 amends it). It was reviewed by wf_01417a5a-d19: lenses S, C, A and M, each with a skeptic, then one fixer. 27 findings were reported, 22 confirmed and fixed (C-C-4 in part), 5 refuted. The orchestrator's O-1 to O-3 went straight to the fixer. The fixer's work was checked by wf_f8f431d1-ccb in three lenses (code and tests, records, mutants), each with a skeptic: 16 findings, 9 confirmed and 7 refuted. A second fixer applied the 9 (wf_ef08ce1c-8c5), an independent check found them correct, and four of its optional record notes were applied by hand (A32-25).
+
+The builders ran 130 mutants: all killed but one, which is equivalent (A32-4). The rerun covered every earlier table, 1,677 rows: 1,498 killed by their named tests, 57 killed-moved (each by a whole-package run), 24 equivalent, 27 survivors the design had already accepted, 2 new survivors, 53 retired, and 14 not rerun (A32-8). The fixer ran 25 mutants and the second fixer 5, all killed; the independent check rebuilt the 5 and one more, all killed, and each survives the test file before the fix. Every run went behind the tunnel guard; the one guard hit was the expected `D1_dial_default` row.
+
+These amendments win over §30 and §31 where they differ. With M2.7b, M2.7 is complete in the code. None of it is walked. The real-API re-run (§31's *The re-run*) ran on 2026-11-19 on M2.7b's tree and passed all thirteen (A31-10 to A31-13).
+
+### From the build (accepted)
+**A32-1 (1a): fixtures and renderers.**
+- `recordMigrated` is called in the two fixtures that build a record as a literal, `readerInstance` and `installedInstance`. The other fourteen of A30-20's list take their record from one of these and save it again with `ServerSideApply` kept. A probe with a refusal at every A30-20 placement passed the whole cli suite with no hit.
+- Four more places get the call where a test turns a record into one a writer runs on: the reader grant records in `TestReaderGrantNeedsATerminal` and `readerGrantRefusalNamesThePlan`, `rekeyInstance`, three storage deploy literals in `storagekeyholder_test.go`, and the record `TestDeployReallyMintsTheBucket` edits. `readerRecordFor`, `newStorageEnv` and `newDataEnv` stay unmigrated: tests that never write share them.
+- The build and fetch policies' YAML comment moved above `policyTypes` when `ingress: []` went; A32-15 rewords it.
+- `run_deploy.json`'s `fetch_plan_digest` moves with `run_fetch.json`'s digest, which it always equals.
+
+**A32-2 (1b-1): the refusal.**
+- No kind was added: `not_migrated` exists since M2.4 (`kinds.go`), and the CLI README's error kinds document it. A23-18's list of errors raised before a plan lives in the CLI README, not in code.
+- Row 92's `consentForm` appends `--yes` to every `writeCommands` row but reader grant, which keeps its interactive seam; the second form appends `--plan`.
+- Row 93's refusal rows come from `clusterWriters()`, the eleven names, which A30-26 derives. Added rows pin each "before X" placement: connect before its precheck, storage key pin before `keyringOf`, run before F's blocks, build before its `--repo`/`--app` check. The `--plan` forms of reconnect and of rotate with no keyholder must not refuse.
+- `install`'s adopted-cluster warning prints right after the finalizing save, before the health verdict's error return.
+- The cli `fakeProvider` returns `Created: true` by default; only the adopted-cluster tests set it false. `Created`'s zero value fails closed.
+- Rotate's refusal sits right after `recordNamed`, before `*metaOut = meta`.
+
+**A32-3 (1b-2): `migrate`.**
+- Its writer is the seam `migrateWriterDefault`. In tests, `refusingdefaults_test.go` replaces it with a writer that opens only a loopback endpoint (`loopbackEndpoint`, factored from `loopbackReader`), and refuses any other record or none. `TestUnsetSeamsRefuseInTests` pins the refusal.
+- `planCommand.identity` is set on every plan row and asserted equal to `Bound.ClusterIdentity`, and `readsCluster == (identity == "reader")`. A writer row opens the writer twice, once per printed plan (JSON and human).
+- cli keeps its own `lastAppliedAnnotation` constant beside kube's and cluster's, for the key it binds.
+- The texts the design did not pin are the builder's: the no-argument usage, `msgMigrateReread`, `msgMigrateReadBack`, `msgMigrateRediscover`, the record failure, the legacy-file failure, the discovery list failure, the Synopsis, the `--yes` help and the Usage's third paragraph. Every pinned text is verbatim.
+- A matching re-read that needs no patch (an annotation removed after the plan) sends nothing, is checked and read back, and counts as migrated.
+- The `credential_missing` wrap (M9's sentence) applies to the writer's open alone.
+
+**A32-4 (1c): Apply in-process.**
+- `Apply` carried a `c.kube == nil` guard until 1d deleted every guard; `newWithRunner` and `fakeRunner` went in 1c, unused.
+- `afterWrites` prints the per-object warning through `output.ErrorText` too, and clears only `ServerSideApply`; `UpdatedAt` is untouched.
+- `planFixtureWith` always starts kubetest `WithSettledWorkloads()`, and the seeded fetch Job's container is `git`, the renderer's name.
+- The new `TestWritingCommandsCarryClusterKinds` rows run each applying command through its plan and `--confirm` (`applyingPlans`), not the `writeCommands` `--yes` forms, which meet refusing defaults first.
+- `TestAClientSideTraceAfterMigrationClearsTheRecord` covers all 16 writer opens; each of the 16 `X-no-defer` mutants is killed by its own subtest.
+- cli `TestEveryApplyIsForced` compares Secret, Deployment, StatefulSet and run's egress-policy ConfigMap by kind, namespace and name only; A23-31's exact masks stay in `TestConfirmWritesThePlannedDocumentsExceptTheirSecrets`.
+- `X-notetrace-failed` is equivalent: `kube.Client.Apply` returns a zero `ObjectMeta` with every error, and `ClientSideTrace` of it is false.
+
+**A32-5 (1d-1e): kubectl and the kubeconfig out; texts.**
+- 20 guards were deleted (A30-33's 16, the three migration methods' and Apply's), and 15 `openWriter` call sites changed.
+- `TestNoCommandHelpNamesKubectl` exempts migrate's Usage for exactly three phrases: "kubectl's client-side apply", "kubectl-client-side-apply entry" and "kubectl's last-applied annotation". §6.1 pins that Usage, and it names what migrate migrates from. The test fails when a phrase is gone, so the exemption cannot go stale; a kubectl anywhere else in migrate's help is caught.
+- Four inline texts became named constants: `msgBuildFailed`, `msgRunBuildFailed`, `msgFetchFailed` and `msgInspectFatline`. Kernel deploy's is the existing `msgNoSuchNamespace`.
+- Comments that kubectl's removal made false were swept beyond the file lists. kubectl stays named where true: provenance of ported code, operator tools (`kubectl describe pod`, inside the rendered kernel template too, which would move the kernel vectors), the rehearsal's guard, the retired error-kind names, and dated history.
+- Row 105 ran on a copy of the tree, because execsites runs `go list` itself.
+- `TestInstancesReadsOnlyTheRecords` asserts its premise, that `credentials.yaml` and `kubeconfig.yaml` lie beside the record (it killed `X-installed-no-kubeconfig`).
+- TechnoCore's image digest moves at the next release: `technocore/kube/client.go` changed only in comments, but its lines moved.
+
+**A32-6 (3): the egress policy's resourceVersion.**
+- kube's A31-2 subtest reads the renderer's output from `kube/testdata/realapi/egress-policy.yaml`, because `TestKubeImportsOnlyItsFour` refuses a test import of `fatline/deploy`. `TestTheRealAPIEgressPolicyIsTheRenderers` pins the file to `RenderPolicyConfigMap` byte for byte, in both forms.
+- After the 409 row, the same subtest applies the render at the stored resourceVersion and expects it written. §31 never observed that half; the re-run decides it (A32-16). *(2026-11-19: it was written at the stored resourceVersion, A31-10.)*
+- The reframed Scale subtest also asserts `spec.replicas` reads 2 after the Scale to 2, and that no foreign manager appears. `TestMigrationLeavesAnotherManagersFieldAlone` gains `mergePatch`, a merge PATCH as a named manager, and stops when no `realapi-other/Update` entry owns `spec.replicas`.
+- `RenderPolicyConfigMap` refuses a resourceVersion holding a double quote, a backslash or a byte outside printable ASCII, so the template cannot be injected. With rv `""` its output is byte-identical to before.
+- `AllowResourceVersion("")` allows nothing, so `ApplyAt(..., "")` is a single-document Apply with no precondition. `ApplyAt` shares Apply's loop and texts. The builder's refusal texts are recorded in its notes.
+- kubetest answers 422 to a non-string body rv and treats an empty or null rv as no precondition; neither was observed on a server.
+- `fakeRunCluster.ApplyAt` reads the rv from the document's body and records the rv it was given; a 409'd ApplyAt records no write.
+
+**A32-7 (2): the records.**
+- A30-36's outcome sentence counts R6's thirteen (twelve kube tests and the cli test); R7's kubectl variant and row 104's mutant are tallied apart.
+- ADR 0023's revisit trigger bolds its first clause, like the others.
+- A30-39's notes sit as `# ` comments in the bash blocks; in phase-4-1 before the heredoc.
+- Dated riders went to the walked runbooks' setup (adr-0023-m2-probe-walk.md and adr-0023-m1-walk.md), so no undated "until M2.7" text remains.
+- The CLI README keeps short dated history notes where lane 5 deleted text.
+- ADR 0019:75's rider is marked inferred: what Admin Activity records of an apply-patch PATCH.
+
+**A32-8 (rerun, halves A and B).**
+- Half A, M2.1 to M2.5 and M2.7a with M2.7b's own rows: 807 rows, 695 killed, 18 killed-moved, 9 equivalent, 19 accepted survivors, 1 new survivor, 51 retired, 14 not rerun. Half B, M2.6a to M2.6d with their reviews and fixers: 870 rows, 803 killed, 39 killed-moved, 15 equivalent, 8 accepted survivors, 1 new survivor, 2 retired.
+- **Not rerun:** 14 of M2.2's N rows (N12a, N12b, N13, N14, N16, N18, N18b, N19, N20, N21, N24, N25, N33 and N37). Nothing records what each mutated; A16-7 keeps only their verdicts.
+- **The new survivors,** each killed by a landed test (A32-13): `mut-m26b:O36`, whose only killer went with `applyReady` (A30-30), and `mut-m25:r69b-twice-srotate`, which M2.5 judged inert before rotate's preflight met the writer (M2.6c).
+- **Accepted survivors stay accepted.** Their killers were drafted and verified under the reruns' `kill/` directories, and not landed.
+- **Timeouts.** Five mutants that let `build --confirm` through hang on `WaitJob` until the binary's timeout, after their named test has failed for the intended reason. They count as killed.
+
+### Changed by the review (confirmed findings)
+**A32-9 (S-S-2): an annotation with no managed-fields entry.** `kube.MigrationPatch` can never rewrite an object that carries the last-applied annotation and no managed-fields entry: the rewrite would leave an empty list, which does not reset the field. `migrateOne` therefore refuses it after the re-read checks and before the patch, and sends nothing. The error is `msgMigrateNoEntries`, kind internal. It does not end with `migrateSoFar`, because a second run stops at the same object. It names the operator's remedy: remove the annotation from Cloud Shell, then `farcast migrate <instance> --plan`. Option (a), a patch of the resourceVersion and the annotation alone, is not built: its server behaviour is *[inf]*. Pinned by `TestMigrateNamesTheRemedyForAnAnnotationWithNoEntries`.
+
+**A32-10 (S-S-3): a provider Namespace is blocked by its name.** A30-22's provider rule also judges a Namespace object by its own name (kube-, gke-, gmp-), since a cluster-scoped object has no namespace. A deployment named gke- or gmp- something, which a farcast older than M2.7 applied into a Namespace of that name (planck's translate refuses only kube-), is blocked with every object in it, as its objects already were. `TestMigratePlanBlocksObjectsFarcastNeverWrites` seeds kube-system, gke-managed-system and gmp-public.
+
+**A32-11 (M-MUT-M27B-01): a record unmigrated since its plan.** A plan binds nothing for the refusal, so `--confirm` of a plan made while the instance was migrated, with the record cleared since, must be refused `not_migrated` with nothing sent, printed or written. `TestConfirmRefusesAnInstanceUnmigratedSinceItsPlan` covers every `applyingPlans` plan, storage key pin's four plan rows and rotate with a keyholder. Row 92b, "skip the refusal under consentConfirm", has eleven variants, one per writer, all killed.
+
+**A32-12 (M-MUT-M27B-02 to -09, -11): migrate's untested edges.**
+| Mutant | Killed by |
+|---|---|
+| O17: a failed fresh discovery taken as nothing found (A30-24) | `TestMigrateRecordsNothingWhenItsFreshDiscoveryFails` |
+| O07: nothing to do without the record's ServerSideApply (A30-21, A30-25's adopted case) | `TestMigrateRecordsAnUnmigratedInstanceWithNothingToRewrite` |
+| O05: the releasing-instance check deleted (A30-21 step 5) | `TestMigrateRefusesAnInstanceBeingReleased` |
+| O06: migrate's `writerRefused` defer deleted (A20-9) | `TestMigrateSaysWhoseA403WasOnce` |
+| O12: the client-side manager set unchecked on the re-read (A30-23) | `TestMigrateConfirmRecomputesAndRefusesAChangedObject/its_client-side_managers_alone,_the_hash_unchanged` |
+| O20: every object bound as annotated (A30-12) | `TestMigratePlanBindsEachObjectAsDiscoveryReadIt/no_annotation` |
+| O21: a subresource manager's suffix dropped (A30-12) | `TestMigratePlanBindsEachObjectAsDiscoveryReadIt/a_status_writer` |
+| O08: nothing to do with a legacy file left | `TestMigrateOnAMigratedRecordKeepsSince/a_legacy_file_left,_interactively` |
+| O38: install recording server_side_apply after a failed create (A30-25) | `TestInstallCreateClusterFailureRecordsError` |
+
+**A32-13 (C-C-2, O-2): the rerun's two survivors.**
+- `TestConnectConfirmMintsNoIdentityBeforeItsWriterReads` replaces the connect ordering that `TestCommandsThatApplyRefuseAMachineThatCannotApply` pinned (A23-35: `realizeIdentity` after the writer's checks), and kills `mut-m26b:O36`. Reviewer M's broader form, every applying plan changes no file, is not landed: by A20-10, kernel meter and kernel confirm save the record before the apply and roll it back with `UpdatedAt` moved.
+- `TestConfirmChecksTheWriterBeforeAnythingIrreversible` counts `msgWriterRBACRefused` exactly once in its storage deploy and storage key rotate preflight rows, killing `mut-m25:r69b-twice-srotate` and storage deploy's double wrap.
+
+**A32-14 (C-C-1, A-CODE-1, O-1): doc comments.** Step 1e's four new constants had been put between an older constant and its doc. Each doc now heads its own constant in build.go, redeploy.go, run.go and runfetch.go; no text changed.
+
+**A32-15 (C-C-3): the empty list, as observed.** The build and fetch policies' YAML comments, manifests_test.go, build_test.go and fetch_test.go say only what §31 saw for one field: on a loopback envtest kube-apiserver 1.36.2, a NetworkPolicy's `ingress: []` was not stored, and every unchanged apply moved the generation. The mechanism is marked inferred. The YAML rewording moved `build.json`, `run_fetch.json` and `run_deploy.json` once more: the policies' sha256 and the digests only.
+
+**A32-16 (C-C-4, A-RB-1, A-RB-2): what the re-run decides.**
+- Both stale-rv subtests must pass: `a_stale_resourceVersion`, and `the_egress_policy_at_a_stale_resourceVersion` on both halves (409 and nothing written, then written at the stored rv). If either fails, M2.7b is not committed and the operator decides.
+- R8 records A31-5's Scale-to-0 and Scale-to-2 lines, the migration's `realapi-other` lines and A31-2's two policy lines. SetRequests' line now follows a Scale to 2 and is not compared with Run 1's.
+- The runbook carries these as 2026-11-19 dated notes in R6, R8 and *What the run decides*. A dated note after its Status says its opening describes Run 1 only (A30-50's runbook site).
+- C-C-4's other parts are not applied: the subtest's doc describes what it asserts, and the Scale-to-2 omission is cosmetic.
+
+**A32-17 (A-REC-2, -3, -4): records.**
+- ADR 0023's Context cites `planck/internal/providers/gke/kubeconfig.go` as a path at 6b62d3f, since M2.7 deleted it.
+- The CLI README's `not_migrated` row adds install's adopted cluster (A30-25).
+- A30-24's residual keeps "inferred, not checked" for other versions and adds what v1.36.2 did (200, the live list kept, the annotation removed; a second run's discovery still selects the object, A31-8).
+
+**A32-18 (O-3): dates.** M2.7 as a whole, and every part M2.7b built, reads "built 2026-11-18 to 2026-11-19"; "M2.1 to M2.7" reads "2026-11-14 to 2026-11-19". M2.7a's own parts (technocore's field manager, the suite), the real-API run's date and its record keep 2026-11-18, as do dated notes whose date is their own.
+
+### Changed by the fix-check (confirmed findings)
+The fix-check's three lenses reported 16 findings; the skeptics confirmed 9 (two pairs overlap) and refuted 7. A fixer applied them (wf_ef08ce1c-8c5) and an independent check followed. None changes behaviour.
+
+**A32-19 (FC-1, FM-2): A32-10's rule, pinned from the other side.**
+- A farcast older than M2.7 kubectl-applied farcast-system and every app Namespace with farcast's label, so on every real instance a traced Namespace farcast writes must be planned, not blocked. `providerSeeded` seeds one, and `TestMigratePlanBlocksObjectsFarcastNeverWrites` expects it among the objects. Row 94c, "block every Namespace", is killed.
+- The rule is a prefix: an app namespace such as `team-kube-gke-gmp-tools` is farcast's. `TestMigrateBlocksOnlyANamespaceThatStartsWithAProviderPrefix` kills row 94b, `strings.Contains` for `strings.HasPrefix`.
+
+**A32-20 (FC-3, FM-1): A32-9's check, placed and conditioned.** An object planned with its client-side entry and re-read with its entries stripped and the annotation kept is a change since the plan (A30-23 step 1): plan_changed under `--confirm`, `msgMigrateChanged` interactively, nothing sent. A new row of `TestMigrateConfirmRecomputesAndRefusesAChangedObject` kills the mutant that moves the no-entries check before the re-read comparison. The condition is pinned too: an object planned with the annotation alone, whose annotation goes between the plan and the re-read, is migrated with nothing sent (`TestMigrateNamesTheRemedyForAnAnnotationWithNoEntries/the_annotation_removed_before_the_re-read`, deterministic through `WithHandler`), killing the mutant that drops `annotated &&`.
+
+**A32-21 (FC-4, FR-6): nothing printed means both streams.** `TestConfirmRefusesAnInstanceUnmigratedSinceItsPlan` requires stdout and stderr empty, as its doc and A32-11 say. A warning written to stderr before the refusal is killed, both in kernel deploy's applying plan and in storage key pin's four rows.
+
+**A32-22 (FC-2): a gke- or gmp- deployment.** The CLI README's Blocks paragraph and `notWrittenByFarcast`'s doc say what works when an older farcast put a deployment in a gke- or gmp- Namespace, by its manifest name or by `run --namespace`. Removing the label does not settle it: the objects keep kubectl's entry, and the next `farcast run` labels them again and clears the record. The remedy is to delete the deployment's objects, or its Namespace, from Cloud Shell, run migrate, then `farcast run` it again. `msgMigrateBlocked` is unchanged.
+
+**A32-23 (FR-2): any failure in the re-run stops the commit.** The runbook's *What the run decides* gains a dated bullet: any FAIL among the twelve kube tests or the cli test stops M2.7b's commit, and the operator decides. Its cause is recorded from fact lines only. The named cases are a build or fetch policy whose generation still moves, Scale finding an owner of `spec.replicas` after the Scale to 0, `realapi-other`'s entry not kept by the migration, and a failure in a reframed test's own code. A fix to any of them runs again under the re-run rule. §31's *The re-run* carries the same gate.
+
+**A32-24 (FR-3): the CLI README's testing section** no longer implies every rendered stream, as now rendered, ran against a real server; its parenthesis says the migrate section has what has not run there since. *(2026-11-19: after the re-run, the parenthesis says the migrate section has what its runs of 2026-11-18 and 2026-11-19 found.)*
+
+**A32-25 (orchestrator, after the independent check): records.**
+- The CLI README's testing section names `TestMigrateBlocksOnlyANamespaceThatStartsWithAProviderPrefix` and the traced Namespace farcast writes.
+- The Blocks paragraph says "of the provider's prefixes, only `kube-` is refused": `run` also refuses farcast-system.
+- The runbook's bullet is titled "A FAIL among R6's counted tests stops the commit": row 104's mutant run fails by design, and R7 has its own rule.
+- The re-run rule's list of code whose change forces another run adds either reframed test's own code; §31's *The re-run* says the same.
+
+### Refuted, kept out
+- **S-1:** a server-sent manager name holding a newline can start a second `farcast:` line on stderr through migrate's errors. So can any API server's Status message in the same command, and keeping `\n` and `\t` in errors is the documented rule (A29-14). A valid manager name is printable *[inf: apimachinery's field-manager validation]*.
+- **RB-3:** the re-run's skips (row 104, R7) are stated where the re-run's plan is given, R1 step 7's note covers the rest, and running either anyway is harmless.
+- **REC-1:** "Ten of its thirteen tests" is R6's counted set; R7's variant is tallied apart (A32-7).
+- **MUT-M27B-10:** no cli test asserts `updated_at` for any command, and nothing decides on it but the max-merge.
+- **MUT-M27B-12:** an unbounded Job wait in the test harness predates M2.7b, and the intended failure prints before the hang.
+- **FC-5:** `registerProvider` panics on a second iteration under `-count` above 1. It predates M2.7b, and check.sh runs nothing above `-count=1`.
+- **FR-1:** seven notes dated 2026-11-18 now give a build range ending 2026-11-19. They already reported M2.7's build in place before O-3 ("built that day"), and a note keeping its date while reporting a later fact is the repository's convention.
+- **FR-4:** "a second run's discovery still selects such an object" is farcast's own code, in the present tense, and tested; it claims nothing of the server.
+- **FR-5:** the template comments say "on kube-apiserver 1.36.2" without "loopback envtest". They are not records, the tests carry the full qualifier, and rewording would move three vectors again.
+- **FR-7:** `allthing/README.md:291`'s dead link to `docs/wire.md` predates M2.7b.
+- **FM-3:** widening the by-name rule to every cluster-scoped kind changes nothing farcast writes; its ClusterRoles have no provider prefix, and ClusterRoleBindings are name-restricted.
+- **FM-4:** the `annotated &&` half of A32-9's check differs from its mutant only if an annotation is removed inside one run's re-read window. Both halves are pinned anyway (A32-20), since each killer was one row.
+
+### Left open
+- **The re-run** ran on 2026-11-19 and passed (§31's *The re-run's results*); its records go into M2.7b's commit.
+- **A bound on the harness's build and fetch Job waits** (MUT-M27B-12), a harness change of its own.
+- **14 of M2.2's N rows** cannot be rerun; their edits were never recorded.
+- **The accepted survivors' killers,** drafted and verified under the reruns' `kill/` directories, not landed.
+- **A deployment in a gke- or gmp- namespace** that an older farcast applied blocks its instance's migration until the operator deletes its objects and deploys it again (A32-10, A32-22). Whether A30-22 should tell such a deployment apart from the provider's own objects is the operator's question. No such deployment is known, and `run` still accepts such a namespace (`validNamespace` refuses only kube-).
+- **`registerProvider` under `-count` above 1** (FC-5), a test-harness change of its own.
+- **`allthing/README.md:291`'s dead link** (FR-7), an AllThing records item.
+- **A32-9's option (a)** is unbuilt; the operator's remedy stands in for it.
+- **The known flake** `kube.TestANonStreamingAttemptHasADeadline` (about 1 in 200), whose fix is offered as its own commit.
+- **Size:** M2.7b against 0397826 is code +1,283/−877, tests +5,117/−1,537, vectors and testdata +48/−11, records +295/−169 in 26 Markdown files, and `exec-allowlist.txt` from 101 entries to 86 (−18 lines).
