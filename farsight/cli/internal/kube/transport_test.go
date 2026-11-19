@@ -681,6 +681,9 @@ func TestANonStreamingAttemptHasADeadline(t *testing.T) {
 		}
 		select {
 		case <-r.Context().Done():
+			// Abort, not return: a return ends the response cleanly, which
+			// the client could read as a short 2xx before its own cancel.
+			panic(http.ErrAbortHandler)
 		case <-release:
 		}
 	}))
