@@ -19,7 +19,7 @@ import "text/template"
 //     publishes a high one and lets the Service map it.
 //
 // Each application's NetworkPolicy comes before its Deployment, because a
-// stream stopped part-way (kubectl interrupted, or from ADR 0023 M2.7 the
+// stream stopped part-way (farcast interrupted, or since ADR 0023 M2.7 the
 // in-process apply at its first failing document, design D3) leaves what came
 // before it, so a policy after its workload could leave the pods running
 // without it.

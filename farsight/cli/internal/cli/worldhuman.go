@@ -12,7 +12,7 @@ import (
 //
 // Every string in it that came from the instance — a namespace, an
 // application, a host, a keeper's name, a section's message — goes through
-// terminalText, because a manifest, a monitor or a kubectl error chose it.
+// terminalText, because a manifest, a monitor or a cluster's error chose it.
 func (d worldDoc) Human(w io.Writer) error {
 	in := d.Instance
 	fprintf(w, "%s — %s, read %s\n", terminalText(in.Name), terminalText(orUnknown(in.Status)),

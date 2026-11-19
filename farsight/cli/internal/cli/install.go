@@ -190,7 +190,7 @@ func (c *installCommand) Run(ctx context.Context, env *Env, args []string) error
 		return fmt.Errorf("provisioning failed: %w; run 'farcast release %s' to clean up", err, c.name)
 	}
 
-	// Finalize: persist the kubeconfig + endpoint, then health-check.
+	// Finalize: record the endpoint, then health-check.
 	meta.Region = cluster.Ref.Location
 	meta.Endpoint = cluster.Endpoint
 	// Recorded only on the provider's word that it read the cluster back as
@@ -200,9 +200,6 @@ func (c *installCommand) Run(ctx context.Context, env *Env, args []string) error
 		meta.CloudLogging = config.CloudLoggingSystem
 	}
 	meta.UpdatedAt = time.Now().UTC()
-	if err := env.ConfigDir.SaveInstanceKubeconfig(c.name, cluster.Kubeconfig); err != nil {
-		return err
-	}
 
 	// The instance's own image registry (ADR 0007). It is instance identity,
 	// like the cluster and the CA, and it must exist before the first image
@@ -216,9 +213,23 @@ func (c *installCommand) Run(ctx context.Context, env *Env, args []string) error
 	} else {
 		meta.Status = config.InstanceUnreachable
 	}
+	// A cluster this call created has no client-side history, so it is
+	// recorded as written with server-side apply since the record was made
+	// (ADR 0023 M2.7, design A30-25). Only here, at the finalizing save: the
+	// first record above carries none. A cluster the provider found under the
+	// name, which is the instance's own, is another machine's install of the
+	// same instance: any farcast may have written to it, so it stays
+	// unmigrated.
+	if cluster.Created {
+		meta.ServerSideApply = &config.ServerSideApply{Since: meta.CreatedAt, Farcast: buildinfo.Get().Version}
+	}
 	meta.UpdatedAt = time.Now().UTC()
 	if err := env.ConfigDir.SaveInstanceMetadata(c.name, meta); err != nil {
 		return err
+	}
+	if !cluster.Created {
+		fprintf(env.Err, "Warning: cluster %q already existed, so this farcast cannot tell what wrote to it; "+
+			"run 'farcast migrate %s --plan' before any command that writes to it.\n", clusterName, c.name)
 	}
 
 	if !healthy {
@@ -340,11 +351,11 @@ func (c *installCommand) printSummary(w io.Writer, region, clusterName string) {
 }
 
 // healthCheck confirms the instance is alive without assuming a public control-
-// plane IP (ADR 0004): the install must have produced a DNS endpoint and a
-// kubeconfig, and the management API must still report the cluster RUNNING. A
+// plane IP (ADR 0004): the install must have produced a DNS endpoint, and the
+// management API must still report the cluster RUNNING (ClusterStatus). A
 // deeper, in-cluster check arrives with TechnoCore.
 func healthCheck(ctx context.Context, p planck.Provider, cluster *planck.Cluster) bool {
-	if cluster.Endpoint == "" || len(cluster.Kubeconfig) == 0 {
+	if cluster.Endpoint == "" {
 		return false
 	}
 	st, err := p.ClusterStatus(ctx, cluster.Ref)
@@ -352,10 +363,13 @@ func healthCheck(ctx context.Context, p planck.Provider, cluster *planck.Cluster
 }
 
 // msgCredentialsRequired is install's refusal of a missing --credentials
-// (ADR 0023 M2.5, A20-1): every cluster-writing command reads the cluster as
-// the installer's stored key, so an instance installed without one could
-// never be connected or deployed into, only released.
-const msgCredentialsRequired = "--credentials is required: since ADR 0023 M2.5 farcast reads an instance's cluster, and writes its storage key pin, " +
+// (ADR 0023 M2.5, A20-1; its text since M2.7, design A30-25): every
+// cluster-writing command reads and writes the cluster as the installer's
+// stored key, so an instance installed without one could never be connected
+// or deployed into, only released. It names the writing commands alone:
+// world, ps, costs, usage, logs and the reader's plans read as the instance's
+// reader.
+const msgCredentialsRequired = "--credentials is required: since ADR 0023 M2.7 the commands that write to an instance's cluster read and write it " +
 	"as the service account whose key --credentials names, never as Application Default Credentials"
 
 // msgCredentialsEmpty is install's refusal of a --credentials file that holds
@@ -364,7 +378,7 @@ const msgCredentialsRequired = "--credentials is required: since ADR 0023 M2.5 f
 // (planck.Config), so such an install would create, and bill, a cluster as
 // whatever this machine's ADC is, and record an instance every writing
 // command then refuses.
-const msgCredentialsEmpty = "--credentials names an empty file: since ADR 0023 M2.5 farcast reads an instance's cluster, and writes its storage key pin, " +
+const msgCredentialsEmpty = "--credentials names an empty file: since ADR 0023 M2.7 the commands that write to an instance's cluster read and write it " +
 	"as the service account whose key --credentials names, never as Application Default Credentials"
 
 // readCredentials loads the service-account key file --credentials names, and

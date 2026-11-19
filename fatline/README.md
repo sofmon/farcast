@@ -279,7 +279,7 @@ Per [AGENTS.md](../AGENTS.md) and [ADR 0002](../docs/adr/0002-backend-language-s
 - **mTLS** over `net.Pipe` with an in-test ephemeral CA: a good client connects; a wrong-CA or no-client-cert peer is rejected at the handshake.
 - **Egress** against `httptest`: a declared host is proxied; an undeclared host and an empty allowlist are denied; table-driven coverage of case-fold / trailing-dot / IP-literal-deny, `CONNECT` vs absolute-URI, the **fragmented-ClientHello SNI buffer/replay**, the `403`/`ErrDenied` deny behavior, and exactly-one-event-per-decision.
 - **Lifecycle** — `ctx`-cancellation drains cleanly (the Go-side analogue of the cancellation-safety tests ADR 0002 mandates for any future Rust data plane).
-- **Secret-safety** — TLS keys never appear in any log or `String()` output (the same guard Planck applies to its kubeconfig).
+- **Secret-safety** — TLS keys never appear in any log or `String()` output (the same guard Planck applies to its registry token).
 - **Integration** — a real-cluster end-to-end test sits behind `//go:build integration` and is **never run by `./check.sh`** (cost pillar), mirroring [Planck](../planck/README.md#testing-strategy).
 
 ---

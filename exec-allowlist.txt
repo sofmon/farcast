@@ -47,9 +47,6 @@
 # at its site.
 #
 # First-party, farcast only:
-# - cluster/cluster.go execRunner.command: kubectl, found on the PATH of an
-#   environment built from an allowlist (cluster.Env), with KUBERC=off. The
-#   Cmd line is the same function's *exec.Cmd return type.
 # - image/recipe.go FindToolchain: `go env GOROOT GOVERSION GOMODCACHE
 #   GOCACHE`, asked of the go on PATH with GOTOOLCHAIN=local. --source and
 #   the development fallback only.
@@ -95,12 +92,9 @@ datasphered linux/amd64 ref vendor/golang.org/x/sys/unix/syscall_unix.go Exec sy
 farcast darwin/amd64 import cloud.google.com/go/auth/credentials/internal/externalaccount os/exec
 farcast darwin/amd64 import cloud.google.com/go/auth/internal/transport/cert os/exec
 farcast darwin/amd64 import github.com/googleapis/enterprise-certificate-proxy/client os/exec
-farcast darwin/amd64 import github.com/sofmon/farcast/farsight/cli/internal/cluster os/exec
 farcast darwin/amd64 import github.com/sofmon/farcast/farsight/cli/internal/image os/exec
 farcast darwin/amd64 import golang.org/x/oauth2/google/externalaccount os/exec
 farcast darwin/amd64 import google.golang.org/api/internal/cert os/exec
-farcast darwin/amd64 ref farsight/cli/internal/cluster/cluster.go execRunner.command os/exec.Cmd 1x
-farcast darwin/amd64 ref farsight/cli/internal/cluster/cluster.go execRunner.command os/exec.CommandContext 1x
 farcast darwin/amd64 ref farsight/cli/internal/image/compile.go goCompile os/exec.CommandContext 1x
 farcast darwin/amd64 ref farsight/cli/internal/image/recipe.go FindToolchain os/exec.CommandContext 1x
 farcast darwin/amd64 ref vendor/cloud.google.com/go/auth/credentials/internal/externalaccount/executable_provider.go runtimeEnvironment.run os/exec.CommandContext 1x
@@ -113,12 +107,9 @@ farcast darwin/amd64 ref vendor/google.golang.org/api/internal/cert/secureconnec
 farcast darwin/arm64 import cloud.google.com/go/auth/credentials/internal/externalaccount os/exec
 farcast darwin/arm64 import cloud.google.com/go/auth/internal/transport/cert os/exec
 farcast darwin/arm64 import github.com/googleapis/enterprise-certificate-proxy/client os/exec
-farcast darwin/arm64 import github.com/sofmon/farcast/farsight/cli/internal/cluster os/exec
 farcast darwin/arm64 import github.com/sofmon/farcast/farsight/cli/internal/image os/exec
 farcast darwin/arm64 import golang.org/x/oauth2/google/externalaccount os/exec
 farcast darwin/arm64 import google.golang.org/api/internal/cert os/exec
-farcast darwin/arm64 ref farsight/cli/internal/cluster/cluster.go execRunner.command os/exec.Cmd 1x
-farcast darwin/arm64 ref farsight/cli/internal/cluster/cluster.go execRunner.command os/exec.CommandContext 1x
 farcast darwin/arm64 ref farsight/cli/internal/image/compile.go goCompile os/exec.CommandContext 1x
 farcast darwin/arm64 ref farsight/cli/internal/image/recipe.go FindToolchain os/exec.CommandContext 1x
 farcast darwin/arm64 ref vendor/cloud.google.com/go/auth/credentials/internal/externalaccount/executable_provider.go runtimeEnvironment.run os/exec.CommandContext 1x
@@ -131,12 +122,9 @@ farcast darwin/arm64 ref vendor/google.golang.org/api/internal/cert/secureconnec
 farcast linux/amd64 import cloud.google.com/go/auth/credentials/internal/externalaccount os/exec
 farcast linux/amd64 import cloud.google.com/go/auth/internal/transport/cert os/exec
 farcast linux/amd64 import github.com/googleapis/enterprise-certificate-proxy/client os/exec
-farcast linux/amd64 import github.com/sofmon/farcast/farsight/cli/internal/cluster os/exec
 farcast linux/amd64 import github.com/sofmon/farcast/farsight/cli/internal/image os/exec
 farcast linux/amd64 import golang.org/x/oauth2/google/externalaccount os/exec
 farcast linux/amd64 import google.golang.org/api/internal/cert os/exec
-farcast linux/amd64 ref farsight/cli/internal/cluster/cluster.go execRunner.command os/exec.Cmd 1x
-farcast linux/amd64 ref farsight/cli/internal/cluster/cluster.go execRunner.command os/exec.CommandContext 1x
 farcast linux/amd64 ref farsight/cli/internal/image/compile.go goCompile os/exec.CommandContext 1x
 farcast linux/amd64 ref farsight/cli/internal/image/recipe.go FindToolchain os/exec.CommandContext 1x
 farcast linux/amd64 ref vendor/cloud.google.com/go/auth/credentials/internal/externalaccount/executable_provider.go runtimeEnvironment.run os/exec.CommandContext 1x
@@ -149,12 +137,9 @@ farcast linux/amd64 ref vendor/google.golang.org/api/internal/cert/secureconnect
 farcast linux/arm64 import cloud.google.com/go/auth/credentials/internal/externalaccount os/exec
 farcast linux/arm64 import cloud.google.com/go/auth/internal/transport/cert os/exec
 farcast linux/arm64 import github.com/googleapis/enterprise-certificate-proxy/client os/exec
-farcast linux/arm64 import github.com/sofmon/farcast/farsight/cli/internal/cluster os/exec
 farcast linux/arm64 import github.com/sofmon/farcast/farsight/cli/internal/image os/exec
 farcast linux/arm64 import golang.org/x/oauth2/google/externalaccount os/exec
 farcast linux/arm64 import google.golang.org/api/internal/cert os/exec
-farcast linux/arm64 ref farsight/cli/internal/cluster/cluster.go execRunner.command os/exec.Cmd 1x
-farcast linux/arm64 ref farsight/cli/internal/cluster/cluster.go execRunner.command os/exec.CommandContext 1x
 farcast linux/arm64 ref farsight/cli/internal/image/compile.go goCompile os/exec.CommandContext 1x
 farcast linux/arm64 ref farsight/cli/internal/image/recipe.go FindToolchain os/exec.CommandContext 1x
 farcast linux/arm64 ref vendor/cloud.google.com/go/auth/credentials/internal/externalaccount/executable_provider.go runtimeEnvironment.run os/exec.CommandContext 1x
@@ -168,13 +153,10 @@ farcast windows/amd64 import cloud.google.com/go/auth/credentials/internal/exter
 farcast windows/amd64 import cloud.google.com/go/auth/internal/compute os/exec
 farcast windows/amd64 import cloud.google.com/go/auth/internal/transport/cert os/exec
 farcast windows/amd64 import github.com/googleapis/enterprise-certificate-proxy/client os/exec
-farcast windows/amd64 import github.com/sofmon/farcast/farsight/cli/internal/cluster os/exec
 farcast windows/amd64 import github.com/sofmon/farcast/farsight/cli/internal/image os/exec
 farcast windows/amd64 import golang.org/x/oauth2/google/externalaccount os/exec
 farcast windows/amd64 import google.golang.org/api/internal/cert os/exec
 farcast windows/amd64 import google.golang.org/grpc/internal/googlecloud os/exec
-farcast windows/amd64 ref farsight/cli/internal/cluster/cluster.go execRunner.command os/exec.Cmd 1x
-farcast windows/amd64 ref farsight/cli/internal/cluster/cluster.go execRunner.command os/exec.CommandContext 1x
 farcast windows/amd64 ref farsight/cli/internal/image/compile.go goCompile os/exec.CommandContext 1x
 farcast windows/amd64 ref farsight/cli/internal/image/recipe.go FindToolchain os/exec.CommandContext 1x
 farcast windows/amd64 ref vendor/cloud.google.com/go/auth/credentials/internal/externalaccount/executable_provider.go runtimeEnvironment.run os/exec.CommandContext 1x

@@ -332,6 +332,13 @@ func (c *connectCommand) Run(ctx context.Context, env *Env, args []string) (err 
 
 	var cl clusterApplier
 	if !connected {
+		// A first deploy or a resume writes to the cluster, so an instance
+		// whose objects were last written with kubectl's client-side apply
+		// is refused first, in every mode (design A30-20). A reconnect and
+		// --status write nothing to it, and never refuse for it.
+		if err := refuseUnmigrated(name, meta); err != nil {
+			return err
+		}
 		// A farcast whose carried components it must not push is refused here,
 		// in every mode, --plan included, before any plan is computed (A23-10):
 		// the first moment connect knows it will deploy, and before it mints,
@@ -347,6 +354,7 @@ func (c *connectCommand) Run(ctx context.Context, env *Env, args []string) (err 
 			if cl, err = c.readyWriter(ctx, env, meta); err != nil {
 				return err
 			}
+			defer afterWrites(env, name, cl)
 		}
 	}
 	// The identity is decided before the registry is taken, as redeploy
@@ -395,6 +403,7 @@ func (c *connectCommand) Run(ctx context.Context, env *Env, args []string) (err 
 		if cl, err = c.readyWriter(ctx, env, meta); err != nil {
 			return err
 		}
+		defer afterWrites(env, name, cl)
 	} else if err := c.consented(env, name, p); err != nil {
 		return err
 	}

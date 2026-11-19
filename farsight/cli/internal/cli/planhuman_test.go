@@ -1007,7 +1007,6 @@ func TestABlockedPlanIsRefusedWithItsKind(t *testing.T) {
 	}
 
 	t.Run("reader grant", func(t *testing.T) {
-		ran := strayKubectl(t)
 		s, dir := planFixture(t, planCommandNamed(t, "reader grant", "no reader"))
 		before := treeFiles(t, string(dir))
 		stdout, stderr, code := farcastIn(t, dir, "reader", "grant", writeName, "--plan")
@@ -1032,8 +1031,8 @@ func TestABlockedPlanIsRefusedWithItsKind(t *testing.T) {
 			envelope.Error.Kind != kindCredentialMissing || envelope.Error.Message != msg || envelope.Error.Code != 1 {
 			t.Errorf("reader grant --confirm of a blocked plan: exit %d, %s (%v)", code, stdout, err)
 		}
-		if len(s.Requests()) != 0 || ran() {
-			t.Errorf("a blocked plan sent %d requests or ran kubectl (%v)", len(s.Requests()), ran())
+		if len(s.Requests()) != 0 {
+			t.Errorf("a blocked plan sent %d requests", len(s.Requests()))
 		}
 		sameFiles(t, "a blocked reader grant", before, treeFiles(t, string(dir)))
 	})
@@ -1045,7 +1044,7 @@ func TestABlockedPlanIsRefusedWithItsKind(t *testing.T) {
 	// the blocked line and no confirm line; its --confirm recomputes it as
 	// the reader and refuses with the block's kind and words, exit 1,
 	// printing nothing, having opened no writer, provider, storage or
-	// keyholder, sent nothing but the reader's reads, run no kubectl and
+	// keyholder, sent nothing but the reader's reads, applied nothing and
 	// written nothing.
 	t.Run("the commands that read the cluster", func(t *testing.T) {
 		for _, row := range []planCommand{
@@ -1055,7 +1054,6 @@ func TestABlockedPlanIsRefusedWithItsKind(t *testing.T) {
 			planCommandNamed(t, "storage key rotate", "behind the pin"),
 		} {
 			t.Run(row.String(), func(t *testing.T) {
-				ran := strayKubectl(t)
 				s, dir := planFixture(t, row)
 				before := treeFiles(t, string(dir))
 				doc, _ := runPlan(t, dir, row, output.ModeJSON)
@@ -1082,9 +1080,6 @@ func TestABlockedPlanIsRefusedWithItsKind(t *testing.T) {
 				if out.Len() != 0 || f.opened+f.writers+f.storages+f.keyholders != 0 {
 					t.Errorf("%s --confirm of the blocked plan printed %q, and opened the provider %d times, the writer %d, storage %d and the keyholder %d",
 						row, out, f.opened, f.writers, f.storages, f.keyholders)
-				}
-				if ran() {
-					t.Errorf("%s ran kubectl for a blocked plan", row)
 				}
 				onlyThePlansReads(t, row, s, consentConfirm)
 				sameFiles(t, "a blocked "+row.name, before, treeFiles(t, string(dir)))
@@ -1297,7 +1292,6 @@ func TestConfirmRefusesAChangedPlan(t *testing.T) {
 		}},
 	} {
 		t.Run(tc.row.String(), func(t *testing.T) {
-			ran := strayKubectl(t)
 			pinPlanClock(t)
 			pinRunClock(t)
 			fakeDeployDefaults(t)
@@ -1336,9 +1330,6 @@ func TestConfirmRefusesAChangedPlan(t *testing.T) {
 			}
 			if err := json.Unmarshal([]byte(stdout), &envelope); err != nil || code != 1 || envelope.Error.Kind != kindPlanChanged || envelope.Error.Message != want {
 				t.Errorf("--confirm of the old plan: exit %d, %s (%v); want plan_changed, %q", code, stdout, err, want)
-			}
-			if ran() {
-				t.Error("a changed plan ran kubectl")
 			}
 			onlyThePlansReads(t, tc.row, s, consentConfirm)
 			sameFiles(t, "a changed plan", before, treeFiles(t, string(dir)))
@@ -1454,7 +1445,6 @@ func TestPlanFromAnotherConfigDirIsRefused(t *testing.T) {
 		runDeployRowNamed(t, "deploy into a metered namespace"),
 	} {
 		t.Run(row.String(), func(t *testing.T) {
-			ran := strayKubectl(t)
 			s, dir := planFixture(t, row)
 			digest := planDigest(t, dir, row)
 			other := copyConfigDir(t, dir)
@@ -1465,8 +1455,8 @@ func TestPlanFromAnotherConfigDirIsRefused(t *testing.T) {
 				t.Fatal(err)
 			}
 			confirmRefusedAsChanged(t, row, s, other, digest)
-			if ran() {
-				t.Error("a plan confirmed against another directory ran kubectl")
+			if applied := len(appliedRequests(s)); applied != 0 {
+				t.Errorf("a plan confirmed against another directory: applied %d documents", applied)
 			}
 		})
 	}
@@ -1484,7 +1474,6 @@ func TestPlanAfterReinstallIsRefused(t *testing.T) {
 		runDeployRowNamed(t, "deploy into a metered namespace"),
 	} {
 		t.Run(row.String(), func(t *testing.T) {
-			ran := strayKubectl(t)
 			s, dir := planFixture(t, row)
 			digest := planDigest(t, dir, row)
 			if _, err := dir.UpdateInstanceMetadata(writeName, func(m *config.InstanceMetadata) error {
@@ -1494,8 +1483,8 @@ func TestPlanAfterReinstallIsRefused(t *testing.T) {
 				t.Fatal(err)
 			}
 			confirmRefusedAsChanged(t, row, s, dir, digest)
-			if ran() {
-				t.Error("a plan confirmed after a reinstall ran kubectl")
+			if applied := len(appliedRequests(s)); applied != 0 {
+				t.Errorf("a plan confirmed after a reinstall: applied %d documents", applied)
 			}
 		})
 	}
@@ -1512,7 +1501,6 @@ func TestPlanAfterReinstallIsRefused(t *testing.T) {
 func TestPlanAgainstAReplacedSystemNamespaceIsRefused(t *testing.T) {
 	for _, row := range append(readerPlans(t), runDeployRowNamed(t, "deploy into a metered namespace")) {
 		t.Run(row.String(), func(t *testing.T) {
-			ran := strayKubectl(t)
 			s, dir := planFixture(t, row)
 			var digest string
 			if row.stage == "deploy" {
@@ -1527,8 +1515,8 @@ func TestPlanAgainstAReplacedSystemNamespaceIsRefused(t *testing.T) {
 			s.Put(map[string]any{"apiVersion": "v1", "kind": "Namespace", "metadata": map[string]any{
 				"name": tcdeploy.DefaultNamespace, "uid": "00000000-0000-4000-8000-0000000000a2"}})
 			confirmRefusedAsChanged(t, row, s, dir, digest)
-			if ran() {
-				t.Error("a plan confirmed against a replaced farcast-system ran kubectl")
+			if applied := len(appliedRequests(s)); applied != 0 {
+				t.Errorf("a plan confirmed against a replaced farcast-system: applied %d documents", applied)
 			}
 		})
 	}

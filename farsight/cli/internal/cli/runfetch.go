@@ -15,6 +15,11 @@ import (
 // carries its own, shorter deadline; this is the operator's patience.
 const fetchTimeout = 8 * time.Minute
 
+// msgFetchFailed is a failed manifest read's error: the manifest and the
+// repository. The end of the read's log, when JobLogs could read it, is
+// printed above it.
+const msgFetchFailed = "could not read %s from %s; the end of the read's log, when it could be read, is printed above"
+
 // fetchDefaultRef is the ref the fetch reads when run is given no --ref, as
 // planck/fetch defaults it (TestTheFetchDefaultsAreFetchs pins the two
 // together). The manifest it reads when given no --manifest is
@@ -82,9 +87,7 @@ func readFetch(ctx context.Context, env *Env, cl fetchReader, cfg pfetch.Config)
 		if logs, lerr := cl.JobLogs(ctx, pfetch.Namespace, job, 40); lerr == nil && strings.TrimSpace(logs) != "" {
 			fprintf(env.Err, "\n%s\n", strings.TrimRight(logs, "\n"))
 		}
-		return fetched{}, fmt.Errorf("could not read %s from %s; its Job survives for %d minutes so "+
-			"'kubectl -n %s logs job/%s' still works",
-			cfg.Manifest, cfg.Repo, pfetch.TTLSeconds/60, pfetch.Namespace, job)
+		return fetched{}, fmt.Errorf(msgFetchFailed, cfg.Manifest, cfg.Repo)
 	}
 
 	report, err := pfetch.ParseReport(res.Message)
@@ -100,7 +103,7 @@ func readFetch(ctx context.Context, env *Env, cl fetchReader, cfg pfetch.Config)
 	}
 	raw := []byte(logs)
 	if err := report.Verify(raw); err != nil {
-		// kubectl adds nothing to a single container's log, but a Pod that
+		// The API adds nothing to a single container's log, but a Pod that
 		// restarted or a log that rotated would. Try once without the
 		// trailing newline the shell's own `cat` may not have produced.
 		if trimmed := strings.TrimSuffix(logs, "\n"); report.Verify([]byte(trimmed)) == nil {

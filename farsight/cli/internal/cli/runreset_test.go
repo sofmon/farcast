@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -759,6 +760,11 @@ func TestAYesRunMergesAPolicyWrittenDuringTheBuilds(t *testing.T) {
 	}
 	if !strings.Contains(written, "worker") || !strings.Contains(written, "my-platform") {
 		t.Errorf("the policy written is not the merge of both runs':\n%s", written)
+	}
+	// ADR 0023 M2.7 (A30-40): at the resourceVersion it read after the
+	// builds, the other run's, not the one its review read.
+	if !slices.Equal(f.appliedAt, []string{"7"}) || !strings.Contains(written, `resourceVersion: "7"`) {
+		t.Errorf("the policy was applied at %q, its document\n%s\nwant it at the 7 read after the builds", f.appliedAt, written)
 	}
 }
 

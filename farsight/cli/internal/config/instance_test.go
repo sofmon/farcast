@@ -138,11 +138,7 @@ func TestSaveInstanceSecretsAre0600(t *testing.T) {
 	if err := d.SaveInstanceCredentials("prod", &InstanceCredentials{Provider: "gke", ServiceAccountKey: `{"k":"v"}`}); err != nil {
 		t.Fatalf("SaveInstanceCredentials: %v", err)
 	}
-	if err := d.SaveInstanceKubeconfig("prod", []byte("apiVersion: v1\n")); err != nil {
-		t.Fatalf("SaveInstanceKubeconfig: %v", err)
-	}
 	assertPerm(t, filepath.Join(d.InstancePath("prod"), credentialsFile), 0o600)
-	assertPerm(t, filepath.Join(d.InstancePath("prod"), kubeconfigFile), 0o600)
 
 	creds, err := d.LoadInstanceCredentials("prod")
 	if err != nil {

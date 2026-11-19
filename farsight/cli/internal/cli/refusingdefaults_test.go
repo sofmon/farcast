@@ -13,24 +13,27 @@ import (
 	"github.com/sofmon/farcast/planck"
 )
 
-// Eight seams refuse in the package's tests when a test leaves them unset
-// (ADR 0023 M2.6, A23-49, A25-20): the deployer's provider opener; the image
-// builder of the deployer commands, run and build; connect's dial of the
-// carrier; the deployer's search for a farcast checkout and its question to
-// that checkout's Go, which runs `go env` from PATH; the reader a plan reads
-// the cluster as (openReaderDefault, M2.6c), which run's plan reader wraps,
-// lazily, since M2.6d; storage deploy's mint of the bucket and keyring
-// (ensureStorageDefault, M2.6c); and the opener of the keyholder of storage
-// key pin, storage key rotate and, since M2.6d, run, which dials the tunnel
-// (openKeyholderDefault, M2.6c); run's uses of the two add no ninth seam
-// (A28-11). Their defaults refuse here, as defaultPinStore's does
+// Nine seams refuse in the package's tests when a test leaves them unset
+// (ADR 0023 M2.6, A23-49, A25-20, and M2.7): the deployer's provider opener;
+// the image builder of the deployer commands, run and build; connect's dial
+// of the carrier; the deployer's search for a farcast checkout and its
+// question to that checkout's Go, which runs `go env` from PATH; the reader
+// a plan reads the cluster as (openReaderDefault, M2.6c), which run's plan
+// reader wraps, lazily, since M2.6d; storage deploy's mint of the bucket and
+// keyring (ensureStorageDefault, M2.6c); the opener of the keyholder of
+// storage key pin, storage key rotate and, since M2.6d, run, which dials the
+// tunnel (openKeyholderDefault, M2.6c), run's uses of the two adding no seam
+// (A28-11); and migrate's writer (migrateWriterDefault, M2.7), which here
+// opens the writer only for a record whose endpoint is a loopback test
+// server's, the cluster a test started, and refuses any other record before
+// it is opened. Their defaults refuse here, as defaultPinStore's does
 // (storagepin_test.go), so no test reaches a real provider, registry,
 // carrier, cluster, bucket or keyholder, runs this machine's Go, or binds
 // the checkout it runs in, through these by forgetting a fake; a test that
 // drives a command past one sets the seam to a fake of its own, or, through
 // the router, takes fakeDeployDefaults. Other seams keep their real
 // defaults, and some commands open a provider, storage or a tunnel directly,
-// so this guard is no wider than the eight.
+// so this guard is no wider than the nine.
 
 // errRefusingDefault is what a default seam answers in a test.
 var errRefusingDefault = errors.New("test: a seam was left at its default, which no test may reach; set it to a fake")
@@ -52,6 +55,16 @@ func init() {
 	openKeyholderDefault = func(context.Context, *Env, string) (sealStateClient, func(), error) {
 		return nil, nil, errRefusingDefault
 	}
+	migrateWriterDefault = func(r clusterRef) (migrateCluster, error) {
+		if r.Meta == nil || !loopbackEndpoint(r.Meta.Endpoint) {
+			return nil, errRefusingDefault
+		}
+		cl, err := openWriter(r)
+		if err != nil {
+			return nil, err
+		}
+		return cl, nil
+	}
 }
 
 // refusingBuilder is the image builder a test gets by default: every call
@@ -72,7 +85,8 @@ func (refusingBuilder) PushEmbedded(context.Context, image.EmbeddedOptions, stri
 
 // TestUnsetSeamsRefuseInTests: every command whose provider, builder, dial,
 // checkout, Go, plan reader, storage mint or keyholder seam is left unset
-// gets the refusing default, never the real one.
+// gets the refusing default, never the real one; and migrate's writer, left
+// unset, opens no cluster but a loopback test server's.
 func TestUnsetSeamsRefuseInTests(t *testing.T) {
 	var d fatlineDeployer
 	d.ensureDefaults()
@@ -164,6 +178,19 @@ func TestUnsetSeamsRefuseInTests(t *testing.T) {
 	for name, open := range map[string]keyholderOpener{"storage key pin": kp.newKeyholder, "storage key rotate": kr.newKeyholder, "run": run.newKeyholder} {
 		if _, _, err := open(cancelled, &Env{ConfigDir: config.Dir(empty)}, "atlas"); !errors.Is(err, errRefusingDefault) {
 			t.Errorf("%s's default keyholder = %v, want the refusing default", name, err)
+		}
+	}
+
+	// migrate's writer (ADR 0023 M2.7), for a record whose endpoint is a
+	// TEST-NET-1 address (RFC 5737), and for one with none, in a directory
+	// holding no key, so that even the real writer would refuse each before
+	// anything is sent.
+	mc := &migrateCommand{}
+	mc.ensureDefaults()
+	for _, endpoint := range []string{"192.0.2.10:443", ""} {
+		remote := &config.InstanceMetadata{Name: "atlas", Provider: "gke", Region: "us-central1", Endpoint: endpoint}
+		if w, err := mc.newCluster(clusterRef{Dir: config.Dir(empty), Meta: remote, Identity: kube.Writer}); !errors.Is(err, errRefusingDefault) || w != nil {
+			t.Errorf("migrate's default writer for endpoint %q = %v, %v; want the refusing default", endpoint, w, err)
 		}
 	}
 }

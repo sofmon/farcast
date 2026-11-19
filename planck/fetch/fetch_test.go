@@ -104,6 +104,22 @@ func TestRenderProducesTheWholeFetch(t *testing.T) {
 	}
 }
 
+// Nothing may reach a fetch: it serves nothing and listens for nothing. Its
+// policy lists Ingress with no ingress rule, which denies all of it. An empty
+// ingress list would say the same, but on a loopback envtest kube-apiserver
+// 1.36.2 it was not stored, and every apply of it moved the policy's
+// generation (ADR 0023 M2.7, design §31 and A31-4).
+func TestNothingMayReachAFetch(t *testing.T) {
+	_, docs := render(t, sampleConfig())
+	np := docs["NetworkPolicy"]
+	if types := fmt.Sprint(at(t, np, "spec", "policyTypes")); types != "[Ingress Egress]" {
+		t.Fatalf("policyTypes = %s, want both: a policy without Ingress leaves the fetch reachable", types)
+	}
+	if ing, ok := at(t, np, "spec").(map[string]any)["ingress"]; ok {
+		t.Errorf("ingress = %v, want absent: a fetch serves nothing and listens for nothing, and policyTypes' Ingress with no rule already denies it", ing)
+	}
+}
+
 // The property that makes a fetch weaker than a build, and the reason it is a
 // separate workload at all (ADR 0010 decision 11).
 //

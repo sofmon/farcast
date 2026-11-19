@@ -391,14 +391,23 @@ func invalid(w http.ResponseWriter, k kube.Kind, name, format string, a ...any) 
 // found; Fail and FailNextApply inject one. An apply that changes nothing
 // writes nothing. WithSettledWorkloads settles what it stores.
 //
+// A body that carries metadata.resourceVersion is held to it, as the API
+// server holds one (design §31, A31-2): one that is not the stored object's
+// answers 409 Conflict and stores nothing, and the stored one applies. For an
+// absent object it is no precondition: the object is created, answered 201,
+// as the server recreates a deleted one. An empty or null one is none at all,
+// and one that is not a string answers 422, as the JSON patch's does.
+//
 // A gap, kept on purpose: kubetest rebuilds an applied object from the body.
 // From the stored one it keeps only uid, creationTimestamp, resourceVersion,
 // status, and other managers' managed-fields entries (and, under
 // WithSettledWorkloads, a Job's selector and template labels). A real server
-// keeps every field another manager owns: kubectl's last-applied annotation,
-// the kernel's adapted-at annotation, and replicas set through /scale. So an
-// apply's answer here never carries the annotation of an earlier client-side
-// apply, and a test that needs one answers the apply through WithHandler.
+// keeps every field another manager owns (kubectl's last-applied annotation,
+// the kernel's adapted-at annotation). It also keeps replicas set through
+// /scale, which no manager owns after a /scale of 0, against an apply that
+// omits it; an apply that carries it takes it back. So an apply's answer here
+// never carries the annotation of an earlier client-side apply, and a test
+// that needs one answers the apply through WithHandler.
 func (s *Server) apply(w http.ResponseWriter, r *http.Request, req Request, ri requestInfo, k kube.Kind, caller tokenInfo, az *authorizer) {
 	partial, err := wantPartial(r.Header.Get("Accept"), false)
 	if err != nil {
@@ -447,6 +456,14 @@ func (s *Server) apply(w http.ResponseWriter, r *http.Request, req Request, ri r
 		badRequest(w, "the namespace of the object (%s) does not match the namespace on the URL (%s)", ns, wantNS)
 		return
 	}
+	var rv string
+	if v := amd["resourceVersion"]; v != nil {
+		var ok bool
+		if rv, ok = v.(string); !ok {
+			invalid(w, k, ri.name, "metadata.resourceVersion is not a string")
+			return
+		}
+	}
 
 	path := k.Path(ri.namespace, ri.name)
 	now := nowString()
@@ -457,6 +474,11 @@ func (s *Server) apply(w http.ResponseWriter, r *http.Request, req Request, ri r
 		// a patch that creates its object is authorized for create too.
 		s.mu.Unlock()
 		writeForbidden(w, ri.withVerb("create"), caller.email)
+		return
+	}
+	if rv != "" && old != nil && rv != str(metadataOf(old.obj), "resourceVersion") {
+		s.mu.Unlock()
+		conflict(w, k, ri.name)
 		return
 	}
 	next, err := s.appliedObject(old, applied, k, manager, now)

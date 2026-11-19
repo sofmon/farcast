@@ -58,11 +58,14 @@ spec:
   podSelector:
     matchLabels:
       farcast.sofmon.com/fetch: {{.JobName}}
+  # Nothing may reach a fetch. It serves nothing and listens for nothing, so
+  # Ingress is listed with no ingress rule, which denies all of it. An
+  # "ingress: []" would say the same, but on kube-apiserver 1.36.2 the stored
+  # policy kept no ingress field, and every unchanged apply of it moved the
+  # policy's generation.
   policyTypes:
     - Ingress
     - Egress
-  # Nothing may reach a fetch. It serves nothing and listens for nothing.
-  ingress: []
   egress:
     # DNS, by both of the paths a GKE cluster may use: kube-dns directly, and
     # NodeLocal DNSCache on a link-local address that the rule below otherwise

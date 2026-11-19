@@ -2,7 +2,9 @@
 
 From [ADR 0023](../adr/0023-one-download-farcast.md) M2.7b, which is not built at the commit this runbook is written against, farcast is to write to a cluster with its own server-side apply, not kubectl. An instance an older farcast wrote is then migrated once: each object's client-side apply entry is renamed to farcast's, and kubectl's last-applied annotation is removed. farcast's tests run against `kubetest`, a local emulation of the API server. kubetest does not track ownership field by field, does not default, and follows no generation rule of a real server. So it cannot show whether a migrated object keeps a field farcast later drops, whether the first apply after a migration rolls a workload, or what the server records for a patch. This runbook runs farcast's real-API suite against a real `kube-apiserver` and `etcd`, from envtest v1.36.2. They run on the keeper VM, listen only on that VM's loopback, and are reached from the Mac through `ssh -L`. The run sits between M2.7a and M2.7b: the migration is built only after it.
 
-**Status.** *Written 2026-11-18 against M2.7a. Run once on 2026-11-18, from 2728e5f; the Results are below. A re-run is due before M2.7b's commit (the M2 design's §31, "The re-run").*
+**Status.** *Written 2026-11-18 against M2.7a. Run on 2026-11-18, from 2728e5f, and again on 2026-11-19, on M2.7b's tree before its commit (the M2 design's §31, "The re-run"); the Results of both are below.*
+
+*(2026-11-19: the re-run builds from M2.7b's tree, built and not committed. There farcast writes with server-side apply and `farcast migrate` is built, so the opening paragraph's "is to" and "the run sits between M2.7a and M2.7b" describe Run 1 only. The re-run also records item 7 for the egress policy as `run` renders it, at a stale resourceVersion and at the stored one. In item 9 it also records a `/scale` write of 2, and whether a `/scale` write of 0 moves the time of farcast's Apply entry.)*
 
 **It records:**
 1. whether a field that a migrated object's manifest later drops is removed by farcast's next apply, for §6.8's seven cases; and whether mutation row 104's mutant is killed there;
@@ -252,6 +254,7 @@ grep -E '^ *--- (PASS|FAIL)|stuck field: ' "$RUN/row104.out"
 ```
 - **The kube run names its tests.** `REALAPI` is every top-level test in `kube/realapi_test.go` but `TestEmulatedSeedMatchesKubectl` (R7), anchored at both ends, so the unit test `TestStatusCauseWireNameIsReason` is not matched. `kube.out` must hold exactly 12 unindented `--- PASS` or `--- FAIL` lines, and `cli.out` exactly 1: the two counts above. Any other count stops the run, because a test was missed.
 - **The stale-rv subtests.** A subtest's result is indented, so the first grep does not show it; the fourth does. `a_stale_resourceVersion` decides step 3 (What the run decides). `a_Secret_deleted_since_it_was_read` only records.
+  - *(2026-11-19, the re-run on M2.7b's tree.)* The test has a third subtest, `the_egress_policy_at_a_stale_resourceVersion` (the M2 design's A31-2). It runs step 3's own path: the policy as `RenderPolicyConfigMap` renders it, split with `AllowResourceVersion`, is refused by `Apply` with a 409 that unwraps to `ErrConflict` and nothing written, then applied at the stored resourceVersion. The fourth grep prints three lines. Step 3 is built, so `a_stale_resourceVersion` no longer decides it alone: it and the new subtest must both pass, the new one on both halves (What the run decides).
 - **Row 104 counts as killed only when both hold:**
   - `TestMigrationRemovesAFieldLaterDroppedFromTheManifest` passed in the unmutated `kube.out`;
   - the mutant's failure is the stuck-field assertion, a line with `stuck field: `, in the subtest `a_label_leaves`, recorded by its subtest's name. The mutant's other six subtests are expected to pass.
@@ -287,8 +290,9 @@ lsof -nP -iTCP:16443 -sTCP:LISTEN >/dev/null || echo 'STOP: the forward is gone;
 This runbook's Results and the M2 design's §31 hold only:
 - the commit the binaries were built from, and its tree hash (R1 step 7); for a re-run from an uncommitted tree, the tree hash and the HEAD it sits on;
 - the versions, the archive's byte count, and that its sha512 matched both published values;
-- each test's PASS or FAIL, `TestApplyRefusesAStaleResourceVersion`'s two subtests' included, and whether row 104's mutant was killed;
+- each test's PASS or FAIL, `TestApplyRefusesAStaleResourceVersion`'s subtests' included (two in Run 1, three from the re-run), and whether row 104's mutant was killed;
 - the facts each test records: managers, operations, subresources, field paths, HTTP codes, kinds and generation moves;
+- *(2026-11-19)* for the re-run, these fact lines as well: `Scale to 0: …; farcast/Apply's time moved: …` and `Scale to 2: …; a technocore/Update/scale entry appears: …; it owns spec.replicas: …` (the M2 design's A31-5); `after realapi-other's merge PATCH …` and `after the migration: …; realapi-other/Update unchanged: …`; and the two `the egress policy rendered at …` lines (A31-2). `SetRequests`' entries line now follows a Scale to 2, so it is not compared with Run 1's;
 - each refusal of a rendered stream, from its fact line: the stream, the document, the code, the reason and the causes' field paths.
 
 The fact lines are pulled out on the terminal only, with nothing written:
@@ -355,6 +359,7 @@ The run's scrubbed outcome is written into Results below and into the M2 design 
   - 409 (the subtest passes): M2.7b builds step 3, the egress policy's resourceVersion precondition.
   - Any other answer (200 when the server ignores the body's resourceVersion): step 3 is not built, and risk 7 stays.
   - The other subtest, `a_Secret_deleted_since_it_was_read`, never gates step 3, so a top-level FAIL of the test is read through its subtests. Its answer, 404, 409, or a 2xx with whether the Secret was recreated, is recorded beside the decision. A 2xx means the precondition cannot tell a deleted policy from one never written: step 3's handling of a deleted object (the M2 design's A30-40) then has nothing to catch, and §31 says so.
+  - *(2026-11-19, the re-run.)* Step 3 is built. If `a_stale_resourceVersion` or `the_egress_policy_at_a_stale_resourceVersion` does not pass, the latter on either half, its 409 or its apply at the stored resourceVersion, step 3 does not hold on this server: M2.7b is not committed, and the operator decides.
 - **Row 104's mutant.**
   - Killed, by R6's rule (a `stuck field: ` line in `a_label_leaves`): row 104 is verified.
   - Survived, or failed anywhere but the stuck-field assertion: stop. The operator decides before M2.7b.
@@ -362,11 +367,19 @@ The run's scrubbed outcome is written into Results below and into the M2 design 
 - **The generation moves.** The migration's own move, and the first apply's. A first apply that moves one confirms risk 3, and the billable walk's W3 watches it.
 - **The Job re-apply:** a no-op, or a conflict.
 - **The kernel's entries:** manager, operation and subresource per write; whether `/scale`'s `replicas` is tracked; and whether farcast's forced apply takes it back.
+  - *(2026-11-19, the re-run.)* Whether a `technocore`/Update entry with subresource `scale` owns `spec.replicas` after the Scale to 2 settles §31's `/scale` inference. Whether farcast's Apply entry's time moved decides whether the kernel's stop can change P1 (c)'s adapted fact, which compares the kernel's adapted-at stamp with that time (the M2 design's A31-5). §31 records both beside Run 1, and ADR 0009's decision 3 note and the CLI README's `run` review follow them.
 - **The wire facts:** metadata-only lists, gets and patches; the conflict cause's key; the kinds of typed and partial list items.
 - **The kubectl variant:** equal, or how the seeds differ.
 - **Any flag** that had to change from this runbook.
+- *(2026-11-19, the re-run.)* **A FAIL among R6's counted tests stops the commit.** A FAIL among the twelve kube tests of `REALAPI` or in the cli test, `TestEveryRenderedStreamAppliesOnARealServer`, stops M2.7b's commit, and the operator decides. Its cause is recorded from fact lines only; a FAIL line is read, never copied. That includes:
+  - a build or fetch policy whose generation still moves on the second apply;
+  - `TestKernelWritesAreTrackedAsTechnocore/Scale` finding an entry that owns `spec.replicas` after the Scale to 0;
+  - `TestMigrationLeavesAnotherManagersFieldAlone` finding realapi-other's entry not kept by the migration;
+  - a failure in either reframed test's own code.
 
-**The re-run rule.** An outcome that changes code the suite exercises runs again by this runbook, with the operator's approval, before M2.7b is committed. That code is a renderer, §6.3's request shape, the suite's `migrateOne`, or the emulated seed.
+  A fix to any of them runs again under the re-run rule. Each part above that "decides one thing before M2.7b is built" describes Run 1.
+
+**The re-run rule.** An outcome that changes code the suite exercises runs again by this runbook, with the operator's approval, before M2.7b is committed. That code is a renderer, §6.3's request shape, the suite's `migrateOne`, the emulated seed, or either reframed test's own code.
 - The re-run's binaries are built from a named tree: an "M2.7a fix" commit on the branch, or M2.7b's tree before it is committed, recorded by its tree hash.
 - Results and §31 record the second run beside the first.
 - If no re-run happens, the records name each such path as not run against a real server.
@@ -413,7 +426,7 @@ The run's scrubbed outcome is written into Results below and into the M2 design 
 **Two checks beyond this runbook**, made against the same server with the run's own kubectl:
 - **`ingress: []`.** A NetworkPolicy carrying it moves its generation on every unchanged server-side apply; without it, it does not. The stored object has no `ingress` field either way. Only the build and fetch renderers emit it.
 - **`/scale`.** Every write tried set 0; a non-zero count was not tried.
-  - A `/scale` write of 0 records no entry for its writer, and it removes `spec.replicas` from every existing entry, the Apply entry included. Why *(inferred, not run)*: a Scale of 0 carries no `replicas` field, because autoscaling/v1 omits an empty one, so its writer owns nothing.
+  - A `/scale` write of 0 records no entry for its writer, and it removes `spec.replicas` from every existing entry, the Apply entry included. Why *(inferred, not run)*: a Scale of 0 carries no `replicas` field, because autoscaling/v1 omits an empty one, so its writer owns nothing. *(2026-11-19: Run 2 does not bear this out. A write of 2, which carries the field, recorded no entry either.)*
   - The same merge PATCH on the Deployment itself is recorded as its manager's Update.
   - After a `/scale` write of 0, an unforced apply of `replicas` takes the field back with no conflict.
 - **`kubectl get`** leaves out managed fields unless `--show-managed-fields` is given.
@@ -425,7 +438,45 @@ The run's scrubbed outcome is written into Results below and into the M2 design 
 - the build and fetch policies drop `ingress: []` in M2.7b;
 - the kernel's `/scale` write, always of 0, is untracked. That changes two of this suite's tests in M2.7b, and `run`'s stopped fact not at all. Whether it moves the time `run`'s adapted fact reads was not recorded.
 
-**Due: a re-run** on M2.7b's tree before its commit, because two renderers change and the egress policy's precondition changes `SplitStream`, `Apply` and the policy's renderer.
+**Due: a re-run** on M2.7b's tree before its commit, because two renderers change and the egress policy's precondition changes `SplitStream`, `Apply` and the policy's renderer. *(2026-11-19: it ran as Run 2, below.)*
 - It runs R0–R6, R8 and R9, with R1 step 7's uncommitted-tree path.
 - Row 104's mutant (R1 step 6, R1 step 7's `-overlay` build, and R6's row-104 run and its grep) runs again only if M2.7b changes `upgradeOne`, and R7 only if the emulated seed changes. R8's grep then leaves out the outputs that were not made.
-- Until it runs, these are not run against a real server: the build and fetch renderers' fix, the precondition's rv-carrying policy apply, and the two reframed tests.
+- Until it runs, these are not run against a real server: the build and fetch renderers' fix, the precondition's rv-carrying policy apply, and the two reframed tests. *(2026-11-19: all three ran in Run 2 and passed.)*
+
+### Run 2, 2026-11-19
+
+**The run.**
+- Built on the Mac from M2.7b's tree before its commit, on HEAD 0397826. Its tree hash, taken through a throwaway index, is babeda086cf07d429a43e5c815684507cc49396f, and it was the same after the builds. The servers ran as the VM's existing account.
+- Versions: `kube-apiserver` v1.36.2, `etcd` 3.6.8, `kubectl` v1.36.2.
+- The archive: 47,304,572 bytes. Its sha512 equalled the `.sha512` asset and, by the operator's comparison, `envtest-releases.yaml`.
+- Row 104's mutant and R7 were not run: M2.7b changes neither `upgradeOne` nor the emulated seed. `kube/migrate.go`, the seed files and the suite's seed functions are byte-identical to 2728e5f's.
+- **Teardown:** R9, in its corrected order, passed at the first try. `kube-apiserver` exited on SIGTERM, then `etcd`. Every check passed.
+- **Agent-side variations, none changing what was tested:**
+  - `ssh -o BatchMode=yes`, `curl -sS` and `scp -q`;
+  - the forward ran as a background job of the agent's shell;
+  - R3's listing and R5's `ss` were printed as entry types, names and addresses only.
+
+**Each test.** The kube suite counted 12 results, and the cli suite 1. All 13 passed.
+
+| Test | Result |
+|---|---|
+| `TestMigrationRemovesAFieldLaterDroppedFromTheManifest` | PASS, all seven cases; each object's only entry afterwards is `farcast/Apply` |
+| `TestAnnotationRemovalInTheSamePatchLeavesNoUpdateEntry` | PASS: no `farcast`/Update entry, in the answer or the read-back, for a Deployment, a Secret or a ConfigMap |
+| `TestRealAPIKeepsTheLiveListOnAnUndecodableRewrite` | PASS: 200, the live list kept; the same patch's annotation removal took effect |
+| `TestMigrationIsResumable` | PASS: 409 at a moved resourceVersion; afterwards `farcast/Apply` and `realapi-other/Apply` |
+| `TestFirstApplyAfterMigrationChangesNoGeneration` | PASS: the migration moved a Deployment's generation by one; the first apply moved none and added no entry |
+| `TestReapplyingAnUnchangedJobIsANoOp` | PASS: 200, forced and unforced, with nothing moved |
+| `TestApplyRefusesAStaleResourceVersion` | PASS, all three subtests. A stale rv is answered 409 and nothing is written; a deleted Secret's rv is answered 201, recreating it. The egress policy as `run` renders it, split with `AllowResourceVersion`, is answered 409 at a stale rv with nothing written, then 200 and written at the stored one |
+| `TestMetadataOnlyListsCarryNoSecretData` | PASS: every metadata-only answer carries `apiVersion`, `kind` and `metadata` only |
+| `TestStatusCauseWireName` | PASS: 409, cause type `FieldManagerConflict` |
+| `TestTypedListItemsCarryNoKind` | PASS: typed items carry no kind; partial items are `PartialObjectMetadata` |
+| `TestKernelWritesAreTrackedAsTechnocore` | PASS: `Scale` to 0 left `farcast/Apply` the only entry, with no entry owning `spec.replicas`, and did not move that entry's time. `Scale` to 2 added no entry (no `technocore/Update` with subresource `scale`), and `replicas` read 2. `SetRequests` and `SaveConfigMap` are `technocore/Update` |
+| `TestMigrationLeavesAnotherManagersFieldAlone` | PASS: `realapi-other`'s merge PATCH was recorded as `realapi-other/Update` owning `spec.replicas`; the migration left that entry unchanged; a forced `farcast` apply of `replicas` took the field back |
+| `TestEveryRenderedStreamAppliesOnARealServer` | PASS: all 23 streams applied twice, with nothing moved on the second apply, the build and fetch policies included |
+
+**What it decided** (the M2 design's §31):
+- step 3's precondition holds on this server: the egress policy as `run` renders and splits it is refused at a stale resourceVersion, writing nothing, and applies at the stored one. `cluster.ApplyAt` itself, and `run`'s path through it, ran against kubetest only;
+- the build and fetch policies no longer move on an unchanged apply;
+- a `/scale` write of 2 is recorded under no manager, as one of 0 is, so Run 1's inferred cause does not explain it, and the cause is not known;
+- on this server, a `/scale` write of 0 leaves the time of farcast's Apply entry as it was, so the kernel's stop does not change what `run`'s adapted fact reads;
+- nothing in M2.7b has to change, and its commit is the operator's to make.

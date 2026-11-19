@@ -52,7 +52,7 @@ var grantMetered = []string{"farcast-system", "web"}
 
 // grantFixture is a loopback instance against kubetest, its reader recorded
 // and uploaded, its kernel metering farcast-system and web, and a 'reader
-// grant' whose kubectl apply is a fake, whose terminal answers "y", and whose
+// grant' whose apply is a fake, whose terminal answers "y", and whose
 // clock is fake. Its reader opens through the default newReader, openCluster.
 type grantFixture struct {
 	s       *kubetest.Server
@@ -505,6 +505,7 @@ func TestReaderGrantNeedsATerminal(t *testing.T) {
 	dir := readerRecordFor(t, grantName, "proj-test1")
 	if _, err := dir.UpdateInstanceMetadata(grantName, func(m *config.InstanceMetadata) error {
 		m.Reader = &config.Reader{Email: readerEmail(grantName, "proj-test1"), KeyID: readerTestKeyID}
+		recordMigrated(m)
 		return nil
 	}); err != nil {
 		t.Fatal(err)
@@ -676,9 +677,9 @@ func TestReaderGrantAppliesTheRenderedRBAC(t *testing.T) {
 	}
 
 	failed := newGrantFixture(t, false, grantRBAC(t))
-	failed.applier.applyErr = errors.New("kubectl said no")
+	failed.applier.applyErr = errors.New("the apply was refused")
 	err = failed.run(t)
-	if err == nil || !strings.Contains(err.Error(), "kubectl said no") || !strings.Contains(err.Error(), "nothing was recorded") {
+	if err == nil || !strings.Contains(err.Error(), "the apply was refused") || !strings.Contains(err.Error(), "nothing was recorded") {
 		t.Fatalf("grant after a failed apply = %v", err)
 	}
 	if got := len(failed.s.Requests()); got != 0 {
@@ -788,7 +789,7 @@ func TestReaderGrantPlanReadsNoClusterAndNeedsNoTerminal(t *testing.T) {
 				for _, line := range []string{
 					"farcast reader grant atlas, stage -, reading the cluster as none\n",
 					"reader: " + grantEmail + " (roles/container.clusterViewer), scope metered: deployments, statefulsets, pods, pods/log, jobs in farcast-system, web;",
-					"write: apply RoleBinding web/farcast-reader (rbac.authorization.k8s.io/v1), force: no, sha256 ",
+					"write: apply RoleBinding web/farcast-reader (rbac.authorization.k8s.io/v1), force: yes, sha256 ",
 					"\ndigest: " + plan.DigestOf([]byte(mustCanonical(t, want))) + "\n",
 				} {
 					if !strings.Contains(f.out.String(), line) {

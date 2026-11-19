@@ -89,8 +89,7 @@ var defaultPinStore pinStoreOpener = openPinStore
 
 // openPinStore reaches the pin in-process as the instance's writer, the
 // installer's stored service-account key (ADR 0023 M2.5): its read, create
-// and replace need no kubectl. Every refusal openCluster makes is local and
-// sends nothing.
+// and replace. Every refusal openCluster makes is local and sends nothing.
 func openPinStore(r clusterRef) (pinStore, error) {
 	cl, err := openWriter(r)
 	if err != nil {
@@ -691,9 +690,9 @@ keys it requires are gone from every machine; it asks first, and says what it
 lowers.
 
 The pin is reached in-process, as the instance's installer service account,
-with the key 'farcast install --credentials' stored; it needs no kubectl.
-Unseal never touches it: 'farcast storage unseal --below-pin' is the way past
-a pin that cannot be met, with no cloud access at all.
+with the key 'farcast install --credentials' stored. Unseal never touches
+it: 'farcast storage unseal --below-pin' is the way past a pin that cannot
+be met, with no cloud access at all.
 
 --plan prints the pin it would write, whether it lowers it and what it
 drops, and the ConfigMap write, with the plan's digest, and changes nothing.
@@ -760,6 +759,9 @@ func (c *keyPinCommand) Run(ctx context.Context, env *Env, args []string) (err e
 	if err := recordNamed(meta, instance); err != nil {
 		return err
 	}
+	if err := refuseUnmigrated(instance, meta); err != nil {
+		return err
+	}
 	if meta.Keyholder == nil || !meta.Keyholder.Deployed {
 		return fmt.Errorf("instance %q has no keyholder deployed; 'farcast storage deploy %s' writes the pin with it", instance, instance)
 	}
@@ -806,7 +808,7 @@ func (c *keyPinCommand) Run(ctx context.Context, env *Env, args []string) (err e
 	}
 	// The writer, after the comparison: its preflight reads farcast-system's
 	// uid, which must be the plan's, then the pin, which must be where the
-	// plan read it. It applies nothing, so it needs no kubectl.
+	// plan read it. It applies nothing.
 	ref.Identity = kube.Writer
 	ps, err := pinStoreFor(c.newPinStore, ref, nil)
 	if err != nil {

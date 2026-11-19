@@ -85,10 +85,8 @@ func recordNamed(meta *config.InstanceMetadata, name string) error {
 //  5. cluster.Open pairs the endpoint and the credential and builds the
 //     client. Nothing is sent before a method is called.
 //
-// Every refusal before step 5 sends nothing. Until ADR 0023 M2.7 a writer's
-// Apply still runs kubectl, over the instance's kubeconfig.yaml and as the
-// active gcloud configuration; everything else the writer does runs
-// in-process as the installer's key.
+// Every refusal before step 5 sends nothing. Everything the writer does, its
+// Apply included, runs in-process as the installer's key.
 func openCluster(r clusterRef) (*cluster.Client, error) {
 	if r.Meta == nil {
 		return nil, errors.New("cli: openCluster needs the instance's record")
@@ -110,10 +108,9 @@ func openCluster(r clusterRef) (*cluster.Client, error) {
 			return nil, err
 		}
 	case kube.Writer:
-		// The writer reads credentials.yaml, and hands kubectl
-		// kubeconfig.yaml, under the recorded name: one that is not a name
-		// install accepts ("../other", a control character) never becomes
-		// a path, and is printed only quoted.
+		// The writer reads credentials.yaml under the recorded name: one
+		// that is not a name install accepts ("../other", a control
+		// character) never becomes a path, and is printed only quoted.
 		if validateInstanceName(name) != nil {
 			return nil, refuse(errCredentialMissing, msgUnsafeRecord, name, "name", name)
 		}
@@ -133,7 +130,6 @@ func openCluster(r clusterRef) (*cluster.Client, error) {
 	}
 	// 4.
 	var cred kube.Credential
-	legacy := ""
 	switch r.Identity {
 	case kube.Reader:
 		if cred, err = readerCredential(r, ep); err != nil {
@@ -143,14 +139,11 @@ func openCluster(r clusterRef) (*cluster.Client, error) {
 		if cred, err = writerCredential(r); err != nil {
 			return nil, err
 		}
-		// 5, the writer's half: only its transitional kubectl Apply reads
-		// a kubeconfig (ADR 0023 M2.5 to M2.7). The reader passes none.
-		legacy = r.Dir.InstanceKubeconfigPath(name)
 	default:
 		return nil, fmt.Errorf("cli: %q is not one of an instance's identities", r.Identity)
 	}
 	// 5.
-	return cluster.Open(kube.Config{Endpoint: ep, Credential: cred, Identity: r.Identity}, r.Warn, legacy)
+	return cluster.Open(kube.Config{Endpoint: ep, Credential: cred, Identity: r.Identity}, r.Warn)
 }
 
 // writerCredential is openCluster's step 4 for the writer: the installer's
@@ -328,8 +321,8 @@ func planRead(m consentMode, err error, name string) error {
 // command that failed before it read the record reached no cluster), and any
 // a plan's reader met (readerPhaseError), which says whose it was already.
 // What an IAM refusal looks like on the wire is not walked; the probe walk
-// pins it. The transitional kubectl Apply's errors never carry
-// tkube.ErrForbidden.
+// pins it. Since ADR 0023 M2.7 an apply's 403 carries tkube.ErrForbidden, so
+// the writer's sentence applies to applies too.
 func writerRefused(err error, meta *config.InstanceMetadata) error {
 	// A plan's reader met it, and readerPhase already said whose it was.
 	var reader *readerPhaseError

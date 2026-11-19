@@ -18,7 +18,8 @@ type Provider interface {
 
 	// CreateCluster provisions a cluster from spec and blocks until it is
 	// ready to accept workloads. If a cluster with the same name and location
-	// already exists, it returns that cluster rather than failing. A provider
+	// already exists, it returns that cluster rather than failing, with
+	// Created false. A provider
 	// that cannot hold a cluster to FarCast's isolation — the GKE adapter's
 	// system-only logging (ADR 0019) — returns an error, not the cluster.
 	CreateCluster(ctx context.Context, spec ClusterSpec) (*Cluster, error)
@@ -51,12 +52,12 @@ type ClusterRef struct {
 	Location string
 }
 
-// Cluster is a provisioned cluster and the credentials to reach it.
+// Cluster is a provisioned cluster and where to reach it. It carries no
+// credential: the caller reaches the endpoint with its own.
 type Cluster struct {
-	Ref        ClusterRef
-	Status     ClusterStatus
-	Endpoint   string // Kubernetes API server endpoint
-	Kubeconfig []byte // credentials to reach the cluster — sensitive; redacted by String
+	Ref      ClusterRef
+	Status   ClusterStatus
+	Endpoint string // Kubernetes API server endpoint
 	// SystemLogsOnly is set by a provider that has read the cluster back and
 	// found it configured to send the cloud's logging service only the
 	// provider's mandatory system logs — not applications' stdout and stderr.
@@ -64,17 +65,20 @@ type Cluster struct {
 	// of what it sends, and on Autopilot it is unwalked (ADR 0019). False
 	// means not verified, not merely "off".
 	SystemLogsOnly bool
+	// Created is set by a provider whose CreateCluster created the cluster in
+	// that call. It is false when the provider found a cluster already under
+	// the name and returned it, which another machine may have created and
+	// written to. Its zero value fails closed: a caller treats a cluster as
+	// new only on the provider's word (farcast install records a cluster as
+	// written with server-side apply only when it is set; ADR 0023 M2.7).
+	Created bool
 }
 
-// String renders the cluster without leaking the kubeconfig, so accidental
-// logging (%v/%s) cannot expose cluster credentials.
+// String renders the cluster's Ref, Status and Endpoint. It redacts
+// nothing: a Cluster carries no credential.
 func (c Cluster) String() string {
-	kube := "<none>"
-	if len(c.Kubeconfig) > 0 {
-		kube = fmt.Sprintf("<redacted %d bytes>", len(c.Kubeconfig))
-	}
-	return fmt.Sprintf("Cluster{Ref:%s/%s Status:%s Endpoint:%s Kubeconfig:%s}",
-		c.Ref.Location, c.Ref.Name, c.Status, c.Endpoint, kube)
+	return fmt.Sprintf("Cluster{Ref:%s/%s Status:%s Endpoint:%s}",
+		c.Ref.Location, c.Ref.Name, c.Status, c.Endpoint)
 }
 
 // ClusterStatus is the FarCast-normalised lifecycle state of a cluster.

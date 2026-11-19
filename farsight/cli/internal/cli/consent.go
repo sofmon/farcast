@@ -236,10 +236,19 @@ func newBound(command string, meta *config.InstanceMetadata, identity, systemNam
 // applyFacts is a write fact for each document of an apply stream, in the
 // stream's order: what it is and where it goes, as the stream's own check
 // identifies it (kube.SplitStream), and the SHA-256 of the document's bytes
-// as rendered. Every one is an apply, without force (A23-15) and at no
+// as rendered. Every one is an apply, forced (§5.3, Choice 6 (c)) and at no
 // resourceVersion.
 func applyFacts(stream []byte) ([]plan.Fact, error) {
-	docs, err := kube.SplitStream(stream)
+	return applyFactsAt(stream, "")
+}
+
+// applyFactsAt is applyFacts for a stream rendered at the resourceVersion
+// rv it was read at, "" for none: the stream is split as cluster.ApplyAt
+// splits it (kube.AllowResourceVersion(rv)), so its one document may carry
+// rv, and each fact binds rv (ADR 0023 M2.7, A30-40). run's egress policy is
+// the one such stream.
+func applyFactsAt(stream []byte, rv string) ([]plan.Fact, error) {
+	docs, err := kube.SplitStream(stream, kube.AllowResourceVersion(rv))
 	if err != nil {
 		return nil, err
 	}
@@ -248,7 +257,7 @@ func applyFacts(stream []byte) ([]plan.Fact, error) {
 		sum := sha256.Sum256(d.Raw)
 		facts = append(facts, plan.WriteFact{
 			Type: plan.TypeWrite, API: d.Kind.APIVersion, Kind: d.Kind.Kind, Namespace: d.Namespace, Name: d.Name,
-			Method: plan.WriteApply, SHA256: hex.EncodeToString(sum[:]),
+			Method: plan.WriteApply, Force: true, ResourceVersion: rv, SHA256: hex.EncodeToString(sum[:]),
 		})
 	}
 	return facts, nil

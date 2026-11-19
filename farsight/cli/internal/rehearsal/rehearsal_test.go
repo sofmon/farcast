@@ -1278,7 +1278,7 @@ func TestClusterAnswersDecode(t *testing.T) {
 	}
 	cl, err := cluster.Open(kube.Config{Endpoint: ep, Identity: kube.Reader, Credential: kube.Credential{
 		Email: meta.Reader.Email, PrivateKeyID: meta.Reader.KeyID, PrivateKeyPEM: readFile(t, instanceFile(rig, "reader.key")),
-	}}, nil, "")
+	}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

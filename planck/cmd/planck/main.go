@@ -107,7 +107,7 @@ func run(args []string) int {
 			fail("%v\n", err)
 			return 1
 		}
-		emit("cluster %q ready at %s (kubeconfig: %d bytes)\n", c.Ref.Name, c.Endpoint, len(c.Kubeconfig))
+		emit("cluster %q ready at %s\n", c.Ref.Name, c.Endpoint)
 	case "status":
 		st, err := p.ClusterStatus(ctx, ref)
 		if err != nil {

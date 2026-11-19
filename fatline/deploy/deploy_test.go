@@ -11,6 +11,7 @@ import (
 	"github.com/goccy/go-yaml"
 
 	"github.com/sofmon/farcast/fatline"
+	"github.com/sofmon/farcast/fatline/policy"
 )
 
 func sampleConfig() Config {
@@ -433,6 +434,41 @@ func TestTheEgressPolicyIsMountedAndOptional(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("no policy volume")
+	}
+}
+
+// ADR 0023 M2.7 (A30-40 as §31's A31-2 amends it): the egress policy's
+// ConfigMap carries the resourceVersion farcast run read it at, as a quoted
+// YAML string in its metadata, so the API server holds the apply to it; read
+// at none, it carries none, and the document is byte for byte the one
+// rendered without the parameter. A resourceVersion that could not sit
+// between the quotes as it is is refused, and nothing is rendered.
+func TestRenderPolicyConfigMapCarriesTheResourceVersionItWasReadAt(t *testing.T) {
+	doc := &policy.Document{Version: policy.Version, Apps: []policy.App{{Name: "api", Namespace: "shop", CredentialSHA256: policy.HashCredential("marker")}}}
+	none, err := RenderPolicyConfigMap("", doc, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(none), "resourceVersion") {
+		t.Errorf("read at no resourceVersion, the policy carries one:\n%s", none)
+	}
+	at, err := RenderPolicyConfigMap("", doc, "41")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := strings.Replace(string(none), "  namespace: "+DefaultNamespace+"\n", "  namespace: "+DefaultNamespace+"\n  resourceVersion: \"41\"\n", 1); string(at) != want {
+		t.Errorf("read at 41, the policy renders\n%s\nwant the same document with resourceVersion: \"41\" in its metadata:\n%s", at, want)
+	}
+	var m struct {
+		Metadata map[string]any `yaml:"metadata"`
+	}
+	if err := yaml.Unmarshal(at, &m); err != nil || m.Metadata["resourceVersion"] != "41" {
+		t.Errorf("metadata.resourceVersion decodes as %#v (%v); want the string \"41\"", m.Metadata["resourceVersion"], err)
+	}
+	for _, rv := range []string{`4"1`, `4\1`, "4\n1", "4é1", "4\x001", "4\t1"} {
+		if out, err := RenderPolicyConfigMap("", doc, rv); err == nil || out != nil {
+			t.Errorf("resourceVersion %q rendered\n%s\nwant it refused", rv, out)
+		}
 	}
 }
 

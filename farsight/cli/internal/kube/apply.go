@@ -15,8 +15,8 @@ import (
 //	PATCH {base}{Kind.Path(ns,name)}?fieldManager=farcast&fieldValidation=Strict&force=<force>
 //	Content-Type: application/apply-patch+yaml
 //
-// with the document's own bytes as its body, unchanged: the API server parses
-// them as it parses kubectl's input today. A missing object is created. A 409
+// with the document's own bytes as its body, unchanged. A missing object is
+// created. A 409
 // whose causes are FieldManagerConflict is the server refusing to take fields
 // another manager owns; FieldConflicts reads them. An apply is retried on 429
 // and 503 (§3.4).
@@ -29,6 +29,11 @@ import (
 // any other name, or a Secret whose bytes carry stringData, is refused here
 // and nothing is sent, whoever built the Document, whatever its Kind.Names
 // says.
+//
+// The one metadata.resourceVersion d.Raw may carry is the one
+// AllowResourceVersion let SplitStream pass. The API server holds the apply
+// to it: one that is no longer the stored one is a 409 that unwraps to
+// tkube.ErrConflict, and nothing is written (§31, A31-2).
 func (c *Client) Apply(ctx context.Context, d Document, force bool) (ObjectMeta, error) {
 	fault := kindFault(d.Kind)
 	if fault == "" {

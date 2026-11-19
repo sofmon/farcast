@@ -189,10 +189,12 @@ func TestScalePatchesTheScaleSubresource(t *testing.T) {
 }
 
 // TestKernelWritesNameTechnocore (ADR 0023 M2.7, design §5.4, A30-11): each
-// of the kernel's four writes names FieldManager as its only query, so the
-// API server records the kernel's fields under technocore; its reads name
-// none (TestListPodsDecodesWhatTheKernelReads, TestGetServiceReadsTheType and
-// TestListPodMetricsReadsTheAggregatedAPI pin their exact queries).
+// of the kernel's four writes names FieldManager as its only query. The
+// server records the kernel's main-resource writes under technocore. Its
+// Scale names technocore too, but a Scale of 0, the only one the kernel
+// makes, was recorded under no manager on v1.36.2 (design A31-5). Its reads
+// name none (TestListPodsDecodesWhatTheKernelReads, TestGetServiceReadsTheType
+// and TestListPodMetricsReadsTheAggregatedAPI pin their exact queries).
 func TestKernelWritesNameTechnocore(t *testing.T) {
 	var seen []capture
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

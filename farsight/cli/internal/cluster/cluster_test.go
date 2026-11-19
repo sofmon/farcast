@@ -25,26 +25,8 @@ import (
 )
 
 // The read tests below run each method in-process, on an Open'd reader
-// against kubetest (ADR 0023 M2.4); the writes, on an Open'd writer (M2.5).
-// Since ADR 0023 M2.5 no method but Apply runs kubectl, so no read keeps a
-// kubectl half. Apply alone is tested on a fake Runner, until ADR 0023 M2.7.
-
-// fakeRunner records each kubectl call and its stdin, and answers each with
-// err.
-type fakeRunner struct {
-	calls  [][]string
-	stdins [][]byte
-	err    error
-}
-
-func (f *fakeRunner) Run(_ context.Context, stdin []byte, args ...string) ([]byte, error) {
-	f.calls = append(f.calls, args)
-	f.stdins = append(f.stdins, stdin)
-	if f.err != nil {
-		return nil, f.err
-	}
-	return nil, nil
-}
+// against kubetest (ADR 0023 M2.4); the writes, on an Open'd writer (M2.5),
+// Apply among them since ADR 0023 M2.7. No method runs kubectl.
 
 // safeBuffer is a buffer a followed Logs writes to while the test reads it.
 type safeBuffer struct {
@@ -159,17 +141,375 @@ func apiPaths(s *kubetest.Server) []string {
 	return out
 }
 
-func TestApplyPipesManifestToStdin(t *testing.T) {
-	fr := &fakeRunner{}
-	c := newWithRunner(fr)
-	if err := c.Apply(context.Background(), []byte("MANIFEST")); err != nil {
+// stream is three documents as farcast's renderers write them: a Namespace,
+// then a ConfigMap and a ServiceAccount in it.
+const stream = `apiVersion: v1
+kind: Namespace
+metadata:
+  name: web
+  labels:
+    app.kubernetes.io/managed-by: farcast
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: settings
+  namespace: web
+  labels:
+    app.kubernetes.io/managed-by: farcast
+data:
+  mode: "on"
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: api
+  namespace: web
+  labels:
+    app.kubernetes.io/managed-by: farcast
+`
+
+// The paths stream's three documents are applied to.
+const (
+	webPath      = "/api/v1/namespaces/web"
+	settingsPath = "/api/v1/namespaces/web/configmaps/settings"
+	accountPath  = "/api/v1/namespaces/web/serviceaccounts/api"
+)
+
+// appliedRequests is every server-side apply s saw, in order: a PATCH whose
+// Content-Type is application/apply-patch+yaml.
+func appliedRequests(s *kubetest.Server) []kubetest.Request {
+	var out []kubetest.Request
+	for _, r := range s.Requests() {
+		if r.Method == http.MethodPatch && r.ContentType == "application/apply-patch+yaml" {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// splitStream is kube.SplitStream of a stream these tests know is valid.
+func splitStream(t *testing.T, manifests string) []kube.Document {
+	t.Helper()
+	docs, err := kube.SplitStream([]byte(manifests))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if len(fr.calls) != 1 || !slices.Equal(fr.calls[0], []string{"apply", "-f", "-"}) {
-		t.Fatalf("calls=%v, want one [apply -f -]", fr.calls)
+	return docs
+}
+
+// ADR 0023 M2.7 (A30-27, design §5.3): Apply runs no kubectl. It mints once,
+// then sends each document as its own server-side apply, in stream order, as
+// the writer: a PATCH to the document's own path, the apply patch media type,
+// fieldManager farcast with strict validation, forced, and the document's own
+// bytes as the body. Every document is stored.
+func TestApplySendsEachDocumentAsServerSideApply(t *testing.T) {
+	s := kubetest.New(t)
+	c := openWriter(t, s, nil)
+	if err := c.Apply(t.Context(), []byte(stream)); err != nil {
+		t.Fatal(err)
 	}
-	if string(fr.stdins[0]) != "MANIFEST" {
-		t.Fatalf("stdin=%q, want MANIFEST", fr.stdins[0])
+	reqs := s.Requests()
+	docs := splitStream(t, stream)
+	if len(reqs) != 1+len(docs) || reqs[0].Path != "/token" || reqs[0].As != "writer" {
+		t.Fatalf("%d requests (%v); want one mint as the writer, then one apply per document", len(reqs), apiPaths(s))
+	}
+	for i, want := range []string{webPath, settingsPath, accountPath} {
+		r := reqs[1+i]
+		if r.Method != http.MethodPatch || r.Path != want || r.ContentType != "application/apply-patch+yaml" ||
+			r.RawQuery != "fieldManager=farcast&fieldValidation=Strict&force=true" || r.As != "writer" {
+			t.Errorf("document %d: %s %s?%s (%s) as %q; want PATCH %s?fieldManager=farcast&fieldValidation=Strict&force=true "+
+				"(application/apply-patch+yaml) as the writer", i, r.Method, r.Path, r.RawQuery, r.ContentType, r.As, want)
+		}
+		if !bytes.Equal(r.Body, docs[i].Raw) {
+			t.Errorf("document %d sent\n%s\nwant its own bytes\n%s", i, r.Body, docs[i].Raw)
+		}
+	}
+	if v, found, err := c.ConfigMapValue(t.Context(), "web", "settings", "mode"); v != "on" || !found || err != nil {
+		t.Errorf("the applied ConfigMap reads %q, %v, %v", v, found, err)
+	}
+}
+
+// ADR 0023 M2.7 (A30-27, §10.5 row 100c): Apply stops at the first document
+// that fails. Its error says how many documents were applied before it and
+// names the one that failed, and unwraps to the API's own error; the
+// documents after it are never sent, and the one before it stays applied: no
+// apply is atomic.
+func TestApplyStopsAtTheFirstFailingDocumentAndSaysHowManyWent(t *testing.T) {
+	s := kubetest.New(t)
+	s.Fail(http.MethodPatch, settingsPath, http.StatusInternalServerError, kube.Status{})
+	c := openWriter(t, s, nil)
+	err := c.Apply(t.Context(), []byte(stream))
+	var ae *kube.APIError
+	if !errors.As(err, &ae) || ae.Status.Code != http.StatusInternalServerError {
+		t.Fatalf("Apply = %v; want the 500, as a *kube.APIError", err)
+	}
+	if want := "cluster: 1 of 3 documents were applied before ConfigMap web/settings failed: "; !strings.HasPrefix(err.Error(), want) {
+		t.Errorf("Apply = %q; want it to begin %q", err, want)
+	}
+	var paths []string
+	for _, r := range appliedRequests(s) {
+		paths = append(paths, r.Path)
+	}
+	if !slices.Equal(paths, []string{webPath, settingsPath}) {
+		t.Errorf("applied %q; want the Namespace, then the ConfigMap that failed, and nothing after it", paths)
+	}
+	if uid, err := c.NamespaceUID(t.Context(), "web"); uid == "" || err != nil {
+		t.Errorf("the Namespace applied before the failure reads %q, %v: an apply is never undone", uid, err)
+	}
+
+	// The first document failing: 0 of them went, and it is named by its
+	// own kind and name, cluster-scoped without a slash.
+	s2 := kubetest.New(t)
+	s2.Fail(http.MethodPatch, webPath, http.StatusForbidden, kube.Status{})
+	err = openWriter(t, s2, nil).Apply(t.Context(), []byte(stream))
+	if want := "cluster: 0 of 3 documents were applied before Namespace web failed: "; err == nil || !strings.HasPrefix(err.Error(), want) ||
+		!errors.Is(err, tkube.ErrForbidden) {
+		t.Errorf("Apply = %v; want it to begin %q and unwrap to tkube.ErrForbidden", err, want)
+	}
+	if got := len(appliedRequests(s2)); got != 1 {
+		t.Errorf("%d applies sent; want the refused first one alone", got)
+	}
+}
+
+// ADR 0023 M2.7 (A30-27, §10.5 row 100b): a stream SplitStream refuses, and
+// a stream that holds no document, are each refused before anything is sent,
+// a token included, and so is any apply by the reader.
+func TestApplyRefusesBeforeSendingAnything(t *testing.T) {
+	for _, row := range []struct {
+		name, stream string
+		want         string // the error's text, or its start for SplitStream's own
+		whole        bool
+	}{
+		{"a document that names a resourceVersion", stream + "---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: stale\n  namespace: web\n  resourceVersion: \"7\"\n",
+			"kube: document 3 (ConfigMap \"stale\") is refused: ", false},
+		{"a kind farcast never applies", "apiVersion: v1\nkind: Pod\nmetadata:\n  name: p\n  namespace: web\n" + "---\n" + stream,
+			"kube: document 0 ", false},
+		{"no stream", "", "cluster: the stream holds no document, so nothing was sent: kube: a document is not one farcast applies", true},
+		{"blanks and comments", "---\n# nothing\n---\n\n", "cluster: the stream holds no document, so nothing was sent: kube: a document is not one farcast applies", true},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			s := kubetest.New(t)
+			c := openWriter(t, s, nil)
+			err := c.Apply(t.Context(), []byte(row.stream))
+			if !errors.Is(err, kube.ErrRefusedDocument) || (row.whole && err.Error() != row.want) || !strings.HasPrefix(err.Error(), row.want) {
+				t.Errorf("Apply = %v; want %q, wrapping kube.ErrRefusedDocument", err, row.want)
+			}
+			if got := s.Requests(); len(got) != 0 {
+				t.Errorf("a refused stream sent %d requests (%v), the token's included; it sends nothing", len(got), apiPaths(s))
+			}
+		})
+	}
+	s := kubetest.New(t)
+	if err := openReader(t, s, nil).Apply(t.Context(), []byte(stream)); !errors.Is(err, errNeverWrites) {
+		t.Errorf("the reader's Apply = %v, want %v", err, errNeverWrites)
+	}
+	if got := s.Requests(); len(got) != 0 {
+		t.Errorf("the reader's refused Apply sent %d requests", len(got))
+	}
+}
+
+// ADR 0023 M2.7 (A30-27): a writer's Apply writes the warnings each answer
+// carried, after that document and before the next is sent, a refused
+// document's included, each distinct text once.
+func TestAWritersApplyWritesItsWarnings(t *testing.T) {
+	var w bytes.Buffer
+	var seen []string
+	s := kubetest.New(t, kubetest.WithWarnings(func(r kubetest.Request) []string {
+		if r.Method != http.MethodPatch {
+			return nil
+		}
+		// What the warnings writer held when this document was sent.
+		seen = append(seen, w.String())
+		return []string{"applied " + r.Path, "deprecated \u202e"}
+	}))
+	s.Fail(http.MethodPatch, accountPath, http.StatusUnprocessableEntity, kube.Status{})
+	c := openWriter(t, s, &w)
+	if err := c.Apply(t.Context(), []byte(stream)); err == nil {
+		t.Fatal("the refused third document read as applied")
+	}
+	want := "Warning (cluster): applied " + webPath + "\nWarning (cluster): \"deprecated \\u202e\"\n" +
+		"Warning (cluster): applied " + settingsPath + "\n" +
+		"Warning (cluster): applied " + accountPath + "\n"
+	if got := w.String(); got != want {
+		t.Errorf("the warnings = %q, want %q", got, want)
+	}
+	if len(seen) != 3 || seen[0] != "" || !strings.HasSuffix(seen[1], "applied "+webPath+"\nWarning (cluster): \"deprecated \\u202e\"\n") ||
+		!strings.HasSuffix(seen[2], "applied "+settingsPath+"\n") {
+		t.Errorf("before each apply the warnings held %q; want each answer's written before the next document is sent", seen)
+	}
+}
+
+// ADR 0023 M2.7 (A30-28, §10.5 row 101b): Traces lists every object an
+// Apply answered with that still carries kubectl's client-side apply: its
+// kubectl-client-side-apply entry, which kubetest's apply keeps from a seeded
+// object as a real server keeps another manager's, or the last-applied
+// annotation, which a real server keeps too and kubetest does not, so it is
+// answered here through WithHandler. Each is named by the document, once, in
+// apply order. An object whose only entry is farcast's own Apply is no trace,
+// and the caller gets a copy of the client's list.
+func TestTracesListsEveryClientSideTrace(t *testing.T) {
+	const marker = "LAST-APPLIED-MARKER"
+	annotated := "/api/v1/namespaces/web/configmaps/annotated"
+	s := kubetest.New(t, kubetest.WithHandler(func(r kubetest.Request) (int, []byte, bool) {
+		if r.Method != http.MethodPatch || r.Path != annotated {
+			return 0, nil, false
+		}
+		return http.StatusOK, []byte(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"annotated","namespace":"web",` +
+			`"annotations":{"kubectl.kubernetes.io/last-applied-configuration":"{\"marker\":\"` + marker + `\"}"},` +
+			`"managedFields":[{"manager":"farcast","operation":"Apply","apiVersion":"v1","fieldsType":"FieldsV1","fieldsV1":{}}]}}`), true
+	}))
+	seeded := object("v1", "ServiceAccount", "web", "api", map[string]any{"metadata": map[string]any{
+		"managedFields": []any{map[string]any{"manager": "kubectl-client-side-apply", "operation": "Update", "apiVersion": "v1",
+			"fieldsType": "FieldsV1", "fieldsV1": map[string]any{"f:metadata": map[string]any{}}}},
+	}})
+	s.Put(seeded)
+	c := openWriter(t, s, nil)
+	if got := c.Traces(); len(got) != 0 {
+		t.Fatalf("Traces before any apply = %q", got)
+	}
+	extra := "---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: annotated\n  namespace: web\n  labels:\n    app.kubernetes.io/managed-by: farcast\n"
+	for range 2 {
+		if err := c.Apply(t.Context(), []byte(stream+extra)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := []string{"ServiceAccount web/api", "ConfigMap web/annotated"}
+	got := c.Traces()
+	if !slices.Equal(got, want) {
+		t.Fatalf("Traces = %q, want %q: the seeded entry and the annotation, each once, in apply order", got, want)
+	}
+	got[0] = "changed by the caller"
+	if again := c.Traces(); !slices.Equal(again, want) {
+		t.Errorf("Traces after its caller changed the list it got = %q; want a copy each time", again)
+	}
+	if fresh := openWriter(t, s, nil); fresh.Traces() != nil {
+		t.Errorf("another client's Traces = %q; traces are per client", fresh.Traces())
+	}
+	for _, name := range c.Traces() {
+		if strings.Contains(name, marker) {
+			t.Errorf("a trace carries the annotation's value: %q", name)
+		}
+	}
+
+	// farcast's own Apply entry, which every answer carries, is no trace:
+	// the Namespace and the ConfigMap above were applied twice and are not
+	// listed, and an apply of them alone lists nothing.
+	clean := openWriter(t, s, nil)
+	if err := clean.Apply(t.Context(), []byte(stream[:strings.Index(stream, "---\napiVersion: v1\nkind: ServiceAccount")])); err != nil {
+		t.Fatal(err)
+	}
+	if got := clean.Traces(); len(got) != 0 {
+		t.Errorf("Traces of farcast's own applies = %q, want none", got)
+	}
+}
+
+// ADR 0023 M2.7 (A30-29, §10.5 row 100): every apply is forced, whatever the
+// stream and however many documents it holds: each apply-patch request
+// carries force=true.
+func TestEveryApplyIsForced(t *testing.T) {
+	s := kubetest.New(t)
+	c := openWriter(t, s, nil)
+	for _, part := range []string{stream, settingsV(2), stream} {
+		if err := c.Apply(t.Context(), []byte(part)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	applies := appliedRequests(s)
+	if len(applies) != 7 {
+		t.Fatalf("%d applies, want 7", len(applies))
+	}
+	for i, r := range applies {
+		q, err := url.ParseQuery(r.RawQuery)
+		if err != nil || q.Get("force") != "true" || len(q["force"]) != 1 {
+			t.Errorf("apply %d (%s) sent ?%s; want force=true", i, r.Path, r.RawQuery)
+		}
+	}
+}
+
+// settingsV is the ConfigMap web/settings at a mode of its own.
+func settingsV(mode int) string {
+	return fmt.Sprintf("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: settings\n  namespace: web\n  labels:\n    app.kubernetes.io/managed-by: farcast\ndata:\n  mode: \"%d\"\n", mode)
+}
+
+// settingsAt is settingsV(mode) carrying metadata.resourceVersion rv, as a
+// YAML string.
+func settingsAt(mode int, rv string) string {
+	return strings.Replace(settingsV(mode), "  namespace: web\n", "  namespace: web\n  resourceVersion: \""+rv+"\"\n", 1)
+}
+
+// ADR 0023 M2.7 (A30-40 as §31's A31-2 amends it): ApplyAt applies one
+// document as Apply does, letting it carry the resourceVersion it is given.
+// At the stored one it is written, the document's bytes sent as they are; at
+// a stale one the API server's 409 comes back unwrapping to
+// tkube.ErrConflict, named as Apply names a failure, with nothing written;
+// with "" it is an apply with no precondition. A manifest that is not one
+// document, or whose resourceVersion is not the one given, is refused with
+// nothing sent, a token included, and so is the reader.
+func TestApplyAtAppliesOneDocumentAtItsResourceVersion(t *testing.T) {
+	s := kubetest.New(t)
+	c := openWriter(t, s, nil)
+	ctx := t.Context()
+	if err := c.ApplyAt(ctx, []byte(settingsV(1)), ""); err != nil {
+		t.Fatalf("ApplyAt with no resourceVersion = %v", err)
+	}
+	_, read, _, err := c.ConfigMapData(ctx, "web", "settings")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Apply(ctx, []byte(settingsV(2))); err != nil {
+		t.Fatal(err)
+	}
+	_, current, _, err := c.ConfigMapData(ctx, "web", "settings")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = c.ApplyAt(ctx, []byte(settingsAt(3, read)), read)
+	if want := "cluster: 0 of 1 documents were applied before ConfigMap web/settings failed: "; !errors.Is(err, tkube.ErrConflict) || !strings.HasPrefix(err.Error(), want) {
+		t.Errorf("ApplyAt at a stale resourceVersion = %v; want it to begin %q and unwrap to tkube.ErrConflict", err, want)
+	}
+	if v, _, _ := c.ConfigMapValue(ctx, "web", "settings", "mode"); v != "2" {
+		t.Errorf("after the refused apply the mode reads %q, want 2", v)
+	}
+
+	body := settingsAt(4, current)
+	if err := c.ApplyAt(ctx, []byte(body), current); err != nil {
+		t.Fatalf("ApplyAt at the stored resourceVersion = %v", err)
+	}
+	applies := appliedRequests(s)
+	if r := applies[len(applies)-1]; r.Body == nil || string(r.Body) != body || r.RawQuery != "fieldManager=farcast&fieldValidation=Strict&force=true" || r.As != "writer" {
+		t.Errorf("the apply sent ?%s as %q with\n%s\nwant the document's own bytes, forced, as the writer", r.RawQuery, r.As, r.Body)
+	}
+	if v, _, _ := c.ConfigMapValue(ctx, "web", "settings", "mode"); v != "4" {
+		t.Errorf("after the apply at the stored resourceVersion the mode reads %q, want 4", v)
+	}
+
+	for _, row := range []struct {
+		name, manifest, rv string
+		want               string
+	}{
+		{"two documents", settingsV(5) + "---\n" + strings.Replace(settingsV(5), "name: settings", "name: other", 1), "",
+			"cluster: ApplyAt applies exactly one document, and the manifest holds 2, so nothing was sent: kube: a document is not one farcast applies"},
+		{"two documents, one at its resourceVersion", settingsAt(5, current) + "---\n" + strings.Replace(settingsV(5), "name: settings", "name: other", 1), current,
+			"cluster: ApplyAt applies exactly one document, and the manifest holds 2, so nothing was sent: kube: a document is not one farcast applies"},
+		{"no document", "# nothing\n", "",
+			"cluster: ApplyAt applies exactly one document, and the manifest holds 0, so nothing was sent: kube: a document is not one farcast applies"},
+		{"another resourceVersion", settingsAt(5, read), current,
+			`kube: document 0 (ConfigMap "settings") is refused: it carries metadata.resourceVersion "` + read + `", and only "` + current + `" is allowed`},
+		{"a resourceVersion with none given", settingsAt(5, current), "",
+			`kube: document 0 (ConfigMap "settings") is refused: it carries metadata.resourceVersion, which only the API server sets`},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			fresh := kubetest.New(t)
+			err := openWriter(t, fresh, nil).ApplyAt(t.Context(), []byte(row.manifest), row.rv)
+			if !errors.Is(err, kube.ErrRefusedDocument) || err.Error() != row.want {
+				t.Errorf("ApplyAt = %v\nwant %q, wrapping kube.ErrRefusedDocument", err, row.want)
+			}
+			if got := fresh.Requests(); len(got) != 0 {
+				t.Errorf("a refused manifest sent %d requests (%v), the token's included", len(got), apiPaths(fresh))
+			}
+		})
 	}
 }
 
@@ -300,14 +640,6 @@ func TestWaitExternalIPTimesOut(t *testing.T) {
 	ip, err := c.WaitExternalIP(t.Context(), "farcast-system", "fatline", 0)
 	if ip != "" || !errors.Is(err, kube.ErrTimedOut) || err.Error() != want {
 		t.Fatalf("= %q, %v; want %q wrapping kube.ErrTimedOut", ip, err, want)
-	}
-}
-
-func TestRunnerErrorPropagates(t *testing.T) {
-	fr := &fakeRunner{err: errors.New("boom")}
-	c := newWithRunner(fr)
-	if err := c.Apply(context.Background(), []byte("x")); err == nil {
-		t.Fatal("expected the runner error to propagate")
 	}
 }
 
@@ -1016,12 +1348,10 @@ func writeRequests(s *kubetest.Server) []kubetest.Request {
 // replaces it with a PUT, in-process as the writer, each sending the body it
 // was given byte for byte under farcast's field manager and strict field
 // validation; a create over a pin that exists is AlreadyExists, a conflict.
-// Nothing is patched or applied, and no kubectl runs.
+// Nothing is patched or applied.
 func TestConfigMapWritesNeverApply(t *testing.T) {
-	bin, saw := recordingKubectl(t)
-	t.Setenv("PATH", bin)
 	s := kubetest.New(t)
-	c := openWriter(t, s, "/cfg/instances/atlas/kubeconfig.yaml", nil)
+	c := openWriter(t, s, nil)
 	ctx := t.Context()
 
 	created := renderPin(t, `{"pin":1}`, "")
@@ -1072,9 +1402,6 @@ func TestConfigMapWritesNeverApply(t *testing.T) {
 			t.Errorf("%s %s (%s): the pin is never patched or applied", r.Method, r.Path, r.ContentType)
 		}
 	}
-	if _, _, ran := kubectlRecord(t, saw); ran {
-		t.Error("a writer's ConfigMap write ran kubectl")
-	}
 }
 
 // ADR 0023 M2.5 (A20-7), mutation 71: a writer's replace is guarded on the
@@ -1088,7 +1415,7 @@ func TestReplaceConfigMapCarriesTheResourceVersion(t *testing.T) {
 	s.Put(object("v1", "ConfigMap", "farcast-system", "datasphered-pin", map[string]any{
 		"metadata": map[string]any{"resourceVersion": "41"}, "data": map[string]any{"pin": `{"pin":1}`},
 	}))
-	c := openWriter(t, s, "", nil)
+	c := openWriter(t, s, nil)
 	ctx := t.Context()
 	_, rv, found, err := c.ConfigMapData(ctx, dsdeploy.DefaultNamespace, dsdeploy.PinConfigMapName(""))
 	if err != nil || !found || rv != "41" {
@@ -1147,7 +1474,7 @@ func TestNamespaceUIDIsThatNamespacesUID(t *testing.T) {
 	s.Put(object("v1", "Namespace", "", "farcast-system", map[string]any{"metadata": map[string]any{"uid": "uid-of-farcast-system"}}))
 	s.Put(namespace("web", nil))
 	var w bytes.Buffer
-	c := openWriter(t, s, "", &w)
+	c := openWriter(t, s, &w)
 	ctx := t.Context()
 
 	if uid, err := c.NamespaceUID(ctx, "farcast-system"); uid != "uid-of-farcast-system" || err != nil {
@@ -1653,7 +1980,7 @@ func TestListMetaGetMetaPatchManagedFieldsAreKubes(t *testing.T) {
 	other["metadata"].(map[string]any)["namespace"] = "elsewhere"
 	s.Put(other)
 	var w bytes.Buffer
-	c := openWriter(t, s, "", &w)
+	c := openWriter(t, s, &w)
 	ctx := t.Context()
 	const (
 		listPath = "/apis/apps/v1/deployments"

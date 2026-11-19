@@ -112,9 +112,9 @@ func FindToolchain(ctx context.Context, parent []string, dir string) (Toolchain,
 	return tc, nil
 }
 
-// lookGo finds go on pathValue as cluster.lookPathIn finds kubectl: absolute
-// entries only, a regular executable file. The path returned is the one on PATH,
-// never symlink-resolved, so a multi-call binary still sees itself invoked as go.
+// lookGo finds go on pathValue: absolute entries only, a regular executable
+// file. The path returned is the one on PATH, never symlink-resolved, so a
+// multi-call binary still sees itself invoked as go.
 func lookGo(pathValue string) (string, bool) {
 	name := "go" + exeSuffix()
 	for _, dir := range filepath.SplitList(pathValue) {

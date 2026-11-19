@@ -64,6 +64,7 @@ func readerKey(t *testing.T, s *kubetest.Server, id, email string) (keyPEM, cert
 // registered with s under id "reader". granted sets GrantedAt and Scope, as a
 // verified 'reader grant' does. A writer credentials.yaml registered under id
 // "writer" sits beside it, so a test can show the reader path never opens it.
+// The record is migrated (recordMigrated), as the rehearsal's is.
 func readerInstance(t *testing.T, s *kubetest.Server, name string, granted bool) (config.Dir, *config.InstanceMetadata) {
 	t.Helper()
 	dir := config.Dir(filepath.Join(t.TempDir(), "cfg"))
@@ -77,6 +78,7 @@ func readerInstance(t *testing.T, s *kubetest.Server, name string, granted bool)
 		Cluster: "farcast-" + name, Endpoint: s.Endpoint(), Status: config.InstanceRunning,
 		Reader: &config.Reader{Email: email, KeyID: keyID},
 	}
+	recordMigrated(meta)
 	if granted {
 		meta.Reader.GrantedAt, meta.Reader.Scope = readerGrantedAt, "metered"
 	}
@@ -761,17 +763,11 @@ func strconvQuote(s string) string {
 // ADR 0023 M2.5 (A20-8): the writer opens as the installer's key from
 // credentials.yaml, in loopback mode against kubetest. Its reads go
 // in-process as the writer, minted with the stored key id, and reader.key is
-// never read; its Apply alone runs kubectl, given the instance's own
-// kubeconfig.yaml, and sends nothing to the API itself.
+// never read. Since ADR 0023 M2.7 (A30-31) its Apply is in-process too: one
+// apply-patch, as the writer, on the token it already minted, and nothing
+// runs kubectl.
 func TestAWriterOpensAsTheInstallerKey(t *testing.T) {
-	saw := t.TempDir()
-	bin := t.TempDir()
-	script := "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > '" + saw + "/argv'\n/bin/cat > /dev/null\n"
-	if err := os.WriteFile(filepath.Join(bin, "kubectl"), []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", bin)
-	s := kubetest.New(t)
+	s := kubetest.New(t, kubetest.WithSettledWorkloads())
 	s.Put(map[string]any{"apiVersion": "v1", "kind": "Namespace", "metadata": map[string]any{"name": "farcast-system", "uid": "uid-1"}})
 	dir, meta := readerInstance(t, s, "atlas", true)
 	reads := observeConfigReads(t)
@@ -795,17 +791,14 @@ func TestAWriterOpensAsTheInstallerKey(t *testing.T) {
 		t.Errorf("the writer read reader.key: %v", got)
 	}
 
-	if err := c.Apply(t.Context(), []byte("apiVersion: v1\nkind: Namespace\nmetadata:\n  name: x\n")); err != nil {
+	namespace := []byte("apiVersion: v1\nkind: Namespace\nmetadata:\n  name: x\n")
+	if err := c.Apply(t.Context(), namespace); err != nil {
 		t.Fatal(err)
 	}
-	argv, err := os.ReadFile(filepath.Join(saw, "argv"))
-	if err != nil {
-		t.Fatalf("Apply ran no kubectl: %v", err)
-	}
-	if want := "--kubeconfig\n" + dir.InstanceKubeconfigPath("atlas") + "\napply\n-f\n-\n"; string(argv) != want {
-		t.Errorf("kubectl ran with %q; want %q", argv, want)
-	}
-	if got := len(s.Requests()); got != 2 {
-		t.Errorf("Apply sent %d requests to the API itself", got-2)
+	reqs = s.Requests()[2:]
+	if len(reqs) != 1 || reqs[0].Method != http.MethodPatch || reqs[0].Path != "/api/v1/namespaces/x" ||
+		reqs[0].ContentType != "application/apply-patch+yaml" || reqs[0].RawQuery != applyQuery ||
+		reqs[0].As != "writer" || !bytes.Equal(reqs[0].Body, namespace) {
+		t.Errorf("Apply sent %+v; want one apply-patch of the document, as the writer, with no second mint", reqs)
 	}
 }

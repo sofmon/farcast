@@ -58,11 +58,11 @@ Per pod, not per application: summing replicas and reserving the total would
 be wrong by the replica count.
 
 Compute comes from the kernel's own profiles (ADR 0014), collected on its
-reconcile tick from the same reading 'kubectl top' shows. Network comes from
-Shrike, through the FatLine tunnel, because the boundary is the only place
-that sees an application's traffic at all. Both are advisory — nothing in the
-cost path reads them, and what could not be measured is reported as unmeasured
-rather than as zero.
+reconcile tick from the cluster's resource metrics (metrics.k8s.io). Network
+comes from Shrike, through the FatLine tunnel, because the boundary is the
+only place that sees an application's traffic at all. Both are advisory —
+nothing in the cost path reads them, and what could not be measured is
+reported as unmeasured rather than as zero.
 
 The network latency is CONNECTION latency, not request latency: FatLine
 tunnels CONNECT opaquely and never terminates TLS, so what happens inside a

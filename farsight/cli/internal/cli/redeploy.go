@@ -132,6 +132,10 @@ func (c *redeployCommand) SetFlags(fs *flag.FlagSet) {
 	c.consent.register(fs)
 }
 
+// msgInspectFatline is redeploy's hint after a rollout that did not complete:
+// the instance. The crashed container is the one --previous reads.
+const msgInspectFatline = "Inspect it with: farcast logs %s fatline --previous"
+
 // msgRedeployYes is redeploy's refusal without a terminal and without --yes:
 // the change it would make (describeRedeploy), and the two routes that need
 // no terminal.
@@ -188,6 +192,9 @@ func (c *redeployCommand) Run(ctx context.Context, env *Env, args []string) (err
 	if err := recordNamed(meta, name); err != nil {
 		return err
 	}
+	if err := refuseUnmigrated(name, meta); err != nil {
+		return err
+	}
 	if meta.Status == config.InstanceDeleting {
 		return fmt.Errorf("instance %q is being released", name)
 	}
@@ -207,13 +214,14 @@ func (c *redeployCommand) Run(ctx context.Context, env *Env, args []string) (err
 	// before anything is decided, ensured, pushed or asked (ADR 0023 M2.5,
 	// A20-10 and A20-11): an instance this machine cannot write as is refused
 	// with nothing changed, and an endpoint that refuses the installer's key
-	// refuses it before kubectl applies anything. --plan never opens it, and
+	// refuses it before anything is applied. --plan never opens it, and
 	// --confirm right after the comparison (A23-23).
 	var cl clusterApplier
 	if mode == consentNone {
 		if cl, err = c.readyWriter(ctx, env, meta); err != nil {
 			return err
 		}
+		defer afterWrites(env, name, cl)
 	}
 
 	// The instance's mTLS material is loaded, never minted: deciding as a
@@ -273,6 +281,7 @@ func (c *redeployCommand) Run(ctx context.Context, env *Env, args []string) (err
 		if cl, err = c.readyWriter(ctx, env, meta); err != nil {
 			return err
 		}
+		defer afterWrites(env, name, cl)
 	} else if err := c.consented(env, name, p); err != nil {
 		return err
 	}
@@ -315,7 +324,7 @@ func (c *redeployCommand) Run(ctx context.Context, env *Env, args []string) (err
 	if err := cl.RolloutStatus(ctx, deploy.DefaultNamespace, deploy.DefaultName, fatlineRolloutTimeout); err != nil {
 		if previous != "" {
 			fprintf(env.Err, "The rollout did not complete; %s is still the image serving traffic.\n", previous)
-			fprintf(env.Err, "Inspect it with: kubectl -n %s describe pod -l app.kubernetes.io/name=%s\n", deploy.DefaultNamespace, deploy.DefaultName)
+			fprintf(env.Err, msgInspectFatline+"\n", name)
 		}
 		return fmt.Errorf("FatLine rollout: %w", err)
 	}

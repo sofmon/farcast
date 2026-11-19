@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sofmon/farcast/farsight/cli/internal/buildinfo"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
 	"github.com/sofmon/farcast/planck"
@@ -60,13 +61,14 @@ func (f *fakeProvider) CreateCluster(_ context.Context, spec planck.ClusterSpec)
 		return f.cluster, nil
 	}
 	// Mirrors the GKE adapter, which returns a cluster only once it has read
-	// it back as system-only logging (ADR 0019).
+	// it back as system-only logging (ADR 0019), and, having found none under
+	// the name, says it created it (ADR 0023 M2.7).
 	return &planck.Cluster{
 		Ref:            planck.ClusterRef{Name: spec.Name, Location: spec.Location},
 		Status:         planck.StatusRunning,
 		Endpoint:       "uid.us-central1.gke.goog",
-		Kubeconfig:     []byte("apiVersion: v1\nkind: Config\n"),
 		SystemLogsOnly: true,
+		Created:        true,
 	}, nil
 }
 
@@ -216,8 +218,13 @@ func TestInstallSuccess(t *testing.T) {
 		t.Errorf("unexpected metadata: %+v", meta)
 	}
 	assertPerm(t, dir.InstancePath("prod"), 0o700)
-	for _, name := range []string{"metadata.yaml", "credentials.yaml", "kubeconfig.yaml"} {
+	for _, name := range []string{"metadata.yaml", "credentials.yaml"} {
 		assertPerm(t, filepath.Join(dir.InstancePath("prod"), name), 0o600)
+	}
+	// ADR 0023 M2.7 (A30-34): install writes no kubeconfig.yaml. Nothing reads
+	// one: every cluster call runs in-process.
+	if _, err := os.Lstat(filepath.Join(dir.InstancePath("prod"), "kubeconfig.yaml")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("kubeconfig.yaml after an install: %v; want it absent", err)
 	}
 	if !strings.Contains(out.String(), "farcast-prod") {
 		t.Errorf("result missing cluster name:\n%s", out.String())
@@ -322,6 +329,12 @@ func TestInstallCreateClusterFailureRecordsError(t *testing.T) {
 	if meta.CloudLogging != "" {
 		t.Errorf("cloud_logging = %q after a failed create, want empty", meta.CloudLogging)
 	}
+	// Nor as migrated to server-side apply: install records that only at its
+	// finalizing save, for a cluster the call created (ADR 0023 M2.7,
+	// A30-25).
+	if meta.ServerSideApply != nil {
+		t.Errorf("a failed create recorded server_side_apply %+v", *meta.ServerSideApply)
+	}
 }
 
 // TestInstallRecordsSystemOnlyLogging: the instance records, and the operator
@@ -356,10 +369,9 @@ func TestInstallRecordsSystemOnlyLogging(t *testing.T) {
 // without having verified its logging gets no "system" record and no claim.
 func TestInstallDoesNotClaimUnverifiedLogging(t *testing.T) {
 	f := &fakeProvider{cluster: &planck.Cluster{
-		Ref:        planck.ClusterRef{Name: "farcast-prod", Location: "us-central1"},
-		Status:     planck.StatusRunning,
-		Endpoint:   "uid.us-central1.gke.goog",
-		Kubeconfig: []byte("apiVersion: v1\nkind: Config\n"),
+		Ref:      planck.ClusterRef{Name: "farcast-prod", Location: "us-central1"},
+		Status:   planck.StatusRunning,
+		Endpoint: "uid.us-central1.gke.goog",
 	}}
 	prov := registerFake(t, f)
 	env, out, _, dir := newInstallEnv(t, output.ModeJSON)
@@ -388,6 +400,105 @@ func TestInstallDoesNotClaimUnverifiedLogging(t *testing.T) {
 	}
 	if strings.Contains(b.String(), "not to be sent to the provider's logging") || !strings.Contains(b.String(), "NOT verified") {
 		t.Errorf("an unverified cluster must be said to be unverified, never kept from the provider:\n%s", b.String())
+	}
+}
+
+// recordAtCreate is a fakeProvider that reads the instance's record as it
+// stands when CreateCluster is called: the first record install saves.
+type recordAtCreate struct {
+	*fakeProvider
+	dir      config.Dir
+	name     string
+	atCreate *config.InstanceMetadata
+	err      error
+}
+
+func (p *recordAtCreate) CreateCluster(ctx context.Context, spec planck.ClusterSpec) (*planck.Cluster, error) {
+	p.atCreate, p.err = p.dir.LoadInstanceMetadata(p.name)
+	return p.fakeProvider.CreateCluster(ctx, spec)
+}
+
+// msgAdoptedCluster is install's warning on a cluster the provider found
+// under the instance's name, for instance prod.
+const msgAdoptedCluster = `Warning: cluster "farcast-prod" already existed, so this farcast cannot tell what wrote to it; ` +
+	"run 'farcast migrate prod --plan' before any command that writes to it.\n"
+
+// ADR 0023 M2.7 (design A30-25): install records an instance whose cluster it
+// created as written with server-side apply, since the record was made and
+// by this farcast, at its finalizing save only. The record it saves before
+// the cluster is created carries none, so an install stopped while it
+// provisions leaves an instance every writing command refuses, and nothing
+// is said about an adopted cluster.
+func TestInstallRecordsServerSideApply(t *testing.T) {
+	env, _, errb, dir := newInstallEnv(t, output.ModeHuman)
+	f := &recordAtCreate{fakeProvider: &fakeProvider{}, dir: dir, name: "prod"}
+	prov := registerProvider(t, f)
+	cmd := &installCommand{credentials: installKey(t), name: "prod", provider: prov, project: "proj-1", region: "us-central1", costLimit: 50, assumeYes: true}
+	if err := cmd.Run(context.Background(), env, nil); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if f.err != nil || f.atCreate == nil {
+		t.Fatalf("the first record, as the cluster was created: %v", f.err)
+	}
+	if f.atCreate.ServerSideApply != nil {
+		t.Errorf("the first record carries server_side_apply %+v; want none until the cluster is created", *f.atCreate.ServerSideApply)
+	}
+	meta, err := dir.LoadInstanceMetadata("prod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ssa := meta.ServerSideApply
+	switch {
+	case ssa == nil:
+		t.Fatal("install recorded no server_side_apply for a cluster it created")
+	case meta.CreatedAt.IsZero() || !ssa.Since.Equal(meta.CreatedAt):
+		t.Errorf("server_side_apply.since = %v; want created_at, %v", ssa.Since, meta.CreatedAt)
+	case ssa.Farcast != buildinfo.Get().Version:
+		t.Errorf("server_side_apply.farcast = %q; want this build's version %q", ssa.Farcast, buildinfo.Get().Version)
+	}
+	if strings.Contains(errb.String(), "already existed") {
+		t.Errorf("install warned of an adopted cluster it created:\n%s", errb.String())
+	}
+}
+
+// ADR 0023 M2.7 (design A30-25), mutation 97b: a cluster the provider found
+// under the instance's name (Created false), which another machine's install
+// of the same name made and may have written to with kubectl, is left
+// unmigrated. install says so on stderr, once, naming the migration, and
+// still succeeds.
+func TestInstallOnAnAdoptedClusterLeavesItUnmigrated(t *testing.T) {
+	for name, mode := range map[string]output.Mode{"human": output.ModeHuman, "json": output.ModeJSON} {
+		t.Run(name, func(t *testing.T) {
+			f := &fakeProvider{cluster: &planck.Cluster{
+				Ref:            planck.ClusterRef{Name: "farcast-prod", Location: "us-central1"},
+				Status:         planck.StatusRunning,
+				Endpoint:       "uid.us-central1.gke.goog",
+				SystemLogsOnly: true,
+			}}
+			prov := registerFake(t, f)
+			env, out, errb, dir := newInstallEnv(t, mode)
+			cmd := &installCommand{credentials: installKey(t), name: "prod", provider: prov, project: "proj-1", region: "us-central1", costLimit: 50, assumeYes: true}
+			err := cmd.Run(context.Background(), env, nil)
+			if err != nil || exitCodeOf(err) != 0 {
+				t.Fatalf("Run = %v (exit %d); want success", err, exitCodeOf(err))
+			}
+			meta, lerr := dir.LoadInstanceMetadata("prod")
+			if lerr != nil {
+				t.Fatal(lerr)
+			}
+			if meta.ServerSideApply != nil {
+				t.Errorf("an adopted cluster was recorded as migrated: %+v", *meta.ServerSideApply)
+			}
+			if meta.Status != config.InstanceRunning {
+				t.Errorf("status = %q, want running", meta.Status)
+			}
+			if got := strings.Count(errb.String(), msgAdoptedCluster); got != 1 {
+				t.Errorf("stderr holds the adopted-cluster warning %d times; want once:\n%s", got, errb.String())
+			}
+			if strings.Contains(out.String(), "already existed") {
+				t.Errorf("the warning reached stdout:\n%s", out.String())
+			}
+		})
 	}
 }
 
@@ -531,7 +642,9 @@ func TestInstallJSONOutput(t *testing.T) {
 // ADR 0023 M2.5 (A20-1), mutation 71e: install refuses to provision without
 // a service-account key. From M2.5 every cluster-writing command reads the
 // cluster as the installer's stored key, so an instance installed with
-// Application Default Credentials could only ever be released. The flag
+// Application Default Credentials could only ever be released; the two
+// refusals' texts are M2.7's (A30-25), which say those commands read and
+// write it so and name no other command. The flag
 // absent from a non-interactive run, a blank answer at the prompt, and a
 // --credentials file holding no key the writer could open (empty, /dev/null,
 // white space, or not a service-account key), are each a usage error naming
@@ -551,7 +664,7 @@ func TestInstallRefusesAMissingCredentials(t *testing.T) {
 			t.Errorf("mode %v: an install without a key recorded an instance or created a cluster", mode)
 		}
 	}
-	if want := "--credentials is required: since ADR 0023 M2.5 farcast reads an instance's cluster, and writes its storage key pin, " +
+	if want := "--credentials is required: since ADR 0023 M2.7 the commands that write to an instance's cluster read and write it " +
 		"as the service account whose key --credentials names, never as Application Default Credentials"; msgCredentialsRequired != want {
 		t.Errorf("the refusal is %q; want %q", msgCredentialsRequired, want)
 	}
@@ -619,7 +732,7 @@ func TestInstallRefusesAMissingCredentials(t *testing.T) {
 			}
 		})
 	}
-	if want := "--credentials names an empty file: since ADR 0023 M2.5 farcast reads an instance's cluster, and writes its storage key pin, " +
+	if want := "--credentials names an empty file: since ADR 0023 M2.7 the commands that write to an instance's cluster read and write it " +
 		"as the service account whose key --credentials names, never as Application Default Credentials"; msgCredentialsEmpty != want {
 		t.Errorf("the empty-file refusal is %q; want %q", msgCredentialsEmpty, want)
 	}

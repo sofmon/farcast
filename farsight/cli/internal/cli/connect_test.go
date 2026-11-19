@@ -14,11 +14,13 @@ import (
 	"io"
 	"log/slog"
 	"math/big"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -26,6 +28,7 @@ import (
 	"github.com/sofmon/farcast/farsight/cli/internal/components"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/image"
+	"github.com/sofmon/farcast/farsight/cli/internal/kube/kubetest"
 	"github.com/sofmon/farcast/farsight/cli/internal/oci"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
 	"github.com/sofmon/farcast/farsight/cli/internal/plan"
@@ -391,10 +394,14 @@ func installedInstance(t *testing.T, dir config.Dir, name string) *config.Instan
 		Status:    config.InstanceRunning,
 		CostLimit: config.CostLimit{Amount: 50, Currency: "USD", Period: "monthly"},
 	}
+	recordMigrated(meta)
 	if err := dir.SaveInstanceMetadata(name, meta); err != nil {
 		t.Fatal(err)
 	}
-	if err := dir.SaveInstanceKubeconfig(name, []byte("fake-kubeconfig")); err != nil {
+	// The kubeconfig.yaml an install before ADR 0023 M2.7 wrote: nothing
+	// writes it since, so it is written here as a file, for migrate's local
+	// fact.
+	if err := os.WriteFile(filepath.Join(dir.InstancePath(name), "kubeconfig.yaml"), []byte("fake-kubeconfig"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	// connect opens the provider from the stored credential to reach the
@@ -2069,5 +2076,38 @@ func TestConnectSourcePlanBindsTheDirectoryAndItsGo(t *testing.T) {
 	}
 	if len(r.fb.built)+len(r.fc.applied)+r.writers != 0 {
 		t.Errorf("built %d, applied %d and opened the writer %d times for a changed plan", len(r.fb.built), len(r.fc.applied), r.writers)
+	}
+}
+
+// ADR 0023 M2.6 (A23-35), M2.7 (A30-30): connect --confirm opens its
+// writer, and reads once as it, before it mints the instance's identity. A
+// first deploy, planned, then confirmed with the writer's token refused from
+// the confirm on, is refused credential_refused with no CA on this machine.
+// (TestCommandsThatApplyRefuseAMachineThatCannotApply pinned this order
+// until applyReady went at M2.7; the writer's preflight is the check that
+// remains.)
+func TestConnectConfirmMintsNoIdentityBeforeItsWriterReads(t *testing.T) {
+	p := applyingPlans(t)[0]
+	if p.String() != "connect/first deploy" {
+		t.Fatalf("applyingPlans' first plan is %s, not connect/first deploy", p)
+	}
+	var refuseWriter atomic.Bool
+	mints := kubetest.WithTokenAnswer(func(email string) (int, []byte, bool) {
+		if email != "writer@kubetest.invalid" || !refuseWriter.Load() {
+			return 0, nil, false
+		}
+		return http.StatusBadRequest, []byte(`{"error":"invalid_grant","error_description":"Invalid JWT Signature."}`), true
+	})
+	c := confirmApplying(t, p, func(_ *kubetest.Server, dir config.Dir, _ plan.Bound) {
+		if _, err := dir.LoadInstanceCACert(writeName); err == nil {
+			t.Fatal("the fixture already holds the instance's CA: its first deploy mints none")
+		}
+		refuseWriter.Store(true)
+	}, mints)
+	if kind := kindOf(classified(c.err)); kind != kindCredentialRefused {
+		t.Fatalf("connect --confirm with its writer's token refused = %v; kind %q, want %q", c.err, kind, kindCredentialRefused)
+	}
+	if _, err := c.dir.LoadInstanceCACert(writeName); err == nil {
+		t.Errorf("connect --confirm minted the instance's CA before its writer read the cluster, which refused it")
 	}
 }

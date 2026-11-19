@@ -197,6 +197,119 @@ func TestApplyConflictSurfacesFieldConflicts(t *testing.T) {
 	}
 }
 
+// settingsAt is settingsV1 with mode and, unless rv is "", the
+// metadata.resourceVersion line `resourceVersion: <rv>`, rv written as given
+// (quote it for a YAML string).
+func settingsAt(mode, rv string) string {
+	s := strings.Replace(settingsV1, `mode: "on"`, "mode: "+mode, 1)
+	if rv != "" {
+		s = strings.Replace(s, "  namespace: web\n", "  namespace: web\n  resourceVersion: "+rv+"\n", 1)
+	}
+	return s
+}
+
+// TestAllowResourceVersion (design §2.1, A30-40 as A31-2 amends it, §10.5
+// row 88c): AllowResourceVersion(rv) lets exactly one document of a stream
+// carry metadata.resourceVersion, a YAML string equal to rv. Another value, a
+// value that is not a string, and a second document carrying it are each
+// refused, and AllowResourceVersion("") allows nothing. Apply accepts the
+// document it let through and sends its bytes as they are, so the API server
+// holds the apply to that resourceVersion: at the stored one it applies, and
+// at a stale one it is a 409 that unwraps to tkube.ErrConflict, with nothing
+// written. A Document built by hand from the same bytes never carries the
+// allowance, so Apply refuses it and sends nothing.
+func TestAllowResourceVersion(t *testing.T) {
+	const notTheServers = "it carries metadata.resourceVersion, which only the API server sets"
+	for _, row := range []struct {
+		name, stream, rv string
+		want             string // the refusal, "" for none
+	}{
+		{"a match", settingsAt("one", `"41"`), "41", ""},
+		{"a match, single-quoted", settingsAt("one", `'41'`), "41", ""},
+		{"a document that carries none", settingsAt("one", ""), "41", ""},
+		{"one carrier among two documents", settingsAt("one", `"41"`) + "---\n" + strings.Replace(settingsAt("two", ""), "name: settings", "name: other", 1), "41", ""},
+		{"another value", settingsAt("one", `"40"`), "41",
+			`kube: document 0 (ConfigMap "settings") is refused: it carries metadata.resourceVersion "40", and only "41" is allowed`},
+		{"a second carrier", settingsAt("one", `"41"`) + "---\n" + strings.Replace(settingsAt("two", `"41"`), "name: settings", "name: other", 1), "41",
+			`kube: document 1 (ConfigMap "other") is refused: it carries metadata.resourceVersion, and so does an earlier document of the stream; only one may`},
+		{"a number", settingsAt("one", "41"), "41", `kube: document 0 (ConfigMap "settings") is refused: its metadata.resourceVersion is not a YAML string`},
+		{"a null", settingsAt("one", "null"), "41", `kube: document 0 (ConfigMap "settings") is refused: its metadata.resourceVersion is not a YAML string`},
+		{"no rv to allow", settingsAt("one", `""`), "", `kube: document 0 (ConfigMap "settings") is refused: ` + notTheServers},
+		{"no option", settingsAt("one", `"41"`), "-", `kube: document 0 (ConfigMap "settings") is refused: ` + notTheServers},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			var opts []kube.SplitOption
+			if row.rv != "-" {
+				opts = append(opts, kube.AllowResourceVersion(row.rv))
+			}
+			docs, err := kube.SplitStream([]byte(row.stream), opts...)
+			switch {
+			case row.want == "" && err != nil:
+				t.Errorf("SplitStream = %v; want the stream let through", err)
+			case row.want != "" && (!errors.Is(err, kube.ErrRefusedDocument) || err.Error() != row.want):
+				t.Errorf("SplitStream = %d documents, %v\nwant %q, wrapping ErrRefusedDocument", len(docs), err, row.want)
+			}
+		})
+	}
+
+	t.Run("Apply accepting the allowed document", func(t *testing.T) {
+		s := kubetest.New(t)
+		c, _ := connect(t, s, "writer")
+		ctx := t.Context()
+		created, err := c.Apply(ctx, splitOne(t, settingsAt("one", "")), true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stale := created.ResourceVersion
+		updated, err := c.Apply(ctx, splitOne(t, settingsAt("two", "")), true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		current := updated.ResourceVersion
+		at := func(mode, rv string) kube.Document {
+			t.Helper()
+			docs, err := kube.SplitStream([]byte(settingsAt(mode, `"`+rv+`"`)), kube.AllowResourceVersion(rv))
+			if err != nil || len(docs) != 1 {
+				t.Fatalf("SplitStream at %s = %d documents, %v", rv, len(docs), err)
+			}
+			return docs[0]
+		}
+
+		// At a stale resourceVersion: 409, nothing written.
+		_, err = c.Apply(ctx, at("three", stale), true)
+		if !errors.Is(err, tkube.ErrConflict) {
+			t.Errorf("an apply at a stale resourceVersion = %v; want a 409 unwrapping to tkube.ErrConflict", err)
+		}
+		if cm, err := c.GetConfigMap(ctx, "web", "settings"); err != nil || cm.Data["mode"] != "two" || cm.Metadata.ResourceVersion != current {
+			t.Errorf("after the refused apply: %+v, %v; want it unwritten", cm, err)
+		}
+
+		// At the stored one: applied, the document's bytes sent as they are.
+		d := at("four", current)
+		md, err := c.Apply(ctx, d, true)
+		if err != nil {
+			t.Fatalf("an apply at the stored resourceVersion = %v", err)
+		}
+		if md.ResourceVersion == current {
+			t.Errorf("the apply at the stored resourceVersion answered it unmoved")
+		}
+		if r := last(t, s); r.Method != http.MethodPatch || !bytes.Equal(r.Body, d.Raw) || !bytes.Contains(r.Body, []byte(`resourceVersion: "`+current+`"`)) {
+			t.Errorf("the apply sent %s with\n%s\nwant the document's own bytes", r.Method, r.Body)
+		}
+
+		// The same bytes in a Document built by hand carry no allowance.
+		before := len(s.Requests())
+		byHand := kube.Document{Index: d.Index, Kind: d.Kind, Namespace: d.Namespace, Name: d.Name, Raw: d.Raw}
+		_, err = c.Apply(ctx, byHand, true)
+		if want := `kube: document 0 (ConfigMap "settings") is refused: ` + notTheServers + "; nothing was sent"; !errors.Is(err, kube.ErrRefusedDocument) || err.Error() != want {
+			t.Errorf("Apply of a hand-built Document carrying a resourceVersion = %v\nwant %q", err, want)
+		}
+		if n := len(s.Requests()); n != before {
+			t.Errorf("the refused hand-built Document sent %d requests", n-before)
+		}
+	})
+}
+
 // TestApplyRefusesADocumentSplitStreamWouldNot: a hand-built Document with a
 // kind outside the table, a name that walks the path, or no bytes is
 // refused, and nothing is sent. So is one SplitStream would refuse for what

@@ -73,7 +73,7 @@ func TestIntegrationValidate(t *testing.T) {
 }
 
 // TestIntegrationClusterLifecycle provisions a real Autopilot cluster, asserts
-// it becomes ready with a kubeconfig, and tears it down. It is gated a second
+// it becomes ready, and tears it down. It is gated a second
 // time behind FARCAST_GKE_TEST_CREATE=1 because it is slow and bills real
 // money; teardown is registered up front so a mid-test failure still cleans up.
 func TestIntegrationClusterLifecycle(t *testing.T) {
@@ -113,17 +113,9 @@ func TestIntegrationClusterLifecycle(t *testing.T) {
 	if c.Status != planck.StatusRunning {
 		t.Errorf("status = %v, want running", c.Status)
 	}
-	if len(c.Kubeconfig) == 0 {
-		t.Error("expected a kubeconfig for the ready cluster")
-	}
-	// ADR 0004: the control plane is private — its endpoint is the DNS FQDN and
-	// the kubeconfig must not pin the cluster CA (the DNS endpoint is publicly
-	// trusted).
+	// ADR 0004: the control plane is private — its endpoint is the DNS FQDN.
 	if !strings.HasSuffix(c.Endpoint, ".gke.goog") {
 		t.Errorf("endpoint = %q, want a DNS endpoint (…gke.goog)", c.Endpoint)
-	}
-	if strings.Contains(string(c.Kubeconfig), "certificate-authority-data") {
-		t.Error("DNS-endpoint kubeconfig must not embed certificate-authority-data")
 	}
 	// ADR 0019: CreateCluster refuses a cluster that does not read back as
 	// system-only logging, so reaching here means the live cloud accepted and

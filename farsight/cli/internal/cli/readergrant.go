@@ -106,10 +106,10 @@ var readerReviews = []readerReview{
 // automated: nothing else in FarCast grants a Google identity RBAC, so --yes
 // never covers it.
 //
-// Until ADR 0023 M2.7 the RBAC is applied by kubectl, as the active gcloud
-// configuration, through newApplier, a writer client that makes no
-// in-process call; the verifying read and reviews are the first in-process
-// calls, as the reader, through newReader.
+// Since ADR 0023 M2.7 the RBAC is applied in-process, with server-side
+// apply, as the instance's writer through newApplier, its first in-process
+// call; the verifying read and reviews follow, as the reader, through
+// newReader.
 type readerGrantCommand struct {
 	yes bool
 	// consent is --plan and --confirm <digest> (ADR 0023 M2.6): the route
@@ -172,8 +172,8 @@ reader as above, and records it. A plan for a reader that is not recorded,
 not uploaded or not the one farcast derives is blocked, and its --confirm
 refuses.
 
-Until ADR 0023 M2.7 the RBAC is applied with kubectl, as the active gcloud
-configuration.`)
+The RBAC is applied in-process, with server-side apply, as the instance's
+installer service account (the key 'farcast install --credentials' stored).`)
 }
 
 func (c *readerGrantCommand) SetFlags(fs *flag.FlagSet) {
@@ -260,6 +260,11 @@ func (c *readerGrantCommand) Run(ctx context.Context, env *Env, args []string) e
 	if err != nil {
 		return err
 	}
+	// The grant applies RBAC, so an instance not migrated to server-side
+	// apply is refused before anything is rendered (design A30-20).
+	if err := refuseUnmigrated(name, meta); err != nil {
+		return err
+	}
 	p, b, err := c.plan(ctx, env, meta)
 	if err != nil {
 		return err
@@ -299,9 +304,7 @@ func (c *readerGrantCommand) Run(ctx context.Context, env *Env, args []string) e
 	if err != nil {
 		return err
 	}
-	if err := applyReady(applier); err != nil {
-		return err
-	}
+	defer afterWrites(env, name, applier)
 	// --confirm is the consent: the operator read the plan this one is.
 	if mode == consentNone {
 		ok, err := newPrompter(env.In, env.Err).yesNo(fmt.Sprintf(msgReaderGrantPrompt,
@@ -316,10 +319,11 @@ func (c *readerGrantCommand) Run(ctx context.Context, env *Env, args []string) e
 	}
 	email := p.email
 
-	// 5. The apply, through kubectl as the active gcloud configuration until
-	// ADR 0023 M2.7.
+	// 5. The apply, in-process as the writer, the installer's key. A 403 it
+	// meets says whose it was (writerRefused); the verification's errors
+	// below are the reader's, and do not.
 	if err := applier.Apply(ctx, p.stream); err != nil {
-		return fmt.Errorf("apply instance %q's reader RBAC: %w; nothing was recorded", name, err)
+		return fmt.Errorf("apply instance %q's reader RBAC: %w; nothing was recorded", name, writerRefused(err, meta))
 	}
 
 	// 6. The verification, as the reader opened above.

@@ -77,7 +77,7 @@ Keep the Mac's `$R/a` from this step: W0 uses it as `$REL`, and W7 deletes it. D
    mkdir -p "$WALK/bin" && cp "$REL/farcast-darwin-arm64" "$WALK/bin/farcast"
    ```
    An outbound firewall that makes its rules per binary (Little Snitch, on the walk Mac) asks about `$WALK/bin/farcast` the first time it reaches each host. Allow it, for that destination only: Google's APIs, the registry's `<region>-docker.pkg.dev`, `gcr.io` for the base image, and the carrier's address on port 8443 after W2.
-4. **Exactly three tools.** Link `kubectl`, the GKE auth plugin and `gcloud` one by one into a directory of their own. Never put a whole tool directory on the walk shell's `PATH`: on the walk Mac, Homebrew's `/opt/homebrew/bin` holds the plugin and `gcloud`, and also `go` and `gofmt`.
+4. **Exactly three tools.** Link `kubectl`, the GKE auth plugin and `gcloud` one by one into a directory of their own. *(2026-11-18, ADR 0023 M2.7, built, not walked: farcast starts none of the three, so a re-walk gives `farcast` no rules or tools for them; they serve only observation, which a re-walk runs from Cloud Shell.)* Never put a whole tool directory on the walk shell's `PATH`: on the walk Mac, Homebrew's `/opt/homebrew/bin` holds the plugin and `gcloud`, and also `go` and `gofmt`.
    ```bash
    mkdir -p "$WALK/tools"
    for t in kubectl gke-gcloud-auth-plugin gcloud; do ln -s "$(command -v "$t")" "$WALK/tools/$t"; done
@@ -93,6 +93,7 @@ Keep the Mac's `$R/a` from this step: W0 uses it as `$REL`, and W7 deletes it. D
    command -v go gofmt                # HARD STOP if this prints anything
    STATE="$HOME/Library/Application Support/farcast"
    export KUBECONFIG="$STATE/instances/$INSTANCE/kubeconfig.yaml"   # W1 writes it
+   # (2026-11-18, ADR 0023 M2.7, built, not walked) Neither install nor connect writes kubeconfig.yaml any more, and farcast migrate deletes it. A re-walk observes with kubectl from Cloud Shell (ADR 0023 Phasing), not over a file farcast wrote; an exported KUBECONFIG naming the absent file fails rather than falling back to ~/.kube/config [inf].
    cd "$WALK"                         # outside any checkout
    farcast version
    ```
@@ -104,6 +105,7 @@ Keep the Mac's `$R/a` from this step: W0 uses it as `$REL`, and W7 deletes it. D
    INSTANCE=<name>; WALK=<the same directory>
    STATE="$HOME/Library/Application Support/farcast"
    export KUBECONFIG="$STATE/instances/$INSTANCE/kubeconfig.yaml"
+   # (2026-11-18, ADR 0023 M2.7, built, not walked) Neither install nor connect writes kubeconfig.yaml any more, and farcast migrate deletes it. A re-walk observes with kubectl from Cloud Shell (ADR 0023 Phasing), not over a file farcast wrote; an exported KUBECONFIG naming the absent file fails rather than falling back to ~/.kube/config [inf].
    export CLOUDSDK_ACTIVE_CONFIG_NAME=<your FarCast gcloud configuration>
    # the carried manifests, by component, from the release farcast itself
    carried() { "$WALK/bin/farcast" -o json version | grep -o '"name":"[a-z]*","go":"[^"]*","manifest":"sha256:[0-9a-f]*"'; }

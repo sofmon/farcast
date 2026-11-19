@@ -69,19 +69,16 @@ func TestRegisterPanicsOnDuplicate(t *testing.T) {
 	Register(name, func(Config) (Provider, error) { return fakeProvider{name: name}, nil })
 }
 
-func TestClusterStringRedactsKubeconfig(t *testing.T) {
+// ADR 0023 M2.7 (A30-34): a Cluster carries no credential, so String names
+// its Ref, Status and Endpoint, exactly, and redacts nothing.
+func TestClusterStringNamesRefStatusAndEndpoint(t *testing.T) {
 	c := Cluster{
-		Ref:        ClusterRef{Name: "demo", Location: "us-central1"},
-		Status:     StatusRunning,
-		Endpoint:   "203.0.113.1",
-		Kubeconfig: []byte("SUPER-SECRET-KUBECONFIG"),
+		Ref:      ClusterRef{Name: "demo", Location: "us-central1"},
+		Status:   StatusRunning,
+		Endpoint: "203.0.113.1",
 	}
-	s := c.String()
-	if strings.Contains(s, "SUPER-SECRET-KUBECONFIG") {
-		t.Errorf("String() leaked the kubeconfig: %s", s)
-	}
-	if !strings.Contains(s, "demo") || !strings.Contains(s, "203.0.113.1") {
-		t.Errorf("String() = %q, want the ref and endpoint", s)
+	if got, want := c.String(), "Cluster{Ref:us-central1/demo Status:running Endpoint:203.0.113.1}"; got != want {
+		t.Errorf("String() = %q, want %q", got, want)
 	}
 }
 

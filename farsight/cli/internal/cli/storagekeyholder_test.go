@@ -283,6 +283,7 @@ func TestDeployRefusesWithoutATunnel(t *testing.T) {
 		t.Fatal(err)
 	}
 	meta := &config.InstanceMetadata{Name: "prod", Provider: "gke", Region: "us-central1", Status: "running"}
+	recordMigrated(meta)
 	if err := dir.SaveInstanceMetadata("prod", meta); err != nil {
 		t.Fatal(err)
 	}
@@ -360,6 +361,7 @@ func TestDeployDoesNotMintOverAnExistingBucket(t *testing.T) {
 		FatLineDeployed: true,
 		Storage:         &config.Storage{Bucket: "farcast-prod-abc", Location: "us-central1"},
 	}
+	recordMigrated(meta)
 	if err := dir.SaveInstanceMetadata("prod", meta); err != nil {
 		t.Fatal(err)
 	}
@@ -398,6 +400,7 @@ func TestDeployCreatesNothingWithoutConsent(t *testing.T) {
 		Name: "prod", Provider: "gke", Region: "us-central1", Status: "running",
 		FatLineDeployed: true,
 	}
+	recordMigrated(meta)
 	if err := dir.SaveInstanceMetadata("prod", meta); err != nil {
 		t.Fatal(err)
 	}
@@ -788,6 +791,7 @@ func TestDeployReallyMintsTheBucket(t *testing.T) {
 	meta.FatLineDeployed = true
 	meta.Storage.Bucket = ""
 	meta.Storage.CreatedAt = time.Time{}
+	recordMigrated(meta)
 	if err := dir.SaveInstanceMetadata("prod", meta); err != nil {
 		t.Fatal(err)
 	}

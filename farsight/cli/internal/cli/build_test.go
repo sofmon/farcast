@@ -158,7 +158,9 @@ func TestABuilderImageIsRequired(t *testing.T) {
 }
 
 // A failed build must surface the build's own output. Repeating "the build
-// failed" helps nobody; the Containerfile said why.
+// failed" helps nobody; the Containerfile said why. Since ADR 0023 M2.7
+// (A30-35) the error points at that output, printed above it, and names no
+// tool the operator would need.
 func TestAFailedBuildShowsTheBuildsOwnOutput(t *testing.T) {
 	dir := config.Dir(t.TempDir())
 	meteringInstance(t, dir, "p42")
@@ -179,8 +181,8 @@ func TestAFailedBuildShowsTheBuildsOwnOutput(t *testing.T) {
 	if !strings.Contains(errOut, "failed to execute command") {
 		t.Errorf("the build's own output was not shown:\n%s", errOut)
 	}
-	if !strings.Contains(err.Error(), "logs job/") {
-		t.Errorf("the failure does not say how to read more: %v", err)
+	if want := "the build of p42/api failed; the end of its log, when it could be read, is printed above"; err.Error() != want {
+		t.Errorf("the failure = %q, want %q", err, want)
 	}
 }
 
@@ -460,8 +462,8 @@ func TestBuildPlanBindsTheBuildItRuns(t *testing.T) {
 }
 
 // ADR 0023 M2.6 (A23-37): build --confirm compares the plan it recomputes
-// with the digest given, and only then opens the writer, runs applyReady and
-// the preflight read, and applies exactly the documents the plan bound, then
+// with the digest given, and only then opens the writer and makes its
+// preflight read, and applies exactly the documents the plan bound, then
 // waits for the Job, asking nothing, with no terminal and no --yes. A plan
 // that changed since (the cost limit, which its cost fact binds) is refused
 // plan_changed with no writer opened and nothing applied.

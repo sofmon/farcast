@@ -27,6 +27,7 @@ import (
 	pfetch "github.com/sofmon/farcast/planck/fetch"
 	"github.com/sofmon/farcast/planck/translate"
 	tcdeploy "github.com/sofmon/farcast/technocore/deploy"
+	tkube "github.com/sofmon/farcast/technocore/kube"
 	"github.com/sofmon/farcast/technocore/pricing"
 )
 
@@ -54,11 +55,13 @@ type runPlanReader interface {
 }
 
 // runCluster is the slice of the cluster client `run` writes through: what
-// its plan reads, and the applies of the fetch, the builds, the egress policy,
-// the workloads and the meter, and the workloads' rollout.
+// its plan reads, and the applies of the fetch, the builds, the workloads and
+// the meter, the egress policy's at the resourceVersion it was read at
+// (ApplyAt, A30-40), and the workloads' rollout.
 type runCluster interface {
 	runPlanReader
 	jobWaiter
+	ApplyAt(ctx context.Context, manifest []byte, resourceVersion string) error
 	RolloutStatus(ctx context.Context, namespace, name string, timeout time.Duration) error
 }
 
@@ -266,6 +269,10 @@ const msgRunNeedsReader = "'farcast run --confirm' computes the deploy plan as i
 const msgFetchJobGone = "the plan's fetch stage changed, or the fetch Job its deploy plan read is gone " +
 	"(a fetch Job is kept %d minutes after it finishes)"
 
+// msgRunBuildFailed is run's error for a failed build: the app. The end of
+// the build's log, when JobLogs could read it, is printed above it.
+const msgRunBuildFailed = "the build of %s failed; nothing was deployed. The end of its log, when it could be read, is printed above"
+
 // msgNothingDeployed ends an error met once the manifest was read and before
 // anything was built.
 const msgNothingDeployed = "the manifest was read, and nothing was built or deployed"
@@ -296,6 +303,9 @@ func (c *runCommand) Run(ctx context.Context, env *Env, args []string) (err erro
 	if err := recordNamed(meta, name); err != nil {
 		return err
 	}
+	if err := refuseUnmigrated(name, meta); err != nil {
+		return err
+	}
 	if meta.Registry == nil || meta.Registry.Prefix == "" {
 		return fmt.Errorf("instance %q has no image registry recorded; run 'farcast connect %s' first", name, name)
 	}
@@ -315,15 +325,16 @@ func (c *runCommand) Run(ctx context.Context, env *Env, args []string) (err erro
 	// before any toolchain image is resolved or pushed, anything is fetched
 	// or asked (ADR 0023 M2.5, A20-10 and A20-11): an instance this machine
 	// cannot write as is refused with nothing spent, and an endpoint that
-	// refuses the installer's key refuses it before kubectl applies the
-	// fetch. --plan never opens it, and --confirm only after a comparison
-	// (A23-23, A23-47).
+	// refuses the installer's key refuses it before the fetch is applied.
+	// --plan never opens it, and --confirm only after a comparison (A23-23,
+	// A23-47).
 	var cl runCluster
 	var uid string
 	if mode == consentNone {
 		if cl, uid, err = openReadyAt(ctx, env, meta, c.newCluster); err != nil {
 			return err
 		}
+		defer afterWrites(env, name, cl)
 	}
 	pf, fb, err := c.fetchPlan(ctx, env, meta, repo, blocked)
 	if err != nil {
@@ -399,6 +410,7 @@ func (c *runCommand) confirmed(ctx context.Context, env *Env, meta *config.Insta
 		if err != nil {
 			return err
 		}
+		defer afterWrites(env, name, cl)
 		if err := applyFetch(ctx, env, cl, pf.cfg); err != nil {
 			return err
 		}
@@ -453,6 +465,7 @@ func (c *runCommand) confirmed(ctx context.Context, env *Env, meta *config.Insta
 	if err != nil {
 		return err
 	}
+	defer afterWrites(env, name, cl)
 	return c.deploy(ctx, env, meta, cl, p, consentConfirm)
 }
 
@@ -798,8 +811,9 @@ func (c *runCommand) deployPlan(ctx context.Context, env *Env, meta *config.Inst
 		return p, plan.Bound{}, err
 	}
 
-	// The egress policy, merged, at the resourceVersion it was read at, each
-	// application's credential a placeholder.
+	// The egress policy, merged, each application's credential a
+	// placeholder, rendered at the resourceVersion it was read at, which its
+	// document carries and its write binds (A30-40).
 	existing, rv, err := readEgressPolicyAt(ctx, rd)
 	if err != nil {
 		return p, plan.Bound{}, planRead(m, err, name)
@@ -809,19 +823,13 @@ func (c *runCommand) deployPlan(ctx context.Context, env *Env, meta *config.Inst
 	if err != nil {
 		return p, plan.Bound{}, err
 	}
-	policyStream, err := fldeploy.RenderPolicyConfigMap(fldeploy.DefaultNamespace, doc)
+	policyStream, err := fldeploy.RenderPolicyConfigMap(fldeploy.DefaultNamespace, doc, rv)
 	if err != nil {
 		return p, plan.Bound{}, err
 	}
-	policyWrites, err := applyFacts(policyStream)
+	policyWrites, err := applyFactsAt(policyStream, rv)
 	if err != nil {
 		return p, plan.Bound{}, err
-	}
-	for i, f := range policyWrites {
-		if w, ok := f.(plan.WriteFact); ok {
-			w.ResourceVersion = rv
-			policyWrites[i] = w
-		}
 	}
 
 	// The builds, and each application's image by a placeholder digest.
@@ -1089,8 +1097,9 @@ func placeholderAppLeaf(namespace, app string) ([]byte, []byte, error) {
 	return []byte(leaf + ":cert"), []byte(leaf + ":key"), nil
 }
 
-// The --confirm re-read's refusals (A23-48, A28-1, A28-10): what changed
-// while the builds ran, and that the builds alone were written.
+// The --confirm re-read's refusals (A23-48, A28-1, A28-10), and the egress
+// policy's 409 in every mode (A30-40): what changed while the builds ran,
+// and that the builds alone were written.
 const (
 	msgAppsChanged          = "%s changed since the plan was made (the kernel stopped or resized it); " + msgBuildsWrittenClause
 	msgLimitReachedSince    = "the instance's spending reached its limit, or its kernel's ledger became unreadable or stale, since the plan was made; " + msgBuildsWrittenClause
@@ -1108,7 +1117,9 @@ const (
 // ledger and the applications again, writes the egress policy, mints and
 // hands over the storage scopes, applies the workloads and meters them, from
 // p's decisions alone. cl is the writer. Under --confirm (m) every write
-// after the builds is checked against the plan first (§9.5, A23-48, A28-10).
+// after the builds is checked against the plan first (§9.5, A23-48, A28-10),
+// and in every mode the egress policy is written at the resourceVersion read
+// just before it (A30-40).
 func (c *runCommand) deploy(ctx context.Context, env *Env, meta *config.InstanceMetadata, cl runCluster, p preparedDeploy, m consentMode) error {
 	name, namespace := meta.Name, p.namespace
 
@@ -1136,7 +1147,8 @@ func (c *runCommand) deploy(ctx context.Context, env *Env, meta *config.Instance
 	// 4. Mint this deployment's egress credentials and write the instance's
 	//    policy, merged with every other deployment's (ADR 0013). The read
 	//    comes first, then, under --confirm, its comparison with the plan's,
-	//    and the mint after both (A28-10).
+	//    and the mint after both (A28-10); the write is at the read's
+	//    resourceVersion (A30-40).
 	existing, rv, err := readEgressPolicyAt(ctx, cl)
 	if err != nil {
 		return err
@@ -1148,7 +1160,7 @@ func (c *runCommand) deploy(ctx context.Context, env *Env, meta *config.Instance
 	if err != nil {
 		return err
 	}
-	policyManifest, err := fldeploy.RenderPolicyConfigMap(fldeploy.DefaultNamespace, doc)
+	policyManifest, err := fldeploy.RenderPolicyConfigMap(fldeploy.DefaultNamespace, doc, rv)
 	if err != nil {
 		return err
 	}
@@ -1156,7 +1168,20 @@ func (c *runCommand) deploy(ctx context.Context, env *Env, meta *config.Instance
 	// before that application starts asking. It polls, so the window is not
 	// zero — but an application that starts first is denied for a few seconds,
 	// where one whose policy never arrives is denied forever.
-	if err := cl.Apply(ctx, policyManifest); err != nil {
+	//
+	// The policy carries the resourceVersion just read, and the API server
+	// holds the apply to it (A30-40, A31-2): a policy another run wrote since
+	// that read is a 409 and is not written over. In every mode that is what
+	// this deploy relied on changing after it was decided, with one attempt
+	// and no merge again: a retry would merge with credentials this run
+	// already minted, for a race only two concurrent runs meet. A policy that
+	// was absent carries no resourceVersion, since server-side apply cannot
+	// say "create only", and one deleted after the read is recreated from
+	// this merge: the precondition sees neither.
+	if err := cl.ApplyAt(ctx, policyManifest, rv); err != nil {
+		if errors.Is(err, tkube.ErrConflict) {
+			return changedAfterPlan(m, msgPolicyChangedSince)
+		}
 		return fmt.Errorf("write the egress policy: %w", err)
 	}
 
@@ -1306,8 +1331,7 @@ func (c *runCommand) buildAll(ctx context.Context, env *Env, cl jobWaiter, meta 
 				Instance: meta.Name, Project: meta.Project, Region: meta.Region,
 				Namespace: pbuild.Namespace, ServiceAccount: pbuild.ServiceAccount,
 			})
-			return nil, fmt.Errorf("the build of %s failed; nothing was deployed. Its Job survives for an hour, "+
-				"so 'kubectl -n %s logs job/%s' still works", b.app, pbuild.Namespace, b.job)
+			return nil, fmt.Errorf(msgRunBuildFailed, b.app)
 		}
 		digest := strings.TrimSpace(res.Message)
 		if !isSHA256(digest) {

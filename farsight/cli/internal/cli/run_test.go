@@ -25,12 +25,14 @@ import (
 	dsdeploy "github.com/sofmon/farcast/datasphere/deploy"
 	"github.com/sofmon/farcast/farsight/cli/internal/cluster"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
+	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
 	"github.com/sofmon/farcast/manifest/parser"
 	pbuild "github.com/sofmon/farcast/planck/build"
 	pfetch "github.com/sofmon/farcast/planck/fetch"
 	tcdeploy "github.com/sofmon/farcast/technocore/deploy"
 	"github.com/sofmon/farcast/technocore/kernel"
+	tkube "github.com/sofmon/farcast/technocore/kube"
 )
 
 const (
@@ -121,6 +123,12 @@ type fakeRunCluster struct {
 	// fails it.
 	workloadReads []string
 	workloadsErr  error
+	// appliedAt is the resourceVersion each ApplyAt was given, in order, a
+	// refused one's included; onApplyAt runs as ApplyAt is called, before it
+	// answers: another writer acting between run's re-read of the egress
+	// policy and its apply.
+	appliedAt []string
+	onApplyAt func()
 }
 
 type cmFailure struct {
@@ -148,6 +156,44 @@ func (f *fakeRunCluster) JobState(_ context.Context, _, name string) (cluster.Jo
 
 func (f *fakeRunCluster) Apply(_ context.Context, m []byte) error {
 	checkApplied(m)
+	return f.record(m)
+}
+
+// ApplyAt is Apply of one document at a resourceVersion, as the cluster
+// client's is (ADR 0023 M2.7, A30-40 as A31-2 amends it). The manifest is
+// checked as cluster.ApplyAt splits it, with rv allowed, and then held to
+// the API server's answers: a document carrying a resourceVersion other than
+// the one ConfigMapData answers for a ConfigMap that is there is refused with
+// a 409, tkube.ErrConflict, and is not in applied, since nothing was written;
+// for one that is absent it is created, as the server recreates a deleted
+// one; and one carrying none is applied with no precondition.
+func (f *fakeRunCluster) ApplyAt(ctx context.Context, m []byte, rv string) error {
+	f.appliedAt = append(f.appliedAt, rv)
+	if f.onApplyAt != nil {
+		f.onApplyAt()
+	}
+	checkApplied(m, kube.AllowResourceVersion(rv))
+	var doc struct {
+		Metadata struct {
+			Name            string `yaml:"name"`
+			Namespace       string `yaml:"namespace"`
+			ResourceVersion string `yaml:"resourceVersion"`
+		} `yaml:"metadata"`
+	}
+	if err := yaml.Unmarshal(m, &doc); err != nil {
+		return err
+	}
+	md := doc.Metadata
+	if _, stored, found, _ := f.ConfigMapData(ctx, md.Namespace, md.Name); md.ResourceVersion != "" && found && md.ResourceVersion != stored {
+		return fmt.Errorf("test: the apply of ConfigMap %s/%s answered 409, the object has been modified: %w", md.Namespace, md.Name, tkube.ErrConflict)
+	}
+	return f.record(m)
+}
+
+// record is what Apply and ApplyAt do with a manifest they take: it is
+// applied, each Job in it is there, and the answer is applyErr, or
+// applyErrOn's refusal.
+func (f *fakeRunCluster) record(m []byte) error {
 	f.applied = append(f.applied, string(m))
 	if f.jobs == nil {
 		f.jobs = map[string]bool{}

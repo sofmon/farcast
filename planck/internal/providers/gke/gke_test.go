@@ -109,9 +109,6 @@ func TestCreateClusterProvisionsAndWaits(t *testing.T) {
 	if c.Endpoint != "uid.us-central1.gke.goog" {
 		t.Errorf("endpoint = %q, want the DNS endpoint", c.Endpoint)
 	}
-	if len(c.Kubeconfig) == 0 {
-		t.Error("expected a kubeconfig")
-	}
 	if !c.SystemLogsOnly {
 		t.Error("a cluster that read back system-only must be reported as such (ADR 0019)")
 	}
@@ -128,6 +125,34 @@ func TestCreateClusterIdempotent(t *testing.T) {
 	}
 	if api.created != nil {
 		t.Error("create() must not be called when the cluster already exists")
+	}
+}
+
+// ADR 0023 M2.7 (design A30-25): CreateCluster says whether it created the
+// cluster in that call. One the look-up did not find, and this call
+// created, is Created; one already under the name, returned as found, is
+// not, so a caller never takes a cluster another machine made for a new one.
+func TestCreateClusterSaysWhetherItCreated(t *testing.T) {
+	running := stateResult{state: clusterState{RawStatus: "RUNNING", Endpoint: "uid.us-central1.gke.goog", SystemLogsOnly: true}, exists: true}
+	for _, row := range []struct {
+		name   string
+		states []stateResult
+		want   bool
+	}{
+		{"new", []stateResult{{exists: false}, {state: clusterState{RawStatus: "PROVISIONING"}, exists: true}, running}, true},
+		{"existing", []stateResult{running}, false},
+		{"existing, still provisioning", []stateResult{{state: clusterState{RawStatus: "PROVISIONING"}, exists: true}, running}, false},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			api := &fakeClient{states: row.states}
+			c, err := newTestProvider(api).CreateCluster(context.Background(), planck.ClusterSpec{Name: "demo"})
+			if err != nil {
+				t.Fatalf("CreateCluster: %v", err)
+			}
+			if c.Created != row.want || (api.created != nil) != row.want {
+				t.Errorf("Created = %v, and create() called = %v; want both %v", c.Created, api.created != nil, row.want)
+			}
+		})
 	}
 }
 
@@ -388,20 +413,6 @@ func TestMapStatus(t *testing.T) {
 		if got := mapStatus(raw); got != want {
 			t.Errorf("mapStatus(%q) = %v, want %v", raw, got, want)
 		}
-	}
-}
-
-func TestBuildKubeconfig(t *testing.T) {
-	kc := string(buildKubeconfig("demo", "uid.us-central1.gke.goog"))
-	for _, want := range []string{"name: demo", "server: https://uid.us-central1.gke.goog", "gke-gcloud-auth-plugin"} {
-		if !strings.Contains(kc, want) {
-			t.Errorf("kubeconfig missing %q:\n%s", want, kc)
-		}
-	}
-	// The DNS endpoint uses a publicly-trusted cert (ADR 0004), so the kubeconfig
-	// must not pin the cluster CA.
-	if strings.Contains(kc, "certificate-authority-data") {
-		t.Errorf("kubeconfig must not embed certificate-authority-data:\n%s", kc)
 	}
 }
 

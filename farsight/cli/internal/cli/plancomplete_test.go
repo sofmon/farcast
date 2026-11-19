@@ -142,11 +142,250 @@ func everyPlanShape(t *testing.T) []planCommand {
 
 // ADR 0023 M2.6d (design §28's step 9b): every command that writes to an
 // instance's cluster has its plan run by the plan tests: everyPlanShape's
-// guard, alone.
+// guard. And each row says who its plan reads the cluster as (M2.7,
+// A30-26): its identity, reader, writer or none, is the cluster_identity of
+// the plan it prints, and a row that reads the cluster as the reader says
+// so (readsCluster) exactly when its identity is the reader.
 func TestEveryWritingCommandHasAPlanRow(t *testing.T) {
-	if len(everyPlanShape(t)) == 0 {
+	rows := everyPlanShape(t)
+	if len(rows) == 0 {
 		t.Fatal("no plan shape")
 	}
+	for _, row := range rows {
+		t.Run(row.String(), func(t *testing.T) {
+			if !slices.Contains([]string{"reader", "writer", "none"}, row.identity) {
+				t.Fatalf("%s's identity is %q; say who its plan reads the cluster as: reader, writer or none", row, row.identity)
+			}
+			if row.readsCluster != (row.identity == "reader") {
+				t.Errorf("%s reads the cluster as the reader: %v, and its identity is %q", row, row.readsCluster, row.identity)
+			}
+			_, dir := planFixture(t, row)
+			doc, _ := runPrintedPlan(t, dir, row, output.ModeJSON)
+			if got := decodedBound(t, doc).ClusterIdentity; got != row.identity {
+				t.Errorf("%s's plan reads the cluster as %q; its row says %q", row, got, row.identity)
+			}
+		})
+	}
+}
+
+// writeMethods are the methods of a seam that writes to a cluster: an apply,
+// the pin's create and replace, and migrate's rewrite (A30-26).
+var writeMethods = []string{"Apply", "CreateConfigMap", "ReplaceConfigMap", "PatchManagedFields"}
+
+// productionWriters is every command farcast's router reaches, by the name
+// a command line gives it, each built by defaultRegistry and walked down
+// every group (storage key among them), that holds a seam that writes to a
+// cluster, with the path of its first such seam (ADR 0023 M2.7, A30-26,
+// RV-3). A seam is a field of the command whose type is a func, named
+// (pinStoreOpener) or not, or such a field of a field of type
+// fatlineDeployer, embedded (connect, redeploy) or named (kernel deploy's
+// deployer); it writes when its first result is an interface whose method
+// set holds one of writeMethods.
+func productionWriters(t *testing.T) map[string]string {
+	t.Helper()
+	deployer := reflect.TypeFor[fatlineDeployer]()
+	writing := func(ft reflect.Type) bool {
+		if ft.Kind() != reflect.Func || ft.NumOut() == 0 || ft.Out(0).Kind() != reflect.Interface {
+			return false
+		}
+		return slices.ContainsFunc(writeMethods, func(m string) bool {
+			_, ok := ft.Out(0).MethodByName(m)
+			return ok
+		})
+	}
+	seamOf := func(typ reflect.Type) string {
+		for i := range typ.NumField() {
+			f := typ.Field(i)
+			if writing(f.Type) {
+				return f.Name
+			}
+			if f.Type != deployer {
+				continue
+			}
+			for j := range deployer.NumField() {
+				if d := deployer.Field(j); writing(d.Type) {
+					return f.Name + "." + d.Name
+				}
+			}
+		}
+		return ""
+	}
+	found := map[string]string{}
+	var walk func(prefix string, reg *Registry)
+	walk = func(prefix string, reg *Registry) {
+		for _, c := range reg.Commands() {
+			name := strings.TrimSpace(prefix + " " + c.Name())
+			if g, ok := c.(*group); ok {
+				walk(name, g.subs)
+				continue
+			}
+			typ := reflect.TypeOf(c)
+			if typ.Kind() == reflect.Pointer {
+				typ = typ.Elem()
+			}
+			if typ.Kind() != reflect.Struct {
+				continue
+			}
+			if seam := seamOf(typ); seam != "" {
+				found[name] = seam
+			}
+		}
+	}
+	walk("", defaultRegistry())
+	if len(found) == 0 {
+		t.Fatal("farcast's router reaches no command that writes to a cluster")
+	}
+	return found
+}
+
+// refusingTypes is every type in this package's non-test source with a
+// method whose body calls refuseUnmigrated. It reads the source files from
+// disk, so a mutation made through go test -overlay is not in what it reads.
+func refusingTypes(dir string) (map[string]bool, error) {
+	files, err := filepath.Glob(filepath.Join(dir, "*.go"))
+	if err != nil {
+		return nil, err
+	}
+	fset := token.NewFileSet()
+	found := map[string]bool{}
+	for _, path := range files {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, path, nil, parser.SkipObjectResolution)
+		if err != nil {
+			return nil, err
+		}
+		for _, d := range f.Decls {
+			fn, ok := d.(*ast.FuncDecl)
+			if !ok || fn.Body == nil || fn.Recv == nil || len(fn.Recv.List) != 1 {
+				continue
+			}
+			rt := fn.Recv.List[0].Type
+			if star, ok := rt.(*ast.StarExpr); ok {
+				rt = star.X
+			}
+			id, ok := rt.(*ast.Ident)
+			if !ok {
+				continue
+			}
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				if call, ok := n.(*ast.CallExpr); ok {
+					if fun, ok := call.Fun.(*ast.Ident); ok && fun.Name == "refuseUnmigrated" {
+						found[id.Name] = true
+					}
+				}
+				return true
+			})
+		}
+	}
+	return found, nil
+}
+
+// ADR 0023 M2.7 (A30-26, RV-3; §10.5 row 93c): every command in production
+// that can write to a cluster is a writeCommands row, so the tests over
+// writeCommands, and the refusal of an unmigrated instance with them, run
+// it. The writers are derived from farcast itself (productionWriters), never
+// listed: their names must be exactly writeCommands' names. The walk reaches
+// a seam held in an embedded fatlineDeployer (connect), in a named one
+// (kernel meter's deployer), and of a named func type (storage key pin's
+// pinStoreOpener). And every such command's type but migrateCommand has a
+// method that calls refuseUnmigrated, while migrateCommand has none: migrate
+// never refuses an unmigrated instance, which is how one comes to be
+// recorded (A30-20).
+func TestEveryProductionWriterIsAWriteCommand(t *testing.T) {
+	writers := productionWriters(t)
+	var got, want []string
+	for name := range writers {
+		got = append(got, name)
+	}
+	for _, wc := range writeCommands() {
+		want = append(want, wc.name)
+	}
+	slices.Sort(got)
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Errorf("the commands farcast's router reaches that write to a cluster are %q; writeCommands holds %q", got, want)
+	}
+	for name, seam := range map[string]string{
+		"kernel meter":    "deployer.newCluster",
+		"connect":         "fatlineDeployer.newCluster",
+		"storage key pin": "newPinStore",
+		"migrate":         "newCluster",
+	} {
+		if writers[name] != seam {
+			t.Errorf("%s writes through %q; want it found through %q", name, writers[name], seam)
+		}
+	}
+
+	refusing, err := refusingTypes(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	commands := map[string]Command{}
+	var index func(prefix string, reg *Registry)
+	index = func(prefix string, reg *Registry) {
+		for _, c := range reg.Commands() {
+			name := strings.TrimSpace(prefix + " " + c.Name())
+			if g, ok := c.(*group); ok {
+				index(name, g.subs)
+				continue
+			}
+			commands[name] = c
+		}
+	}
+	index("", defaultRegistry())
+	for name := range writers {
+		typ := reflect.TypeOf(commands[name])
+		if typ.Kind() == reflect.Pointer {
+			typ = typ.Elem()
+		}
+		switch {
+		case typ.Name() == "migrateCommand" && refusing[typ.Name()]:
+			t.Errorf("%s (%s) calls refuseUnmigrated; migrate never refuses an unmigrated instance", name, typ.Name())
+		case typ.Name() != "migrateCommand" && !refusing[typ.Name()]:
+			t.Errorf("%s (%s) writes to a cluster, and no method of it calls refuseUnmigrated", name, typ.Name())
+		}
+	}
+
+	// refusingTypes finds a method's call, through a value or a pointer
+	// receiver, and not a function's, a method's that calls something else,
+	// or a test file's.
+	t.Run("refusingTypes", func(t *testing.T) {
+		dir := t.TempDir()
+		src := `package fake
+
+type value struct{}
+type pointer struct{}
+type other struct{}
+
+func refuseUnmigrated(string) error { return nil }
+
+func (value) Run() error     { return refuseUnmigrated("a") }
+func (p *pointer) plan() error {
+	if true {
+		return refuseUnmigrated("b")
+	}
+	return nil
+}
+func (other) Run() error { return nil }
+func free() error        { return refuseUnmigrated("c") }
+`
+		if err := os.WriteFile(filepath.Join(dir, "fake.go"), []byte(src), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		test := "package fake\n\ntype tested struct{}\n\nfunc (tested) Run() error { return refuseUnmigrated(\"d\") }\n"
+		if err := os.WriteFile(filepath.Join(dir, "fake_test.go"), []byte(test), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		got, err := refusingTypes(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := map[string]bool{"value": true, "pointer": true}; !reflect.DeepEqual(got, want) {
+			t.Errorf("refusingTypes = %v; want %v", got, want)
+		}
+	})
 }
 
 // ADR 0023 M2.6 (A23-28; design §28's step 9b): every flag that changes what
@@ -162,7 +401,6 @@ func TestEveryWritingCommandHasAPlanRow(t *testing.T) {
 // --interval bind "" when not given, their effective values being the
 // kernel_settings fact's.
 func TestEveryBehaviourFlagIsBound(t *testing.T) {
-	strayKubectl(t)
 	resolved := map[string][]string{"kernel confirm": {"amount", "from", "to"}}
 	emptyUnlessGiven := map[string][]string{"kernel deploy": {"adapt", "adapt-cooldown", "interval"}}
 	commands := consentCommands(t)

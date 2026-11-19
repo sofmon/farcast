@@ -58,10 +58,10 @@ type preflighter interface {
 
 // preflightUID is that read: farcast-system's uid, as the writer reads it
 // (ADR 0023 M2.6, A23-23). It makes the first in-process call as the writer,
-// the installer's key, before a command's first kubectl Apply could land, so
-// an endpoint or a cluster that refuses the writer refuses it before anything
-// was written, asked, minted or pushed. "" (no farcast-system yet, a first
-// connect) is no failure. Under --confirm a plan that read the cluster as
+// the installer's key, before anything is applied, so an endpoint or a
+// cluster that refuses the writer refuses it before anything was written,
+// asked, minted or pushed. "" (no farcast-system yet, a first connect) is no
+// failure. Under --confirm a plan that read the cluster as
 // the reader compares it with the uid it bound (openConfirmed).
 func preflightUID(ctx context.Context, cl preflighter) (string, error) {
 	uid, err := cl.NamespaceUID(ctx, deploy.DefaultNamespace)
@@ -73,9 +73,8 @@ func preflightUID(ctx context.Context, cl preflighter) (string, error) {
 
 // openWriter is every writing seam's default: openCluster as the instance's
 // writer, the installer's service-account key (ADR 0023 M2.5). Its reads,
-// and the storage key pin's create and replace, run in-process as that key;
-// until ADR 0023 M2.7 its Apply runs kubectl as the active gcloud
-// configuration.
+// and the storage key pin's create and replace, run in-process as that key,
+// and since ADR 0023 M2.7 so does its Apply.
 func openWriter(r clusterRef) (*cluster.Client, error) {
 	r.Identity, r.Verifying = kube.Writer, false
 	return openCluster(r)
@@ -92,38 +91,13 @@ func openReader(r clusterRef) (*cluster.Client, error) {
 	return openCluster(r)
 }
 
-// applyReadier is a writer that can say, running nothing and sending
-// nothing, whether its Apply could start: cluster.Client.ApplyReady.
-type applyReadier interface {
-	ApplyReady() error
-}
-
 // The cluster client is what every writing seam opens by default, so the
-// checks below that find a method by its interface never silently stop
-// finding it.
+// checks that find a method by its interface (afterWrites' tracer, the pin
+// store) never silently stop finding it.
 var (
-	_ applyReadier = (*cluster.Client)(nil)
-	_ pinStore     = (*cluster.Client)(nil)
+	_ tracer   = (*cluster.Client)(nil)
+	_ pinStore = (*cluster.Client)(nil)
 )
-
-// applyReady is the local check every command that applies makes right after
-// it opens its writer, before it reads, asks, mints, pushes, writes or
-// records anything (ADR 0023 M2.5, S-F2). Until ADR 0023 M2.7 its Apply runs
-// kubectl over the instance's kubeconfig; before M2.5 a missing kubectl or
-// kubeconfig was found at the command's first read, which ran kubectl, and
-// since M2.5 that read is in-process, so this finds them there instead. It
-// cannot find a missing auth plugin or a signed-out gcloud: only kubectl's
-// run does. A writer that cannot say (a test's fake) is taken as ready.
-func applyReady(cl any) error {
-	r, ok := cl.(applyReadier)
-	if !ok {
-		return nil
-	}
-	if err := r.ApplyReady(); err != nil {
-		return fmt.Errorf("this machine cannot apply to the instance's cluster, so nothing was changed: %w", err)
-	}
-	return nil
-}
 
 // msgPinWriterOnly is pinStoreFor's refusal of a ref that is not the
 // writer's (ADR 0023 M2.6, A23-20).
@@ -743,12 +717,11 @@ func (d *fatlineDeployer) readyWriter(ctx context.Context, env *Env, meta *confi
 // openReady opens the instance's writer through open, the command's writing
 // seam, and reads once as it, before anything is minted, ensured, pushed,
 // asked or applied (ADR 0023 M2.5, A20-10, A20-11): opening sends nothing,
-// so an instance this machine cannot write as is refused first; applyReady
-// finds a machine that cannot apply; and the read makes the writer's first
-// in-process call before kubectl applies anything. The uid it reads is
-// discarded: the plans of the commands that open it here bind none
-// (cluster_identity none). An interactive or --yes run opens it before its
-// plan, and --confirm right after the comparison (A23-23).
+// so an instance this machine cannot write as is refused first, and the read
+// makes the writer's first in-process call before anything is applied. The
+// uid it reads is discarded: the plans of the commands that open it here
+// bind none (cluster_identity none). An interactive or --yes run opens it
+// before its plan, and --confirm right after the comparison (A23-23).
 func openReady[W preflighter](ctx context.Context, env *Env, meta *config.InstanceMetadata, open func(clusterRef) (W, error)) (W, error) {
 	cl, _, err := openReadyAt(ctx, env, meta, open)
 	return cl, err
@@ -759,9 +732,6 @@ func openReadyAt[W preflighter](ctx context.Context, env *Env, meta *config.Inst
 	var none W
 	cl, err := open(clusterRef{Dir: env.ConfigDir, Meta: meta, Identity: kube.Writer, Warn: env.Err})
 	if err != nil {
-		return none, "", err
-	}
-	if err := applyReady(cl); err != nil {
 		return none, "", err
 	}
 	uid, err := preflightUID(ctx, cl)
@@ -780,11 +750,10 @@ const msgOtherCluster = "instance %q's cluster is not the one its plan read: far
 // openConfirmed is openReady under --confirm, right after the comparison and
 // the block check, before anything is minted, ensured, pushed or saved, for
 // the plan b that was confirmed (ADR 0023 M2.6, A23-23): the writer opens
-// through open, applyReady runs, and its preflight reads farcast-system's
-// uid. A plan that read the cluster as the reader bound that uid, and the
-// writer must read the same one: the reader and the writer are two
-// credentials, and the cluster the writer reaches must be the cluster the
-// plan was made from. Otherwise it refuses, plan_changed, with nothing
+// through open, and its preflight reads farcast-system's uid. A plan that
+// read the cluster as the reader bound that uid, and the writer must read
+// the same one: the reader and the writer are two credentials, and the
+// cluster the writer reaches must be the cluster the plan was made from. Otherwise it refuses, plan_changed, with nothing
 // written. A plan that read no cluster (cluster_identity none) bound no uid,
 // and the one read is discarded, as openReady discards it.
 func openConfirmed[W preflighter](ctx context.Context, env *Env, meta *config.InstanceMetadata, b plan.Bound, open func(clusterRef) (W, error)) (W, error) {
@@ -804,8 +773,8 @@ func openConfirmed[W preflighter](ctx context.Context, env *Env, meta *config.In
 // read the cluster as the reader bound one, and the writer must read the
 // same, or the command refuses, plan_changed, with nothing written. A plan
 // that read no cluster bound none, and nothing is compared. storage key pin,
-// which applies nothing and so opens its writer without applyReady, checks
-// it here too.
+// which applies nothing and so opens its writer without openConfirmed,
+// checks it here too.
 func confirmedCluster(meta *config.InstanceMetadata, b plan.Bound, uid string) error {
 	if b.ClusterIdentity == "reader" && uid != b.Target.SystemNamespaceUID {
 		return withKind(kindPlanChanged, fmt.Errorf(msgOtherCluster, meta.Name, uidText(uid), uidText(b.Target.SystemNamespaceUID)))

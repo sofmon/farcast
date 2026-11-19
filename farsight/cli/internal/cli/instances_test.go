@@ -22,6 +22,14 @@ import (
 func TestInstancesReadsOnlyTheRecords(t *testing.T) {
 	dir := config.Dir(t.TempDir())
 	connectedInstance(t, dir, "atlas") // credentials, kubeconfig and mTLS on disk beside the record
+	// The premise: the files instances must not open are there to be opened.
+	// Nothing writes kubeconfig.yaml since ADR 0023 M2.7, so the fixture
+	// writes the one an older install left (installedInstance, A30-34).
+	for _, f := range []string{"credentials.yaml", "kubeconfig.yaml"} {
+		if _, err := os.Lstat(filepath.Join(dir.InstancePath("atlas"), f)); err != nil {
+			t.Fatalf("the fixture holds no %s beside the record: %v", f, err)
+		}
+	}
 	var mu sync.Mutex
 	var opened []string
 	stop := config.ObserveReads(func(p string) {

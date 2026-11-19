@@ -429,8 +429,12 @@ type continueToken struct {
 // the path names none. It honours labelSelector and fieldSelector
 // (metadata.name and metadata.namespace) with equality terms, pages with
 // limit and continue in namespace-then-name order, and answers metadata-only
-// items to an Accept that asks for a PartialObjectMetadataList. Items carry
-// no kind or apiVersion, as a typed list's items do.
+// items to an Accept that asks for a PartialObjectMetadataList. As the real
+// server answered (v1.36.2, ADR 0023 design §31), a typed list's items carry
+// no kind or apiVersion, and neither do these; a partial list's items there
+// are each a PartialObjectMetadata, where these carry their metadata alone.
+// kube stamps each item's kind from the kind it listed, so neither reaches a
+// caller.
 func (s *Server) list(w http.ResponseWriter, r *http.Request, ri requestInfo, k kube.Kind) {
 	q := r.URL.Query()
 	labels, err := parseSelector(q.Get("labelSelector"))

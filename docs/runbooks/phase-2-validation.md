@@ -235,6 +235,9 @@ echo "exit=$?"
   kubectl version --client && gke-gcloud-auth-plugin --version
   ```
 
+  *(2026-11-18, ADR 0023 M2.7, built, not walked: farcast needs neither. They serve only
+  this runbook's own kubectl observation, which a re-walk runs from Cloud Shell.)*
+
 ## B1. Have a checkout and a Go toolchain (no image step)
 
 There is nothing to build by hand and no container engine to install. `connect`
@@ -303,6 +306,7 @@ minutes** while the LB is assigned. ✅ Expect:
 
 ```bash
 export KUBECONFIG="$FARCAST_CONFIG_HOME/instances/$INSTANCE/kubeconfig.yaml"
+# (2026-11-18, ADR 0023 M2.7, built, not walked) Neither install nor connect writes kubeconfig.yaml any more, and farcast migrate deletes it. A re-walk observes with kubectl from Cloud Shell (ADR 0023 Phasing), not over a file farcast wrote; an exported KUBECONFIG naming the absent file fails rather than falling back to ~/.kube/config [inf].
 kubectl get all -n farcast-system
 kubectl get secret fatline-mtls -n farcast-system -o jsonpath='{.data}' | tr ',' '\n'
 ```
@@ -391,6 +395,7 @@ Finally, change the policy while it runs and confirm the monitor follows it:
 kubectl -n farcast-system get configmap fatline-egress-policy -o json \
   | jq '.data["policy.json"] |= (fromjson | (.apps[] | select(.name=="hermit") | .external) |= [{"host":"api.stripe.com","reason":"reload check"}] | tojson)' \
   | kubectl apply -f -
+# (2026-11-18, ADR 0023 M2.7) On an instance migrated to server-side apply, a kubectl apply here leaves kubectl's client-side apply on the object. farcast's next write warns and clears the record, and every write then refuses until farcast migrate runs again (the CLI README's migrate section).
 kubectl -n farcast-system logs -l app.kubernetes.io/name=fatline -c shrike --tail=20 | grep -i reload
 ```
 
@@ -471,7 +476,7 @@ left billing.
 |---|---|
 | `release` fails `CLUSTER_ALREADY_HAS_OPERATION` | Normal, not a fault: Autopilot runs `RESIZE_CLUSTER` for several minutes after a deploy, and GKE refuses a delete while any operation is in flight. `release` keeps the local record and says to re-run — wait for `gcloud container operations list --filter="status!=DONE"` to come back empty (this took ~9 min in the live run), then re-run `release`. |
 | `install` fails `code = Internal` from `container.googleapis.com` | A transient Google 5xx during credential validation. Nothing is created (validation precedes every write), so simply re-run. FarCast does not yet retry these automatically. |
-| `kubectl not found on PATH` | Install `kubectl` + `gke-gcloud-auth-plugin` (B0). The CLI shells to kubectl by design ([ADR 0006](../adr/0006-connect-bootstrap-kubectl.md)). |
+| `kubectl not found on PATH` | Install `kubectl` + `gke-gcloud-auth-plugin` (B0). The CLI shells to kubectl by design ([ADR 0006](../adr/0006-connect-bootstrap-kubectl.md)). *(2026-11-18: gone since ADR 0023 M2.7, built, not walked: farcast starts no kubectl.)* |
 | `connect` prompts for cost / refuses non-interactively | The LB is billable. Pass `--yes` (required when not a TTY or in `--output json`). |
 | Deployment stuck `ImagePullBackOff` | The node SA can't pull from the instance registry. `connect` grants `roles/artifactregistry.reader` on that one repository automatically, so this means the grant did not happen: check the installer SA has `roles/artifactregistry.admin` (Phase 1 step 2) and re-run `connect` — the ensure is idempotent. Inspect with `gcloud artifacts repositories get-iam-policy "farcast-$INSTANCE" --location "$REGION" --project "$PROJECT_ID"`. |
 | `connect` says the image is not in the registry and there is no checkout | It builds FatLine from a farcast checkout; run it from one, or pass `--source <dir>`. Non-interactively it also needs `--yes` to build. |

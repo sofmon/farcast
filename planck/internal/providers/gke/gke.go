@@ -109,7 +109,14 @@ func (p *provider) CreateCluster(ctx context.Context, spec planck.ClusterSpec) (
 			return nil, fmt.Errorf("gke: create cluster %q: %w", in.Name, err)
 		}
 	}
-	return p.waitReady(ctx, api, ref)
+	c, err := p.waitReady(ctx, api, ref)
+	if err != nil {
+		return nil, err
+	}
+	// Created only when the look-up found none and this call created it; a
+	// cluster found under the name is returned as found (planck.Cluster).
+	c.Created = !exists
+	return c, nil
 }
 
 func (p *provider) ClusterStatus(ctx context.Context, ref planck.ClusterRef) (planck.ClusterStatus, error) {
@@ -230,8 +237,8 @@ func (p *provider) planCreate(spec planck.ClusterSpec) (createInput, error) {
 	}, nil
 }
 
-// waitReady polls until the cluster reports Running (returning it with a
-// kubeconfig), enters an error state, or ctx expires.
+// waitReady polls until the cluster reports Running (returning it with its
+// DNS endpoint), enters an error state, or ctx expires.
 //
 // Running is not enough: the cluster must also read back as sending the
 // provider's logging nothing but system logs (ADR 0019). That holds for the
@@ -258,7 +265,6 @@ func (p *provider) waitReady(ctx context.Context, api clusterAPI, ref planck.Clu
 					Ref:            ref,
 					Status:         planck.StatusRunning,
 					Endpoint:       st.Endpoint,
-					Kubeconfig:     buildKubeconfig(ref.Name, st.Endpoint),
 					SystemLogsOnly: true,
 				}, nil
 			case planck.StatusError:

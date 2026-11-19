@@ -141,6 +141,9 @@ func (c *kernelConfirmCommand) Run(ctx context.Context, env *Env, args []string)
 	if err := recordNamed(meta, name); err != nil {
 		return err
 	}
+	if err := refuseUnmigrated(name, meta); err != nil {
+		return err
+	}
 	if meta.Kernel == nil || !meta.Kernel.Deployed {
 		return fmt.Errorf("instance %q has no kernel; run 'farcast kernel deploy %s' first", name, name)
 	}
@@ -190,9 +193,7 @@ func (c *kernelConfirmCommand) Run(ctx context.Context, env *Env, args []string)
 	if err != nil {
 		return err
 	}
-	if err := applyReady(cl); err != nil {
-		return err
-	}
+	defer afterWrites(env, name, cl)
 
 	// Recorded before the apply, like every other thing this CLI changes in a
 	// cluster: a confirmation the cluster has and local state does not is one

@@ -170,6 +170,9 @@ cat    "$FARCAST_CONFIG_HOME/instances/$INSTANCE/metadata.yaml"
 ✅ Expect: directory `0700`; `metadata.yaml`, `credentials.yaml`, `kubeconfig.yaml`
 all `0600`; metadata shows `status: running`, the DNS `endpoint`, and the
 `cost_limit`.
+*(2026-11-18, ADR 0023 M2.7, built, not walked: `install` writes no `kubeconfig.yaml` any
+more. Expect `metadata.yaml`, with `server_side_apply` for a cluster this install
+created, and `credentials.yaml`.)*
 
 ## 7. Verify the cluster in GCP (independent of FarCast)
 
@@ -259,6 +262,10 @@ against a local API server only. This step is still not walked.)*
    `credentials.yaml`, which step 5's `--credentials` stored. It opens the instance's
    writer with that key, before it asks anything, to run the apply, though it makes no
    in-process call as the writer. Not yet walked.)*
+
+   *(2026-11-18, ADR 0023 M2.7, built, not walked: the apply runs in-process as the
+   instance's writer, with that key, and so mints its token. It needs no kubectl and no
+   gcloud session.)*
 
    ```bash
    ./farcast reader grant "$INSTANCE"

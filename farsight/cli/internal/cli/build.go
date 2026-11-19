@@ -122,6 +122,10 @@ func (c *buildCommand) ensureDefaults() {
 	}
 }
 
+// msgBuildFailed is a failed build's error: the deployment and the app. The
+// end of the build's log, when JobLogs could read it, is printed above it.
+const msgBuildFailed = "the build of %s/%s failed; the end of its log, when it could be read, is printed above"
+
 // msgBuildCostYes is the build's refusal without a terminal and without
 // --yes: its Job's vCPU and MiB, and the two routes that need no terminal.
 const msgBuildCostYes = "building runs a %d vCPU / %d MiB Job in the instance until it finishes or its deadline expires; pass --yes to confirm" + consentSuffix
@@ -238,6 +242,9 @@ func (c *buildCommand) Run(ctx context.Context, env *Env, args []string) (err er
 	if err := recordNamed(meta, name); err != nil {
 		return err
 	}
+	if err := refuseUnmigrated(name, meta); err != nil {
+		return err
+	}
 	if c.repo == "" || c.app == "" {
 		return usagef("--repo and --app are required")
 	}
@@ -254,14 +261,14 @@ func (c *buildCommand) Run(ctx context.Context, env *Env, args []string) (err er
 	// before the builder image is resolved and before anything is asked (ADR
 	// 0023 M2.5, A20-10 and A20-11): an instance this machine cannot write as
 	// is refused with nothing spent, and an endpoint that refuses the
-	// installer's key refuses it before kubectl applies the build. --plan
-	// never opens it, and --confirm right after the comparison (A23-23,
-	// A23-37).
+	// installer's key refuses it before anything is applied. --plan never
+	// opens it, and --confirm right after the comparison (A23-23, A23-37).
 	var cl jobWaiter
 	if mode == consentNone {
 		if cl, err = openReady(ctx, env, meta, c.newCluster); err != nil {
 			return err
 		}
+		defer afterWrites(env, name, cl)
 	}
 
 	p, b, err := c.plan(ctx, env, meta)
@@ -278,6 +285,7 @@ func (c *buildCommand) Run(ctx context.Context, env *Env, args []string) (err er
 		if cl, err = openReady(ctx, env, meta, c.newCluster); err != nil {
 			return err
 		}
+		defer afterWrites(env, name, cl)
 	default:
 		ok, err := c.confirm(env, meta, p)
 		if err != nil {
@@ -319,8 +327,7 @@ func (c *buildCommand) Run(ctx context.Context, env *Env, args []string) (err er
 			Instance: name, Project: meta.Project, Region: meta.Region,
 			Namespace: pbuild.Namespace, ServiceAccount: pbuild.ServiceAccount,
 		})
-		return fmt.Errorf("the build of %s/%s failed; its Job survives for an hour so 'kubectl -n %s logs job/%s' still works",
-			deployment, c.app, pbuild.Namespace, job)
+		return fmt.Errorf(msgBuildFailed, deployment, c.app)
 	}
 
 	// The whole digest, not just its prefix. A truncated one would build a

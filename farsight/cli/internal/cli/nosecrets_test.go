@@ -125,10 +125,15 @@ func TestWorldNeverOpensAWriterCredential(t *testing.T) {
 
 // Design §8.2 and §10.2, mutation 65: instances reports the reader's state
 // from the record and the key file's presence alone. With reader.key at mode
-// 000 it still says "granted", and never opened the key.
+// 000 it still says "granted", and never opened the key. The record is saved
+// again unmigrated (A30-20), so the migrated column's false is covered too.
 func TestInstancesNeverOpensTheReaderKey(t *testing.T) {
 	s := kubetest.New(t)
-	dir, _ := readerInstance(t, s, "atlas", true)
+	dir, meta := readerInstance(t, s, "atlas", true)
+	meta.ServerSideApply = nil
+	if err := dir.SaveInstanceMetadata("atlas", meta); err != nil {
+		t.Fatal(err)
+	}
 	key := filepath.Join(dir.InstancePath("atlas"), "reader.key")
 	if err := os.Chmod(key, 0o000); err != nil {
 		t.Fatal(err)

@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -17,9 +18,11 @@ import (
 
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/image"
+	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 	"github.com/sofmon/farcast/farsight/cli/internal/kube/kubetest"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
 	"github.com/sofmon/farcast/farsight/cli/internal/plan"
+	"github.com/sofmon/farcast/planck"
 	tcdeploy "github.com/sofmon/farcast/technocore/deploy"
 )
 
@@ -459,12 +462,13 @@ func TestNoticesPrintOnceInTheCommandsWords(t *testing.T) {
 // wiredCommands is every writeCommands row, each of which registers --plan
 // and --confirm: ADR 0023 M2.6 wired all eleven (M2.6a kernel meter, kernel
 // confirm and reader grant, M2.6b connect, redeploy and build, M2.6c kernel
-// deploy, storage deploy, storage key pin and storage key rotate, M2.6d
-// run). The list is derived, not written here: the rows are checked against
-// the commands with plans that farcast's router reaches (consentCommands),
-// so a row that registers no --plan or no --confirm, a row whose command is
-// not the router's, and a command with a plan that has no row each fail the
-// test that asked (design §28's step 9b).
+// deploy, storage deploy, storage key pin and storage key rotate, M2.6d run),
+// and M2.7's migrate is the twelfth (A30-26). The list is derived, not
+// written here: the rows are checked against the commands with plans that
+// farcast's router reaches (consentCommands), so a row that registers no
+// --plan or no --confirm, a row whose command is not the router's, and a
+// command with a plan that has no row each fail the test that asked (design
+// §28's step 9b).
 func wiredCommands(t *testing.T) []writeCommand {
 	t.Helper()
 	planned := consentCommands(t)
@@ -537,14 +541,14 @@ func runDirect(t *testing.T, dir config.Dir, wc writeCommand, extra ...string) (
 // printing nothing on stdout under -o json and changing no file. --yes -y is
 // one answer, and --yes=false --plan is a plan. connect runs as a first
 // deploy, and redeploy over the material the instance holds, with the
-// deployer's defaults faked, so their plans read a fake registry and their
-// --yes stops at the writer's applyReady, never dialling.
+// deployer's defaults faked, so their plans read a fake registry. A --yes
+// that reaches an apply sends it refused (FailNextApply, A30-31) and stops
+// there, never waiting on a workload or dialling.
 func consentAnswersOnTheCommands(t *testing.T) {
-	noKubectl(t)
 	fakeDeployDefaults(t)
 	for _, wc := range wiredCommands(t) {
 		t.Run(wc.name, func(t *testing.T) {
-			s := kubetest.New(t)
+			s := kubetest.New(t, kubetest.WithSettledWorkloads())
 			dir, meta := writeInstance(t, s, true)
 			if wc.edit != nil {
 				wc.edit(meta)
@@ -583,8 +587,12 @@ func consentAnswersOnTheCommands(t *testing.T) {
 			if code != 0 || printedDocument(t, []byte(stdout)).Kind != plan.Kind {
 				t.Errorf("%s --yes=false --plan: exit %d, %q %q; want a plan", wc.name, code, stdout, stderr)
 			}
+			s.FailNextApply(http.StatusInternalServerError, kube.Status{})
 			if _, stderr, _ := runLine(commandLine(dir, wc, "--yes", "-y")); strings.Contains(stderr, msgConsentExclusive) {
 				t.Errorf("%s --yes -y is two answers: %q", wc.name, stderr)
+			}
+			if applied := len(appliedRequests(s)); applied > 1 {
+				t.Errorf("%s --yes -y sent %d applies; want at most its first, refused", wc.name, applied)
 			}
 		})
 	}
@@ -664,7 +672,6 @@ func TestAPlanFlagIsNeverIgnored(t *testing.T) {
 // itself, are a plan; kernel deploy's and the storage commands' read the
 // cluster as the reader (fakeDeployDefaults' loopback reader).
 func planFlagThroughTheRouter(t *testing.T) {
-	ran := strayKubectl(t)
 	fakeDeployDefaults(t)
 	cwd := t.TempDir()
 	t.Chdir(cwd)
@@ -701,9 +708,6 @@ func planFlagThroughTheRouter(t *testing.T) {
 		if code != 2 || stdout != "" || !strings.Contains(stderr, want) {
 			t.Errorf("farcast %q: exit %d, stdout %q, stderr %q; want exit 2 and %q", tc.line, code, stdout, stderr, want)
 		}
-	}
-	if ran() {
-		t.Error("a line read with a sibling's flags ran kubectl")
 	}
 	for _, s := range servers {
 		if got := s.Requests(); len(got) != 0 {
@@ -747,7 +751,6 @@ func planFlagOfATopLevelCommand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ran := strayKubectl(t)
 	fakeDeployDefaults(t)
 	cwd := t.TempDir()
 	t.Chdir(cwd)
@@ -794,9 +797,6 @@ func planFlagOfATopLevelCommand(t *testing.T) {
 			t.Errorf("farcast %q planned %q of %q; want %s's plan", tc.line, b.Command, b.Instance, tc.command)
 		}
 	}
-	if ran() {
-		t.Error("a plan ran kubectl")
-	}
 	for _, s := range servers {
 		if got := s.Requests(); len(got) != 0 {
 			t.Errorf("a plan sent %d requests", len(got))
@@ -814,9 +814,9 @@ func planFlagOfATopLevelCommand(t *testing.T) {
 // cost question), run's (its review), kernel deploy's (its cost question,
 // below the floor or not, and the build question), storage deploy's (its
 // cost question, and the build question), storage key pin's (lowering the
-// pin with --replace) and storage key rotate's (its question): kernel meter
-// and kernel confirm ask nothing, so a run without a terminal is not
-// refused (A23-9).
+// pin with --replace), storage key rotate's (its question) and migrate's
+// (ADR 0023 M2.7: its typed name, A30-26): kernel meter and kernel confirm
+// ask nothing, so a run without a terminal is not refused (A23-9).
 //
 // The gates are derived, not only listed (design §28's step 9b): every
 // usage error in this package's source that names the route
@@ -841,6 +841,7 @@ func TestNonInteractiveRefusalsNameThePlan(t *testing.T) {
 		{"storage key pin", []string{msgKeyPinLowerYes}, keyPinRefusalNamesThePlan},
 		{"storage key rotate", []string{msgRotateYes}, rotateRefusalNamesThePlan},
 		{"reader grant", []string{msgReaderGrantTerminal}, readerGrantRefusalNamesThePlan},
+		{"migrate", []string{msgMigrateTerminal}, migrateRefusalNamesThePlan},
 	}
 	planned := consentCommands(t)
 	gated := map[string]bool{}
@@ -905,6 +906,7 @@ func readerGrantRefusalNamesThePlan(t *testing.T) {
 	dir := readerRecordFor(t, grantName, "proj-test1")
 	if _, err := dir.UpdateInstanceMetadata(grantName, func(m *config.InstanceMetadata) error {
 		m.Reader = &config.Reader{Email: readerEmail(grantName, "proj-test1"), KeyID: readerTestKeyID}
+		recordMigrated(m)
 		return nil
 	}); err != nil {
 		t.Fatal(err)
@@ -915,41 +917,69 @@ func readerGrantRefusalNamesThePlan(t *testing.T) {
 	}
 }
 
+// migrateRefusalNamesThePlan is TestNonInteractiveRefusalsNameThePlan's row
+// for migrate (ADR 0023 M2.7, A30-26): with no terminal and no answer it
+// refuses, exit 2, naming the plan's route, through the router, before it
+// reads the record or sends anything.
+func migrateRefusalNamesThePlan(t *testing.T) {
+	s := kubetest.New(t)
+	dir, _ := writeInstance(t, s, true)
+	reads := observeConfigReads(t)
+	stdout, stderr, code := farcastIn(t, dir, "migrate", writeName)
+	if code != 2 || stdout != "" || !strings.HasPrefix(stderr, "farcast migrate: migrate needs a terminal to confirm, or --plan and then --confirm <digest>\n") {
+		t.Errorf("migrate without a terminal: exit %d, %q %q", code, stdout, stderr)
+	}
+	for _, p := range reads() {
+		if strings.HasPrefix(p, dir.InstancePath(writeName)) {
+			t.Errorf("migrate without a terminal read %s", p)
+		}
+	}
+	if got := s.Requests(); len(got) != 0 {
+		t.Errorf("migrate without a terminal sent %d requests", len(got))
+	}
+}
+
 // confirmLineOnTheCommands is TestTheConfirmLineRunsTheSameCommand's rows
 // through run(), for the commands that have plans: the line a plan prints, split as a shell splits
 // it and run as farcast runs it, recomputes the same plan, so it passes the
-// comparison. A plan that writes then stops at the writer's applyReady (this
-// test's PATH holds no kubectl), and one that writes nothing says so and
-// exits 0; a blocked plan prints no line.
+// comparison. A plan that applies then opens the writer and sends its first
+// apply, which kubetest refuses (FailNextApply, A30-31): one refused apply,
+// nothing stored, exit 1. One that writes nothing says so and exits 0; a
+// blocked plan prints no line.
 //
 // A row whose command has fakes behind its seams (connect's, redeploy's,
 // build's) cannot run through the router, which sets none: connect's
 // reconnect would dial the carrier. connect runs here as a first deploy
 // instead, and redeploy and build as writeCommands has them, with the
-// deployer's defaults faked; each stops at applyReady and never dials.
+// deployer's defaults faked; each stops at its refused apply and never
+// dials.
 //
 // kernel deploy's and the storage commands' rows (ADR 0023 M2.6c) run
 // through the router as planCommands has them, their fakes left to the
 // router's defaults: the deployer's faked, the plan's reader the loopback
 // one, the key pin reached as the writer against the fixture's kubetest
 // (realPinOpener), and the keyholder and the storage mint refused. kernel
-// deploy and storage deploy stop at applyReady, after the reader's reads
-// alone. storage key pin writes its pin and hands it to no replica,
+// deploy and storage deploy stop at their refused apply, after the reader's
+// reads and the writer's preflight, and storage deploy's pin create as its
+// plan lists it. storage key pin writes its pin and hands it to no replica,
 // exit 0; storage key rotate with no keyholder mints and saves, exit 0; and
 // with one it mints, saves and cannot open the keyholder, so its rotation is
 // unfinished, exit 1. Each got past the comparison.
 //
+// migrate's rows (ADR 0023 M2.7, A30-26) run through the router too, its
+// writer the package's loopback default: the plan reads as the writer, and
+// the line migrates what it listed and records the instance, exit 0, every
+// request the writer's.
+//
 // run's fetch plans (ADR 0023 M2.6d) run through the router as planCommands
 // has them: the line of one that is not blocked opens the reader, then the
-// writer, and stops at applyReady, having sent nothing. Its deploy plan has
-// its own row (runConfirmLinesRunTheSameCommand): the fetch plan's line,
-// run with a kubectl that succeeds, prints the deploy plan, whose line
-// confirms it alone.
+// writer, and stops at its refused apply of the fetch. Its deploy plan has
+// its own row (runConfirmLinesRunTheSameCommand): the fetch plan's line
+// prints the deploy plan, whose line confirms it alone.
 func confirmLineOnTheCommands(t *testing.T) {
-	noKubectl(t)
 	pinPlanClock(t)
 	pinRunClock(t)
-	fakeDeployDefaults(t)
+	fp, _ := fakeDeployDefaults(t)
 	realPinOpener(t)
 	var rows []planCommand
 	for _, name := range []string{"connect", "redeploy", "build"} {
@@ -967,7 +997,7 @@ func confirmLineOnTheCommands(t *testing.T) {
 		switch {
 		case row.fakes == nil:
 			rows = append(rows, row)
-		case slices.Contains(readsCluster, row.name) || row.name == "run":
+		case slices.Contains(readsCluster, row.name) || row.name == "run" || row.identity == "writer":
 			row.fakes, row.cmd = nil, nil
 			rows = append(rows, row)
 		}
@@ -975,6 +1005,12 @@ func confirmLineOnTheCommands(t *testing.T) {
 	for _, row := range rows {
 		t.Run(row.String(), func(t *testing.T) {
 			s, dir := planFixture(t, row)
+			// The registry the ensure answers is the one the record names.
+			meta, err := dir.LoadInstanceMetadata(writeName)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fp.registry = &planck.Registry{Ref: registryRefFor(meta), Prefix: meta.Registry.Prefix}
 			wc := writeCommand{name: row.name, args: row.args, flags: row.flags}
 			stdout, stderr, code := runLine(commandLine(dir, wc, "--plan"))
 			if code != 0 {
@@ -994,7 +1030,11 @@ func confirmLineOnTheCommands(t *testing.T) {
 			if slices.Contains(words, "--plan") {
 				t.Errorf("the confirm line still plans: %q", line)
 			}
+			// What the plan writes, in JSON, before the confirm line writes it.
+			jsonPlan, _, _ := runLine(commandLine(dir, wc, "-o", "json", "--plan"))
+			planned := decodedBound(t, printedDocument(t, []byte(jsonPlan)))
 			reads := len(s.Requests())
+			s.FailNextApply(http.StatusInternalServerError, kube.Status{})
 			out, errb, code := runLine(words)
 			if strings.Contains(errb, "the plan for this command is now") {
 				t.Fatalf("the confirm line computed another plan: %s", errb)
@@ -1003,7 +1043,7 @@ func confirmLineOnTheCommands(t *testing.T) {
 			switch {
 			case noop && (code != 0 || out == ""):
 				t.Errorf("the confirm line of a plan that writes nothing: exit %d, %q %q", code, out, errb)
-			case row.name == "storage key pin" || row.String() == "storage key rotate/no keyholder":
+			case row.name == "storage key pin" || row.String() == "storage key rotate/no keyholder" || row.identity == "writer":
 				if code != 0 || out == "" {
 					t.Errorf("the confirm line: exit %d, %q %q; want it done", code, out, errb)
 				}
@@ -1011,16 +1051,62 @@ func confirmLineOnTheCommands(t *testing.T) {
 				if code != 1 || !strings.Contains(errb, "the hand-over did not happen") {
 					t.Errorf("the confirm line: exit %d, %q; want it past the comparison, its keyholder refused", code, errb)
 				}
-			case !noop && (code != 1 || !strings.Contains(errb, msgCannotApply+msgKubectlMissing)):
-				t.Errorf("the confirm line: exit %d, %q; want it past the comparison, at applyReady", code, errb)
+			case row.String() == "storage deploy/a first deploy":
+				// Its storage mint, which the router leaves at its refusing
+				// default, comes after the writer's pin read and before any
+				// write.
+				if code != 1 || !strings.Contains(errb, "create storage for") {
+					t.Errorf("the confirm line: exit %d, %q; want it past the comparison, its storage mint refused", code, errb)
+				}
+			case !noop && (code != 1 || !strings.Contains(errb, "documents were applied before")):
+				t.Errorf("the confirm line: exit %d, %q; want it past the comparison, at its first apply, refused", code, errb)
 			}
 			switch {
-			case !row.readsCluster:
-				if got := s.Requests(); len(got) != 0 {
-					t.Errorf("%s sent %d requests", row, len(got))
+			case noop || row.String() == "storage key rotate/no keyholder":
+				onlyThePlansSent(t, row, s.Requests()[reads:], consentConfirm)
+			case row.String() == "storage deploy/a first deploy":
+				confirmed := s.Requests()[reads:]
+				firstWriter := slices.IndexFunc(confirmed, func(r kubetest.Request) bool { return r.As == "writer" })
+				onlyThePlansSent(t, row, confirmed[:max(firstWriter, 0)], consentConfirm)
+				var sent []string
+				for _, r := range confirmed[max(firstWriter, 0):] {
+					if r.Path != "/token" {
+						sent = append(sent, r.Method+" "+r.Path)
+					}
 				}
-			case row.name == "kernel deploy" || row.name == "storage deploy":
-				onlyThePlansReads(t, row, s, consentConfirm)
+				if want := []string{"GET /api/v1/namespaces", "GET " + pinPath}; firstWriter < 0 || !slices.Equal(sent, want) {
+					t.Errorf("%s sent as the writer %q; want %q", row, sent, want)
+				}
+			case row.identity == "writer":
+				// The plan and its recomputation read as the writer, which
+				// then rewrites what the plan listed.
+				for i, r := range s.Requests() {
+					if r.As != "writer" || (i < reads && r.Path != "/token" && r.Method != http.MethodGet) {
+						t.Errorf("%s sent %s %s as %q at %d; want the writer's, and only its reads before the confirm line", row, r.Method, r.Path, r.As, i)
+					}
+				}
+			case !row.readsCluster || row.name == "kernel deploy" || row.name == "storage deploy":
+				// The plan's reads, if it reads, then the writer: its
+				// preflight, if it makes one, and storage deploy's pin
+				// create, as its plan lists it, before its refused apply.
+				readerReqs, writerReqs := stoppedAtTheFirstApply(t, row.String(), s.Requests()[reads:])
+				onlyThePlansSent(t, row, readerReqs, consentConfirm)
+				var sent []string
+				for _, r := range writerReqs {
+					sent = append(sent, r.Method+" "+r.Path)
+				}
+				var want []string
+				switch row.name {
+				case "kernel meter", "kernel confirm", "reader grant":
+				case "storage deploy":
+					want = []string{"GET /api/v1/namespaces", "GET " + pinPath, "POST " + configMapsPath}
+					sameSHA256(t, "the pin's create", pinWriteBody(t, writerReqs), pinWriteFact(planned))
+				default:
+					want = []string{"GET /api/v1/namespaces"}
+				}
+				if !slices.Equal(sent, want) {
+					t.Errorf("%s sent as the writer before its first apply %q; want %q", row, sent, want)
+				}
 			default:
 				// The recomputation reads as the reader, and only then does
 				// the writer reach the pin.

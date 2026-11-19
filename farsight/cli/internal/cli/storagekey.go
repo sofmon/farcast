@@ -433,10 +433,10 @@ ones are in use. From then on a replica that restarts refuses any bundle from
 before the rotation — a keeper's included — even with no serving replica left
 to compare it against. The pin is written in-process, as the instance's
 installer service account, with the key 'farcast install --credentials'
-stored, and needs no kubectl. In an interactive or --yes run, if it cannot
-be written the rotation still happens, this exits non-zero, and 'farcast
-storage key pin' writes it afterwards; under --confirm a writer that will
-not open refuses the rotation before anything is minted. The pin is read
+stored. In an interactive or --yes run, if it cannot be written the rotation
+still happens, this exits non-zero, and 'farcast storage key pin' writes it
+afterwards; under --confirm a writer that will not open refuses the rotation
+before anything is minted. The pin is read
 before the question, so a keyring behind it is refused before anything is
 asked.
 
@@ -563,6 +563,13 @@ func (c *keyRotateCommand) Run(ctx context.Context, env *Env, args []string) (er
 		}
 	}
 	if lerr == nil && pinMeta(m) {
+		// With a keyholder the rotation writes the pin to the cluster, so an
+		// instance not migrated to server-side apply is refused before the
+		// pin store opens; with none it writes nothing there, and never
+		// refuses for it (design A30-20).
+		if err := refuseUnmigrated(instance, m); err != nil {
+			return err
+		}
 		ref := clusterRef{Dir: env.ConfigDir, Meta: m, Identity: kube.Writer, Warn: env.Err}
 		if ps, pinErr = pinStoreFor(c.newPinStore, ref, nil); pinErr == nil {
 			cur, present, _, invalid, err := readPin(ctx, ps)
@@ -610,7 +617,7 @@ func rotateBehind(b *pinBehind, instance string) error {
 // instance's reader, which 'reader grant' must have verified (A23-21);
 // without one it reads no cluster and needs no reader. --plan prints the plan.
 // --confirm compares it, says what it says once, and then, with a keyholder,
-// opens the writer — no applyReady: rotate applies nothing — whose
+// opens the writer — rotate applies nothing — whose
 // farcast-system must be the plan's and whose pin must be where the plan read
 // it (A23-23), and waits for the clock to pass the newest key (A23-32), before
 // anything is minted, saved, opened or handed over.
@@ -622,6 +629,13 @@ func (c *keyRotateCommand) planned(ctx context.Context, env *Env, instance strin
 	}
 	if err := recordNamed(meta, instance); err != nil {
 		return err
+	}
+	// As an interactive run: only a rotation that writes the pin refuses an
+	// instance not migrated to server-side apply (design A30-20).
+	if pinMeta(meta) {
+		if err := refuseUnmigrated(instance, meta); err != nil {
+			return err
+		}
 	}
 	*metaOut = meta
 	// The keyring, for its key ids and their times (A23-25); --confirm

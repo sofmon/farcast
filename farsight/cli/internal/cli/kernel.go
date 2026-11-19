@@ -220,8 +220,7 @@ const (
 	// the instance does not have, joined by ", ".
 	msgNoSuchNamespace = "cannot meter %s: no such namespace in this instance.\n" +
 		"The kernel binds a role in every namespace it meters, so each one has to exist before it " +
-		"deploys.\nCreate it with 'kubectl create namespace <name>', or deploy into it with " +
-		"'farcast run', which creates the namespace it is given."
+		"deploys.\nDeploy into it with 'farcast run', which creates the namespace it is given."
 	msgNoLongerMetering = "no longer metering %q: the namespace does not exist in this instance any more."
 	msgCooldownRecorded = "The adapt cooldown %s is recorded; it takes effect only with --adapt."
 	msgValidationValues = "These are validation values, below the kernel's defaults; '--interval=0 --adapt-cooldown=0' restores them."
@@ -305,6 +304,9 @@ func (c *kernelDeployCommand) Run(ctx context.Context, env *Env, args []string) 
 	if err := recordNamed(meta, name); err != nil {
 		return err
 	}
+	if err := refuseUnmigrated(name, meta); err != nil {
+		return err
+	}
 	// The kernel needs no tunnel of its own — it talks to the API server, not
 	// through FatLine. But an instance with no FatLine has no workloads worth
 	// metering yet, and deploying a cost enforcer before there is anything to
@@ -341,13 +343,11 @@ func (c *kernelDeployCommand) Run(ctx context.Context, env *Env, args []string) 
 	// built or written.
 	//
 	// An interactive or --yes run reads it as the writer (ADR 0023 M2.5): the
-	// first in-process call, right after the local check that this machine
-	// can run the apply at the end, kubectl until ADR 0023 M2.7 (S-F2), so no
-	// cost is asked, image pushed or kernel recorded for a deploy that could
-	// not land. --plan and --confirm read it as the instance's reader, which
-	// must be one 'reader grant' has verified (A23-21): the writer is never
-	// opened for a plan, and under --confirm only after the comparison
-	// (A23-23).
+	// first in-process call, so no cost is asked, image pushed or kernel
+	// recorded for a deploy whose writer the cluster refuses. --plan and
+	// --confirm read it as the instance's reader, which must be one 'reader
+	// grant' has verified (A23-21): the writer is never opened for a plan,
+	// and under --confirm only after the comparison (A23-23).
 	ref := clusterRef{Dir: env.ConfigDir, Meta: meta, Warn: env.Err}
 	var cl clusterApplier
 	var rd kernelPlanReader
@@ -356,9 +356,7 @@ func (c *kernelDeployCommand) Run(ctx context.Context, env *Env, args []string) 
 		if cl, err = c.deployer.newCluster(ref); err != nil {
 			return err
 		}
-		if err := applyReady(cl); err != nil {
-			return err
-		}
+		defer afterWrites(env, name, cl)
 		rd = cl
 	} else {
 		if err := requireGrantedReader(env.ConfigDir, meta, "kernel deploy", mode); err != nil {
@@ -404,6 +402,7 @@ func (c *kernelDeployCommand) Run(ctx context.Context, env *Env, args []string) 
 		if cl, err = openConfirmed(ctx, env, meta, b, c.deployer.newCluster); err != nil {
 			return err
 		}
+		defer afterWrites(env, name, cl)
 	} else if proceed, err := c.consented(env, meta, p); err != nil || !proceed {
 		return err
 	}

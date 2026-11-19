@@ -177,8 +177,8 @@ func TestTimesAreTruncatedToTheSecond(t *testing.T) {
 }
 
 // No vector carries anything shaped like an account, in any case: the pinned
-// one, a work identity's, or a service account's. kubectl's errors name them,
-// and the builder replaces every one.
+// one, a work identity's, or a service account's. A cluster's errors name
+// them, and the builder replaces every one.
 func TestNoVectorCarriesAnAccount(t *testing.T) {
 	for _, v := range worldVectors() {
 		t.Run(v.name, func(t *testing.T) {

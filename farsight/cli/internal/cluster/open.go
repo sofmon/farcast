@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"net/netip"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,50 +19,32 @@ import (
 	tkube "github.com/sofmon/farcast/technocore/kube"
 )
 
-// errReaderKubeconfig is Open's refusal of a reader given a kubeconfig: only
-// a writer's transitional Apply runs kubectl (ADR 0023 M2.5 to M2.7).
-var errReaderKubeconfig = errors.New("cluster: a reader client runs no kubectl, so Open takes no kubeconfig for it")
-
 // errNeverWrites is every write of a reader client: refused before anything
 // is sent.
 var errNeverWrites = errors.New("cluster: a reader client never writes")
 
-// errNoKubeconfig is the Apply of a writer opened without a kubeconfig: until
-// ADR 0023 M2.7 Apply is the one method that still runs kubectl, and kubectl
-// needs one. Nothing is run and nothing is sent.
-var errNoKubeconfig = errors.New("cluster: this client was opened without a kubeconfig, and Apply still runs kubectl until ADR 0023 M2.7")
-
 // Open builds a Client that reaches the cluster in-process, through
 // internal/kube (ADR 0023 decision 2), as one of the instance's two
 // identities: kube.Reader or kube.Writer. It starts no program, dials nothing
-// and mints nothing until a method is called. Any other identity, and a
-// reader given a legacyKubeconfig, are refused before the client is built,
-// with nothing sent.
+// and mints nothing until a method is called. Any other identity is refused
+// before the client is built, with nothing sent.
 //
 // Either identity answers every read, CanI and NamespaceUID in-process. A
-// reader refuses Apply, CreateConfigMap and ReplaceConfigMap before anything
-// is sent, and never runs kubectl; since ADR 0023 M2.4 it is how 'world',
-// 'ps', 'costs', 'usage' and 'logs' read the cluster. A writer creates and
-// replaces a ConfigMap in-process too (the storage key pin), and its Apply
-// alone still runs kubectl, until ADR 0023 M2.7: over legacyKubeconfig, with
-// Env(os.Environ()), so the apply acts as the active gcloud configuration
-// while everything else the writer does acts as cfg's credential, the
-// instance's stored installer key. A writer
-// opened with an empty legacyKubeconfig opens, and its Apply fails with
-// errNoKubeconfig's text, running nothing.
+// reader refuses Apply, CreateConfigMap, ReplaceConfigMap and
+// PatchManagedFields before anything is sent; since ADR 0023 M2.4 it is how
+// 'world', 'ps', 'costs', 'usage' and 'logs' read the cluster. A writer
+// applies, creates and replaces a ConfigMap (the storage key pin), and
+// patches managed fields (migrate), all of it as cfg's credential, the
+// instance's stored installer key.
 //
 // warnings receives each distinct API Warning header text, once, as
 // "Warning (cluster): <text>\n", after the call whose answer carried it, and
 // the notes Logs writes. A text that would not print as it is (a control
 // character, a bidi override, invalid UTF-8) is written Go-quoted instead,
 // because it comes from the server. A nil warnings discards them.
-func Open(cfg kube.Config, warnings io.Writer, legacyKubeconfig string) (*Client, error) {
+func Open(cfg kube.Config, warnings io.Writer) (*Client, error) {
 	switch cfg.Identity {
-	case kube.Reader:
-		if legacyKubeconfig != "" {
-			return nil, errReaderKubeconfig
-		}
-	case kube.Writer:
+	case kube.Reader, kube.Writer:
 	default:
 		return nil, fmt.Errorf("cluster: Open builds an instance's reader or writer, and %q is neither", cfg.Identity)
 	}
@@ -71,25 +52,13 @@ func Open(cfg kube.Config, warnings io.Writer, legacyKubeconfig string) (*Client
 	if err != nil {
 		return nil, err
 	}
-	c := &Client{kube: kc, warnings: warnings}
-	if cfg.Identity == kube.Writer && legacyKubeconfig != "" {
-		// Env(os.Environ()) is built from an allowlist: kubectl acts as
-		// whichever gcloud configuration the parent selects (ADR 0023 M0
-		// changes what reaches kubectl, not who it acts as), and keeps the
-		// parent's KUBECONFIG, never the instance's. A missing kubectl says
-		// that deploying needs it (execRunner's own text).
-		c.runner = execRunner{kubeconfig: legacyKubeconfig, env: Env(os.Environ())}
-	}
-	return c, nil
+	return &Client{kube: kc, warnings: warnings}, nil
 }
 
 // CanI asks the API server whether this client's identity may do one thing:
 // kube.Client.SelfSubjectAccessReview, for the proof 'farcast reader grant'
 // makes that the reader cannot write (ADR 0023 §7.2).
 func (c *Client) CanI(ctx context.Context, a kube.ResourceAttributes) (bool, error) {
-	if c.kube == nil {
-		return false, inProcessOnly("CanI")
-	}
 	allowed, err := c.kube.SelfSubjectAccessReview(ctx, a)
 	c.flushWarnings()
 	if err != nil {
@@ -104,9 +73,6 @@ func (c *Client) CanI(ctx context.Context, a kube.ResourceAttributes) (bool, err
 // error and never "". In ADR 0023 M2.5 its one caller is the writing
 // commands' preflight read.
 func (c *Client) NamespaceUID(ctx context.Context, name string) (string, error) {
-	if c.kube == nil {
-		return "", inProcessOnly("NamespaceUID")
-	}
 	uid, err := c.kube.NamespaceUID(ctx, name)
 	c.flushWarnings()
 	if err != nil {
@@ -138,9 +104,6 @@ func blankLastApplied(o *kube.Object) {
 // with the metadata; each object is returned with that annotation's key and
 // an empty value (blankLastApplied).
 func (c *Client) ListMeta(ctx context.Context, k kube.Kind, namespace, selector string) ([]kube.Object, error) {
-	if c.kube == nil {
-		return nil, inProcessOnly("ListMeta")
-	}
 	objs, err := c.kube.ListObjects(ctx, k, namespace, selector)
 	c.flushWarnings()
 	if err != nil {
@@ -158,9 +121,6 @@ func (c *Client) ListMeta(ctx context.Context, k kube.Kind, namespace, selector 
 // stringData are never decoded, and the last-applied annotation is returned
 // with its key and an empty value.
 func (c *Client) GetMeta(ctx context.Context, k kube.Kind, namespace, name string) (kube.Object, error) {
-	if c.kube == nil {
-		return kube.Object{}, inProcessOnly("GetMeta")
-	}
 	o, err := c.kube.GetObject(ctx, k, namespace, name)
 	c.flushWarnings()
 	if err != nil {
@@ -175,13 +135,10 @@ func (c *Client) GetMeta(ctx context.Context, k kube.Kind, namespace, name strin
 // kube.Client.PatchJSON, as fieldManager farcast, its answer metadata only,
 // with the last-applied annotation's value emptied as GetMeta empties it. A
 // reader client refuses it before anything is sent, a token included. It is
-// never retried here: migrate's loop, from M2.7b, is to retry a 409.
+// never retried here: migrate's loop retries a 409 (A30-23).
 func (c *Client) PatchManagedFields(ctx context.Context, k kube.Kind, namespace, name string, patch []byte) (kube.Object, error) {
 	if err := c.neverWrites(); err != nil {
 		return kube.Object{}, err
-	}
-	if c.kube == nil {
-		return kube.Object{}, inProcessOnly("PatchManagedFields")
 	}
 	o, err := c.kube.PatchJSON(ctx, k, namespace, name, patch)
 	c.flushWarnings()
@@ -192,23 +149,10 @@ func (c *Client) PatchManagedFields(ctx context.Context, k kube.Kind, namespace,
 	return o, nil
 }
 
-// inProcessOnly is the refusal, naming the method, of every exported method
-// but Apply on a Client that has no in-process client: nothing is run and
-// nothing is sent. Each of them begins with that check. Open always builds an
-// in-process client; since ADR 0023 M2.5 a Client without one is built only
-// by this package's tests (newWithEnv, newWithRunner), until kubectl goes in
-// ADR 0023 M2.7, and the check makes such a client refuse rather than
-// dereference a nil kube.
-func inProcessOnly(method string) error {
-	return fmt.Errorf("cluster: %s is in-process only, and this client runs kubectl", method)
-}
-
 // neverWrites refuses a write on a reader client before anything is sent. It
-// keys on the identity the client was opened as: a writer writes. A test-built
-// client has no in-process identity and passes it, so that its Apply runs its
-// runner; its ConfigMap writes are refused by inProcessOnly first.
+// keys on the identity the client was opened as: a writer writes.
 func (c *Client) neverWrites() error {
-	if c.kube != nil && c.kube.Identity() != kube.Writer {
+	if c.kube.Identity() != kube.Writer {
 		return errNeverWrites
 	}
 	return nil

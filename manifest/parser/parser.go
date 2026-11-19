@@ -374,10 +374,10 @@ func validateRelPath(s, path string) error {
 	}
 	// Rules 31 and 32. The path becomes one of the build Job's arguments,
 	// written inside a double-quoted YAML scalar (planck/build). A character
-	// that does not print could end that scalar's line, to kubectl's reader or
-	// to the API server's, and add documents of its own to the stream the
-	// operator's credential applies; a double quote or a backslash would end
-	// or escape the scalar. None of them belongs in a repository path, so the
+	// that does not print could end that scalar's line, to the API server's
+	// reader, and add documents of its own to the stream the operator's
+	// credential applies; a double quote or a backslash would end or escape
+	// the scalar. None of them belongs in a repository path, so the
 	// manifest is refused here, before anything is built.
 	if err := printableText(s, path); err != nil {
 		return err

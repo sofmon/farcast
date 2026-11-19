@@ -74,10 +74,13 @@ const (
 	keepersSubdir   = "keepers"
 	metadataFile    = "metadata.yaml"
 	credentialsFile = "credentials.yaml"
-	kubeconfigFile  = "kubeconfig.yaml"
+	// kubeconfigFile is the kubeconfig an older farcast's install wrote for
+	// kubectl. Nothing writes it since ADR 0023 M2.7.
+	kubeconfigFile = "kubeconfig.yaml"
 	// pluginCacheFile is the GKE auth plugin's token cache, which kubectl,
-	// run over kubeconfigFile, left beside it. farcast migrate, from ADR 0023
-	// M2.7b (not built at M2.7a), is to delete both (LegacyKubectlFiles).
+	// run over kubeconfigFile, left beside it. farcast migrate (ADR 0023
+	// M2.7) deletes both once it has recorded the instance
+	// (RemoveLegacyKubectlFiles).
 	pluginCacheFile = "gke_gcloud_auth_plugin_cache"
 	fatlineSubdir   = "fatline"
 	// datasphereSubdir holds the instance's storage keyring. It sits beside
@@ -401,8 +404,8 @@ type InstanceMetadata struct {
 	// ServerSideApply records that the instance's objects are written with
 	// server-side apply (ADR 0023 M2.7): since when, and by which farcast.
 	// Nil means they were last written with kubectl's client-side apply.
-	// Declared in M2.4 so 'farcast instances' can report it; 'farcast
-	// migrate' and 'farcast install' write it from M2.7.
+	// Declared in M2.4 so 'farcast instances' can report it; farcast
+	// migrate and farcast install write it.
 	ServerSideApply *ServerSideApply `yaml:"server_side_apply,omitempty"`
 
 	// CloudLogging is the provider's logging configuration for the cluster, as
@@ -847,17 +850,6 @@ func (d Dir) LoadInstanceCredentials(name string) (*InstanceCredentials, error) 
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 	return &c, nil
-}
-
-// SaveInstanceKubeconfig writes kubeconfig.yaml (0600) for an instance.
-func (d Dir) SaveInstanceKubeconfig(name string, kubeconfig []byte) error {
-	return d.writeInstanceFile(name, kubeconfigFile, kubeconfig)
-}
-
-// InstanceKubeconfigPath returns the path to an instance's kubeconfig (so the
-// connect bootstrap can hand it to kubectl).
-func (d Dir) InstanceKubeconfigPath(name string) string {
-	return filepath.Join(d.instanceDir(name), kubeconfigFile)
 }
 
 // legacyKubectlFiles are the files an instance's kubectl left on this

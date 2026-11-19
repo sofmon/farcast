@@ -42,8 +42,7 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 //     *.gke.goog, and the bearer token sent to it, are trusted on. On Linux
 //     they always do; on macOS and Windows a GODEBUG of
 //     x509sslcertoverrideplatform=1 makes them. The roots are loaded at their
-//     first use, after this, so unsetting them here is enough. kubectl never
-//     saw them either (cluster.Env drops them).
+//     first use, after this, so unsetting them here is enough.
 //
 // Then the two routes by which vendored Google code starts programs nobody
 // asked for (ADR 0023 decision 1). GOOGLE_API_USE_CLIENT_CERTIFICATE=false
@@ -213,6 +212,7 @@ func defaultRegistry() *Registry {
 
 	reg.Register(&installCommand{})
 	reg.Register(&releaseCommand{})
+	reg.Register(&migrateCommand{})
 	reg.Register(newConnectCommand())
 	reg.Register(newRedeployCommand())
 	reg.Register(&runCommand{})

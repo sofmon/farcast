@@ -152,7 +152,7 @@ func (c *Config) withDefaults() {
 
 // Render produces the Kubernetes apply stream (Namespace, Secret, StatefulSet,
 // PodDisruptionBudget, and the data/status/unseal Services) as multi-document
-// YAML for `kubectl apply -f -`.
+// YAML, applied in stream order.
 func Render(c Config) ([]byte, error) {
 	c.withDefaults()
 	if c.Image == "" {
@@ -337,8 +337,8 @@ type templateData struct {
 // second apply a no-op instead of a field-ownership tug-of-war.
 //
 // The NetworkPolicy comes before the StatefulSet, because a stream stopped
-// part-way (kubectl interrupted, or from ADR 0023 M2.7 the in-process apply at
-// its first failing document, design D3) leaves what came before it, so a
+// part-way (farcast interrupted, or since ADR 0023 M2.7 the in-process apply
+// at its first failing document, design D3) leaves what came before it, so a
 // policy after its workload could leave the keyholder's pods running without
 // it.
 var workloadTemplate = template.Must(template.New("datasphered").Parse(`apiVersion: v1

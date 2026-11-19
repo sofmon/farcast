@@ -663,13 +663,12 @@ func TestReaderCommandIsRegistered(t *testing.T) {
 		t.Errorf("reader alone: exit %d, %q", code, errOut)
 	}
 	// Since ADR 0023 M2.4 the read commands' cluster reads run as the reader,
-	// and the help says which; since M2.5 it says that the writing commands
-	// read, and write the pin, as the installer's key, and only apply with
-	// kubectl (A20-17).
+	// and the help says which; since M2.7 (A30-35) it says that the writing
+	// commands read and write in-process as the installer's key.
 	if flat := strings.Join(strings.Fields(out), " "); !strings.Contains(flat, "The cluster reads of 'world', 'ps', 'costs', 'usage' and 'logs' run as it") ||
-		!strings.Contains(flat, "The commands that write read the cluster, and write the storage key pin, in-process as the installer's stored service-account key") ||
-		!strings.Contains(flat, "their applies still run kubectl as the active gcloud configuration until ADR 0023 M2.7") ||
-		strings.Contains(flat, "for their reads too") || strings.Contains(flat, "until then") {
+		!strings.Contains(flat, "The commands that write read and write the cluster in-process as the installer's stored service-account key. "+
+			"The 'storage' and 'secret' reads use the installer's key too.") ||
+		strings.Contains(flat, "for their reads too") || strings.Contains(flat, "until then") || strings.Contains(flat, "gcloud configuration") {
 		t.Errorf("help reader does not say which reads run as the reader, and which as the installer:\n%s", out)
 	}
 }

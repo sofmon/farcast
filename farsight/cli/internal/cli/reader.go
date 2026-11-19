@@ -99,10 +99,9 @@ its own, farcast-reader- and 8 hex characters of the instance name's SHA-256.
 The cluster reads of 'world', 'ps', 'costs', 'usage' and 'logs' run as it, so
 they never mint a token for the installer, which can write; without a reader
 that 'reader grant' has verified read-only they read nothing. The commands
-that write read the cluster, and write the storage key pin, in-process as the
-installer's stored service-account key; their applies still run kubectl as
-the active gcloud configuration until ADR 0023 M2.7. The 'storage' and
-'secret' reads use the installer's key too.
+that write read and write the cluster in-process as the installer's stored
+service-account key. The 'storage' and 'secret' reads use the installer's
+key too.
 
 Setting it up takes four steps, one of them yours in Cloud Shell:
 

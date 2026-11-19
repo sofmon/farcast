@@ -29,9 +29,11 @@
 // or a token. R8 copies only these lines into the records.
 //
 // Some helpers write around Apply on purpose, because Apply refuses what they
-// send, and each says so: seedClientSide (kubectl's client-side apply, with
-// its annotation), rawApply (a second applier, and a body that carries a
-// resourceVersion) and migrateOne (the migration's JSON patch).
+// send or is not the write they make, and each says so: seedClientSide
+// (kubectl's client-side apply, with its annotation), rawApply (a second
+// applier, and a body that carries a resourceVersion no AllowResourceVersion
+// let through), migrateOne (the migration's JSON patch) and mergePatch
+// (another manager's merge patch).
 package kube
 
 import (
@@ -78,6 +80,10 @@ const realAPIEmail = "realapi@realapi.invalid"
 // mediaStrategicMergePatch is the content type of kubectl's client-side
 // apply's second write, which kube never sends.
 const mediaStrategicMergePatch = "application/strategic-merge-patch+json"
+
+// mediaMergePatch is the content type of a JSON merge patch, another
+// manager's write that kube never sends.
+const mediaMergePatch = "application/merge-patch+json"
 
 // realAPIEnv is the suite's environment, read once per run.
 type realAPIEnv struct {
@@ -543,10 +549,11 @@ func (r *realAPI) migrateOne(ctx context.Context, k Kind, ns, name string) (migr
 // rawApply is one server-side apply, as Apply sends it, with the field
 // manager and force given and none of Apply's checks: its query is
 // fieldManager=<manager>, fieldValidation=Strict and force. It bypasses Apply
-// on purpose, for the bodies Apply refuses (one carrying a resourceVersion)
-// and for a second applier. It returns the answer's metadata and, with no
-// error, the answer's own 2xx status: 201 when the apply created the object,
-// which c.decode does not tell from 200.
+// on purpose, for the bodies Apply refuses (one carrying a resourceVersion
+// that no AllowResourceVersion let through) and for a second applier. It
+// returns the answer's metadata and, with no error, the answer's own 2xx
+// status: 201 when the apply created the object, which c.decode does not
+// tell from 200.
 func (r *realAPI) rawApply(ctx context.Context, k Kind, ns, name string, body []byte, manager string, force bool) (ObjectMeta, int, error) {
 	cl := call{
 		method:      http.MethodPatch,
@@ -1166,8 +1173,12 @@ spec:
               memory: 128Mi
 `
 
-// policyConfigMap is the egress policy's ConfigMap, the object design
-// A30-40's resourceVersion precondition would guard.
+// egressPolicyName is the name fatline/deploy gives the egress policy
+// (PolicyConfigMap), which testdata/realapi/egress-policy.yaml renders.
+const egressPolicyName = "fatline-egress-policy"
+
+// policyConfigMap is a ConfigMap in the egress policy's shape, the kind of
+// object design A30-40's resourceVersion precondition guards.
 const policyConfigMap = `apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -1540,16 +1551,24 @@ func TestReapplyingAnUnchangedJobIsANoOp(t *testing.T) {
 
 // TestApplyRefusesAStaleResourceVersion records what an apply whose body
 // carries a resourceVersion answers. Its subtest "a stale resourceVersion"
-// (a_stale_resourceVersion, as -test.v names it) decides step 3 (A30-40):
-// whether an apply whose body carries a resourceVersion the object has moved
-// on from is refused with 409, which the egress policy's precondition would
-// need. It passes only on 409. The subtest "a Secret deleted since it was
-// read" only records what such an apply answers for a Secret deleted since it
-// was read: 404, 409, or a 2xx that recreated it, which A30-40's precondition
-// could then not tell from a policy that was never there. It fails only on any
-// other answer, or on a 2xx that left no new Secret there, and it never
-// decides step 3. Both bodies go through rawApply, because Apply refuses a
-// resourceVersion.
+// (a_stale_resourceVersion, as -test.v names it) decided step 3 (A30-40,
+// A31-2): an apply whose body carries a resourceVersion the object has moved
+// on from is refused with 409, which the egress policy's precondition needs.
+// It passes only on 409. The subtest "a Secret deleted since it was read"
+// only records what such an apply answers for a Secret deleted since it was
+// read: 404, 409, or a 2xx that recreated it, which the precondition then
+// cannot tell from a policy that was never there (§31 recorded 201). It fails
+// only on any other answer, or on a 2xx that left no new Secret there. Both
+// bodies go through rawApply, which takes a body Apply would refuse.
+//
+// The subtest "the egress policy at a stale resourceVersion" (A31-2) runs
+// step 3's own path: the policy as fldeploy.RenderPolicyConfigMap renders it
+// at a stale resourceVersion, split with AllowResourceVersion, is refused by
+// Apply with a 409 that unwraps to tkube.ErrConflict, and nothing is written.
+// The same render at the stored resourceVersion then applies. kube's tests
+// may not import fatline/deploy (doc_test.go), so the render is read from
+// testdata/realapi/egress-policy.yaml, which the cli package's
+// TestTheRealAPIEgressPolicyIsTheRenderers pins to the renderer's output.
 func TestApplyRefusesAStaleResourceVersion(t *testing.T) {
 	r := openRealAPI(t)
 	ns := r.runNamespace(t, "stale")
@@ -1565,7 +1584,7 @@ func TestApplyRefusesAStaleResourceVersion(t *testing.T) {
 		after := r.object(t, kindConfigMap, ns, "fatline-policy")
 		fact(t, "an apply carrying a stale metadata.resourceVersion: %d; the object was written: %t", code, after.Metadata.ResourceVersion != current.Metadata.ResourceVersion)
 		if code != http.StatusConflict || !errors.Is(err, tkube.ErrConflict) {
-			t.Errorf("an apply carrying a stale metadata.resourceVersion answered %d, not 409: the server does not hold an apply to it, so step 3 is not built (A30-40)", code)
+			t.Errorf("an apply carrying a stale metadata.resourceVersion answered %d, not 409: the server does not hold an apply to it, so the egress policy's precondition (A30-40) does not hold here", code)
 		}
 		if code == http.StatusConflict && after.Metadata.ResourceVersion != current.Metadata.ResourceVersion {
 			t.Error("the refused apply still wrote the object")
@@ -1594,6 +1613,56 @@ func TestApplyRefusesAStaleResourceVersion(t *testing.T) {
 			}
 		default:
 			t.Errorf("the apply answered %d, neither 404, 409 nor a 2xx", code)
+		}
+	})
+	t.Run("the egress policy at a stale resourceVersion", func(t *testing.T) {
+		file, err := os.ReadFile(filepath.Join("testdata", "realapi", "egress-policy.yaml"))
+		r.check(t, err, "the egress policy's testdata")
+		_, rendered, ok := strings.Cut(string(file), "\n---\n")
+		if !ok {
+			t.Fatal("testdata/realapi/egress-policy.yaml holds no --- line")
+		}
+		// at is the policy as run renders it into ns, one application whose
+		// credential_sha256 is credential (a marker), at rv ("" for none),
+		// split as cluster.ApplyAt splits it.
+		at := func(t *testing.T, credential, rv string) Document {
+			t.Helper()
+			text := rendered
+			if rv == "" {
+				text = strings.Replace(text, "  resourceVersion: \"{rv}\"\n", "", 1)
+			}
+			text = strings.NewReplacer("{ns}", ns, "{credential}", credential, "{rv}", rv).Replace(text)
+			docs, err := SplitStream([]byte(text), AllowResourceVersion(rv))
+			if err != nil || len(docs) != 1 {
+				t.Fatalf("the rendered policy does not split into one document: %d, %v", len(docs), err)
+			}
+			return docs[0]
+		}
+		first, err := r.c.Apply(ctx, at(t, strings.Repeat("1", 64), ""), true)
+		r.check(t, err, "the policy's first Apply")
+		_, err = r.c.Apply(ctx, at(t, strings.Repeat("2", 64), ""), true)
+		r.check(t, err, "the policy's second Apply")
+		current := r.object(t, kindConfigMap, ns, egressPolicyName)
+
+		_, err = r.c.Apply(ctx, at(t, strings.Repeat("3", 64), first.ResourceVersion), true)
+		code := r.answered(t, err)
+		after := r.object(t, kindConfigMap, ns, egressPolicyName)
+		written := after.Metadata.ResourceVersion != current.Metadata.ResourceVersion
+		fact(t, "the egress policy rendered at a stale resourceVersion, split with AllowResourceVersion: Apply answered %d; the object was written: %t", code, written)
+		if !errors.Is(err, tkube.ErrConflict) {
+			t.Errorf("Apply of the policy at a stale resourceVersion answered %d, not a 409 unwrapping to tkube.ErrConflict", code)
+		}
+		if written {
+			t.Error("the refused apply still wrote the policy")
+		}
+
+		_, err = r.c.Apply(ctx, at(t, strings.Repeat("4", 64), current.Metadata.ResourceVersion), true)
+		code = r.answered(t, err)
+		now := r.object(t, kindConfigMap, ns, egressPolicyName)
+		written = now.Metadata.ResourceVersion != current.Metadata.ResourceVersion
+		fact(t, "the egress policy rendered at the stored resourceVersion: Apply answered %d; the object was written: %t", code, written)
+		if err != nil || !written {
+			t.Errorf("Apply of the policy at the stored resourceVersion answered %d, the object written: %t; want it applied", code, written)
 		}
 	})
 }
@@ -1769,17 +1838,36 @@ func kernelEntries(md ObjectMeta) []ManagedFieldsEntry {
 }
 
 // TestKernelWritesAreTrackedAsTechnocore drives the kernel's real writes
-// through technocore/kube.Client: Scale to 0, SetRequests, and SaveConfigMap's
-// POST and PUT. Each must be tracked under technocore (A30-11, built in
-// M2.7a), never a name the server derives from the client. It records each
-// entry's manager, operation and subresource, and whether /scale's entry owns
-// spec.replicas.
+// through technocore/kube.Client: Scale, SetRequests, and SaveConfigMap's POST
+// and PUT. Its main-resource writes must each be tracked under technocore
+// (A30-11, built in M2.7a), never a name the server derives from the client.
+// It records each entry's manager, operation and subresource.
+//
+// Its Scale to 0, the only Scale the kernel makes, was recorded under no
+// manager on a loopback envtest kube-apiserver v1.36.2, and left spec.replicas
+// owned by no entry (§31, A31-5). So the Scale subtest records the entries
+// and asserts replicas 0 and no foreign manager, without requiring a
+// technocore entry, and asserts that no entry owns spec.replicas, so a server
+// that starts tracking it shows up. It records whether that Scale, sent at
+// least a second after the apply, moved the time of farcast's Apply entry,
+// which P1 (c)'s adapted fact compares with the kernel's stamp. Then it
+// scales to 2, and records whether a technocore/Update entry with subresource
+// scale appears and owns spec.replicas.
 func TestKernelWritesAreTrackedAsTechnocore(t *testing.T) {
 	r := openRealAPI(t)
 	ns := r.runNamespace(t, "kernel")
 	ctx := t.Context()
 	k := r.kernel(t, ns)
 	r.apply(t, doc(appV2, ns, seedV1), true)
+	appliedAt := time.Now()
+	foreign := func(t *testing.T, what string, md ObjectMeta) {
+		t.Helper()
+		for _, e := range md.ManagedFields {
+			if e.Manager != FieldManager && e.Manager != tkube.FieldManager {
+				t.Errorf("%s: an entry names %s, neither farcast nor %s", what, entryName(e), tkube.FieldManager)
+			}
+		}
+	}
 	named := func(t *testing.T, what string, md ObjectMeta) {
 		t.Helper()
 		var replicas []bool
@@ -1790,17 +1878,52 @@ func TestKernelWritesAreTrackedAsTechnocore(t *testing.T) {
 		if len(kernelEntries(md)) == 0 {
 			t.Errorf("%s left no %s entry", what, tkube.FieldManager)
 		}
+		foreign(t, what, md)
+	}
+	// applyTime is the time of farcast's own Apply entry, "" without one.
+	applyTime := func(md ObjectMeta) string {
 		for _, e := range md.ManagedFields {
-			if e.Manager != FieldManager && e.Manager != tkube.FieldManager {
-				t.Errorf("%s: an entry names %s, neither farcast nor %s", what, entryName(e), tkube.FieldManager)
+			if IsOwnApply(e) {
+				return e.Time
 			}
 		}
+		return ""
 	}
 	t.Run("Scale", func(t *testing.T) {
-		r.check(t, k.Scale(ctx, ns, "api", 0), "Scale")
-		named(t, "Scale", r.object(t, kindDeployment, ns, "api").Metadata)
+		before := r.object(t, kindDeployment, ns, "api").Metadata
+		// An entry's time is kept to the second, so a Scale sent within the
+		// apply's second could not be seen to move it.
+		if wait := time.Second - time.Since(appliedAt); wait > 0 {
+			time.Sleep(wait)
+		}
+		r.check(t, k.Scale(ctx, ns, "api", 0), "Scale to 0")
+		zero := r.object(t, kindDeployment, ns, "api").Metadata
+		owned := false
+		for _, e := range zero.ManagedFields {
+			if owns(e, "f:spec", "f:replicas") {
+				owned = true
+				t.Errorf("after the Scale to 0, %s owns spec.replicas; on v1.36.2 no entry did (A31-5)", entryName(e))
+			}
+		}
+		fact(t, "Scale to 0: entries %v; an entry owns spec.replicas: %t; farcast/Apply's time moved: %t", entryNames(zero), owned, applyTime(zero) != applyTime(before))
+		foreign(t, "Scale to 0", zero)
 		if got := field(r.raw(t, kindDeployment.Path(ns, "api")), "spec", "replicas"); got != float64(0) {
 			t.Errorf("spec.replicas reads %v after Scale to 0", got)
+		}
+
+		r.check(t, k.Scale(ctx, ns, "api", 2), "Scale to 2")
+		two := r.object(t, kindDeployment, ns, "api").Metadata
+		tracked, trackedOwns := false, false
+		for _, e := range two.ManagedFields {
+			if e.Manager == tkube.FieldManager && e.Operation == "Update" && e.Subresource == "scale" {
+				tracked = true
+				trackedOwns = trackedOwns || owns(e, "f:spec", "f:replicas")
+			}
+		}
+		fact(t, "Scale to 2: entries %v; a %s/Update/scale entry appears: %t; it owns spec.replicas: %t", entryNames(two), tkube.FieldManager, tracked, trackedOwns)
+		foreign(t, "Scale to 2", two)
+		if got := field(r.raw(t, kindDeployment.Path(ns, "api")), "spec", "replicas"); got != float64(2) {
+			t.Errorf("spec.replicas reads %v after Scale to 2", got)
 		}
 	})
 	t.Run("SetRequests", func(t *testing.T) {
@@ -1820,11 +1943,22 @@ func TestKernelWritesAreTrackedAsTechnocore(t *testing.T) {
 	})
 }
 
-// TestMigrationLeavesAnotherManagersFieldAlone: the kernel's real Scale sets
-// replicas through /scale on an object kubectl's client-side apply seeded. The
-// migration leaves that entry and its owner as they were, and the replicas the
-// kernel set. Then a forced farcast apply of replicas: 1 takes the field,
-// which is P1 (c)'s reset.
+// TestMigrationLeavesAnotherManagersFieldAlone: another manager's field, on
+// an object kubectl's client-side apply seeded, survives the migration, and a
+// forced farcast apply then takes it, which is P1 (c)'s reset. The other
+// manager is realapi-other's merge PATCH on the Deployment itself, which the
+// server records as an Update owning spec.replicas (§31's /scale [diag]).
+// The order is pinned (A31-5), because a /scale write of 0 strips every owner
+// of spec.replicas:
+//  1. the client-side seed;
+//  2. the kernel's Scale to 0, whose entries are recorded only;
+//  3. realapi-other's merge PATCH of spec.replicas to 3, a value other than
+//     the live one, after which realapi-other/Update owns it;
+//  4. migrateOne, after which that entry is unchanged and replicas reads 3;
+//  5. the forced apply of replicas: 1, after which farcast/Apply owns it and
+//     it reads 1.
+//
+// No /scale write follows the PATCH.
 func TestMigrationLeavesAnotherManagersFieldAlone(t *testing.T) {
 	r := openRealAPI(t)
 	ns := r.runNamespace(t, "scale")
@@ -1833,16 +1967,25 @@ func TestMigrationLeavesAnotherManagersFieldAlone(t *testing.T) {
 	r.seed(t, kindDeployment, ns, doc(fatlineV1, ns, seedV1), seedV1bPatch)
 	r.check(t, k.Scale(ctx, ns, "fatline", 0), "the kernel's Scale")
 	scaled := r.object(t, kindDeployment, ns, "fatline")
-	fact(t, "after the kernel's Scale: entries %v", entryNames(scaled.Metadata))
+	fact(t, "after the kernel's Scale to 0: entries %v", entryNames(scaled.Metadata))
+
+	r.check(t, r.mergePatch(ctx, kindDeployment, ns, "fatline", []byte(`{"spec":{"replicas":3}}`), realAPIOther), "realapi-other's merge PATCH")
+	patched := r.object(t, kindDeployment, ns, "fatline")
+	other, ok := otherReplicasEntry(patched.Metadata)
+	fact(t, "after %s's merge PATCH of spec.replicas: entries %v; %s/Update owns spec.replicas: %t", realAPIOther, entryNames(patched.Metadata), realAPIOther, ok)
+	if !ok {
+		t.Fatalf("after its merge PATCH, no %s/Update entry owns spec.replicas", realAPIOther)
+	}
 
 	m, err := r.migrateOne(ctx, kindDeployment, ns, "fatline")
 	r.check(t, err, "the migration")
-	fact(t, "after the migration: entries %v", entryNames(m.after.Metadata))
-	if before, after := kernelEntries(scaled.Metadata), kernelEntries(m.after.Metadata); len(before) == 0 || !sameEntries(before, after) {
-		t.Errorf("the migration changed the kernel's entries: %v, then %v", entryNames(ObjectMeta{ManagedFields: before}), entryNames(ObjectMeta{ManagedFields: after}))
+	migrated, ok := otherReplicasEntry(m.after.Metadata)
+	fact(t, "after the migration: entries %v; %s/Update unchanged: %t", entryNames(m.after.Metadata), realAPIOther, ok && sameEntries([]ManagedFieldsEntry{other}, []ManagedFieldsEntry{migrated}))
+	if !ok || !sameEntries([]ManagedFieldsEntry{other}, []ManagedFieldsEntry{migrated}) {
+		t.Errorf("the migration changed %s's entry, or its ownership of spec.replicas", realAPIOther)
 	}
-	if got := field(r.raw(t, kindDeployment.Path(ns, "fatline")), "spec", "replicas"); got != float64(0) {
-		t.Errorf("spec.replicas reads %v after the migration, not the kernel's 0", got)
+	if got := field(r.raw(t, kindDeployment.Path(ns, "fatline")), "spec", "replicas"); got != float64(3) {
+		t.Errorf("spec.replicas reads %v after the migration, not %s's 3", got, realAPIOther)
 	}
 
 	r.apply(t, doc(fatlineV1, ns, seedV1b, "{replicas}", "1"), true)
@@ -1860,6 +2003,35 @@ func TestMigrationLeavesAnotherManagersFieldAlone(t *testing.T) {
 	if !farcastOwns {
 		t.Error("farcast/Apply does not own spec.replicas after its forced apply")
 	}
+}
+
+// realAPIOther is the other manager TestMigrationLeavesAnotherManagersFieldAlone
+// writes as, the name the suite's other second appliers use too.
+const realAPIOther = "realapi-other"
+
+// otherReplicasEntry is md's realapi-other/Update entry on the main
+// resource, and whether there is one that owns spec.replicas.
+func otherReplicasEntry(md ObjectMeta) (ManagedFieldsEntry, bool) {
+	for _, e := range md.ManagedFields {
+		if e.Manager == realAPIOther && e.Operation == "Update" && e.Subresource == "" && owns(e, "f:spec", "f:replicas") {
+			return e, true
+		}
+	}
+	return ManagedFieldsEntry{}, false
+}
+
+// mergePatch is a JSON merge PATCH of body on the object, as manager, with
+// strict validation. It bypasses Apply on purpose: it is another manager's
+// write, which the server records as that manager's Update.
+func (r *realAPI) mergePatch(ctx context.Context, k Kind, ns, name string, body []byte, manager string) error {
+	_, err := r.c.do(ctx, call{
+		method:      http.MethodPatch,
+		path:        k.Path(ns, name),
+		query:       url.Values{"fieldManager": {manager}, "fieldValidation": {"Strict"}},
+		contentType: mediaMergePatch,
+		body:        body,
+	})
+	return err
 }
 
 // sameEntries compares two lists of entries by manager, operation,

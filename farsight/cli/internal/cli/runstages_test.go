@@ -677,29 +677,121 @@ func TestConfirmRefusesAnAppStoppedAfterTheCompare(t *testing.T) {
 // is read again, and its resourceVersion compared with the one its plan
 // bound, before any credential is minted: one another run wrote meanwhile is
 // plan_changed, with nothing minted and the policy not written.
+//
+// ADR 0023 M2.7 (A30-40 as A31-2 amends it, row 88b): the policy is then
+// written at the resourceVersion just read, which its document carries. One
+// another run writes between that read and the apply is the API server's
+// 409, which is plan_changed too, with one attempt, at the version read, and
+// no workload applied; an interactive or --yes run, which consented to no
+// digest, refuses with the same words, and no kind. The API server's other
+// refusals of the apply are not a changed plan. A policy deleted between the
+// read and the apply is recreated from this run's merge, which the
+// precondition cannot tell from one never there: the deploy goes on.
 func TestConfirmRefusesAPolicyChangedAfterTheCompare(t *testing.T) {
-	r := newStageRig(t, nil)
-	d := r.deployPlan()
-	if w := policyWriteOf(t, decodedBound(t, d)); w.ResourceVersion != "" {
-		t.Fatalf("the policy's write binds resourceVersion %q; want the absent policy's", w.ResourceVersion)
-	}
-	r.f.onBuild = func(string) {
+	const policyKey = fldeploy.DefaultNamespace + "/" + fldeploy.PolicyConfigMap
+	// writeOther is another run's write of the policy, at resourceVersion
+	// rv: its own deployment's application alone.
+	writeOther := func(t *testing.T, f *fakeRunCluster, rv string) {
+		t.Helper()
 		other := &policy.Document{Version: policy.Version, Apps: []policy.App{{Name: "worker", Namespace: "other", CredentialSHA256: policy.HashCredential("theirs")}}}
 		body, err := other.Marshal()
 		if err != nil {
 			t.Fatal(err)
 		}
-		if r.f.configMaps == nil {
-			r.f.configMaps = map[string]string{}
+		if f.configMaps == nil {
+			f.configMaps = map[string]string{}
 		}
-		r.f.configMaps[fldeploy.DefaultNamespace+"/"+fldeploy.PolicyConfigMap+"/"+fldeploy.PolicyKey] = string(body)
-		r.f.rvs = map[string]string{fldeploy.DefaultNamespace + "/" + fldeploy.PolicyConfigMap: "7"}
+		f.configMaps[policyKey+"/"+fldeploy.PolicyKey] = string(body)
+		f.rvs = map[string]string{policyKey: rv}
 	}
-	_, _, err := r.confirm(d)
-	plannedChange(t, err, "the instance's egress policy changed since the plan was made; the builds were written, and nothing after them was")
-	if got := appliedAfterTheBuilds(t, r.f); len(got) != 0 || r.minted != 0 {
-		t.Errorf("applied %q, minting %d credentials, after the policy changed", got, r.minted)
+	// policyAt is a rig whose cluster holds another run's policy at
+	// resourceVersion 5, and the deploy plan it reads at that version.
+	policyAt := func(t *testing.T) (*stageRig, plan.Document) {
+		t.Helper()
+		r := newStageRig(t, nil)
+		writeOther(t, r.f, "5")
+		d := r.deployPlan()
+		if w := policyWriteOf(t, decodedBound(t, d)); w.ResourceVersion != "5" {
+			t.Fatalf("the policy's write binds resourceVersion %q; want the 5 it was read at", w.ResourceVersion)
+		}
+		return r, d
 	}
+	// nothingAfterTheBuilds checks that a refused policy left the builds
+	// alone written, its apply tried once, at version 5.
+	nothingAfterTheBuilds := func(t *testing.T, f *fakeRunCluster) {
+		t.Helper()
+		if got := appliedAfterTheBuilds(t, f); len(got) != 0 || len(builds(t, f)) != 2 {
+			t.Errorf("applied %q after the builds %q; want the builds alone", got, builds(t, f))
+		}
+		if !slices.Equal(f.appliedAt, []string{"5"}) {
+			t.Errorf("the policy's applies were at %q; want one, at the 5 it was read at", f.appliedAt)
+		}
+	}
+
+	t.Run("during the builds", func(t *testing.T) {
+		r := newStageRig(t, nil)
+		d := r.deployPlan()
+		if w := policyWriteOf(t, decodedBound(t, d)); w.ResourceVersion != "" {
+			t.Fatalf("the policy's write binds resourceVersion %q; want the absent policy's", w.ResourceVersion)
+		}
+		r.f.onBuild = func(string) { writeOther(t, r.f, "7") }
+		_, _, err := r.confirm(d)
+		plannedChange(t, err, "the instance's egress policy changed since the plan was made; the builds were written, and nothing after them was")
+		if got := appliedAfterTheBuilds(t, r.f); len(got) != 0 || r.minted != 0 || len(r.f.appliedAt) != 0 {
+			t.Errorf("applied %q, minting %d credentials, after the policy changed; its applies were at %q", got, r.minted, r.f.appliedAt)
+		}
+	})
+	t.Run("between the re-read and the apply", func(t *testing.T) {
+		r, d := policyAt(t)
+		r.f.onApplyAt = func() { r.f.rvs[policyKey] = "6" }
+		_, _, err := r.confirm(d)
+		plannedChange(t, err, "the instance's egress policy changed since the plan was made; the builds were written, and nothing after them was")
+		nothingAfterTheBuilds(t, r.f)
+	})
+	for _, mode := range []struct {
+		name string
+		cmd  func(*runCommand) *runCommand
+		in   string
+	}{
+		{"--yes, between the re-read and the apply", func(c *runCommand) *runCommand { return c }, ""},
+		{"interactively, between the re-read and the apply", interactively, "y\n"},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			f := newFakeRun(twoAppManifest)
+			writeOther(t, f, "5")
+			f.onApplyAt = func() { f.rvs[policyKey] = "6" }
+			stderr, err := p1Run(t, mode.cmd(p1Cmd(f)), mode.in)
+			if err == nil || err.Error() != msgPolicyChangedSince || kindOf(classified(err)) != kindInternal || exitCodeOf(err) != 1 {
+				t.Fatalf("%s = %v (kind %s, exit %d)\n%s\nwant %q, kind internal", mode.name, err, kindOf(classified(err)), exitCodeOf(err), stderr, msgPolicyChangedSince)
+			}
+			nothingAfterTheBuilds(t, f)
+		})
+	}
+	t.Run("another refusal of the apply", func(t *testing.T) {
+		r, d := policyAt(t)
+		r.f.applyErrOn = "name: " + fldeploy.PolicyConfigMap
+		_, _, err := r.confirm(d)
+		if want := "write the egress policy: the API server said no"; err == nil || err.Error() != want || kindOf(classified(err)) == kindPlanChanged {
+			t.Fatalf("--confirm = %v (kind %s); want %q, no plan change", err, kindOf(classified(err)), want)
+		}
+		if got := appliedAfterTheBuilds(t, r.f); !slices.Equal(got, []string{"ConfigMap/" + fldeploy.PolicyConfigMap}) {
+			t.Errorf("applied %q after the builds; want the refused policy alone", got)
+		}
+	})
+	t.Run("deleted between the re-read and the apply", func(t *testing.T) {
+		r, d := policyAt(t)
+		r.f.onApplyAt = func() { r.f.configMaps, r.f.rvs = nil, nil }
+		if _, errb, err := r.confirm(d); err != nil {
+			t.Fatalf("--confirm over a policy deleted after its re-read = %v\n%s", err, errb)
+		}
+		policyApplied := appliedWith(t, r.f, "name: "+fldeploy.PolicyConfigMap)
+		if !strings.Contains(policyApplied, `resourceVersion: "5"`) || !strings.Contains(policyApplied, `"name": "worker"`) {
+			t.Errorf("the policy recreated is not this run's merge at the version it read:\n%s", policyApplied)
+		}
+		if got := appliedAfterTheBuilds(t, r.f); !slices.ContainsFunc(got, func(k string) bool { return strings.HasPrefix(k, "Deployment/") }) {
+			t.Errorf("applied %q after the builds; want the workloads too", got)
+		}
+	})
 }
 
 // policyWriteOf is b's write of the egress policy.

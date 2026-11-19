@@ -19,13 +19,60 @@ type Document struct {
 	Namespace string // "" for cluster-scoped
 	Name      string
 	Raw       []byte // the document's own bytes, sent unchanged as the apply body
+
+	// allowedResourceVersion is the metadata.resourceVersion Raw carries
+	// because AllowResourceVersion let it, "" when it carries none. Only
+	// SplitStream sets it, and Apply's rawFault honours it, so a Document
+	// built by hand never carries one.
+	allowedResourceVersion string
 }
 
-// SplitOption adjusts SplitStream. No option is built yet: AllowResourceVersion
-// (§2.1) exists only once §10.6's TestApplyRefusesAStaleResourceVersion passes.
+// SplitOption adjusts SplitStream.
 type SplitOption func(*splitOptions)
 
-type splitOptions struct{}
+type splitOptions struct {
+	// resourceVersion is the one metadata.resourceVersion a document may
+	// carry (AllowResourceVersion), "" for none.
+	resourceVersion string
+}
+
+// AllowResourceVersion lets exactly one document of the stream carry
+// metadata.resourceVersion, and only as a YAML string equal to rv (design
+// §2.1, A30-40). Any other value, one that is not a string, and a second
+// document that carries one are each refused. With rv "" it allows nothing.
+//
+// The API server holds an apply that carries a resourceVersion to it: one
+// that is no longer the stored one is answered 409 and nothing is written
+// (§31, A31-2). That is the egress policy's precondition. An object deleted
+// since it was read is created again, so the precondition cannot tell it from
+// one that was never there.
+func AllowResourceVersion(rv string) SplitOption {
+	return func(o *splitOptions) { o.resourceVersion = rv }
+}
+
+// resourceVersionAllowance is what inspectDocument lets a document's
+// metadata.resourceVersion be: value ("" allows none), and only while no
+// earlier document of the stream has carried it (carried).
+type resourceVersionAllowance struct {
+	value   string
+	carried bool
+}
+
+// fault is why the value v of metadata.resourceVersion is refused under a,
+// "" when a lets it through.
+func (a resourceVersionAllowance) fault(v any) string {
+	switch s, isString := v.(string); {
+	case a.value == "":
+		return "it carries metadata.resourceVersion, which only the API server sets"
+	case a.carried:
+		return "it carries metadata.resourceVersion, and so does an earlier document of the stream; only one may"
+	case !isString:
+		return "its metadata.resourceVersion is not a YAML string"
+	case s != a.value:
+		return fmt.Sprintf("it carries metadata.resourceVersion %q, and only %q is allowed", s, a.value)
+	}
+	return ""
+}
 
 // lastAppliedAnnotation is kubectl's client-side apply annotation
 // (corev1.LastAppliedConfigAnnotation).
@@ -69,14 +116,16 @@ func SplitStream(stream []byte, opts ...SplitOption) ([]Document, error) {
 
 	// 2. Split on lines exactly ---, skipping chunks of blanks and comments.
 	var docs []Document
+	allow := resourceVersionAllowance{value: o.resourceVersion}
 	for _, c := range chunks {
 		if c.empty() {
 			continue
 		}
-		d, err := checkDocument(len(docs), c.raw)
+		d, err := checkDocument(len(docs), c.raw, allow)
 		if err != nil {
 			return nil, err
 		}
+		allow.carried = allow.carried || d.allowedResourceVersion != ""
 		docs = append(docs, d)
 	}
 	return docs, nil
@@ -203,9 +252,10 @@ type header struct {
 	Metadata   map[string]any `yaml:"metadata"`
 }
 
-// checkDocument is steps 3 to 5 of §5.2 for one non-empty chunk.
-func checkDocument(index int, raw []byte) (Document, error) {
-	d, f := inspectDocument(index, raw)
+// checkDocument is steps 3 to 5 of §5.2 for one non-empty chunk, with what
+// allow lets its metadata.resourceVersion be.
+func checkDocument(index int, raw []byte, allow resourceVersionAllowance) (Document, error) {
+	d, f := inspectDocument(index, raw, allow)
 	if f != nil {
 		return Document{}, refuseDocument(index, f.kind, f.name, "%s", f.reason)
 	}
@@ -217,8 +267,9 @@ func checkDocument(index int, raw []byte) (Document, error) {
 type documentFault struct{ kind, name, reason string }
 
 // inspectDocument is checkDocument without the framing of the refusal, so
-// Apply can give the reason in its own sentence.
-func inspectDocument(index int, raw []byte) (Document, *documentFault) {
+// Apply can give the reason in its own sentence. A metadata.resourceVersion
+// allow lets through is the Document's allowedResourceVersion.
+func inspectDocument(index int, raw []byte, allow resourceVersionAllowance) (Document, *documentFault) {
 	unidentified := func(reason string, a ...any) (Document, *documentFault) {
 		return Document{}, &documentFault{reason: fmt.Sprintf(reason, a...)}
 	}
@@ -297,8 +348,17 @@ func inspectDocument(index int, raw []byte) (Document, *documentFault) {
 	if _, present := top["status"]; present {
 		return refuseHere("it carries status, which only the API server sets")
 	}
+	var allowed string
 	for _, key := range serverSetMetadata {
-		if _, present := h.Metadata[key]; present {
+		v, present := h.Metadata[key]
+		switch {
+		case !present:
+		case key == "resourceVersion":
+			if reason := allow.fault(v); reason != "" {
+				return refuseHere("%s", reason)
+			}
+			allowed = allow.value
+		default:
 			return refuseHere("it carries metadata.%s, which only the API server sets", key)
 		}
 	}
@@ -308,16 +368,17 @@ func inspectDocument(index int, raw []byte) (Document, *documentFault) {
 	if !k.Namespaced {
 		namespace = ""
 	}
-	return Document{Index: index, Kind: k, Namespace: namespace, Name: name, Raw: bytes.Clone(raw)}, nil
+	return Document{Index: index, Kind: k, Namespace: namespace, Name: name, Raw: bytes.Clone(raw), allowedResourceVersion: allowed}, nil
 }
 
 // rawFault is why d's bytes are not the document d says they are, "" when
 // they are. Apply sends d.Raw, not d's fields, so a Document built by hand
 // rather than by SplitStream is checked again here: §5.2's steps run on d.Raw
 // alone, which must be exactly one non-empty document, and the kind, namespace
-// and name they read must be d's. It runs with no SplitOption: if
-// AllowResourceVersion is ever built (§2.1), the document it lets through
-// needs the same allowance here, or Apply refuses it.
+// and name they read must be d's. It runs with the allowance SplitStream gave
+// d and no other: the metadata.resourceVersion AllowResourceVersion let
+// through (d's allowedResourceVersion), which a Document built by hand never
+// has, so its bytes may carry none.
 func rawFault(d Document) string {
 	chunks := splitChunks(d.Raw)
 	if len(chunks) != 1 {
@@ -332,7 +393,7 @@ func rawFault(d Document) string {
 	if c.empty() {
 		return "its bytes hold no document"
 	}
-	got, f := inspectDocument(d.Index, d.Raw)
+	got, f := inspectDocument(d.Index, d.Raw, resourceVersionAllowance{value: d.allowedResourceVersion})
 	if f != nil {
 		return f.reason
 	}

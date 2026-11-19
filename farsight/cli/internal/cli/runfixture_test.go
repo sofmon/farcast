@@ -46,8 +46,8 @@ import (
 // it as --confirm of a digest that is no plan's does — A23-47's "otherwise"
 // path, which reads as the reader alone and writes nothing — and reads its
 // digest from the refusal; runDeployPlan prints it, through --confirm with
-// the fetch plan's digest under the succeeding stand-in kubectl. Both read
-// runFixture's cluster, on kubetest.
+// the fetch plan's digest, whose manifest read is applied in-process (ADR
+// 0023 M2.7). Both read runFixture's cluster, on kubetest.
 
 // runTarget is the namespace the deploy plans of runDeployRows deploy into:
 // twoAppManifest's name.
@@ -87,7 +87,9 @@ func runOtherPolicy() *policy.Document {
 //   - the key pin, retiring a key no keyring here holds (pinRetiringForeign);
 //   - the fetch Job of stageRepo at its default ref, finished at
 //     stageJobUID, its pod's termination message the report of
-//     twoAppManifest, and its log that manifest;
+//     twoAppManifest, and its log that manifest; its container is the fetch
+//     renderer's, git, so the Job an in-process apply rebuilds from its
+//     body (ADR 0023 M2.7), keeping its status, still names the pod's;
 //   - each application's build Job, finished, its pod's message the digest
 //     runBuildDigests gives it.
 //
@@ -113,7 +115,7 @@ func runSeed(t *testing.T, target bool) func(s *kubetest.Server) {
 			s.Put(map[string]any{"apiVersion": "v1", "kind": "ConfigMap",
 				"metadata": map[string]any{"name": cm.name, "namespace": cm.ns}, "data": map[string]any{cm.key: cm.value}})
 		}
-		finishedJob(s, stageFetchJob(), stageJobUID, "fetch", reportFor(twoAppManifest), twoAppManifest)
+		finishedJob(s, stageFetchJob(), stageJobUID, "git", reportFor(twoAppManifest), twoAppManifest)
 		for _, app := range []string{"api", "web"} {
 			finishedJob(s, pbuild.JobName(runTarget, app), runBuildUIDs[app], "kaniko", runBuildDigests[app], "")
 		}
@@ -257,7 +259,7 @@ func runDeployRows(t *testing.T) []planCommand {
 	row := func(shape string, target, metered bool, prepare func(*testing.T, config.Dir)) planCommand {
 		f := &planFakes{provider: &fakeProvider{}, builder: &fakeBuilder{}}
 		r := planCommand{name: "run", shape: shape, stage: "deploy", args: runFixtureArgs, flags: runFixtureFlags,
-			readsCluster: true, cmd: runWithFakes(f), seed: runSeed(t, target), prepare: prepare, fakes: f}
+			readsCluster: true, identity: "reader", cmd: runWithFakes(f), seed: runSeed(t, target), prepare: prepare, fakes: f}
 		if metered {
 			r.edit = meterRunTarget
 		}
@@ -327,16 +329,13 @@ func runDeployDigest(t *testing.T, dir config.Dir, row planCommand, in io.Reader
 
 // runDeployPlan is row's deploy plan as run prints it (A28-11): --plan, then
 // --confirm with the fetch plan's digest, which runs the manifest read — the
-// fetch Job applied as the writer through the succeeding stand-in kubectl,
-// for that one run, and read back as the reader from the Job the fixture
-// holds — and prints the deploy plan in mode, nothing on stderr. It returns
-// what runPlan returns, and puts PATH back as it was.
+// fetch Job applied in-process as the writer, over the finished Job the
+// fixture holds, whose status the apply keeps, and read back as the reader
+// — and prints the deploy plan in mode, nothing on stderr. It returns what
+// runPlan returns.
 func runDeployPlan(t *testing.T, dir config.Dir, row planCommand, mode output.Mode) (plan.Document, string) {
 	t.Helper()
 	fetch, _ := runPlan(t, dir, row, output.ModeJSON)
-	path := os.Getenv("PATH")
-	succeedingKubectl(t)
-	defer t.Setenv("PATH", path)
 	cmd := withFlags(t, row.cmd(), append(slices.Clone(row.flags), "--confirm", fetch.Digest)...)
 	env, out, errb := testEnvBoth(dir, mode)
 	if err := cmd.Run(t.Context(), env, row.args); err != nil {
@@ -367,9 +366,8 @@ func planDigest(t *testing.T, dir config.Dir, row planCommand) string {
 // the fetch plan and reads no cluster, needs no reader; --confirm, with the
 // fetch plan's digest or the deploy plan's, needs one 'reader grant'
 // verified, and without it refuses with run's own words, credential_missing,
-// before the reader or the writer opens — no fetch Job applied, the
-// stand-in kubectl never run, no request sent, credentials.yaml never read
-// and nothing printed. A granted reader that is not the derived one is
+// before the reader or the writer opens — no fetch Job applied, no request
+// sent, credentials.yaml never read and nothing printed. A granted reader that is not the derived one is
 // refused by openCluster, in its words, before the writer opens.
 func runWithoutAReaderIsRefused(t *testing.T) {
 	for _, tc := range []struct {
@@ -394,7 +392,6 @@ func runWithoutAReaderIsRefused(t *testing.T) {
 	} {
 		for _, stage := range []string{"--plan", "<F>", "<D>"} {
 			t.Run(tc.state+"/"+stage, func(t *testing.T) {
-				ran := strayKubectl(t)
 				row, s, dir := runFixture(t)
 				answer := []string{"--plan"}
 				switch stage {
@@ -454,9 +451,6 @@ func runWithoutAReaderIsRefused(t *testing.T) {
 						t.Errorf("run %s read %s", stage, p)
 					}
 				}
-				if ran() {
-					t.Errorf("run %s with a reader %s ran kubectl: the fetch Job was applied", stage, tc.state)
-				}
 			})
 		}
 	}
@@ -492,8 +486,7 @@ func runPlanReadErrorsNameTheReader(t *testing.T, status kube.Status, sentence s
 // the writer's list of the same namespace, answered here for the writer
 // alone, names another, or none. --confirm with the deploy plan's digest
 // compares, opens the writer, and refuses plan_changed, naming both uids,
-// once the writer's preflight read it: no build applied, the stand-in
-// kubectl never run, nothing written.
+// once the writer's preflight read it: no build applied, nothing written.
 func runConfirmChecksTheWritersCluster(t *testing.T) {
 	for _, tc := range []struct {
 		name, writerUID, said string
@@ -502,7 +495,6 @@ func runConfirmChecksTheWritersCluster(t *testing.T) {
 		{"no farcast-system", "", "absent"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			ran := strayKubectl(t)
 			theWriters := kubetest.WithHandler(func(r kubetest.Request) (int, []byte, bool) {
 				if r.As != "writer" || r.Method != http.MethodGet || r.Path != "/api/v1/namespaces" {
 					return 0, nil, false
@@ -528,8 +520,8 @@ func runConfirmChecksTheWritersCluster(t *testing.T) {
 			if err == nil || err.Error() != want || kindOf(classified(err)) != kindPlanChanged || exitCodeOf(err) != 1 {
 				t.Fatalf("run --confirm <D> against another cluster = %v (kind %s);\nwant %q, plan_changed\n%s", err, kindOf(classified(err)), want, errb)
 			}
-			if ran() || out.Len() != 0 {
-				t.Errorf("ran kubectl %v and printed %q before refusing", ran(), out)
+			if applied := len(appliedRequests(s)); applied != 0 || out.Len() != 0 {
+				t.Errorf("applied %d documents and printed %q before refusing", applied, out)
 			}
 			if !slices.Equal(row.fakes.readers, []kube.Identity{kube.Reader, kube.Reader}) || row.fakes.writers != 1 {
 				t.Errorf("opened the plan's reader as %v and the writer %d times; want the reader twice, then the writer once", row.fakes.readers, row.fakes.writers)
@@ -561,22 +553,26 @@ func runConfirmChecksTheWritersCluster(t *testing.T) {
 
 // answeredRequest is one request kubetest answered, as
 // TestConfirmRecomputesAsThePlansIdentity orders them: its identity, its
-// method and path, and how many runs of the stand-in kubectl had begun.
+// method and path, and how many applies had been answered before it.
 type answeredRequest struct {
 	as, method, path string
 	applied          int
 }
 
-// answeredLog is a kubetest option that logs every request answered, with
-// how many applies runs counts had begun, and the log.
-func answeredLog(runs func() int) (kubetest.Option, func() []answeredRequest) {
+// answeredLog is a kubetest option that logs every request answered, each
+// with how many server-side applies (apply-patch PATCHes) were answered
+// before it (A30-31), and the log.
+func answeredLog() (kubetest.Option, func() []answeredRequest) {
 	var mu sync.Mutex
 	var seen []answeredRequest
+	applies := 0
 	return kubetest.WithAnswered(func(r kubetest.Request, _ int) {
-			n := runs()
 			mu.Lock()
 			defer mu.Unlock()
-			seen = append(seen, answeredRequest{r.As, r.Method, r.Path, n})
+			seen = append(seen, answeredRequest{r.As, r.Method, r.Path, applies})
+			if r.Method == http.MethodPatch && r.ContentType == "application/apply-patch+yaml" {
+				applies++
+			}
 		}), func() []answeredRequest {
 			mu.Lock()
 			defer mu.Unlock()
@@ -586,26 +582,26 @@ func answeredLog(runs func() int) (kubetest.Option, func() []answeredRequest) {
 
 // runConfirmRecomputesAsThePlansIdentity is
 // TestConfirmRecomputesAsThePlansIdentity's run cases (A23-47, A23-50, rows
-// 76 and 76a), against runFixture through run's real reader and writer, the
-// stand-in kubectl the succeeding one.
+// 76 and 76a), against runFixture through run's real reader and writer.
 //
 // run <F>: --confirm with the fetch plan's digest applies the read as the
-// writer — its token and its preflight first, before any apply — then the
-// stand-in applies exactly the fetch plan's documents, and every request
-// after is the reader's: the Job's wait, its pod list and its log, and the
-// deploy plan's reads. It prints the deploy plan.
+// writer — its token and its preflight first, before any apply — then one
+// apply per document of the fetch plan, exactly its documents, each as the
+// writer with farcast's forced query (ADR 0023 M2.7, A30-31), and every
+// request after is the reader's: the Job's wait, its pod list and its log,
+// and the deploy plan's reads. It prints the deploy plan.
 //
 // run <D>: --confirm with the deploy plan's digest runs to the end. Every
 // request before the writer's first token is the reader's, and none was
 // answered after an apply: the deploy plan is computed again, and compared,
 // as the reader, before anything is written. Every request after that token
-// is the writer's, its preflight before any apply, and the stand-in applied
-// the builds, then the egress policy, then the workloads.
+// is the writer's, its preflight before any apply, and it applied the
+// builds, then the egress policy, then the workloads, one document at a
+// time, as the writer with farcast's forced query.
 func runConfirmRecomputesAsThePlansIdentity(t *testing.T) {
 	t.Run("run <F>", func(t *testing.T) {
-		calls, runs := succeedingKubectlRuns(t)
-		opt, seen := answeredLog(runs)
-		row, _, dir := runFixture(t, opt)
+		opt, seen := answeredLog()
+		row, s, dir := runFixture(t, opt)
 		fetch, _ := runPlan(t, dir, row, output.ModeJSON)
 		planned := len(seen())
 		cmd := withFlags(t, row.cmd(), append(slices.Clone(row.flags), "--confirm", fetch.Digest)...)
@@ -617,24 +613,25 @@ func runConfirmRecomputesAsThePlansIdentity(t *testing.T) {
 			t.Errorf("run --plan sent %d requests", planned)
 		}
 		confirmed := seen()[planned:]
-		if len(confirmed) < 3 || confirmed[0] != (answeredRequest{"writer", http.MethodPost, "/token", 0}) ||
-			confirmed[1] != (answeredRequest{"writer", http.MethodGet, "/api/v1/namespaces", 0}) {
-			t.Fatalf("the confirm's requests begin %+v; want the writer's token, then its preflight, before any apply", confirmed)
+		writes := applyWrites(decodedBound(t, fetch))
+		want := []answeredRequest{{"writer", http.MethodPost, "/token", 0}, {"writer", http.MethodGet, "/api/v1/namespaces", 0}}
+		for i, w := range writes {
+			want = append(want, answeredRequest{"writer", http.MethodPatch, factPath(t, w), i})
 		}
-		for _, a := range confirmed[2:] {
-			if a.as != "reader" || a.applied != 1 {
-				t.Errorf("after the writer's preflight: %s %s as %q, after %d applies; want the reader's, after the read's one apply", a.method, a.path, a.as, a.applied)
+		if len(writes) == 0 || len(confirmed) <= len(want) || !slices.Equal(confirmed[:len(want)], want) {
+			t.Fatalf("the confirm's requests begin %+v;\nwant the writer's token, then its preflight, then one apply per document of the fetch plan\n%+v", confirmed, want)
+		}
+		for _, a := range confirmed[len(want):] {
+			if a.as != "reader" || a.applied != len(writes) {
+				t.Errorf("after the writer's applies: %s %s as %q, after %d applies; want the reader's, after the read's %d", a.method, a.path, a.as, a.applied, len(writes))
 			}
 		}
 		job := "/apis/batch/v1/namespaces/" + pfetch.Namespace + "/jobs/" + stageFetchJob()
 		if !slices.ContainsFunc(confirmed, func(a answeredRequest) bool { return a.as == "reader" && a.path == job }) {
 			t.Errorf("the reader never read the fetch Job %s: %+v", job, confirmed)
 		}
-		applied := appliedStreams(calls())
-		if len(applied) != 1 {
-			t.Fatalf("the stand-in applied %d streams; want the read's one", len(applied))
-		}
-		if got, want := wantWrites(t, applied[0]), planWrites(decodedBound(t, fetch)); !reflect.DeepEqual(got, want) {
+		applied := appliedBodies(t, appliedRequests(s))
+		if got, want := wantWrites(t, streamOf(applied)), planWrites(decodedBound(t, fetch)); !reflect.DeepEqual(got, want) {
 			t.Errorf("applied\n%#v\nthe fetch plan bound\n%#v", got, want)
 		}
 		if b := decodedBound(t, printedDocument(t, out.Bytes())); b.Stage != "deploy" || b.ClusterIdentity != "reader" {
@@ -646,9 +643,8 @@ func runConfirmRecomputesAsThePlansIdentity(t *testing.T) {
 	})
 
 	t.Run("run <D>", func(t *testing.T) {
-		calls, runs := succeedingKubectlRuns(t)
-		opt, seen := answeredLog(runs)
-		row, _, dir := runFixture(t, opt)
+		opt, seen := answeredLog()
+		row, s, dir := runFixture(t, opt)
 		digest := runDeployDigest(t, dir, row, nil)
 		planned := len(seen())
 		cmd := withFlags(t, row.cmd(), append(slices.Clone(row.flags), "--confirm", digest)...).(*runCommand)
@@ -673,24 +669,27 @@ func runConfirmRecomputesAsThePlansIdentity(t *testing.T) {
 		if firstWriter+1 == len(confirmed) || confirmed[firstWriter+1] != (answeredRequest{"writer", http.MethodGet, "/api/v1/namespaces", 0}) {
 			t.Errorf("the writer's reads are %+v; want its preflight first, before any apply", confirmed[firstWriter+1:])
 		}
-		var kinds []string
-		for _, s := range appliedStreams(calls()) {
-			docs := docsIn(t, string(s))
-			switch {
-			case len(docs) == 1 && docs["ConfigMap/"+fldeploy.PolicyConfigMap] != "":
-				kinds = append(kinds, "policy")
-			case docs["Job/"+pbuild.JobName(runTarget, "api")] != "":
-				kinds = append(kinds, "build api")
-			case docs["Job/"+pbuild.JobName(runTarget, "web")] != "":
-				kinds = append(kinds, "build web")
-			case docs["Deployment/api"] == runTarget && docs["Deployment/web"] == runTarget:
-				kinds = append(kinds, "workloads")
-			default:
-				kinds = append(kinds, fmt.Sprint(docs))
+		// The builds, then the egress policy, then the workloads, each
+		// document its own apply: their paths, which no resourceVersion
+		// moves.
+		builds, policyDoc, workloads := runPlannedDocuments(t, dir, "")
+		var want []string
+		for _, stream := range append(append(slices.Clone(builds), policyDoc), workloads) {
+			docs, err := kube.SplitStream(stream)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, d := range docs {
+				want = append(want, d.Kind.Path(d.Namespace, d.Name))
 			}
 		}
-		if want := []string{"build api", "build web", "policy", "workloads"}; !slices.Equal(kinds, want) {
-			t.Errorf("the stand-in applied %q; want %q", kinds, want)
+		var got []string
+		for _, r := range appliedRequests(s) {
+			got = append(got, r.Path)
+		}
+		appliedBodies(t, appliedRequests(s))
+		if !slices.Equal(got, want) {
+			t.Errorf("applied\n%q\nwant each build's documents, then the policy, then the workloads'\n%q", got, want)
 		}
 		if !slices.Equal(row.fakes.readers, []kube.Identity{kube.Reader, kube.Reader}) || row.fakes.writers != 1 {
 			t.Errorf("opened the plan's reader as %v and the writer %d times; want the reader for the plan and for the recomputation, then the writer once",
@@ -720,10 +719,11 @@ func runMasked(doc []byte) []byte {
 // runPlannedDocuments is what the deploy plan into runTarget renders over
 // its placeholders (A23-30), as the test computes it: each build, pinned to
 // the commit read; the egress policy, runOtherPolicy merged with the
-// manifest's, each of its credentials a placeholder; and the workloads,
-// over placeholder images, credentials and leaves, and the instance's CA
-// certificate.
-func runPlannedDocuments(t *testing.T, dir config.Dir) (builds [][]byte, policyDoc, workloads []byte) {
+// manifest's, each of its credentials a placeholder, carrying policyRV, the
+// resourceVersion the plan read it at (A30-40; "" renders none); and the
+// workloads, over placeholder images, credentials and leaves, and the
+// instance's CA certificate.
+func runPlannedDocuments(t *testing.T, dir config.Dir, policyRV string) (builds [][]byte, policyDoc, workloads []byte) {
 	t.Helper()
 	meta, err := dir.LoadInstanceMetadata(writeName)
 	if err != nil {
@@ -738,7 +738,7 @@ func runPlannedDocuments(t *testing.T, dir config.Dir) (builds [][]byte, policyD
 	if err != nil {
 		t.Fatal(err)
 	}
-	if policyDoc, err = fldeploy.RenderPolicyConfigMap(fldeploy.DefaultNamespace, doc); err != nil {
+	if policyDoc, err = fldeploy.RenderPolicyConfigMap(fldeploy.DefaultNamespace, doc, policyRV); err != nil {
 		t.Fatal(err)
 	}
 	images, scopes := map[string]string{}, map[string]datasphere.Scope{}
@@ -765,21 +765,29 @@ func runPlannedDocuments(t *testing.T, dir config.Dir) (builds [][]byte, policyD
 // TestConfirmWritesThePlannedDocumentsExceptTheirSecrets's row for run
 // (A23-31, row 80): its deploy plan into runTarget, printed by --confirm
 // with the fetch plan's digest, then confirmed through run's real writer
-// against kubetest, its kubectl the succeeding stand-in, its keyholder one
-// whose replicas serve, so the key pin is raised. The plan's write facts
-// are the test's own rendering over the placeholders. The stand-in applied
-// each build byte for byte as planned; the egress policy and the workloads
+// against a settled kubetest, each document its own apply (ADR 0023 M2.7),
+// its keyholder one whose replicas serve, so the key pin is raised. The
+// plan's write facts are the test's own rendering over the placeholders. It
+// applied each build byte for byte as planned; the egress policy and the
+// workloads
 // equal the planned rendering once A23-31's differences are masked, and
 // differ unmasked only in a Secret, a Deployment's image and the policy's
 // credentials; and the pin, written in-process as the writer at the
 // resourceVersion the plan read, is the planned document but for its key
 // ids, whose count each array keeps.
 func confirmWritesRunsDocumentsAsPlanned(t *testing.T) {
-	calls := succeedingKubectl(t)
 	row, s, dir := runFixture(t)
 	doc, _ := runDeployPlan(t, dir, row, output.ModeJSON)
 	b := decodedBound(t, doc)
-	builds, policyDoc, workloads := runPlannedDocuments(t, dir)
+	// The policy is rendered at the resourceVersion the plan read, which
+	// its document carries (A30-40). kubetest refuses an apply at any other
+	// with a 409 (A31-2), so the --confirm below succeeding is that it was
+	// the stored one.
+	policyRV := policyWriteOf(t, b).ResourceVersion
+	if policyRV == "" {
+		t.Errorf("the plan binds the policy, which the fixture holds, at no resourceVersion")
+	}
+	builds, policyDoc, workloads := runPlannedDocuments(t, dir, policyRV)
 
 	// The plan's write facts are this rendering: the builds, the policy at
 	// the resourceVersion the plan read, the workloads, then the pin.
@@ -791,16 +799,13 @@ func confirmWritesRunsDocumentsAsPlanned(t *testing.T) {
 	for _, build := range builds {
 		want = append(want, wantWrites(t, build)...)
 	}
-	policyWrite := wantWrites(t, policyDoc)
+	policyWrite := wantWrites(t, policyDoc, kube.AllowResourceVersion(policyRV))
 	writes := planWrites(b)
 	if len(policyWrite) != 1 || len(writes) < len(want)+1 {
 		t.Fatalf("the policy renders %d documents, and the plan binds %d writes", len(policyWrite), len(writes))
 	}
 	pw := policyWrite[0].(plan.WriteFact)
-	pw.ResourceVersion = writes[len(want)].(plan.WriteFact).ResourceVersion
-	if pw.ResourceVersion == "" {
-		t.Errorf("the plan binds the policy, which the fixture holds, at no resourceVersion")
-	}
+	pw.ResourceVersion = policyRV
 	want = append(append(want, pw), wantWrites(t, workloads)...)
 	if got := writes[:len(writes)-1]; !reflect.DeepEqual(got, want) || writes[len(writes)-1] != plan.Fact(*pin) {
 		t.Fatalf("the plan's write facts are not the planned rendering, then the pin:\n%#v\n%#v", writes, want)
@@ -813,23 +818,34 @@ func confirmWritesRunsDocumentsAsPlanned(t *testing.T) {
 	if err := cmd.Run(t.Context(), env, row.args); err != nil {
 		t.Fatalf("--confirm <D>: %v\n%s", err, errb)
 	}
-	applied := appliedStreams(calls())
-	if len(applied) != len(builds)+2 {
-		t.Fatalf("the stand-in applied %d streams; want the %d builds, the policy and the workloads", len(applied), len(builds))
-	}
-	for i, build := range builds {
-		if !bytes.Equal(applied[i], build) {
-			t.Errorf("build %d applied\n%s\nthe plan rendered\n%s", i, applied[i], build)
+	// One apply per document: the builds', the policy's, then the
+	// workloads', in the plan's order.
+	applied := appliedBodies(t, appliedOf(s.Requests()[sent:]))
+	var buildDocs []kube.Document
+	for _, build := range builds {
+		docs, err := kube.SplitStream(build)
+		if err != nil {
+			t.Fatal(err)
 		}
+		buildDocs = append(buildDocs, docs...)
 	}
-	if got, want := runMasked(applied[len(builds)]), runMasked(policyDoc); !bytes.Equal(got, want) || bytes.Equal(applied[len(builds)], policyDoc) {
-		t.Errorf("the policy applied differs from the plan's beyond its credentials, or not there at all:\napplied:\n%s\nplanned:\n%s", applied[len(builds)], policyDoc)
-	}
-	appliedDocs, err := kube.SplitStream(applied[len(builds)+1])
+	plannedDocs, err := kube.SplitStream(workloads)
 	if err != nil {
 		t.Fatal(err)
 	}
-	plannedDocs, err := kube.SplitStream(workloads)
+	if len(applied) != len(buildDocs)+1+len(plannedDocs) {
+		t.Fatalf("applied %d documents; want the builds' %d, the policy and the workloads' %d", len(applied), len(buildDocs), len(plannedDocs))
+	}
+	for i, d := range buildDocs {
+		if !bytes.Equal(applied[i], d.Raw) {
+			t.Errorf("build document %d applied\n%s\nthe plan rendered\n%s", i, applied[i], d.Raw)
+		}
+	}
+	policyApplied := applied[len(buildDocs)]
+	if got, want := runMasked(policyApplied), runMasked(policyDoc); !bytes.Equal(got, want) || bytes.Equal(policyApplied, policyDoc) {
+		t.Errorf("the policy applied differs from the plan's beyond its credentials, or not there at all:\napplied:\n%s\nplanned:\n%s", policyApplied, policyDoc)
+	}
+	appliedDocs, err := kube.SplitStream(streamOf(applied[len(buildDocs)+1:]))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -907,7 +923,6 @@ func runDeployPlansCarryNoKeyMaterial(t *testing.T) {
 // refuses plan_changed, naming both, having read only as the reader and
 // written nothing.
 func runDeployPlanChangedByThePolicy(t *testing.T) {
-	ran := strayKubectl(t)
 	row, s, dir := runFixture(t)
 	given := runDeployDigest(t, dir, row, nil)
 	body, err := runOtherPolicy().Marshal()
@@ -921,8 +936,8 @@ func runDeployPlanChangedByThePolicy(t *testing.T) {
 		t.Fatalf("the deploy plan is %s before and after the policy's resourceVersion moved: it binds no version", now)
 	}
 	confirmRefusedAsChanged(t, row, s, dir, given)
-	if ran() {
-		t.Error("a changed deploy plan ran kubectl")
+	if applied := len(appliedRequests(s)); applied != 0 {
+		t.Errorf("a changed deploy plan applied %d documents", applied)
 	}
 }
 
@@ -932,15 +947,15 @@ func runDeployPlanChangedByThePolicy(t *testing.T) {
 // plan --confirm with the fetch plan's digest prints carries it as a notice
 // fact, in JSON and in its rendering, with the hand-over's notice beside
 // it, and prints neither on stderr. --confirm with the deploy plan's digest
-// prints it once, right after the comparison, and stops here at applyReady,
-// with no kubectl.
+// prints it once, right after the comparison, and stops here at its first
+// apply, which kubetest refuses (A30-31).
 func runDeployNoticesAreFacts(t *testing.T) {
 	row := runDeployRowNamed(t, "deploy into a metered namespace")
 	row.edit = func(m *config.InstanceMetadata) {
 		meterRunTarget(m)
 		m.FatLineDeployed = false
 	}
-	_, dir := planFixture(t, row)
+	s, dir := planFixture(t, row)
 	notice := noWayOutWarning(writeName, mustManifest(t, twoAppManifest), false)
 	if notice == "" {
 		t.Fatal("guard: no notice to print")
@@ -956,12 +971,14 @@ func runDeployNoticesAreFacts(t *testing.T) {
 		}
 	}
 	doc, _ := runDeployPlan(t, dir, row, output.ModeJSON)
-	noKubectl(t)
+	s.FailNextApply(http.StatusInternalServerError, kube.Status{})
+	sent := len(s.Requests())
 	cmd := withFlags(t, row.cmd(), append(slices.Clone(row.flags), "--confirm", doc.Digest)...)
 	env, _, errb := testEnvBoth(dir, output.ModeHuman)
-	if err := cmd.Run(t.Context(), env, row.args); err == nil || !strings.Contains(err.Error(), msgCannotApply+msgKubectlMissing) {
-		t.Fatalf("--confirm <D> = %v; want it past the comparison, at applyReady", err)
+	if err := cmd.Run(t.Context(), env, row.args); kindOf(classified(err)) != kindClusterRejected {
+		t.Fatalf("--confirm <D> = %v; want it past the comparison, at its first apply, refused", err)
 	}
+	stoppedAtTheFirstApply(t, "--confirm <D>", s.Requests()[sent:])
 	if got := strings.Count(errb.String(), notice+"\n"); got != 1 {
 		t.Errorf("--confirm <D> printed the notice %d times; want once:\n%s", got, errb)
 	}
@@ -1009,13 +1026,12 @@ func runPrintedPlan(t *testing.T, dir config.Dir, row planCommand, mode output.M
 // deploy plan from --confirm with the fetch plan's digest — prints its one
 // block first, with no fact, and the blocked line in place of the confirm
 // line. --confirm with its digest refuses with the block, exit 1, printing
-// nothing, opening no writer and no keyholder, running no kubectl and
-// writing nothing: the fetch plan's sends nothing, and the deploy plan's
+// nothing, opening no writer and no keyholder, applying nothing and writing
+// nothing: the fetch plan's sends nothing, and the deploy plan's
 // recomputes it as the reader, and sends nothing else.
 func runBlockedPlansAreRefusedWithTheirKind(t *testing.T) {
 	for _, tc := range runBlocks(t) {
 		t.Run(tc.row.shape, func(t *testing.T) {
-			ran := strayKubectl(t)
 			row := tc.row
 			s, dir := planFixture(t, row)
 			doc, _ := runPrintedPlan(t, dir, row, output.ModeJSON)
@@ -1039,9 +1055,9 @@ func runBlockedPlansAreRefusedWithTheirKind(t *testing.T) {
 			if err == nil || err.Error() != block.Message || kindOf(classified(err)) != tc.kind || exitCodeOf(err) != 1 {
 				t.Errorf("%s --confirm of the blocked plan = %v (kind %s, exit %d); want its block", row, err, kindOf(classified(err)), exitCodeOf(err))
 			}
-			if out.Len() != 0 || row.fakes.writers != writers || row.fakes.keyholders != 0 || ran() {
-				t.Errorf("%s --confirm of the blocked plan printed %q, opened the writer %d times and the keyholder %d times, and ran kubectl %v",
-					row, out, row.fakes.writers-writers, row.fakes.keyholders, ran())
+			if applied := len(appliedOf(s.Requests()[sent:])); out.Len() != 0 || row.fakes.writers != writers || row.fakes.keyholders != 0 || applied != 0 {
+				t.Errorf("%s --confirm of the blocked plan printed %q, opened the writer %d times and the keyholder %d times, and applied %d documents",
+					row, out, row.fakes.writers-writers, row.fakes.keyholders, applied)
 			}
 			onlyThePlansSent(t, row, s.Requests()[sent:], consentConfirm)
 			sameFiles(t, "a blocked "+row.String(), before, treeFiles(t, string(dir)))
@@ -1062,7 +1078,7 @@ func runDeployHostileText(t *testing.T) {
 		seed(s)
 		s.Put(map[string]any{"apiVersion": "v1", "kind": "Namespace", "metadata": map[string]any{
 			"name": tcdeploy.DefaultNamespace, "uid": hostileUID}})
-		finishedJob(s, stageFetchJob(), hostileJobUID, "fetch", reportFor(twoAppManifest), twoAppManifest)
+		finishedJob(s, stageFetchJob(), hostileJobUID, "git", reportFor(twoAppManifest), twoAppManifest)
 	}
 	_, dir := planFixture(t, row)
 	_, text := runDeployPlan(t, dir, row, output.ModeHuman)
@@ -1079,12 +1095,12 @@ func runDeployHostileText(t *testing.T) {
 }
 
 // runConfirmLinesRunTheSameCommand is TestTheConfirmLineRunsTheSameCommand's
-// row for run's deploy plan through run() (A23-17): the fetch plan's line,
-// run with the succeeding stand-in kubectl, runs the manifest read and
-// prints the deploy plan, whose own line drops the fetch plan's --confirm
-// and confirms the deploy plan's digest alone. That line, run with no
-// kubectl, computes the same deploy plan as the reader and stops at
-// applyReady, past the comparison, having sent only the reader's reads.
+// row for run's deploy plan through run() (A23-17): the fetch plan's line
+// runs the manifest read, its apply in-process, and prints the deploy plan,
+// whose own line drops the fetch plan's --confirm and confirms the deploy
+// plan's digest alone. That line computes the same deploy plan as the
+// reader and, past the comparison, opens the writer, which sends its
+// preflight and one apply, refused (A30-31), having stored nothing.
 // run's clock is pinned at runClock (pinRunClock), so the deploy plan binds
 // runSeed's ledger as fresh and below the limit, as the direct rows do.
 func runConfirmLinesRunTheSameCommand(t *testing.T) {
@@ -1097,7 +1113,6 @@ func runConfirmLinesRunTheSameCommand(t *testing.T) {
 	}
 	fetch := digestLine(t, stdout)
 	words := shellWords(t, confirmLineOf(stdout))
-	succeedingKubectl(t)
 	stdout, stderr, code = runLine(words)
 	if code != 0 {
 		t.Fatalf("the fetch plan's confirm line %q: exit %d, %s", words, code, stderr)
@@ -1111,14 +1126,18 @@ func runConfirmLinesRunTheSameCommand(t *testing.T) {
 		slices.Contains(words, fetch) || slices.Contains(words, "--plan") || deploy == fetch {
 		t.Fatalf("the deploy plan's confirm line is %q; want the command again, confirming %s alone", words, deploy)
 	}
-	noKubectl(t)
+	s.FailNextApply(http.StatusInternalServerError, kube.Status{})
 	sent := len(s.Requests())
 	_, stderr, code = runLine(words)
 	if strings.Contains(stderr, "the plan for this command is now") {
 		t.Fatalf("the deploy plan's confirm line computed another plan: %s", stderr)
 	}
-	if code != 1 || !strings.Contains(stderr, msgCannotApply+msgKubectlMissing) {
-		t.Errorf("the deploy plan's confirm line: exit %d, %q; want it past the comparison, at applyReady", code, stderr)
+	if code != 1 || !strings.Contains(stderr, "documents were applied before") {
+		t.Errorf("the deploy plan's confirm line: exit %d, %q; want it past the comparison, at its first apply, refused", code, stderr)
 	}
-	onlyThePlansSent(t, row, s.Requests()[sent:], consentConfirm)
+	readerReqs, writerReqs := stoppedAtTheFirstApply(t, "the deploy plan's confirm line", s.Requests()[sent:])
+	onlyThePlansSent(t, row, readerReqs, consentConfirm)
+	if len(writerReqs) != 1 || writerReqs[0].Method != http.MethodGet || writerReqs[0].Path != "/api/v1/namespaces" {
+		t.Errorf("before its apply the writer sent %v; want its preflight alone", writerReqs)
+	}
 }

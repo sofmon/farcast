@@ -1733,6 +1733,75 @@ func TestApplyRequiresTheBodyToNameTheURLsObject(t *testing.T) {
 	}
 }
 
+// TestApplyAnswersConflictOnAStaleResourceVersion (design A30-40 as A31-2
+// amends it, §10.5 row 88d): an apply whose body carries a
+// metadata.resourceVersion is held to it, as the API server held one in §31's
+// run. One that is not the stored object's is 409 Conflict, and stores
+// nothing (kube's TestAllowResourceVersion reads it as tkube.ErrConflict
+// through Apply); the stored one applies, moving the
+// resourceVersion; for an object that is absent (deleted since it was read,
+// or never there) it is no precondition, and the object is created, 201. One
+// that is not a string is 422, and stores nothing either.
+func TestApplyAnswersConflictOnAStaleResourceVersion(t *testing.T) {
+	f := newFixture(t)
+	tok := f.mint(f.s.Credential("writer"))
+	const path = "/api/v1/namespaces/fatline/configmaps/policy"
+	at := func(mode, rv string) string {
+		s := "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: policy\n  namespace: fatline\n"
+		if rv != "" {
+			s += "  resourceVersion: " + rv + "\n"
+		}
+		return s + "data:\n  mode: " + mode + "\n"
+	}
+	stored := func() (rv, mode string) {
+		t.Helper()
+		m := object(t, f.get(path, tok))
+		rv, _ = metaOf(t, m)["resourceVersion"].(string)
+		mode, _ = get(m, "data", "mode").(string)
+		return rv, mode
+	}
+
+	wantCode(t, f.apply(path, tok, at("one", "")), http.StatusCreated)
+	read, _ := stored()
+	wantCode(t, f.apply(path, tok, at("two", "")), http.StatusOK)
+	current, _ := stored()
+	if current == read {
+		t.Fatalf("the second apply left the resourceVersion at %s", read)
+	}
+
+	t.Run("a stale one", func(t *testing.T) {
+		wantStatus(t, f.apply(path, tok, at("three", `"`+read+`"`)), http.StatusConflict, "Conflict")
+		if rv, mode := stored(); rv != current || mode != "two" {
+			t.Errorf("after the refused apply the object is at %s, mode %s; want it unwritten at %s, mode two", rv, mode, current)
+		}
+	})
+	t.Run("the stored one", func(t *testing.T) {
+		wantCode(t, f.apply(path, tok, at("four", `"`+current+`"`)), http.StatusOK)
+		if rv, mode := stored(); rv == current || mode != "four" {
+			t.Errorf("after the apply at the stored resourceVersion the object is at %s, mode %s; want it written", rv, mode)
+		}
+	})
+	t.Run("not a string", func(t *testing.T) {
+		before, _ := stored()
+		wantStatus(t, f.apply(path, tok, at("five", before)), http.StatusUnprocessableEntity, "Invalid")
+		if rv, mode := stored(); rv != before || mode != "four" {
+			t.Errorf("after the refused apply the object is at %s, mode %s; want it unwritten", rv, mode)
+		}
+	})
+	t.Run("an absent object", func(t *testing.T) {
+		const gone = "/api/v1/namespaces/fatline/configmaps/gone"
+		body := strings.ReplaceAll(at("six", `"`+current+`"`), "name: policy", "name: gone")
+		a := f.apply(gone, tok, body)
+		wantCode(t, a, http.StatusCreated)
+		if md := metaOf(t, object(t, a)); md["uid"] == "" || md["resourceVersion"] == "" {
+			t.Errorf("the created object's metadata = %v", md)
+		}
+		if got := get(object(t, f.get(gone, tok)), "data", "mode"); got != "six" {
+			t.Errorf("the object created at a resourceVersion reads mode %v, want six", got)
+		}
+	})
+}
+
 // TestSingleObjectAnswersCarryKindAndListItemsDoNot: GET, PATCH, POST and PUT
 // answers carry kind and apiVersion; list items carry neither.
 func TestSingleObjectAnswersCarryKindAndListItemsDoNot(t *testing.T) {

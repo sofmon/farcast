@@ -102,7 +102,8 @@ func readEgressPolicy(ctx context.Context, cl configMapReader) (*policy.Document
 
 // readEgressPolicyAt is readEgressPolicy for run, with the ConfigMap's
 // resourceVersion, which a plan binds on the policy's write and --confirm
-// compares before it mints (ADR 0023 M2.6d, A23-47, A28-10). Its outcomes
+// compares before it mints (ADR 0023 M2.6d, A23-47, A28-10), and which the
+// policy is then written at (ADR 0023 M2.7, A30-40). Its outcomes
 // are readEgressPolicy's: no ConfigMap is an empty document, at no
 // resourceVersion; one without policy.json is document_unreadable; one
 // whose policy.json does not parse is as readEgressPolicy has it.

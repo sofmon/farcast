@@ -185,8 +185,12 @@ func TestABuildReachesTheInternetAndNothingInTheCluster(t *testing.T) {
 	if fmt.Sprint(types) != "[Ingress Egress]" {
 		t.Fatalf("policyTypes = %v, want both", types)
 	}
-	if ing, ok := at(t, np, "spec", "ingress").([]any); !ok || len(ing) != 0 {
-		t.Errorf("ingress = %v, want empty: a build serves nothing and listens for nothing", ing)
+	// Ingress listed with no ingress rule denies all of it. An empty list
+	// would say the same, but on a loopback envtest kube-apiserver 1.36.2 it
+	// was not stored, and every apply of it moved the policy's generation
+	// (ADR 0023 M2.7, design §31 and A31-4).
+	if ing, ok := at(t, np, "spec").(map[string]any)["ingress"]; ok {
+		t.Errorf("ingress = %v, want absent: a build serves nothing and listens for nothing, and policyTypes' Ingress with no rule already denies it", ing)
 	}
 
 	rules := at(t, np, "spec", "egress").([]any)

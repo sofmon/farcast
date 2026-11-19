@@ -53,7 +53,7 @@ All three are mutable after creation (`gcloud … clusters update`, or `ClusterU
 
    This is a FarCast **invariant**, in the same spirit as "Autopilot always on" — with an escape hatch (see 5) rather than a per-install knob. Authorized networks gate only the IP endpoints; the operator's DNS path stays open via IAM (`container.clusters.connect`) and `AllowExternalTraffic`, and the cluster-level `Cluster.MasterAuthorizedNetworksConfig` is left unset (the SDK forbids setting both it and the nested config).
 
-2. **Operator/CLI access is via the DNS endpoint + IAM** (`container.clusters.connect`). The kubeconfig Planck returns uses the **DNS FQDN** (`server: https://uid.<region>.gke.goog`), not a public IP, with the `gke-gcloud-auth-plugin` exec credential. *(2026-11-13: [ADR 0023](0023-one-download-farcast.md), accepted that day, replaces the exec credential at its M2. `farcast` then mints the cluster token itself, in memory, as an identity bound to the instance, and still reaches the cluster through the DNS endpoint and IAM. Until M2 lands, the plugin is what authenticates, and the matching Negative consequence below stands.)*
+2. **Operator/CLI access is via the DNS endpoint + IAM** (`container.clusters.connect`). The kubeconfig Planck returns uses the **DNS FQDN** (`server: https://uid.<region>.gke.goog`), not a public IP, with the `gke-gcloud-auth-plugin` exec credential. *(2026-11-13: [ADR 0023](0023-one-download-farcast.md), accepted that day, replaces the exec credential at its M2. `farcast` then mints the cluster token itself, in memory, as an identity bound to the instance, and still reaches the cluster through the DNS endpoint and IAM. Until M2 lands, the plugin is what authenticates, and the matching Negative consequence below stands.)* *(2026-11-18, ADR 0023 M2.7, built, not walked: the supersession took effect at M2.7, before the rest of M2. The exec credential is gone: farcast mints the token in memory from the instance's stored service-account keys, and still reaches the cluster through the DNS endpoint and IAM. Planck returns the endpoint alone, and `install` writes no kubeconfig. The writer is the installer service account, one per project, until M3b binds one to the instance.)*
 
 3. **In-cluster components (TechnoCore) use the internal endpoint** — unchanged, no special handling.
 
@@ -77,12 +77,12 @@ All three are mutable after creation (`gcloud … clusters update`, or `ClusterU
 **Negative / constraints**
 
 - Operators need the `container.clusters.connect` IAM permission and connectivity to Google APIs (true for anyone who can run `farcast install`).
-- The returned kubeconfig is DNS-based and relies on the `gke-gcloud-auth-plugin` exec credential + an IAM token, not a static client cert — slightly more moving parts than a public-IP kubeconfig.
+- The returned kubeconfig is DNS-based and relies on the `gke-gcloud-auth-plugin` exec credential + an IAM token, not a static client cert — slightly more moving parts than a public-IP kubeconfig. *(The exec credential went at ADR 0023 M2.7, built 2026-11-18 to 2026-11-19, not walked; the IAM token remains, minted by farcast.)*
 - This governs only the control plane; **node egress is not yet locked down** (private nodes are deferred), so the full "no Pod reaches the internet except via FatLine" guarantee still depends on the NetworkPolicy boundary (ADR 0003) until the FatLine egress phase.
 
 **Per-module implications**
 
-- **Planck** — set `ControlPlaneEndpointsConfig` at create (public off / internal on / DNS on); build the kubeconfig from the **DNS endpoint**; surface the DNS FQDN as `Cluster.Endpoint`.
+- **Planck** — set `ControlPlaneEndpointsConfig` at create (public off / internal on / DNS on); build the kubeconfig from the **DNS endpoint** *(until ADR 0023 M2.7; Planck now returns the endpoint alone)*; surface the DNS FQDN as `Cluster.Endpoint`.
 - **FarSight CLI (`farcast install`, 1.3)** — health-check via management-API status / DNS-endpoint, not a public-IP dial; show the DNS endpoint in results.
 - **TechnoCore** — no change; in-cluster controller over the internal endpoint.
 - **FatLine** — owns the deferred private-node / egress decision (Cloud NAT vs. proxy-only).

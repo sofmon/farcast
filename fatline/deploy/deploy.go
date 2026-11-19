@@ -1,14 +1,15 @@
 // Package deploy renders FatLine's own Kubernetes workload — the Namespace,
 // mTLS Secret, Deployment, and Service that run FatLine inside an instance — as
 // a multi-document YAML apply stream. FatLine owns the shape of how it is
-// deployed; `farcast connect` (2.3) pipes the output to `kubectl apply -f -`.
+// deployed; `farcast connect` (2.3) applies the output in-process, one
+// server-side apply per document (ADR 0023 M2.7).
 //
 // It is the one-off precursor to Planck's general manifest→workload translator
 // (4.2). It deliberately renders plain YAML rather than depending on a
 // Kubernetes client library — the operator-side toolchain stays minimal-deps
-// (the CLI uses kubectl, ADR 0006). Every container carries resource requests
-// and drops privilege, so the workload is GKE Autopilot-admission-compliant
-// (ADR 0003).
+// (the CLI applies with its own in-process client, not client-go; ADR 0023).
+// Every container carries resource requests and drops privilege, so the
+// workload is GKE Autopilot-admission-compliant (ADR 0003).
 package deploy
 
 import (
@@ -195,7 +196,8 @@ func (c *Config) withDefaults() {
 }
 
 // Render produces the Kubernetes apply stream (Namespace, Secret, Deployment,
-// PodDisruptionBudget, Service) as multi-document YAML for `kubectl apply -f -`.
+// PodDisruptionBudget, Service) as multi-document YAML, applied in stream
+// order.
 func Render(c Config) ([]byte, error) {
 	c.withDefaults()
 	if c.Image == "" {
@@ -586,9 +588,22 @@ spec:
 // are written once. `farcast run` writes this ConfigMap and this package's
 // Deployment reads it: two spellings of one name would mount an empty volume
 // forever, and the mount is optional precisely so that failure would be silent.
-func RenderPolicyConfigMap(namespace string, doc *policy.Document) ([]byte, error) {
+//
+// resourceVersion is the ConfigMap's as `farcast run` read it, "" when it read
+// none. When it is not "", the document carries it, quoted
+// (`resourceVersion: "<rv>"`), and the API server holds the apply to it: an
+// apply over a policy another run wrote since the read is answered 409 and
+// writes nothing (ADR 0023 M2.7, design A30-40 as §31's A31-2 amends it). A
+// policy that was absent carries none, and one deleted after the read is
+// recreated: server-side apply cannot say "create only". A resourceVersion
+// that could not sit between the quotes as it is, one holding a quote, a
+// backslash, or a byte outside printable ASCII, is refused.
+func RenderPolicyConfigMap(namespace string, doc *policy.Document, resourceVersion string) ([]byte, error) {
 	if namespace == "" {
 		namespace = DefaultNamespace
+	}
+	if !quotable(resourceVersion) {
+		return nil, fmt.Errorf("deploy: render the egress policy: its resourceVersion %q cannot be written between quotes as it is", resourceVersion)
 	}
 	body, err := doc.Marshal()
 	if err != nil {
@@ -596,14 +611,27 @@ func RenderPolicyConfigMap(namespace string, doc *policy.Document) ([]byte, erro
 	}
 	var buf bytes.Buffer
 	if err := policyTemplate.Execute(&buf, map[string]any{
-		"Namespace": namespace,
-		"Name":      PolicyConfigMap,
-		"Key":       PolicyKey,
-		"Policy":    indentBlock(string(body), 4),
+		"Namespace":       namespace,
+		"Name":            PolicyConfigMap,
+		"ResourceVersion": resourceVersion,
+		"Key":             PolicyKey,
+		"Policy":          indentBlock(string(body), 4),
 	}); err != nil {
 		return nil, fmt.Errorf("deploy: render the egress policy: %w", err)
 	}
 	return buf.Bytes(), nil
+}
+
+// quotable reports whether s can be written between double quotes in YAML as
+// it is: printable ASCII, with no quote and no backslash, so that every YAML
+// reader takes the same string from it.
+func quotable(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c < 0x20 || c > 0x7e || c == '"' || c == '\\' {
+			return false
+		}
+	}
+	return true
 }
 
 // indentBlock shifts a block scalar's body to its position in the document.
@@ -623,6 +651,9 @@ kind: ConfigMap
 metadata:
   name: {{.Name}}
   namespace: {{.Namespace}}
+{{- if .ResourceVersion}}
+  resourceVersion: "{{.ResourceVersion}}"
+{{- end}}
   labels:
     app.kubernetes.io/name: fatline
     app.kubernetes.io/managed-by: farcast

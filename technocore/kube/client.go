@@ -25,10 +25,12 @@ const (
 )
 
 // FieldManager is the field manager the kernel names, explicitly, on every
-// write it makes: Scale, SaveConfigMap's PUT and POST, and SetRequests. The
-// API server records each write's fields under it, so an object's managed
-// fields name the kernel as technocore, never as a manager the server derives
-// from the User-Agent (ADR 0023 M2.7). Reads carry no field manager.
+// write it makes: Scale, SaveConfigMap's PUT and POST, and SetRequests, so
+// the server never derives one from the User-Agent (ADR 0023 M2.7). The
+// server records the kernel's main-resource writes under technocore. Its
+// Scale names technocore too, but a Scale of 0, the only one the kernel
+// makes, was recorded under no manager on v1.36.2. Reads carry no field
+// manager.
 const FieldManager = "technocore"
 
 var (

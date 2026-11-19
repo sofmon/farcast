@@ -1,0 +1,36 @@
+# The egress policy as fatline/deploy.RenderPolicyConfigMap renders it, for
+# the real-API suite's TestApplyRefusesAStaleResourceVersion (design A31-2).
+# kube's tests may not import fatline/deploy (doc_test.go), so the suite
+# reads the renderer's output here. Below the --- line it is
+# RenderPolicyConfigMap("{ns}", one application "api" in "{ns}" whose
+# credential_sha256 is "{credential}", "{rv}") byte for byte; with the
+# resourceVersion line taken out it is the same render at no resourceVersion.
+# The cli package's TestTheRealAPIEgressPolicyIsTheRenderers pins both.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fatline-egress-policy
+  namespace: {ns}
+  resourceVersion: "{rv}"
+  labels:
+    app.kubernetes.io/name: fatline
+    app.kubernetes.io/managed-by: farcast
+# The per-application egress policy (ADR 0013): which applications exist, what
+# each may reach, and a HASH of the credential that identifies each one.
+#
+# It is a ConfigMap and not a Secret because it holds no secret material. The
+# credentials themselves live only in each application's own Secret; this side
+# carries SHA-256 of them, which is all FatLine needs to recognise a caller.
+data:
+  policy.json: |
+    {
+      "version": 1,
+      "apps": [
+        {
+          "name": "api",
+          "namespace": "{ns}",
+          "credential_sha256": "{credential}"
+        }
+      ]
+    }

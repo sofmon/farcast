@@ -147,8 +147,8 @@ type WriteFact struct {
 	Name      string `json:"name"`
 	// Method is one of the Write* constants.
 	Method string `json:"method"`
-	// Force is false in M2.6: kubectl's client-side apply has no force, and
-	// the pin's create and replace are not applies.
+	// Force is true for every apply since ADR 0023 M2.7; false for the pin's
+	// create and replace, which are not applies.
 	Force bool `json:"force"`
 	// ResourceVersion is "" except for a replace, and for the documents whose
 	// content depends on what the cluster holds.
@@ -483,12 +483,11 @@ func (NoticeFact) FactType() string { return TypeNotice }
 
 // ------------------------------------------------------------------ migrate
 
-// MigrateFact is what farcast migrate, from ADR 0023 M2.7b (not built at
-// M2.7a), is to rewrite (A30-12): the cluster objects an older farcast
-// applied with kubectl's client-side apply, each named with what the rewrite
-// converts and keeps, and the local files it deletes once every object is
-// verified. It binds no resourceVersion: a Deployment's moves with every
-// status change.
+// MigrateFact is what farcast migrate rewrites (ADR 0023 M2.7, A30-12): the
+// cluster objects an older farcast applied with kubectl's client-side apply,
+// each named with what the rewrite converts and keeps, and the local files
+// it deletes once every object is verified and the instance recorded. It
+// binds no resourceVersion: a Deployment's moves with every status change.
 type MigrateFact struct {
 	Type string `json:"type"`
 	// Objects come in discovery order: the kinds' order, then the server's.

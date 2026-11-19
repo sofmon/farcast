@@ -26,6 +26,7 @@ APPS=with-build
 
 FARCAST_STATE="${FARCAST_CONFIG_HOME:-$HOME/Library/Application Support/farcast}"
 export KUBECONFIG="$FARCAST_STATE/instances/$INSTANCE/kubeconfig.yaml"
+# (2026-11-18, ADR 0023 M2.7, built, not walked) Neither install nor connect writes kubeconfig.yaml any more, and farcast migrate deletes it. A re-walk observes with kubectl from Cloud Shell (ADR 0023 Phasing), not over a file farcast wrote; an exported KUBECONFIG naming the absent file fails rather than falling back to ~/.kube/config [inf].
 kubectl config current-context
 ```
 
@@ -181,6 +182,7 @@ GO
 # From the farcast checkout, with the digest-pinned image from step 3.
 go run /tmp/render.go "$IMAGE" "$INSTANCE" > /tmp/with-build.yaml
 kubectl apply -f /tmp/with-build.yaml
+# (2026-11-18, ADR 0023 M2.7) On an instance migrated to server-side apply, a kubectl apply here leaves kubectl's client-side apply on the object. farcast's next write warns and clears the record, and every write then refuses until farcast migrate runs again (the CLI README's migrate section).
 kubectl -n "$APPS" rollout status deploy/prover --timeout=180s
 ```
 

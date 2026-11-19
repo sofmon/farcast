@@ -16,10 +16,9 @@ import (
 
 // clusterAPI is the narrow seam over the cloud's cluster-management API,
 // expressed in neutral terms so the adapter's logic (defaults, status mapping,
-// readiness polling, idempotency, kubeconfig assembly) stays unit testable
-// without the cloud SDK. The real implementation, gkeClient, wraps
-// cloud.google.com/go/container's ClusterManagerClient; the unit tests use a
-// fake (see gke_test.go).
+// readiness polling, idempotency) stays unit testable without the cloud SDK.
+// The real implementation, gkeClient, wraps cloud.google.com/go/container's
+// ClusterManagerClient; the unit tests use a fake (see gke_test.go).
 type clusterAPI interface {
 	// validate performs a cheap, side-effect-free permission probe.
 	validate(ctx context.Context) error

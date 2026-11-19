@@ -5,6 +5,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
+	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -21,6 +23,7 @@ import (
 	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 	fldeploy "github.com/sofmon/farcast/fatline/deploy"
 	"github.com/sofmon/farcast/fatline/identity"
+	"github.com/sofmon/farcast/fatline/policy"
 	"github.com/sofmon/farcast/manifest/parser"
 	pbuild "github.com/sofmon/farcast/planck/build"
 	pfetch "github.com/sofmon/farcast/planck/fetch"
@@ -31,7 +34,8 @@ import (
 
 // Every stream farcast applies must pass the checks the in-process client
 // makes before it sends anything (ADR 0023 decision 2, Verification 1): one
-// that does not would be refused the day the client replaces kubectl. So every
+// that does not is refused, since the client replaced kubectl in ADR 0023
+// M2.7. So every
 // renderer's output, and every stream a command composes from several
 // renderers, goes through kube.SplitStream here, built by the same function
 // the command calls. A rendered stringData, an unknown kind, a missing
@@ -76,14 +80,14 @@ func TestEveryRenderedStreamPassesTheApplyChecks(t *testing.T) {
 	}
 }
 
-// ADR 0023 M2.7's migrate, not yet built, is to find what it rewrites by
-// farcast's label alone: one cluster-wide list per kind, selected by
-// app.kubernetes.io/managed-by=farcast (design §6.2). A document rendered
-// without the label would never be migrated: its next forced apply would
-// carry kubectl's client-side trace, and the instance's migrated record would
-// be cleared after every migration (A30-16). So every document of every
-// rendered stream carries it, the kernel's seed technocore-namespaces and the
-// confirmations ConfigMap among them.
+// ADR 0023 M2.7's migrate finds what it rewrites through farcast's label
+// alone: one cluster-wide list per kind, selected by
+// app.kubernetes.io/managed-by=farcast (design §6.2, discoverClientSide). A
+// document rendered without the label would never be migrated: its next
+// forced apply would carry kubectl's client-side trace, and the instance's
+// migrated record would be cleared after every migration (A30-16). So every
+// document of every rendered stream carries it, the kernel's seed
+// technocore-namespaces and the confirmations ConfigMap among them.
 func TestEveryRenderedDocumentIsManagedByFarcast(t *testing.T) {
 	key, value, _ := strings.Cut(managedSelector, "=")
 	seen := map[string]bool{}
@@ -109,7 +113,7 @@ func TestEveryRenderedDocumentIsManagedByFarcast(t *testing.T) {
 	}
 }
 
-// A stream is applied in order, and from ADR 0023 M2.7 the in-process apply
+// A stream is applied in order, and since ADR 0023 M2.7 the in-process apply
 // stops at its first failing document (design D3). A NetworkPolicy rendered
 // after the workload it selects would be left unapplied by a failure between
 // the two, with the workload's pods running unrestricted by it (an
@@ -170,6 +174,119 @@ func TestEveryNetworkPolicyPrecedesItsWorkload(t *testing.T) {
 	if checked == 0 {
 		t.Error("no rendered stream holds both a NetworkPolicy and a workload, so nothing was checked")
 	}
+}
+
+// The build and fetch policies' "ingress: []", applied server-side on a
+// loopback envtest kube-apiserver 1.36.2, was not stored: the stored policy
+// had no ingress field, and every apply of the unchanged stream moved the
+// policy's generation (ADR 0023 M2.7, design §31 and A31-4). Why is
+// inferred, not read: storage keeps no empty list, so each apply sets it
+// again, and the update strategy counts that as a change. Only that one field
+// was seen to do so; the guard is wider. So no document of any rendered
+// stream carries an empty list, anywhere in it. An empty map is left alone, because
+// "podSelector: {}" and "emptyDir: {}" carry meaning. The walk is first run
+// over documents that hide an empty list where a shallow walk would not look.
+func TestNoRenderedDocumentCarriesAnEmptyList(t *testing.T) {
+	for _, c := range []struct {
+		doc  string
+		want []string
+	}{
+		{"spec:\n  ingress: []\n", []string{"spec.ingress"}},
+		{"spec:\n  egress:\n    - to: []\n    - ports:\n        - port: 53\n", []string{"spec.egress[0].to"}},
+		{"spec:\n  rules:\n    - - a\n    - []\n", []string{"spec.rules[1]"}},
+		{"items: []\nspec:\n  podSelector: {}\n  volumes:\n    - emptyDir: {}\n", []string{"items"}},
+	} {
+		var v any
+		if err := yaml.Unmarshal([]byte(c.doc), &v); err != nil {
+			t.Fatal(err)
+		}
+		if got := emptyLists(v, ""); !slices.Equal(got, c.want) {
+			t.Errorf("the walk of %q found %q, want %q", c.doc, got, c.want)
+		}
+	}
+	for _, s := range renderedStreams(t) {
+		docs, err := kube.SplitStream(s.stream)
+		if err != nil {
+			t.Fatalf("%s: refused: %v", s.name, err)
+		}
+		for _, d := range docs {
+			var v any
+			if err := yaml.Unmarshal(d.Raw, &v); err != nil {
+				t.Fatalf("%s: %s does not decode: %v", s.name, docIdentity(d), err)
+			}
+			if got := emptyLists(v, ""); len(got) != 0 {
+				t.Errorf("%s: %s carries an empty list at %s", s.name, docIdentity(d), strings.Join(got, ", "))
+			}
+		}
+	}
+}
+
+// ADR 0023 M2.7 (A31-2): kube's real-API suite applies the egress policy
+// from kube/testdata/realapi/egress-policy.yaml, because kube's tests may
+// import nothing but the standard library, the package's four and kubetest
+// (kube/doc_test.go). Below its --- line that file is RenderPolicyConfigMap's
+// output at a resourceVersion and, with the resourceVersion line taken out,
+// at none, byte for byte, so the suite's row applies the renderer's own
+// document.
+func TestTheRealAPIEgressPolicyIsTheRenderers(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("..", "kube", "testdata", "realapi", "egress-policy.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, golden, ok := strings.Cut(string(b), "\n---\n")
+	if !ok {
+		t.Fatal("egress-policy.yaml holds no --- line")
+	}
+	const ns, rv, rvLine = "realapi-stale-0a1b2c3d", "41", "  resourceVersion: \"{rv}\"\n"
+	credential := strings.Repeat("3", 64)
+	doc := &policy.Document{Version: policy.Version, Apps: []policy.App{{Name: "api", Namespace: ns, CredentialSHA256: credential}}}
+	fill := strings.NewReplacer("{ns}", ns, "{credential}", credential, "{rv}", rv)
+	if strings.Count(golden, rvLine) != 1 {
+		t.Fatalf("egress-policy.yaml carries the line %q %d times, want once", rvLine, strings.Count(golden, rvLine))
+	}
+	for _, at := range []string{rv, ""} {
+		want, err := fldeploy.RenderPolicyConfigMap(ns, doc, at)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := golden
+		if at == "" {
+			got = strings.Replace(got, rvLine, "", 1)
+		}
+		if got = fill.Replace(got); got != string(want) {
+			t.Errorf("at resourceVersion %q, egress-policy.yaml reads\n%s\nRenderPolicyConfigMap renders\n%s", at, got, want)
+		}
+	}
+}
+
+// emptyLists is the path of every empty list in a decoded document, map keys
+// in sorted order. A container it cannot walk is reported as one, so nothing
+// passes unread.
+func emptyLists(v any, path string) []string {
+	at := func(k string) string {
+		if path == "" {
+			return k
+		}
+		return path + "." + k
+	}
+	var out []string
+	switch v := v.(type) {
+	case nil, string, bool, int, int64, uint64, float64:
+	case map[string]any:
+		for _, k := range slices.Sorted(maps.Keys(v)) {
+			out = append(out, emptyLists(v[k], at(k))...)
+		}
+	case []any:
+		if len(v) == 0 {
+			return []string{path}
+		}
+		for i, e := range v {
+			out = append(out, emptyLists(e, fmt.Sprintf("%s[%d]", path, i))...)
+		}
+	default:
+		out = append(out, fmt.Sprintf("%s (a %T this walk does not read)", path, v))
+	}
+	return out
 }
 
 // renderedObject is the part of a rendered document these tests read: its
@@ -333,7 +450,7 @@ func renderedStreams(t *testing.T) []renderedStream {
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err = fldeploy.RenderPolicyConfigMap(fldeploy.DefaultNamespace, doc)
+	b, err = fldeploy.RenderPolicyConfigMap(fldeploy.DefaultNamespace, doc, "")
 	add("egress policy", b, err)
 
 	// run: the workloads, through runCommand.translate, without and with a
@@ -394,9 +511,8 @@ func kernelConfig(instance string, adapt bool, meter []string) tcdeploy.Config {
 
 // The kernel learns what it meters from technocore-namespaces, and may read a
 // namespace only through its RoleBinding there. A stream is applied in order,
-// and stopped part-way it leaves what came before it: kubectl interrupted
-// today, and the in-process client at its first failure (ADR 0023 M2, design
-// §5.3). So the list comes after every binding it names, in both streams that
+// and stopped part-way it leaves what came before it: the in-process client
+// stops at its first failure (ADR 0023 M2.7, design §5.3). So the list comes after every binding it names, in both streams that
 // write it; before them, a stream stopped between the two would tell the
 // kernel to meter a namespace it cannot read (kernelmeter.go's meterManifest,
 // kernel.go's kernelManifests).
@@ -568,7 +684,7 @@ func TestManifestTextIsRefusedBeforeTheApplyChecks(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		b, err := fldeploy.RenderPolicyConfigMap(fldeploy.DefaultNamespace, doc)
+		b, err := fldeploy.RenderPolicyConfigMap(fldeploy.DefaultNamespace, doc, "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -638,11 +754,13 @@ var appliedRefusals struct {
 	errs []string
 }
 
-// checkApplied is called by every fake cluster's Apply. A refusal is kept with
-// where its stream came from: the test that was running, and the line that
-// called the fake's Apply, which for a command is the command's own apply.
-func checkApplied(m []byte) {
-	if _, err := kube.SplitStream(m); err != nil {
+// checkApplied is called by every fake cluster's Apply, and by run's fake's
+// ApplyAt with the resourceVersion it was given allowed (opts, as
+// cluster.ApplyAt splits its manifest). A refusal is kept with where its
+// stream came from: the test that was running, and the line that called the
+// fake's Apply, which for a command is the command's own apply.
+func checkApplied(m []byte, opts ...kube.SplitOption) {
+	if _, err := kube.SplitStream(m, opts...); err != nil {
 		test, site := applyCaller()
 		appliedRefusals.Lock()
 		defer appliedRefusals.Unlock()
