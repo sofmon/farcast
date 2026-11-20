@@ -213,23 +213,16 @@ func (c *installCommand) Run(ctx context.Context, env *Env, args []string) error
 	} else {
 		meta.Status = config.InstanceUnreachable
 	}
-	// A cluster this call created has no client-side history, so it is
-	// recorded as written with server-side apply since the record was made
-	// (ADR 0023 M2.7, design A30-25). Only here, at the finalizing save: the
-	// first record above carries none. A cluster the provider found under the
-	// name, which is the instance's own, is another machine's install of the
-	// same instance: any farcast may have written to it, so it stays
-	// unmigrated.
-	if cluster.Created {
-		meta.ServerSideApply = &config.ServerSideApply{Since: meta.CreatedAt, Farcast: buildinfo.Get().Version}
-	}
 	meta.UpdatedAt = time.Now().UTC()
 	if err := env.ConfigDir.SaveInstanceMetadata(c.name, meta); err != nil {
 		return err
 	}
+	// A cluster the provider found under the name, which is the instance's
+	// own, was not made by this call: a leftover, or another machine's install
+	// of the same instance (ADR 0023 M2.7, M2.9a). Install records nothing
+	// about it and goes on, and says so once.
 	if !cluster.Created {
-		fprintf(env.Err, "Warning: cluster %q already existed, so this farcast cannot tell what wrote to it; "+
-			"run 'farcast migrate %s --plan' before any command that writes to it.\n", clusterName, c.name)
+		fprintf(env.Err, msgAdoptedCluster, clusterName)
 	}
 
 	if !healthy {
@@ -361,6 +354,13 @@ func healthCheck(ctx context.Context, p planck.Provider, cluster *planck.Cluster
 	st, err := p.ClusterStatus(ctx, cluster.Ref)
 	return err == nil && st == planck.StatusRunning
 }
+
+// msgAdoptedCluster is install's warning, on stderr, about a cluster the
+// provider found under the instance's name rather than created (ADR 0023
+// M2.7; reworded at M2.9a, design A37-4): the cluster's name. Install still
+// succeeds.
+const msgAdoptedCluster = "Warning: cluster %q already existed under this instance's name, " +
+	"so this farcast did not create it and cannot tell what else wrote to it.\n"
 
 // msgCredentialsRequired is install's refusal of a missing --credentials
 // (ADR 0023 M2.5, A20-1; its text since M2.7, design A30-25): every

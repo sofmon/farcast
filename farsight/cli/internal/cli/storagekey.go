@@ -563,13 +563,6 @@ func (c *keyRotateCommand) Run(ctx context.Context, env *Env, args []string) (er
 		}
 	}
 	if lerr == nil && pinMeta(m) {
-		// With a keyholder the rotation writes the pin to the cluster, so an
-		// instance not migrated to server-side apply is refused before the
-		// pin store opens; with none it writes nothing there, and never
-		// refuses for it (design A30-20).
-		if err := refuseUnmigrated(instance, m); err != nil {
-			return err
-		}
 		ref := clusterRef{Dir: env.ConfigDir, Meta: m, Identity: kube.Writer, Warn: env.Err}
 		if ps, pinErr = pinStoreFor(c.newPinStore, ref, nil); pinErr == nil {
 			cur, present, _, invalid, err := readPin(ctx, ps)
@@ -629,13 +622,6 @@ func (c *keyRotateCommand) planned(ctx context.Context, env *Env, instance strin
 	}
 	if err := recordNamed(meta, instance); err != nil {
 		return err
-	}
-	// As an interactive run: only a rotation that writes the pin refuses an
-	// instance not migrated to server-side apply (design A30-20).
-	if pinMeta(meta) {
-		if err := refuseUnmigrated(instance, meta); err != nil {
-			return err
-		}
 	}
 	*metaOut = meta
 	// The keyring, for its key ids and their times (A23-25); --confirm

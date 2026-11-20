@@ -135,12 +135,6 @@ func (c *kernelMeterCommand) Run(ctx context.Context, env *Env, args []string) (
 			Instance: name, Metered: append([]string(nil), meta.Kernel.Namespaces...),
 		})
 	}
-	// The list-only form above writes nothing; a change of the metered
-	// namespaces applies RBAC, so it is refused on an instance not migrated
-	// to server-side apply (design A30-20).
-	if err := refuseUnmigrated(name, meta); err != nil {
-		return err
-	}
 	for _, ns := range requested {
 		if err := validNamespace(ns); err != nil {
 			return usagef("namespace %q: %v", ns, err)
@@ -187,7 +181,6 @@ func (c *kernelMeterCommand) Run(ctx context.Context, env *Env, args []string) (
 	if err != nil {
 		return err
 	}
-	defer afterWrites(env, name, cl)
 
 	// Recorded before the apply, like every other thing this CLI changes in a
 	// cluster: a namespace the cluster meters and local state does not know

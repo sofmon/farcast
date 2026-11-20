@@ -125,10 +125,9 @@ func vectorMeta() *config.InstanceMetadata {
 		// The reader 'world' reads as (ADR 0023 M2.4), granted.
 		Reader: &config.Reader{Email: readerEmail("atlas", "proj-atlas"), KeyID: strings.Repeat("c0", 20),
 			GrantedAt: time.Date(2026, 11, 14, 9, 30, 0, 0, time.UTC), Scope: "metered"},
-		ServerSideApply: &config.ServerSideApply{Since: time.Date(2026, 11, 14, 9, 0, 0, 0, time.UTC), Farcast: "v0.0.0-vector"},
-		Carrier:         &config.Carrier{Type: "nlb", Endpoint: "203.0.113.7:443", ServerName: "fatline.atlas.farcast"},
-		Registry:        &config.Registry{Prefix: vecRegistry, FatLineDigest: vecFatLineImage},
-		Storage:         &config.Storage{Bucket: "farcast-atlas-5f3a9c21"},
+		Carrier:  &config.Carrier{Type: "nlb", Endpoint: "203.0.113.7:443", ServerName: "fatline.atlas.farcast"},
+		Registry: &config.Registry{Prefix: vecRegistry, FatLineDigest: vecFatLineImage},
+		Storage:  &config.Storage{Bucket: "farcast-atlas-5f3a9c21"},
 		Kernel: &config.Kernel{Deployed: true, Applied: true, Image: vecKernelImage,
 			Namespaces: []string{"farcast-system", "shop"}, Limit: 50, Currency: "USD", Period: "monthly"},
 		Keyholder: &config.Keyholder{Deployed: true, Image: vecKeyholderImage, Replicas: 2, Generation: 7},

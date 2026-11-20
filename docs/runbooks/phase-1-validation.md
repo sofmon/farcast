@@ -173,6 +173,9 @@ all `0600`; metadata shows `status: running`, the DNS `endpoint`, and the
 *(2026-11-18, ADR 0023 M2.7, built, not walked: `install` writes no `kubeconfig.yaml` any
 more. Expect `metadata.yaml`, with `server_side_apply` for a cluster this install
 created, and `credentials.yaml`.)*
+*(2026-11-20, ADR 0023 M2.9a, built, not walked: `install` records no `server_side_apply`,
+since `farcast migrate` and the refusal that read it are removed. Expect `metadata.yaml`
+and `credentials.yaml`.)*
 
 ## 7. Verify the cluster in GCP (independent of FarCast)
 

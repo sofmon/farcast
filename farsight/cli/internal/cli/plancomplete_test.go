@@ -143,9 +143,11 @@ func everyPlanShape(t *testing.T) []planCommand {
 // ADR 0023 M2.6d (design §28's step 9b): every command that writes to an
 // instance's cluster has its plan run by the plan tests: everyPlanShape's
 // guard. And each row says who its plan reads the cluster as (M2.7,
-// A30-26): its identity, reader, writer or none, is the cluster_identity of
-// the plan it prints, and a row that reads the cluster as the reader says
-// so (readsCluster) exactly when its identity is the reader.
+// A30-26): its identity, reader or none, is the cluster_identity of the plan
+// it prints, and a row that reads the cluster as the reader says so
+// (readsCluster) exactly when its identity is the reader. No plan reads as
+// the writer since ADR 0023 M2.9a removed migrate's (design A37-12,
+// mutation 199).
 func TestEveryWritingCommandHasAPlanRow(t *testing.T) {
 	rows := everyPlanShape(t)
 	if len(rows) == 0 {
@@ -153,8 +155,8 @@ func TestEveryWritingCommandHasAPlanRow(t *testing.T) {
 	}
 	for _, row := range rows {
 		t.Run(row.String(), func(t *testing.T) {
-			if !slices.Contains([]string{"reader", "writer", "none"}, row.identity) {
-				t.Fatalf("%s's identity is %q; say who its plan reads the cluster as: reader, writer or none", row, row.identity)
+			if !slices.Contains([]string{"reader", "none"}, row.identity) {
+				t.Fatalf("%s's identity is %q; say who its plan reads the cluster as: reader or none", row, row.identity)
 			}
 			if row.readsCluster != (row.identity == "reader") {
 				t.Errorf("%s reads the cluster as the reader: %v, and its identity is %q", row, row.readsCluster, row.identity)
@@ -169,10 +171,10 @@ func TestEveryWritingCommandHasAPlanRow(t *testing.T) {
 }
 
 // writeMethods are the methods of a seam that writes to a cluster: an apply,
-// the pin's create and replace, migrate's rewrite (A30-26), and
-// git-credential rm's delete (ADR 0023 M2.8, design §33, A33-32, row 93d),
-// so a seam that only deletes is a writer too.
-var writeMethods = []string{"Apply", "CreateConfigMap", "ReplaceConfigMap", "PatchManagedFields", "DeleteSecret"}
+// the pin's create and replace, and git-credential rm's delete (ADR 0023
+// M2.8, design §33, A33-32, row 93d), so a seam that only deletes is a writer
+// too.
+var writeMethods = []string{"Apply", "CreateConfigMap", "ReplaceConfigMap", "DeleteSecret"}
 
 // productionWriters is every command farcast's router reaches, by the name
 // a command line gives it, each built by defaultRegistry and walked down
@@ -240,62 +242,15 @@ func productionWriters(t *testing.T) map[string]string {
 	return found
 }
 
-// refusingTypes is every type in this package's non-test source with a
-// method whose body calls refuseUnmigrated. It reads the source files from
-// disk, so a mutation made through go test -overlay is not in what it reads.
-func refusingTypes(dir string) (map[string]bool, error) {
-	files, err := filepath.Glob(filepath.Join(dir, "*.go"))
-	if err != nil {
-		return nil, err
-	}
-	fset := token.NewFileSet()
-	found := map[string]bool{}
-	for _, path := range files {
-		if strings.HasSuffix(path, "_test.go") {
-			continue
-		}
-		f, err := parser.ParseFile(fset, path, nil, parser.SkipObjectResolution)
-		if err != nil {
-			return nil, err
-		}
-		for _, d := range f.Decls {
-			fn, ok := d.(*ast.FuncDecl)
-			if !ok || fn.Body == nil || fn.Recv == nil || len(fn.Recv.List) != 1 {
-				continue
-			}
-			rt := fn.Recv.List[0].Type
-			if star, ok := rt.(*ast.StarExpr); ok {
-				rt = star.X
-			}
-			id, ok := rt.(*ast.Ident)
-			if !ok {
-				continue
-			}
-			ast.Inspect(fn.Body, func(n ast.Node) bool {
-				if call, ok := n.(*ast.CallExpr); ok {
-					if fun, ok := call.Fun.(*ast.Ident); ok && fun.Name == "refuseUnmigrated" {
-						found[id.Name] = true
-					}
-				}
-				return true
-			})
-		}
-	}
-	return found, nil
-}
-
 // ADR 0023 M2.7 (A30-26, RV-3; §10.5 row 93c): every command in production
 // that can write to a cluster is a writeCommands row, so the tests over
-// writeCommands, and the refusal of an unmigrated instance with them, run
-// it. The writers are derived from farcast itself (productionWriters), never
-// listed: their names must be exactly writeCommands' names. The walk reaches
-// a seam held in an embedded fatlineDeployer (connect), in a named one
-// (kernel meter's deployer), of a named func type (storage key pin's
-// pinStoreOpener), and git-credential rm's, whose writer deletes (ADR 0023
-// M2.8, row 93d). And every such command's type but migrateCommand has a
-// method that calls refuseUnmigrated, while migrateCommand has none: migrate
-// never refuses an unmigrated instance, which is how one comes to be
-// recorded (A30-20).
+// writeCommands run it. The writers are derived from farcast itself
+// (productionWriters), never listed: their names must be exactly
+// writeCommands' names, thirteen since ADR 0023 M2.9a removed migrate (design
+// A37-10). The walk reaches a seam held in an embedded fatlineDeployer
+// (connect), in a named one (kernel meter's deployer), of a named func type
+// (storage key pin's pinStoreOpener), and git-credential rm's, whose writer
+// deletes (ADR 0023 M2.8, row 93d).
 func TestEveryProductionWriterIsAWriteCommand(t *testing.T) {
 	writers := productionWriters(t)
 	var got, want []string
@@ -310,11 +265,13 @@ func TestEveryProductionWriterIsAWriteCommand(t *testing.T) {
 	if !slices.Equal(got, want) {
 		t.Errorf("the commands farcast's router reaches that write to a cluster are %q; writeCommands holds %q", got, want)
 	}
+	if len(got) != 13 {
+		t.Errorf("%d commands write to a cluster; ADR 0023 M2.9a has thirteen: %q", len(got), got)
+	}
 	for name, seam := range map[string]string{
 		"kernel meter":      "deployer.newCluster",
 		"connect":           "fatlineDeployer.newCluster",
 		"storage key pin":   "newPinStore",
-		"migrate":           "newCluster",
 		"git-credential rm": "newCluster",
 	} {
 		if writers[name] != seam {
@@ -322,74 +279,6 @@ func TestEveryProductionWriterIsAWriteCommand(t *testing.T) {
 		}
 	}
 
-	refusing, err := refusingTypes(".")
-	if err != nil {
-		t.Fatal(err)
-	}
-	commands := map[string]Command{}
-	var index func(prefix string, reg *Registry)
-	index = func(prefix string, reg *Registry) {
-		for _, c := range reg.Commands() {
-			name := strings.TrimSpace(prefix + " " + c.Name())
-			if g, ok := c.(*group); ok {
-				index(name, g.subs)
-				continue
-			}
-			commands[name] = c
-		}
-	}
-	index("", defaultRegistry())
-	for name := range writers {
-		typ := reflect.TypeOf(commands[name])
-		if typ.Kind() == reflect.Pointer {
-			typ = typ.Elem()
-		}
-		switch {
-		case typ.Name() == "migrateCommand" && refusing[typ.Name()]:
-			t.Errorf("%s (%s) calls refuseUnmigrated; migrate never refuses an unmigrated instance", name, typ.Name())
-		case typ.Name() != "migrateCommand" && !refusing[typ.Name()]:
-			t.Errorf("%s (%s) writes to a cluster, and no method of it calls refuseUnmigrated", name, typ.Name())
-		}
-	}
-
-	// refusingTypes finds a method's call, through a value or a pointer
-	// receiver, and not a function's, a method's that calls something else,
-	// or a test file's.
-	t.Run("refusingTypes", func(t *testing.T) {
-		dir := t.TempDir()
-		src := `package fake
-
-type value struct{}
-type pointer struct{}
-type other struct{}
-
-func refuseUnmigrated(string) error { return nil }
-
-func (value) Run() error     { return refuseUnmigrated("a") }
-func (p *pointer) plan() error {
-	if true {
-		return refuseUnmigrated("b")
-	}
-	return nil
-}
-func (other) Run() error { return nil }
-func free() error        { return refuseUnmigrated("c") }
-`
-		if err := os.WriteFile(filepath.Join(dir, "fake.go"), []byte(src), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		test := "package fake\n\ntype tested struct{}\n\nfunc (tested) Run() error { return refuseUnmigrated(\"d\") }\n"
-		if err := os.WriteFile(filepath.Join(dir, "fake_test.go"), []byte(test), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		got, err := refusingTypes(dir)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if want := map[string]bool{"value": true, "pointer": true}; !reflect.DeepEqual(got, want) {
-			t.Errorf("refusingTypes = %v; want %v", got, want)
-		}
-	})
 }
 
 // ADR 0023 M2.6 (A23-28; design §28's step 9b): every flag that changes what

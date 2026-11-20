@@ -261,15 +261,9 @@ func (s *Server) emulate(w http.ResponseWriter, r *http.Request, req Request, ri
 			return
 		}
 	case http.MethodPatch:
-		if object {
-			switch mediaType(req.ContentType) {
-			case applyPatchType:
-				s.apply(w, r, req, ri, k, caller, az)
-				return
-			case "application/json-patch+json":
-				s.jsonPatch(w, r, req, ri, k)
-				return
-			}
+		if object && mediaType(req.ContentType) == applyPatchType {
+			s.apply(w, r, req, ri, k, caller, az)
+			return
 		}
 	case http.MethodPost:
 		if ri.name == "" && ri.namespace != "" && k.Kind == "ConfigMap" {

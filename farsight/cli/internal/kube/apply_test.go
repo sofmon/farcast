@@ -101,36 +101,23 @@ func TestApplyIsOneServerSideApply(t *testing.T) {
 
 // TestEveryWriteNamesFarcast (design §1, A30-9, mutation rows 102 and 102b):
 // every write the package makes names farcast's field manager explicitly, so
-// the API server never derives one from the User-Agent: Apply, the pin's
-// create and replace (CreateConfigMap, ReplaceConfigMap) and the migration's
-// PatchJSON, each sent as the writer. DeleteSecret is exempt, for good (ADR
-// 0023 M2.8, design §33, A33-31): a DELETE carries DeleteOptions, which has
-// no field manager. Its exemption is pinned instead: one DELETE as the
-// writer, with no query and exactly the uid-preconditioned DeleteOptions;
-// and, by a scan of farsight/cli's source that counts every call, method
-// value and method expression named DeleteSecret, in a function or in a
-// package-level value, its one caller is cluster.Client.DeleteSecret, whose
-// one caller is git-credential rm. The scan's root is checked to be all of
-// farsight/cli, cmd/ included, by what it holds.
+// the API server never derives one from the User-Agent: Apply and the pin's
+// create and replace (CreateConfigMap, ReplaceConfigMap), each sent as the
+// writer. DeleteSecret is exempt, for good (ADR 0023 M2.8, design §33,
+// A33-31): a DELETE carries DeleteOptions, which has no field manager. Its
+// exemption is pinned instead: one DELETE as the writer, with no query and
+// exactly the uid-preconditioned DeleteOptions; and, by a scan of
+// farsight/cli's source that counts every call, method value and method
+// expression named DeleteSecret, in a function or in a package-level value,
+// its one caller is cluster.Client.DeleteSecret, whose one caller is
+// git-credential rm. The scan's root is checked to be all of farsight/cli,
+// cmd/ included, by what it holds.
 func TestEveryWriteNamesFarcast(t *testing.T) {
 	s := kubetest.New(t)
-	s.Put(clientSideApplied("v1", "ConfigMap", "web", "settings", nil))
+	s.Put(obj("v1", "ConfigMap", "web", "settings", nil))
 	c, _ := connect(t, s, "writer")
 	ctx := t.Context()
-	configmaps := mustKind(t, "v1", "ConfigMap")
 
-	o, err := c.GetObject(ctx, configmaps, "web", "settings")
-	if err != nil {
-		t.Fatal(err)
-	}
-	csa, err := kube.ClientSideManagers(o.Metadata.ManagedFields)
-	if err != nil {
-		t.Fatal(err)
-	}
-	patch, err := kube.MigrationPatch(o, csa, kube.FieldManager)
-	if err != nil || patch == nil {
-		t.Fatalf("MigrationPatch = %s, %v", patch, err)
-	}
 	pin := func(rv string) []byte {
 		md := `"name":"datasphered-pin","namespace":"farcast-system"`
 		if rv != "" {
@@ -138,18 +125,12 @@ func TestEveryWriteNamesFarcast(t *testing.T) {
 		}
 		return []byte(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{` + md + `},"data":{"pin":"1"}}`)
 	}
-	// The migration's patch is guarded on the resourceVersion it was read
-	// at, so it goes first, and the apply last, as a later write would.
 	writes := []struct {
 		name   string
 		method string
 		path   string
 		send   func() error
 	}{
-		{"PatchJSON", http.MethodPatch, "/api/v1/namespaces/web/configmaps/settings", func() error {
-			_, err := c.PatchJSON(ctx, configmaps, "web", "settings", patch)
-			return err
-		}},
 		{"CreateConfigMap", http.MethodPost, "/api/v1/namespaces/farcast-system/configmaps", func() error {
 			return c.CreateConfigMap(ctx, pin(""))
 		}},

@@ -64,7 +64,6 @@ func readerKey(t *testing.T, s *kubetest.Server, id, email string) (keyPEM, cert
 // registered with s under id "reader". granted sets GrantedAt and Scope, as a
 // verified 'reader grant' does. A writer credentials.yaml registered under id
 // "writer" sits beside it, so a test can show the reader path never opens it.
-// The record is migrated (recordMigrated), as the rehearsal's is.
 func readerInstance(t *testing.T, s *kubetest.Server, name string, granted bool) (config.Dir, *config.InstanceMetadata) {
 	t.Helper()
 	dir := config.Dir(filepath.Join(t.TempDir(), "cfg"))
@@ -78,7 +77,6 @@ func readerInstance(t *testing.T, s *kubetest.Server, name string, granted bool)
 		Cluster: "farcast-" + name, Endpoint: s.Endpoint(), Status: config.InstanceRunning,
 		Reader: &config.Reader{Email: email, KeyID: keyID},
 	}
-	recordMigrated(meta)
 	if granted {
 		meta.Reader.GrantedAt, meta.Reader.Scope = readerGrantedAt, "metered"
 	}

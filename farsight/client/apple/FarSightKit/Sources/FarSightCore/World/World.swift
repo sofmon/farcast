@@ -220,9 +220,10 @@ public struct SectionProblem: Codable, Sendable, Equatable, Hashable {
 
     /// The CLI's stable error kinds, so the map tells "no tunnel", "no
     /// kernel", "version skew" and "credential missing" apart without
-    /// reading prose. The five kinds ADR 0023 M2 retired (the kubectl and
-    /// gcloud ones) are not cases: a farcast that still sent one would read
-    /// as `unknown`, and one built from this app's commit never does.
+    /// reading prose. The six kinds ADR 0023 M2 retired (the five kubectl
+    /// and gcloud ones, and `not_migrated`, which went with `farcast
+    /// migrate` at M2.9a) are not cases: a farcast that still sent one would
+    /// read as `unknown`, and one built from this app's commit never does.
     public enum Kind: String, Codable, Sendable, Equatable, Hashable, CaseIterable, UnknownDecodable {
         case recordUnreadable
         case notFound
@@ -252,7 +253,6 @@ public struct SectionProblem: Codable, Sendable, Equatable, Hashable {
         case clusterRejected
         case documentUnreadable
         case rolloutStalled
-        case notMigrated
         case planChanged
         case timeout
         case `internal`
@@ -277,7 +277,6 @@ public struct SectionProblem: Codable, Sendable, Equatable, Hashable {
             case .clusterRejected: "cluster rejected"
             case .documentUnreadable: "document unreadable"
             case .rolloutStalled: "rollout stalled"
-            case .notMigrated: "not migrated"
             case .planChanged: "plan changed"
             case .timeout: "timed out"
             case .internal: "internal error"

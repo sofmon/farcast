@@ -340,70 +340,6 @@ func TestAWritersApplyWritesItsWarnings(t *testing.T) {
 	}
 }
 
-// ADR 0023 M2.7 (A30-28, §10.5 row 101b): Traces lists every object an
-// Apply answered with that still carries kubectl's client-side apply: its
-// kubectl-client-side-apply entry, which kubetest's apply keeps from a seeded
-// object as a real server keeps another manager's, or the last-applied
-// annotation, which a real server keeps too and kubetest does not, so it is
-// answered here through WithHandler. Each is named by the document, once, in
-// apply order. An object whose only entry is farcast's own Apply is no trace,
-// and the caller gets a copy of the client's list.
-func TestTracesListsEveryClientSideTrace(t *testing.T) {
-	const marker = "LAST-APPLIED-MARKER"
-	annotated := "/api/v1/namespaces/web/configmaps/annotated"
-	s := kubetest.New(t, kubetest.WithHandler(func(r kubetest.Request) (int, []byte, bool) {
-		if r.Method != http.MethodPatch || r.Path != annotated {
-			return 0, nil, false
-		}
-		return http.StatusOK, []byte(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"annotated","namespace":"web",` +
-			`"annotations":{"kubectl.kubernetes.io/last-applied-configuration":"{\"marker\":\"` + marker + `\"}"},` +
-			`"managedFields":[{"manager":"farcast","operation":"Apply","apiVersion":"v1","fieldsType":"FieldsV1","fieldsV1":{}}]}}`), true
-	}))
-	seeded := object("v1", "ServiceAccount", "web", "api", map[string]any{"metadata": map[string]any{
-		"managedFields": []any{map[string]any{"manager": "kubectl-client-side-apply", "operation": "Update", "apiVersion": "v1",
-			"fieldsType": "FieldsV1", "fieldsV1": map[string]any{"f:metadata": map[string]any{}}}},
-	}})
-	s.Put(seeded)
-	c := openWriter(t, s, nil)
-	if got := c.Traces(); len(got) != 0 {
-		t.Fatalf("Traces before any apply = %q", got)
-	}
-	extra := "---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: annotated\n  namespace: web\n  labels:\n    app.kubernetes.io/managed-by: farcast\n"
-	for range 2 {
-		if err := c.Apply(t.Context(), []byte(stream+extra)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	want := []string{"ServiceAccount web/api", "ConfigMap web/annotated"}
-	got := c.Traces()
-	if !slices.Equal(got, want) {
-		t.Fatalf("Traces = %q, want %q: the seeded entry and the annotation, each once, in apply order", got, want)
-	}
-	got[0] = "changed by the caller"
-	if again := c.Traces(); !slices.Equal(again, want) {
-		t.Errorf("Traces after its caller changed the list it got = %q; want a copy each time", again)
-	}
-	if fresh := openWriter(t, s, nil); fresh.Traces() != nil {
-		t.Errorf("another client's Traces = %q; traces are per client", fresh.Traces())
-	}
-	for _, name := range c.Traces() {
-		if strings.Contains(name, marker) {
-			t.Errorf("a trace carries the annotation's value: %q", name)
-		}
-	}
-
-	// farcast's own Apply entry, which every answer carries, is no trace:
-	// the Namespace and the ConfigMap above were applied twice and are not
-	// listed, and an apply of them alone lists nothing.
-	clean := openWriter(t, s, nil)
-	if err := clean.Apply(t.Context(), []byte(stream[:strings.Index(stream, "---\napiVersion: v1\nkind: ServiceAccount")])); err != nil {
-		t.Fatal(err)
-	}
-	if got := clean.Traces(); len(got) != 0 {
-		t.Errorf("Traces of farcast's own applies = %q, want none", got)
-	}
-}
-
 // ADR 0023 M2.7 (A30-29, §10.5 row 100): every apply is forced, whatever the
 // stream and however many documents it holds: each apply-patch request
 // carries force=true.
@@ -907,12 +843,13 @@ func sameState(a, b DeploymentState) bool {
 		a.AdaptedAt.Equal(b.AdaptedAt) && a.LastAppliedAt.Equal(b.LastAppliedAt) && a.ResourceVersion == b.ResourceVersion
 }
 
-// ADR 0023 M2.6 (A23-46, A28-7): DeploymentState is one GET of the
-// Deployment, its warnings written after it. Its replicas, each container's
-// requests ("" as 0), the kernel's adapted-at stamp as the kernel reads it
-// (zero when it does not parse), and the newest time among the entries that
-// record farcast's own apply of the object: farcast's Apply and kubectl's
-// client-side apply Update. A subresource entry (the kernel's scale), another
+// ADR 0023 M2.6 (A23-46, A28-7), narrowed at M2.9a (design §37, A37-8,
+// mutation row 200): DeploymentState is one GET of the Deployment, its
+// warnings written after it. Its replicas, each container's requests ("" as
+// 0), the kernel's adapted-at stamp as the kernel reads it (zero when it does
+// not parse), and the newest time among the entries that record farcast's own
+// Apply of the object, in UTC: web's is seeded at +02:00. kubectl's
+// client-side apply Update, a subresource entry (the kernel's scale), another
 // operation, another manager and a time that does not parse are passed over,
 // each seeded newer than the answer. Only the API server's own 404 Status is
 // absent; a 404 that is not a Status and a 403 are errors, and a set request
@@ -945,7 +882,7 @@ func TestDeploymentStateReadsTheAdaptationAndTheLastApply(t *testing.T) {
 	s.Put(api)
 	s.Put(appDeployment("web", nil, [][3]string{{"web", "1", "1Gi"}},
 		map[string]string{kernel.AdaptedAtLabel: "yesterday-ish"},
-		managedEntry("farcast", "Apply", "", "2026-11-17T08:00:00Z"),
+		managedEntry("farcast", "Apply", "", "2026-11-17T10:15:00+02:00"),
 		managedEntry("kubectl-client-side-apply", "Update", "", "2026-11-17T12:45:30+02:00"),
 	))
 	s.Put(appDeployment("bare", 1, [][3]string{{"bare", "", ""}}, map[string]string{kernel.AdaptedAtLabel: "2026-11-17T11:00:00+01:00"}))
@@ -972,7 +909,7 @@ func TestDeploymentStateReadsTheAdaptationAndTheLastApply(t *testing.T) {
 		}},
 		{"web", DeploymentState{
 			Present: true, Requests: map[string]Requests{"web": {1000, 1024}},
-			LastAppliedAt: at("2026-11-17T10:45:30Z"),
+			LastAppliedAt: at("2026-11-17T08:15:00Z"),
 		}},
 		{"bare", DeploymentState{
 			Present: true, Replicas: &one, Requests: map[string]Requests{"bare": {0, 0}},
@@ -1950,24 +1887,25 @@ func TestLogWarningsComeBeforeTheLog(t *testing.T) {
 	}
 }
 
-// clientSideDeployment is the Deployment web/api as an older farcast left it:
-// farcast's label, kubectl's last-applied annotation holding marker, and
-// kubectl-client-side-apply's Update entry.
-func clientSideDeployment(marker string) map[string]any {
+// annotatedDeployment is the Deployment web/api as farcast applied it and
+// kubectl then wrote it: farcast's label, farcast's Apply entry, and
+// kubectl's last-applied annotation holding marker.
+func annotatedDeployment(marker string) map[string]any {
 	d := appDeployment("api", 1, [][3]string{{"api", "250m", "512Mi"}},
 		map[string]string{"kubectl.kubernetes.io/last-applied-configuration": `{"kind":"Deployment","marker":"` + marker + `"}`},
-		managedEntry("kubectl-client-side-apply", "Update", "", "2026-11-01T09:00:00Z"))
+		managedEntry("farcast", "Apply", "", "2026-11-01T09:00:00Z"))
 	d["metadata"].(map[string]any)["labels"] = map[string]any{"app.kubernetes.io/managed-by": "farcast"}
 	return d
 }
 
-// ADR 0023 M2.7 (A30-15): migrate's three calls are kube's, metadata only, in
-// process as the writer. ListMeta is ListObjects, across every namespace when
-// it names none, by label, paged; GetMeta is GetObject; PatchManagedFields is
-// PatchJSON, under fieldManager farcast with strict validation. Each asks for
-// PartialObjectMetadata, and each writes the warnings its own answer carried,
-// after it and before it returns.
-func TestListMetaGetMetaPatchManagedFieldsAreKubes(t *testing.T) {
+// ADR 0023 M2.7 (A30-15), M2.9a (design §37, A37-7): GetMeta is kube's
+// GetObject, metadata only, in process as the writer: one GET of the object,
+// with no query, asking for PartialObjectMetadata, its warning written after
+// it and before it returns. The last-applied annotation comes back with its
+// key and an empty value (blankLastApplied), so its value, which on a Secret
+// kubectl applied holds the Secret's values, reaches neither the caller nor
+// the warnings.
+func TestGetMetaIsKubesGetObject(t *testing.T) {
 	deployments, ok := kube.KindOf("apps/v1", "Deployment")
 	if !ok {
 		t.Fatal("no Deployment kind")
@@ -1975,154 +1913,41 @@ func TestListMetaGetMetaPatchManagedFieldsAreKubes(t *testing.T) {
 	s := kubetest.New(t, kubetest.WithWarnings(func(r kubetest.Request) []string {
 		return []string{r.Method + " " + r.Path}
 	}))
-	s.Put(clientSideDeployment("LAST-APPLIED-MARKER"))
-	other := appDeployment("someone-elses", 1, [][3]string{{"x", "", ""}}, nil)
-	other["metadata"].(map[string]any)["namespace"] = "elsewhere"
-	s.Put(other)
+	const marker = "LAST-APPLIED-MARKER"
+	s.Put(annotatedDeployment(marker))
 	var w bytes.Buffer
 	c := openWriter(t, s, &w)
-	ctx := t.Context()
 	const (
-		listPath = "/apis/apps/v1/deployments"
-		objPath  = "/apis/apps/v1/namespaces/web/deployments/api"
-		partial  = "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1"
+		objPath = "/apis/apps/v1/namespaces/web/deployments/api"
+		partial = "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1"
 	)
-	warned := func(call, want string) {
-		t.Helper()
-		if !strings.HasSuffix(w.String(), "Warning (cluster): "+want+"\n") {
-			t.Errorf("after %s the warnings are %q; want its own, %q, last", call, w.String(), want)
-		}
-	}
 
-	objs, err := c.ListMeta(ctx, deployments, "", "app.kubernetes.io/managed-by=farcast")
+	o, err := c.GetMeta(t.Context(), deployments, "web", "api")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(objs) != 1 || objs[0].Kind.Kind != "Deployment" || objs[0].Metadata.Namespace != "web" || objs[0].Metadata.Name != "api" {
-		var got []string
-		for _, o := range objs {
-			got = append(got, o.Kind.Kind+" "+o.Metadata.Namespace+"/"+o.Metadata.Name)
-		}
-		t.Errorf("ListMeta = %v; want the Deployment web/api alone", got)
+	if o.Kind.Kind != "Deployment" || o.Metadata.Namespace != "web" || o.Metadata.Name != "api" || o.Metadata.UID == "" ||
+		len(o.Metadata.ManagedFields) != 1 || !kube.IsOwnApply(o.Metadata.ManagedFields[0]) {
+		t.Errorf("GetMeta = %s %s/%s, uid %q, managed fields %+v", o.Kind.Kind, o.Metadata.Namespace, o.Metadata.Name,
+			o.Metadata.UID, o.Metadata.ManagedFields)
 	}
-	warned("ListMeta", "GET "+listPath)
-
-	o, err := c.GetMeta(ctx, deployments, "web", "api")
-	if err != nil {
-		t.Fatal(err)
+	if want := "Warning (cluster): GET " + objPath + "\n"; w.String() != want {
+		t.Errorf("after GetMeta the warnings are %q; want its own, %q", w.String(), want)
 	}
-	if o.Kind.Kind != "Deployment" || o.Metadata.UID == "" || len(o.Metadata.ManagedFields) != 1 {
-		t.Errorf("GetMeta = %s %s/%s, uid %q, %d managed-fields entries", o.Kind.Kind, o.Metadata.Namespace, o.Metadata.Name,
-			o.Metadata.UID, len(o.Metadata.ManagedFields))
-	}
-	warned("GetMeta", "GET "+objPath)
-
-	csa, err := kube.ClientSideManagers(o.Metadata.ManagedFields)
-	if err != nil {
-		t.Fatal(err)
-	}
-	hadApply := slices.ContainsFunc(o.Metadata.ManagedFields, kube.IsOwnApply)
-	patch, err := kube.MigrationPatch(o, csa, kube.FieldManager)
-	if err != nil || patch == nil {
-		t.Fatalf("MigrationPatch = %s, %v", patch, err)
-	}
-	p, err := c.PatchManagedFields(ctx, deployments, "web", "api", patch)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := kube.MigratedEndState(p, csa, kube.FieldManager, hadApply); err != nil {
-		t.Errorf("the patch's answer is not migrated: %v", err)
-	}
-	warned("PatchManagedFields", "PATCH "+objPath)
 
 	reqs := apiRequests(s)
-	if len(reqs) != 3 {
-		t.Fatalf("%d requests, want a list, a get and a patch: %v", len(reqs), apiPaths(s))
+	if len(reqs) != 1 {
+		t.Fatalf("%d requests, want one get: %v", len(reqs), apiPaths(s))
 	}
-	list, get, patched := reqs[0], reqs[1], reqs[2]
-	q, err := url.ParseQuery(list.RawQuery)
-	if err != nil {
-		t.Fatal(err)
+	get := reqs[0]
+	if get.Method != http.MethodGet || get.Path != objPath || get.RawQuery != "" || get.Accept != partial || get.As != "writer" {
+		t.Errorf("GetMeta sent %s %s?%s, Accept %q, as %q", get.Method, get.Path, get.RawQuery, get.Accept, get.As)
 	}
-	if list.Method != http.MethodGet || list.Path != listPath || q.Get("labelSelector") != "app.kubernetes.io/managed-by=farcast" ||
-		q.Get("limit") != "500" || q.Has("fieldManager") || list.Accept != "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1" {
-		t.Errorf("ListMeta sent %s %s?%s, Accept %q", list.Method, list.Path, list.RawQuery, list.Accept)
-	}
-	if get.Method != http.MethodGet || get.Path != objPath || get.RawQuery != "" || get.Accept != partial {
-		t.Errorf("GetMeta sent %s %s?%s, Accept %q", get.Method, get.Path, get.RawQuery, get.Accept)
-	}
-	if patched.Method != http.MethodPatch || patched.Path != objPath || patched.RawQuery != "fieldManager=farcast&fieldValidation=Strict" ||
-		patched.ContentType != "application/json-patch+json" || patched.Accept != partial || !bytes.Equal(patched.Body, patch) {
-		t.Errorf("PatchManagedFields sent %s %s?%s (%s), Accept %q, body %s", patched.Method, patched.Path, patched.RawQuery,
-			patched.ContentType, patched.Accept, patched.Body)
-	}
-	for _, r := range reqs {
-		if r.As != "writer" {
-			t.Errorf("%s %s was sent as %q, not the writer", r.Method, r.Path, r.As)
-		}
-	}
-	if strings.Contains(w.String(), "LAST-APPLIED-MARKER") {
+	if strings.Contains(w.String(), marker) {
 		t.Errorf("the annotation's value reached the warnings: %q", w.String())
 	}
-
-	// Each of the three returns the last-applied annotation with its key and
-	// an empty value (blankLastApplied): still a trace, and its value, which
-	// on a Secret kubectl applied holds the Secret's values, reaches no caller.
-	// A patch that leaves the annotation shows PatchManagedFields' answer.
-	kept := clientSideDeployment("LAST-APPLIED-MARKER")
-	kept["metadata"].(map[string]any)["name"] = "kept"
-	s.Put(kept)
-	read, err := c.GetMeta(ctx, deployments, "web", "kept")
-	if err != nil {
-		t.Fatal(err)
-	}
-	same, err := json.Marshal([]map[string]any{{"op": "replace", "path": "/metadata/resourceVersion", "value": read.Metadata.ResourceVersion}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	answered, err := c.PatchManagedFields(ctx, deployments, "web", "kept", same)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(objs) != 1 {
-		t.Fatalf("ListMeta returned %d objects", len(objs))
-	}
-	for _, got := range []struct {
-		what string
-		o    kube.Object
-	}{{"ListMeta", objs[0]}, {"GetMeta", o}, {"GetMeta of a second object", read}, {"PatchManagedFields' answer", answered}} {
-		value, present := got.o.Metadata.Annotations["kubectl.kubernetes.io/last-applied-configuration"]
-		if !present || value != "" || !kube.ClientSideTrace(got.o.Metadata) {
-			t.Errorf("%s: the annotation present %t, its value %d bytes, a trace %t; want the key with an empty value",
-				got.what, present, len(value), kube.ClientSideTrace(got.o.Metadata))
-		}
-	}
-}
-
-// ADR 0023 M2.7 (A30-15): a reader refuses migrate's one write before
-// anything is sent, its token included: PatchManagedFields asks neverWrites
-// first, and the object stays as it was.
-func TestReaderNeverPatchesManagedFields(t *testing.T) {
-	deployments, ok := kube.KindOf("apps/v1", "Deployment")
-	if !ok {
-		t.Fatal("no Deployment kind")
-	}
-	s := kubetest.New(t)
-	s.Put(clientSideDeployment("LAST-APPLIED-MARKER"))
-	c := openReader(t, s, nil)
-	patch := []byte(`[{"op":"remove","path":"/metadata/annotations/kubectl.kubernetes.io~1last-applied-configuration"}]`)
-	o, err := c.PatchManagedFields(t.Context(), deployments, "web", "api", patch)
-	if !errors.Is(err, errNeverWrites) || err.Error() != "cluster: a reader client never writes" {
-		t.Errorf("a reader's PatchManagedFields = %v; want the reader's refusal", err)
-	}
-	if o.Metadata.Name != "" || o.Kind.Kind != "" {
-		t.Errorf("the refused patch returned %s %s/%s", o.Kind.Kind, o.Metadata.Namespace, o.Metadata.Name)
-	}
-	if got := s.Requests(); len(got) != 0 {
-		var sent []string
-		for _, r := range got {
-			sent = append(sent, r.Method+" "+r.Path)
-		}
-		t.Errorf("the refused patch sent %d requests, the token's included: %v", len(got), sent)
+	value, present := o.Metadata.Annotations["kubectl.kubernetes.io/last-applied-configuration"]
+	if !present || value != "" {
+		t.Errorf("GetMeta: the annotation present %t, its value %d bytes; want the key with an empty value", present, len(value))
 	}
 }

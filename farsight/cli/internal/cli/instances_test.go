@@ -47,7 +47,7 @@ func TestInstancesReadsOnlyTheRecords(t *testing.T) {
 	if !slices.Equal(opened, []string{filepath.Join(dir.InstancePath("atlas"), "metadata.yaml")}) {
 		t.Errorf("read %v, want the one record", opened)
 	}
-	if !strings.Contains(out.String(), "atlas") || !strings.Contains(out.String(), "READER") || !strings.Contains(out.String(), " none ") {
+	if !strings.Contains(out.String(), "atlas") || !strings.Contains(out.String(), " READER\n") || !strings.Contains(out.String(), " none\n") {
 		t.Errorf("listing:\n%s", out.String())
 	}
 }
@@ -84,10 +84,14 @@ func TestHelpListsTheConnectedViewCommands(t *testing.T) {
 	}
 }
 
-// Design §7.4 and A18-12, mutation 67: pin-gcloud is retired. Its documented
-// form, the subcommand alone, and --account alone are each a usage error,
-// through the router: exit 2, the retirement text on stderr, nothing on
-// stdout, in either output mode, and the record byte for byte as it was.
+// Design §7.4 and A18-12, mutation 67: pin-gcloud is retired. The
+// subcommand, alone or with an instance, is a usage error through the
+// router: exit 2, the retirement text on stderr, nothing on stdout, in either
+// output mode. Its --account flag went at ADR 0023 M2.9a (design A37-11,
+// superseding A18-12's registration, mutation 195), so every form that gives
+// it, whatever its value, is the flag parser's refusal before Run: exit 2,
+// the parser's text and not the retirement text on stderr, nothing on
+// stdout. Neither touches the record.
 func TestPinGCloudIsRetired(t *testing.T) {
 	dir := vectorConfigDir(t)
 	writeRecord(t, dir, vectorMeta())
@@ -96,24 +100,42 @@ func TestPinGCloudIsRetired(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	invoke := func(mode string, args []string) (int, string, string) {
+		var out, errb bytes.Buffer
+		code := run(context.Background(), append([]string{"farcast", "--config", dir.Path(), "-o", mode}, args...), strings.NewReader(""), &out, &errb)
+		return code, out.String(), errb.String()
+	}
 	for _, args := range [][]string{
-		{"instances", "pin-gcloud", "atlas", "--account", "operator@example.org"},
 		{"instances", "pin-gcloud", "atlas"},
 		{"instances", "pin-gcloud"},
+	} {
+		for _, mode := range []string{"json", "human"} {
+			code, out, errb := invoke(mode, args)
+			if code != 2 || out != "" {
+				t.Errorf("%v -o %s: exit %d, stdout %q; want exit 2 and nothing", args, mode, code, out)
+			}
+			if !strings.Contains(errb, msgPinGCloudRetired) {
+				t.Errorf("%v -o %s: stderr %q; want the retirement text", args, mode, errb)
+			}
+		}
+	}
+	for _, args := range [][]string{
+		{"instances", "pin-gcloud", "atlas", "--account", "operator@example.org"},
 		{"instances", "--account", "operator@example.org"},
-		// A18-12 (C-C24-6): the flag given is the retired form, whatever its
-		// value; an empty one, from an unset variable, included.
+		// An empty value, from an unset variable, is refused the same way.
 		{"instances", "--account", ""},
 		{"instances", "--account="},
 	} {
 		for _, mode := range []string{"json", "human"} {
-			var out, errb bytes.Buffer
-			code := run(context.Background(), append([]string{"farcast", "--config", dir.Path(), "-o", mode}, args...), strings.NewReader(""), &out, &errb)
-			if code != 2 || out.Len() != 0 {
-				t.Errorf("%v -o %s: exit %d, stdout %q; want exit 2 and nothing", args, mode, code, out.String())
+			code, out, errb := invoke(mode, args)
+			if code != 2 || out != "" {
+				t.Errorf("%v -o %s: exit %d, stdout %q; want exit 2 and nothing", args, mode, code, out)
 			}
-			if !strings.Contains(errb.String(), msgPinGCloudRetired) {
-				t.Errorf("%v -o %s: stderr %q; want the retirement text", args, mode, errb.String())
+			if !strings.Contains(errb, "flag provided but not defined: -account") {
+				t.Errorf("%v -o %s: stderr %q; want the flag parser's refusal", args, mode, errb)
+			}
+			if strings.Contains(errb, msgPinGCloudRetired) {
+				t.Errorf("%v -o %s: stderr %q holds the retirement text; --account no longer reaches Run", args, mode, errb)
 			}
 		}
 	}

@@ -44,7 +44,6 @@ const (
 	applyQuery  = "?fieldManager=farcast&fieldValidation=Strict&force=true"
 	partialList = "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1"
 	partialOne  = "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1"
-	lastApplied = "kubectl.kubernetes.io/last-applied-configuration"
 )
 
 // ---- the test client -------------------------------------------------------
@@ -152,15 +151,6 @@ func (f *fixture) get(path, token string) answer {
 func (f *fixture) apply(path, token, doc string) answer {
 	f.t.Helper()
 	return f.send(call{method: http.MethodPatch, path: path + applyQuery, token: token, contentType: applyType, body: []byte(doc)})
-}
-
-func (f *fixture) patchJSON(path, token string, ops any) answer {
-	f.t.Helper()
-	b, err := json.Marshal(ops)
-	if err != nil {
-		f.t.Fatal(err)
-	}
-	return f.send(call{method: http.MethodPatch, path: path + "?fieldManager=farcast&fieldValidation=Strict", token: token, contentType: jsonPatch, body: b})
 }
 
 func (f *fixture) lastRequest() kubetest.Request {
@@ -1459,22 +1449,6 @@ func TestSettledWorkloadsRollOutAndGetAnAddress(t *testing.T) {
 			t.Errorf("a Service's own address after an apply = %v, want 198.51.100.7 kept", ingress)
 		}
 
-		// A JSON patch settles what it stores: a Deployment Put left with no
-		// status reads rolled out after one, as migrate's patch leaves it.
-		const patched = "/apis/apps/v1/namespaces/web/deployments/patched"
-		f.s.Put(map[string]any{"apiVersion": "apps/v1", "kind": "Deployment",
-			"metadata": map[string]any{"name": "patched", "namespace": "web", "generation": 2, "annotations": map[string]any{"k": "v"}},
-			"spec": map[string]any{"replicas": 2, "selector": map[string]any{"matchLabels": map[string]any{"app": "patched"}},
-				"template": map[string]any{"metadata": map[string]any{"labels": map[string]any{"app": "patched"}},
-					"spec": map[string]any{"containers": []any{map[string]any{"name": "web", "image": "example.invalid/web:1"}}}}}})
-		if st := get(object(t, f.get(patched, tok)), "status"); st != nil {
-			t.Fatalf("a Deployment Put stored is settled already: %v", st)
-		}
-		wantCode(t, f.patchJSON(patched, tok, []map[string]any{{"op": "remove", "path": "/metadata/annotations/k"}}), http.StatusOK)
-		if d := deploymentOf(t, f.get(patched, tok)); d.Status.ObservedGeneration != 2 || d.Status.AvailableReplicas != 2 || d.Status.ReadyReplicas != 2 {
-			t.Errorf("a JSON patch left the Deployment's status %+v, want it settled at generation 2 with 2 replicas", d.Status)
-		}
-
 		// A stored Job keeps its selector and the template labels the
 		// body omits, and an unchanged spec moves no generation.
 		a = f.apply(seededJob, tok, jobDoc("seeded", "example.invalid/build:1"))
@@ -1553,8 +1527,7 @@ func TestSettledWorkloadsRollOutAndGetAnAddress(t *testing.T) {
 // TestFailNextApplyRefusesOneApply (design A30-10): the next server-side
 // apply, whatever its path, is answered as Fail answers and stores nothing;
 // an unauthenticated apply does not consume it (TestFailNextApplyComesAfterRBAC
-// has WithRBAC's rows), and neither a GET nor a JSON patch does; the apply
-// after it lands. It comes before WithHandler and Fail's answers, which see
+// has WithRBAC's rows), and neither does a GET; the apply after it lands. It comes before WithHandler and Fail's answers, which see
 // every other request as before.
 func TestFailNextApplyRefusesOneApply(t *testing.T) {
 	const (
@@ -1569,9 +1542,7 @@ func TestFailNextApplyRefusesOneApply(t *testing.T) {
 		}
 		return 0, nil, false
 	}))
-	annotated := configMap("web", "seeded", map[string]string{"k": "v"})
-	annotated["metadata"].(map[string]any)["annotations"] = map[string]any{lastApplied: `{"marker":"last-applied"}`}
-	f.s.Put(annotated)
+	f.s.Put(configMap("web", "seeded", map[string]string{"k": "v"}))
 	tok := f.mint(f.s.Credential("writer"))
 
 	f.s.FailNextApply(http.StatusInternalServerError, kube.Status{})
@@ -1595,12 +1566,11 @@ func TestFailNextApplyRefusesOneApply(t *testing.T) {
 	}
 
 	// Whatever its path, with its own Status, once per call; Fail's answers
-	// come after it, and a JSON patch is not an apply.
+	// come after it.
 	f.s.FailNextApply(http.StatusConflict, kube.Status{Status: tkube.Status{Reason: "Conflict", Message: "refused once"}})
 	f.s.FailNextApply(http.StatusForbidden, kube.Status{})
 	f.s.Fail(http.MethodPatch, other, http.StatusServiceUnavailable, kube.Status{})
 	cm := "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: settings\n  namespace: web\n"
-	wantCode(t, f.patchJSON(seeded, tok, []map[string]any{{"op": "remove", "path": "/metadata/annotations/" + strings.ReplaceAll(lastApplied, "/", "~1")}}), http.StatusOK)
 	if st := wantStatus(t, f.apply(other, tok, cm), http.StatusConflict, "Conflict"); st.Message != "refused once" {
 		t.Errorf("the second refusal's message = %q", st.Message)
 	}
@@ -2044,33 +2014,23 @@ func TestPartialObjectMetadataAnswersCarryNoData(t *testing.T) {
 		t.Errorf("a full get lost the data: %s", a.body)
 	}
 
-	// A PATCH's answer honours Accept as a GET's does (design A30-9): a JSON
-	// patch's and an apply's, and a view it cannot give is 406 before
-	// anything is written.
-	rv := metaOf(t, object(t, a))["resourceVersion"].(string)
+	// An apply's answer honours Accept as a GET's does (design A30-9), and a
+	// view it cannot give is 406 before anything is written.
 	const secret = "/api/v1/namespaces/web/secrets/s"
-	ops, err := json.Marshal([]map[string]any{{"op": "replace", "path": "/metadata/resourceVersion", "value": rv}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	patch := call{method: http.MethodPatch, path: secret + "?fieldManager=farcast&fieldValidation=Strict", token: tok, contentType: jsonPatch, accept: partialOne, body: ops}
 	applied := "apiVersion: v1\nkind: Secret\nmetadata:\n  name: s\n  namespace: web\ndata:\n  key: " + secretValue + "\n  more: " + secretValue + "\n"
 	apply := call{method: http.MethodPatch, path: secret + applyQuery, token: tok, contentType: applyType, accept: partialOne, body: []byte(applied)}
-	for _, c := range []call{patch, apply} {
-		a = f.send(c)
-		wantCode(t, a, http.StatusOK)
-		one := object(t, a)
-		if one["kind"] != "PartialObjectMetadata" || one["apiVersion"] != "meta.k8s.io/v1" || one["data"] != nil || bytes.Contains(a.body, []byte(secretValue)) ||
-			get(one, "metadata", "name") != "s" {
-			t.Errorf("a metadata-only %s answer = %s", c.contentType, a.body)
-		}
+	a = f.send(apply)
+	wantCode(t, a, http.StatusOK)
+	one = object(t, a)
+	if one["kind"] != "PartialObjectMetadata" || one["apiVersion"] != "meta.k8s.io/v1" || one["data"] != nil || bytes.Contains(a.body, []byte(secretValue)) ||
+		get(one, "metadata", "name") != "s" {
+		t.Errorf("a metadata-only apply answer = %s", a.body)
 	}
-	rv = metaOf(t, object(t, f.get(secret, tok)))["resourceVersion"].(string)
-	for _, c := range []call{patch, apply} {
-		c.accept = partialList
-		c.body = []byte(strings.Replace(string(c.body), "more:", "other:", 1))
-		wantStatus(t, f.send(c), http.StatusNotAcceptable, "NotAcceptable")
-	}
+	rv := metaOf(t, object(t, f.get(secret, tok)))["resourceVersion"].(string)
+	refused := apply
+	refused.accept = partialList
+	refused.body = []byte(strings.Replace(applied, "more:", "other:", 1))
+	wantStatus(t, f.send(refused), http.StatusNotAcceptable, "NotAcceptable")
 	full := object(t, f.get(secret, tok))
 	if metaOf(t, full)["resourceVersion"] != rv || get(full, "data", "other") != nil {
 		t.Errorf("a PATCH answered 406 wrote: %v", full)
@@ -2247,448 +2207,13 @@ func TestLogsAreChunkedFlushedAndFollowedUntilTheContextEnds(t *testing.T) {
 	}
 }
 
-// liveCSAObject is a Deployment as kubectl's client-side apply leaves it: a
-// kubectl-client-side-apply Update entry that owns the last-applied
-// annotation, and the annotation itself.
-func liveCSAObject() map[string]any {
-	return map[string]any{
-		"apiVersion": "apps/v1", "kind": "Deployment",
-		"metadata": map[string]any{
-			"name": "web", "namespace": "web",
-			"annotations": map[string]any{lastApplied: `{"marker":"last-applied"}`, "keep": "me"},
-			"managedFields": []any{map[string]any{
-				"manager": "kubectl-client-side-apply", "operation": "Update", "apiVersion": "apps/v1",
-				"time": "2026-11-01T00:00:00Z", "fieldsType": "FieldsV1",
-				"fieldsV1": map[string]any{
-					"f:metadata": map[string]any{"f:annotations": map[string]any{".": map[string]any{}, "f:" + lastApplied: map[string]any{}}},
-					"f:spec":     map[string]any{"f:replicas": map[string]any{}},
-				},
-			}},
-		},
-		"spec": map[string]any{"replicas": 1},
-	}
-}
-
-// migratedEntry is the entry the rewrite submits, decodable as the server
-// decodes it; mutate makes it not.
-func migratedEntry(mutate func(map[string]any)) map[string]any {
-	e := map[string]any{
-		"manager": "farcast", "operation": "Apply", "apiVersion": "apps/v1",
-		"time": "2026-11-01T00:00:00Z", "fieldsType": "FieldsV1",
-		"fieldsV1": map[string]any{"f:spec": map[string]any{"f:replicas": map[string]any{}}},
-	}
-	if mutate != nil {
-		mutate(e)
-	}
-	return e
-}
-
-func migrationOps(managedFields any, rv string) []map[string]any {
-	return []map[string]any{
-		{"op": "replace", "path": "/metadata/managedFields", "value": managedFields},
-		{"op": "replace", "path": "/metadata/resourceVersion", "value": rv},
-		{"op": "remove", "path": "/metadata/annotations/kubectl.kubernetes.io~1last-applied-configuration"},
-	}
-}
-
-// withoutLastApplied is liveCSAObject's entries as the API server keeps them
-// after a patch that removed the last-applied annotation: its field manager
-// subtracts the removed path from every entry (structured-merge-diff v6.3.1
-// merge/update.go), so kubectl-client-side-apply's annotations node is left a
-// member with no children.
-func withoutLastApplied(t *testing.T, live []entry) []entry {
-	t.Helper()
-	if len(live) != 1 || live[0].Manager != "kubectl-client-side-apply" {
-		t.Fatalf("live entries = %+v, want liveCSAObject's one", live)
-	}
-	out := slices.Clone(live)
-	out[0].FieldsV1 = json.RawMessage(`{"f:metadata":{"f:annotations":{}},"f:spec":{"f:replicas":{}}}`)
-	return out
-}
-
-// TestKubetestKeepsTheLiveListOnAnUndecodableRewrite (§10.5 row 37): a
-// submitted managedFields list the API server cannot decode leaves the live
-// list in place, silently, while the patch's other operations still apply,
-// as apimachinery v0.37.2's decodeLiveOrNew does. Each row breaks one of
-// DecodeManagedFields' rules; the last row is decodable, and is taken. The
-// live list is kept less the removed annotation's path, which the field
-// manager then strips from every entry it keeps.
-func TestKubetestKeepsTheLiveListOnAnUndecodableRewrite(t *testing.T) {
-	f := newFixture(t)
-	tok := f.mint(f.s.Credential("writer"))
-	const path = "/apis/apps/v1/namespaces/web/deployments/web"
-	rows := []struct {
-		name    string
-		list    []any
-		decodes bool
-	}{
-		{"an operation that is neither Apply nor Update", []any{migratedEntry(func(e map[string]any) { e["operation"] = "Merge" })}, false},
-		{"no operation", []any{migratedEntry(func(e map[string]any) { delete(e, "operation") })}, false},
-		{"an empty apiVersion", []any{migratedEntry(func(e map[string]any) { e["apiVersion"] = "" })}, false},
-		{"no fieldsType", []any{migratedEntry(func(e map[string]any) { delete(e, "fieldsType") })}, false},
-		{"fieldsType FieldsV2", []any{migratedEntry(func(e map[string]any) { e["fieldsType"] = "FieldsV2" })}, false},
-		{"fieldsV1 that is a string", []any{migratedEntry(func(e map[string]any) { e["fieldsV1"] = "f:spec" })}, false},
-		{"fieldsV1 with a key that is no path element", []any{migratedEntry(func(e map[string]any) { e["fieldsV1"] = map[string]any{"spec": map[string]any{}} })}, false},
-		{"fieldsV1 with a node that is not an object", []any{migratedEntry(func(e map[string]any) { e["fieldsV1"] = map[string]any{"f:spec": []any{}} })}, false},
-		{"fieldsV1 with a k: key that is not JSON", []any{migratedEntry(func(e map[string]any) {
-			e["fieldsV1"] = map[string]any{"f:spec": map[string]any{"k:{name": map[string]any{}}}
-		})}, false},
-		{"one good entry and one bad", []any{migratedEntry(nil), migratedEntry(func(e map[string]any) { e["manager"] = "x"; e["apiVersion"] = "" })}, false},
-		{"a decodable list", []any{migratedEntry(nil)}, true},
-	}
-	for _, r := range rows {
-		t.Run(r.name, func(t *testing.T) {
-			f.s.Put(liveCSAObject())
-			live := object(t, f.get(path, tok))
-			liveEntries := managedFields(t, live)
-			rv := metaOf(t, live)["resourceVersion"].(string)
-
-			a := f.patchJSON(path, tok, migrationOps(r.list, rv))
-			wantCode(t, a, http.StatusOK)
-			for _, got := range []map[string]any{object(t, a), object(t, f.get(path, tok))} {
-				md := metaOf(t, got)
-				ann, _ := md["annotations"].(map[string]any)
-				if _, ok := ann[lastApplied]; ok {
-					t.Error("the annotation's removal did not apply")
-				}
-				if ann["keep"] != "me" {
-					t.Errorf("another annotation was lost: %v", ann)
-				}
-				if md["resourceVersion"] == rv {
-					t.Error("a patch that removed the annotation kept the resourceVersion")
-				}
-				es := managedFields(t, got)
-				switch {
-				case r.decodes && (len(es) != 1 || es[0].Manager != "farcast" || es[0].Operation != "Apply"):
-					t.Errorf("a decodable list was not taken: %+v", es)
-				case !r.decodes && !reflect.DeepEqual(es, withoutLastApplied(t, liveEntries)):
-					t.Errorf("an undecodable list replaced the live one: %+v, live %+v", es, liveEntries)
-				}
-			}
-		})
-	}
-}
-
-// TestJSONPatchGuardsAndRefusesWhatItDoesNotEmulate: the resourceVersion
-// guard, all-or-nothing operations, and the shapes the fake refuses rather
-// than misread.
-func TestJSONPatchGuardsAndRefusesWhatItDoesNotEmulate(t *testing.T) {
-	f := newFixture(t)
-	tok := f.mint(f.s.Credential("writer"))
-	const path = "/apis/apps/v1/namespaces/web/deployments/web"
-	fresh := func(t *testing.T) (map[string]any, string) {
-		t.Helper()
-		f.s.Put(liveCSAObject())
-		live := object(t, f.get(path, tok))
-		return live, metaOf(t, live)["resourceVersion"].(string)
-	}
-	unchanged := func(t *testing.T, live map[string]any) {
-		t.Helper()
-		if now := object(t, f.get(path, tok)); !reflect.DeepEqual(now, live) {
-			t.Errorf("a refused patch changed the object:\n got %v\nwant %v", now, live)
-		}
-	}
-
-	t.Run("a stale resourceVersion is 409", func(t *testing.T) {
-		live, _ := fresh(t)
-		st := wantStatus(t, f.patchJSON(path, tok, migrationOps([]any{migratedEntry(nil)}, "stale")), http.StatusConflict, "Conflict")
-		if !strings.Contains(st.Message, "the object has been modified") {
-			t.Errorf("409 message = %q", st.Message)
-		}
-		unchanged(t, live)
-	})
-	t.Run("operations are all or nothing", func(t *testing.T) {
-		live, _ := fresh(t)
-		ops := []map[string]any{
-			{"op": "remove", "path": "/metadata/annotations/kubectl.kubernetes.io~1last-applied-configuration"},
-			{"op": "replace", "path": "/metadata/resourceVersion", "value": "stale"},
-		}
-		wantCode(t, f.patchJSON(path, tok, ops), http.StatusConflict)
-		unchanged(t, live)
-	})
-	for name, ops := range map[string]func(rv string) any{
-		"removing an absent annotation": func(rv string) any {
-			return []map[string]any{{"op": "remove", "path": "/metadata/annotations/absent"}}
-		},
-		"an add": func(rv string) any {
-			return []map[string]any{{"op": "add", "path": "/metadata/labels/x", "value": "y"}}
-		},
-		"a replace elsewhere": func(rv string) any {
-			return []map[string]any{{"op": "replace", "path": "/spec/replicas", "value": 3}}
-		},
-		"a remove of more than one annotation key": func(rv string) any {
-			return []map[string]any{{"op": "remove", "path": "/metadata/annotations/a/b"}}
-		},
-		"a reset to []": func(rv string) any { return migrationOps([]any{}, rv) },
-		"a reset to [{}]": func(rv string) any {
-			return migrationOps([]any{map[string]any{}}, rv)
-		},
-		"managedFields that is not a list": func(rv string) any { return migrationOps("x", rv) },
-		"an entry time that is not a time": func(rv string) any {
-			return migrationOps([]any{migratedEntry(func(e map[string]any) { e["time"] = "yesterday" })}, rv)
-		},
-		"a replace with no value": func(rv string) any {
-			return []map[string]any{{"op": "replace", "path": "/metadata/managedFields"}}
-		},
-	} {
-		t.Run(name, func(t *testing.T) {
-			live, rv := fresh(t)
-			wantStatus(t, f.patchJSON(path, tok, ops(rv)), http.StatusUnprocessableEntity, "Invalid")
-			unchanged(t, live)
-		})
-	}
-	t.Run("a null list keeps the live one", func(t *testing.T) {
-		live, rv := fresh(t)
-		a := f.patchJSON(path, tok, migrationOps(nil, rv))
-		wantCode(t, a, http.StatusOK)
-		if es := managedFields(t, object(t, a)); !reflect.DeepEqual(es, withoutLastApplied(t, managedFields(t, live))) {
-			t.Errorf("a null managedFields replaced the live list: %+v", es)
-		}
-	})
-	t.Run("a decodable list is collapsed by manager and sorted as the server sorts it", func(t *testing.T) {
-		_, rv := fresh(t)
-		list := []any{
-			map[string]any{"manager": "kubectl-scale", "operation": "Update", "apiVersion": "apps/v1", "time": "2026-11-02T00:00:00Z", "fieldsType": "FieldsV1", "subresource": "scale",
-				"fieldsV1": map[string]any{"f:spec": map[string]any{"f:replicas": map[string]any{}}}},
-			migratedEntry(func(e map[string]any) { e["time"] = "2026-10-01T00:00:00Z" }),
-			migratedEntry(func(e map[string]any) { e["apiVersion"] = "apps/v2"; e["time"] = "2026-11-03T00:00:00Z" }),
-		}
-		a := f.patchJSON(path, tok, migrationOps(list, rv))
-		wantCode(t, a, http.StatusOK)
-		var got []string
-		for _, e := range managedFields(t, object(t, a)) {
-			got = append(got, e.Manager+"/"+e.Operation+"/"+e.APIVersion)
-		}
-		if want := []string{"farcast/Apply/apps/v2", "kubectl-scale/Update/apps/v1"}; !slices.Equal(got, want) {
-			t.Errorf("managedFields = %v, want %v", got, want)
-		}
-	})
-	t.Run("the object must exist", func(t *testing.T) {
-		wantStatus(t, f.patchJSON("/apis/apps/v1/namespaces/web/deployments/absent", tok, migrationOps([]any{migratedEntry(nil)}, "1")), http.StatusNotFound, "NotFound")
-	})
-	t.Run("the body must be a JSON patch", func(t *testing.T) {
-		live, _ := fresh(t)
-		wantStatus(t, f.send(call{method: http.MethodPatch, path: path, token: tok, contentType: jsonPatch, body: []byte(`{"op":"remove"}`)}), http.StatusBadRequest, "BadRequest")
-		unchanged(t, live)
-	})
-}
-
-// TestJSONPatchStripsARemovedAnnotationFromEveryEntry (F-F2): when a patch
-// removes an annotation, the API server's field manager subtracts its path
-// from every entry the object keeps, and drops an entry left with no field
-// (structured-merge-diff v6.3.1 merge/update.go, Updater.update). kubetest
-// does the same, whether the list is the live one kept or the one submitted.
-// An entry that owned no field before the patch stays, because kubetest's own
-// apply entries own none.
-func TestJSONPatchStripsARemovedAnnotationFromEveryEntry(t *testing.T) {
-	f := newFixture(t)
-	tok := f.mint(f.s.Credential("writer"))
-	const path = "/apis/apps/v1/namespaces/web/deployments/web"
-	ownsAnn := map[string]any{".": map[string]any{}, "f:" + lastApplied: map[string]any{}}
-	mf := func(manager, operation, at string, fields map[string]any) map[string]any {
-		return map[string]any{"manager": manager, "operation": operation, "apiVersion": "apps/v1", "time": at, "fieldsType": "FieldsV1", "fieldsV1": fields}
-	}
-	seed := func(t *testing.T) string {
-		t.Helper()
-		o := liveCSAObject()
-		md := o["metadata"].(map[string]any)
-		md["managedFields"] = []any{
-			mf("farcast", "Apply", "2026-11-01T00:00:00Z", map[string]any{}),
-			mf("kubectl-edit", "Update", "2026-11-02T00:00:00Z", map[string]any{
-				"f:metadata": map[string]any{"f:annotations": ownsAnn},
-				"f:spec":     map[string]any{"f:template": map[string]any{}},
-			}),
-			mf("kubectl-annotate", "Update", "2026-11-03T00:00:00Z", map[string]any{
-				"f:metadata": map[string]any{"f:annotations": map[string]any{"f:" + lastApplied: map[string]any{}}},
-			}),
-			mf("technocore", "Update", "2026-11-04T00:00:00Z", map[string]any{"f:spec": map[string]any{"f:replicas": map[string]any{}}}),
-		}
-		f.s.Put(o)
-		return metaOf(t, object(t, f.get(path, tok)))["resourceVersion"].(string)
-	}
-	want := []string{
-		`farcast/Apply {}`,
-		`kubectl-edit/Update {"f:metadata":{"f:annotations":{}},"f:spec":{"f:template":{}}}`,
-		`technocore/Update {"f:spec":{"f:replicas":{}}}`,
-	}
-	got := func(t *testing.T, a answer) []string {
-		t.Helper()
-		var out []string
-		for _, e := range managedFields(t, object(t, a)) {
-			out = append(out, e.Manager+"/"+e.Operation+" "+string(e.FieldsV1))
-		}
-		return out
-	}
-
-	t.Run("the live list kept", func(t *testing.T) {
-		rv := seed(t)
-		a := f.patchJSON(path, tok, migrationOps([]any{migratedEntry(func(e map[string]any) { e["apiVersion"] = "" })}, rv))
-		wantCode(t, a, http.StatusOK)
-		for _, ans := range []answer{a, f.get(path, tok)} {
-			if g := got(t, ans); !slices.Equal(g, want) {
-				t.Errorf("entries = %q\nwant      %q", g, want)
-			}
-		}
-	})
-	t.Run("only the annotation removed", func(t *testing.T) {
-		rv := seed(t)
-		a := f.patchJSON(path, tok, []map[string]any{
-			{"op": "replace", "path": "/metadata/resourceVersion", "value": rv},
-			{"op": "remove", "path": "/metadata/annotations/kubectl.kubernetes.io~1last-applied-configuration"},
-		})
-		wantCode(t, a, http.StatusOK)
-		if g := got(t, a); !slices.Equal(g, want) {
-			t.Errorf("entries = %q\nwant      %q", g, want)
-		}
-	})
-	t.Run("the submitted list, taken", func(t *testing.T) {
-		rv := seed(t)
-		submitted := []any{migratedEntry(func(e map[string]any) {
-			e["fieldsV1"] = map[string]any{"f:metadata": map[string]any{"f:annotations": ownsAnn}, "f:spec": map[string]any{"f:replicas": map[string]any{}}}
-		})}
-		a := f.patchJSON(path, tok, migrationOps(submitted, rv))
-		wantCode(t, a, http.StatusOK)
-		if g, w := got(t, a), []string{`farcast/Apply {"f:metadata":{"f:annotations":{}},"f:spec":{"f:replicas":{}}}`}; !slices.Equal(g, w) {
-			t.Errorf("entries = %q\nwant      %q", g, w)
-		}
-	})
-	t.Run("no annotation removed, nothing stripped", func(t *testing.T) {
-		rv := seed(t)
-		before := managedFields(t, object(t, f.get(path, tok)))
-		a := f.patchJSON(path, tok, []map[string]any{{"op": "replace", "path": "/metadata/resourceVersion", "value": rv}})
-		wantCode(t, a, http.StatusOK)
-		if es := managedFields(t, object(t, a)); !reflect.DeepEqual(es, before) {
-			t.Errorf("entries = %+v, want them unchanged %+v", es, before)
-		}
-	})
-
-	// D-D-5: removing the last annotation removes the annotations map
-	// itself, so its own path, the "." member, leaves every entry too, and an
-	// entry that owned nothing else goes; a key the object no longer had stays,
-	// as it was not among the removed fields.
-	seedLast := func(t *testing.T) string {
-		t.Helper()
-		o := liveCSAObject()
-		md := o["metadata"].(map[string]any)
-		delete(md["annotations"].(map[string]any), "keep")
-		md["managedFields"] = append(md["managedFields"].([]any),
-			mf("farcast", "Apply", "2026-11-01T00:00:00Z", map[string]any{}),
-			mf("kubectl-edit", "Update", "2026-11-02T00:00:00Z", map[string]any{"f:metadata": map[string]any{"f:annotations": ownsAnn}}),
-			mf("kubectl-annotate", "Update", "2026-11-03T00:00:00Z", map[string]any{
-				"f:metadata": map[string]any{"f:annotations": map[string]any{".": map[string]any{}, "f:stale": map[string]any{}}},
-			}),
-		)
-		f.s.Put(o)
-		return metaOf(t, object(t, f.get(path, tok)))["resourceVersion"].(string)
-	}
-	t.Run("the last annotation removed, the live list kept", func(t *testing.T) {
-		rv := seedLast(t)
-		a := f.patchJSON(path, tok, migrationOps([]any{migratedEntry(func(e map[string]any) { e["apiVersion"] = "" })}, rv))
-		wantCode(t, a, http.StatusOK)
-		want := []string{
-			`kubectl-client-side-apply/Update {"f:spec":{"f:replicas":{}}}`,
-			`farcast/Apply {}`,
-			`kubectl-annotate/Update {"f:metadata":{"f:annotations":{"f:stale":{}}}}`,
-		}
-		for _, ans := range []answer{a, f.get(path, tok)} {
-			if _, has := metaOf(t, object(t, ans))["annotations"]; has {
-				t.Error("the object still has an annotations map")
-			}
-			if g := got(t, ans); !slices.Equal(g, want) {
-				t.Errorf("entries = %q\nwant      %q", g, want)
-			}
-		}
-	})
-	t.Run("the last annotation removed, the submitted list taken", func(t *testing.T) {
-		rv := seedLast(t)
-		submitted := []any{migratedEntry(func(e map[string]any) {
-			e["fieldsV1"] = map[string]any{"f:metadata": map[string]any{"f:annotations": ownsAnn}, "f:spec": map[string]any{"f:replicas": map[string]any{}}}
-		})}
-		a := f.patchJSON(path, tok, migrationOps(submitted, rv))
-		wantCode(t, a, http.StatusOK)
-		if g, w := got(t, a), []string{`farcast/Apply {"f:spec":{"f:replicas":{}}}`}; !slices.Equal(g, w) {
-			t.Errorf("entries = %q\nwant      %q", g, w)
-		}
-	})
-}
-
 // TestClientBodiesAreReadByExactKeys (F-F1): the API server decodes what a
 // client sends case-sensitively, so a key spelt in another case is no field:
 // dropped, or under fieldValidation=Strict refused. kubetest reads every
 // client body the same way, so a client whose wire names differ from the API's
 // only in case fails here as it would against a real server.
 func TestClientBodiesAreReadByExactKeys(t *testing.T) {
-	const deployment = "/apis/apps/v1/namespaces/web/deployments/web"
 	const strict, warn = "?fieldManager=farcast&fieldValidation=Strict", "?fieldManager=farcast"
-	patch := func(f *fixture, tok, query string, ops any) answer {
-		b, err := json.Marshal(ops)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return f.send(call{method: http.MethodPatch, path: deployment + query, token: tok, contentType: jsonPatch, body: b})
-	}
-
-	t.Run("a JSON patch operation", func(t *testing.T) {
-		f := newFixture(t)
-		tok := f.mint(f.s.Credential("writer"))
-		f.s.Put(liveCSAObject())
-		live := object(t, f.get(deployment, tok))
-		rv := metaOf(t, live)["resourceVersion"].(string)
-		for name, op := range map[string]map[string]any{
-			"Op":   {"Op": "replace", "path": "/metadata/resourceVersion", "value": rv},
-			"Path": {"op": "replace", "Path": "/metadata/resourceVersion", "value": rv},
-		} {
-			st := wantStatus(t, patch(f, tok, strict, []any{op}), http.StatusUnprocessableEntity, "Invalid")
-			if !strings.Contains(st.Message, `strict decoding error: unknown field "`+name+`"`) {
-				t.Errorf("%s under Strict: message %q", name, st.Message)
-			}
-			// Without strict validation the key is dropped, and the
-			// operation has no op or no path.
-			wantStatus(t, patch(f, tok, warn, []any{op}), http.StatusUnprocessableEntity, "Invalid")
-		}
-		st := wantStatus(t, patch(f, tok, strict, []any{map[string]any{"op": "replace", "path": "/metadata/resourceVersion", "value": rv, "extra": 1}}),
-			http.StatusUnprocessableEntity, "Invalid")
-		if !strings.Contains(st.Message, `unknown field "extra"`) {
-			t.Errorf("an unknown key under Strict: message %q", st.Message)
-		}
-		if now := object(t, f.get(deployment, tok)); !reflect.DeepEqual(now, live) {
-			t.Error("a refused patch changed the object")
-		}
-	})
-
-	t.Run("a managed-fields entry", func(t *testing.T) {
-		f := newFixture(t)
-		tok := f.mint(f.s.Credential("writer"))
-		for _, key := range []string{"Manager", "Operation", "APIVersion", "FieldsV1", "fieldsv1"} {
-			f.s.Put(liveCSAObject())
-			live := object(t, f.get(deployment, tok))
-			rv := metaOf(t, live)["resourceVersion"].(string)
-			e := migratedEntry(nil)
-			lower := map[string]string{"Manager": "manager", "Operation": "operation", "APIVersion": "apiVersion", "FieldsV1": "fieldsV1", "fieldsv1": "fieldsV1"}[key]
-			e[key] = e[lower]
-			delete(e, lower)
-			st := wantStatus(t, f.patchJSON(deployment, tok, migrationOps([]any{e}, rv)), http.StatusUnprocessableEntity, "Invalid")
-			if !strings.Contains(st.Message, `strict decoding error: unknown field "metadata.managedFields[0].`+key+`"`) {
-				t.Errorf("%s under Strict: message %q", key, st.Message)
-			}
-			if now := object(t, f.get(deployment, tok)); !reflect.DeepEqual(now, live) {
-				t.Errorf("%s: a refused patch changed the object", key)
-			}
-		}
-		// Without strict validation the key is dropped: "Manager" is no
-		// manager, and "Operation" leaves the entry undecodable, so the
-		// live list is kept.
-		f.s.Put(liveCSAObject())
-		rv := metaOf(t, object(t, f.get(deployment, tok)))["resourceVersion"].(string)
-		e := migratedEntry(nil)
-		e["Operation"] = e["operation"]
-		delete(e, "operation")
-		a := patch(f, tok, warn, migrationOps([]any{e}, rv))
-		wantCode(t, a, http.StatusOK)
-		if es := managedFields(t, object(t, a)); len(es) != 1 || es[0].Manager != "kubectl-client-side-apply" {
-			t.Errorf("an entry whose operation is spelt Operation was taken: %+v", es)
-		}
-	})
 
 	t.Run("a ConfigMap write", func(t *testing.T) {
 		f := newFixture(t)
@@ -2922,7 +2447,9 @@ func TestFailInjectsEachAnswerOnce(t *testing.T) {
 }
 
 // TestEverythingElseIs405AndRecorded: what the emulation does not cover is
-// 405, as a Status, and still recorded.
+// 405, as a Status, and still recorded. A JSON patch is among it since ADR
+// 0023 M2.9a, which removed the migration that sent one (design §37, A37-7,
+// mutation row 201).
 func TestEverythingElseIs405AndRecorded(t *testing.T) {
 	f := newFixture(t)
 	tok := f.mint(f.s.Credential("writer"))
@@ -2932,6 +2459,7 @@ func TestEverythingElseIs405AndRecorded(t *testing.T) {
 		{method: http.MethodPut, path: "/api/v1/namespaces/web/secrets/s", contentType: "application/json", body: []byte(`{}`)},
 		{method: http.MethodPatch, path: "/apis/apps/v1/namespaces/web/deployments/web", contentType: "application/merge-patch+json", body: []byte(`{}`)},
 		{method: http.MethodPatch, path: "/apis/apps/v1/namespaces/web/deployments/web", contentType: "application/strategic-merge-patch+json", body: []byte(`{}`)},
+		{method: http.MethodPatch, path: "/apis/apps/v1/namespaces/web/deployments/web?fieldManager=farcast&fieldValidation=Strict", contentType: jsonPatch, body: []byte(`[]`)},
 		{method: http.MethodPatch, path: "/apis/apps/v1/namespaces/web/deployments/web/scale" + applyQuery, contentType: applyType, body: []byte(`{}`)},
 		{method: http.MethodGet, path: "/apis/apps/v1/namespaces/web/deployments/web/status"},
 		{method: http.MethodGet, path: "/version"},

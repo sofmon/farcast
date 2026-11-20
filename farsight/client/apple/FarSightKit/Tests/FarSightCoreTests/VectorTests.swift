@@ -490,7 +490,7 @@ struct VectorTests {
         #expect(listing.stamp == CLIStamp(version: "v0.0.0-vector", commit: "0e54eb1"))
         #expect(listing.instances.map(\.name) == ["atlas", "broken", "empty", "lab"])
         let atlas = listing.instances[0], broken = listing.instances[1], blank = listing.instances[2], lab = listing.instances[3]
-        #expect(atlas.reader == .granted && atlas.migrated == true)
+        #expect(atlas.reader == .granted)
         #expect(atlas.status == .running && atlas.cloudLogging == .systemOnly)
         #expect(atlas.components == [.boundary: true, .kernel: true, .storage: true])
         #expect(atlas.components[.monitor] == nil)
@@ -499,10 +499,10 @@ struct VectorTests {
             #expect(unreadable.problem?.section == .record)
             #expect(unreadable.problem?.kind == .recordUnreadable)
             #expect(unreadable.status == .unknown && unreadable.components.isEmpty)
-            #expect(unreadable.reader == nil && unreadable.migrated == nil)
+            #expect(unreadable.reader == nil)
         }
         #expect(lab.status == .provisioning && lab.cloudLogging == .unverified)
-        #expect(lab.reader == ReaderState.none && lab.migrated == false)
+        #expect(lab.reader == ReaderState.none)
         #expect(lab.components == [.boundary: false, .monitor: false, .kernel: false, .storage: false])
         #expect(lab.recordedLimitCents == 1250)
     }
@@ -516,8 +516,8 @@ struct VectorTests {
     func everyErrorKindMaps() throws {
         struct Kinds: Decodable { let kinds: [String] }
         let wire = try JSONDecoder().decode(Kinds.self, from: try Vectors.data("kinds/kinds.json")).kinds
-        #expect(wire.count == 21)
-        #expect(!wire.contains { ["kubectl_missing", "kubectl_failed", "gcloud_mismatch", "gcloud_signed_out", "auth_tool_missing"].contains($0) })
+        #expect(wire.count == 20)
+        #expect(!wire.contains { ["kubectl_missing", "kubectl_failed", "gcloud_mismatch", "gcloud_signed_out", "auth_tool_missing", "not_migrated"].contains($0) })
         let mapped = wire.map(CLIDocuments.kind)
         #expect(!mapped.contains(.unknown))
         #expect(Set(mapped) == Set(SectionProblem.Kind.allCases).subtracting([.unknown]))

@@ -264,11 +264,6 @@ func (c *readerGrantCommand) Run(ctx context.Context, env *Env, args []string) e
 	if err != nil {
 		return err
 	}
-	// The grant applies RBAC, so an instance not migrated to server-side
-	// apply is refused before anything is rendered (design A30-20).
-	if err := refuseUnmigrated(name, meta); err != nil {
-		return err
-	}
 	p, b, err := c.plan(ctx, env, meta)
 	if err != nil {
 		return err
@@ -308,7 +303,6 @@ func (c *readerGrantCommand) Run(ctx context.Context, env *Env, args []string) e
 	if err != nil {
 		return err
 	}
-	defer afterWrites(env, name, applier)
 	// --confirm is the consent: the operator read the plan this one is.
 	if mode == consentNone {
 		ok, err := newPrompter(env.In, env.Err).yesNo(fmt.Sprintf(msgReaderGrantPrompt,

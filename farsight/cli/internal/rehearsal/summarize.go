@@ -204,14 +204,14 @@ func Summarize(r io.Reader, w io.Writer) error {
 // The closed sets, as farsight/cli/README.md fixes them.
 var (
 	sectionNames = []string{"spend", "apps", "policy", "network", "seal"}
-	// errorKinds are the 21 of ADR 0023 M2.4, in the README's order. The
-	// five the gcloud identity's kubectl reads had are retired, and read as
-	// "other".
+	// errorKinds are the 20 since ADR 0023 M2.9a, in the README's order.
+	// The six retired (M2.4's five, which the gcloud identity's kubectl reads
+	// had, and M2.9a's not_migrated) read as "other".
 	errorKinds = []string{
 		"record_unreadable", "not_found", "not_connected", "tunnel_unreachable", "kernel_absent", "not_checkpointed",
 		"version_skew", "credential_missing", "credential_refused", "unsafe_environment", "endpoint_refused",
 		"cluster_unreachable", "unauthorized", "forbidden", "cluster_rejected", "document_unreadable",
-		"rollout_stalled", "not_migrated", "plan_changed", "timeout", "internal",
+		"rollout_stalled", "plan_changed", "timeout", "internal",
 	}
 	statuses      = []string{"provisioning", "running", "unreachable", "deleting", "error"}
 	cloudLoggings = []string{"system_only", "unverified", "unknown"}

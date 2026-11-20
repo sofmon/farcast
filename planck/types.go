@@ -69,8 +69,8 @@ type Cluster struct {
 	// that call. It is false when the provider found a cluster already under
 	// the name and returned it, which another machine may have created and
 	// written to. Its zero value fails closed: a caller treats a cluster as
-	// new only on the provider's word (farcast install records a cluster as
-	// written with server-side apply only when it is set; ADR 0023 M2.7).
+	// new only on the provider's word (farcast install warns when it is not
+	// set; ADR 0023 M2.7, M2.9a).
 	Created bool
 }
 

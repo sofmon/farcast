@@ -165,7 +165,7 @@ struct RenderHarness {
     static func feedWorld(_ name: String, read: FakeReader.Answer, then next: FakeReader.Answer? = nil) async throws -> World {
         let listing = InstanceListing(
             name: name, status: .running, cloudLogging: .systemOnly, recordedLimitCents: 5000,
-            components: [.kernel: true, .monitor: true, .boundary: true, .storage: true], reader: .granted, migrated: true
+            components: [.kernel: true, .monitor: true, .boundary: true, .storage: true], reader: .granted
         )
         let reader = FakeReader(listing: [listing], worlds: [name: read])
         let feed = WorldFeed(reader: reader)

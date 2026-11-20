@@ -30,13 +30,12 @@ var errNeverWrites = errors.New("cluster: a reader client never writes")
 // before the client is built, with nothing sent.
 //
 // Either identity answers every read, CanI and NamespaceUID in-process. A
-// reader refuses Apply, CreateConfigMap, ReplaceConfigMap,
-// PatchManagedFields and DeleteSecret before anything is sent; since ADR
-// 0023 M2.4 it is how 'world', 'ps', 'costs', 'usage' and 'logs' read the
-// cluster. A writer applies, creates and replaces a ConfigMap (the storage
-// key pin), patches managed fields (migrate), and deletes a Secret on its
-// uid (git-credential rm, M2.8), all of it as cfg's credential, the
-// instance's stored installer key.
+// reader refuses Apply, ApplyAt, CreateConfigMap, ReplaceConfigMap and
+// DeleteSecret before anything is sent; since ADR 0023 M2.4 it is how
+// 'world', 'ps', 'costs', 'usage' and 'logs' read the cluster. A writer
+// applies, creates and replaces a ConfigMap (the storage key pin), and
+// deletes a Secret on its uid (git-credential rm, M2.8), all of it as cfg's
+// credential, the instance's stored installer key.
 //
 // warnings receives each distinct API Warning header text, once, as
 // "Warning (cluster): <text>\n", after the call whose answer carried it, and
@@ -83,65 +82,29 @@ func (c *Client) NamespaceUID(ctx context.Context, name string) (string, error) 
 }
 
 // lastAppliedAnnotation is kubectl's client-side apply's annotation: on an
-// object an older farcast applied with kubectl, a copy of every field it
-// applied, a Secret's values included.
+// object anyone applied with kubectl, a copy of every field it applied, a
+// Secret's values included.
 const lastAppliedAnnotation = "kubectl.kubernetes.io/last-applied-configuration"
 
 // blankLastApplied keeps the last-applied annotation's key on o and empties
-// its value, so nothing a caller prints or binds can carry it (ADR 0023
-// §6.4). Every reader of the annotation tests its key alone:
-// kube.ClientSideTrace, kube.MigrationPatch and kube.MigratedEndState.
+// its value (ADR 0023 §6.4). No caller reads the annotation. A Secret anyone
+// applied with kubectl carries its data in that value, and the blank keeps
+// it out of what a caller prints or binds.
 func blankLastApplied(o *kube.Object) {
 	if _, ok := o.Metadata.Annotations[lastAppliedAnnotation]; ok {
 		o.Metadata.Annotations[lastAppliedAnnotation] = ""
 	}
 }
 
-// ListMeta lists one kind's objects, metadata only: kube.Client.ListObjects,
-// k.ListPath(namespace) with the label selector, "" being every namespace,
-// paged (ADR 0023 §2.3). It is for migrate's discovery (§6.2). A Secret's
-// data and stringData are never decoded. Its last-applied annotation, which
-// on a Secret kubectl applied holds a copy of them, is decoded into memory
-// with the metadata; each object is returned with that annotation's key and
-// an empty value (blankLastApplied).
-func (c *Client) ListMeta(ctx context.Context, k kube.Kind, namespace, selector string) ([]kube.Object, error) {
-	objs, err := c.kube.ListObjects(ctx, k, namespace, selector)
-	c.flushWarnings()
-	if err != nil {
-		return nil, err
-	}
-	for i := range objs {
-		blankLastApplied(&objs[i])
-	}
-	return objs, nil
-}
-
 // GetMeta reads one object's metadata: kube.Client.GetObject (ADR 0023
-// §2.3), for migrate's re-read before and after each rewrite (§6.4), and
-// git-credential's Secret read (§9.8). As with ListMeta, a Secret's data and
-// stringData are never decoded, and the last-applied annotation is returned
-// with its key and an empty value.
+// §2.3), for the plans' and the grants' reads of the two ServiceAccounts'
+// uids (design §33, A33-18) and git-credential's Secret read (§9.8). A
+// Secret's data and stringData are never decoded. Its last-applied
+// annotation, which on a Secret kubectl applied holds a copy of them, is
+// decoded into memory with the metadata, and returned with its key and an
+// empty value (blankLastApplied).
 func (c *Client) GetMeta(ctx context.Context, k kube.Kind, namespace, name string) (kube.Object, error) {
 	o, err := c.kube.GetObject(ctx, k, namespace, name)
-	c.flushWarnings()
-	if err != nil {
-		return kube.Object{}, err
-	}
-	blankLastApplied(&o)
-	return o, nil
-}
-
-// PatchManagedFields sends migrate's one write, a JSON patch of an object's
-// managed fields and its last-applied annotation (ADR 0023 §6.3):
-// kube.Client.PatchJSON, as fieldManager farcast, its answer metadata only,
-// with the last-applied annotation's value emptied as GetMeta empties it. A
-// reader client refuses it before anything is sent, a token included. It is
-// never retried here: migrate's loop retries a 409 (A30-23).
-func (c *Client) PatchManagedFields(ctx context.Context, k kube.Kind, namespace, name string, patch []byte) (kube.Object, error) {
-	if err := c.neverWrites(); err != nil {
-		return kube.Object{}, err
-	}
-	o, err := c.kube.PatchJSON(ctx, k, namespace, name, patch)
 	c.flushWarnings()
 	if err != nil {
 		return kube.Object{}, err
@@ -558,14 +521,14 @@ func unreadableRequest(namespace, name, container, resource, value string) error
 	return &unreadable{msg: fmt.Sprintf("cluster: the Deployment %s/%s's container %q requests %s %q, which farcast cannot read as a quantity", namespace, name, container, resource, value)}
 }
 
-// lastAppliedAt is the newest time among the entries that record an apply of
-// the object by farcast (kube.IsLastApply), zero when there is none. An entry
-// whose time does not parse is passed over: it can only make the last apply
-// read older, and an older apply never gates anything.
+// lastAppliedAt is the newest time among the entries that record farcast's
+// own Apply of the object (kube.IsOwnApply), zero when there is none. An
+// entry whose time does not parse is passed over: it can only make the last
+// apply read older, and an older apply never gates anything.
 func lastAppliedAt(entries []kube.ManagedFieldsEntry) time.Time {
 	var newest time.Time
 	for _, e := range entries {
-		if !kube.IsLastApply(e) {
+		if !kube.IsOwnApply(e) {
 			continue
 		}
 		at, err := time.Parse(time.RFC3339, e.Time)

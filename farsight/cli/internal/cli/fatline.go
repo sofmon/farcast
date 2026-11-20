@@ -95,12 +95,9 @@ func openReader(r clusterRef) (*cluster.Client, error) {
 }
 
 // The cluster client is what every writing seam opens by default, so the
-// checks that find a method by its interface (afterWrites' tracer, the pin
-// store) never silently stop finding it.
-var (
-	_ tracer   = (*cluster.Client)(nil)
-	_ pinStore = (*cluster.Client)(nil)
-)
+// check that finds a method by its interface (the pin store) never silently
+// stops finding it.
+var _ pinStore = (*cluster.Client)(nil)
 
 // msgPinWriterOnly is pinStoreFor's refusal of a ref that is not the
 // writer's (ADR 0023 M2.6, A23-20).

@@ -48,10 +48,6 @@ public struct InstanceListing: Sendable, Equatable, Identifiable {
     /// farcast did not say. `farcast world` reads no cluster section until
     /// it is `granted`.
     public var reader: ReaderState?
-    /// Whether the instance was last written with server-side apply
-    /// (`farcast instances`' `migrated`); nil when the record could not be
-    /// read. The app runs no command that writes, so nothing draws it.
-    public var migrated: Bool?
 
     public var id: String { name }
 
@@ -87,8 +83,7 @@ public struct InstanceListing: Sendable, Equatable, Identifiable {
         recordedLimitCents: Int? = nil,
         components: [SystemRole: Bool] = [:],
         problem: SectionProblem? = nil,
-        reader: ReaderState? = nil,
-        migrated: Bool? = nil
+        reader: ReaderState? = nil
     ) {
         self.name = name
         self.status = status
@@ -97,7 +92,6 @@ public struct InstanceListing: Sendable, Equatable, Identifiable {
         self.components = components
         self.problem = problem
         self.reader = reader
-        self.migrated = migrated
     }
 }
 

@@ -96,7 +96,6 @@ func TestCanonicalWritesEmptyArraysNotNull(t *testing.T) {
 		run,
 		ApplicationResetFact{Type: TypeApplicationReset},
 		ReaderFact{Type: TypeReader},
-		MigrateFact{Type: TypeMigrate, Objects: []MigrateObject{{Kind: "Deployment"}}},
 		GrantFact{Type: TypeGrant},
 	}}
 	withEmpties := Bound{Protocol: Protocol, Options: []Option{}, Blocked: []Block{}, Facts: []Fact{
@@ -112,8 +111,6 @@ func TestCanonicalWritesEmptyArraysNotNull(t *testing.T) {
 		RunFact{Type: TypeRun, Apps: []RunApp{{Name: "web", External: []RunHost{}}}, OtherDeploymentsKept: []string{}},
 		ApplicationResetFact{Type: TypeApplicationReset},
 		ReaderFact{Type: TypeReader, Namespaces: []string{}, Resources: []string{}, ConfigMaps: []string{}, ServiceAccounts: []string{}},
-		MigrateFact{Type: TypeMigrate, Local: []string{},
-			Objects: []MigrateObject{{Kind: "Deployment", CSAManagers: []string{}, OtherManagers: []string{}}}},
 		GrantFact{Type: TypeGrant, Roles: []string{}},
 	}}
 
@@ -139,7 +136,7 @@ func TestCanonicalWritesEmptyArraysNotNull(t *testing.T) {
 	for _, member := range []string{
 		`"options":[]`, `"blocked":[]`, `"standing":[]`, `"one_off":[]`, `"namespaces":[]`, `"add":[]`,
 		`"metered_after":[]`, `"windows_after":[]`, `"lowering":[]`, `"external":[]`, `"other_deployments_kept":[]`,
-		`"configmaps":[]`, `"local":[]`, `"csa_managers":[]`, `"other_managers":[]`, `"roles":[]`,
+		`"configmaps":[]`, `"roles":[]`,
 	} {
 		if !bytes.Contains(got, []byte(member)) {
 			t.Errorf("Canonical has no %s: %s", member, got)
@@ -244,7 +241,6 @@ func factSamples() map[string]Fact {
 		"ApplicationResetFact": ApplicationResetFact{},
 		"ReaderFact":           ReaderFact{},
 		"NoticeFact":           NoticeFact{},
-		"MigrateFact":          MigrateFact{},
 		"GrantFact":            GrantFact{},
 		"GitCredentialFact":    GitCredentialFact{},
 	}
@@ -335,8 +331,8 @@ func TestFactTypesAreCanonical(t *testing.T) {
 	if declared := factTypesDeclared(t); !reflect.DeepEqual(declared, sampled) {
 		t.Fatalf("the fact types declared are\n  %v\nbut the samples are\n  %v", declared, sampled)
 	}
-	if len(sampled) != 20 {
-		t.Errorf("ADR 0023 M2.8 has 20 fact types, not %d", len(sampled))
+	if len(sampled) != 19 {
+		t.Errorf("ADR 0023 M2.9a has 19 fact types, not %d", len(sampled))
 	}
 
 	seen := map[reflect.Type]bool{}
@@ -388,9 +384,9 @@ func jsonPaths(typ reflect.Type, prefix string) []string {
 }
 
 func TestFactFieldsFollowTheFactTable(t *testing.T) {
-	// §9.4's fact table as A23-33 amends it, with A30-12's migrate fact,
-	// A33-11's grant fact, A33-16's service_accounts and A33-29's
-	// git_credential fact, and §9.3's Bound and Document.
+	// §9.4's fact table as A23-33 amends it, with A33-11's grant fact,
+	// A33-16's service_accounts and A33-29's git_credential fact, and §9.3's
+	// Bound and Document. A30-12's migrate fact went at ADR 0023 M2.9a.
 	want := map[string]string{
 		TypeCost: "type currency period limit_cents " +
 			"standing standing[].what standing[].replicas standing[].cpu_milli standing[].mem_mib standing[].month_cents standing[].max_month_cents " +
@@ -415,10 +411,8 @@ func TestFactFieldsFollowTheFactTable(t *testing.T) {
 		TypeBuild: "type repository ref app containerfile context tag destination",
 		TypeApplicationReset: "type namespace app state stopped_by_cost_guard limit_reached replicas_live replicas_after " +
 			"requests_live requests_live.cpu_milli requests_live.mem_mib requests_after requests_after.cpu_milli requests_after.mem_mib",
-		TypeReader: "type email iam_role scope namespaces resources configmaps service_accounts",
-		TypeNotice: "type text",
-		TypeMigrate: "type objects objects[].api objects[].kind objects[].namespace objects[].name objects[].uid " +
-			"objects[].csa_managers objects[].csa_fields_sha256 objects[].annotation objects[].other_managers local irreversible",
+		TypeReader:        "type email iam_role scope namespaces resources configmaps service_accounts",
+		TypeNotice:        "type text",
 		TypeGrant:         "type name target service_account principal roles state shared_principal shared apply",
 		TypeGitCredential: "type action namespace name",
 	}

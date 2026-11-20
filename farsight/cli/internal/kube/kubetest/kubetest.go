@@ -246,7 +246,7 @@ func WithoutRecording() Option {
 }
 
 // WithSettledWorkloads settles what a write leaves stored (a server-side
-// apply, a POST, a PUT or a JSON patch), as the API server's defaulting and
+// apply, a POST or a PUT), as the API server's defaulting and
 // the cluster's controllers would, so a client that waits on a rollout or an
 // address, or reads a Job's pods, is answered at once:
 //   - a Deployment or StatefulSet gets status.observedGeneration equal to its

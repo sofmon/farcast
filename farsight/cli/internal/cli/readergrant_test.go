@@ -505,7 +505,6 @@ func TestReaderGrantNeedsATerminal(t *testing.T) {
 	dir := readerRecordFor(t, grantName, "proj-test1")
 	if _, err := dir.UpdateInstanceMetadata(grantName, func(m *config.InstanceMetadata) error {
 		m.Reader = &config.Reader{Email: readerEmail(grantName, "proj-test1"), KeyID: readerTestKeyID}
-		recordMigrated(m)
 		return nil
 	}); err != nil {
 		t.Fatal(err)

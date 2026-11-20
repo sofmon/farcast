@@ -3,7 +3,6 @@ package kubetest
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -19,9 +18,7 @@ import (
 )
 
 // mfEntry is meta/v1's ManagedFieldsEntry on the wire, kubetest's own copy.
-// It is used to read and write the store's own entries. An entry a client
-// sends is never decoded into it with encoding/json, which would match its
-// keys in any case: submittedEntries reads it key by key (exactObject).
+// It is used to read and write the store's own entries.
 type mfEntry struct {
 	Manager     string          `json:"manager,omitempty"`
 	Operation   string          `json:"operation,omitempty"`
@@ -33,19 +30,16 @@ type mfEntry struct {
 }
 
 const (
-	operationApply  = "Apply"
-	operationUpdate = "Update"
-	fieldsTypeV1    = "FieldsV1"
+	operationApply = "Apply"
+	fieldsTypeV1   = "FieldsV1"
 )
 
 // The wire names of the fields of the bodies kubetest checks under strict
-// field validation, case and all: meta/v1's ManagedFieldsEntry and ObjectMeta
-// (k8s.io/apimachinery v0.37.2 pkg/apis/meta/v1/types.go), core/v1's
-// ConfigMap (k8s.io/api v0.37.2 core/v1/types.go), and the JSON patch
-// operation the API server decodes a patch into (k8s.io/apiserver v0.37.2
-// pkg/endpoints/handlers/patch.go, jsonPatchOp). DeleteOptions and a
-// SelfSubjectAccessReview are read by their exact keys too, but never under
-// strict validation, so an unknown key in them is only dropped.
+// field validation, case and all: meta/v1's ObjectMeta (k8s.io/apimachinery
+// v0.37.2 pkg/apis/meta/v1/types.go) and core/v1's ConfigMap (k8s.io/api
+// v0.37.2 core/v1/types.go). DeleteOptions and a SelfSubjectAccessReview are
+// read by their exact keys too, but never under strict validation, so an
+// unknown key in them is only dropped.
 //
 // The API server decodes every request body case-sensitively: an unknown key,
 // one that differs from a field's name only in case included, is dropped, or
@@ -57,10 +51,8 @@ const (
 // server deletes without the precondition. kubetest therefore reads what a
 // client sends as maps whose keys must match exactly.
 var (
-	managedFieldsEntryFields = []string{"manager", "operation", "apiVersion", "time", "fieldsType", "fieldsV1", "subresource"}
-	jsonPatchOpFields        = []string{"op", "path", "from", "value"}
-	configMapFields          = []string{"apiVersion", "kind", "metadata", "immutable", "data", "binaryData"}
-	objectMetaFields         = []string{
+	configMapFields  = []string{"apiVersion", "kind", "metadata", "immutable", "data", "binaryData"}
+	objectMetaFields = []string{
 		"name", "generateName", "namespace", "selfLink", "uid", "resourceVersion", "generation",
 		"creationTimestamp", "deletionTimestamp", "deletionGracePeriodSeconds", "labels", "annotations",
 		"ownerReferences", "finalizers", "managedFields",
@@ -178,169 +170,6 @@ func sortEntries(es []mfEntry) {
 	})
 }
 
-// managerIdentifier is the key the API server decodes entries under: an
-// entry's manager, operation, subresource and, for Update only, apiVersion.
-// Two entries with one identifier collapse into the later one. A port of
-// k8s.io/apimachinery v0.37.2 managedfields.go (BuildManagerIdentifier).
-func managerIdentifier(e mfEntry) string {
-	id := mfEntry{Manager: e.Manager, Operation: e.Operation, APIVersion: e.APIVersion, Subresource: e.Subresource}
-	if e.Operation == operationApply {
-		id.APIVersion = ""
-	}
-	return string(mustMarshal(id))
-}
-
-// decodable is the API server's check of a submitted managed-fields list: a
-// port of k8s.io/apimachinery v0.37.2 managedfields.go (DecodeManagedFields).
-// Every entry's operation is Apply or Update, its apiVersion is not empty,
-// its fieldsType is FieldsV1, and its fieldsV1, when present, parses.
-func decodable(es []mfEntry) bool {
-	for _, e := range es {
-		if e.Operation != operationApply && e.Operation != operationUpdate {
-			return false
-		}
-		if e.APIVersion == "" || e.FieldsType != fieldsTypeV1 {
-			return false
-		}
-		if f := bytes.TrimSpace(e.FieldsV1); len(f) > 0 && !bytes.Equal(f, []byte("null")) && !validFieldsV1(f) {
-			return false
-		}
-	}
-	return true
-}
-
-// validFieldsV1 reports whether f parses as a FieldsV1 trie: every node a
-// JSON object; "." marking membership, as {}; every other key a path element,
-// f:<name>, k:<JSON object>, v:<JSON value> or i:<integer>. The node rules are
-// kube's (fields.go); the element rules are structured-merge-diff's
-// fieldpath element encoding, from memory and not fetched.
-func validFieldsV1(f []byte) bool {
-	var node map[string]json.RawMessage
-	if err := json.Unmarshal(f, &node); err != nil || node == nil {
-		return false
-	}
-	for k, v := range node {
-		if k == "." {
-			var self map[string]json.RawMessage
-			if err := json.Unmarshal(v, &self); err != nil || self == nil || len(self) != 0 {
-				return false
-			}
-			continue
-		}
-		prefix, rest, ok := strings.Cut(k, ":")
-		if !ok {
-			return false
-		}
-		switch prefix {
-		case "f":
-		case "k":
-			var key map[string]json.RawMessage
-			if err := json.Unmarshal([]byte(rest), &key); err != nil || key == nil {
-				return false
-			}
-		case "v":
-			if !json.Valid([]byte(rest)) {
-				return false
-			}
-		case "i":
-			if _, err := strconv.Atoi(rest); err != nil {
-				return false
-			}
-		default:
-			return false
-		}
-		if !validFieldsV1(v) {
-			return false
-		}
-	}
-	return true
-}
-
-// errReset is a submitted managed-fields list the API server reads as a
-// reset, which kubetest does not emulate.
-var errReset = errors.New("a managedFields of [] or [{}] resets the field on a real API server, which kubetest does not emulate")
-
-// submittedEntries reads the value of a JSON patch's managedFields replace as
-// the API server's field manager reads it (k8s.io/apimachinery v0.37.2
-// pkg/util/managedfields/internal/fieldmanager.go, decodeLiveOrNew): a list
-// that does not decode, or decodes to nothing, keeps the live list, silently
-// ("If the managed field is empty or we failed to decode it, let's try the
-// live object"), and the patch's other operations still apply. keep reports
-// that. An error is a value the object itself cannot hold: not a list, an
-// entry that is not an entry, a time that is not a time, and, under strict
-// field validation, a key that is not exactly one of an entry's fields.
-//
-// Each entry is read key by key, exactly: a key in another case is no field.
-// Under strict validation it is refused, as the API server refuses the
-// patched object (k8s.io/apiserver v0.37.2 pkg/endpoints/handlers/patch.go,
-// applyPatchToCurrentObject: a strict decoding error is 422 Invalid); without
-// it, it is dropped, and the entry is read without it.
-func submittedEntries(value json.RawMessage, strict bool) (es []mfEntry, keep bool, err error) {
-	if value == nil {
-		return nil, false, errors.New("a replace needs a value")
-	}
-	if isNull(value) {
-		return nil, true, nil
-	}
-	var raw []json.RawMessage
-	if err := json.Unmarshal(value, &raw); err != nil {
-		return nil, false, errors.New("metadata.managedFields is not a list")
-	}
-	es = make([]mfEntry, len(raw))
-	for i, r := range raw {
-		m, err := exactObject(r)
-		if err != nil {
-			return nil, false, fmt.Errorf("metadata.managedFields[%d] is not a managed-fields entry", i)
-		}
-		if strict {
-			if f := unknownField(keysOf(m), fmt.Sprintf("metadata.managedFields[%d].", i), managedFieldsEntryFields); f != "" {
-				return nil, false, strictDecodingError(f)
-			}
-		}
-		e := &es[i]
-		for _, field := range []struct {
-			name string
-			dst  *string
-		}{
-			{"manager", &e.Manager}, {"operation", &e.Operation}, {"apiVersion", &e.APIVersion},
-			{"time", &e.Time}, {"fieldsType", &e.FieldsType}, {"subresource", &e.Subresource},
-		} {
-			if *field.dst, err = stringValue(m[field.name]); err != nil {
-				return nil, false, fmt.Errorf("metadata.managedFields[%d] is not a managed-fields entry", i)
-			}
-		}
-		if f, ok := m["fieldsV1"]; ok {
-			e.FieldsV1 = slices.Clone(f)
-		}
-		if es[i].Time != "" {
-			if _, err := time.Parse(time.RFC3339, es[i].Time); err != nil {
-				return nil, false, fmt.Errorf("metadata.managedFields[%d].time is not an RFC 3339 time", i)
-			}
-		}
-	}
-	// isResetManagedFields, in the same file.
-	if len(es) == 0 || (len(es) == 1 && reflect.DeepEqual(es[0], mfEntry{})) {
-		return nil, false, errReset
-	}
-	if !decodable(es) {
-		return nil, true, nil
-	}
-	// Decoded into a map by identifier, then encoded sorted.
-	byID := map[string]int{}
-	var out []mfEntry
-	for _, e := range es {
-		id := managerIdentifier(e)
-		if i, ok := byID[id]; ok {
-			out[i] = e
-			continue
-		}
-		byID[id] = len(out)
-		out = append(out, e)
-	}
-	sortEntries(out)
-	return out, false, nil
-}
-
 // decodeYAMLObject reads an apply body with go-yaml, as one mapping, and
 // returns it in the store's JSON form.
 func decodeYAMLObject(body []byte) (map[string]any, error) {
@@ -396,7 +225,7 @@ func invalid(w http.ResponseWriter, k kube.Kind, name, format string, a ...any) 
 // answers 409 Conflict and stores nothing, and the stored one applies. For an
 // absent object it is no precondition: the object is created, answered 201,
 // as the server recreates a deleted one. An empty or null one is none at all,
-// and one that is not a string answers 422, as the JSON patch's does.
+// and one that is not a string answers 422.
 //
 // A gap, kept on purpose: kubetest rebuilds an applied object from the body.
 // From the stored one it keeps only uid, creationTimestamp, resourceVersion,
@@ -405,9 +234,7 @@ func invalid(w http.ResponseWriter, k kube.Kind, name, format string, a ...any) 
 // keeps every field another manager owns (kubectl's last-applied annotation,
 // the kernel's adapted-at annotation). It also keeps replicas set through
 // /scale, which no manager owns after a /scale of 0, against an apply that
-// omits it; an apply that carries it takes it back. So an apply's answer here
-// never carries the annotation of an earlier client-side apply, and a test
-// that needs one answers the apply through WithHandler.
+// omits it; an apply that carries it takes it back.
 func (s *Server) apply(w http.ResponseWriter, r *http.Request, req Request, ri requestInfo, k kube.Kind, caller tokenInfo, az *authorizer) {
 	partial, err := wantPartial(r.Header.Get("Accept"), false)
 	if err != nil {
@@ -676,255 +503,6 @@ func childMap(m map[string]any, key string) map[string]any {
 		m[key] = c
 	}
 	return c
-}
-
-// patchOp is one RFC 6902 operation, as readPatch reads it.
-type patchOp struct {
-	Op    string
-	Path  string
-	Value json.RawMessage // nil when the operation has no "value"
-}
-
-// readPatch reads a JSON patch's operations key by key, exactly. An
-// operation whose "op" or "path" is spelt in another case has none, and is
-// answered as an operation kubetest does not emulate (422), as the API
-// server's patch library finds no operation there (evanphx/json-patch reads
-// op["op"] and op["path"] from a map). Under strict field validation any key
-// that is not op, path, from or value is refused with 422, as the API server
-// refuses the strict errors of decoding the patch (k8s.io/apiserver v0.37.2
-// pkg/endpoints/handlers/patch.go, applyJSPatch then
-// applyPatchToCurrentObject).
-func readPatch(body []byte, strict bool) (ops []patchOp, badRequest bool, err error) {
-	var raw []json.RawMessage
-	if err := json.Unmarshal(body, &raw); err != nil {
-		return nil, true, errors.New("the body is not a JSON patch (RFC 6902)")
-	}
-	ops = make([]patchOp, len(raw))
-	for i, r := range raw {
-		m, err := exactObject(r)
-		if err != nil {
-			return nil, true, errors.New("the body is not a JSON patch (RFC 6902)")
-		}
-		if strict {
-			if f := unknownField(keysOf(m), "", jsonPatchOpFields); f != "" {
-				return nil, false, fmt.Errorf("operation %d: json patch %w", i, strictDecodingError(f))
-			}
-		}
-		op, err1 := stringValue(m["op"])
-		path, err2 := stringValue(m["path"])
-		if err1 != nil || err2 != nil {
-			return nil, true, errors.New("the body is not a JSON patch (RFC 6902)")
-		}
-		ops[i] = patchOp{Op: op, Path: path, Value: m["value"]}
-	}
-	return ops, false, nil
-}
-
-const annotationsPointer = "/metadata/annotations/"
-
-// jsonPatch is the migration's PATCH with Content-Type
-// application/json-patch+json. It supports replace on /metadata/managedFields
-// and /metadata/resourceVersion, and remove on one annotation; anything else
-// answers 422. The operations apply in order and all or nothing. A
-// resourceVersion that is not current answers 409 Conflict, as etcd's
-// precondition does (csaupgrade's guard, client-go v0.37.2
-// util/csaupgrade/upgrade.go). A managedFields list is read as
-// submittedEntries reads it, so an undecodable one keeps the live list while
-// the other operations still apply.
-//
-// The operations and the managed-fields entries are read with their keys
-// exactly as sent (readPatch, submittedEntries); under fieldValidation=Strict
-// a key that names no field is 422.
-//
-// When the patch removes an annotation, its path leaves the fieldsV1 of
-// every entry the object keeps, the live list kept silently included, and an
-// entry left with no field at all goes: the API server's field manager
-// subtracts the fields an update removed from every manager, and drops a
-// manager with none left (sigs.k8s.io/structured-merge-diff v6.3.1
-// merge/update.go, Updater.update). When it removes the last annotation, the
-// annotations map itself is gone from the object (ObjectMeta.Annotations is
-// omitempty), so its own path, .metadata.annotations, is removed too
-// (typed/compare.go, compare) and leaves every entry the same way. An entry
-// with no fields before the patch is kept, because kubetest's own apply
-// entries own none.
-//
-// The real API server also records the patch itself as an Update by its
-// field manager; whether that leaves a farcast/Update entry is open (§6.3),
-// and kubetest records none.
-//
-// It answers 200 with the object, or its metadata alone as a
-// PartialObjectMetadata when Accept asks for that, as a GET's answer is.
-// WithSettledWorkloads settles what it stores.
-func (s *Server) jsonPatch(w http.ResponseWriter, r *http.Request, req Request, ri requestInfo, k kube.Kind) {
-	partial, err := wantPartial(r.Header.Get("Accept"), false)
-	if err != nil {
-		writeStatus(w, http.StatusNotAcceptable, "", err.Error(), nil)
-		return
-	}
-	q := r.URL.Query()
-	if q.Has("dryRun") {
-		badRequest(w, "kubetest does not emulate dryRun")
-		return
-	}
-	strict := q.Get("fieldValidation") == "Strict"
-	ops, bad, err := readPatch(req.Body, strict)
-	switch {
-	case err != nil && bad:
-		badRequest(w, "%v", err)
-		return
-	case err != nil:
-		invalid(w, k, ri.name, "%v", err)
-		return
-	}
-	path := k.Path(ri.namespace, ri.name)
-	s.mu.Lock()
-	old := s.objects[path]
-	if old == nil {
-		s.mu.Unlock()
-		notFound(w, k, ri.name)
-		return
-	}
-	next := cloneObject(old.obj)
-	md := metadataOf(next)
-	var removed []string // the annotations this patch removes
-	for i, op := range ops {
-		switch {
-		case op.Op == "replace" && op.Path == "/metadata/managedFields":
-			es, keep, err := submittedEntries(op.Value, strict)
-			if err != nil {
-				s.mu.Unlock()
-				invalid(w, k, ri.name, "operation %d: %v", i, err)
-				return
-			}
-			if !keep {
-				setEntries(md, es)
-			}
-		case op.Op == "replace" && op.Path == "/metadata/resourceVersion":
-			var rv string
-			if err := json.Unmarshal(op.Value, &rv); err != nil {
-				s.mu.Unlock()
-				invalid(w, k, ri.name, "operation %d: metadata.resourceVersion is not a string", i)
-				return
-			}
-			if rv != str(md, "resourceVersion") {
-				s.mu.Unlock()
-				conflict(w, k, ri.name)
-				return
-			}
-		case op.Op == "remove" && strings.HasPrefix(op.Path, annotationsPointer) &&
-			!strings.Contains(strings.TrimPrefix(op.Path, annotationsPointer), "/"):
-			key := strings.NewReplacer("~1", "/", "~0", "~").Replace(strings.TrimPrefix(op.Path, annotationsPointer))
-			ann, _ := md["annotations"].(map[string]any)
-			if _, ok := ann[key]; !ok {
-				s.mu.Unlock()
-				invalid(w, k, ri.name, "operation %d: jsonpatch remove operation does not apply: doc is missing path: %s", i, op.Path)
-				return
-			}
-			delete(ann, key)
-			if len(ann) == 0 {
-				delete(md, "annotations")
-			}
-			removed = append(removed, key)
-		default:
-			s.mu.Unlock()
-			invalid(w, k, ri.name, "operation %d (%s %s): kubetest emulates only replace of /metadata/managedFields and /metadata/resourceVersion, and remove of one annotation", i, op.Op, op.Path)
-			return
-		}
-	}
-	if len(removed) > 0 {
-		_, kept := md["annotations"]
-		if es, err := entriesOf(md); err == nil {
-			if stripped, changed := stripAnnotations(es, removed, !kept); changed {
-				setEntries(md, stripped)
-			}
-		}
-	}
-	s.settle(next, k)
-	if !reflect.DeepEqual(old.obj, next) {
-		md["resourceVersion"] = s.nextRV()
-		old.obj = next
-	}
-	body := answerBody(next, partial)
-	s.mu.Unlock()
-	writeRaw(w, http.StatusOK, "application/json", body)
-}
-
-// stripAnnotations is the field manager's subtraction for removed
-// annotations: each key's path, f:metadata.f:annotations.f:<key>, leaves every
-// entry's fieldsV1 (kube.RemoveField's rule), and, when gone, so does the
-// annotations map's own path (dropAnnotationsMember); an entry that held one
-// and is left with no field goes. It reports whether any entry changed.
-func stripAnnotations(es []mfEntry, keys []string, gone bool) ([]mfEntry, bool) {
-	var out []mfEntry
-	changed := false
-	for _, e := range es {
-		f := e.FieldsV1
-		if len(bytes.TrimSpace(f)) == 0 || isNull(f) {
-			out = append(out, e)
-			continue
-		}
-		for _, key := range keys {
-			next, err := kube.RemoveField(f, "f:metadata", "f:annotations", "f:"+key)
-			if err != nil {
-				break // fields kubetest cannot read are kept as they are
-			}
-			f = next
-		}
-		if gone {
-			if next, err := dropAnnotationsMember(f); err == nil {
-				f = next
-			}
-		}
-		if bytes.Equal(f, e.FieldsV1) {
-			out = append(out, e)
-			continue
-		}
-		changed = true
-		if bytes.Equal(f, []byte("{}")) {
-			continue // the annotation was all it held
-		}
-		e.FieldsV1 = f
-		out = append(out, e)
-	}
-	return out, changed
-}
-
-// dropAnnotationsMember takes the path .metadata.annotations itself out of a
-// FieldsV1 set, as fieldpath.Set's Difference does: the "." member of
-// f:metadata.f:annotations goes, the node goes once nothing is left under it,
-// and f:metadata goes once it is empty. A key still under f:annotations, one
-// the object no longer had, is kept, as it was not among the removed fields.
-// A set that does not hold the path is returned as it was, byte for byte.
-func dropAnnotationsMember(f json.RawMessage) (json.RawMessage, error) {
-	var root map[string]json.RawMessage
-	if err := json.Unmarshal(f, &root); err != nil {
-		return nil, err
-	}
-	// No f:metadata object, or no f:annotations object in it: nothing to
-	// take out.
-	var md, ann map[string]json.RawMessage
-	if json.Unmarshal(root["f:metadata"], &md) != nil || md == nil {
-		return f, nil
-	}
-	if json.Unmarshal(md["f:annotations"], &ann) != nil || ann == nil {
-		return f, nil
-	}
-	// {} alone is the member itself; otherwise "." marks it.
-	if _, member := ann["."]; !member && len(ann) != 0 {
-		return f, nil
-	}
-	delete(ann, ".")
-	if len(ann) == 0 {
-		delete(md, "f:annotations")
-	} else {
-		md["f:annotations"] = mustMarshal(ann)
-	}
-	if len(md) == 0 {
-		delete(root, "f:metadata")
-	} else {
-		root["f:metadata"] = mustMarshal(md)
-	}
-	return mustMarshal(root), nil
 }
 
 // writeBody reads a POST's or PUT's JSON body for kind k in the URL's

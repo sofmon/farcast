@@ -7,8 +7,8 @@ package plan
 // Money is integer cents, CPU integer millicores, memory integer MiB, and a
 // time a string written by Time.
 //
-// M2.7 added MigrateFact (A30-12); M2.8 added GrantFact (design §33, A33-11)
-// and GitCredentialFact (A33-29).
+// M2.7 added MigrateFact (A30-12), which M2.9a removed; M2.8 added GrantFact
+// (design §33, A33-11) and GitCredentialFact (A33-29).
 
 // The type words, one per fact type.
 const (
@@ -29,7 +29,6 @@ const (
 	TypeApplicationReset = "application_reset"
 	TypeReader           = "reader"
 	TypeNotice           = "notice"
-	TypeMigrate          = "migrate"
 	TypeGrant            = "grant"
 	TypeGitCredential    = "git_credential"
 )
@@ -492,59 +491,6 @@ type NoticeFact struct {
 }
 
 func (NoticeFact) FactType() string { return TypeNotice }
-
-// ------------------------------------------------------------------ migrate
-
-// MigrateFact is what farcast migrate rewrites (ADR 0023 M2.7, A30-12): the
-// cluster objects an older farcast applied with kubectl's client-side apply,
-// each named with what the rewrite converts and keeps, and the local files
-// it deletes once every object is verified and the instance recorded. It
-// binds no resourceVersion: a Deployment's moves with every status change.
-type MigrateFact struct {
-	Type string `json:"type"`
-	// Objects come in discovery order: the kinds' order, then the server's.
-	Objects []MigrateObject `json:"objects"`
-	// Local is exactly config's LegacyKubectlFiles: the present files, as
-	// slash-separated paths relative to the config directory.
-	Local []string `json:"local"`
-	// CannotBeUndone is always true in production. It is not named
-	// Irreversible, because Go refuses a field and a method of one name, and
-	// the rendering finds the method.
-	CannotBeUndone bool `json:"irreversible"`
-}
-
-func (MigrateFact) FactType() string { return TypeMigrate }
-
-// Irreversible says the migration cannot be undone, so the rendering puts the
-// fact before the others.
-func (f MigrateFact) Irreversible() bool { return f.CannotBeUndone }
-
-// MigrateObject is one object the migration rewrites. API and Kind are
-// kube.Kinds'; the namespace, the name, the uid and the managers are the
-// server's, unscrubbed.
-type MigrateObject struct {
-	API       string `json:"api"`
-	Kind      string `json:"kind"`
-	Namespace string `json:"namespace"`
-	Name      string `json:"name"`
-	UID       string `json:"uid"`
-	// CSAManagers is kube.ClientSideManagers' sorted, distinct names: the
-	// managers whose Update entries the rewrite turns into farcast/Apply.
-	CSAManagers []string `json:"csa_managers"`
-	// CSAFieldsSHA256 is the lowercase hex SHA-256 of the raw FieldsV1 bytes,
-	// concatenated in list order, of every entry the rewrite converts or
-	// removes: operation Update, subresource "", a manager in CSAManagers. An
-	// object with the annotation alone hashes the empty input. FieldsV1 names
-	// fields, never their values.
-	CSAFieldsSHA256 string `json:"csa_fields_sha256"`
-	// Annotation says whether kubectl's last-applied annotation's key is
-	// present. Its value, which on a Secret holds every key, is never bound.
-	Annotation bool `json:"annotation"`
-	// OtherManagers is every other managed-fields entry, as manager/operation
-	// and /subresource when it is set, distinct, in list order: kept, never
-	// rewritten.
-	OtherManagers []string `json:"other_managers"`
-}
 
 // ------------------------------------------------------------------ grant
 

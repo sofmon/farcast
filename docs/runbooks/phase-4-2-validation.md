@@ -26,7 +26,7 @@ APPS=with-build
 
 FARCAST_STATE="${FARCAST_CONFIG_HOME:-$HOME/Library/Application Support/farcast}"
 export KUBECONFIG="$FARCAST_STATE/instances/$INSTANCE/kubeconfig.yaml"
-# (2026-11-18, ADR 0023 M2.7, built, not walked) Neither install nor connect writes kubeconfig.yaml any more, and farcast migrate deletes it. A re-walk observes with kubectl from Cloud Shell (ADR 0023 Phasing), not over a file farcast wrote; an exported KUBECONFIG naming the absent file fails rather than falling back to ~/.kube/config [inf].
+# (2026-11-18, ADR 0023 M2.7, built, not walked) Neither install nor connect writes kubeconfig.yaml any more. (2026-11-20, M2.9a, built, not walked: farcast migrate, which deleted one an older farcast left, is removed; only release deletes it now, with the instance's directory.) A re-walk observes with kubectl from Cloud Shell (ADR 0023 Phasing), not over a file farcast wrote; an exported KUBECONFIG naming the absent file fails rather than falling back to ~/.kube/config [inf].
 kubectl config current-context
 ```
 
@@ -184,7 +184,7 @@ GO
 # From the farcast checkout, with the digest-pinned image from step 3.
 go run /tmp/render.go "$IMAGE" "$INSTANCE" > /tmp/with-build.yaml
 kubectl apply -f /tmp/with-build.yaml
-# (2026-11-18, ADR 0023 M2.7) On an instance migrated to server-side apply, a kubectl apply here leaves kubectl's client-side apply on the object. farcast's next write warns and clears the record, and every write then refuses until farcast migrate runs again (the CLI README's migrate section).
+# (2026-11-18, ADR 0023 M2.7; 2026-11-20, M2.9a, built, not walked) A kubectl apply here leaves kubectl's client-side apply on the object: a managed-fields entry and a last-applied annotation, which for a Secret holds its keys. From M2.7 until M2.9a farcast's next write warned and cleared the record, and every write then refused until farcast migrate ran again. farcast migrate is removed, and farcast neither warns nor refuses: its next forced server-side apply takes the fields it applies and leaves that entry and annotation in place [inf].
 kubectl -n "$APPS" rollout status deploy/prover --timeout=180s
 ```
 

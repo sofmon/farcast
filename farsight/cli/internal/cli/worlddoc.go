@@ -35,8 +35,9 @@ import (
 
 // worldSchema is the schema of both documents the FarCast app reads, this one
 // and 'instances'. Schema 2 (ADR 0023 M2.4) carries the in-process client's
-// error kinds and never the five it retired, each group's apps_error, and
-// the instances' reader state and migration in place of gcloud_pinned.
+// error kinds and never the six retired (M2.4's five, and not_migrated at
+// M2.9a), each group's apps_error, and the instances' reader state in place
+// of gcloud_pinned. M2.9a dropped the instances' migrated within schema 2.
 const worldSchema = 2
 
 const (

@@ -458,13 +458,13 @@ func installedInstance(t *testing.T, dir config.Dir, name string) *config.Instan
 		Status:    config.InstanceRunning,
 		CostLimit: config.CostLimit{Amount: 50, Currency: "USD", Period: "monthly"},
 	}
-	recordMigrated(meta)
 	if err := dir.SaveInstanceMetadata(name, meta); err != nil {
 		t.Fatal(err)
 	}
 	// The kubeconfig.yaml an install before ADR 0023 M2.7 wrote: nothing
-	// writes it since, so it is written here as a file, for migrate's local
-	// fact.
+	// writes it since, and since M2.9a nothing but release, which deletes the
+	// instance's directory, removes it. It is written here as a file, so a
+	// test can show that what must never open it does not (design A37-14).
 	if err := os.WriteFile(filepath.Join(dir.InstancePath(name), "kubeconfig.yaml"), []byte("fake-kubeconfig"), 0o600); err != nil {
 		t.Fatal(err)
 	}

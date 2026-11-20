@@ -22,7 +22,6 @@ var (
 	ErrRefusedDocument   = errors.New("kube: a document is not one farcast applies")
 	ErrTimedOut          = errors.New("kube: timed out waiting")
 	ErrRolloutStalled    = errors.New("kube: the rollout exceeded its progress deadline")
-	ErrNotMigrated       = errors.New("kube: an object did not come back migrated")
 	// ErrUnsafeEnvironment is a process environment under which a request
 	// would print a secret, such as GODEBUG's http2debug. It is not
 	// ErrEndpointRefused: the endpoint and the credential may pair perfectly.

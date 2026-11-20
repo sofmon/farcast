@@ -219,7 +219,7 @@ func planTarget(meta *config.InstanceMetadata, systemNamespaceUID string) plan.T
 
 // newBound opens command's plan for the instance meta records: the protocol,
 // this farcast's stamp, and the target. identity is who the plan reads the
-// cluster as ("reader", "writer" or "none"), and systemNamespaceUID the uid of
+// cluster as ("reader" or "none"), and systemNamespaceUID the uid of
 // farcast-system it read ("" for none). The command adds its stage, options,
 // facts and blocks.
 func newBound(command string, meta *config.InstanceMetadata, identity, systemNamespaceUID string) plan.Bound {

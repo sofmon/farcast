@@ -533,12 +533,6 @@ func TestRetryPolicy(t *testing.T) {
 		{"DELETE 503", http.MethodDelete, "/api/v1/namespaces/web/secrets/s", []int{503},
 			func(t *testing.T, c *kube.Client) error { return c.DeleteSecret(ctx, "web", "s", "uid-s") },
 			1, nil, false},
-		{"JSON patch 503", http.MethodPatch, cmPath, []int{503},
-			func(t *testing.T, c *kube.Client) error {
-				_, err := c.PatchJSON(ctx, mustKind(t, "v1", "ConfigMap"), "web", "x", []byte(`[]`))
-				return err
-			},
-			1, nil, false},
 		{"review POST 429", http.MethodPost, "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews", []int{429},
 			func(t *testing.T, c *kube.Client) error {
 				_, err := c.SelfSubjectAccessReview(ctx, kube.ResourceAttributes{Verb: "get", Resource: "pods"})

@@ -332,9 +332,6 @@ func (c *buildCommand) Run(ctx context.Context, env *Env, args []string) (err er
 	if err := recordNamed(meta, name); err != nil {
 		return err
 	}
-	if err := refuseUnmigrated(name, meta); err != nil {
-		return err
-	}
 	if c.repo == "" || c.app == "" {
 		return usagef("--repo and --app are required")
 	}
@@ -373,7 +370,6 @@ func (c *buildCommand) Run(ctx context.Context, env *Env, args []string) (err er
 		if cl, uid, err = openReadyAt(ctx, env, meta, c.newCluster); err != nil {
 			return err
 		}
-		defer afterWrites(env, name, cl)
 		rd = cl
 	} else if rd, err = c.newPlanReader(clusterRef{Dir: env.ConfigDir, Meta: meta, Identity: kube.Reader, Warn: env.Err}); err != nil {
 		return err
@@ -395,7 +391,6 @@ func (c *buildCommand) Run(ctx context.Context, env *Env, args []string) (err er
 		if cl, err = openConfirmed(ctx, env, meta, b, c.newCluster); err != nil {
 			return err
 		}
-		defer afterWrites(env, name, cl)
 	default:
 		ok, err := c.confirm(env, meta, p, b)
 		if err != nil {

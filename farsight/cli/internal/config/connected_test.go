@@ -14,8 +14,11 @@ import (
 
 // The per-namespace provenance survives a write and a read, and a record
 // written before it loads with none. A record that still carries the
-// gcloud_account an older farcast pinned (retired by ADR 0023 M2.4) loads as
-// before, and the key is gone at its next save.
+// gcloud_account an older farcast pinned (retired by ADR 0023 M2.4), or the
+// server_side_apply an M2.4 to M2.8 farcast or a rehearsal directory wrote
+// (removed by ADR 0023 M2.9a, design A37-3, row 197), loads as before, and
+// both keys are gone at its next save: records decode leniently, and a save
+// writes only the fields the record has.
 func TestARetiredGCloudAccountLoadsAndDeploymentsRoundTrip(t *testing.T) {
 	d := testDir(t)
 	if err := d.CreateInstance("atlas"); err != nil {
@@ -41,13 +44,16 @@ func TestARetiredGCloudAccountLoadsAndDeploymentsRoundTrip(t *testing.T) {
 	if !strings.Contains(string(raw), "deployments:") {
 		t.Errorf("the record does not carry the deployments:\n%s", raw)
 	}
-	// As an older farcast left it: the pinned account among the fields.
-	if err := os.WriteFile(path, append(raw, []byte("gcloud_account: operator@example.org\n")...), 0o600); err != nil {
+	// As an older farcast left it: the pinned account, and the mark of an
+	// instance written with server-side apply, among the fields.
+	retired := "gcloud_account: operator@example.org\n" +
+		"server_side_apply:\n  since: 2026-11-18T09:00:00Z\n  farcast: v0.0.0\n"
+	if err := os.WriteFile(path, append(raw, []byte(retired)...), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	got, err := d.LoadInstanceMetadata("atlas")
 	if err != nil {
-		t.Fatalf("a record with the retired gcloud_account no longer loads: %v", err)
+		t.Fatalf("a record with the retired gcloud_account and server_side_apply no longer loads: %v", err)
 	}
 	if dep := got.Deployments["shop"]; dep.Repository != "https://github.com/example/shop" || !dep.DeployedAt.Equal(at) || !dep.StorageWired || dep.Commit != "4f2a9c1e" {
 		t.Errorf("deployment = %+v", dep)
@@ -56,8 +62,9 @@ func TestARetiredGCloudAccountLoadsAndDeploymentsRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	raw, _ = os.ReadFile(path)
-	if strings.Contains(string(raw), "gcloud_account") || !strings.Contains(string(raw), "deployments:") {
-		t.Errorf("the next save kept the retired key, or lost the deployments:\n%s", raw)
+	if strings.Contains(string(raw), "gcloud_account") || strings.Contains(string(raw), "server_side_apply") ||
+		strings.Contains(string(raw), "since:") || !strings.Contains(string(raw), "deployments:") {
+		t.Errorf("the next save kept a retired key, or lost the deployments:\n%s", raw)
 	}
 
 	old := &InstanceMetadata{Name: "old", Provider: "gke", Region: "us-central1", Status: InstanceRunning}

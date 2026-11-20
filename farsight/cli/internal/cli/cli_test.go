@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/sofmon/farcast/farsight/cli/internal/kube/kubetest"
 )
 
 // runCLI invokes the router with an isolated config home and returns the
@@ -110,6 +112,37 @@ func TestUnknownCommand(t *testing.T) {
 	}
 	if !strings.Contains(errOut, "unknown command") {
 		t.Errorf("expected unknown-command error:\n%s", errOut)
+	}
+}
+
+// ADR 0023 M2.9a (design A37-1, A37-19 M6, mutation 194): farcast migrate is
+// gone. Against a recorded instance whose cluster is a kubetest server, the
+// form its plan took, in either output mode, is the router's unknown command:
+// exit 2, the router's text on stderr, nothing on stdout, the config tree byte
+// for byte as it was, and no request to the cluster. The root help lists no
+// migrate either.
+func TestMigrateIsAnUnknownCommand(t *testing.T) {
+	s := kubetest.New(t)
+	dir, _ := writeInstance(t, s, true)
+	before := treeFiles(t, dir.Path())
+	for _, mode := range []string{"json", "human"} {
+		var out, errb bytes.Buffer
+		code := run(context.Background(), []string{"farcast", "--config", dir.Path(), "-o", mode, "migrate", writeName, "--plan"},
+			strings.NewReader(""), &out, &errb)
+		if code != 2 || out.Len() != 0 {
+			t.Errorf("migrate -o %s: exit %d, stdout %q; want exit 2 and nothing", mode, code, out.String())
+		}
+		if !strings.Contains(errb.String(), `farcast: unknown command "migrate"`) {
+			t.Errorf("migrate -o %s: stderr %q; want the router's unknown command", mode, errb.String())
+		}
+	}
+	sameFiles(t, "migrate", before, treeFiles(t, dir.Path()))
+	if got := s.Requests(); len(got) != 0 {
+		t.Errorf("migrate sent %d requests to the cluster", len(got))
+	}
+	help, _, code := runCLI(t, "help")
+	if code != 0 || !strings.Contains(help, "\nCommands:\n") || strings.Contains(help, "\n  migrate ") {
+		t.Errorf("help: exit %d; want its command list, without migrate:\n%s", code, help)
 	}
 }
 

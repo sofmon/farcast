@@ -37,7 +37,6 @@ const (
 	kindClusterRejected    = "cluster_rejected"
 	kindDocumentUnreadable = "document_unreadable"
 	kindRolloutStalled     = "rollout_stalled"
-	kindNotMigrated        = "not_migrated"
 	kindPlanChanged        = "plan_changed"
 	kindTimeout            = "timeout"
 	kindInternal           = output.KindInternal
@@ -50,13 +49,13 @@ var errorKinds = []string{
 	kindKernelAbsent, kindNotCheckpointed, kindVersionSkew,
 	kindCredentialMissing, kindCredentialRefused, kindUnsafeEnvironment, kindEndpointRefused,
 	kindClusterUnreachable, kindUnauthorized, kindForbidden, kindClusterRejected,
-	kindDocumentUnreadable, kindRolloutStalled, kindNotMigrated, kindPlanChanged,
+	kindDocumentUnreadable, kindRolloutStalled, kindPlanChanged,
 	kindTimeout, kindInternal,
 }
 
-// retiredKinds were shipped and are emitted no longer (ADR 0023 M2). A new kind
-// never takes one of these names.
-var retiredKinds = []string{"kubectl_missing", "kubectl_failed", "gcloud_mismatch", "gcloud_signed_out", "auth_tool_missing"}
+// retiredKinds were shipped and are emitted no longer (ADR 0023 M2;
+// not_migrated at M2.9a). A new kind never takes one of these names.
+var retiredKinds = []string{"kubectl_missing", "kubectl_failed", "gcloud_mismatch", "gcloud_signed_out", "auth_tool_missing", "not_migrated"}
 
 // kindError is an error that names its kind. It wraps, so whatever it wraps
 // can still be matched, and its text is exactly the wrapped error's: giving an
@@ -136,8 +135,6 @@ func clusterKind(err error) string {
 		return kindDocumentUnreadable
 	case errors.Is(err, kube.ErrRolloutStalled):
 		return kindRolloutStalled
-	case errors.Is(err, kube.ErrNotMigrated):
-		return kindClusterRejected
 	case errors.Is(err, kube.ErrRefusedDocument):
 		// A document farcast rendered and its own checks refused: a bug in
 		// farcast, not a cluster's answer.

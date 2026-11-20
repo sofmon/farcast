@@ -565,9 +565,6 @@ func (c *gitCredentialCommand) Run(ctx context.Context, env *Env, args []string)
 	if err := recordNamed(meta, name); err != nil {
 		return err
 	}
-	if err := refuseUnmigrated(name, meta); err != nil {
-		return err
-	}
 	// A 403 the writer met says whose it was, once (A20-9).
 	defer func() { err = writerRefused(err, meta) }()
 
@@ -590,9 +587,6 @@ func (c *gitCredentialCommand) Run(ctx context.Context, env *Env, args []string)
 	cl, err := c.newCluster(clusterRef{Dir: env.ConfigDir, Meta: meta, Identity: kube.Writer, Warn: env.Err})
 	if err != nil {
 		return err
-	}
-	if c.action == plan.GitCredentialSet {
-		defer afterWrites(env, name, cl)
 	}
 
 	// 10. --confirm is the consent: the operator read the plan this one is.

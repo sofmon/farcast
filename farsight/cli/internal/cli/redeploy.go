@@ -192,9 +192,6 @@ func (c *redeployCommand) Run(ctx context.Context, env *Env, args []string) (err
 	if err := recordNamed(meta, name); err != nil {
 		return err
 	}
-	if err := refuseUnmigrated(name, meta); err != nil {
-		return err
-	}
 	if meta.Status == config.InstanceDeleting {
 		return fmt.Errorf("instance %q is being released", name)
 	}
@@ -221,7 +218,6 @@ func (c *redeployCommand) Run(ctx context.Context, env *Env, args []string) (err
 		if cl, err = c.readyWriter(ctx, env, meta); err != nil {
 			return err
 		}
-		defer afterWrites(env, name, cl)
 	}
 
 	// The instance's mTLS material is loaded, never minted: deciding as a
@@ -281,7 +277,6 @@ func (c *redeployCommand) Run(ctx context.Context, env *Env, args []string) (err
 		if cl, err = c.readyWriter(ctx, env, meta); err != nil {
 			return err
 		}
-		defer afterWrites(env, name, cl)
 	} else if err := c.consented(env, name, p); err != nil {
 		return err
 	}

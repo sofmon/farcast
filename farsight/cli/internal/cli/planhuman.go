@@ -33,9 +33,9 @@ type planResult struct {
 	confirm string `json:"-"`
 }
 
-// Human writes the blocks, the header, the facts (any irreversible one
-// first), the digest, and the confirm line, or for a blocked plan the line
-// saying --confirm would refuse it.
+// Human writes the blocks, the header, the facts in their order, the digest,
+// and the confirm line, or for a blocked plan the line saying --confirm would
+// refuse it.
 func (r planResult) Human(w io.Writer) error {
 	b := r.typed
 	var lines []string
@@ -51,16 +51,8 @@ func (r planResult) Human(w io.Writer) error {
 		lines = append(lines, "")
 	}
 	keys, minted := placeholderKeyLabels(b.Facts)
-	var rest []int
 	for i, f := range b.Facts {
-		if isIrreversible(f) {
-			lines = append(lines, factLines(f, keys, minted[i])...)
-			continue
-		}
-		rest = append(rest, i)
-	}
-	for _, i := range rest {
-		lines = append(lines, factLines(b.Facts[i], keys, minted[i])...)
+		lines = append(lines, factLines(f, keys, minted[i])...)
 	}
 
 	lines = append(lines, "", "digest: "+r.Digest)
@@ -113,13 +105,6 @@ func planHeader(b plan.Bound) []string {
 		fmt.Sprintf("farcast %s (commit %s), plan protocol %s",
 			terminalText(b.FarCast.Version), terminalText(b.FarCast.Commit), terminalText(b.Protocol)),
 	}
-}
-
-// isIrreversible is a fact that says it cannot be undone; the rendering puts
-// it before the others. migrate's fact is one (ADR 0023 M2.7, A30-12).
-func isIrreversible(f plan.Fact) bool {
-	i, ok := factValue(f).(interface{ Irreversible() bool })
-	return ok && i.Irreversible()
 }
 
 // factValue is f, with a pointer to a fact read through, so a plan that holds
@@ -179,8 +164,6 @@ func factLines(f plan.Fact, keys map[string]string, minted string) []string {
 			listText(f.Namespaces), listText(f.ConfigMaps), listText(f.ServiceAccounts))}
 	case plan.NoticeFact:
 		return noticeLines(f)
-	case plan.MigrateFact:
-		return migrateLines(f)
 	case plan.GrantFact:
 		return grantLines(f)
 	case plan.GitCredentialFact:
@@ -288,8 +271,8 @@ func imageLines(f plan.ImageFact) []string {
 // describeObject names one cluster object as an operator reads it: <Kind>
 // <namespace>/<name>, or <Kind> <name> for a cluster-scoped one (namespace
 // ""), each through terminalText, since the namespace and the name may be the
-// server's. A write, a migrated object, and migrate's blocks and errors are
-// all named by it (A30-13).
+// server's. A write's object and a Git credential's Secret are named by it
+// (A30-13).
 func describeObject(kind, namespace, name string) string {
 	obj := terminalText(name)
 	if namespace != "" {
@@ -495,43 +478,6 @@ func resetLines(f plan.ApplicationResetFact) []string {
 		fmt.Sprintf("  replicas: %s now, %d after; requests: %s now, %dm CPU and %d MiB after",
 			live, f.ReplicasAfter, liveReq, f.RequestsAfter.CPUMilli, f.RequestsAfter.MemMiB),
 	}
-}
-
-// migrateIrreversible closes the rendering of a migrate fact that cannot be
-// undone, design §6.7's paragraph verbatim.
-const migrateIrreversible = `This cannot be undone. Which fields kubectl's client-side apply owned is lost when its entry is renamed; ` +
-	`csaupgrade, kubectl's own routine for the same rename, says "This operation is not reversible". ` +
-	`A farcast older than this one must not write to the instance afterwards: its client-side apply would copy each Secret's keys back into an annotation.`
-
-// migrateLines is migrate's fact (A30-13): what it rewrites on the cluster and
-// deletes on this machine, one line per object, and, when it cannot be
-// undone, §6.7's paragraph, before the digest. Every string the server sent
-// (a namespace, a name, a uid, a manager) goes through terminalText, and
-// every list through listText.
-func migrateLines(f plan.MigrateFact) []string {
-	local := "no local file"
-	if len(f.Local) > 0 {
-		local = listText(f.Local)
-	}
-	irreversible := "no"
-	if f.CannotBeUndone {
-		irreversible = "yes"
-	}
-	lines := []string{fmt.Sprintf("migrate %d object(s) on the cluster; then delete %s; irreversible: %s", len(f.Objects), local, irreversible)}
-	for _, o := range f.Objects {
-		annotation := "absent"
-		if o.Annotation {
-			annotation = "present, removed"
-		}
-		lines = append(lines, fmt.Sprintf("  %s (%s, uid %s): client-side managers %s become farcast/Apply; "+
-			"their fields' sha256 %s; last-applied annotation %s; other managers kept: %s",
-			describeObject(o.Kind, o.Namespace, o.Name), terminalText(o.API), terminalText(o.UID), listText(o.CSAManagers),
-			terminalText(o.CSAFieldsSHA256), annotation, listText(o.OtherManagers)))
-	}
-	if f.CannotBeUndone {
-		lines = append(lines, "  "+migrateIrreversible)
-	}
-	return lines
 }
 
 // grantLines is a grant fact (ADR 0023 M2.8, A33-11): the uid principal, the

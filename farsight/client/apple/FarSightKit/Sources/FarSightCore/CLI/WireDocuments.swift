@@ -60,7 +60,6 @@ struct WireListingEntry: Decodable {
     let cloudLogging: String?
     let components: WireRecordedComponents?
     let reader: String?
-    let migrated: Bool?
     let error: WireProblem?
 
     enum CodingKeys: String, CodingKey {
@@ -68,7 +67,7 @@ struct WireListingEntry: Decodable {
         case costLimit = "cost_limit"
         case cloudLogging = "cloud_logging"
         case components
-        case reader, migrated
+        case reader
         case error
     }
 }

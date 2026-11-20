@@ -434,17 +434,16 @@ func TestWorldReadsTheRehearsalWhole(t *testing.T) {
 	var list struct {
 		Schema    int `json:"schema"`
 		Instances []struct {
-			Name     string `json:"name"`
-			Reader   string `json:"reader"`
-			Migrated bool   `json:"migrated"`
-			Status   string `json:"status"`
+			Name   string `json:"name"`
+			Reader string `json:"reader"`
+			Status string `json:"status"`
 		} `json:"instances"`
 	}
 	if err := json.Unmarshal(out, &list); err != nil {
 		t.Fatal(err)
 	}
 	if list.Schema != 2 || len(list.Instances) != 1 || list.Instances[0].Name != instance ||
-		list.Instances[0].Reader != "granted" || !list.Instances[0].Migrated || list.Instances[0].Status != "running" {
+		list.Instances[0].Reader != "granted" || list.Instances[0].Status != "running" {
 		t.Fatalf("instances: %s", out)
 	}
 	if n := len(calls(t, rig)); n != 0 {
@@ -510,9 +509,6 @@ func TestTheRecordIsTheLoopbackReaders(t *testing.T) {
 	}
 	if meta.Endpoint != rig.ClusterAddr || meta.Region != "rehearsal-local" || meta.Project != rehearsal.DefaultProject {
 		t.Errorf("endpoint %q, region %q, project %q", meta.Endpoint, meta.Region, meta.Project)
-	}
-	if ssa := meta.ServerSideApply; ssa == nil || !ssa.Since.Equal(s.Started) || ssa.Farcast != "rehearsal" {
-		t.Errorf("server_side_apply %+v", ssa)
 	}
 	for _, f := range []string{"reader.key", "reader.crt", "cluster-ca.crt", "credentials.yaml"} {
 		if info, err := os.Stat(instanceFile(rig, f)); err != nil || info.Mode().Perm() != 0o600 {
@@ -1646,8 +1642,9 @@ func TestSummarizeSaysNoNames(t *testing.T) {
 }
 
 // TestSummarizeKnowsEveryKind (A18-18, mutation O45): summarize's closed set
-// of error kinds is the CLI's 21, from the kinds vector the CLI's own test
-// pins: each prints as itself, and each kind ADR 0023 M2 retired as "other".
+// of error kinds is the CLI's 20, from the kinds vector the CLI's own test
+// pins: each prints as itself, and each kind ADR 0023 M2 or M2.9a retired as
+// "other".
 // A kind missing from summarize's hand copy would print as "other" with
 // nothing else noticing.
 func TestSummarizeKnowsEveryKind(t *testing.T) {
@@ -1658,11 +1655,12 @@ func TestSummarizeKnowsEveryKind(t *testing.T) {
 	var v struct {
 		Kinds []string `json:"kinds"`
 	}
-	if err := json.Unmarshal(data, &v); err != nil || len(v.Kinds) != 21 {
+	if err := json.Unmarshal(data, &v); err != nil || len(v.Kinds) != 20 {
 		t.Fatalf("the kinds vector: %v, %d kinds", err, len(v.Kinds))
 	}
-	// The kinds cli's retiredKinds names (ADR 0023 M2), never emitted again.
-	retired := []string{"kubectl_missing", "kubectl_failed", "gcloud_mismatch", "gcloud_signed_out", "auth_tool_missing"}
+	// The kinds cli's retiredKinds names (ADR 0023 M2; not_migrated at
+	// M2.9a), never emitted again.
+	retired := []string{"kubectl_missing", "kubectl_failed", "gcloud_mismatch", "gcloud_signed_out", "auth_tool_missing", "not_migrated"}
 	for _, row := range append(slices.Clone(v.Kinds), retired...) {
 		want := row
 		if slices.Contains(retired, row) {

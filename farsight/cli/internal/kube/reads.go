@@ -21,8 +21,8 @@ import (
 // ignores every other field, so a server newer than these structs is a
 // non-event, as in technocore/kube.
 
-// ObjectMeta is tkube's ObjectMeta with the two fields the migration and the
-// rollout rules need.
+// ObjectMeta is tkube's ObjectMeta with the two fields the last-apply time and
+// the rollout rules need.
 type ObjectMeta struct {
 	tkube.ObjectMeta
 	Generation    int64                `json:"generation"`

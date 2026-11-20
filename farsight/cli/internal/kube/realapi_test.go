@@ -1,7 +1,8 @@
 //go:build realapi
 
 // The no-cost suite on a real API server (ADR 0023 M2.7, design §10.6 as
-// A30-18 amends it). It runs only by docs/runbooks/adr-0023-m2-realapi.md:
+// A30-18 amends it, and M2.9a, which removed the migration and its tests:
+// design §37, A37-9). It runs only by docs/runbooks/adr-0023-m2-realapi.md:
 // an envtest kube-apiserver and etcd on the keeper VM, listening on that
 // machine's loopback, reached from the Mac through ssh -L. ./check.sh
 // type-checks and lints this file, and never runs it. R6 runs its tests by
@@ -13,8 +14,7 @@
 //   - FARCAST_REALAPI_TOKEN_FILE, a static bearer for a user in system:masters.
 //
 // Without all three every test fails, and none skips, so a tagged run cannot
-// pass by testing nothing. The one exception is TestEmulatedSeedMatchesKubectl,
-// which skips, saying why, when FARCAST_REALAPI_KUBECTL_NAMESPACE is unset (R7).
+// pass by testing nothing.
 //
 // The token is read once, trimmed, and used only as the bearer: it is never
 // printed and never put in a message. The suite starts no process, and it
@@ -29,11 +29,9 @@
 // or a token. R8 copies only these lines into the records.
 //
 // Some helpers write around Apply on purpose, because Apply refuses what they
-// send or is not the write they make, and each says so: seedClientSide
-// (kubectl's client-side apply, with its annotation), rawApply (a second
+// send or is not the write they make, and each says so: rawApply (a second
 // applier, and a body that carries a resourceVersion no AllowResourceVersion
-// let through), migrateOne (the migration's JSON patch) and mergePatch
-// (another manager's merge patch).
+// let through) and mergePatch (another manager's merge patch).
 package kube
 
 import (
@@ -50,7 +48,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -59,27 +56,21 @@ import (
 	"time"
 
 	"cloud.google.com/go/auth"
-	"github.com/goccy/go-yaml"
 
 	tkube "github.com/sofmon/farcast/technocore/kube"
 )
 
-// The suite's environment (R6, R7).
+// The suite's environment (R6).
 const (
-	envRealAPIEndpoint         = "FARCAST_REALAPI_ENDPOINT"
-	envRealAPICAFile           = "FARCAST_REALAPI_CA_FILE"
-	envRealAPITokenFile        = "FARCAST_REALAPI_TOKEN_FILE"
-	envRealAPIKubectlNamespace = "FARCAST_REALAPI_KUBECTL_NAMESPACE"
+	envRealAPIEndpoint  = "FARCAST_REALAPI_ENDPOINT"
+	envRealAPICAFile    = "FARCAST_REALAPI_CA_FILE"
+	envRealAPITokenFile = "FARCAST_REALAPI_TOKEN_FILE"
 )
 
 // realAPIEmail is the identity newClient pairs with a loopback endpoint: a
 // credential under .invalid, which goes to a loopback endpoint and nowhere
 // else (§3.2). It signs nothing: the token is the file's.
 const realAPIEmail = "realapi@realapi.invalid"
-
-// mediaStrategicMergePatch is the content type of kubectl's client-side
-// apply's second write, which kube never sends.
-const mediaStrategicMergePatch = "application/strategic-merge-patch+json"
 
 // mediaMergePatch is the content type of a JSON merge patch, another
 // manager's write that kube never sends.
@@ -314,238 +305,6 @@ func (r *realAPI) raw(t *testing.T, path string) map[string]any {
 	return m
 }
 
-// clientSideQuery is the query of kubectl's client-side apply's two writes:
-// its field manager, and the strict validation kubectl asks for by default.
-func clientSideQuery() url.Values {
-	return url.Values{"fieldManager": {kubectlClientSideApply}, "fieldValidation": {"Strict"}}
-}
-
-// seedClientSide leaves an object as kubectl's client-side apply leaves it
-// after two applies (design §6.8 step 1, L4.4). It bypasses Apply on purpose:
-// Apply refuses the last-applied annotation, and kube has no create and no
-// strategic-merge patch.
-//  1. A POST of v1 to k.ListPath(ns), under kubectl-client-side-apply,
-//     carrying the annotation kubectl writes: v1's own JSON and a newline.
-//  2. A strategic-merge PATCH of v1bSMP under the same manager, carrying the
-//     annotation updated to v1 with v1bSMP merged in, as kubectl's second
-//     apply of a changed manifest sends it.
-//
-// v1JSON is one object; its namespace is set to ns. v1bSMP changes map
-// fields only, such as a label's value, where a strategic merge patch and a
-// JSON merge patch agree, so the updated annotation is v1 with the patch
-// merged; a list in it is refused. A nil v1bSMP sends the POST alone, as
-// kubectl sends nothing for a manifest that did not change.
-func (r *realAPI) seedClientSide(ctx context.Context, k Kind, ns string, v1JSON, v1bSMP []byte) error {
-	var v1 map[string]any
-	if err := json.Unmarshal(v1JSON, &v1); err != nil {
-		return fmt.Errorf("v1 does not decode: %w", err)
-	}
-	md, _ := v1["metadata"].(map[string]any)
-	if md == nil {
-		return errors.New("v1 has no metadata")
-	}
-	name, _ := md["name"].(string)
-	if k.Namespaced {
-		md["namespace"] = ns
-	}
-	created, err := withLastApplied(v1, v1)
-	if err != nil {
-		return err
-	}
-	if _, err := r.c.do(ctx, call{method: http.MethodPost, path: k.ListPath(ns), query: clientSideQuery(), contentType: mediaJSON, body: created}); err != nil {
-		return fmt.Errorf("the client-side create: %w", err)
-	}
-	if v1bSMP == nil {
-		return nil
-	}
-	var smp map[string]any
-	if err := json.Unmarshal(v1bSMP, &smp); err != nil {
-		return fmt.Errorf("v1b's patch does not decode: %w", err)
-	}
-	v1b := cloneJSON(v1)
-	if err := mergeMaps(v1b, smp); err != nil {
-		return err
-	}
-	patch, err := withLastApplied(smp, v1b)
-	if err != nil {
-		return err
-	}
-	if _, err := r.c.do(ctx, call{method: http.MethodPatch, path: k.Path(ns, name), query: clientSideQuery(), contentType: mediaStrategicMergePatch, body: patch}); err != nil {
-		return fmt.Errorf("the client-side second apply: %w", err)
-	}
-	return nil
-}
-
-// withLastApplied is body with kubectl's annotation set to applied's JSON
-// and a newline, as kubectl's client-side apply records the manifest it
-// applied, encoded.
-func withLastApplied(body, applied map[string]any) ([]byte, error) {
-	a, err := json.Marshal(applied)
-	if err != nil {
-		return nil, err
-	}
-	out := cloneJSON(body)
-	md, _ := out["metadata"].(map[string]any)
-	if md == nil {
-		md = map[string]any{}
-		out["metadata"] = md
-	}
-	ann, _ := md["annotations"].(map[string]any)
-	if ann == nil {
-		ann = map[string]any{}
-		md["annotations"] = ann
-	}
-	ann[lastAppliedAnnotation] = string(a) + "\n"
-	return json.Marshal(out)
-}
-
-// cloneJSON is a deep copy of a decoded JSON object.
-func cloneJSON(m map[string]any) map[string]any {
-	b, err := json.Marshal(m)
-	if err != nil {
-		panic(err)
-	}
-	var out map[string]any
-	if err := json.Unmarshal(b, &out); err != nil {
-		panic(err)
-	}
-	return out
-}
-
-// mergeMaps merges patch into dst as a JSON merge patch does (RFC 7386): a
-// null deletes, a map merges, a value replaces. A list is refused, because
-// there a strategic merge patch would merge by key and a merge patch would
-// replace.
-func mergeMaps(dst, patch map[string]any) error {
-	for k, pv := range patch {
-		switch v := pv.(type) {
-		case nil:
-			delete(dst, k)
-		case map[string]any:
-			d, _ := dst[k].(map[string]any)
-			if d == nil {
-				d = map[string]any{}
-				dst[k] = d
-			}
-			if err := mergeMaps(d, v); err != nil {
-				return err
-			}
-		case []any:
-			return fmt.Errorf("the emulated second apply changes map fields only, and its patch carries a list at %q", k)
-		default:
-			dst[k] = v
-		}
-	}
-	return nil
-}
-
-// secondApplyPatch is the patch kubectl's second apply sends for documents
-// that differ in map values only: each changed value, null for a removed key.
-// A list that differs is refused, as mergeMaps refuses it. It is nil when the
-// two are equal.
-func secondApplyPatch(v1, v1b map[string]any) (map[string]any, error) {
-	patch := map[string]any{}
-	for k, b := range v1b {
-		a, ok := v1[k]
-		switch {
-		case !ok:
-			patch[k] = b
-		case reflect.DeepEqual(a, b):
-		default:
-			am, aok := a.(map[string]any)
-			bm, bok := b.(map[string]any)
-			if aok && bok {
-				sub, err := secondApplyPatch(am, bm)
-				if err != nil {
-					return nil, err
-				}
-				patch[k] = sub
-				continue
-			}
-			if _, isList := a.([]any); isList {
-				return nil, fmt.Errorf("the seed files differ in the list at %q; they may differ in map values only", k)
-			}
-			patch[k] = b
-		}
-	}
-	for k := range v1 {
-		if _, ok := v1b[k]; !ok {
-			patch[k] = nil
-		}
-	}
-	if len(patch) == 0 {
-		return nil, nil
-	}
-	return patch, nil
-}
-
-// seed is seedClientSide of a YAML document, failing the test on an error.
-func (r *realAPI) seed(t *testing.T, k Kind, ns, v1YAML, v1bSMP string) {
-	t.Helper()
-	var v1 map[string]any
-	if err := yaml.Unmarshal([]byte(v1YAML), &v1); err != nil {
-		t.Fatalf("the test's v1 does not decode: %v", err)
-	}
-	v1JSON, err := json.Marshal(v1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var smp []byte
-	if v1bSMP != "" {
-		smp = []byte(v1bSMP)
-	}
-	r.check(t, r.seedClientSide(t.Context(), k, ns, v1JSON, smp), "seed "+k.Kind)
-}
-
-// migration is what migrateOne read and was answered, as far as it got.
-type migration struct {
-	csa      []string // ClientSideManagers of the object as read
-	hadApply bool     // the read carried farcast's own Apply entry
-	before   Object   // the read
-	answer   Object   // PatchJSON's answer, when it was sent
-	after    Object   // the fresh read after it
-}
-
-// migrateOne is §6.4's steps 1 to 3 for one object, over kube's primitives
-// (C20): GetObject; ClientSideManagers; MigrationPatch, then PatchJSON;
-// MigratedEndState on the answer; then a fresh GetObject and MigratedEndState
-// on it. It bypasses Apply on purpose: the migration's one write is a JSON
-// patch. It retries nothing; migrate's loop is a cli test (A30-23). The fresh
-// read is made even when the answer's end state is refused, so a test can
-// record what the server kept.
-func (r *realAPI) migrateOne(ctx context.Context, k Kind, ns, name string) (migration, error) {
-	var m migration
-	var err error
-	if m.before, err = r.c.GetObject(ctx, k, ns, name); err != nil {
-		return m, fmt.Errorf("the read: %w", err)
-	}
-	if m.csa, err = ClientSideManagers(m.before.Metadata.ManagedFields); err != nil {
-		return m, err
-	}
-	m.hadApply = slices.ContainsFunc(m.before.Metadata.ManagedFields, IsOwnApply)
-	patch, err := MigrationPatch(m.before, m.csa, FieldManager)
-	if err != nil {
-		return m, err
-	}
-	if patch == nil {
-		return m, errors.New("the object needs no migration")
-	}
-	if m.answer, err = r.c.PatchJSON(ctx, k, ns, name, patch); err != nil {
-		return m, fmt.Errorf("the patch: %w", err)
-	}
-	answerState := MigratedEndState(m.answer, m.csa, FieldManager, m.hadApply)
-	if m.after, err = r.c.GetObject(ctx, k, ns, name); err != nil {
-		return m, fmt.Errorf("the read-back: %w", err)
-	}
-	if answerState != nil {
-		return m, fmt.Errorf("the patch's answer: %w", answerState)
-	}
-	if err := MigratedEndState(m.after, m.csa, FieldManager, m.hadApply); err != nil {
-		return m, fmt.Errorf("the read-back: %w", err)
-	}
-	return m, nil
-}
-
 // rawApply is one server-side apply, as Apply sends it, with the field
 // manager and force given and none of Apply's checks: its query is
 // fieldManager=<manager>, fieldValidation=Strict and force. It bypasses Apply
@@ -593,8 +352,8 @@ func (r *realAPI) applied(t *testing.T, code int, err error) int {
 
 // answered is the HTTP status a write ended with: 200 for no error, or an
 // APIError's code. Any other error, such as no answer at all, fails the test.
-// It is for writes that cannot create, a PatchJSON or an Apply of an object
-// that exists, whose success is 200; rawApply's callers use applied.
+// It is for writes that cannot create, such as an Apply of an object that
+// exists, whose success is 200; rawApply's callers use applied.
 func (r *realAPI) answered(t *testing.T, err error) int {
 	t.Helper()
 	if err == nil {
@@ -626,18 +385,8 @@ func entryNames(md ObjectMeta) []string {
 	return out
 }
 
-// owns is whether an entry's fields hold path, false when they do not read.
-func owns(e ManagedFieldsEntry, path ...string) bool {
-	ok, err := ownsPath(e.FieldsV1, path)
-	return err == nil && ok
-}
-
-// annotated is whether md carries kubectl's last-applied annotation. Its
-// value is never read.
-func annotated(md ObjectMeta) bool {
-	_, ok := md.Annotations[lastAppliedAnnotation]
-	return ok
-}
+// owns, which reads an entry's fieldsV1, is in owns_test.go, untagged, so
+// that ./check.sh runs its own test.
 
 // field reads a nested value of a decoded object, nil when a step is missing.
 func field(v any, path ...string) any {
@@ -690,16 +439,11 @@ const (
 	markerProxy   = "realapi-marker-proxy"
 	markerDropped = "realapi-marker-dropped"
 	seedV1        = "v1"
-	seedV1b       = "v1b"
-	// seedV1bPatch is v1b: kubectl's second apply of a manifest whose seed
-	// label's value changed (L4.4).
-	seedV1bPatch = `{"metadata":{"labels":{"realapi.farcast.sofmon.com/seed":"v1b"}}}`
 )
 
-// doc fills a document template: {ns}, {seed} ("v1", or "v1b" for the
-// manifest as kubectl last applied it), {replicas} (2 unless more says
-// otherwise), and the base64 of the Secret's two markers. Pairs in more come
-// first, so they win.
+// doc fills a document template: {ns}, {seed} (the seed label's value,
+// seedV1), {replicas} (2 unless more says otherwise), and the base64 of the
+// Secret's two markers. Pairs in more come first, so they win.
 func doc(tmpl, ns, seed string, more ...string) string {
 	pairs := append(slices.Clone(more),
 		"{ns}", ns, "{seed}", seed, "{replicas}", "2",
@@ -710,8 +454,8 @@ func doc(tmpl, ns, seed string, more ...string) string {
 
 // The documents, in the renderers' shape (FatLine's and TechnoCore's
 // Deployments, an application's Deployment, Service, egress Secret, ConfigMap
-// and NetworkPolicy, the keyholder's StatefulSet, a build Job), with marker
-// values only. Each v2 drops one thing its v1 has (§6.8).
+// and NetworkPolicy, a build Job), with marker values only. Each v2 drops one
+// thing its v1 has (§6.8).
 
 const fatlineV1 = `apiVersion: apps/v1
 kind: Deployment
@@ -984,23 +728,8 @@ spec:
       targetPort: 8080
 `
 
-// secretSeed is the egress Secret as farcast rendered it before ADR 0023
-// M2.2: stringData, which only a seed may carry (SplitStream refuses it).
-const secretSeed = `apiVersion: v1
-kind: Secret
-metadata:
-  name: api-egress
-  namespace: {ns}
-  labels:
-    app.kubernetes.io/name: api
-    app.kubernetes.io/managed-by: farcast
-    realapi.farcast.sofmon.com/seed: {seed}
-stringData:
-  FARCAST_FATLINE_PROXY: realapi-marker-proxy
-  REALAPI_DROPPED: realapi-marker-dropped
-`
-
-// secretV1 is secretSeed as farcast renders it since M2.2: data:, base64.
+// secretV1 is the egress Secret as farcast renders it since ADR 0023 M2.2:
+// data:, base64 (SplitStream refuses stringData).
 const secretV1 = `apiVersion: v1
 kind: Secret
 metadata:
@@ -1110,39 +839,6 @@ spec:
           port: 443
 `
 
-const statefulSetV1 = `apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: datasphered
-  namespace: {ns}
-  labels:
-    app.kubernetes.io/name: datasphered
-    app.kubernetes.io/managed-by: farcast
-    realapi.farcast.sofmon.com/seed: {seed}
-spec:
-  serviceName: datasphered
-  replicas: 1
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: datasphered
-  template:
-    metadata:
-      labels:
-        app.kubernetes.io/name: datasphered
-        app.kubernetes.io/managed-by: farcast
-    spec:
-      automountServiceAccountToken: false
-      containers:
-        - name: datasphered
-          image: registry.invalid/realapi/datasphered:marker
-          args:
-            - serve
-          resources:
-            requests:
-              cpu: 50m
-              memory: 64Mi
-`
-
 const jobV1 = `apiVersion: batch/v1
 kind: Job
 metadata:
@@ -1202,8 +898,8 @@ func withResourceVersion(t *testing.T, text, ns, rv string) []byte {
 	return []byte(strings.Replace(text, line, line+"  resourceVersion: \""+rv+"\"\n", 1))
 }
 
-// stuckCase is one of §6.8's cases: an object seeded by kubectl's
-// client-side apply, migrated, then applied as v2, which drops one thing.
+// stuckCase is one of §6.8's cases: an object farcast applied as v1, then
+// applied as v2, which drops one thing.
 type stuckCase struct {
 	name   string
 	kind   Kind
@@ -1212,6 +908,8 @@ type stuckCase struct {
 	// left names what of the dropped thing the object still holds, "" when
 	// it is gone.
 	left func(obj map[string]any) string
+	// held is what left reads after v1's forced apply: all of what v2 drops.
+	held string
 }
 
 func stuckCases() []stuckCase {
@@ -1231,6 +929,7 @@ func stuckCases() []stuckCase {
 				}
 				return strings.Join(left, ", ")
 			},
+			held: "the container shrike, the volume shrike-wire, fatline's mount of shrike-wire",
 		},
 		{
 			name: "an argument leaves an atomic args list", kind: kindDeployment, object: "technocore", v1: technocoreV1, v2: technocoreV2,
@@ -1242,6 +941,7 @@ func stuckCases() []stuckCase {
 				}
 				return ""
 			},
+			held: "the argument --adapt",
 		},
 		{
 			name: "an env entry leaves", kind: kindDeployment, object: "api", v1: appV1, v2: appV2,
@@ -1251,6 +951,7 @@ func stuckCases() []stuckCase {
 				}
 				return ""
 			},
+			held: "the env entry REALAPI_DROPPED",
 		},
 		{
 			name: "a label leaves", kind: kindService, object: "api", v1: serviceV1, v2: serviceV2,
@@ -1260,15 +961,17 @@ func stuckCases() []stuckCase {
 				}
 				return ""
 			},
+			held: "the label farcast.sofmon.com/instance",
 		},
 		{
-			name: "a Secret data key leaves, from a stringData v1", kind: kindSecret, object: "api-egress", v1: secretSeed, v2: secretV2,
+			name: "a Secret data key leaves", kind: kindSecret, object: "api-egress", v1: secretV1, v2: secretV2,
 			left: func(obj map[string]any) string {
 				if field(obj, "data", "REALAPI_DROPPED") != nil {
 					return "the data key REALAPI_DROPPED"
 				}
 				return ""
 			},
+			held: "the data key REALAPI_DROPPED",
 		},
 		{
 			name: "a ConfigMap data key leaves", kind: kindConfigMap, object: "api", v1: configMapV1, v2: configMapV2,
@@ -1278,6 +981,7 @@ func stuckCases() []stuckCase {
 				}
 				return ""
 			},
+			held: "the data key REALAPI_DROPPED",
 		},
 		{
 			name: "a NetworkPolicy egress rule leaves", kind: mustKind("networking.k8s.io/v1", "NetworkPolicy"), object: "api", v1: networkPolicyV1, v2: networkPolicyV2,
@@ -1291,6 +995,7 @@ func stuckCases() []stuckCase {
 				}
 				return ""
 			},
+			held: "the egress rule to 198.51.100.0/24",
 		},
 	}
 }
@@ -1301,215 +1006,27 @@ func asList(v any) []any {
 	return l
 }
 
-// TestMigrationRemovesAFieldLaterDroppedFromTheManifest is §6.8's stuck-fields
-// test, one subtest per case: seed v1 as kubectl's client-side apply would,
-// migrate it, apply v2 forced, and check that what v2 dropped is gone from the
-// live object and that the end state still holds. The field's assertion
-// begins "stuck field: ", which R6 tells from any other failure: mutation row
-// 104 counts as killed only on it.
-func TestMigrationRemovesAFieldLaterDroppedFromTheManifest(t *testing.T) {
+// TestForcedApplyRemovesAFieldDroppedFromTheManifest is §6.8's stuck-fields
+// test as ADR 0023 M2.9a keeps it (design §37, A37-9; written, not run), one
+// subtest per case: apply v1 forced, require the live object to hold all of
+// what v2 drops (held), apply v2 forced, and check that it is gone. Without
+// held, a v1 that never stored the field would pass. The field's assertion
+// begins "stuck field: ", which R6 tells from any other failure.
+func TestForcedApplyRemovesAFieldDroppedFromTheManifest(t *testing.T) {
 	r := openRealAPI(t)
 	ns := r.runNamespace(t, "stuck")
 	for _, sc := range stuckCases() {
 		t.Run(sc.name, func(t *testing.T) {
-			r.seed(t, sc.kind, ns, doc(sc.v1, ns, seedV1), seedV1bPatch)
-			m, err := r.migrateOne(t.Context(), sc.kind, ns, sc.object)
-			r.check(t, err, "the migration")
-			r.apply(t, doc(sc.v2, ns, seedV1b), true)
+			r.apply(t, doc(sc.v1, ns, seedV1), true)
+			if held := sc.left(r.raw(t, sc.kind.Path(ns, sc.object))); held != sc.held {
+				t.Fatalf("after v1's forced apply the live %s holds %q, not %q: what v2 drops was not stored, so its absence would show nothing", sc.kind.Kind, held, sc.held)
+			}
+			r.apply(t, doc(sc.v2, ns, seedV1), true)
 			if left := sc.left(r.raw(t, sc.kind.Path(ns, sc.object))); left != "" {
 				t.Errorf("stuck field: %s is still on the live %s after v2's forced apply", left, sc.kind.Kind)
 			}
 			back := r.object(t, sc.kind, ns, sc.object)
-			if err := MigratedEndState(back, m.csa, FieldManager, m.hadApply); err != nil {
-				t.Errorf("the end state after v2's apply: %v", err)
-			}
-			fact(t, "%s: after the migration and v2's apply, entries %v", sc.name, entryNames(back.Metadata))
-		})
-	}
-}
-
-// TestAnnotationRemovalInTheSamePatchLeavesNoUpdateEntry decides §6.3 (A30-1):
-// the migration removes the annotation in the same JSON patch that rewrites
-// the managed fields. If the server then records the patch as farcast's
-// Update, the removal moves to a second request. It records the entries, and
-// whether farcast's Apply entry still owns the annotation's path.
-func TestAnnotationRemovalInTheSamePatchLeavesNoUpdateEntry(t *testing.T) {
-	r := openRealAPI(t)
-	ns := r.runNamespace(t, "samepatch")
-	for _, tc := range []struct {
-		kind         Kind
-		object, seed string
-	}{
-		{kindDeployment, "fatline", fatlineV1},
-		{kindSecret, "api-egress", secretSeed},
-		{kindConfigMap, "api", configMapV1},
-	} {
-		t.Run(tc.kind.Kind, func(t *testing.T) {
-			r.seed(t, tc.kind, ns, doc(tc.seed, ns, seedV1), seedV1bPatch)
-			m, err := r.migrateOne(t.Context(), tc.kind, ns, tc.object)
-			for _, o := range []struct {
-				what string
-				obj  Object
-			}{{"the patch's answer", m.answer}, {"the read-back", m.after}} {
-				if o.obj.Metadata.Name == "" {
-					continue
-				}
-				var updates int
-				ownsAnnotation := false
-				for _, e := range o.obj.Metadata.ManagedFields {
-					if e.Manager == FieldManager && e.Operation == operationUpdate {
-						updates++
-					}
-					if IsOwnApply(e) && owns(e, lastAppliedFieldPath...) {
-						ownsAnnotation = true
-					}
-				}
-				fact(t, "%s, %s: entries %v; farcast/Update entries %d; farcast/Apply owns the annotation's path: %t; annotation present: %t",
-					tc.kind.Kind, o.what, entryNames(o.obj.Metadata), updates, ownsAnnotation, annotated(o.obj.Metadata))
-				if updates != 0 {
-					t.Errorf("%s carries %d farcast/Update entries after the same-patch removal; §6.3's removal moves to a second request", o.what, updates)
-				}
-				if ownsAnnotation {
-					t.Errorf("%s: farcast/Apply still owns the annotation's path", o.what)
-				}
-			}
-			r.check(t, err, "the migration")
-		})
-	}
-}
-
-// TestRealAPIKeepsTheLiveListOnAnUndecodableRewrite: a rewrite whose entries
-// the server cannot decode (an apiVersion of "") is ignored without an error.
-// The server keeps the live list and still applies the annotation's removal, and
-// MigratedEndState refuses on the answer and on the read-back (§6.3, "Why it
-// is read back"). The migration's own write is sent through PatchJSON, as
-// migrateOne sends it.
-func TestRealAPIKeepsTheLiveListOnAnUndecodableRewrite(t *testing.T) {
-	r := openRealAPI(t)
-	ns := r.runNamespace(t, "undecodable")
-	ctx := t.Context()
-	r.seed(t, kindDeployment, ns, doc(fatlineV1, ns, seedV1), seedV1bPatch)
-	before := r.object(t, kindDeployment, ns, "fatline")
-	csa, err := ClientSideManagers(before.Metadata.ManagedFields)
-	r.check(t, err, "ClientSideManagers")
-	hadApply := slices.ContainsFunc(before.Metadata.ManagedFields, IsOwnApply)
-	patch, err := MigrationPatch(before, csa, FieldManager)
-	r.check(t, err, "MigrationPatch")
-	undecodable := strings.Replace(string(patch), `"apiVersion":"apps/v1"`, `"apiVersion":""`, 1)
-	if patch == nil || undecodable == string(patch) {
-		t.Fatal("the patch carries no apiVersion to break")
-	}
-	answer, err := r.c.PatchJSON(ctx, kindDeployment, ns, "fatline", []byte(undecodable))
-	code := r.answered(t, err)
-	fact(t, "an undecodable managed-fields rewrite: %d", code)
-	if err != nil {
-		t.Fatalf("the server refused the undecodable rewrite rather than keeping the live list: %s", r.env.scrub(err.Error()))
-	}
-	back := r.object(t, kindDeployment, ns, "fatline")
-	for _, o := range []struct {
-		what string
-		obj  Object
-	}{{"the answer", answer}, {"the read-back", back}} {
-		kept := slices.ContainsFunc(o.obj.Metadata.ManagedFields, isCSAEntry(kubectlClientSideApply))
-		fact(t, "%s: entries %v; annotation present: %t", o.what, entryNames(o.obj.Metadata), annotated(o.obj.Metadata))
-		if annotated(o.obj.Metadata) {
-			t.Errorf("%s still carries the annotation: its removal did not apply", o.what)
-		}
-		if !kept {
-			t.Errorf("%s lost kubectl-client-side-apply/Update: the server did not keep the live list", o.what)
-		}
-		if err := MigratedEndState(o.obj, csa, FieldManager, hadApply); !errors.Is(err, ErrNotMigrated) {
-			t.Errorf("%s: MigratedEndState = %v, want a refusal", o.what, err)
-		}
-	}
-}
-
-// TestMigrationIsResumable, at the level of the primitives (C20; the
-// five-attempt loop is a cli test, A30-23): a patch read at a resourceVersion
-// another writer has since moved is a 409 that unwraps to tkube.ErrConflict,
-// and leaves the object as it was; a fresh read then migrates it; and a second
-// pass finds nothing to do.
-func TestMigrationIsResumable(t *testing.T) {
-	r := openRealAPI(t)
-	ns := r.runNamespace(t, "resume")
-	ctx := t.Context()
-	r.seed(t, kindConfigMap, ns, doc(configMapV1, ns, seedV1), seedV1bPatch)
-	stale := r.object(t, kindConfigMap, ns, "api")
-	csa, err := ClientSideManagers(stale.Metadata.ManagedFields)
-	r.check(t, err, "ClientSideManagers")
-	other := fmt.Sprintf("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: api\n  namespace: %s\n  labels:\n    realapi.farcast.sofmon.com/other: \"yes\"\n", ns)
-	_, _, err = r.rawApply(ctx, kindConfigMap, ns, "api", []byte(other), "realapi-other", false)
-	r.check(t, err, "another writer's apply")
-	moved := r.object(t, kindConfigMap, ns, "api")
-
-	patch, err := MigrationPatch(stale, csa, FieldManager)
-	r.check(t, err, "MigrationPatch")
-	_, err = r.c.PatchJSON(ctx, kindConfigMap, ns, "api", patch)
-	code := r.answered(t, err)
-	fact(t, "a migration patch read at a moved resourceVersion: %d", code)
-	if !errors.Is(err, tkube.ErrConflict) {
-		t.Fatalf("the stale patch: %d, want 409 unwrapping to tkube.ErrConflict", code)
-	}
-	unchanged := r.object(t, kindConfigMap, ns, "api")
-	left, _ := ClientSideManagers(unchanged.Metadata.ManagedFields)
-	if unchanged.Metadata.ResourceVersion != moved.Metadata.ResourceVersion || !annotated(unchanged.Metadata) || !slices.Equal(left, csa) {
-		t.Errorf("the refused patch changed the object: entries %v, annotation present %t", entryNames(unchanged.Metadata), annotated(unchanged.Metadata))
-	}
-
-	m, err := r.migrateOne(ctx, kindConfigMap, ns, "api")
-	r.check(t, err, "the migration from a fresh read")
-	fact(t, "after the resumed migration: entries %v", entryNames(m.after.Metadata))
-
-	again := r.object(t, kindConfigMap, ns, "api")
-	csa2, err := ClientSideManagers(again.Metadata.ManagedFields)
-	r.check(t, err, "ClientSideManagers on the second pass")
-	if p, err := MigrationPatch(again, csa2, FieldManager); err != nil || p != nil {
-		t.Errorf("the second pass: MigrationPatch = %d bytes, %v; want nothing to do", len(p), err)
-	}
-}
-
-// TestFirstApplyAfterMigrationChangesNoGeneration is csaupgrade's caveat 3
-// (§6.3): after the migration farcast owns the fields the client-side create
-// had defaulted, and its first forced apply, which omits them, releases them.
-// The baseline is the read after the migration, whose own generation move is
-// recorded: a Deployment's annotation change bumps it [doc]. The re-apply is
-// the manifest as kubectl last applied it (v1 with v1b's one change; the
-// Secret in its data: form): it must leave the generation where it was and
-// add no entry. Whether the resourceVersion moved is recorded.
-func TestFirstApplyAfterMigrationChangesNoGeneration(t *testing.T) {
-	r := openRealAPI(t)
-	ns := r.runNamespace(t, "generation")
-	for _, tc := range []struct {
-		kind              Kind
-		object, seed, now string
-	}{
-		{kindDeployment, "fatline", fatlineV1, fatlineV1},
-		{kindStatefulSet, "datasphered", statefulSetV1, statefulSetV1},
-		{kindService, "api", serviceV1, serviceV1},
-		{kindSecret, "api-egress", secretSeed, secretV1},
-	} {
-		t.Run(tc.kind.Kind, func(t *testing.T) {
-			r.seed(t, tc.kind, ns, doc(tc.seed, ns, seedV1), seedV1bPatch)
-			seeded := r.object(t, tc.kind, ns, tc.object)
-			m, err := r.migrateOne(t.Context(), tc.kind, ns, tc.object)
-			r.check(t, err, "the migration")
-			base := m.after.Metadata
-			r.apply(t, doc(tc.now, ns, seedV1b), true)
-			after := r.object(t, tc.kind, ns, tc.object).Metadata
-			var added []string
-			for _, e := range entryNames(after) {
-				if !slices.Contains(entryNames(base), e) {
-					added = append(added, e)
-				}
-			}
-			fact(t, "%s: generation %d seeded, %d after the migration, %d after the first apply; entries added %v; resourceVersion moved on the apply: %t",
-				tc.kind.Kind, seeded.Metadata.Generation, base.Generation, after.Generation, added, after.ResourceVersion != base.ResourceVersion)
-			if after.Generation != base.Generation {
-				t.Errorf("the first apply after the migration moved metadata.generation from %d to %d", base.Generation, after.Generation)
-			}
-			if len(added) > 0 {
-				t.Errorf("the first apply after the migration added entries %v", added)
-			}
+			fact(t, "%s: after v1's and v2's forced applies, entries %v", sc.name, entryNames(back.Metadata))
 		})
 	}
 }
@@ -1668,15 +1185,24 @@ func TestApplyRefusesAStaleResourceVersion(t *testing.T) {
 }
 
 // TestMetadataOnlyListsCarryNoSecretData: what farcast asks for as metadata
-// only (§2.1, A30-9) comes back without a Secret's values, while kubectl's
-// annotation, which holds a copy of them, is still there; no message may
-// quote it. It reads the raw answers of ListObjects, a raw partial list,
-// GetObject and the migration's PatchJSON, through TapAnswers.
+// only (§2.1, A30-9) comes back without a Secret's values. The Secret is
+// farcast's own forced apply, which carries no kubectl annotation (design
+// §37, A37-9). A full GET first requires the stored Secret to hold a value
+// under each of its two keys, or an answer without them would show nothing;
+// the values are checked for presence only and never printed. Then it reads
+// the raw answers of ListObjects, a raw partial list and GetObject, through
+// TapAnswers.
 func TestMetadataOnlyListsCarryNoSecretData(t *testing.T) {
 	r := openRealAPI(t)
 	ns := r.runNamespace(t, "metadata")
 	ctx := t.Context()
-	r.seed(t, kindSecret, ns, doc(secretSeed, ns, seedV1), seedV1bPatch)
+	r.apply(t, doc(secretV1, ns, seedV1), true)
+	stored, _ := field(r.raw(t, kindSecret.Path(ns, "api-egress")), "data").(map[string]any)
+	for _, key := range []string{"FARCAST_FATLINE_PROXY", "REALAPI_DROPPED"} {
+		if v, _ := stored[key].(string); v == "" {
+			t.Fatalf("the stored Secret holds no value under %s, so an answer without data would show nothing", key)
+		}
+	}
 
 	c := r.client(t)
 	var mu sync.Mutex
@@ -1691,34 +1217,28 @@ func TestMetadataOnlyListsCarryNoSecretData(t *testing.T) {
 		defer mu.Unlock()
 		return last[method]
 	}
-	tapped := &realAPI{env: r.env, c: c}
 
 	objs, err := c.ListObjects(ctx, kindSecret, ns, "")
 	r.check(t, err, "ListObjects")
-	if len(objs) != 1 || !annotated(objs[0].Metadata) {
-		t.Errorf("ListObjects decoded %d object(s); want the one Secret, its annotation present", len(objs))
+	if len(objs) != 1 || objs[0].Metadata.Name != "api-egress" {
+		t.Errorf("ListObjects decoded %d object(s); want the one Secret", len(objs))
 	}
-	noSecretValues(t, "ListObjects' answer", answer(http.MethodGet), true)
+	noSecretValues(t, "ListObjects' answer", answer(http.MethodGet))
 
 	b, err := c.do(ctx, call{method: http.MethodGet, path: kindSecret.ListPath(ns), accept: acceptPartialList, retry: true})
 	r.check(t, err, "the raw partial list")
-	noSecretValues(t, "a raw partial list", b, true)
+	noSecretValues(t, "a raw partial list", b)
 
 	_, err = c.GetObject(ctx, kindSecret, ns, "api-egress")
 	r.check(t, err, "GetObject")
-	noSecretValues(t, "GetObject's answer", answer(http.MethodGet), true)
-
-	_, err = tapped.migrateOne(ctx, kindSecret, ns, "api-egress")
-	r.check(t, err, "the migration")
-	noSecretValues(t, "PatchJSON's answer", answer(http.MethodPatch), false)
-	noSecretValues(t, "GetObject's answer after the migration", answer(http.MethodGet), false)
+	noSecretValues(t, "GetObject's answer", answer(http.MethodGet))
 }
 
 // noSecretValues fails when any object of a raw answer, or of its items,
-// carries data or stringData. wantAnnotation is whether each must still carry
-// kubectl's annotation, whose value is never read. It records the answer's
-// kind and each object's top-level keys.
-func noSecretValues(t *testing.T, what string, body []byte, wantAnnotation bool) {
+// carries data or stringData, or kubectl's annotation, which farcast's apply
+// never writes and whose value is never read. It records the answer's kind
+// and each object's top-level keys.
+func noSecretValues(t *testing.T, what string, body []byte) {
 	t.Helper()
 	var top map[string]any
 	if err := json.Unmarshal(body, &top); err != nil {
@@ -1740,8 +1260,8 @@ func noSecretValues(t *testing.T, what string, body []byte, wantAnnotation bool)
 				t.Errorf("%s carries %s", what, k)
 			}
 		}
-		if got := field(m, "metadata", "annotations", lastAppliedAnnotation) != nil; got != wantAnnotation {
-			t.Errorf("%s: the annotation present %t, want %t", what, got, wantAnnotation)
+		if field(m, "metadata", "annotations", lastAppliedAnnotation) != nil {
+			t.Errorf("%s carries kubectl's annotation", what)
 		}
 	}
 	fact(t, "%s: kind %v; the objects' top-level keys %v", what, top["kind"], shapes)
@@ -1943,59 +1463,54 @@ func TestKernelWritesAreTrackedAsTechnocore(t *testing.T) {
 	})
 }
 
-// TestMigrationLeavesAnotherManagersFieldAlone: another manager's field, on
-// an object kubectl's client-side apply seeded, survives the migration, and a
-// forced farcast apply then takes it, which is P1 (c)'s reset. The other
-// manager is realapi-other's merge PATCH on the Deployment itself, which the
-// server records as an Update owning spec.replicas (§31's /scale [diag]).
-// The order is pinned (A31-5), because a /scale write of 0 strips every owner
-// of spec.replicas:
-//  1. the client-side seed;
+// TestForcedApplyTakesAnotherManagersField (design §37, A37-9; written, not
+// run): a forced farcast apply takes another manager's field, which is P1
+// (c)'s reset. The other manager is realapi-other's merge PATCH on the
+// Deployment itself, which the server records as an Update owning
+// spec.replicas (§31's /scale [diag]). The order is pinned (A31-5), because a
+// /scale write of 0 strips every owner of spec.replicas:
+//  1. farcast's forced apply of the Deployment, after which farcast/Apply
+//     owns spec.replicas;
 //  2. the kernel's Scale to 0, whose entries are recorded only;
 //  3. realapi-other's merge PATCH of spec.replicas to 3, a value other than
-//     the live one, after which realapi-other/Update owns it;
-//  4. migrateOne, after which that entry is unchanged and replicas reads 3;
-//  5. the forced apply of replicas: 1, after which farcast/Apply owns it and
+//     the live one, after which realapi-other/Update owns it, farcast/Apply
+//     does not, and it reads 3;
+//  4. the forced apply of replicas: 1, after which farcast/Apply owns it and
 //     it reads 1.
 //
-// No /scale write follows the PATCH.
-func TestMigrationLeavesAnotherManagersFieldAlone(t *testing.T) {
+// Steps 1 and 3 require farcast/Apply to own the field and then not, so the
+// last step cannot pass on a field farcast never lost. No /scale write
+// follows the PATCH.
+func TestForcedApplyTakesAnotherManagersField(t *testing.T) {
 	r := openRealAPI(t)
 	ns := r.runNamespace(t, "scale")
 	ctx := t.Context()
 	k := r.kernel(t, ns)
-	r.seed(t, kindDeployment, ns, doc(fatlineV1, ns, seedV1), seedV1bPatch)
+	r.apply(t, doc(fatlineV1, ns, seedV1), true)
+	if !farcastOwnsReplicas(r.object(t, kindDeployment, ns, "fatline").Metadata) {
+		t.Fatal("farcast/Apply does not own spec.replicas after its first forced apply, so nothing here shows the field taken back")
+	}
 	r.check(t, k.Scale(ctx, ns, "fatline", 0), "the kernel's Scale")
 	scaled := r.object(t, kindDeployment, ns, "fatline")
 	fact(t, "after the kernel's Scale to 0: entries %v", entryNames(scaled.Metadata))
 
 	r.check(t, r.mergePatch(ctx, kindDeployment, ns, "fatline", []byte(`{"spec":{"replicas":3}}`), realAPIOther), "realapi-other's merge PATCH")
 	patched := r.object(t, kindDeployment, ns, "fatline")
-	other, ok := otherReplicasEntry(patched.Metadata)
+	ok := otherOwnsReplicas(patched.Metadata)
 	fact(t, "after %s's merge PATCH of spec.replicas: entries %v; %s/Update owns spec.replicas: %t", realAPIOther, entryNames(patched.Metadata), realAPIOther, ok)
 	if !ok {
 		t.Fatalf("after its merge PATCH, no %s/Update entry owns spec.replicas", realAPIOther)
 	}
-
-	m, err := r.migrateOne(ctx, kindDeployment, ns, "fatline")
-	r.check(t, err, "the migration")
-	migrated, ok := otherReplicasEntry(m.after.Metadata)
-	fact(t, "after the migration: entries %v; %s/Update unchanged: %t", entryNames(m.after.Metadata), realAPIOther, ok && sameEntries([]ManagedFieldsEntry{other}, []ManagedFieldsEntry{migrated}))
-	if !ok || !sameEntries([]ManagedFieldsEntry{other}, []ManagedFieldsEntry{migrated}) {
-		t.Errorf("the migration changed %s's entry, or its ownership of spec.replicas", realAPIOther)
+	if farcastOwnsReplicas(patched.Metadata) {
+		t.Fatalf("farcast/Apply still owns spec.replicas after %s's merge PATCH, so the forced apply would take nothing back", realAPIOther)
 	}
 	if got := field(r.raw(t, kindDeployment.Path(ns, "fatline")), "spec", "replicas"); got != float64(3) {
-		t.Errorf("spec.replicas reads %v after the migration, not %s's 3", got, realAPIOther)
+		t.Errorf("spec.replicas reads %v after the merge PATCH, not %s's 3", got, realAPIOther)
 	}
 
-	r.apply(t, doc(fatlineV1, ns, seedV1b, "{replicas}", "1"), true)
+	r.apply(t, doc(fatlineV1, ns, seedV1, "{replicas}", "1"), true)
 	reset := r.object(t, kindDeployment, ns, "fatline")
-	var farcastOwns bool
-	for _, e := range reset.Metadata.ManagedFields {
-		if IsOwnApply(e) && owns(e, "f:spec", "f:replicas") {
-			farcastOwns = true
-		}
-	}
+	farcastOwns := farcastOwnsReplicas(reset.Metadata)
 	fact(t, "after a forced farcast apply of replicas: 1: entries %v; farcast/Apply owns spec.replicas: %t", entryNames(reset.Metadata), farcastOwns)
 	if got := field(r.raw(t, kindDeployment.Path(ns, "fatline")), "spec", "replicas"); got != float64(1) {
 		t.Errorf("spec.replicas reads %v after the forced apply of 1", got)
@@ -2005,19 +1520,27 @@ func TestMigrationLeavesAnotherManagersFieldAlone(t *testing.T) {
 	}
 }
 
-// realAPIOther is the other manager TestMigrationLeavesAnotherManagersFieldAlone
+// realAPIOther is the other manager TestForcedApplyTakesAnotherManagersField
 // writes as, the name the suite's other second appliers use too.
 const realAPIOther = "realapi-other"
 
-// otherReplicasEntry is md's realapi-other/Update entry on the main
-// resource, and whether there is one that owns spec.replicas.
-func otherReplicasEntry(md ObjectMeta) (ManagedFieldsEntry, bool) {
+// otherOwnsReplicas is whether md has a realapi-other/Update entry on the
+// main resource that owns spec.replicas.
+func otherOwnsReplicas(md ObjectMeta) bool {
 	for _, e := range md.ManagedFields {
 		if e.Manager == realAPIOther && e.Operation == "Update" && e.Subresource == "" && owns(e, "f:spec", "f:replicas") {
-			return e, true
+			return true
 		}
 	}
-	return ManagedFieldsEntry{}, false
+	return false
+}
+
+// farcastOwnsReplicas is whether farcast's own Apply entry on md owns
+// spec.replicas.
+func farcastOwnsReplicas(md ObjectMeta) bool {
+	return slices.ContainsFunc(md.ManagedFields, func(e ManagedFieldsEntry) bool {
+		return IsOwnApply(e) && owns(e, "f:spec", "f:replicas")
+	})
 }
 
 // mergePatch is a JSON merge PATCH of body on the object, as manager, with
@@ -2034,177 +1557,6 @@ func (r *realAPI) mergePatch(ctx context.Context, k Kind, ns, name string, body 
 	return err
 }
 
-// sameEntries compares two lists of entries by manager, operation,
-// subresource and fields, the time aside.
-func sameEntries(a, b []ManagedFieldsEntry) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if entryName(a[i]) != entryName(b[i]) || !sameFields(a[i].FieldsV1, b[i].FieldsV1) {
-			return false
-		}
-	}
-	return true
-}
-
-// sameFields compares two fieldsV1 as decoded JSON.
-func sameFields(a, b json.RawMessage) bool {
-	var x, y any
-	if json.Unmarshal(a, &x) != nil || json.Unmarshal(b, &y) != nil {
-		return false
-	}
-	return reflect.DeepEqual(x, y)
-}
-
-// seedDocs reads one of the kubectl variant's files, testdata/realapi/<file>,
-// the documents R7 applies with kubectl -n: each decoded, in file order.
-func seedDocs(t *testing.T, file string) []map[string]any {
-	t.Helper()
-	b, err := os.ReadFile(filepath.Join("testdata", "realapi", file))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var out []map[string]any
-	for _, c := range splitChunks(b) {
-		if c.empty() {
-			continue
-		}
-		var m map[string]any
-		if err := yaml.Unmarshal(c.raw, &m); err != nil {
-			t.Fatalf("%s: a document does not decode: %v", file, err)
-		}
-		out = append(out, cloneJSON(m))
-	}
-	return out
-}
-
-// seedV2 is a kubectl seed document as farcast applies its next version:
-// v1b in namespace ns, without the label farcast.sofmon.com/instance, and a
-// Secret's stringData as data:. It is YAML, which SplitStream checks.
-func seedV2(t *testing.T, v1b map[string]any, ns string) string {
-	t.Helper()
-	v2 := cloneJSON(v1b)
-	labels, _ := field(v2, "metadata", "labels").(map[string]any)
-	if _, ok := labels["farcast.sofmon.com/instance"]; !ok {
-		t.Fatal("a seed document carries no label farcast.sofmon.com/instance to drop")
-	}
-	delete(labels, "farcast.sofmon.com/instance")
-	field(v2, "metadata").(map[string]any)["namespace"] = ns
-	if sd, ok := v2["stringData"].(map[string]any); ok {
-		data := map[string]any{}
-		for k, v := range sd {
-			s, _ := v.(string)
-			data[k] = base64.StdEncoding.EncodeToString([]byte(s))
-		}
-		delete(v2, "stringData")
-		v2["data"] = data
-	}
-	// Through JSON, so a number decoded as a float64 is written as the
-	// integer it is (443, not 443.0).
-	j, err := json.Marshal(v2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	b, err := yaml.JSONToYAML(j)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return string(b)
-}
-
-// seedEntry is a managed-fields entry as the kubectl variant compares it:
-// the time and the apiVersion aside.
-type seedEntry struct {
-	Name   string
-	Fields any
-}
-
-func seedEntriesOf(t *testing.T, md ObjectMeta) []seedEntry {
-	t.Helper()
-	out := make([]seedEntry, 0, len(md.ManagedFields))
-	for _, e := range md.ManagedFields {
-		var f any
-		if err := json.Unmarshal(e.FieldsV1, &f); err != nil {
-			t.Fatalf("%s's fieldsV1 does not decode", entryName(e))
-		}
-		out = append(out, seedEntry{Name: entryName(e), Fields: f})
-	}
-	return out
-}
-
-// TestEmulatedSeedMatchesKubectl validates the emulated client-side seed the
-// stuck-field cases rely on (A30-3), once, in R7: kubectl has applied
-// kubectl-seed-v1.yaml and then kubectl-seed-v1b.yaml in the namespace
-// FARCAST_REALAPI_KUBECTL_NAMESPACE names; this seeds the same documents with
-// seedClientSide in a namespace of its own. Each entry's manager, operation,
-// subresource and fieldsV1, and the annotation's presence, must match. Then
-// both are migrated and applied as v2, and must end the same way.
-func TestEmulatedSeedMatchesKubectl(t *testing.T) {
-	kns := os.Getenv(envRealAPIKubectlNamespace)
-	if kns == "" {
-		t.Skipf("%s is unset: this test compares kubectl's own client-side seed, which R7 of docs/runbooks/adr-0023-m2-realapi.md makes on the VM, with the emulated one, and R7 runs it", envRealAPIKubectlNamespace)
-	}
-	r := openRealAPI(t)
-	ns := r.runNamespace(t, "emulated")
-	ctx := t.Context()
-	v1s, v1bs := seedDocs(t, "kubectl-seed-v1.yaml"), seedDocs(t, "kubectl-seed-v1b.yaml")
-	if len(v1s) == 0 || len(v1s) != len(v1bs) {
-		t.Fatalf("the seed files hold %d and %d documents", len(v1s), len(v1bs))
-	}
-	for i, v1 := range v1s {
-		v1b := v1bs[i]
-		apiVersion, _ := v1["apiVersion"].(string)
-		kindName, _ := v1["kind"].(string)
-		name, _ := field(v1, "metadata", "name").(string)
-		k, ok := KindOf(apiVersion, kindName)
-		if !ok || v1b["kind"] != kindName || field(v1b, "metadata", "name") != name {
-			t.Fatalf("seed document %d: %s %s %q is not a kind farcast applies, or v1b's document %d is not the same object", i, apiVersion, kindName, name, i)
-		}
-		t.Run(kindName+" "+name, func(t *testing.T) {
-			v1JSON, err := json.Marshal(v1)
-			r.check(t, err, "v1")
-			patch, err := secondApplyPatch(v1, v1b)
-			r.check(t, err, "v1b's patch")
-			var smp []byte
-			if patch != nil {
-				if smp, err = json.Marshal(patch); err != nil {
-					t.Fatal(err)
-				}
-			}
-			r.check(t, r.seedClientSide(ctx, k, ns, v1JSON, smp), "the emulated seed")
-			kubectl := r.object(t, k, kns, name).Metadata
-			emulated := r.object(t, k, ns, name).Metadata
-			same := reflect.DeepEqual(seedEntriesOf(t, kubectl), seedEntriesOf(t, emulated)) && annotated(kubectl) == annotated(emulated)
-			fact(t, "%s %s: kubectl's seed %v, annotation %t; the emulated seed %v, annotation %t; equal: %t",
-				kindName, name, entryNames(kubectl), annotated(kubectl), entryNames(emulated), annotated(emulated), same)
-			if !same {
-				for _, md := range []struct {
-					who string
-					md  ObjectMeta
-				}{{"kubectl's", kubectl}, {"the emulated", emulated}} {
-					for _, e := range md.md.ManagedFields {
-						fact(t, "%s seed's %s fieldsV1 %s", md.who, entryName(e), e.FieldsV1)
-					}
-				}
-				t.Errorf("the emulated seed differs from kubectl's")
-			}
-			for _, n := range []string{kns, ns} {
-				m, err := r.migrateOne(ctx, k, n, name)
-				r.check(t, err, "the migration")
-				r.apply(t, seedV2(t, v1b, n), true)
-				if field(r.raw(t, k.Path(n, name)), "metadata", "labels", "farcast.sofmon.com/instance") != nil {
-					t.Errorf("stuck field: the label farcast.sofmon.com/instance is still on the live %s after v2's forced apply", kindName)
-				}
-				back := r.object(t, k, n, name)
-				if err := MigratedEndState(back, m.csa, FieldManager, m.hadApply); err != nil {
-					t.Errorf("the end state after v2's apply: %v", err)
-				}
-			}
-		})
-	}
-}
-
 // serviceAccountDoc is a ServiceAccount in the renderers' shape, the
 // builder's (planck/build) and the keyholder's (datasphere/deploy): its
 // name, its namespace and its app.kubernetes.io/name label.
@@ -2218,15 +1570,16 @@ metadata:
     app.kubernetes.io/managed-by: farcast
 `
 
-// TestServiceAccountUIDSurvivesForcedApplyAndMigration (design §33, R1;
-// written, not run): the grants of ADR 0023 M2.8 name a ServiceAccount by
-// the uid the API server gave it, so nothing farcast does to the account
-// may give it another. A forced apply of the builder's ServiceAccount over
-// itself, as kernel deploy and every build apply it, keeps its uid; and a
-// keyholder's ServiceAccount kubectl's client-side apply created keeps its
-// uid through the migration's patch and the first forced apply after it.
-// What it records: whether each kept the uid, never the uid.
-func TestServiceAccountUIDSurvivesForcedApplyAndMigration(t *testing.T) {
+// TestServiceAccountUIDSurvivesAForcedApply (design §33, R1, as §37's A37-9
+// narrows it; written, not run): the grants of ADR 0023 M2.8 name a
+// ServiceAccount by the uid the API server gave it, so nothing farcast does
+// to the account may give it another. A forced apply of the builder's
+// ServiceAccount over itself, as kernel deploy and every build apply it,
+// keeps its uid; and so does a forced apply that changes the keyholder's
+// ServiceAccount's labels. That account must have a uid and lack the added
+// label before the change, so the change is one. What it records: whether
+// each kept the uid, never the uid.
+func TestServiceAccountUIDSurvivesAForcedApply(t *testing.T) {
 	r := openRealAPI(t)
 	ns := r.runNamespace(t, "sauid")
 	k := mustKind("v1", "ServiceAccount")
@@ -2242,17 +1595,27 @@ func TestServiceAccountUIDSurvivesForcedApplyAndMigration(t *testing.T) {
 		t.Errorf("a forced apply of an unchanged ServiceAccount gave it another uid, or none")
 	}
 
+	const managedBy = "    app.kubernetes.io/managed-by: farcast\n"
 	keyholder := fmt.Sprintf(serviceAccountDoc, "datasphered", ns, "datasphered")
-	r.seed(t, k, ns, keyholder, "")
-	seeded := r.object(t, k, ns, "datasphered").Metadata
-	m, err := r.migrateOne(t.Context(), k, ns, "datasphered")
-	r.check(t, err, "the migration of the ServiceAccount")
+	relabelled := strings.Replace(keyholder, managedBy, managedBy+"    realapi.farcast.sofmon.com/seed: changed\n", 1)
+	if relabelled == keyholder {
+		t.Fatal("the keyholder's ServiceAccount carries no managed-by label to add a label after")
+	}
 	r.apply(t, keyholder, true)
-	applied := r.object(t, k, ns, "datasphered").Metadata
-	fact(t, "a ServiceAccount kubectl created: uid kept through the migration %t, through the first apply after it %t; entries %v",
-		m.after.Metadata.UID == seeded.UID, applied.UID == seeded.UID, entryNames(applied))
-	if seeded.UID == "" || m.after.Metadata.UID != seeded.UID || applied.UID != seeded.UID {
-		t.Errorf("the migration, or the first apply after it, gave the ServiceAccount another uid")
+	created := r.object(t, k, ns, "datasphered").Metadata
+	if _, ok := created.Labels["realapi.farcast.sofmon.com/seed"]; ok || created.UID == "" {
+		t.Fatal("the keyholder's ServiceAccount already carries the label the second apply adds, or has no uid, so that apply would show nothing")
+	}
+	r.apply(t, relabelled, true)
+	changed := r.object(t, k, ns, "datasphered").Metadata
+	fact(t, "a forced apply that changes a ServiceAccount's labels: label applied %t, uid kept %t, resourceVersion moved %t; entries %v",
+		changed.Labels["realapi.farcast.sofmon.com/seed"] == "changed", changed.UID == created.UID,
+		changed.ResourceVersion != created.ResourceVersion, entryNames(changed))
+	if changed.Labels["realapi.farcast.sofmon.com/seed"] != "changed" {
+		t.Fatal("the forced apply of the changed labels did not change them")
+	}
+	if created.UID == "" || changed.UID != created.UID {
+		t.Errorf("a forced apply that changes a ServiceAccount's labels gave it another uid, or none")
 	}
 }
 

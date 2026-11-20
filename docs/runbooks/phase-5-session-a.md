@@ -28,7 +28,7 @@ REPO=$PWD                    # the checkout: every farcast command runs from her
 WALK=$(mktemp -d)            # 0700 and OUTSIDE the checkout: keyring copies, packets, the passphrase, leaves
 STATE="${FARCAST_CONFIG_HOME:-$HOME/Library/Application Support/farcast}"   # the macOS default; on Linux, ${XDG_CONFIG_HOME:-$HOME/.config}/farcast
 export KUBECONFIG="$STATE/instances/$INSTANCE/kubeconfig.yaml"             # S1 writes it; never the default kubeconfig
-# (2026-11-18, ADR 0023 M2.7, built, not walked) Neither install nor connect writes kubeconfig.yaml any more, and farcast migrate deletes it. A re-walk observes with kubectl from Cloud Shell (ADR 0023 Phasing), not over a file farcast wrote; an exported KUBECONFIG naming the absent file fails rather than falling back to ~/.kube/config [inf].
+# (2026-11-18, ADR 0023 M2.7, built, not walked) Neither install nor connect writes kubeconfig.yaml any more. (2026-11-20, M2.9a, built, not walked: farcast migrate, which deleted one an older farcast left, is removed; only release deletes it now, with the instance's directory.) A re-walk observes with kubectl from Cloud Shell (ADR 0023 Phasing), not over a file farcast wrote; an exported KUBECONFIG naming the absent file fails rather than falling back to ~/.kube/config [inf].
 # the probe, built ONCE at a fixed path — see the note below
 go test -C "$REPO" -mod=vendor -tags walk -c -o "$WALK/walkprobe.test" ./farsight/cli/internal/cli/
 probe() { (cd "$WALK" && env FARCAST_WALK=1 FARCAST_WALK_INSTANCE="$INSTANCE" FARCAST_WALK_CWD="$WALK" "$@" \

@@ -341,11 +341,14 @@ struct CLIDocumentsTests {
         for word in ["Granted", "keyMissing", "", "pinned", "granted "] {
             #expect(CLIDocuments.readerState(word) == .unknown, "\(word)")
         }
+        // `migrated`, which farcast printed from ADR 0023 M2.4 to M2.8, is a
+        // key this build ignores. Entries a and b keep it, and c never had
+        // it, so a schema-2 listing reads with it or without it: why M2.9a
+        // removed it without a new schema.
         let entries = #"[{"name":"a","status":"running","reader":"not_granted","migrated":false},{"name":"b","status":"running","reader":"rotating","migrated":true},{"name":"c","status":"running"}]"#
         let data = Data(#"{"schema":2,"generated_at":"2026-11-12T10:00:00Z","farcast":{"version":"v0","commit":"0e54eb1"},"instances":\#(entries)}"#.utf8)
         let listing = try CLIDocuments.instances(data).instances
         #expect(listing.map(\.reader) == [.notGranted, .unknown, nil])
-        #expect(listing.map(\.migrated) == [false, true, nil])
     }
 
     @Test("a group the reader may not read carries why, as the apps section's kind; a group read carries nothing")

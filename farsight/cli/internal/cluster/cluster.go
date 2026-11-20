@@ -1,23 +1,21 @@
 // Package cluster is FarCast's operations on an instance's cluster: apply a
 // manifest stream, await a rollout, read a Service's external IP, read the
 // kernel's checkpoint and an application Deployment's state, create or
-// compare-and-replace the keyholder's key pin, (ADR 0023 M2.7) the
-// migration's metadata reads and managed-fields patch, and (M2.8)
-// git-credential rm's delete of a Secret. Every Client is built by Open, as
-// one of the instance's two identities, and works in-process through
-// internal/kube: the reader for the read commands and the plans, and the
-// writer for a writing command's reads and every write. Every write is a
-// server-side apply as farcast, except the pin's create and replace, the
-// migration's patch, and git-credential rm's uid-preconditioned Secret
-// delete, which takes no field manager. It starts no program: kubectl, its
-// allowlisted environment and the Runner seam went in ADR 0023 M2.7.
+// compare-and-replace the keyholder's key pin, and (ADR 0023 M2.8) read one
+// object's metadata and delete git-credential rm's Secret. Every Client is
+// built by Open, as one of the instance's two identities, and works
+// in-process through internal/kube: the reader for the read commands and the
+// plans, and the writer for a writing command's reads and every write. Every
+// write is a server-side apply as farcast, except the pin's create and
+// replace, and git-credential rm's uid-preconditioned Secret delete, which
+// takes no field manager. It starts no program: kubectl, its allowlisted
+// environment and the Runner seam went in ADR 0023 M2.7.
 package cluster
 
 import (
 	"context"
 	"fmt"
 	"io"
-	"slices"
 	"sync"
 	"time"
 
@@ -37,13 +35,6 @@ type Client struct {
 	warnMu   sync.Mutex
 	warned   int
 
-	// traces is every object an Apply's answer showed still carrying a trace
-	// of kubectl's client-side apply (kube.ClientSideTrace), named by
-	// traceName, once each, in apply order (ADR 0023 §6.6). Traces returns a
-	// copy. Both are under traceMu.
-	traceMu sync.Mutex
-	traces  []string
-
 	// poll is the wait between the reads of RolloutStatus, WaitExternalIP and
 	// WaitJob; zero is each one's own (2 s, 3 s and 5 s). cluster's tests set
 	// it so that several reads take no time.
@@ -62,10 +53,6 @@ type Client struct {
 // document that fails, and its error says how many documents before it were
 // applied and names the one that failed; nothing after it is sent. No apply
 // is atomic: the documents before the failure stay applied.
-//
-// Each answer that still carries a trace of kubectl's client-side apply
-// (kube.ClientSideTrace) is noted for Traces, the documents applied before a
-// failure included.
 func (c *Client) Apply(ctx context.Context, manifests []byte) error {
 	if err := c.neverWrites(); err != nil {
 		return err
@@ -107,57 +94,28 @@ func (c *Client) ApplyAt(ctx context.Context, manifest []byte, resourceVersion s
 }
 
 // applyDocuments sends each of docs as its own forced server-side apply, in
-// order, writing the warnings each answer carried after it and noting its
-// traces, and stops at the first that fails (Apply's rules).
+// order, writing the warnings each answer carried after it, and stops at the
+// first that fails (Apply's rules). The answer's metadata is not read.
 func (c *Client) applyDocuments(ctx context.Context, docs []kube.Document) error {
 	for i, d := range docs {
-		md, err := c.kube.Apply(ctx, d, true)
+		_, err := c.kube.Apply(ctx, d, true)
 		c.flushWarnings()
 		if err != nil {
 			return fmt.Errorf("cluster: %d of %d documents were applied before %s failed: %w", i, len(docs), traceName(d), err)
 		}
-		c.noteTrace(d, md)
 	}
 	return nil
 }
 
-// traceName names an applied document as Traces lists it and Apply's error
-// names it: "<Kind> <namespace>/<name>", or "<Kind> <name>" for a
-// cluster-scoped one. It is built from the Document, whose kind, namespace
-// and name SplitStream checked, never from the server's answer.
+// traceName names a document as Apply's error names it: "<Kind>
+// <namespace>/<name>", or "<Kind> <name>" for a cluster-scoped one. It is
+// built from the Document, whose kind, namespace and name SplitStream
+// checked, never from the server's answer.
 func traceName(d kube.Document) string {
 	if d.Namespace == "" {
 		return d.Kind.Kind + " " + d.Name
 	}
 	return d.Kind.Kind + " " + d.Namespace + "/" + d.Name
-}
-
-// noteTrace notes d's object, once, when the answer md to its apply still
-// carries a trace of kubectl's client-side apply (kube.ClientSideTrace): the
-// last-applied annotation's key, or a client-side manager's entry. Only d's
-// name is kept, never anything of md, so no annotation value is held.
-func (c *Client) noteTrace(d kube.Document, md kube.ObjectMeta) {
-	if !kube.ClientSideTrace(md) {
-		return
-	}
-	name := traceName(d)
-	c.traceMu.Lock()
-	defer c.traceMu.Unlock()
-	if !slices.Contains(c.traces, name) {
-		c.traces = append(c.traces, name)
-	}
-}
-
-// Traces lists every object an Apply of this client answered with that still
-// carries kubectl's client-side apply's annotation or entry (ADR 0023 §6.6):
-// a farcast older than M2.7, or kubectl, wrote it since the instance was
-// migrated. Each is named as traceName names it, once, in apply order, and
-// the list is a copy; it is empty when there is none. farcast's own Apply
-// entry, which every answer carries, is no trace.
-func (c *Client) Traces() []string {
-	c.traceMu.Lock()
-	defer c.traceMu.Unlock()
-	return slices.Clone(c.traces)
 }
 
 // RolloutStatus blocks until the named Deployment is rolled out or the timeout
@@ -265,9 +223,9 @@ type DeploymentState struct {
 	AdaptedAt time.Time
 	// LastAppliedAt is the newest time among the Deployment's own
 	// managed-fields entries that record an apply by farcast
-	// (kube.IsLastApply: farcast's Apply, or kubectl's client-side apply
-	// Update), in UTC, zero when there is none. The kernel's scale and resize
-	// writes never move it. Kubernetes moves an entry's time only when that
+	// (kube.IsOwnApply: farcast's own Apply of the object), in UTC, zero
+	// when there is none. Another manager's write, kubectl's apply and the
+	// kernel's scale and resize writes among them, never moves it. Kubernetes moves an entry's time only when that
 	// manager changes a value, so an apply that changed nothing leaves it
 	// where it was.
 	LastAppliedAt time.Time

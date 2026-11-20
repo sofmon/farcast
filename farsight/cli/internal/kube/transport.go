@@ -56,7 +56,6 @@ const (
 const (
 	mediaJSON          = "application/json"
 	mediaApplyPatch    = "application/apply-patch+yaml"
-	mediaJSONPatch     = "application/json-patch+json"
 	acceptPartial      = "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1"
 	acceptPartialList  = "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1"
 	msgAnswerTooLarge  = "the API server's answer to %s %s is larger than 64 MiB"
@@ -223,8 +222,8 @@ type call struct {
 	contentType string
 	body        []byte
 	// retry is D12's policy: a GET or a server-side apply is sent again on
-	// 429 and 503. POST, PUT, DELETE and a JSON patch never are; their
-	// callers have their own policies.
+	// 429 and 503. POST, PUT and DELETE never are; their callers have their
+	// own policies.
 	retry bool
 	// stream is a log read: no per-attempt deadline, and no cap on its body.
 	stream bool

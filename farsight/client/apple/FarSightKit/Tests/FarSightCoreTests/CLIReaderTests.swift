@@ -147,6 +147,9 @@ struct CLIReaderTests {
             (Data(#"{"error":{"message":"instance \"atlas\" has no reader identity","code":1,"kind":"credential_missing"}}"#.utf8), .credentialMissing),
             // One it retired reads as no reason the map knows.
             (Data(#"{"error":{"message":"m","code":1,"kind":"gcloud_mismatch"}}"#.utf8), .unknown),
+            // So does the one M2.9a retired with farcast migrate, which an
+            // M2.7 or M2.8 farcast sent.
+            (Data(#"{"error":{"message":"m","code":1,"kind":"not_migrated"}}"#.utf8), .unknown),
         ]
         for (data, kind) in envelopes {
             let reader = Fixture.reader(try Fixture.executor(worlds: ["atlas": .result(Fixture.exited(1, data))]))

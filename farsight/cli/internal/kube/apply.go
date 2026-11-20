@@ -68,6 +68,26 @@ func (c *Client) Apply(ctx context.Context, d Document, force bool) (ObjectMeta,
 	return answer.Metadata, nil
 }
 
+// operationApply is the managed-fields operation of a server-side apply
+// (meta/v1 ManagedFieldsOperationApply).
+const operationApply = "Apply"
+
+// IsOwnApply reports whether a managed-fields entry is farcast's own
+// server-side apply of the object: FieldManager's Apply entry on the main
+// resource (subresource ""). Every answer to Apply carries one. A write to
+// /scale or /status is not an apply of the object, and no other manager's
+// entry is farcast's, the kernel's included. cluster's DeploymentState reads
+// it for an application's last apply.
+func IsOwnApply(e ManagedFieldsEntry) bool {
+	return isSSAEntry(FieldManager)(e)
+}
+
+func isSSAEntry(ssa string) func(ManagedFieldsEntry) bool {
+	return func(e ManagedFieldsEntry) bool {
+		return e.Manager == ssa && e.Operation == operationApply && e.Subresource == ""
+	}
+}
+
 // deleteOptions is the body of DeleteSecret's request (meta/v1 DeleteOptions).
 type deleteOptions struct {
 	APIVersion    string        `json:"apiVersion"`

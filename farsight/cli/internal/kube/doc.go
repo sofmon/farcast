@@ -27,8 +27,6 @@
 //     may go (ParseServiceAccountJSON);
 //   - kinds.go is the table of kinds farcast applies;
 //   - stream.go splits and checks a rendered stream (SplitStream);
-//   - fields.go and migrate.go are the managed-fields rewrite of the one-time
-//     migration, a port of client-go's csaupgrade;
 //   - rollout.go and reads.go port kubectl's rollout status rules and its
 //     choice of a workload's pod for logs;
 //   - readerkey.go makes the reader identity's key and generic certificate.

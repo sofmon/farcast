@@ -8099,3 +8099,516 @@ After the review's fixes, the fix-check replayed step 5's 52 rows and the first 
 - **FT-MFC-9 (fix-check):** that row 139's precondition calls `namesADevice`, the code under test. A broken `namesADevice` fails the test there, which is a kill.
 - **FT-MFC-10 and FT-MFC-11 (fix-check):** `os.ModeDevice` in place of `os.ModeCharDevice`, and `namesADevice(path)` in place of `isTerminal(f)` on the opened file. The first is equivalent on every character device and refuses block devices too, which is the safe direction. The second is equivalent unless the path is changed in the moment between the open and its stat. No test can show that without a new seam, and the code as built checks the descriptor it opened (A36-2; D-S36-1).
 - **FT-MFC-12, FT-MFC-13 and FT-MFC-14 (fix-check):** the scan's dedupe, a walk that skips directories named `cmd`, and a scan that ignores a parenthesised receiver. The first can only fail closed. The second needs a new branch, and the fixture's `cmd/tool/main.go` (`tool:main`, A36-5) kills it; the root check, an `os.Stat` of two files, does not (D-S36-2). The third needs a condition on the selector's receiver, which the scan never reads.
+
+## 37. Decided before M2.9a's build (2026-11-20)
+
+M2.9a was mapped against the code at 37ce50b by a workflow of four read-only lanes, then a completeness critic. The lanes were the CLI, config and rehearsal packages; kube, kubetest and cluster; the Swift app; and the records. The critic made 14 corrections, found 13 missing items, designed 16 decisions with a build order and an estimate, and put three questions, which the orchestrator settled as the critic recommended. The operator had decided two things first, on 2026-11-20. The raw map is `map-result.json`, a working file that is not kept. M2.9 is split: **M2.9a** is the removal below, and **M2.9b** is the records sweep and the M2 walk runbook that §0 (`:79`) and §11 (`:2617`) gave M2.9. This section wins over §0–§36 wherever it differs. Where it is silent, the earlier sections govern, and a lane's proposal is advice, not a decision.
+
+Line numbers are at 37ce50b. Builders find each site by its symbol and confirm the line. In the bold leads, **Dn** is the critic's n-th design decision, **Cn** its n-th correction and **Mn** its n-th missing item, each in the map's order. §12's own D-rows are always named with their section.
+
+### Decided by the operator on 2026-11-20
+
+**A37-1 (O1): `farcast migrate`, the `not_migrated` refusal, and everything that exists only for them, are removed.**
+- **The premise.** No FarCast instance runs anywhere, and none persists until FarSight is finished. Every instance a walk installs is released at the walk's end.
+- **Why the migration was built.** The design noted on 2026-11-14 that no live instance existed, because the M1 walk had released its instance (§0, `:108`) [read]. It built the migration anyway, because ADR 0023 decision 2 called for a one-time, plan-gated command and a refusal in every other writing command (ADR 0023:93) [read], and §0's order put both in one commit with server-side apply (`:88`) [read]. With no instance to move, both protect nothing.
+- **What goes:**
+  - `cli/migrate.go` (685 lines), `migrate_test.go` (2,367 lines) and `testdata/plan/migrate.json` [read], and the registration (`cli.go:239`) [read];
+  - `refuseUnmigrated`'s 13 call sites in 12 commands, `storage key rotate` having two (`storagekey.go:570`, `:636`) [read];
+  - `afterWrites`' 17 call sites in 10 files (C8, A37-13) [read];
+  - the record's `server_side_apply` (A37-3), the `instances` document's `migrated` (A37-5), the kind (A37-6), kube's migration code (A37-7), `MigrateFact` (A37-12) and the legacy kubectl file helpers (A37-14).
+- **What stays:** everything else M2 built. Every write is still a forced server-side apply as `farcast` (`cluster.go:114`) [read], and the kernel's writes are still `technocore`'s. `data:` Secrets stay, and `kube.SplitStream` still refuses a rendered document that carries kubectl's last-applied annotation (`kube/stream.go:365-367`) [read].
+- **Accepted:**
+  - an instance an older farcast wrote is not supported (A37-18);
+  - an M2.7 or M2.8 farcast refuses `not_migrated` on a record M2.9a wrote (A37-3).
+
+  No instance persists, so neither case meets an operator.
+
+**A37-2 (O2): `instances pin-gcloud`'s `--account` flag is removed.** `instances pin-gcloud`, alone or with an instance, keeps `msgPinGCloudRetired` (`instances.go:52`) [read]. A37-11 gives the mechanics.
+
+### Decided by the orchestrator on 2026-11-20
+
+**A37-3 (D1, M7, M9): the record's `ServerSideApply` is removed.**
+- **What goes:**
+  - the field (`config/instance.go:404-409`) and its type (`:468-473`) [read];
+  - install's write (`install.go:216-225`) and the rehearsal's (`rehearsal/layout.go:257`) [read];
+  - `TestServerSideApplyRoundTripsAndMerges` (`config/instance_test.go:916`) [read];
+  - `recordMigrated` (`writecommands_test.go:61-70`) [read] and every call to it, with `clusterref_test.go:67`'s comment and its `:81` call (M9).
+- **Why:** nothing reads it once `instances.go:114` goes. Loading stays lenient: `yaml.Unmarshal` (`instance.go:751`) runs goccy's decoder with `disallowUnknownField: false` (`vendor/github.com/goccy/go-yaml/decode.go:65`) [read]. So a record that an M2.4–M2.8 farcast or a rehearsal directory wrote with the key loads, and its next save drops it. That is the `gcloud_account` precedent (`config/connected_test.go:15-60`) [read]. A field kept and ignored would round-trip a stale claim. Nothing reports the dropped key.
+- **Pinned by** `TestARetiredGCloudAccountLoadsAndDeploymentsRoundTrip` (M7). Its record also carries a nested `server_side_apply` block with `since` and `farcast`. The record loads, the deployments survive, and the raw file after `UpdateInstanceMetadata` holds no `server_side_apply`. Row 197.
+- **What this buys:** every write test now runs on a record without the mark. A record-based refusal put back fails them.
+
+**A37-4 (D2, C7, C11, M5; the critic's first question, resolved as recommended): `install` records nothing about the apply mode, and keeps a reworded warning.**
+- **Code:** the comment and the `if cluster.Created` block (`install.go:216-225`) go. The warning (`:230-233`) [read] becomes `Warning: cluster %q already existed under this instance's name, so this farcast did not create it and cannot tell what else wrote to it.`, with its newline. It is printed once, on stderr only, and install still succeeds. `buildinfo` stays imported (`install.go:163`) [read].
+- **Why keep a warning:** a leftover cluster, or another machine's install of the same name, is a fact the operator should know, whether or not client-side apply ever ran. `planck.Cluster.Created` (`gke.go:116-118`, pinned by `TestCreateClusterSaysWhetherItCreated`, `gke_test.go:135`) [read] keeps its one reader. Only its doc changes (`planck/types.go:68-73`) [read]: `(farcast install warns when it is not set; ADR 0023 M2.7, M2.9a)`.
+- **Tests:** `TestInstallRecordsServerSideApply` (`install_test.go:478`) and `TestInstallOnAnAdoptedClusterLeavesItUnmigrated` (`:515`) become `TestInstallWarnsOnlyOfAnAdoptedCluster`, run in `-o human` and `-o json`.
+  - With `Created` true, stderr holds no `already existed`. Today only `:505-507` pins that [read].
+  - With `Created` false, stderr holds the new text once, and stdout does not.
+
+  `recordAtCreate` (`:452-465`), `msgAdoptedCluster`'s old text (`:467-470`), the failed-create test's `ServerSideApply` assertion (`:377-383`) and the `buildinfo` import (`:19`) go [read]. Row 97b is re-pointed.
+- **Records:** the CLI README's install step 10 (`:295`) gets a dated replacement. It says M2.9a removed the `server_side_apply` record and the advice to run `migrate`, and it quotes the new warning (C11).
+
+**A37-5 (D3, C10, C13): the `instances` document loses `migrated`, and stays at schema 2.**
+- **Go:** `Migrated` (`instances.go:114`, `:182`) and the human table's `MIGRATED` column (`:224-225`, `:235`) go [read], with `nosecrets_test.go`'s unmigrated re-save and field and `rehearsal_test.go`'s `Migrated` assertions. `worldSchema` stays 2. Its doc (`worlddoc.go:36-39`) [read] says the instances' reader state, and `never the six retired (M2.4's five, and not_migrated at M2.9a)`.
+- **Swift:** these go [read]:
+  - `WireListingEntry.migrated` (`WireDocuments.swift:63`, `:71`);
+  - `InstanceListing.migrated` and its init parameter (`WorldReader.swift:51-54`, `:91`, `:100`);
+  - the mapping (`CLIDocuments.swift:227`) and `RenderHarness.swift:168`.
+
+  `VectorTests.swift:493`, `:502` and `:505` drop their `migrated` halves. `CLIDocumentsTests.swift:348` goes. `:344`'s hand-written `migrated` keys stay, as the proof that an unknown key is ignored [read].
+- **Vectors:** `testdata/instances/unreadable.json` is regenerated, its only change the two `migrated` keys, and copied into FarSightKit.
+- **Why no bump:** a bump would rewrite 31 vectors, the skew tests and row 64, and protect nothing:
+  - the app never draws the field (`WorldReader.swift:51-53`) [read];
+  - its synthesized `Decodable` ignores unknown keys and decodes an absent optional as nil;
+  - the app refuses a farcast not of its own commit before it decodes anything (`CLIReader.swift:126-153`) [read].
+
+  ADR 0023 `:3` and `PLAN.md :457` ("schema 2") stay true. The CLI README's `:1488` gains `M2.9a dropped migrated within schema 2.`
+
+**A37-6 (D4, C4, C5, M8): `not_migrated` is retired.**
+- **Go:** `kindNotMigrated` (`kinds.go:40`) leaves `errorKinds` (`:53`), which then holds 20. `retiredKinds` (`:59`) gains `not_migrated`, and its comment (`:57-58`) reads `(ADR 0023 M2; not_migrated at M2.9a)`. The `kube.ErrNotMigrated` case (`:139-140`) goes with the sentinel [read].
+- **`kinds_test.go`** [read]:
+  - the doc (`:118`) says `the six retired (five at M2, not_migrated at M2.9a)`;
+  - the want list (`:123`) gains it;
+  - the count (`:131-132`) is 20, `the 20 since ADR 0023 M2.9a`;
+  - the constant floor (`:166`) is 19;
+  - the row `an object that came back unmigrated` (`:207`) goes.
+- **Rehearsal:** `summarize.go:207-215` drops it and says `the 20 since M2.9a … the six retired read as other`. `rehearsal_test.go:1661` wants 20, and `:1664`'s retired list gains it [read].
+- **Swift:**
+  - `World.swift:255` and `:280` go, and its comment (`:221-225`) names six retired kinds; `CLIDocuments.swift:107` goes, and `ProblemText.swift:86` drops `.notMigrated` [read];
+  - `ProblemTextTests.swift:43` goes and `:53` counts 21;
+  - `VectorTests.swift:519` counts 20, and `:520`'s list of kinds that never appear gains it;
+  - `CLIReaderTests.swift` gains an envelope row after `:149` that reads `not_migrated` as `.unknown`. It sits inside the existing loop, so no test is added.
+- **Vectors and README:** `testdata/kinds/kinds.json` is regenerated and copied into FarSightKit. The README's row (`:1577`) goes, and its retired-kinds paragraph (`:1591`) names it [read].
+- **Why:** a shipped kind keeps its meaning and is never reused (`kinds.go:13-18`) [read]. `TestTheREADMEDocumentsEveryErrorKind` (`kinds_test.go:27`) and `vector_copy` (`check.sh:382-396`) [read] tie the Go list, the README, both vectors and FarSightKit's copies to one commit.
+
+**A37-7 (D5, C2; the critic's third question, resolved as recommended): kube, kubetest and cluster lose the migration's code, and `ListObjects` stays.**
+- **Removed:**
+  - `cluster.Client.ListMeta` (`open.go:100-117`) and `PatchManagedFields` (`:134-151`) [read];
+  - in kube: `PatchJSON`, `MigrationPatch`, `MigratedEndState`, `ClientSideManagers`, `ClientSideTrace`, `UpgradeManagedFields`, `upgradeOne` and `IsLastApply` (A37-8), with their constants (`kube/migrate.go`) [read]; `ErrNotMigrated` (`errors.go:25`); `mediaJSONPatch` (`transport.go:59`); `fields.go`, `fields_test.go` and `migrate_test.go`; `migrate_wire_test.go`, once its two kept tests move; and the doc bullet (`doc.go:30-31`) [read];
+  - in kubetest: the JSON-patch route (`kubetest/store.go:269-271`) and its emulation (`kubetest/writes.go:181-342` and `:680-928`), with `operationUpdate` (`:37`), the two field lists (`:60-61`) and the `errors` import [read].
+- **Kept and moved:**
+  - `Object`, `GetObject`, `ListObjects` and `stampKind` go to `kube/objects.go`. `Object`'s doc reads `as GetObject and ListObjects read it` (C2).
+  - `operationApply`, `IsOwnApply` and `isSSAEntry` go to `apply.go`.
+  - `TestObjectDecodesAnAnswerThatCarriesKind` and `TestListObjectsAsksForMetadataOnly` (`migrate_wire_test.go:42`, `:110`) [read] move to `objects_wire_test.go`. They are seeded with a `farcast` Apply entry and farcast's label, in place of the client-side seed.
+- **Kept in place:** `GetMeta` and `blankLastApplied` (`open.go:90-98`, `:124-132`) [read], for the grants (`grants.go:137`, `:164`) and git-credential (`gitcredential.go:112`, `:616`) [read].
+  - `blankLastApplied`'s doc (`:90-93`) stops naming three removed readers. It says what the blank still does: a Secret anyone applied with kubectl carries its data in that annotation, and the blank keeps it out of what a caller prints or binds.
+  - The package doc (`cluster.go:1-13`) and `Open`'s doc (`open.go:32-39`) lose the migration's reads, its patch and its write exception [read].
+- **`ListObjects` stays as product code that only tests call.** `readerrbac_test.go:357-360`, in package `cli`, uses it [read]. That is the only probe that the reader may list no ServiceAccount, an M2.8 RBAC property. It costs about 25 lines.
+- **Why:** every removed symbol's callers are `cli/migrate.go`, migrate's tests or other removed code [map]. The critic's overlay of every production removal builds `./farsight/...` and `./planck/...` with exit 0 [map]. `cluster.Client` goes from 23 exported methods, counted in `open.go` and `cluster.go` [read], to 20.
+- **kubetest's 405:** a JSON patch falls through to 405. A new row in `TestEverythingElseIs405AndRecorded` (`kubetest_test.go:2926`) [read] pins it. Row 201.
+
+**A37-8 (D6, C3; the critic's second question, resolved as recommended): `DeploymentState`'s last apply is farcast's own Apply.**
+- **Code:** `lastAppliedAt` (`open.go:560-579`) tests `kube.IsOwnApply` in place of `kube.IsLastApply` (`:568`) [read]. Its doc and `DeploymentState.LastAppliedAt`'s (`cluster.go:266-273`) say so.
+- **Why:** the kubectl half existed only for objects an older farcast wrote with kubectl (`kube/migrate.go:121-133`) [read]. The runbooks have the operator `kubectl apply` from Cloud Shell, and that apply would count as farcast's in `run`'s adapted fact (`runreset.go:253`) [read]. The fact now changes for a Deployment someone applied with kubectl: an adaptation after farcast's last apply reads as adapted.
+- **Tests:** `TestDeploymentStateReadsTheAdaptationAndTheLastApply` (`cluster_test.go:920`) [read]:
+  - its doc (`:913-916`) says farcast's own Apply only;
+  - the `web` row's `farcast` Apply entry (`:948`) is seeded with a `+02:00` offset, and its want (`:975`) is that time in UTC;
+  - the `kubectl-client-side-apply` entry (`:949`) stays, newer, and is passed over.
+
+  The reseed keeps a non-UTC input, so a mutant that drops `.UTC()` (`open.go:579`) still dies. `TestIsLastApplyIsFarcastsOwnApplyOfTheObject` (`kube/migrate_test.go:170`) [read] moves to kube's internal tests as `TestIsOwnApplyIsFarcastsOwnApplyOfTheObject`, its kubectl Update row flipped to false. Row 200.
+
+**A37-9 (D7, C14): the real-API suite keeps what is not the migration.**
+- **Removed (5):** `TestAnnotationRemovalInTheSamePatchLeavesNoUpdateEntry`, `TestRealAPIKeepsTheLiveListOnAnUndecodableRewrite`, `TestMigrationIsResumable`, `TestEmulatedSeedMatchesKubectl` and `TestFirstApplyAfterMigrationChangesNoGeneration` (`kube/realapi_test.go:1336`, `:1387`, `:1432`, `:2143`, `:1479`) [read]. The last needs no replacement. An unchanged forced re-apply that leaves `metadata.generation` alone is pinned for every rendered stream at `cli/realapi_test.go:433-434` [read]. Its no-new-entry half meant something only after the migration renamed entries.
+- **Reworked (3):**
+  - `TestMigrationRemovesAFieldLaterDroppedFromTheManifest` (`:1310`) becomes `TestForcedApplyRemovesAFieldDroppedFromTheManifest`. Each stuck case is applied v1 forced, then v2 forced, and the dropped field is gone. The Secret case starts from `secretV1`.
+  - `TestMigrationLeavesAnotherManagersFieldAlone` (`:1962`) becomes `TestForcedApplyTakesAnotherManagersField`. Its first step is a forced apply, not the seed.
+  - `TestServiceAccountUIDSurvivesForcedApplyAndMigration` (`:2229`) becomes `TestServiceAccountUIDSurvivesAForcedApply`. Its keyholder half applies `datasphered` forced, then again with a changed label, and the uid does not move.
+- **Reseeded:** `TestMetadataOnlyListsCarryNoSecretData` (`:1675`), by a forced apply of `secretV1`, expecting no annotation.
+- **Helpers:** `owns()` (`:628-632`) is rewritten without `ownsPath`, as a walk of the `f:` keys. These go [read]:
+  - the helpers only the seed and the migration used;
+  - the two kubectl seeds (`testdata/realapi/kubectl-seed-v1.yaml` and `-v1b.yaml`, 113 lines each);
+  - `FARCAST_REALAPI_KUBECTL_NAMESPACE` (`:72`);
+  - the goccy (`:62`) and `reflect` (`:53`) imports.
+- **§10.6's test list is replaced.** The suite is twelve tests [read]:
+  - ten in kube: `TestForcedApplyRemovesAFieldDroppedFromTheManifest`, `TestReapplyingAnUnchangedJobIsANoOp`, `TestApplyRefusesAStaleResourceVersion`, `TestMetadataOnlyListsCarryNoSecretData`, `TestStatusCauseWireName`, `TestTypedListItemsCarryNoKind`, `TestKernelWritesAreTrackedAsTechnocore`, `TestForcedApplyTakesAnotherManagersField`, `TestServiceAccountUIDSurvivesAForcedApply` and `TestDeleteSecretHonoursItsUIDPrecondition`;
+  - two in cli: `TestEveryRenderedStreamAppliesOnARealServer` and `TestReaderReadsTheNamedServiceAccounts` (`cli/realapi_test.go:361`, `:460`).
+- **Why:** stuck fields, another manager's field and the uid's survival are pinned against a real server nowhere else. All of it is written and not run until the runbook runs again. `check.sh` only vets and lints it (`:303`, `:310`) [read], so a leftover helper fails lint.
+
+**A37-10 (D8, C6): thirteen writing commands.**
+- **The commands.** With `migrate` unregistered, 13 commands write to a cluster and take `--plan` and `--confirm`. The registry has no count test, but `TestEveryProductionWriterIsAWriteCommand` (`plancomplete_test.go:299`) [read] derives the writers, so 13 is enforced.
+- **The seams.** The unset seams go from 11 to 10 (`refusingdefaults_test.go:17`, `:42`), as `migrateWriterDefault`'s override (`:67-76`) leaves `init` [read].
+- **The vectors.** The plan vectors go from 17 to 16 [read].
+- **The README.** The CLI README's `the ten that ask` (`:1655`) becomes nine, and its fourteens (`:1647`, `:1725`, `:1983`) become thirteen [read]. Dated count chains keep their history with a rider (A37-16).
+
+**A37-11 (D9; O2): `--account` is refused by the flag parser.**
+- **Code:** the `accountGiven` field and its doc (`instances.go:20-25`) go, `SetFlags` (`:54-59`) is empty, and `:73` tests the subcommand alone [read]. `parseInterspersed` refuses the flag before `Run` (`cli.go:137-141`) [read]: exit 2, `flag provided but not defined: -account`.
+- **Test:** `TestPinGCloudIsRetired` (`instances_test.go:91`) keeps its two subcommand rows. Its four `--account` rows (`:100`, `:103`, `:106`, `:107`) [read] assert:
+  - exit 2, and empty stdout;
+  - stderr holding the parser's text, and not `msgPinGCloudRetired`;
+  - the record unchanged.
+
+  Its doc (`:87-90`) says so.
+- **Records:** the CLI README's documented form (`:1490`) and its test sentence (`:1926`) change. Row 67 stands, and row 195 is new.
+
+**A37-12 (D10, M1–M4, M13): no plan reads as the writer, and no fact is irreversible.**
+- **plan:**
+  - `TypeMigrate` (`facts.go:32`) goes, with the migrate block (`:496-547`): `MigrateFact`, `MigrateObject` and `Irreversible` [read];
+  - the header (`:10-11`) reads `M2.7 added MigrateFact (A30-12), which M2.9a removed; M2.8 added GrantFact (design §33, A33-11) and GitCredentialFact (A33-29).`;
+  - `Bound.ClusterIdentity`'s doc (`plan.go:55-56`) and `newBound`'s (`consent.go:222`) say `"reader" or "none"`. Only `migrate.go:408` passed `"writer"` [read];
+  - `plan_test.go` drops its migrate rows and counts 19 fact types (`:338-339`) [read].
+- **cli:**
+  - `isIrreversible` (`planhuman.go:118-123`) and the irreversible-first loop in `Human` (`:54-64`) go, so the facts render in order, and `Human`'s doc (`:36-38`) drops `any irreversible one first` [read];
+  - so do the migrate case (`:182-183`), `migrateIrreversible` and `migrateLines` (`:500-535`) [read];
+  - `TestIrreversibleFactsComeFirst` (`planhuman_test.go:1627`) and `TestMigratePlanQuotesServerNames` (`:1685`) go;
+  - the hostile-text check (`:805`) keeps a plain sample fact with no `Irreversible` method, and `:585` says `ADR 0023 M2.9a has 19` [read];
+  - `TestEveryWritingCommandHasAPlanRow` (`plancomplete_test.go:156-157`) allows `reader` and `none` [read].
+- **Why:** after M2.9a no plan reads as the writer and no fact is irreversible.
+- **The protocol stays `farcast-plan-1`** (`plan.go:35`) [read]. It names the digest scheme, and no other plan's bytes change: `newBound` (`consent.go:224-233`) binds no record mark, and `plan.Target` (`plan.go:69-80`) holds none [read]. The 16 other plan vectors stay byte-identical, and `TestEveryVectorFileIsProduced` (`kindsvector_test.go:32`) needs only `migrate.json` deleted.
+
+**A37-13 (D11, C1, C8): the trace machinery goes.**
+- **What goes:**
+  - `afterWrites` and its 17 sites;
+  - `tracer` (`fatline.go:101`); its comment (`:97-99`) then names only the pin store [read];
+  - cluster's `traceMu` and `traces` (`cluster.go:40-45`), `noteTrace` (`:135-149`), `Traces` (`:151-161`) and the call at `:119` [read].
+- **What changes with it:** `md` becomes `_` at `:114`, or `cluster.go` does not compile (`declared and not used: md`). The `slices` import (`:20`) goes, its only uses being `:146` and `:160`. `sync` stays, for `warnMu` (`:37`) [read]. `traceName` stays, for `Apply`'s error (`:117`).
+- **Why:** the machinery's only job was to clear the record, so that the next write refused. With nothing to refuse, its advice points at nothing.
+
+**A37-14 (D12): the legacy kubectl file helpers go.**
+- **What goes** [read]:
+  - `kubeconfigFile` and `pluginCacheFile` (`config/instance.go:77-84`);
+  - `legacyKubectlFiles` through `RemoveLegacyKubectlFiles` (`:855-915`), with `TestLegacyKubectlFilesStatsAndRemoves` (`instance_test.go:996`);
+  - `writecommands_test.go:100-102`'s write, and `planvectors_test.go:495-501`'s `vectorKubeconfig`.
+- **What stays:** `connect_test.go:465-470`'s write, with its comment reworded. It is the premise of `TestInstancesReadsOnlyTheRecords` (`instances_test.go:22-31`) that `instances` never opens a stray `kubeconfig.yaml` [read].
+- **Why:** their only callers are `migrate.go:430` and `:599` [read]. A machine from M2.6 could still hold the file. The records say that only `release` deletes it, with the instance's directory (`release.go:220`, `config/instance.go:548-549`) [read].
+
+**A37-15 (D13): mutation rows are retired, re-pointed and added here** (*Mutation rows* below), never edited in §10.5, §30, §32 or §33. *Why:* later sections override earlier ones, and §32 and §36 record replays against those tables. An edit in place would falsify history.
+
+**A37-16 (D14, C9, C12): the records split between M2.9a's commit and M2.9b's sweep** (*Records* below).
+
+**A37-17 (D15): the walk is revised here** (*The walk* below), and written in M2.9b. Amendments after M2.9a's build go into a §38.
+
+**A37-18 (D16): one honest sentence about an instance an older farcast wrote.** ADR 0023 decision 2's M2.9a note says that such an instance is not supported. A farcast from M2.9a writes to it without refusing, and leaves kubectl's managed-fields entries and last-applied annotations in place, each Secret's keys among them [inf]; release it. *Why:* AGENTS.md treats overstatement as the worst failure. Without the refusal, ADR 0023's first finding, that client-side apply copies Secret keys into annotations (ADR 0023:59) [read], would return silently for such an instance.
+
+**A37-19: the critic's other corrections and missing items are adopted.** C1–C14 and M1–M13 are folded into the entries above and the sections below, except these three:
+- **M6:** a new router test, `TestMigrateIsAnUnknownCommand`. It runs `farcast --config <dir> migrate atlas --plan` with the instance recorded, in `-o json` and in `-o human`, and requires:
+  - exit 2, with `unknown command "migrate"` on stderr (`cli.go:117`) [read];
+  - nothing on stdout;
+  - the config tree byte-identical;
+  - no request to a kubetest server.
+
+  Row 194.
+- **M11:** ADR 0023 `:34`'s method count moves in M2.9b. It is 20 after M2.9a.
+- **M12:** `exec-allowlist.txt`, the carried component digests and the 31 vendored modules do not move [map]:
+  - no removed file starts a process, so `check.sh` step 1b is unchanged;
+  - `go list -deps` of `fatline`, `technocore`, `datasphere` and `shrike` links no `farsight/cli` package;
+  - every import the removal drops is of the standard library, a first-party package, or a module still imported elsewhere.
+
+### Mutation rows
+
+Each runs as an overlay (`go test -overlay`), never by editing the tree, and behind the tunnel guard. Each is rebuilt from its anchors on the built tree (A36-14).
+
+**Retired.** Their code or test is removed. The tables that hold them stand as history.
+- §10.5, M2.1: 32–37.
+- §10.5, M2.7: 92–99, 96a, 101 and 104.
+- §30: 92a, 93 *(changed)*, 93a, 93b, 94a, 94b, 96b, 96c, 97a, 97c, 98a, 98b, 99a, 99b, 101a, 101b, 104 *(re-pointed)* and 104a.
+- §32: A32-4's 16 `X-no-defer` mutants and `X-notetrace-failed`; A32-12's O05, O06, O07, O08, O12, O17, O20, O21 and O38.
+- §33: 119 and 123, and the rerun list's 92, 93, 93a, 93b and 101.
+
+**Re-pointed:**
+- **19:** `TestObjectDecodesAnAnswerThatCarriesKind`, moved to `kube/objects_wire_test.go`.
+- **93c:** delete `git-credential rm`'s `writeCommands` row; killed by `TestEveryProductionWriterIsAWriteCommand`.
+- **97b:** ignore `Created`, warning always or never; killed by `TestInstallWarnsOnlyOfAnAdoptedCluster`.
+- **102:** omit `fieldManager` on the pin POST, with `PatchJSON` dropped from the row; killed by `TestEveryWriteNamesFarcast`.
+- **R1:** "A forced apply keeps the uid"; realapi `TestServiceAccountUIDSurvivesAForcedApply`; not run.
+- **67** stands: `TestPinGCloudIsRetired` keeps the subcommand's rows.
+
+**Added:**
+
+| # | Requirement | Mutation | Must fail | Run |
+|---|---|---|---|---|
+| 194 | `migrate` is gone | register a `migrate` stub | `TestMigrateIsAnUnknownCommand` | check.sh |
+| 195 | The parser refuses `--account` | register `--account` again | `TestPinGCloudIsRetired` (its four `--account` rows) | check.sh |
+| 196 | `not_migrated` stays retired | put `kindNotMigrated` back in `errorKinds` | `TestRetiredKindsAreNeverReused`, `TestKindsVector`, `TestTheREADMEDocumentsEveryErrorKind`; with the vector regenerated and copied, FarSightKit's `everyErrorKindMaps` (`VectorTests.swift:516`) [read] | check.sh |
+| 197 | A record that carries `server_side_apply` loads, and its next save drops it | decode records strictly | `TestARetiredGCloudAccountLoadsAndDeploymentsRoundTrip` (its `server_side_apply` half) | check.sh |
+| 198 | `instances` carries no `migrated` | put the field back | `TestInstancesVectors` (`cmdvectors_test.go:60`) [read]; with the vector regenerated and not copied, `check.sh`'s `vector_copy` | check.sh |
+| 199 | No plan reads as the writer | a command's `newBound` passes `"writer"` | `TestEveryWritingCommandHasAPlanRow`, which compares each printed plan's `cluster_identity` with its row (`plancomplete_test.go:162-166`) [read] | check.sh |
+| 200 | The last apply is farcast's own, in UTC | count a `kubectl-client-side-apply` Update; or drop `.UTC()` | `TestDeploymentStateReadsTheAdaptationAndTheLastApply` (the reseeded `web` row) | check.sh |
+| 201 | kubetest emulates no JSON patch | route `application/json-patch+json` again | `TestEverythingElseIs405AndRecorded` (its new PATCH row) | check.sh |
+
+**Rows to re-run after the new ones,** by named test, because M2.9a edits code beside them: 61 and 64 (the kinds and the schema), 67, 93d (`writeMethods` loses `PatchManagedFields`) and 100 (`Apply`'s answer discarded). `git status` is the same before and after.
+
+### The walk
+
+§10.7 is revised here. M2.9b writes it as `docs/runbooks/adr-0023-m2-walk.md`. It needs Q10's approval and has not run.
+- **Fresh instances only.** The walk installs with the M2 release farcast, and W6 releases everything it installed, which is the operator's premise. Its instance is `$INSTANCE`, §10.7's `$NEW`.
+- **Dropped:**
+  - W0, the M1 build's install of `$OLD`;
+  - W1's `reader grant` refusal with `not_migrated`, and its `migrate --plan` and `--confirm`;
+  - W2, the Cloud Shell read of managed fields. A fresh instance has no kubectl entry or annotation to find. W2's `technocore` half stays pinned against a real API server by `TestKernelWritesAreTrackedAsTechnocore`, and is not walked on Autopilot;
+  - W4 (b), the swap of `$OLD`'s hand-applied shared grant. The swap is pinned against fixtures only (`datasphere/internal/providers/gcs/iam_test.go:719`, `TestBucketGrantRemovesTheSharedBinding`, row 132) [read], and is not walked.
+- **W1's other checks join W4 on `$INSTANCE`, as its reader steps.** They run right after the install, from a shell with no kubectl, plugin or gcloud on `PATH`:
+  - `world` gives `credential_missing` on the cluster sections before a reader exists;
+  - `reader init`, the Cloud Shell paste, and `reader record`;
+  - `reader grant`, interactive, and its verification, with IAM's lag recorded;
+  - `world`, `ps`, `logs` and `costs`;
+  - the cluster's Kubernetes version, for §10.6's pinned minor.
+- **W4 stands otherwise, on `$INSTANCE`.** Its `kernel deploy` carries `--adapt --adapt-cooldown 1m`. W4's (a), (c), (d) and (f) stand. Its optional (e) needed `$OLD`'s cluster: it runs only on a second fresh instance in the project, priced in the approval, or it is dropped. M2.9b's runbook says which.
+- **W3 moves onto `$INSTANCE`,** after W4's `run` and one adaptation:
+  - `kernel deploy` without `--adapt`: the `--adapt` argument is gone from the live Deployment. It is still the walk's only live stuck-field check, now of farcast's forced apply alone under Autopilot's admission;
+  - then `redeploy` and a second `run`. Record whether an unchanged forced re-apply moves `metadata.generation`, and whether a ReplicaSet is made;
+  - record the application's requests after `run`, and the review's reset lines (P1).
+- **A22-2's choice** still comes before the walk. Where key upload is blocked, the reader steps and every `--plan` step cannot run, and the walk takes the terminal path (A33-39).
+- **W5** audits `$INSTANCE`'s writes. **W6** releases every instance the walk installed, runs the reader lines each `release` prints, and checks the cloud at zero.
+- **Its cost [inf]:** `$OLD`'s six instance-hours go. `$INSTANCE` lives longer by W1's and W3's steps, about four hours, which is about USD 0.5 by §10.7's model. The approval asked for stays under USD 5.
+- **What only this walk settles:**
+  - that Autopilot's mutations converge under forced apply;
+  - whether an unchanged forced re-apply rolls a workload on Autopilot. This replaces `:2530`'s "a re-apply after migration", and so §14's risk 3 (`:2711`);
+  - the audit's caller identity and user agent;
+  - W4's uid-principal checks (A33-4 (f)).
+
+### Records
+
+Every M2.9a record says "built 2026-11-20, not walked". A walked text is left as walked, and a dated note is added (A36-13).
+
+**In M2.9a's commit,** so that no living sentence, link or test-held README row is false at that commit:
+- `AGENTS.md` `:48`, `:50`, `:52`, `:53` and `:70` [read].
+- `README.md` `:280` and `:300`, the `migrate` example (`:361-364`) and the list of what is implemented (`:369`) [read].
+- `PLAN.md` `:432`, `:436`, `:454` and `:457` [read].
+- ADR 0023 `:3`; `:93`, its link to the removed section and a dated M2.9a note carrying A37-18's sentence; `:305`, `:319` and `:367`. ADR 0019 `:79` and `:95` [read].
+- The CLI README:
+  - every line that states current behaviour (the records lane's list);
+  - the `migrate` section, with the 15 links to its anchor (`:106`, `:264`, `:295`, `:545`, `:692`, `:1267`, `:1438`, `:1485`, `:1577`, `:1608`, `:1628`, `:1638`, `:1643`, `:1686`, `:1950`) and ADR 0023 `:93`'s [read];
+  - the lines A37-4, A37-5, A37-6, A37-10 and A37-11 name.
+- `planck/types.go:68-73`'s doc (A37-4).
+- The runbook notes that state `migrate`'s current behaviour [read]: `phase-1-validation.md:173-175`; `phase-2-validation.md:309`, `:398`; `phase-3-2-validation.md:28`; `phase-4-1-validation.md:30`, `:144`; `phase-4-2-validation.md:29`, `:187`; `phase-4-3-validation.md:26`, `:40`; `phase-4-4-validation.md:31`, `:176`, `:203`; `phase-5-session-a.md:31`; `adr-0023-m1-walk.md:96`, `:108`; `adr-0023-m2-probe-walk.md:80`, `:93`. Each gets a dated M2.9a note saying three things:
+  - there is no `migrate`;
+  - farcast neither warns about nor refuses kubectl's entry or annotation, which stay [inf];
+  - only `release` deletes an old `kubeconfig.yaml`, with the instance's directory.
+- The real-API runbook (C9): one dated note at `:7`, and one after the M2.8 note at `:256` [read]. The walked procedure is left as walked. The second note:
+  - gives the post-M2.9a `REALAPI` list, A37-9's ten kube tests, and the cli pattern's two, with the counts 10 and 2;
+  - says that R1 step 6, the row-104 build, R6's row-104 run, and R7 with its kubectl seeds are retired;
+  - says that five tests were removed and three renamed.
+- This section, before the build.
+
+`AGENTS.md :48`, ADR 0023 `:3` and `:319`, and `PLAN.md :457` all say `M2.9b (the records sweep and the M2 walk runbook) and every later milestone are not started` (C12).
+
+**In M2.9b's sweep:** riders that are true as history and help a reader count.
+- ADR 0021 `:3`, `:222` and `:295`.
+- ADR 0023 `:99`, `:118`, `:213`, `:214`, `:218` and `:375`.
+- `PLAN.md :447`, and the consolidation of its M2 bullet.
+- The CLI README's count chain (`:19`).
+- ADR 0023 `:34`'s method count (A37-19).
+- The M2 walk runbook (*The walk*).
+
+### The build order
+
+M2.9a is one commit. Steps 1 to 3 are its build order, not commits. `vector_copy` (`check.sh:382-396`) and `TestTheREADMEDocumentsEveryErrorKind` (`kinds_test.go:27`) tie the Go kinds, the README and FarSightKit's copies together, so `./check.sh` runs in full once, at step 4. Commit only when the operator asks.
+
+0. **This section,** docs only.
+1. **The CLI removal, with `--account`, the records and the README.**
+   - **In `cli`:**
+     - `migrate.go`, `migrate_test.go` and `testdata/plan/migrate.json` deleted, and `cli.go:239`;
+     - the 13 `refuseUnmigrated` and the 17 `afterWrites` sites, and `fatline.go:101`;
+     - kinds (A37-6), install (A37-4), instances (A37-5, A37-11), consent and planhuman (A37-12);
+     - every test edit and `recordMigrated` caller.
+   - **Beside it:** `plan` (A37-12), `config` (A37-3, A37-14), `rehearsal` (`layout.go:257`, `summarize.go` and its test) and `planck/types.go`'s doc.
+   - **Vectors:** the kinds and instances vectors, regenerated by one command with `FARCAST_UPDATE_VECTORS=1` and `-run Vector`.
+   - **Records:** every M2.9a record (*Records*).
+   - **Left alone:** kube, cluster and kubetest. Their callerless exported symbols still compile, and their tests pass.
+   - **Evidence:** the cli lane's overlay of the production edits builds `./farsight/cli/...` with exit 0 [map].
+2. **The wire code** (A37-7, A37-8, A37-9, A37-13):
+   - kube's moves and deletions;
+   - cluster's removals, `md` to `_`, the `slices` import and `IsOwnApply`, with `cluster_test`'s reseed;
+   - kubetest's route, emulation and 405 row;
+   - the real-API reworks, and the seeds deleted.
+
+   Then `go vet -tags=integration,walk,realapi` and `golangci-lint`, which catches an unused real-API helper. *Evidence:* the critic's overlay of every production removal builds `./farsight/...` and `./planck/...` with exit 0 [map].
+3. **Swift** (A37-5, A37-6), with step 1's two vectors copied into FarSightKit.
+4. **`./check.sh` in full:**
+   - 1b, the allowlist unchanged;
+   - 3b, 4 and 5;
+   - 7a–7d, Swift with `vector_copy`;
+   - the `cli` package under `-race`, which took 651 s to 676 s at M2.8b (A36-15).
+
+   Then the mutation rows above, as overlays. §38 records them.
+
+M2.9b is the records sweep and the M2 walk runbook. Re-running the real-API runbook is optional and costs no cloud. It takes about 45 minutes and covers A37-9's three reworked tests and M2.8's three unrun ones.
+
+**The size [inf]:** about 7,500 lines removed (±500), about 450 changed and about 350 added. Whole files are about 4,890 of the removed lines, and about 150 of those move to `objects.go`, `apply.go` and the relocated wire tests. Steps 0–3 are one build session of about 5–7 hours with `check.sh`, plus the replay. M2.6 and M2.7 each ran 2–4 times their estimates.
+
+### Superseded
+
+§37 supersedes the following where they differ:
+- **A18-12** (`:2906`): `--account` is refused by the parser (A37-11).
+- **The migration parts of:**
+  - §0: the M2.7 row (`:77`), order item 5 (`:88`), the M2.7 transitional row (`:102`) and the `kubeconfig.yaml` bullet (`:106`);
+  - §1's rows at `:129`, `:138`, `:141`, `:143`, `:144` and `:146`;
+  - §2.1 (`:172`, `:281`, `:431-472`), §2.2 (`:571`), §2.3, §2.5 (`:697`) and §2.6 (`:762`);
+  - §5, and all of §6;
+  - §7.3 (`:1638`) and §8 (`:1707`, `:1730`, `:1748`, `:1783`, `:1805`);
+  - §9 (`:1836`, `:1914`, `:1973`, `:1994`, `:2022`, `:2028`, `:2115`);
+  - §10.4 (`:2283`), §10.5's rows (*Mutation rows*), §10.6's test list (A37-9) and §10.7 (*The walk*);
+  - §11 (`:2571`, `:2598`, and its M2.9 item, now M2.9b's);
+  - §12's MC-9 (`:2653`) and its D1, D4, D5, D6 and D18 (`:2661-2678`);
+  - §13's M2.7 row (`:2698`), and §14's risk 3 (`:2711`).
+- **Later amendments:**
+  - A18-9's `not_migrated` sentence;
+  - §30's migration parts: A30-12's fact, step 1b (`:5612-5825`), A30-34's deletion by `migrate`, and its mutation rows;
+  - §31's decisions on §6.3's patch shape and on row 104. Its results stand as history;
+  - §32's migration amendments: A32-2, A32-3, A32-4's trace half, A32-9 to A32-12, and A32-19 to A32-22;
+  - §33's rows 119, 123 and R1, and its rerun bullets.
+- **ADR 0023 decision 2's migration bullet** (ADR 0023:93-95) stays as the record of what was decided and built, and gets A37-18's dated M2.9a note.
+
+## 38. Amended after M2.9a's build (2026-11-20)
+
+M2.9a was built on 2026-11-20 in §37's steps 0 to 3, in five lanes: §37 itself, the CLI, the records, the wire code and Swift. It was then reviewed read-only on its own tree, in four lenses (safety; conformance to §37; the records; tests and mutation), each finding put to a skeptic: 12 findings, 8 confirmed, 2 plausible, 2 refuted. The safety lens found none. The 10 were fixed, two of them by a record here (A38-14, and row 197 in *The mutation replay*). A last fix then hardened the real-API suite and pinned its `owns` helper (A38-17, A38-18), and a skeptic found its seven parts sound. Then every §37 row was replayed. `git diff HEAD`, which counts a changed line as one removed and one added, gives 106 tracked files besides this design, 8,471 lines removed and 846 added, and four new files hold 325 lines. §37's estimate [inf] was about 7,500 removed (±500), 450 changed and 350 added. Line numbers are in the working tree as built. These amendments record what changed. Where they differ from §37, they win.
+
+### The CLI
+
+**A38-1: tests that held only `migrate`'s parts went with it, beyond §37's lists.**
+- `TestCanonicalWritesEmptyArraysNotNull` (`plan/plan_test.go:87`) listed `MigrateFact`'s three empty members. They are gone; its nested-list case stays with `apps[].external`.
+- `yesApplyingCommands` and `yesApplying` are removed from `writecommands_test.go`. Only `migrate_test.go` used them, and lint flagged them once it went. The `confirmation` type's doc (`:1104`) is adjusted.
+- `TestInstancesReadsOnlyTheRecords` (`instances_test.go:22`) looks for `READER\n` and `none\n`, because `READER` is now the human table's last column.
+
+**A38-2: `TestIrreversibleFactsComeFirst` becomes `TestFactsRenderInTheirOrder`** (`planhuman_test.go:1596`), rather than going as A37-12 says. It keeps the only check that a fact type with no words prints as its JSON. It renders two orders, so a sort or a reversal fails it. `irreversibleSample` is now `unknownSample` (`:1584`), with no `Irreversible` method, and the hostile-text check (`:776`) uses it.
+
+**A38-3: three pins beyond §37.**
+- `TestEveryProductionWriterIsAWriteCommand` also requires exactly 13 writers (`plancomplete_test.go:268`), beside its derived set.
+- `msgAdoptedCluster` is a production constant (`install.go:358-362`) holding A37-4's text. `TestInstallWarnsOnlyOfAnAdoptedCluster` (`install_test.go:512`) compares a literal of that text, so a change to the constant fails it. It also requires that stderr never names `migrate`.
+- `TestMigrateIsAnUnknownCommand` (`cli_test.go:124`) also requires that root help lists no `migrate`.
+
+**A38-4 (REC-1, plausible): the CLI README keeps the removed section's real-API evidence.** The 2026-11-18 run's ten of thirteen, its `ingress: []` and `/scale` findings, and the 2026-11-19 re-run are condensed into the *Not yet walked* note (`:1586`), which links the real-API runbook. After the review it says that M2.9a removed four of the thirteen tests and the test of the suite's emulated kubectl seed. Of the others, two are renamed and one is reseeded, each now starting from farcast's forced apply, and the suite as it now stands has not run against a real server. `:1927` names M2.8's three unrun tests; it is M2.8's and true, and is left.
+
+### The wire code
+
+**A38-5: kube, as built.**
+- `doc.go` (`:24`) does not list `objects.go`. Its list is the pure half, and `objects.go` makes requests, as `apply.go` does.
+- `entry()` (`apply_internal_test.go:6`) lost its fields parameter, which every row passed as `""`.
+- `TestListObjectsAsksForMetadataOnly` pins a path-walking name with `GetObject(…, "..")` (`objects_wire_test.go:108`), through the same `objectPath`, in place of `PatchJSON`'s.
+- `TestObjectDecodesAnAnswerThatCarriesKind` also requires the decoded entry to be `IsOwnApply` (`:44`), so the farcast seed is shown to decode.
+- `TestEveryWriteNamesFarcast`'s rows are `CreateConfigMap`, `ReplaceConfigMap` and `Apply`, with the `DeleteSecret` exemption. Its doc no longer names `PatchJSON`.
+
+**A38-6: kubetest, as built.** The new JSON-patch row of `TestEverythingElseIs405AndRecorded` (`kubetest_test.go:2462`) carries `?fieldManager=farcast&fieldValidation=Strict`, as `PatchJSON` sent it; the recorded-path check strips the query. The tests of the emulation alone went with it: three JSON-patch tests, two subtests of `TestClientBodiesAreReadByExactKeys`, and the JSON-patch halves of `TestSettledWorkloadsRollOutAndGetAnAddress`, `TestFailNextApplyRefusesOneApply` and `TestPartialObjectMetadataAnswersCarryNoData` (`:1974`). `TestFailNextApplyRefusesOneApply` is seeded without the annotation and still counts seven applies.
+
+**A38-7: cluster, as built.** `TestListMetaGetMetaPatchManagedFieldsAreKubes` becomes `TestGetMetaIsKubesGetObject` (`cluster_test.go:1908`), with every assertion it made of `GetMeta`. `TestTracesListsEveryClientSideTrace` and `TestReaderNeverPatchesManagedFields` tested only removed methods, and are gone. `clientSideDeployment` is now `annotatedDeployment`.
+
+**A38-8: the real-API suite, as built** (A37-9).
+- `noSecretValues` (`kube/realapi_test.go:1241`) lost its `wantAnnotation` parameter. It always fails on kubectl's annotation, which farcast's own apply never writes.
+- `otherReplicasEntry` is now `otherOwnsReplicas(md) bool` (`:1529`). The entry it returned had no reader once `sameEntries` went.
+- `statefulSetV1` is removed. Only the removed `TestFirstApplyAfterMigrationChangesNoGeneration` used it.
+- `TestForcedApplyTakesAnotherManagersField` keeps its check that `spec.replicas` reads 3, now after the merge PATCH (`:1507`).
+- `TestServiceAccountUIDSurvivesAForcedApply`'s second keyholder apply adds a test label (`:1600`). The test fails unless the label was applied, before it compares the uid (`:1614`).
+
+### The Swift app
+
+**A38-9: Swift, as built** (A37-5, A37-6).
+- `World.swift:223` names "The six kinds ADR 0023 M2 retired (the five kubectl and gcloud ones, and `not_migrated` …)", so the count adds up.
+- `CLIDocuments.schema`'s doc (`CLIDocuments.swift:48-50`) says "never one ADR 0023 M2 retired", with no count, and that `migrated` is a key this build ignores.
+- `CLIDocumentsTests.swift:344`'s comment says why the kept `migrated` keys show that M2.9a needed no new schema: entry `c` never had the key.
+- `CLIReaderTests.swift:152`'s `not_migrated` row has its own comment. It sits in the existing loop, so FarSightKit still has 306 tests (190 core, 101 UI, 15 TLS).
+
+### The records
+
+**A38-10: not every write is an apply.** A37-1's *What stays* says "Every write is still a forced server-side apply as `farcast`". The storage key pin's create and replace, and `git-credential rm`'s delete, are not applies. ADR 0023 `:93`'s M2.9a note says "every apply", and this amends A37-1 to match.
+
+**A38-11: ADR 0023 `:93`'s M2.7 note drops its link** to the removed CLI README section, rather than pointing it at §6. The M2.9a note after it links §37.
+
+**A38-12: planck's README `:174`, outside §37's list,** stated the removed `server_side_apply` record as current. It now describes A37-4's warning, with a dated note.
+
+**A38-13: AGENTS.md `:53` keeps one dated line,** that `migrate`, which took `--plan` and `--confirm` from M2.7, was removed at M2.9a, rather than losing the sentence. `:52` keeps its dated reason inside the parenthesis.
+
+**A38-14 (CONF-2): each runbook note says only what bears on its line.** This is an accepted deviation from §37 *Records*' three items, and from A36-13's form of a note added beside the old text.
+- The `kubeconfig.yaml` notes say that there is no `migrate`, and that only `release` deletes an old `kubeconfig.yaml`, with the instance's directory: `phase-2-validation.md:309`, `phase-3-2-validation.md:28`, `phase-4-1-validation.md:30`, `phase-4-2-validation.md:29`, `phase-4-3-validation.md:40`, `phase-4-4-validation.md:31`, `phase-5-session-a.md:31`, `adr-0023-m1-walk.md:96` and `:108`, and `adr-0023-m2-probe-walk.md:80` and `:93`.
+- The kubectl-apply notes say that there is no `migrate`, and that farcast neither warns about nor refuses kubectl's entry or annotation, which stay [inf]. M2.7's behaviour is told in the past tense: `phase-2:398`, `phase-4-1:144`, `phase-4-2:187`, and `phase-4-4:176` and `:203`. Each whole M2.7 line was replaced, and its pointer to the removed section dropped.
+- `phase-1:176` says only that there is no `migrate`. It sits beside its M2.7 note, the one note in A36-13's form. `phase-4-3:26` says that, and that such an instance is not supported.
+- The dated M2.7 clause "and farcast migrate deletes it" was moved into each M2.9a note, in the past tense. `phase-4-3:26`'s sentence that such an instance "must first be migrated" was dropped, not restated.
+
+*Why accepted:* no sentence is false, and no item left out bears on its line. Keeping §37's letter would rewrite about 17 lines.
+
+**A38-15: four more records, fixed after the review.**
+- **CONF-1, REC-3:** the CLI README's `:1432` said the app "decodes it as optional", which was true only of the M2.4 to M2.8 app. It now reads `the app no longer decodes it, and ignores it as it ignores any key it does not know.`
+- **REC-2:** a doubled comma at `:1613`, left by removing `migrate`'s writer read.
+- **REC-4 (plausible):** ADR 0019 `:95`'s M2.9a rider said "no plan reads the cluster as the installer", against the same bullet's M2.6d and M2.8 riders. It is now scoped: under `--plan` and `--confirm` no plan reads the cluster as the installer, and no `--plan` mints the installer's token. An interactive or `--yes` run still makes a plan's reads as the installer.
+- **REC-5:** the real-API runbook's `:9` note says that item 8 now asks only of metadata-only lists and gets, since no patch is left to check. R6's M2.9a note (`:273`) says that R8's grep reads `kube.out` and `cli.out` only.
+
+### The tests added after the review
+
+**A38-16 (TEST-1, TEST-2): `TestInstallRecordsBeforeItProvisions`** (`install_test.go:407`, its wrapper `verifyAtCreate` at `:384`).
+- **Why:** A37-4 removed `recordAtCreate` and `TestInstallRecordsServerSideApply` for their `server_side_apply` purpose. They were also the only pins of two facts. Install saves `metadata.yaml` before `CreateCluster` (`install.go:173`, `:181`), which `:148-149` calls cost safety. And it records a non-zero `created_at` (`:164`), which every plan binds as `target.created_at`. The review's overlays of both deletions survived the whole `cli` package. Neither fact was pinned before M2.7 either.
+- **What it requires:** inside `CreateCluster`, the record (provisioning, its cluster, its cost limit) and `credentials.yaml` are on disk. `created_at` is non-zero, in UTC, within the run, and unchanged by the finalizing save.
+- **Beside it:** `TestInstallCreateClusterFailureRecordsError`'s comment (`:366`) no longer claims to show the order, since the failure path saves a record anyway. The CLI README's install test line (`:1862`) names the new test.
+
+Rows 202 to 204.
+
+**A38-17 (FIN-1): four real-API tests check their precondition before they act.** TEST-3 was refuted as a defect of M2.9a: A37-9 prescribed the shape, and the templates do carry each field. Its hardening was made anyway, so that a template edit or a server that prunes fails the test rather than passes it.
+- `TestForcedApplyRemovesAFieldDroppedFromTheManifest`: each stuck case names what v1 holds (`held`, `kube/realapi_test.go:911-998`). After v1's forced apply a raw GET must give exactly that (`:1021`), or the subtest fails with text that does not start `stuck field: `. A scratch overlay that decodes the templates offline found `held` right for all seven cases, and nothing left after v2.
+- `TestForcedApplyTakesAnotherManagersField`: farcast's Apply must own `spec.replicas` after its first apply (`:1490`), and must not after `realapi-other`'s merge PATCH (`:1504`). A new helper, `farcastOwnsReplicas` (`:1540`), reads it, and the last check uses it too.
+- `TestServiceAccountUIDSurvivesAForcedApply`: before the relabel, the keyholder's ServiceAccount must have a uid and lack the added label (`:1606`).
+- `TestMetadataOnlyListsCarryNoSecretData`: a full GET must find a non-empty value under both Secret keys (`:1201`). It checks presence only and prints no value.
+
+Written 2026-11-20, not run against a real server. The runbook's M2.9a bullets for these tests do not mention the preconditions. They are true but incomplete, which is left for M2.9b.
+
+**A38-18 (FIN-2, FIN-3): `owns` moves to an untagged file, and is pinned.** A37-9 rewrote `owns` in `realapi_test.go`, which `check.sh` never runs. It moves unchanged to `kube/owns_test.go:15`, and `realapi_test.go:388` keeps a pointer. `TestOwnsWalksTheFieldsV1Trie` (`owns_test.go:66`) has 17 rows and runs in `check.sh`'s `go test`. Its fieldsV1 sets are drawn from the real-API templates (`fatlineV1`, and `appV2` after the Scale to 0) and from kubetest's `{}` by the format's rules (§6.3). None was read from a server. The suite's documents hold no set of scalars, so it has no `v:` row. The real-API runbook's R6 note adds that `TestKernelWritesAreTrackedAsTechnocore` keeps its body but reads through the rewritten `owns`, which has not run against a real server. Rows 205 to 209.
+
+**Refuted, kept out:** REC-6, that AGENTS.md `:53`'s "took them" has no clear antecedent. It reads through the sentence before it, and the fact is right.
+
+**Open, not changed:**
+- `TestKernelWritesAreTrackedAsTechnocore`'s Scale subtest asserts that no entry owns `spec.replicas` after the Scale to 0, which would also pass if `owns` misread a real entry. It has no positive precondition on the entries before.
+- `TestReapplyingAnUnchangedJobIsANoOp` records the selector and template labels the server defaults, and does not require them. If the server added none, the re-apply is trivially a no-op.
+- `TestForcedApplyTakesAnotherManagersField` asserts that farcast's Apply owns `spec.replicas` after its forced apply, not that `realapi-other`'s entry lost it. With A38-17's preconditions it cannot pass on a field farcast never lost.
+- `kube.Apply` asks for the whole object (`kube/apply.go:51-63`). An applied Secret's data so comes back to the writer, decoded into metadata only and, since M2.9a, not read. This predates M2.9a.
+- For M2.9b's sweep, besides §37's list: the probe-walk runbook's `:3` and `:25` ("M2.9's billable walk"), and ADR 0023 `:95`'s stuck-field sub-bullet.
+
+### The mutation replay
+
+Run on the final tree, after the review's fixes and A38-17 and A38-18, in two lanes: the CLI's, and the wire code's with Swift's. Each Go mutant was rebuilt from its anchors as an overlay (`go test -overlay`), behind the loopback tunnel guard. Each Swift mutant was made in a scratch copy of FarSightKit. Every baseline passed with the guard alone. In both lanes `git diff HEAD` and `git status` were the same before and after.
+
+**Row 197 is amended (CONF-3).** §37's mutant, decode records strictly, dies at the load on the record's `gcloud_account` key, which the older precedent already pins. It never reaches the `server_side_apply` half. Row 197's mutant is now the field kept: a `server_side_apply` field back on `InstanceMetadata`. Strict decode stays as a second mutant, 197s, without "(its `server_side_apply` half)".
+
+| Row | Mutant | Killed by | Result |
+|---|---|---|---|
+| 194 | register a `migrate` stub | `TestMigrateIsAnUnknownCommand` (the stub's flag refusal, not the router's text; help listed it) | killed |
+| 195 | register `--account` again | `TestPinGCloudIsRetired` (its four `--account` rows) | killed |
+| 196, Go | `kindNotMigrated` back in `errorKinds` | `TestRetiredKindsAreNeverReused`, `TestKindsVector`, `TestTheREADMEDocumentsEveryErrorKind` | killed |
+| 196, Swift | `not_migrated` back in FarSightKit's `kinds.json` | `everyErrorKindMaps` (`VectorTests.swift:516`) | killed |
+| 197 | a `server_side_apply` field and its type back on `InstanceMetadata` | `TestARetiredGCloudAccountLoadsAndDeploymentsRoundTrip`, at the save (`connected_test.go:67`) | killed |
+| 197s | decode records strictly | the same, at the load (`:56`), on `gcloud_account` | killed |
+| 197s, a variant | decode strictly, with `gcloud_account` declared again | the same, at the load, on `server_side_apply` | killed |
+| 198, Go | `Migrated` back on `instanceEntry` | `TestInstancesVectors/unreadable` | killed |
+| 198, Swift | both `migrated` keys back in FarSightKit's `unreadable.json` | `check.sh`'s `vector_copy`, run in scratch; no FarSightKit test fails, since the app ignores the key | killed |
+| 199 | `connect`'s `newBound` passes `"writer"` | `TestEveryWritingCommandHasAPlanRow` (five `connect` subtests) | killed |
+| 200 | count a `kubectl-client-side-apply` Update | `TestDeploymentStateReadsTheAdaptationAndTheLastApply` (the `web` row) | killed |
+| 200 | drop `.UTC()` | the same | killed |
+| 201 | route `application/json-patch+json` to the apply emulation | `TestEverythingElseIs405AndRecorded` (400, not 405) | killed |
+| 19 | `Object.Kind` tagged `json:"kind"` | `TestObjectDecodesAnAnswerThatCarriesKind` | killed |
+| 93c | delete `git-credential rm`'s `writeCommands` row | `TestEveryProductionWriterIsAWriteCommand` | killed |
+| 93d | `writeMethods` without `DeleteSecret`, and `gitCredentialCluster` without `Apply` | `TestEveryProductionWriterIsAWriteCommand` (11 writers, not 13); a control with only the seam changed passed | killed |
+| 97b | the warning always | `TestInstallWarnsOnlyOfAnAdoptedCluster` (`Created` true) | killed |
+| 97b | the warning never | the same (`Created` false) | killed |
+| 102 | the pin POST without `fieldManager` | `TestEveryWriteNamesFarcast` | killed |
+| 61 | `kubectl_failed` appended to `errorKinds` | `TestRetiredKindsAreNeverReused` | killed |
+| 64, Go | `worldSchema = 1` | `TestInstancesVectors`, `TestWorldVectors` (28 subtests) | killed |
+| 64, Swift | every world vector at schema 1 | `everyWorldVectorIsSchemaTwo` (28 issues) | killed |
+| 67 | `pin-gcloud` succeeds | `TestPinGCloudIsRetired` (its two subcommand rows) | killed |
+| 67, a variant | the `pin-gcloud` branch deleted | the same (exit 2 with the wrong text) | killed |
+| 100, S2 | `applyDocuments` sends `force=false` | `TestEveryApplyIsForced` in `cluster` and in `cli`; `TestApplySendsEachDocumentAsServerSideApply`; `TestApplyAtAppliesOneDocumentAtItsResourceVersion` | killed |
+| S1 | `GetMeta` skips `blankLastApplied` | `TestGetMetaIsKubesGetObject` | killed |
+| S3 | `ApplyAt` without its `neverWrites` check | `TestAReaderClientNeverWrites` | killed |
+| 202 | install's save before `CreateCluster` deleted | `TestInstallRecordsBeforeItProvisions` | killed |
+| 203 | install sets no `CreatedAt` | the same | killed |
+| 204 | install's `now` not in UTC | the same | killed here only; see below |
+| 205 | `owns` always true | `TestOwnsWalksTheFieldsV1Trie` (8 of 17 rows) | killed |
+| 206 | `owns` always false | the same (9 rows) | killed |
+| 207 | `owns` without the `.` rule | the same (3 rows) | killed |
+| 208 | `owns` true at any node it reaches | the same (2 rows, the prefixes) | killed |
+| 209 | `owns` without the `{}` leaf rule | the same (6 rows) | killed |
+| R1 | none | realapi `TestServiceAccountUIDSurvivesAForcedApply` | not run |
+
+S1 to S3 are the safety review's mutants. 208 and 209 are the last skeptic's. Rows 202 to 209 are added by this section.
+
+- **Nothing survived here.** Row 204 is killed only because this machine's zone is not UTC. On a UTC machine it survives, and then nothing pins that install's `now` is in UTC.
+- **Rows 61 and 196** died on `TestRetiredKindsAreNeverReused`'s runtime checks of `errorKinds`. Its scan of the constants reads `kinds.go` from disk, so an overlay cannot reach it.
+- **R1 was not run.** It needs a real API server, and this replay had only loopback and no server.
+
+### What is still not run
+
+- **The real-API suite as M2.9a left it,** A37-9's twelve. In kube: `TestForcedApplyRemovesAFieldDroppedFromTheManifest`, `TestReapplyingAnUnchangedJobIsANoOp`, `TestApplyRefusesAStaleResourceVersion`, `TestMetadataOnlyListsCarryNoSecretData`, `TestStatusCauseWireName`, `TestTypedListItemsCarryNoKind`, `TestKernelWritesAreTrackedAsTechnocore`, `TestForcedApplyTakesAnotherManagersField`, `TestServiceAccountUIDSurvivesAForcedApply` and `TestDeleteSecretHonoursItsUIDPrecondition`. In cli: `TestEveryRenderedStreamAppliesOnARealServer` and `TestReaderReadsTheNamedServiceAccounts`. None has run on this tree.
+  - Built 2026-11-20, not run against a real server: the three tests A37-9 reworked and the one it reseeded, each with A38-17's precondition, and `TestKernelWritesAreTrackedAsTechnocore` through the rewritten `owns`.
+  - M2.8's `TestDeleteSecretHonoursItsUIDPrecondition` and `TestReaderReadsTheNamedServiceAccounts` have never run, nor has the uid test in any form.
+  - The other five ran on 2026-11-18 or 2026-11-19, on the trees of those days.
+
+  `check.sh` vets and lints the suite with the `realapi` tag and never runs it. Re-running the runbook is optional, costs no cloud, and is M2.9b's.
+- **The walk.** §37's revised walk is written in M2.9b, needs Q10's approval, and has not run. Nothing of M2.9a is walked.
+- **The second host.** `./check.sh` checks that release builds are byte-identical on the dev Mac only. The second-host check has not run.
+- **The full `./check.sh`** has not run on any M2.9a tree. The `cli` package ran under `-race` once, at step 1 (663 s), before the wire step and the review's fixes, and without `-race` after them (296 s and 285 s). `check.sh`'s step 7 ran through a scratch copy of its lines on the tree before the review, and passed: 306 FarSightKit tests on `swift test` and on both `xcodebuild test` destinations. The fixes after it change no Swift file and no vector. After the last fix, `go build`, `go vet` with and without the tags, `golangci-lint` (0 issues), the pinned `gofmt -l` of kube and kube's tests under `-race` passed.
+
+The full `./check.sh` is run on the final tree before the commit, and its result is in the commit message.

@@ -114,13 +114,14 @@ func TestCostsAndWorldShareTheCheckpointReader(t *testing.T) {
 	}
 }
 
-// Design §8.1, mutation 61: a kind once shipped keeps its meaning, so the
-// five ADR 0023 M2 retired are never emitted again and never reused. No
+// Design §8.1, mutation 61, and A37-6, mutation 196: a kind once shipped
+// keeps its meaning, so the six retired (five at M2, not_migrated at M2.9a)
+// are never emitted again and never reused. No
 // kind in errorKinds is one of them, and no kind* constant in kinds.go holds
 // one, read from the source so a constant added outside errorKinds is caught
 // too.
 func TestRetiredKindsAreNeverReused(t *testing.T) {
-	if want := []string{"kubectl_missing", "kubectl_failed", "gcloud_mismatch", "gcloud_signed_out", "auth_tool_missing"}; !slices.Equal(retiredKinds, want) {
+	if want := []string{"kubectl_missing", "kubectl_failed", "gcloud_mismatch", "gcloud_signed_out", "auth_tool_missing", "not_migrated"}; !slices.Equal(retiredKinds, want) {
 		t.Errorf("retiredKinds = %q, want %q", retiredKinds, want)
 	}
 	for _, k := range errorKinds {
@@ -128,8 +129,8 @@ func TestRetiredKindsAreNeverReused(t *testing.T) {
 			t.Errorf("errorKinds holds the retired kind %q", k)
 		}
 	}
-	if len(errorKinds) != 21 {
-		t.Errorf("errorKinds holds %d kinds, want the 21 of ADR 0023 M2.4", len(errorKinds))
+	if len(errorKinds) != 20 {
+		t.Errorf("errorKinds holds %d kinds, want the 20 since ADR 0023 M2.9a", len(errorKinds))
 	}
 	f, err := parser.ParseFile(token.NewFileSet(), "kinds.go", nil, 0)
 	if err != nil {
@@ -163,7 +164,7 @@ func TestRetiredKindsAreNeverReused(t *testing.T) {
 		}
 		return false
 	})
-	if consts < 20 {
+	if consts < 19 {
 		t.Fatalf("read %d kind constants from kinds.go; the walk proves nothing", consts)
 	}
 }
@@ -204,7 +205,6 @@ func TestClusterKindIsFoundByErrorsIs(t *testing.T) {
 		{"namespaces that answered 403 and 401", namespaceErrors{fmt.Errorf("a: %w", apiError(http.StatusForbidden, true)), fmt.Errorf("b: %w", apiError(http.StatusUnauthorized, true))}, kindUnauthorized},
 		{"a document that does not read", fmt.Errorf("x: %w", kube.ErrUnreadable), kindDocumentUnreadable},
 		{"a stalled rollout", fmt.Errorf("x: %w", kube.ErrRolloutStalled), kindRolloutStalled},
-		{"an object that came back unmigrated", fmt.Errorf("x: %w", kube.ErrNotMigrated), kindClusterRejected},
 		{"a document farcast refused", fmt.Errorf("x: %w", kube.ErrRefusedDocument), kindInternal},
 		{"a 500", apiError(http.StatusInternalServerError, true), kindClusterRejected},
 		{"a 404", apiError(http.StatusNotFound, true), kindClusterRejected},

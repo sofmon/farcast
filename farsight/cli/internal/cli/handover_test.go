@@ -360,7 +360,6 @@ func rekeyInstance(t *testing.T) (*Env, *bytes.Buffer, config.Dir, *fakeObjectSt
 		t.Fatal(err)
 	}
 	meta.Keyholder = &config.Keyholder{Deployed: true, Replicas: 2}
-	recordMigrated(meta)
 	if err := dir.SaveInstanceMetadata("prod", meta); err != nil {
 		t.Fatal(err)
 	}

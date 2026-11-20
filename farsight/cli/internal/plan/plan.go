@@ -52,8 +52,8 @@ type Bound struct {
 	Stage    string `json:"stage"` // "" except run: "fetch" | "deploy"
 	// Options are the flags that change behaviour, strictly ascending by Flag.
 	Options []Option `json:"options"`
-	// ClusterIdentity is who the plan reads the cluster as: "reader", "writer"
-	// or "none", fixed per command and state.
+	// ClusterIdentity is who the plan reads the cluster as: "reader" or
+	// "none", fixed per command and state.
 	ClusterIdentity string `json:"cluster_identity"`
 	// Facts are in the order the command presents them.
 	Facts []Fact `json:"facts"`

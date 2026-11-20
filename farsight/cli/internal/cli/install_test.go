@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,7 +17,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sofmon/farcast/farsight/cli/internal/buildinfo"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
 	"github.com/sofmon/farcast/planck"
@@ -362,7 +362,8 @@ func TestInstallCreateClusterFailureRecordsError(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "release") {
 		t.Fatalf("err = %v, want provisioning failure with a release hint", err)
 	}
-	// Record-before-create: the metadata exists and is marked error.
+	// The failed create is recorded: the metadata exists and is marked error.
+	// That install saved it before the create is TestInstallRecordsBeforeItProvisions'.
 	meta, lerr := dir.LoadInstanceMetadata("boom")
 	if lerr != nil {
 		t.Fatalf("metadata should still exist after a failed create: %v", lerr)
@@ -375,11 +376,63 @@ func TestInstallCreateClusterFailureRecordsError(t *testing.T) {
 	if meta.CloudLogging != "" {
 		t.Errorf("cloud_logging = %q after a failed create, want empty", meta.CloudLogging)
 	}
-	// Nor as migrated to server-side apply: install records that only at its
-	// finalizing save, for a cluster the call created (ADR 0023 M2.7,
-	// A30-25).
-	if meta.ServerSideApply != nil {
-		t.Errorf("a failed create recorded server_side_apply %+v", *meta.ServerSideApply)
+}
+
+// verifyAtCreate is a fakeProvider that reads the instance's directory as it
+// stands when CreateCluster is called: what install saved before it asked
+// for a cluster.
+type verifyAtCreate struct {
+	*fakeProvider
+	dir      config.Dir
+	name     string
+	atCreate *config.InstanceMetadata
+	err      error
+	credErr  error
+}
+
+func (p *verifyAtCreate) CreateCluster(ctx context.Context, spec planck.ClusterSpec) (*planck.Cluster, error) {
+	p.atCreate, p.err = p.dir.LoadInstanceMetadata(p.name)
+	_, p.credErr = p.dir.LoadInstanceCredentials(p.name)
+	return p.fakeProvider.CreateCluster(ctx, spec)
+}
+
+// TestInstallRecordsBeforeItProvisions: install saves the instance's record,
+// marked provisioning with its cost limit, and its credentials, before it
+// asks the provider for a cluster. So a cluster never exists un-recorded,
+// and an install stopped while it provisions leaves an instance release can
+// load (cost safety). The record's created_at is this install's, set once,
+// in UTC; every plan binds it as its target's, so a plan made before a
+// release does not confirm after a new install. Until ADR 0023 M2.9a,
+// TestInstallRecordsServerSideApply pinned both on its way.
+func TestInstallRecordsBeforeItProvisions(t *testing.T) {
+	env, _, _, dir := newInstallEnv(t, output.ModeHuman)
+	f := &verifyAtCreate{fakeProvider: &fakeProvider{}, dir: dir, name: "prod"}
+	prov := registerProvider(t, f)
+	cmd := &installCommand{credentials: installKey(t), name: "prod", provider: prov, project: "proj-1", region: "us-central1", costLimit: 50, assumeYes: true}
+	before := time.Now().UTC().Truncate(time.Second)
+	if err := cmd.Run(context.Background(), env, nil); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	after := time.Now().UTC()
+	if f.err != nil || f.atCreate == nil {
+		t.Fatalf("no record as the cluster was created: %v", f.err)
+	}
+	if f.credErr != nil {
+		t.Fatalf("no credentials as the cluster was created: %v", f.credErr)
+	}
+	if at := f.atCreate; at.Status != config.InstanceProvisioning || at.Cluster != "farcast-prod" || at.CostLimit.Amount != 50 {
+		t.Errorf("the record as the cluster was created: status %q, cluster %q, cost limit %v; want provisioning, farcast-prod, 50",
+			at.Status, at.Cluster, at.CostLimit.Amount)
+	}
+	meta, err := dir.LoadInstanceMetadata("prod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, offset := meta.CreatedAt.Zone(); meta.CreatedAt.Before(before) || meta.CreatedAt.After(after) || offset != 0 {
+		t.Errorf("created_at = %v; want this install's time in UTC, between %v and %v", meta.CreatedAt, before, after)
+	}
+	if !f.atCreate.CreatedAt.Equal(meta.CreatedAt) {
+		t.Errorf("created_at moved from %v, as the cluster was created, to %v", f.atCreate.CreatedAt, meta.CreatedAt)
 	}
 }
 
@@ -449,102 +502,58 @@ func TestInstallDoesNotClaimUnverifiedLogging(t *testing.T) {
 	}
 }
 
-// recordAtCreate is a fakeProvider that reads the instance's record as it
-// stands when CreateCluster is called: the first record install saves.
-type recordAtCreate struct {
-	*fakeProvider
-	dir      config.Dir
-	name     string
-	atCreate *config.InstanceMetadata
-	err      error
-}
-
-func (p *recordAtCreate) CreateCluster(ctx context.Context, spec planck.ClusterSpec) (*planck.Cluster, error) {
-	p.atCreate, p.err = p.dir.LoadInstanceMetadata(p.name)
-	return p.fakeProvider.CreateCluster(ctx, spec)
-}
-
-// msgAdoptedCluster is install's warning on a cluster the provider found
-// under the instance's name, for instance prod.
-const msgAdoptedCluster = `Warning: cluster "farcast-prod" already existed, so this farcast cannot tell what wrote to it; ` +
-	"run 'farcast migrate prod --plan' before any command that writes to it.\n"
-
-// ADR 0023 M2.7 (design A30-25): install records an instance whose cluster it
-// created as written with server-side apply, since the record was made and
-// by this farcast, at its finalizing save only. The record it saves before
-// the cluster is created carries none, so an install stopped while it
-// provisions leaves an instance every writing command refuses, and nothing
-// is said about an adopted cluster.
-func TestInstallRecordsServerSideApply(t *testing.T) {
-	env, _, errb, dir := newInstallEnv(t, output.ModeHuman)
-	f := &recordAtCreate{fakeProvider: &fakeProvider{}, dir: dir, name: "prod"}
-	prov := registerProvider(t, f)
-	cmd := &installCommand{credentials: installKey(t), name: "prod", provider: prov, project: "proj-1", region: "us-central1", costLimit: 50, assumeYes: true}
-	if err := cmd.Run(context.Background(), env, nil); err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	if f.err != nil || f.atCreate == nil {
-		t.Fatalf("the first record, as the cluster was created: %v", f.err)
-	}
-	if f.atCreate.ServerSideApply != nil {
-		t.Errorf("the first record carries server_side_apply %+v; want none until the cluster is created", *f.atCreate.ServerSideApply)
-	}
-	meta, err := dir.LoadInstanceMetadata("prod")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ssa := meta.ServerSideApply
-	switch {
-	case ssa == nil:
-		t.Fatal("install recorded no server_side_apply for a cluster it created")
-	case meta.CreatedAt.IsZero() || !ssa.Since.Equal(meta.CreatedAt):
-		t.Errorf("server_side_apply.since = %v; want created_at, %v", ssa.Since, meta.CreatedAt)
-	case ssa.Farcast != buildinfo.Get().Version:
-		t.Errorf("server_side_apply.farcast = %q; want this build's version %q", ssa.Farcast, buildinfo.Get().Version)
-	}
-	if strings.Contains(errb.String(), "already existed") {
-		t.Errorf("install warned of an adopted cluster it created:\n%s", errb.String())
-	}
-}
-
-// ADR 0023 M2.7 (design A30-25), mutation 97b: a cluster the provider found
-// under the instance's name (Created false), which another machine's install
-// of the same name made and may have written to with kubectl, is left
-// unmigrated. install says so on stderr, once, naming the migration, and
-// still succeeds.
-func TestInstallOnAnAdoptedClusterLeavesItUnmigrated(t *testing.T) {
-	for name, mode := range map[string]output.Mode{"human": output.ModeHuman, "json": output.ModeJSON} {
-		t.Run(name, func(t *testing.T) {
-			f := &fakeProvider{cluster: &planck.Cluster{
-				Ref:            planck.ClusterRef{Name: "farcast-prod", Location: "us-central1"},
-				Status:         planck.StatusRunning,
-				Endpoint:       "uid.us-central1.gke.goog",
-				SystemLogsOnly: true,
-			}}
-			prov := registerFake(t, f)
-			env, out, errb, dir := newInstallEnv(t, mode)
-			cmd := &installCommand{credentials: installKey(t), name: "prod", provider: prov, project: "proj-1", region: "us-central1", costLimit: 50, assumeYes: true}
-			err := cmd.Run(context.Background(), env, nil)
-			if err != nil || exitCodeOf(err) != 0 {
-				t.Fatalf("Run = %v (exit %d); want success", err, exitCodeOf(err))
-			}
-			meta, lerr := dir.LoadInstanceMetadata("prod")
-			if lerr != nil {
-				t.Fatal(lerr)
-			}
-			if meta.ServerSideApply != nil {
-				t.Errorf("an adopted cluster was recorded as migrated: %+v", *meta.ServerSideApply)
-			}
-			if meta.Status != config.InstanceRunning {
-				t.Errorf("status = %q, want running", meta.Status)
-			}
-			if got := strings.Count(errb.String(), msgAdoptedCluster); got != 1 {
-				t.Errorf("stderr holds the adopted-cluster warning %d times; want once:\n%s", got, errb.String())
-			}
-			if strings.Contains(out.String(), "already existed") {
-				t.Errorf("the warning reached stdout:\n%s", out.String())
-			}
-		})
+// ADR 0023 M2.7, reworded at M2.9a (design A37-4), mutation 97b: install
+// warns of a cluster the provider found under the instance's name (Created
+// false), a leftover or another machine's install of the same name, once, on
+// stderr only, with the cluster's name, and still succeeds. A cluster the
+// call created (Created true) is never warned of. Install records nothing
+// about either, so the record of an adopted cluster is the record of a
+// created one.
+func TestInstallWarnsOnlyOfAnAdoptedCluster(t *testing.T) {
+	const warning = `Warning: cluster "farcast-prod" already existed under this instance's name, ` +
+		"so this farcast did not create it and cannot tell what else wrote to it.\n"
+	for _, created := range []bool{true, false} {
+		for name, mode := range map[string]output.Mode{"human": output.ModeHuman, "json": output.ModeJSON} {
+			t.Run(fmt.Sprintf("created=%t/%s", created, name), func(t *testing.T) {
+				f := &fakeProvider{cluster: &planck.Cluster{
+					Ref:            planck.ClusterRef{Name: "farcast-prod", Location: "us-central1"},
+					Status:         planck.StatusRunning,
+					Endpoint:       "uid.us-central1.gke.goog",
+					SystemLogsOnly: true,
+					Created:        created,
+				}}
+				prov := registerFake(t, f)
+				env, out, errb, dir := newInstallEnv(t, mode)
+				cmd := &installCommand{credentials: installKey(t), name: "prod", provider: prov, project: "proj-1", region: "us-central1", costLimit: 50, assumeYes: true}
+				err := cmd.Run(context.Background(), env, nil)
+				if err != nil || exitCodeOf(err) != 0 {
+					t.Fatalf("Run = %v (exit %d); want success", err, exitCodeOf(err))
+				}
+				meta, lerr := dir.LoadInstanceMetadata("prod")
+				if lerr != nil {
+					t.Fatal(lerr)
+				}
+				if meta.Status != config.InstanceRunning {
+					t.Errorf("status = %q, want running", meta.Status)
+				}
+				want := 0
+				if !created {
+					want = 1
+				}
+				if got := strings.Count(errb.String(), warning); got != want {
+					t.Errorf("stderr holds the adopted-cluster warning %d times; want %d:\n%s", got, want, errb.String())
+				}
+				if created && strings.Contains(errb.String(), "already existed") {
+					t.Errorf("install warned of an adopted cluster it created:\n%s", errb.String())
+				}
+				if strings.Contains(out.String(), "already existed") {
+					t.Errorf("the warning reached stdout:\n%s", out.String())
+				}
+				if strings.Contains(errb.String(), "migrate") {
+					t.Errorf("install's stderr names migrate, which ADR 0023 M2.9a removed:\n%s", errb.String())
+				}
+			})
+		}
 	}
 }
 

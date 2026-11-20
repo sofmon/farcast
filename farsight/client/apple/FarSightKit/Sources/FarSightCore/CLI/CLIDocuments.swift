@@ -43,9 +43,11 @@ public struct CLIWorld: Sendable, Equatable {
 /// problem with that figure, never a refusal of the instance.
 public enum CLIDocuments {
     /// The one schema this build reads (Go: `worldSchema`). Schema 2 is ADR
-    /// 0023 M2.4's: the instances document carries `reader` and `migrated`
-    /// in place of `gcloud_pinned`, and a world's errors carry the in-process
-    /// client's kinds, never the five it retired.
+    /// 0023 M2.4's: the instances document carries `reader` in place of
+    /// `gcloud_pinned`, and a world's errors carry the in-process client's
+    /// kinds, never one ADR 0023 M2 retired. The `migrated` an M2.4 to M2.8
+    /// farcast printed is a key this build ignores (M2.9a removed it without
+    /// a new schema).
     public static let schema = 2
 
     /// `farcast version -o json`: only `version` and `commit` are read; every
@@ -104,7 +106,6 @@ public enum CLIDocuments {
         case "cluster_rejected": .clusterRejected
         case "document_unreadable": .documentUnreadable
         case "rollout_stalled": .rolloutStalled
-        case "not_migrated": .notMigrated
         case "plan_changed": .planChanged
         case "timeout": .timeout
         case "internal": .internal
@@ -223,8 +224,7 @@ public enum CLIDocuments {
             recordedLimitCents: entry.costLimit?.cents,
             components: components,
             problem: problem,
-            reader: entry.reader.map(readerState),
-            migrated: entry.migrated
+            reader: entry.reader.map(readerState)
         )
     }
 

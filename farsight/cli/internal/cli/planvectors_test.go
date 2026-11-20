@@ -7,8 +7,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -36,15 +34,14 @@ import (
 // M2.6c — kernel deploy, storage deploy, storage key pin and storage key
 // rotate — read it as the instance's reader, through vectorCluster, a fixed
 // cluster that holds atlas's namespaces and no key pin yet, and the storage
-// commands read the ids and times of vectorKeyring's keys. migrate's (M2.7)
-// reads it as the writer, through vectorMigrateCluster. connect's,
+// commands read the ids and times of vectorKeyring's keys. connect's,
 // redeploy's, kernel deploy's and storage deploy's read the registry,
 // through a fake provider and a fake builder whose registry holds no carried
 // image's version tag, as a release farcast at the vector stamp that carries
 // the fake components. They are produced in Go and are not copied to
 // FarSightKit until ADR 0021 step 7.1. Each part of M2.6 adds the vectors of
-// the commands it wires, M2.7 migrate's, and M2.8 git-credential's, which
-// read the record alone.
+// the commands it wires, and M2.8 git-credential's, which read the record
+// alone. M2.7 added migrate's, which M2.9a removed (design A37-10).
 //
 //	FARCAST_UPDATE_VECTORS=1 go test ./farsight/cli/internal/cli/ -run Vector
 //
@@ -469,38 +466,6 @@ func vectorRunMaterial(t *testing.T, dir config.Dir) {
 	}
 }
 
-// vectorMigrateCluster is the migrate vector's writer (ADR 0023 M2.7,
-// A30-26): a fixed cluster whose lists answer, as a server sends them, the
-// objects an older farcast applied to atlas with kubectl's client-side apply:
-// the Deployment of FatLine and its mTLS Secret, whose data and last-applied
-// annotation each hold migrateMarker, in farcast-system, and the kernel's
-// RoleBinding in web, a namespace nothing labels. Its farcast-system is at
-// vectorSystemUID. It reads nothing else and writes nothing.
-func vectorMigrateCluster() fakeMigrateCluster {
-	const rbac = "rbac.authorization.k8s.io/v1"
-	withUID := func(o map[string]any, uid string) map[string]any {
-		md := o["metadata"].(map[string]any)
-		md["uid"], md["resourceVersion"] = uid, "4711"
-		return o
-	}
-	return fakeMigrateCluster{uid: vectorSystemUID, objects: map[string][]map[string]any{
-		"Secret": {withUID(clientSideSecret(), seededSecretUID)},
-		"Deployment": {withUID(clientSideObject("apps/v1", "Deployment", fldeploy.DefaultNamespace, fldeploy.DefaultName, `{"kind":"Deployment"}`+"\n"),
-			"00000000-0000-4000-8000-0000000000b1")},
-		"RoleBinding": {withUID(clientSideObject(rbac, "RoleBinding", "web", seededRoleBinding, `{"kind":"RoleBinding"}`+"\n"),
-			"00000000-0000-4000-8000-0000000000b3")},
-	}}
-}
-
-// vectorKubeconfig is the kubeconfig.yaml kubectl read for atlas, which the
-// migrate vector's plan lists to delete. Its bytes are never read.
-func vectorKubeconfig(t *testing.T, dir config.Dir) {
-	t.Helper()
-	if err := os.WriteFile(filepath.Join(dir.InstancePath("atlas"), "kubeconfig.yaml"), []byte("apiVersion: v1\nkind: Config\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-}
-
 // vectorRegistryNamed is the atlas record with its registry's repository and
 // location recorded beside its prefix, as the ensure records them: build's
 // and run's plans refuse a record without them (design §33, A33-15).
@@ -673,20 +638,6 @@ func planVectors() []planVector {
 			vectorRunMaterial(t, dir)
 			vectorKey(t, dir)
 		}, true},
-		// migrate (M2.7), read as the writer: atlas not yet migrated, the three
-		// objects of vectorMigrateCluster to rewrite, and kubeconfig.yaml to
-		// delete. It binds no byte of the Secret's data or annotation.
-		{"migrate", func(m *config.InstanceMetadata) { m.ServerSideApply = nil }, func(t *testing.T, flags ...string) Command {
-			c := withFlags(t, &migrateCommand{}, flags...)
-			c.newCluster = func(r clusterRef) (migrateCluster, error) {
-				if r.Identity != kube.Writer {
-					return nil, fmt.Errorf("test: the migrate vector's plan read the cluster as %q", r.Identity)
-				}
-				return vectorMigrateCluster(), nil
-			}
-			c.now = vectorClock
-			return c
-		}, []string{"atlas"}, nil, vectorKubeconfig, false},
 		// git-credential set (M2.8, design §33, A33-40): the Secret
 		// farcast-system/repo-git, rendered from the placeholders. Its
 		// --username is a marker, which no plan binds, and its --token-file

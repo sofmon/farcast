@@ -236,7 +236,6 @@ func defaultRegistry() *Registry {
 
 	reg.Register(&installCommand{})
 	reg.Register(&releaseCommand{})
-	reg.Register(&migrateCommand{})
 	reg.Register(newConnectCommand())
 	reg.Register(newRedeployCommand())
 	reg.Register(&runCommand{})

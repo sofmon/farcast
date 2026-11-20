@@ -759,9 +759,6 @@ func (c *keyPinCommand) Run(ctx context.Context, env *Env, args []string) (err e
 	if err := recordNamed(meta, instance); err != nil {
 		return err
 	}
-	if err := refuseUnmigrated(instance, meta); err != nil {
-		return err
-	}
 	if meta.Keyholder == nil || !meta.Keyholder.Deployed {
 		return fmt.Errorf("instance %q has no keyholder deployed; 'farcast storage deploy %s' writes the pin with it", instance, instance)
 	}

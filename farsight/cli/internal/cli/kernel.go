@@ -309,9 +309,6 @@ func (c *kernelDeployCommand) Run(ctx context.Context, env *Env, args []string) 
 	if err := recordNamed(meta, name); err != nil {
 		return err
 	}
-	if err := refuseUnmigrated(name, meta); err != nil {
-		return err
-	}
 	// The kernel needs no tunnel of its own — it talks to the API server, not
 	// through FatLine. But an instance with no FatLine has no workloads worth
 	// metering yet, and deploying a cost enforcer before there is anything to
@@ -361,7 +358,6 @@ func (c *kernelDeployCommand) Run(ctx context.Context, env *Env, args []string) 
 		if cl, err = c.deployer.newCluster(ref); err != nil {
 			return err
 		}
-		defer afterWrites(env, name, cl)
 		rd = cl
 	} else {
 		if err := requireGrantedReader(env.ConfigDir, meta, "kernel deploy", mode); err != nil {
@@ -407,7 +403,6 @@ func (c *kernelDeployCommand) Run(ctx context.Context, env *Env, args []string) 
 		if cl, err = openConfirmed(ctx, env, meta, b, c.deployer.newCluster); err != nil {
 			return err
 		}
-		defer afterWrites(env, name, cl)
 	} else if proceed, err := c.consented(env, meta, p); err != nil || !proceed {
 		return err
 	}

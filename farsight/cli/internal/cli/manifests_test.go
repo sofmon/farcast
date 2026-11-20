@@ -81,14 +81,15 @@ func TestEveryRenderedStreamPassesTheApplyChecks(t *testing.T) {
 	}
 }
 
-// ADR 0023 M2.7's migrate finds what it rewrites through farcast's label
-// alone: one cluster-wide list per kind, selected by
-// app.kubernetes.io/managed-by=farcast (design §6.2, discoverClientSide). A
-// document rendered without the label would never be migrated: its next
-// forced apply would carry kubectl's client-side trace, and the instance's
-// migrated record would be cleared after every migration (A30-16). So every
-// document of every rendered stream carries it, the kernel's seed
-// technocore-namespaces and the confirmations ConfigMap among them.
+// farcast's label, app.kubernetes.io/managed-by=farcast, is how farcast
+// tells what it wrote: world lists the instance's namespaces by it
+// (managedSelector), reader grant verifies the reader with the same
+// selector (readerGrantSelector), and git-credential tells its own Secrets
+// by it (gitCredentialManagedBy). ADR 0023 M2.7's migrate found what it
+// rewrote by it too (design §6.2, A30-16), until M2.9a removed migrate
+// (design A37-1). So every document of every rendered stream carries it,
+// the kernel's seed technocore-namespaces and the confirmations ConfigMap
+// among them.
 func TestEveryRenderedDocumentIsManagedByFarcast(t *testing.T) {
 	key, value, _ := strings.Cut(managedSelector, "=")
 	seen := map[string]bool{}

@@ -372,9 +372,8 @@ func TestReaderRBACBindsOnlyNamespacesClusterWide(t *testing.T) {
 // farcast-reader-serviceaccounts renders exactly readerServiceAccounts there,
 // and no other document of the reader's RBAC names serviceaccounts. Every
 // read of a ServiceAccount's metadata in this package's source (a GetMeta of
-// kind ServiceAccount, outside migrate.go, which reads every kind it migrates
-// as the writer) names one of them in farcast-system, followed through any
-// helper that passes its own parameters on, so a plan that reads another
+// kind ServiceAccount) names one of them in farcast-system, followed through
+// any helper that passes its own parameters on, so a plan that reads another
 // account, or one elsewhere, fails here before a reader is refused it. The
 // scan is tested first on a fixture source, so a scan that finds nothing
 // cannot pass for one that finds every read.
@@ -474,7 +473,7 @@ func kindGiven(ctx context.Context, rd reader, k kube.Kind) {
 	fset := token.NewFileSet()
 	var parsed []*ast.File
 	for _, f := range files {
-		if strings.HasSuffix(f, "_test.go") || f == "migrate.go" {
+		if strings.HasSuffix(f, "_test.go") {
 			continue
 		}
 		file, err := goparser.ParseFile(fset, f, nil, goparser.SkipObjectResolution)

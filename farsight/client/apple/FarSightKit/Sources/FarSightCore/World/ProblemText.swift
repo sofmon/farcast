@@ -83,7 +83,7 @@ public enum ProblemText {
         // The app's child environment never carries what unsafe_environment
         // refuses, and in a terminal the CLI's message says what to unset.
         case .unsafeEnvironment, .endpointRefused, .clusterRejected, .documentUnreadable,
-             .rolloutStalled, .notMigrated, .planChanged: nil
+             .rolloutStalled, .planChanged: nil
         case .recordUnreadable, .notFound, .tunnelUnreachable, .timeout, .internal, .unknown: nil
         }
     }

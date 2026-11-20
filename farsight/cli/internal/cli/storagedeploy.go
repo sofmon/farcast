@@ -379,9 +379,6 @@ func (c *storageDeployCommand) Run(ctx context.Context, env *Env, args []string)
 	if err := recordNamed(meta, name); err != nil {
 		return err
 	}
-	if err := refuseUnmigrated(name, meta); err != nil {
-		return err
-	}
 	if !meta.FatLineDeployed {
 		// The keyholder is only reachable through the tunnel, so deploying it
 		// into an instance with no tunnel would produce something nobody can
@@ -412,7 +409,6 @@ func (c *storageDeployCommand) Run(ctx context.Context, env *Env, args []string)
 		if cl, err = c.deployer.newCluster(ref); err != nil {
 			return fmt.Errorf("the key pin could not be reached, so nothing was deployed: %w", err)
 		}
-		defer afterWrites(env, name, cl)
 		if ps, err = c.pinStoreOf(ref, cl); err != nil {
 			return fmt.Errorf("the key pin could not be reached, so nothing was deployed: %w", err)
 		}
@@ -465,7 +461,6 @@ func (c *storageDeployCommand) Run(ctx context.Context, env *Env, args []string)
 		if cl, err = openConfirmed(ctx, env, meta, b, c.deployer.newCluster); err != nil {
 			return err
 		}
-		defer afterWrites(env, name, cl)
 		ref.Identity = kube.Writer
 		if ps, err = c.pinStoreOf(ref, cl); err != nil {
 			return fmt.Errorf("the key pin could not be reached, so nothing was deployed: %w", err)

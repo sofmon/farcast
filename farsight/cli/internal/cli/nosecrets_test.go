@@ -125,15 +125,10 @@ func TestWorldNeverOpensAWriterCredential(t *testing.T) {
 
 // Design §8.2 and §10.2, mutation 65: instances reports the reader's state
 // from the record and the key file's presence alone. With reader.key at mode
-// 000 it still says "granted", and never opened the key. The record is saved
-// again unmigrated (A30-20), so the migrated column's false is covered too.
+// 000 it still says "granted", and never opened the key.
 func TestInstancesNeverOpensTheReaderKey(t *testing.T) {
 	s := kubetest.New(t)
-	dir, meta := readerInstance(t, s, "atlas", true)
-	meta.ServerSideApply = nil
-	if err := dir.SaveInstanceMetadata("atlas", meta); err != nil {
-		t.Fatal(err)
-	}
+	dir, _ := readerInstance(t, s, "atlas", true)
 	key := filepath.Join(dir.InstancePath("atlas"), "reader.key")
 	if err := os.Chmod(key, 0o000); err != nil {
 		t.Fatal(err)
@@ -150,18 +145,16 @@ func TestInstancesNeverOpensTheReaderKey(t *testing.T) {
 	}
 	var doc struct {
 		Instances []struct {
-			Name     string          `json:"name"`
-			Reader   string          `json:"reader"`
-			Migrated *bool           `json:"migrated"`
-			Error    *sectionProblem `json:"error"`
+			Name   string          `json:"name"`
+			Reader string          `json:"reader"`
+			Error  *sectionProblem `json:"error"`
 		} `json:"instances"`
 	}
 	if err := json.Unmarshal(out, &doc); err != nil {
 		t.Fatalf("%v:\n%s", err, out)
 	}
-	if len(doc.Instances) != 1 || doc.Instances[0].Reader != readerGranted || doc.Instances[0].Error != nil ||
-		doc.Instances[0].Migrated == nil || *doc.Instances[0].Migrated {
-		t.Errorf("instances = %s; want atlas's reader granted, and not migrated", out)
+	if len(doc.Instances) != 1 || doc.Instances[0].Reader != readerGranted || doc.Instances[0].Error != nil {
+		t.Errorf("instances = %s; want atlas's reader granted", out)
 	}
 	if got := reads(); slices.Contains(got, key) {
 		t.Errorf("instances opened reader.key: %v", got)

@@ -17,13 +17,6 @@ import (
 // instancesCommand lists the instances this machine holds, from their local
 // records alone.
 type instancesCommand struct {
-	// accountGiven is whether the retired pin-gcloud's flag was given, with
-	// any value, an empty one included. The flag stays registered until ADR
-	// 0023 M2.9 only so that the documented form 'instances pin-gcloud
-	// <instance> --account <email>' reaches the retirement text rather than
-	// the flag parser's refusal (A18-12).
-	accountGiven bool
-
 	// Seams: the clock and the build stamp.
 	now   func() time.Time
 	stamp func() buildStamp
@@ -41,22 +34,18 @@ Usage: farcast instances
 List every instance this machine holds, from each one's local record alone:
 its status, region, cost limit, which of FarCast's components the record says
 were deployed, how many keepers are enrolled, whether a reader identity is
-recorded and how far it is set up ('farcast reader'), and whether the instance
-has been migrated to server-side apply. It opens no credential, no kubeconfig,
-no CA key, no reader key and no keyring, and touches no network: whether the
-reader's key is on this machine is told from the file's presence alone.`)
+recorded and how far it is set up ('farcast reader'). It opens no credential,
+no kubeconfig, no CA key, no reader key and no keyring, and touches no network:
+whether the reader's key is on this machine is told from the file's presence
+alone.`)
 }
 
 // msgPinGCloudRetired is what 'instances pin-gcloud' says since ADR 0023 M2
-// (design §7.4): a usage error, exit 2.
+// (design §7.4): a usage error, exit 2. Its --account flag went at M2.9a
+// (design A37-11), so the flag parser refuses that form before Run.
 const msgPinGCloudRetired = "pin-gcloud was retired by ADR 0023 M2: farcast reads each instance's cluster as its own read-only service account ('farcast reader init'), so there is no gcloud account to pin."
 
-func (c *instancesCommand) SetFlags(fs *flag.FlagSet) {
-	fs.Func("account", "retired with pin-gcloud (ADR 0023 M2)", func(string) error {
-		c.accountGiven = true
-		return nil
-	})
-}
+func (c *instancesCommand) SetFlags(*flag.FlagSet) {}
 
 func (c *instancesCommand) ensureDefaults() {
 	if c.now == nil {
@@ -69,8 +58,9 @@ func (c *instancesCommand) ensureDefaults() {
 
 func (c *instancesCommand) Run(_ context.Context, env *Env, args []string) error {
 	c.ensureDefaults()
-	// The retired pin, in any of its forms, writes nothing and says why.
-	if (len(args) > 0 && args[0] == "pin-gcloud") || c.accountGiven {
+	// The retired pin, with or without an instance, writes nothing and says
+	// why.
+	if len(args) > 0 && args[0] == "pin-gcloud" {
 		return usagef("%s", msgPinGCloudRetired)
 	}
 	if len(args) > 0 {
@@ -110,8 +100,7 @@ func instanceEntryOf(dir config.Dir, name string) instanceEntry {
 			Kernel:    meta.Kernel != nil && meta.Kernel.Deployed,
 			Keyholder: meta.Keyholder != nil && meta.Keyholder.Deployed,
 		},
-		Reader:   reader,
-		Migrated: meta.ServerSideApply != nil,
+		Reader: reader,
 	}
 	for _, k := range meta.Keepers {
 		if !k.Revoked {
@@ -179,7 +168,6 @@ type instanceEntry struct {
 	Components   *componentsEntry `json:"components,omitempty"`
 	Keepers      int              `json:"keepers"`
 	Reader       string           `json:"reader"`
-	Migrated     bool             `json:"migrated"`
 	Error        *sectionProblem  `json:"error,omitempty"`
 }
 
@@ -221,18 +209,18 @@ func (r instancesResult) Human(w io.Writer) error {
 		}
 		return "no"
 	}
-	fprintf(w, "%-18s %-12s %-16s %-18s %-8s %-8s %-8s %-8s %-13s %s\n",
-		"NAME", "STATUS", "REGION", "LIMIT", "FATLINE", "KERNEL", "STORAGE", "KEEPERS", "READER", "MIGRATED")
+	fprintf(w, "%-18s %-12s %-16s %-18s %-8s %-8s %-8s %-8s %s\n",
+		"NAME", "STATUS", "REGION", "LIMIT", "FATLINE", "KERNEL", "STORAGE", "KEEPERS", "READER")
 	for _, e := range r.Instances {
 		if e.Error != nil {
 			fprintf(w, "%-18s %s: %s\n", terminalText(e.Name), e.Error.Kind, terminalText(e.Error.Message))
 			continue
 		}
 		limit := fmt.Sprintf("%s %.0f/%s", e.CostLimit.Currency, float64(e.CostLimit.Cents)/100, e.CostLimit.Period)
-		fprintf(w, "%-18s %-12s %-16s %-18s %-8s %-8s %-8s %-8d %-13s %s\n",
+		fprintf(w, "%-18s %-12s %-16s %-18s %-8s %-8s %-8s %-8d %s\n",
 			terminalText(e.Name), terminalText(e.Status), terminalText(e.Region), terminalText(limit),
 			yes(e.Components.FatLine), yes(e.Components.Kernel), yes(e.Components.Keyholder), e.Keepers,
-			strings.ReplaceAll(e.Reader, "_", " "), yes(e.Migrated))
+			strings.ReplaceAll(e.Reader, "_", " "))
 	}
 	return nil
 }

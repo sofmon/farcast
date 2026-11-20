@@ -40,7 +40,6 @@ struct ProblemTextTests {
         .clusterRejected: "network not read · cluster rejected",
         .documentUnreadable: "network not read · document unreadable",
         .rolloutStalled: "network not read · rollout stalled",
-        .notMigrated: "network not read · not migrated",
         .planChanged: "network not read · plan changed",
         .timeout: "network not read · timed out",
         .internal: "network not read · internal error",
@@ -50,7 +49,7 @@ struct ProblemTextTests {
     @Test("every kind, in a section, says what was not read, why, and the remedy where there is one")
     func everyKindInASection() {
         #expect(Set(Self.sectionSentences.keys) == Set(SectionProblem.Kind.allCases))
-        #expect(SectionProblem.Kind.allCases.count == 22)
+        #expect(SectionProblem.Kind.allCases.count == 21)
         for kind in SectionProblem.Kind.allCases {
             #expect(ProblemText.sentence(.network, kind) == Self.sectionSentences[kind], "\(kind)")
         }

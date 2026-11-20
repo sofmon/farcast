@@ -306,7 +306,7 @@ minutes** while the LB is assigned. ✅ Expect:
 
 ```bash
 export KUBECONFIG="$FARCAST_CONFIG_HOME/instances/$INSTANCE/kubeconfig.yaml"
-# (2026-11-18, ADR 0023 M2.7, built, not walked) Neither install nor connect writes kubeconfig.yaml any more, and farcast migrate deletes it. A re-walk observes with kubectl from Cloud Shell (ADR 0023 Phasing), not over a file farcast wrote; an exported KUBECONFIG naming the absent file fails rather than falling back to ~/.kube/config [inf].
+# (2026-11-18, ADR 0023 M2.7, built, not walked) Neither install nor connect writes kubeconfig.yaml any more. (2026-11-20, M2.9a, built, not walked: farcast migrate, which deleted one an older farcast left, is removed; only release deletes it now, with the instance's directory.) A re-walk observes with kubectl from Cloud Shell (ADR 0023 Phasing), not over a file farcast wrote; an exported KUBECONFIG naming the absent file fails rather than falling back to ~/.kube/config [inf].
 kubectl get all -n farcast-system
 kubectl get secret fatline-mtls -n farcast-system -o jsonpath='{.data}' | tr ',' '\n'
 ```
@@ -395,7 +395,7 @@ Finally, change the policy while it runs and confirm the monitor follows it:
 kubectl -n farcast-system get configmap fatline-egress-policy -o json \
   | jq '.data["policy.json"] |= (fromjson | (.apps[] | select(.name=="hermit") | .external) |= [{"host":"api.stripe.com","reason":"reload check"}] | tojson)' \
   | kubectl apply -f -
-# (2026-11-18, ADR 0023 M2.7) On an instance migrated to server-side apply, a kubectl apply here leaves kubectl's client-side apply on the object. farcast's next write warns and clears the record, and every write then refuses until farcast migrate runs again (the CLI README's migrate section).
+# (2026-11-18, ADR 0023 M2.7; 2026-11-20, M2.9a, built, not walked) A kubectl apply here leaves kubectl's client-side apply on the object: a managed-fields entry and a last-applied annotation, which for a Secret holds its keys. From M2.7 until M2.9a farcast's next write warned and cleared the record, and every write then refused until farcast migrate ran again. farcast migrate is removed, and farcast neither warns nor refuses: its next forced server-side apply takes the fields it applies and leaves that entry and annotation in place [inf].
 kubectl -n farcast-system logs -l app.kubernetes.io/name=fatline -c shrike --tail=20 | grep -i reload
 ```
 

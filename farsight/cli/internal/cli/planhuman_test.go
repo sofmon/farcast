@@ -383,35 +383,6 @@ func renderRows() []renderRow {
 		factRow("notice", plan.NoticeFact{Type: plan.TypeNotice, Text: "f-notice <&> line\nand its second"},
 			map[string][]string{"type": {"notice: "}, "text": {"notice: f-notice <&> line\n  and its second\n"}}),
 
-		factRow("migrate", plan.MigrateFact{Type: plan.TypeMigrate, Local: []string{"f-local1", "f-local2"}, CannotBeUndone: true,
-			Objects: []plan.MigrateObject{{API: "f-mapi", Kind: "f-mkind", Namespace: "f-mns", Name: "f-mname", UID: "f-muid",
-				CSAManagers: []string{"f-csa1", "f-csa2"}, CSAFieldsSHA256: "f-msha", Annotation: true,
-				OtherManagers: []string{"f-other1", "f-other2"}}}},
-			map[string][]string{
-				"type":                        {"migrate 1 object(s) on the cluster; "},
-				"objects[].api":               {" f-mns/f-mname (f-mapi, uid "},
-				"objects[].kind":              {"\n  f-mkind f-mns/f-mname ("},
-				"objects[].namespace":         {" f-mns/f-mname ("},
-				"objects[].name":              {"/f-mname (f-mapi,"},
-				"objects[].uid":               {", uid f-muid): client-side managers"},
-				"objects[].csa_managers[]":    {"): client-side managers f-csa1, f-csa2 become farcast/Apply; "},
-				"objects[].csa_fields_sha256": {"; their fields' sha256 f-msha; "},
-				"objects[].annotation":        {"; last-applied annotation present, removed; "},
-				"objects[].other_managers[]":  {"; other managers kept: f-other1, f-other2\n"},
-				"local[]":                     {"; then delete f-local1, f-local2; irreversible"},
-				"irreversible":                {"; irreversible: yes\n", "f-other2\n  " + migrateIrreversible + "\n"},
-			}),
-		factRow("migrate, cluster-scoped, no local file, can be undone", plan.MigrateFact{Type: plan.TypeMigrate,
-			Objects: []plan.MigrateObject{{API: "f-mapi2", Kind: "f-mkind2", Name: "f-mname2", UID: "f-muid2",
-				CSAManagers: []string{"f-csa3"}, CSAFieldsSHA256: "f-msha2"}}},
-			map[string][]string{
-				"objects[].namespace":        {"\n  f-mkind2 f-mname2 (f-mapi2, uid f-muid2): "},
-				"objects[].annotation":       {"; last-applied annotation absent; "},
-				"objects[].other_managers[]": {"; other managers kept: none\n"},
-				"local[]":                    {"; then delete no local file; "},
-				"irreversible":               {"; irreversible: no\n"},
-			}),
-
 		// The grant (A33-11): apply in both words, and each observation's
 		// three states.
 		factRow("grant", plan.GrantFact{Type: plan.TypeGrant, Name: plan.GrantBucket, Target: "f-gtarget",
@@ -581,8 +552,8 @@ func TestEveryBoundFactIsRendered(t *testing.T) {
 		planTypes[typ.Name()] = typ
 	}
 	names := factTypeNames(t)
-	if len(names) != 20 {
-		t.Errorf("the plan package has %d fact types, %v; ADR 0023 M2.8 has 20", len(names), names)
+	if len(names) != 19 {
+		t.Errorf("the plan package has %d fact types, %v; ADR 0023 M2.9a has 19", len(names), names)
 	}
 	for _, n := range names {
 		if _, ok := planTypes[n]; !ok {
@@ -802,7 +773,7 @@ func TestPlanRenderingQuotesHostileText(t *testing.T) {
 		}
 	}
 	// A fact this farcast has no words for prints its JSON, quoted too.
-	text = renderPlan(t, sampleBound(irreversibleSample{Type: "irreversible_sample", What: hostile, once: true}))
+	text = renderPlan(t, sampleBound(unknownSample{Type: "unknown_sample", What: hostile}))
 	if strings.Contains(text, "\x1b") || strings.Contains(text, "\u202e") {
 		t.Errorf("a fact with no words prints a value raw:\n%q", text)
 	}
@@ -1610,110 +1581,35 @@ func TestPlanAgainstAReplacedSystemNamespaceIsRefused(t *testing.T) {
 	}
 }
 
-// irreversibleSample is a fact type the rendering has no words for, which
-// says it cannot be undone unless once is set.
-type irreversibleSample struct {
+// unknownSample is a fact type the rendering has no words for.
+type unknownSample struct {
 	Type string `json:"type"`
 	What string `json:"what"`
-	once bool
 }
 
-func (irreversibleSample) FactType() string     { return "irreversible_sample" }
-func (s irreversibleSample) Irreversible() bool { return !s.once }
+func (unknownSample) FactType() string { return "unknown_sample" }
 
-// TestIrreversibleFactsComeFirst: a fact that says it cannot be undone is
-// rendered before the others, and a fact type the rendering has no words for
-// is still shown in full, as its JSON.
-func TestIrreversibleFactsComeFirst(t *testing.T) {
+// TestFactsRenderInTheirOrder: the facts render in the order the plan binds
+// them, whatever they are, and a fact type the rendering has no words for is
+// still shown in full, as its JSON. ADR 0023 M2.9a removed the rule that put
+// an irreversible fact first, with migrate's, the only one (design A37-12).
+func TestFactsRenderInTheirOrder(t *testing.T) {
 	notice := plan.NoticeFact{Type: plan.TypeNotice, Text: "a notice"}
-	r := planResult{typed: sampleBound(notice, irreversibleSample{Type: "irreversible_sample", What: "x <y>"}), confirm: "To do exactly this: …"}
+	r := planResult{typed: sampleBound(notice, unknownSample{Type: "unknown_sample", What: "x <y>"}), confirm: "To do exactly this: …"}
 	var w bytes.Buffer
 	if err := r.Human(&w); err != nil {
 		t.Fatal(err)
 	}
-	if want := "\n\nfact irreversible_sample: {\"type\":\"irreversible_sample\",\"what\":\"x <y>\"}\nnotice: a notice\n"; !strings.Contains(w.String(), want) {
-		t.Errorf("the irreversible fact does not come first:\n%s", w.String())
+	if want := "\n\nnotice: a notice\nfact unknown_sample: {\"type\":\"unknown_sample\",\"what\":\"x <y>\"}\n\ndigest: "; !strings.Contains(w.String(), want) {
+		t.Errorf("the facts are not in their order, or the unknown one is not its JSON:\n%s", w.String())
 	}
 
-	r.typed = sampleBound(notice, &irreversibleSample{Type: "irreversible_sample", What: "z", once: true})
+	r.typed = sampleBound(&unknownSample{Type: "unknown_sample", What: "z"}, notice)
 	w.Reset()
 	if err := r.Human(&w); err != nil {
 		t.Fatal(err)
 	}
-	if want := "notice: a notice\nfact irreversible_sample: {\"type\":\"irreversible_sample\",\"what\":\"z\"}\n"; !strings.Contains(w.String(), want) {
-		t.Errorf("a fact that can be undone moved:\n%s", w.String())
-	}
-
-	// migrate's own fact (ADR 0023 M2.7, A30-12): it cannot be undone, so it
-	// comes first, and §6.7's paragraph closes its lines before the next
-	// fact. Bound as one that could be undone, it keeps its place and says
-	// nothing of the kind.
-	const empty = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-	migrate := plan.MigrateFact{Type: plan.TypeMigrate, Local: []string{"instances/h-instance/kubeconfig.yaml"}, CannotBeUndone: true,
-		Objects: []plan.MigrateObject{{API: "v1", Kind: "Secret", Namespace: "web", Name: "git", UID: "u-1",
-			CSAFieldsSHA256: empty, Annotation: true, OtherManagers: []string{"kubectl/Apply"}}}}
-	lines := "migrate 1 object(s) on the cluster; then delete instances/h-instance/kubeconfig.yaml; irreversible: %s\n" +
-		"  Secret web/git (v1, uid u-1): client-side managers none become farcast/Apply; their fields' sha256 " + empty +
-		"; last-applied annotation present, removed; other managers kept: kubectl/Apply\n"
-	r.typed = sampleBound(notice, migrate)
-	w.Reset()
-	if err := r.Human(&w); err != nil {
-		t.Fatal(err)
-	}
-	if want := "\n\n" + fmt.Sprintf(lines, "yes") + "  " + migrateIrreversible + "\nnotice: a notice\n\ndigest: "; !strings.Contains(w.String(), want) {
-		t.Errorf("migrate's fact does not come first, closed by its paragraph:\n%s", w.String())
-	}
-	migrate.CannotBeUndone = false
-	r.typed = sampleBound(notice, &migrate)
-	w.Reset()
-	if err := r.Human(&w); err != nil {
-		t.Fatal(err)
-	}
-	if want := "notice: a notice\n" + fmt.Sprintf(lines, "no") + "\ndigest: "; !strings.Contains(w.String(), want) {
-		t.Errorf("migrate's fact, bound as one that can be undone, moved:\n%s", w.String())
-	}
-	if strings.Contains(w.String(), "This cannot be undone") {
-		t.Errorf("a migrate fact that can be undone says it cannot:\n%s", w.String())
-	}
-}
-
-// TestMigratePlanQuotesServerNames (A30-13, mutation row 98b): migrate's fact
-// names what the cluster sent, namespaces, names, uids and managers, and each
-// that would not print as it is prints Go-quoted, a list's elements one by
-// one: no byte below 0x20 reaches the text but the rendering's own newlines,
-// and no name's newline forges a line of its own.
-func TestMigratePlanQuotesServerNames(t *testing.T) {
-	const (
-		manager = "kubectl\x1b[2K\n\"edit\""
-		name    = "api\x07"
-		ns      = "web\r"
-		uid     = "u\x1b]0;title\x07"
-		role    = "reader\x00"
-	)
-	f := plan.MigrateFact{Type: plan.TypeMigrate, CannotBeUndone: true, Objects: []plan.MigrateObject{
-		{API: "apps/v1", Kind: "Deployment", Namespace: ns, Name: name, UID: uid, CSAManagers: []string{"kubectl-client-side-apply", manager},
-			CSAFieldsSHA256: "f-sha", Annotation: true, OtherManagers: []string{manager + "/Update", "farcast/Apply"}},
-		{API: "rbac.authorization.k8s.io/v1", Kind: "ClusterRole", Name: role, UID: "u-2", CSAManagers: []string{manager},
-			CSAFieldsSHA256: "f-sha2"},
-	}}
-	text := renderPlan(t, sampleBound(f))
-	for i := 0; i < len(text); i++ {
-		if text[i] < 0x20 && text[i] != '\n' {
-			t.Fatalf("byte %#02x at %d reaches the rendering raw:\n%q", text[i], i, text)
-		}
-	}
-	q := strconv.QuoteToGraphic
-	for _, want := range []string{
-		"\n  Deployment " + q(ns) + "/" + q(name) + " (apps/v1, uid " + q(uid) + "): client-side managers kubectl-client-side-apply, " +
-			q(manager) + " become farcast/Apply; ",
-		"; other managers kept: " + q(manager+"/Update") + ", farcast/Apply\n",
-		"\n  ClusterRole " + q(role) + " (rbac.authorization.k8s.io/v1, uid u-2): client-side managers " + q(manager) + " become ",
-	} {
-		if !strings.Contains(text, want) {
-			t.Errorf("the rendering should hold %q:\n%s", want, text)
-		}
-	}
-	if strings.Contains(text, "\n\"edit\"") {
-		t.Errorf("a manager's newline starts a line of its own:\n%s", text)
+	if want := "\n\nfact unknown_sample: {\"type\":\"unknown_sample\",\"what\":\"z\"}\nnotice: a notice\n\ndigest: "; !strings.Contains(w.String(), want) {
+		t.Errorf("the facts are not in their order:\n%s", w.String())
 	}
 }

@@ -58,17 +58,6 @@ import (
 // writeName is the instance the writing commands' fixtures record.
 const writeName = "atlas"
 
-// recordMigrated records m as an instance whose objects are written with
-// server-side apply, at a fixed time and by a fixed farcast: the record ADR
-// 0023 M2.7's writers check before they do anything (design A30-20). It is
-// called wherever a record a writer runs on is built: in readerInstance and
-// installedInstance, on which every other base fixture builds and saves the
-// record again with it kept, and in the tests and helpers that build their
-// own. Only a test of an unmigrated instance clears it.
-func recordMigrated(m *config.InstanceMetadata) {
-	m.ServerSideApply = &config.ServerSideApply{Since: time.Date(2026, 11, 18, 9, 0, 0, 0, time.UTC), Farcast: "v0.0.0-test"}
-}
-
 // writeNewNamespace is a namespace the fixture's kernel does not meter yet,
 // so kernel meter has one to add.
 const writeNewNamespace = "extra"
@@ -77,10 +66,9 @@ const writeNewNamespace = "extra"
 // granted, its writer's credentials.yaml registered with s under id
 // "writer") with everything each writing command checks before it opens the
 // writer: a registry, a kernel and a cost limit, FatLine behind a carrier, a
-// keyholder, storage and a keyring, and the kubeconfig.yaml an install
-// before ADR 0023 M2.7 wrote, which nothing reads or writes since M2.7 and
-// migrate deletes: written here as a file, for migrate's local fact. keyed false rewrites credentials.yaml as an install with
-// Application Default Credentials wrote it: a provider and no key.
+// keyholder, storage and a keyring. keyed false rewrites credentials.yaml as
+// an install with Application Default Credentials wrote it: a provider and
+// no key.
 func writeInstance(t *testing.T, s *kubetest.Server, keyed bool) (config.Dir, *config.InstanceMetadata) {
 	t.Helper()
 	dir, meta := readerInstance(t, s, writeName, true)
@@ -97,9 +85,6 @@ func writeInstance(t *testing.T, s *kubetest.Server, keyed bool) (config.Dir, *c
 		t.Fatal(err)
 	}
 	saveKeyring(t, dir, writeName, appsKeyring(t, "web"))
-	if err := os.WriteFile(filepath.Join(dir.InstancePath(writeName), "kubeconfig.yaml"), []byte("apiVersion: v1\nkind: Config\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
 	if !keyed {
 		if err := dir.SaveInstanceCredentials(writeName, &config.InstanceCredentials{Provider: "gke"}); err != nil {
 			t.Fatal(err)
@@ -137,12 +122,10 @@ type writeCommand struct {
 	prepare func(t *testing.T, dir config.Dir)
 }
 
-// writeCommands is the fourteen commands that write to an instance's
-// cluster: ADR 0023 M2.7's migrate is the twelfth (A30-26), and M2.8's
-// git-credential set and rm the thirteenth and fourteenth (design §33,
-// A33-32). migrate's row answers its typed-name question as runWrite answers
-// every prompt, "y", which is not the instance's name, so it aborts having
-// written nothing. git-credential's rows ask through their interactive seam,
+// writeCommands is the thirteen commands that write to an instance's
+// cluster: M2.8's git-credential set and rm are the twelfth and thirteenth
+// (design §33, A33-32), and ADR 0023 M2.9a removed M2.7's migrate (design
+// A37-1, A37-10). git-credential's rows ask through their interactive seam,
 // as reader grant's does, since --yes is refused, and set's reads its token
 // from a fake (gitCredentialTokenOf): runWrite's stdin answers the question.
 func writeCommands() []writeCommand {
@@ -164,7 +147,6 @@ func writeCommands() []writeCommand {
 		{name: "reader grant", args: []string{writeName}, cmd: func() Command {
 			return &readerGrantCommand{interactive: func(*Env) bool { return true }}
 		}},
-		{name: "migrate", args: []string{writeName}, cmd: func() Command { return &migrateCommand{interactive: func(*Env) bool { return true }} }},
 		{name: "git-credential set", args: []string{writeName}, flags: gitCredentialSetFlags(), cmd: func() Command {
 			return &gitCredentialCommand{action: plan.GitCredentialSet, interactive: func(*Env) bool { return true }, readToken: gitCredentialTokenOf(gitCredentialToken + "\n")}
 		}},
@@ -1070,17 +1052,14 @@ func applyingPlans(t *testing.T) []applyingPlan {
 }
 
 // rolledBack is "" when after is the record a failure of p's command leaves
-// from before, and otherwise what is wrong with it: no failure leaves the
-// instance unmigrated; connect and redeploy record FatLine only once it is
+// from before, and otherwise what is wrong with it: connect and redeploy
+// record FatLine only once it is
 // applied; kernel deploy and storage deploy record their workload before
 // the apply and keep it, unapplied; kernel meter and kernel confirm put back
 // what they recorded before the apply; build, run and reader grant record
 // nothing until they are done; and git-credential set records nothing at
 // all.
 func (p applyingPlan) rolledBack(before, after *config.InstanceMetadata) string {
-	if after.ServerSideApply == nil {
-		return "unmigrated"
-	}
 	same := func(field string, a, b any) string {
 		if !reflect.DeepEqual(a, b) {
 			return fmt.Sprintf("with %s %+v, not %+v", field, b, a)
@@ -1122,9 +1101,8 @@ func (p applyingPlan) rolledBack(before, after *config.InstanceMetadata) string 
 	return ""
 }
 
-// confirmation is what confirmApplying or yesApplying saw: the fixture, the
-// plan, the requests the run after it sent, and its error, stdout and
-// stderr.
+// confirmation is what confirmApplying saw: the fixture, the plan, the
+// requests the run after it sent, and its error, stdout and stderr.
 type confirmation struct {
 	s              *kubetest.Server
 	dir            config.Dir
@@ -1157,32 +1135,6 @@ func confirmApplying(t *testing.T, p applyingPlan, before func(s *kubetest.Serve
 		before(s, dir, c.b)
 	}
 	c.run(t, p, "--confirm", doc.Digest)
-	return c
-}
-
-// yesApplyingCommands are the commands that apply whose interactive or
-// --yes run opens its writer apart from the one --confirm opens: each takes
-// --yes. kernel meter, kernel confirm and reader grant open one writer in
-// every mode.
-var yesApplyingCommands = []string{"connect", "redeploy", "build", "kernel deploy", "storage deploy", "run"}
-
-// yesApplying is confirmApplying's --yes form, for a command of
-// yesApplyingCommands: p's plan is printed with --plan (run's fetch plan, for
-// a run row), and before run between it and the command run again with
-// --yes, through its real writer, past every question.
-func yesApplying(t *testing.T, p applyingPlan, before func(s *kubetest.Server, dir config.Dir, b plan.Bound), opts ...kubetest.Option) confirmation {
-	t.Helper()
-	s, dir := planFixtureWith(t, p.row, true, opts...)
-	if p.seed != nil {
-		p.seed(s)
-	}
-	recordedRegistry(t, p.row, dir)
-	doc, _ := runPlan(t, dir, p.row, output.ModeJSON)
-	c := confirmation{s: s, dir: dir, b: decodedBound(t, doc)}
-	if before != nil {
-		before(s, dir, c.b)
-	}
-	c.run(t, p, "--yes")
 	return c
 }
 
@@ -1272,8 +1224,6 @@ func realWriter(t *testing.T, cmd Command) Command {
 		c.newPinStore = nil
 	case *runCommand:
 		c.newCluster = nil
-	case *migrateCommand:
-		c.newCluster = nil
 	case *gitCredentialCommand:
 		c.newCluster = nil
 	case *kernelMeterCommand, *kernelConfirmCommand, *readerGrantCommand:
@@ -1287,10 +1237,9 @@ func realWriter(t *testing.T, cmd Command) Command {
 // onlyThePlansReads fails t unless every request s saw is one row's plan
 // may make under m (design §7.3, A23-20): none for a plan that reads no
 // cluster, and for one that reads it, the reader's token and the reader's
-// GETs, or for migrate's, read as the writer (identity "writer", A30-26),
-// the writer's token and the writer's GETs. Under --confirm a row whose
-// --confirm reads the cluster (confirmReadsCluster, run's fetch plan) may
-// make the reader's too.
+// GETs. No plan reads as the writer since ADR 0023 M2.9a removed migrate's
+// (design A37-12). Under --confirm a row whose --confirm reads the cluster
+// (confirmReadsCluster, run's fetch plan) may make the reader's too.
 func onlyThePlansReads(t *testing.T, row planCommand, s *kubetest.Server, m consentMode) {
 	t.Helper()
 	onlyThePlansSent(t, row, s.Requests(), m)
@@ -1300,17 +1249,13 @@ func onlyThePlansReads(t *testing.T, row planCommand, s *kubetest.Server, m cons
 // saw a writer's requests too, before the ones it checks.
 func onlyThePlansSent(t *testing.T, row planCommand, reqs []kubetest.Request, m consentMode) {
 	t.Helper()
-	reads := row.readsCluster || row.identity == "writer" || (m == consentConfirm && row.confirmReadsCluster)
-	as := "reader"
-	if row.identity == "writer" {
-		as = "writer"
-	}
+	reads := row.readsCluster || (m == consentConfirm && row.confirmReadsCluster)
 	for _, r := range reqs {
 		switch {
 		case !reads:
 			t.Errorf("%s reads no cluster, and sent %s %s as %q", row, r.Method, r.Path, r.As)
-		case r.As != as:
-			t.Errorf("%s sent %s %s as %q; its plan reads as the %s alone", row, r.Method, r.Path, r.As, as)
+		case r.As != "reader":
+			t.Errorf("%s sent %s %s as %q; its plan reads as the reader alone", row, r.Method, r.Path, r.As)
 		case r.Path != "/token" && r.Method != http.MethodGet:
 			t.Errorf("%s sent %s %s; a plan only reads", row, r.Method, r.Path)
 		}
@@ -1516,11 +1461,9 @@ func bodyResourceVersion(t *testing.T, body []byte) string {
 // any command the router reaches, each group and its subcommands included,
 // names kubectl, and neither do the five hint texts: build's, run's and the
 // manifest read's failures, redeploy's rollout hint and kernel deploy's
-// missing-namespace block. migrate's Usage names kubectl only as what it
-// migrates from (design §6.1): its client-side apply, that apply's manager
-// entry and its last-applied annotation.
+// missing-namespace block. No command is exempt since ADR 0023 M2.9a removed
+// migrate (design A37-1).
 func TestNoCommandHelpNamesKubectl(t *testing.T) {
-	migratedFrom := []string{"kubectl's client-side apply", "kubectl-client-side-apply entry", "kubectl's last-applied annotation"}
 	var seen []string
 	var walk func(prefix string, reg *Registry)
 	walk = func(prefix string, reg *Registry) {
@@ -1531,14 +1474,6 @@ func TestNoCommandHelpNamesKubectl(t *testing.T) {
 			commandFlags(c).VisitAll(func(f *flag.Flag) { texts["--"+f.Name] = f.Usage })
 			for what, text := range texts {
 				flat := strings.Join(strings.Fields(text), " ")
-				if name == "migrate" && what == "Usage" {
-					for _, phrase := range migratedFrom {
-						if !strings.Contains(flat, phrase) {
-							t.Errorf("migrate's Usage no longer says %q; this test's exemption is stale:\n%s", phrase, text)
-						}
-						flat = strings.ReplaceAll(flat, phrase, "")
-					}
-				}
 				if strings.Contains(flat, "kubectl") {
 					t.Errorf("%s's %s names kubectl:\n%s", name, what, text)
 				}
@@ -1549,7 +1484,7 @@ func TestNoCommandHelpNamesKubectl(t *testing.T) {
 		}
 	}
 	walk("", defaultRegistry())
-	for _, want := range []string{"migrate", "build", "run", "redeploy", "kernel meter", "reader grant", "usage", "storage key pin", "storage key rotate",
+	for _, want := range []string{"build", "run", "redeploy", "kernel meter", "reader grant", "usage", "storage key pin", "storage key rotate",
 		"git-credential", "git-credential set", "git-credential rm"} {
 		if !slices.Contains(seen, want) {
 			t.Errorf("the walk never reached %q; it reached %q", want, seen)
@@ -1711,10 +1646,10 @@ type planCommand struct {
 	// readsCluster: the plan reads the cluster, as the instance's reader.
 	readsCluster bool
 	// identity is who the plan reads the cluster as, its cluster_identity:
-	// "reader" for a row that readsCluster; "writer" for migrate's, the one
-	// plan read as the writer, because it lists Secrets' metadata (ADR 0023
-	// M2.7, design §6.1, A30-26); and "none" for a plan that reads no
-	// cluster. TestEveryWritingCommandHasAPlanRow holds it to the plan's.
+	// "reader" for a row that readsCluster, and "none" for a plan that reads
+	// no cluster. No plan reads as the writer since ADR 0023 M2.9a removed
+	// migrate's (design A37-12). TestEveryWritingCommandHasAPlanRow holds it
+	// to the plan's.
 	identity string
 	// confirmReadsCluster: its --confirm of a digest that is not its own
 	// reads the cluster as the reader, where its --plan reads none: run's
@@ -1890,11 +1825,9 @@ func loopbackEndpoint(endpoint string) bool {
 // storage key pin (M2.6c), which reads the cluster as the reader and no
 // Google; and storage key rotate (M2.6c), which reads the cluster as the
 // reader when a keyholder is deployed, and no cluster otherwise, and no
-// Google; run (M2.6d), whose rows are below and in runDeployRows; and
-// migrate (M2.7, A30-26), whose plan reads the cluster as the writer, the
-// instance's own against the fixture's kubetest, and no Google. kernel
-// confirm reads planClock; through the router, pinPlanClock fixes the same
-// clock.
+// Google; and run (M2.6d), whose rows are below and in runDeployRows. ADR
+// 0023 M2.9a removed migrate's rows (design A37-12). kernel confirm reads
+// planClock; through the router, pinPlanClock fixes the same clock.
 func planCommands() []planCommand {
 	meter := func() Command { return &kernelMeterCommand{} }
 	confirm := func() Command {
@@ -2090,17 +2023,6 @@ func planCommands() []planCommand {
 		m.Toolchain = &config.Toolchain{Fetcher: fetcherDigest, Builder: builderDigest}
 	}
 	intoShop := append(slices.Clone(runFixtureFlags), "--namespace", "shop")
-	// migrate, its writer the instance's, against the fixture's kubetest
-	// (migrateWriterDefault, loopback only here), counted as a writer open.
-	migrate := func(f *planFakes) func() Command {
-		return func() Command {
-			return &migrateCommand{newCluster: func(r clusterRef) (migrateCluster, error) {
-				f.writers++
-				return migrateWriterDefault(r)
-			}}
-		}
-	}
-	migrating, nothingToMigrate := fakes(nil), fakes(nil)
 	// git-credential set and rm (M2.8, design §33, A33-29), whose plans read
 	// the record alone: the writer the instance's, against the fixture's
 	// kubetest (gitCredentialWriterDefault, loopback only here), counted as
@@ -2225,14 +2147,6 @@ func planCommands() []planCommand {
 			}, fakes: runOther},
 		{name: "run", shape: "a keyring holding the shared application scope", identity: "none", stage: "fetch", args: runFixtureArgs, flags: runFixtureFlags,
 			cmd: runWithFakes(runShared), prepare: func(t *testing.T, dir config.Dir) { saveSharedScopeKeyring(t, dir, writeName) }, fakes: runShared},
-		// migrate's plans (M2.7, A30-26), read as the writer: an instance an
-		// older farcast applied with kubectl, its objects to migrate, and a
-		// migrated one with nothing to migrate. Each finds the kubeconfig.yaml
-		// the fixture holds, which a migration deletes.
-		{name: "migrate", shape: "objects to migrate", identity: "writer", args: []string{writeName}, cmd: migrate(migrating),
-			edit: func(m *config.InstanceMetadata) { m.ServerSideApply = nil }, seed: clientSideSeeded, fakes: migrating},
-		{name: "migrate", shape: "nothing to migrate", identity: "writer", args: []string{writeName}, cmd: migrate(nothingToMigrate),
-			seed: systemNamespace, fakes: nothingToMigrate},
 		// git-credential's plans (M2.8): set of a credential the cluster
 		// lacks, and rm of one farcast wrote, which the fixture's cluster
 		// holds (gitCredentialSeeded). Neither reads the cluster.
@@ -2420,8 +2334,8 @@ var factTypes = map[string]reflect.Type{
 	plan.TypeRotation: reflect.TypeFor[plan.RotationFact](), plan.TypeFetch: reflect.TypeFor[plan.FetchFact](),
 	plan.TypeRun: reflect.TypeFor[plan.RunFact](), plan.TypeBuild: reflect.TypeFor[plan.BuildFact](),
 	plan.TypeApplicationReset: reflect.TypeFor[plan.ApplicationResetFact](), plan.TypeReader: reflect.TypeFor[plan.ReaderFact](),
-	plan.TypeNotice: reflect.TypeFor[plan.NoticeFact](), plan.TypeMigrate: reflect.TypeFor[plan.MigrateFact](),
-	plan.TypeGrant: reflect.TypeFor[plan.GrantFact](), plan.TypeGitCredential: reflect.TypeFor[plan.GitCredentialFact](),
+	plan.TypeNotice: reflect.TypeFor[plan.NoticeFact](), plan.TypeGrant: reflect.TypeFor[plan.GrantFact](),
+	plan.TypeGitCredential: reflect.TypeFor[plan.GitCredentialFact](),
 }
 
 // decodedBound decodes a printed plan's bound member, its facts typed.
@@ -2503,10 +2417,9 @@ func writeTargets(b plan.Bound) []string {
 // a builder (connect's, redeploy's, build's, kernel deploy's, storage
 // deploy's) ensures and deletes no registry, builds and pushes no image (its
 // token and lookups are reads), opens no writer and dials nothing; storage
-// deploy mints no storage, and storage key pin opens no keyholder. migrate's
-// plan (ADR 0023 M2.7, A30-26) is read as the writer: it opens the writer
-// once for each plan it prints, and only reads as it. The
-// shapes are every command's (everyPlanShape, design §28's step 9b), and
+// deploy mints no storage, and storage key pin opens no keyholder. No plan
+// opens the writer since ADR 0023 M2.9a removed migrate's (design A37-12).
+// The shapes are every command's (everyPlanShape, design §28's step 9b), and
 // run's deploy plans among them are computed as --confirm of a digest that
 // is no plan's computes them (runDeployDigest): as the reader alone, with
 // no writer opened and no fetch Job applied.
@@ -2539,15 +2452,10 @@ func TestPlansWriteNothing(t *testing.T) {
 				if len(f.builder.built)+len(f.builder.embedded) != 0 {
 					t.Errorf("%s --plan built %d images and pushed %d", row, len(f.builder.built), len(f.builder.embedded))
 				}
-				// One writer open for each of the two plans printed, for a
-				// plan read as the writer, and none for any other.
-				opens := 0
-				if row.identity == "writer" {
-					opens = 2
-				}
-				if f.writers != opens || f.dialled+f.storages+f.keyholders+f.tokens != 0 {
-					t.Errorf("%s --plan opened the writer %d times (want %d), dialled %d, minted storage %d times, opened the keyholder %d times and read a Git token %d times",
-						row, f.writers, opens, f.dialled, f.storages, f.keyholders, f.tokens)
+				// No plan opens the writer.
+				if f.writers != 0 || f.dialled+f.storages+f.keyholders+f.tokens != 0 {
+					t.Errorf("%s --plan opened the writer %d times (want 0), dialled %d, minted storage %d times, opened the keyholder %d times and read a Git token %d times",
+						row, f.writers, f.dialled, f.storages, f.keyholders, f.tokens)
 				}
 				// No plan writes a bucket's policy, --grant-bucket's
 				// included (design §33, A33-24, row 106b).
@@ -2797,9 +2705,8 @@ func TestConnectPlanFactsFollowItsState(t *testing.T) {
 // the record and keys.yaml; --confirm with its digest reads the key, for the
 // writer that applies the manifest read, before a deploy plan exists
 // (A28-11). Each deploy plan is computed as --confirm of a digest that is no
-// plan's computes it (runDeployDigest). migrate's plan (M2.7, A30-26) reads
-// it too, not for Google: it reads the cluster as the writer. git-credential
-// set's and rm's plans (M2.8) read the record alone. A plan of the read
+// plan's computes it (runDeployDigest). git-credential set's and rm's plans
+// (M2.8) read the record alone. A plan of the read
 // group on an instance installed without a key (Application Default
 // Credentials) is refused credential_missing, before the provider opens.
 func TestPlansStillReadTheInstallerKeyForGoogle(t *testing.T) {
@@ -2809,7 +2716,7 @@ func TestPlansStillReadTheInstallerKeyForGoogle(t *testing.T) {
 		"connect": true, "connect/reconnect": false, "redeploy": true, "build": true,
 		"kernel deploy": true, "kernel deploy/a missing namespace": false,
 		"storage deploy": true, "storage deploy/behind the pin": false, "storage key pin": false,
-		"storage key rotate": false, "run": false, "migrate": true,
+		"storage key rotate": false, "run": false,
 		// git-credential's plans read the record alone (design §33, A33-35).
 		"git-credential set": false, "git-credential rm": false,
 		// run's deploy plans (design §33, A33-35): those past every block
@@ -3903,9 +3810,8 @@ func readerPlans(t *testing.T) []planCommand {
 // the reader's, and its reader seam was asked for the reader. A plan that
 // reads no cluster sends nothing. run's deploy plans (M2.6d) are computed
 // as --confirm of a digest that is no plan's computes them
-// (runDeployDigest): the reader alone, and no writer. migrate's plan (M2.7,
-// A30-26) is the one read as the writer: every request is the writer's
-// token or a GET as the writer.
+// (runDeployDigest): the reader alone, and no writer. No plan is read as the
+// writer since ADR 0023 M2.9a removed migrate's (design A37-12).
 func TestPlansPresentOnlyTheReaderToken(t *testing.T) {
 	onlyTheReaders := func(t *testing.T, row planCommand, reqs []kubetest.Request) {
 		t.Helper()
@@ -3926,20 +3832,6 @@ func TestPlansPresentOnlyTheReaderToken(t *testing.T) {
 			s, dir := planFixture(t, row)
 			runPlan(t, dir, row, output.ModeJSON)
 			reqs := s.Requests()
-			if row.identity == "writer" {
-				// migrate's plan is read as the writer (ADR 0023 M2.7,
-				// A30-26): every request, every token among them, is the
-				// writer's, and only reads.
-				if len(reqs) == 0 {
-					t.Fatalf("%s reads the cluster as the writer, and sent nothing", row)
-				}
-				for _, r := range reqs {
-					if r.As != "writer" || (r.Path != "/token" && r.Method != http.MethodGet) {
-						t.Errorf("%s: %s %s?%s as %q; want the writer's token and reads alone", row, r.Method, r.Path, r.RawQuery, r.As)
-					}
-				}
-				return
-			}
 			if !row.readsCluster {
 				if len(reqs) != 0 {
 					t.Errorf("%s --plan reads no cluster, and sent %d requests", row, len(reqs))

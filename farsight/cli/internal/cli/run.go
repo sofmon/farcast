@@ -329,9 +329,6 @@ func (c *runCommand) Run(ctx context.Context, env *Env, args []string) (err erro
 	if err := recordNamed(meta, name); err != nil {
 		return err
 	}
-	if err := refuseUnmigrated(name, meta); err != nil {
-		return err
-	}
 	if meta.Registry == nil || meta.Registry.Prefix == "" {
 		return fmt.Errorf("instance %q has no image registry recorded; run 'farcast connect %s' first", name, name)
 	}
@@ -368,7 +365,6 @@ func (c *runCommand) Run(ctx context.Context, env *Env, args []string) (err erro
 		if cl, uid, err = openReadyAt(ctx, env, meta, c.newCluster); err != nil {
 			return err
 		}
-		defer afterWrites(env, name, cl)
 	}
 	pf, fb, err := c.fetchPlan(ctx, env, meta, repo, blocked)
 	if err != nil {
@@ -450,7 +446,6 @@ func (c *runCommand) confirmed(ctx context.Context, env *Env, meta *config.Insta
 		if err != nil {
 			return err
 		}
-		defer afterWrites(env, name, cl)
 		if err := applyFetch(ctx, env, cl, pf.cfg); err != nil {
 			return err
 		}
@@ -505,7 +500,6 @@ func (c *runCommand) confirmed(ctx context.Context, env *Env, meta *config.Insta
 	if err != nil {
 		return err
 	}
-	defer afterWrites(env, name, cl)
 	return c.deploy(ctx, env, meta, cl, p, consentConfirm)
 }
 

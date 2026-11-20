@@ -253,9 +253,8 @@ func makeLayout(root string, s Spec, tunnelAddr, clusterAddr string, now time.Ti
 		Endpoint: clusterAddr, Status: config.InstanceRunning,
 		CostLimit: config.CostLimit{Amount: limitUSD, Currency: "USD", Period: "monthly"},
 		CreatedAt: now, UpdatedAt: now,
-		Reader:          &config.Reader{Email: readerEmail(inst), KeyID: keyID, GrantedAt: now},
-		ServerSideApply: &config.ServerSideApply{Since: now, Farcast: "rehearsal"},
-		CloudLogging:    config.CloudLoggingSystem, FatLineDeployed: true,
+		Reader:       &config.Reader{Email: readerEmail(inst), KeyID: keyID, GrantedAt: now},
+		CloudLogging: config.CloudLoggingSystem, FatLineDeployed: true,
 		Carrier:  &config.Carrier{Type: "rehearsal", Endpoint: tunnelAddr, ServerName: identity.ServerName(inst)},
 		Registry: &config.Registry{Prefix: "registry.rehearsal.invalid/farcast", FatLineDigest: s.Images[nameFatLine]},
 		Kernel: &config.Kernel{
