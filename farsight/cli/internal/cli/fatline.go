@@ -48,6 +48,9 @@ type clusterApplier interface {
 	// into before it builds anything (see kernel deploy).
 	Namespaces(ctx context.Context) ([]string, error)
 	preflighter
+	// serviceAccountReader reads a ServiceAccount's uid as the writer, which
+	// a grant names (ADR 0023 M2.8, design §33 A33-18).
+	serviceAccountReader
 }
 
 // preflighter is the one read a writing command makes as the writer before
@@ -805,9 +808,9 @@ func registryTarget(meta *config.InstanceMetadata) string {
 
 // registryFacts are a plan's cloud facts for the registry (A23-24): the
 // ensure, unconditionally, as its two writes (the repository, then the
-// cluster's pull grant on it, whose target is the repository until ADR 0023
-// M2.8 reads the project number), then a push for each decision that puts an
-// image in the registry, in the order given.
+// cluster's pull grant on it, whose target is the repository: the pull
+// principal is recorded as Registry.Puller, design §33 A33-23), then a push
+// for each decision that puts an image in the registry, in the order given.
 func registryFacts(meta *config.InstanceMetadata, decs ...imageDecision) []plan.Fact {
 	target := registryTarget(meta)
 	facts := []plan.Fact{

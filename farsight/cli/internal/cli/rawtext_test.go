@@ -11,9 +11,12 @@ import (
 	"testing"
 
 	"github.com/sofmon/farcast/datasphere"
+	dsdeploy "github.com/sofmon/farcast/datasphere/deploy"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/keyholder"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
+	"github.com/sofmon/farcast/farsight/cli/internal/plan"
+	pbuild "github.com/sofmon/farcast/planck/build"
 )
 
 // hostileControls is what each of A28-3's rows hands a value or an error: an
@@ -238,18 +241,178 @@ func TestOlderRawTextsAreQuoted(t *testing.T) {
 		quotedOnTheTerminal(t, "\"farcast keeper enroll p513 desk", map[string]string{"stdout": sees.out.String(), "stderr": sees.err.String()})
 	})
 
-	// storage deploy: the bucket grant names the record's project and
-	// bucket, and the result its image.
-	t.Run("storage deploy: the bucket grant's project", func(t *testing.T) {
-		var b bytes.Buffer
-		writeBucketGrant(&b, "proj"+hostileControls, "bucket-1", "ns", "sa")
-		quotedOnTheTerminal(t, "gcloud projects describe \"proj", map[string]string{"stderr": b.String()})
-	})
-	t.Run("storage deploy: the bucket grant's bucket", func(t *testing.T) {
-		var b bytes.Buffer
-		writeBucketGrant(&b, "proj-1", "bucket"+hostileControls, "ns", "sa")
-		quotedOnTheTerminal(t, "add-iam-policy-binding gs://\"bucket", map[string]string{"stderr": b.String()})
-	})
+	// storage deploy (ADR 0023 M2.8, design §33 A33-15, A33-18, mutations
+	// 110i and 135): the bucket grant's commands take only checked values. A
+	// project or a recorded bucket carrying a quote, a $( or a control byte
+	// is refused, internal, in msgUnsafeRecord's words, and a uid the API
+	// server sent carrying a quote or a newline as document_unreadable:
+	// either way before anything is written, and nothing is printed.
+	storageDeployRefuses := func(t *testing.T, r *storageRig) error {
+		t.Helper()
+		env, out, errb := testEnvBoth(r.dir, output.ModeHuman)
+		err := r.cmd(t, "--yes").Run(context.Background(), env, []string{writeName})
+		if out.Len()+errb.Len() != 0 {
+			t.Errorf("storage deploy printed %q %q", out, errb)
+		}
+		r.wroteNothing(t)
+		if opened, reads, _ := r.bg.counts(); opened+reads != 0 {
+			t.Errorf("storage deploy opened the bucket's IAM %d times and read its policy %d", opened, reads)
+		}
+		return err
+	}
+	for _, project := range []string{"proj-1'$(id)", "proj-1$(touch x)", "proj" + hostileControls} {
+		t.Run(fmt.Sprintf("storage deploy: the bucket grant's project %q", project), func(t *testing.T) {
+			r := newStorageRig(t, func(m *config.InstanceMetadata) { m.Project = project })
+			err := storageDeployRefuses(t, r)
+			if want := fmt.Sprintf(msgUnsafeRecord, writeName, "project ID", project); err == nil || err.Error() != want || kindOf(classified(err)) != kindInternal {
+				t.Errorf("storage deploy = %v; want %q, internal", err, want)
+			}
+		})
+	}
+	for _, bucket := range []string{"farcast-atlas'$(id)", "farcast-atlas" + hostileControls} {
+		t.Run(fmt.Sprintf("storage deploy: the bucket grant's bucket %q", bucket), func(t *testing.T) {
+			r := newStorageRig(t, func(m *config.InstanceMetadata) { m.Storage.Bucket = bucket })
+			err := storageDeployRefuses(t, r)
+			if want := fmt.Sprintf(msgUnsafeRecord, writeName, "storage bucket", bucket); err == nil || err.Error() != want || kindOf(classified(err)) != kindInternal {
+				t.Errorf("storage deploy = %v; want %q, internal", err, want)
+			}
+		})
+	}
+	for _, uid := range []string{"00000000-0000-4000-8000-0000000'00d5", "00000000-0000-4000-8000-0000000000d5\nrm -rf ~"} {
+		t.Run(fmt.Sprintf("storage deploy: the keyholder's uid %q", uid), func(t *testing.T) {
+			r := newStorageRig(t, nil)
+			r.accounts[dsdeploy.DefaultName] = uid
+			if err := storageDeployRefuses(t, r); kindOf(classified(err)) != kindDocumentUnreadable {
+				t.Errorf("storage deploy = %v (kind %s); want document_unreadable", err, kindOf(classified(err)))
+			}
+		})
+		t.Run(fmt.Sprintf("the bucket grant's commands, the uid %q", uid), func(t *testing.T) {
+			g := fixtureBucketGrant(plan.GrantMissing, plan.GrantPresent)
+			if text, err := g.printed(fixtureBucket, uid); err == nil || text != "" || err.Error() != msgUnsafeGrantUID || kindOf(err) != kindInternal {
+				t.Errorf("the commands for %q = %q, %v; want A33-10's refusal, nothing printed", uid, text, err)
+			}
+		})
+	}
+	// build and run (ADR 0023 M2.8, design §33 A33-15, A33-18, mutations
+	// 110i and 135): the push grant's commands take only checked values. A
+	// project carrying a quote or a $( is refused, internal, in
+	// msgUnsafeRecord's words, and a uid the API server sent carrying a
+	// quote or a newline as document_unreadable: either way before anything
+	// is applied, and the commands print nothing.
+	for _, project := range []string{"proj-1'$(id)", "proj-1$(touch x)"} {
+		t.Run("build: the push grant's project "+project, func(t *testing.T) {
+			dir := config.Dir(t.TempDir())
+			meta := meteringInstance(t, dir, "p42")
+			meta.Project = project
+			if err := dir.SaveInstanceMetadata("p42", meta); err != nil {
+				t.Fatal(err)
+			}
+			fj := &fakeJobs{accounts: fixtureAccounts()}
+			c := buildCmd(fj)
+			opened := countWriterOpens(c, fj)
+			c.repo, c.app, c.builderImage = "https://github.com/example/repo.git", "api", builderDigest
+			env, out, errb := testEnvBoth(dir, output.ModeHuman)
+			err := c.Run(context.Background(), env, []string{"p42"})
+			if want := fmt.Sprintf(msgUnsafeRecord, "p42", "project ID", project); err == nil || err.Error() != want || kindOf(classified(err)) != kindInternal {
+				t.Errorf("build = %v; want %q, internal", err, want)
+			}
+			if out.Len()+errb.Len() != 0 || len(fj.applied) != 0 {
+				t.Errorf("build printed %q %q and applied %d streams", out, errb, len(fj.applied))
+			}
+			if *opened+fj.uidReads+fj.metaReads != 0 {
+				t.Errorf("build opened the writer %d times and read the cluster %d+%d times before it refused the record", *opened, fj.uidReads, fj.metaReads)
+			}
+		})
+		t.Run("run: the push grant's project "+project, func(t *testing.T) {
+			r := newStageRig(t, func(m *config.InstanceMetadata) { m.Project = project })
+			r.f.accounts = fixtureAccounts()
+			stdout, stderr, err := r.run(output.ModeHuman, "--yes")
+			if want := fmt.Sprintf(msgUnsafeRecord, stageName, "project ID", project); err == nil || err.Error() != want || kindOf(classified(err)) != kindInternal {
+				t.Errorf("run = %v; want %q, internal", err, want)
+			}
+			if stdout+stderr != "" || len(r.f.applied) != 0 {
+				t.Errorf("run printed %q %q and applied %d streams; want it refused before its fetch", stdout, stderr, len(r.f.applied))
+			}
+		})
+	}
+	// The repository and the location the push grant's commands print, each
+	// checked against registryNameShape (A33-15); a hand-edited record is
+	// the only way to hold another. One carrying a quote, or not in lower
+	// case, is refused, internal, in msgUnsafeRecord's words, before the
+	// provider is read, anything applied or anything printed; and build
+	// refuses it before the writer is opened or the cluster read.
+	for _, tc := range []struct{ field, value string }{
+		{"repository", "farcast-p42'; touch /tmp/x; '"},
+		{"repository", "Farcast-P42"},
+		{"location", "us-central1'; touch /tmp/x; '"},
+		{"location", "US-CENTRAL1"},
+	} {
+		edit := func(m *config.InstanceMetadata) {
+			if tc.field == "repository" {
+				m.Registry.Repository = tc.value
+			} else {
+				m.Registry.Location = tc.value
+			}
+		}
+		t.Run(fmt.Sprintf("build: the push grant's %s %q", tc.field, tc.value), func(t *testing.T) {
+			dir := config.Dir(t.TempDir())
+			meta := meteringInstance(t, dir, "p42")
+			edit(meta)
+			if err := dir.SaveInstanceMetadata("p42", meta); err != nil {
+				t.Fatal(err)
+			}
+			fj, fp := &fakeJobs{accounts: fixtureAccounts()}, &fakeProvider{}
+			c := buildCmd(fj)
+			c.openProvider = providerOf(fp)
+			opened := countWriterOpens(c, fj)
+			c.repo, c.app, c.builderImage = "https://github.com/example/repo.git", "api", builderDigest
+			env, out, errb := testEnvBoth(dir, output.ModeHuman)
+			err := c.Run(context.Background(), env, []string{"p42"})
+			if want := fmt.Sprintf(msgUnsafeRecord, "p42", tc.field, tc.value); err == nil || err.Error() != want || kindOf(classified(err)) != kindInternal {
+				t.Errorf("build = %v; want %q, internal", err, want)
+			}
+			if out.Len()+errb.Len() != 0 || len(fj.applied)+len(fp.grantCalls) != 0 {
+				t.Errorf("build printed %q %q, applied %d streams and asked the provider %q", out, errb, len(fj.applied), fp.grantCalls)
+			}
+			if *opened+fj.uidReads+fj.metaReads != 0 {
+				t.Errorf("build opened the writer %d times and read the cluster %d+%d times before it refused the record", *opened, fj.uidReads, fj.metaReads)
+			}
+		})
+		t.Run(fmt.Sprintf("run: the push grant's %s %q", tc.field, tc.value), func(t *testing.T) {
+			r := newStageRig(t, edit)
+			r.f.accounts, r.fp = fixtureAccounts(), &fakeProvider{}
+			stdout, stderr, err := r.run(output.ModeHuman, "--yes")
+			if want := fmt.Sprintf(msgUnsafeRecord, stageName, tc.field, tc.value); err == nil || err.Error() != want || kindOf(classified(err)) != kindInternal {
+				t.Errorf("run = %v; want %q, internal", err, want)
+			}
+			if stdout+stderr != "" || len(r.f.applied)+len(r.fp.grantCalls) != 0 {
+				t.Errorf("run printed %q %q, applied %d streams and asked the provider %q; want it refused before its fetch", stdout, stderr, len(r.f.applied), r.fp.grantCalls)
+			}
+		})
+	}
+	for _, uid := range []string{"00000000-0000-4000-8000-0000000'00b5", "00000000-0000-4000-8000-0000000000b5\nrm -rf ~"} {
+		t.Run(fmt.Sprintf("build: the builder's uid %q", uid), func(t *testing.T) {
+			dir := config.Dir(t.TempDir())
+			meteringInstance(t, dir, "p42")
+			fj := &fakeJobs{accounts: map[string]string{pbuild.ServiceAccount: uid}}
+			c := buildCmd(fj)
+			c.repo, c.app, c.builderImage = "https://github.com/example/repo.git", "api", builderDigest
+			env, out, errb := testEnvBoth(dir, output.ModeHuman)
+			err := c.Run(context.Background(), env, []string{"p42"})
+			if kindOf(classified(err)) != kindDocumentUnreadable {
+				t.Errorf("build = %v (kind %s); want document_unreadable", err, kindOf(classified(err)))
+			}
+			if out.Len()+errb.Len() != 0 || len(fj.applied) != 0 {
+				t.Errorf("build printed %q %q and applied %d streams", out, errb, len(fj.applied))
+			}
+		})
+		t.Run(fmt.Sprintf("the push grant's commands, the uid %q", uid), func(t *testing.T) {
+			g := fixturePushGrant(plan.GrantMissing, plan.GrantPresent)
+			if text, err := g.text(uid); err == nil || text != "" || err.Error() != msgUnsafeGrantUID || kindOf(err) != kindInternal {
+				t.Errorf("the commands for %q = %q, %v; want A33-10's refusal, nothing printed", uid, text, err)
+			}
+		})
+	}
 	t.Run("storage deploy: the image", func(t *testing.T) {
 		var b bytes.Buffer
 		if err := (deployResult{Instance: "p", Image: "img" + hostileControls, Replicas: 2}).Human(&b); err != nil {
@@ -408,4 +571,15 @@ func (p *pushesThen) Unseal(ctx context.Context, i int, payload []byte, intent s
 		p.then()
 	}
 	return p.flakyKeyholder.Unseal(ctx, i, payload, intent)
+}
+
+// countWriterOpens makes c's writer seam count its opens, each answered by
+// fj, and returns the count.
+func countWriterOpens(c *buildCommand, fj *fakeJobs) *int {
+	opened := new(int)
+	c.newCluster = func(clusterRef) (jobWaiter, error) {
+		*opened++
+		return fj, nil
+	}
+	return opened
 }

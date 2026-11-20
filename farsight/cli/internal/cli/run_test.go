@@ -26,8 +26,11 @@ import (
 	"github.com/sofmon/farcast/farsight/cli/internal/cluster"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/kube"
+	"github.com/sofmon/farcast/farsight/cli/internal/kube/kubetest"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
+	"github.com/sofmon/farcast/farsight/cli/internal/plan"
 	"github.com/sofmon/farcast/manifest/parser"
+	"github.com/sofmon/farcast/planck"
 	pbuild "github.com/sofmon/farcast/planck/build"
 	pfetch "github.com/sofmon/farcast/planck/fetch"
 	tcdeploy "github.com/sofmon/farcast/technocore/deploy"
@@ -129,6 +132,24 @@ type fakeRunCluster struct {
 	// policy and its apply.
 	appliedAt []string
 	onApplyAt func()
+	// accounts are the ServiceAccounts its farcast-system holds, by name,
+	// at their uids (accountMeta), none when nil; metaReads is each one
+	// read, and metaErr, when set, answers every read (design §33, A33-18).
+	accounts  map[string]string
+	metaReads []string
+	metaErr   error
+	// createAccount is the uid an applied stream that holds the builder's
+	// ServiceAccount creates it at, when farcast-system does not hold it
+	// yet, as the API server would; "" creates none.
+	createAccount string
+}
+
+func (f *fakeRunCluster) GetMeta(_ context.Context, k kube.Kind, namespace, name string) (kube.Object, error) {
+	f.metaReads = append(f.metaReads, namespace+"/"+name)
+	if f.metaErr != nil {
+		return kube.Object{}, f.metaErr
+	}
+	return accountMeta(f.accounts, k, namespace, name)
 }
 
 type cmFailure struct {
@@ -207,6 +228,14 @@ func (f *fakeRunCluster) record(m []byte) error {
 		}
 		if yaml.Unmarshal([]byte(d), &doc) == nil && doc.Kind == "Job" {
 			f.jobs[doc.Metadata.Name] = true
+		}
+		if doc.Kind == "ServiceAccount" && doc.Metadata.Name == pbuild.ServiceAccount && f.createAccount != "" {
+			if f.accounts == nil {
+				f.accounts = map[string]string{}
+			}
+			if _, ok := f.accounts[doc.Metadata.Name]; !ok {
+				f.accounts[doc.Metadata.Name] = f.createAccount
+			}
 		}
 	}
 	if f.applyErrOn != "" && strings.Contains(string(m), f.applyErrOn) {
@@ -343,6 +372,9 @@ func runCmd(f *fakeRunCluster) *runCommand {
 	c := &runCommand{assumeYes: true}
 	c.newCluster = func(clusterRef) (runCluster, error) { return f, nil }
 	c.newBuilder = func(func(string)) imageBuilder { return &fakeBuilder{} }
+	// The deploy plan's push grant reads the provider (A33-22): the fixture
+	// number, and every grant missing.
+	c.openProvider = providerOf(&fakeProvider{})
 	c.fetcherImage, c.builderImage = fetcherDigest, builderDigest
 	// No test dials a real tunnel. Without this the default seam reaches for
 	// the network and waits out a connect timeout — which is slow, is flaky
@@ -697,6 +729,7 @@ func TestRunRecordsTheReviewedImagesSoTheNextRunNeedNotBeTold(t *testing.T) {
 	c2 := &runCommand{assumeYes: true}
 	c2.newCluster = func(clusterRef) (runCluster, error) { return f2, nil }
 	c2.newBuilder = func(func(string)) imageBuilder { return &fakeBuilder{} }
+	c2.openProvider = providerOf(&fakeProvider{})
 	if err := c2.Run(context.Background(), env, []string{"p43", "github.com/example/my-platform"}); err != nil {
 		t.Fatalf("a second run had to be told the images again: %v", err)
 	}
@@ -1422,16 +1455,39 @@ func TestRunNamesTheGrantWhenAPushIsRefused(t *testing.T) {
 	f := newFakeRun(twoAppManifest)
 	f.buildFails = true
 	f.buildLogs = arDenial
+	f.accounts = fixtureAccounts()
 
 	if err := runCmd(f).Run(context.Background(), env, []string{"p42", "github.com/example/my-platform"}); err == nil {
 		t.Fatal("a failed build reported success")
 	}
 	errOut := env.Err.(interface{ String() string }).String()
-	for _, want := range []string{"not a problem with the Containerfile", "add-iam-policy-binding farcast-p42"} {
+	for _, want := range []string{"not a problem with the Containerfile", "add-iam-policy-binding 'farcast-p42' --project 'proj-1' --location 'us-central1'"} {
 		if !strings.Contains(errOut, want) {
 			t.Errorf("run does not name the grant (%q missing):\n%s", want, errOut)
 		}
 	}
+
+	// A grant the plan read present, the push refused all the same: the
+	// explanation says what the plan read, and still prints the add (design
+	// §33, A33-22).
+	t.Run("a grant the plan read present", func(t *testing.T) {
+		member := uidMember(fixtureProjectNumber, "proj-1", fixtureBuilderUID)
+		env, _ := testEnv(dir, output.ModeHuman)
+		f := newFakeRun(twoAppManifest)
+		f.buildFails, f.buildLogs, f.accounts = true, arDenial, fixtureAccounts()
+		c := runCmd(f)
+		c.openProvider = providerOf(&fakeProvider{grantStates: map[string]planck.GrantState{member: planck.GrantPresent}})
+		if err := c.Run(context.Background(), env, []string{"p42", "github.com/example/my-platform"}); err == nil {
+			t.Fatal("a failed build reported success")
+		}
+		errOut := env.Err.(interface{ String() string }).String()
+		for _, want := range []string{"the repository's own policy granted it write access",
+			"add-iam-policy-binding 'farcast-p42' --project 'proj-1' --location 'us-central1' --member '" + member + "'"} {
+			if !strings.Contains(errOut, want) {
+				t.Errorf("run's explanation is missing %q:\n%s", want, errOut)
+			}
+		}
+	})
 }
 
 // Every application gets its own scope, minted when it is deployed and
@@ -1858,6 +1914,10 @@ func (w runWriterWithPin) NamespaceUID(ctx context.Context, name string) (string
 	return w.fakeRunCluster.NamespaceUID(ctx, name)
 }
 
+func (w runWriterWithPin) GetMeta(ctx context.Context, k kube.Kind, namespace, name string) (kube.Object, error) {
+	return w.fakeRunCluster.GetMeta(ctx, k, namespace, name)
+}
+
 func (w runWriterWithPin) ConfigMapData(ctx context.Context, namespace, name string) (map[string]string, string, bool, error) {
 	if namespace == dsdeploy.DefaultNamespace && name == dsdeploy.PinConfigMapName("") {
 		return w.fakePinStore.ConfigMapData(ctx, namespace, name)
@@ -1999,5 +2059,66 @@ func runRefusalNamesThePlan(t *testing.T) {
 	}
 	if got := builds(t, f); len(got) != 0 {
 		t.Errorf("a refused run built %q", got)
+	}
+}
+
+// TestRunConfirmFetchChecksTheBuilderReadFirst (design §33, A33-22, OQ-C,
+// mutation 140): run --confirm with the fetch plan's digest reads the
+// builder's ServiceAccount as the reader before the writer opens and the
+// fetch Job bills. A reader granted before ADR 0023 M2.8, which may not, is
+// refused there, in A33-17's words and that nothing was written: the fetch
+// Job is never applied and the writer never opened. An account that does
+// not exist yet goes on: the deploy plan binds its placeholder.
+func TestRunConfirmFetchChecksTheBuilderReadFirst(t *testing.T) {
+	t.Run("a reader granted before M2.8", func(t *testing.T) {
+		row := runDeployRowNamed(t, "deploy into a metered namespace")
+		email, stream := preM28ReaderRBAC(t, row)
+		s, dir := planFixtureWith(t, row, true, kubetest.WithRBAC(email, stream))
+		fetch, _ := runPlan(t, dir, row, output.ModeJSON)
+		cmd := withFlags(t, row.cmd(), append(slices.Clone(row.flags), "--confirm", fetch.Digest)...)
+		env, out, _ := testEnvBoth(dir, output.ModeJSON)
+		err := cmd.Run(t.Context(), env, row.args)
+		want := fmt.Sprintf(msgReaderLacksServiceAccounts, tcdeploy.DefaultNamespace, pbuild.ServiceAccount, plan.GrantPush, writeName) +
+			" (kube: forbidden) Nothing was written."
+		if err == nil || err.Error() != want || kindOf(classified(err)) != kindForbidden {
+			t.Fatalf("run --confirm <F> = %v (kind %s);\nwant %q, forbidden", err, kindOf(classified(err)), want)
+		}
+		if row.fakes.writers != 0 || len(appliedRequests(s)) != 0 || out.Len() != 0 {
+			t.Errorf("opened the writer %d times, applied %d documents and printed %q", row.fakes.writers, len(appliedRequests(s)), out)
+		}
+		onlyThePlansReads(t, row, s, consentConfirm)
+	})
+	t.Run("an account that does not exist yet", func(t *testing.T) {
+		row := runDeployRowNamed(t, "deploy into a metered namespace")
+		row.seed = runSeedOf(t, true, false)
+		_, dir := planFixture(t, row)
+		doc, _ := runDeployPlan(t, dir, row, output.ModeJSON)
+		if g := grantAfterImage(t, decodedBound(t, doc)); !strings.HasSuffix(g.Principal, "/farcast-placeholder:sa-uid:farcast-system/farcast-builder") {
+			t.Errorf("the deploy plan names %s; want the uid placeholder of the account it creates", g.Principal)
+		}
+	})
+}
+
+// TestRunConfirmFetchGoogleFailurePrintsNoDeployPlan (design §33, A33-22,
+// MS-7): under --confirm with the fetch plan's digest, the deploy plan's
+// Google reads come after the manifest read, which has billed. A
+// projects.get that fails there refuses with its error, prints no deploy
+// plan, and writes nothing after the read's own documents.
+func TestRunConfirmFetchGoogleFailurePrintsNoDeployPlan(t *testing.T) {
+	row, s, dir := runFixture(t)
+	fetch, _ := runPlan(t, dir, row, output.ModeJSON)
+	refused := errors.New("googleapi: Error 503: backend unavailable")
+	row.fakes.provider.projectNumberErr = refused
+	cmd := withFlags(t, row.cmd(), append(slices.Clone(row.flags), "--confirm", fetch.Digest)...)
+	env, out, _ := testEnvBoth(dir, output.ModeJSON)
+	err := cmd.Run(t.Context(), env, row.args)
+	if !errors.Is(err, refused) || !strings.Contains(err.Error(), msgNothingDeployed) {
+		t.Fatalf("run --confirm <F> = %v; want the projects.get failure, with nothing deployed", err)
+	}
+	if out.Len() != 0 {
+		t.Errorf("printed a deploy plan:\n%s", out)
+	}
+	if applied, writes := appliedRequests(s), applyWrites(decodedBound(t, fetch)); len(applied) != len(writes) {
+		t.Errorf("applied %d documents; want the read's %d alone", len(applied), len(writes))
 	}
 }

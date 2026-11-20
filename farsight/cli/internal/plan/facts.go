@@ -7,7 +7,8 @@ package plan
 // Money is integer cents, CPU integer millicores, memory integer MiB, and a
 // time a string written by Time.
 //
-// M2.7 added MigrateFact (A30-12); M2.8 adds GrantFact and GitCredentialFact.
+// M2.7 added MigrateFact (A30-12); M2.8 added GrantFact (design §33, A33-11),
+// and adds GitCredentialFact.
 
 // The type words, one per fact type.
 const (
@@ -29,6 +30,7 @@ const (
 	TypeReader           = "reader"
 	TypeNotice           = "notice"
 	TypeMigrate          = "migrate"
+	TypeGrant            = "grant"
 )
 
 // ------------------------------------------------------------------ cost
@@ -466,6 +468,10 @@ type ReaderFact struct {
 	// Resources are the role's per-namespace grant, in its rule order.
 	Resources  []string `json:"resources"`
 	ConfigMaps []string `json:"configmaps"`
+	// ServiceAccounts are the ServiceAccounts the reader may get, by name,
+	// in farcast-system alone, for the uid a grant names (ADR 0023 M2.8,
+	// design §33, A33-16).
+	ServiceAccounts []string `json:"service_accounts"`
 }
 
 func (ReaderFact) FactType() string { return TypeReader }
@@ -533,3 +539,49 @@ type MigrateObject struct {
 	// rewritten.
 	OtherManagers []string `json:"other_managers"`
 }
+
+// ------------------------------------------------------------------ grant
+
+// GrantFact is one cloud IAM grant a ServiceAccount's own cloud identity
+// needs (design §33, A33-11): the keyholder's on its bucket, or the builder's
+// push on the instance's registry. It names the ServiceAccount by its uid,
+// the principal Google documents for one ServiceAccount object, and states
+// the principal every FarCast instance in the project shares, which the
+// grant removes. Both observations come from one read of the target's IAM
+// policy, in which a binding with a condition never counts.
+type GrantFact struct {
+	Type string `json:"type"`
+	// Name is GrantBucket or GrantPush.
+	Name string `json:"name"`
+	// Target is gs://<bucket>, or the registry's image-path prefix.
+	Target string `json:"target"`
+	// ServiceAccount is <namespace>/<name>.
+	ServiceAccount string `json:"service_account"`
+	// Principal is the uid principal; "" when no project number is known.
+	Principal string   `json:"principal"`
+	Roles     []string `json:"roles"`
+	// State is Principal's: GrantPresent when every role has a binding with
+	// no condition that holds it, GrantUnknown when the policy could not be
+	// read, GrantMissing otherwise.
+	State string `json:"state"`
+	// SharedPrincipal is the name principal every instance in the project
+	// shares; "" when no project number is known.
+	SharedPrincipal string `json:"shared_principal"`
+	// Shared is SharedPrincipal's: GrantPresent when a binding of any of the
+	// roles with no condition holds it, GrantUnknown when the policy could not
+	// be read, GrantMissing otherwise.
+	Shared string `json:"shared"`
+	// Apply is true when the command writes the grant itself.
+	Apply bool `json:"apply"`
+}
+
+func (GrantFact) FactType() string { return TypeGrant }
+
+// The grants, and the states of each observation.
+const (
+	GrantBucket  = "bucket"
+	GrantPush    = "push"
+	GrantPresent = "present"
+	GrantMissing = "missing"
+	GrantUnknown = "unknown"
+)

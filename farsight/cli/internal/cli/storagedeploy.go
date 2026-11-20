@@ -6,6 +6,9 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,6 +20,8 @@ import (
 	"github.com/sofmon/farcast/farsight/cli/internal/plan"
 	"github.com/sofmon/farcast/farsight/cli/internal/storage"
 	"github.com/sofmon/farcast/fatline/identity"
+	"github.com/sofmon/farcast/planck"
+	tcdeploy "github.com/sofmon/farcast/technocore/deploy"
 	"github.com/sofmon/farcast/technocore/pricing"
 )
 
@@ -46,6 +51,10 @@ const keyholderReplicas = 2
 type storageDeployCommand struct {
 	deployer fatlineDeployer
 	image    string
+	// grantBucket is --grant-bucket: apply the keyholder's bucket grant, by
+	// its ServiceAccount's uid, under --confirm or this terminal's question
+	// (ADR 0023 M2.8, design §33, A33-24).
+	grantBucket bool
 
 	// ensureStorage mints the bucket and keyring when the instance has none.
 	// A seam, because whether this command mints at all is the fix for a real
@@ -54,12 +63,56 @@ type storageDeployCommand struct {
 	ensureStorage func(ctx context.Context, env *Env, instance string) error
 	// newPinStore reaches the key pin; nil reaches the cluster.
 	newPinStore pinStoreOpener
-	// newPlanReader opens what the plan reads the pin and farcast-system's
-	// uid through under --plan and --confirm: the instance's reader (ADR
-	// 0023 M2.6, A23-20), openPinPlanReader when unset, and never the
-	// writer. An interactive or --yes run reads through the pin store it
-	// opened as the writer instead (design §7.3).
-	newPlanReader func(clusterRef) (pinPlanReader, error)
+	// newPlanReader opens what the plan reads the pin, farcast-system's uid
+	// and the keyholder's ServiceAccount through under --plan and
+	// --confirm: the instance's reader (ADR 0023 M2.6, A23-20; M2.8,
+	// A33-18), openKeyholderPlanReader when unset, and never the writer. An
+	// interactive or --yes run reads through the pin store and the writer
+	// it opened instead (design §7.3).
+	newPlanReader func(clusterRef) (keyholderPlanReader, error)
+	// openBucketGrants opens the instance's bucket IAM with the installer's
+	// key (A33-14): what the plan reads the keyholder's grant through, in
+	// every mode, and what --grant-bucket applies it with.
+	// openBucketGrantsDefault when unset.
+	openBucketGrants func(ctx context.Context, env *Env, meta *config.InstanceMetadata) (bucketGrants, error)
+	// interactive says whether the run can ask this terminal; isInteractive
+	// when unset.
+	interactive func(*Env) bool
+}
+
+// keyholderPlanReader is what storage deploy's plan reads the cluster
+// through (A33-18): the key pin and farcast-system's uid, and the
+// keyholder's ServiceAccount, whose uid the bucket grant names.
+type keyholderPlanReader interface {
+	pinPlanReader
+	serviceAccountReader
+}
+
+// keyholderReader is an interactive or --yes run's plan reader: the pin
+// store it opened as the writer, and the writer itself for the account.
+type keyholderReader struct {
+	pinPlanReader
+	serviceAccountReader
+}
+
+// openKeyholderPlanReader is storage deploy's plan reader when its seam is
+// unset (A23-20, A33-18): openReaderDefault, the instance's cluster as its
+// reader, never the writer. A refusal returns a nil reader, never a nil
+// *cluster.Client inside a non-nil one.
+func openKeyholderPlanReader(r clusterRef) (keyholderPlanReader, error) {
+	cl, err := openReaderDefault(r)
+	if err != nil {
+		return nil, err
+	}
+	return cl, nil
+}
+
+// bucketGrants is the instance's bucket IAM as storage deploy reads and
+// changes it (A33-14): *storage.Grants, which proves the bucket's labels
+// before each call.
+type bucketGrants interface {
+	State(ctx context.Context, bucket string, roles []string, member, shared string) (state, sharedState datasphere.GrantState, sharedRoles []string, err error)
+	Ensure(ctx context.Context, bucket string, roles []string, member, shared string) (bool, error)
 }
 
 // ensureStorageDefault is what storage deploy mints the instance's storage
@@ -67,6 +120,29 @@ type storageDeployCommand struct {
 // ring in the cloud. A variable, so the package's tests refuse it, and no
 // test reaches a cloud provider's storage by leaving the seam unset.
 var ensureStorageDefault = mintStorage
+
+// openBucketGrantsDefault is what storage deploy opens the bucket's IAM with
+// when its seam is unset: openInstanceBucketGrants, which reaches Google. A
+// variable, so the package's tests refuse it (the tenth refusing seam), and
+// no test reaches a bucket's policy by leaving the seam unset.
+var openBucketGrantsDefault = openInstanceBucketGrants
+
+// openInstanceBucketGrants opens the instance's bucket IAM with the
+// installer's key (A33-14): loadInstallerKey, which refuses a blank key, so
+// Application Default Credentials are never reached, then
+// storage.OpenBucketGrants, which opens no keyring and mints nothing. It
+// sends nothing: the adapter resolves its credential on its first call.
+func openInstanceBucketGrants(_ context.Context, env *Env, meta *config.InstanceMetadata) (bucketGrants, error) {
+	creds, err := loadInstallerKey(env.ConfigDir, meta.Name)
+	if err != nil {
+		return nil, err
+	}
+	g, err := storage.OpenBucketGrants(meta, creds.ServiceAccountKey)
+	if err != nil {
+		return nil, err
+	}
+	return g, nil
+}
 
 // mintStorage mints the instance's bucket and, with none on this machine,
 // its keyring, as the first storage command to need them does.
@@ -81,8 +157,23 @@ func (c *storageDeployCommand) ensureDefaults() {
 		c.ensureStorage = ensureStorageDefault
 	}
 	if c.newPlanReader == nil {
-		c.newPlanReader = openPinPlanReader
+		c.newPlanReader = openKeyholderPlanReader
 	}
+	if c.openBucketGrants == nil {
+		c.openBucketGrants = openBucketGrantsDefault
+	}
+	if c.interactive == nil {
+		c.interactive = isInteractive
+	}
+}
+
+// isInteractive is whether this run can ask its terminal: the command's
+// seam, or isInteractive for a command whose defaults are not set.
+func (c *storageDeployCommand) isInteractive(env *Env) bool {
+	if c.interactive != nil {
+		return c.interactive(env)
+	}
+	return isInteractive(env)
 }
 
 func (*storageDeployCommand) Name() string { return "deploy" }
@@ -93,7 +184,7 @@ func (*storageDeployCommand) Synopsis() string {
 func (*storageDeployCommand) Usage() string {
 	return strings.TrimSpace(`
 Usage: farcast storage deploy <instance> [--datasphered-image REF@sha256:… | --source DIR | --embedded] [-y]
-                               [--plan | --confirm <digest>]
+                               [--grant-bucket] [--plan | --confirm <digest>]
 
 Deploy the keyholder: the one in-cluster process that holds DataSphere key
 material, and holds it only in memory.
@@ -116,20 +207,40 @@ does not survive every node being replaced at once.
 
 It reads the key pin, decides the pin it writes and the image, and checks
 the instance's mTLS material before it asks anything: it reads the
-instance's recorded registry with the installer's key, and creates the
+keyholder's ServiceAccount farcast-system/datasphered, and, with the
+installer's key in every mode, the instance's recorded registry, the
+project's number, and the bucket's labels and IAM policy. It creates the
 bucket and keyring, ensures the registry, pushes and builds only once the
 deploy is confirmed. On an instance that records no registry, an
 interactive or --yes run ensures it first.
 
+The keyholder reads and writes the bucket under its own cloud identity:
+its ServiceAccount, named by the uid the API server gave it, since the
+principal its name makes is shared by every FarCast instance in the
+project. The deploy applies that ServiceAccount first, reads its uid, and
+only then starts the replicas. Without --grant-bucket it prints the
+commands that grant the ServiceAccount the bucket, and remove the binding
+every instance in the project shares, just before it starts them; on a
+first deploy the replicas restart on a 403 until that grant has
+propagated, and an unseal fails meanwhile. --grant-bucket applies the
+grant instead, in one change of the bucket's IAM policy, before any
+replica exists: under --confirm of a plan made with it, or after its own
+question in a terminal; never with --yes. The uid on a bucket's policy is
+unverified until the M2 walk. One project per instance is still the full
+separation: every cluster in a project can present any uid.
+
 --plan prints what the deploy would do, and changes nothing: its cost, the
 image and where it comes from, the registry calls and the bucket it would
-create, what it mints, the key pin it writes, each document it would apply,
-and what it would print, with the plan's digest. It reads the pin and the
-cluster as the instance's reader, which 'farcast reader grant' must have
-verified read-only (there is no fallback to the installer's account), and
-the registry with the installer's key; it opens no writer, and no private
-key. A keyring behind the pin is a block: the plan says so, and its
---confirm refuses it.
+create, what it mints, the keyholder's ServiceAccount, the bucket grant and
+whether it is applied, the key pin it writes, each document it would apply,
+and what it would print, with the plan's digest. It reads the pin, the
+cluster and the keyholder's ServiceAccount as the instance's reader, which
+'farcast reader grant' must have verified read-only (there is no fallback
+to the installer's account), and the registry, the project's number and the
+bucket's labels and IAM policy with the installer's key; it opens no
+writer, and no private key. A keyring behind the pin is a block: the plan
+says so, and its --confirm refuses it. So is --grant-bucket where the
+stored credential may not read the bucket's IAM policy.
 
 --confirm <digest> does exactly the plan with that digest, asking nothing,
 and refuses, having written nothing, if anything it binds has changed since.
@@ -148,6 +259,7 @@ func (c *storageDeployCommand) SetFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.deployer.sourceDir, "source", "", "farcast checkout to build the keyholder's image from with this machine's Go; recorded as operator-built")
 	c.deployer.setEmbeddedFlag(fs)
 	c.deployer.setYesFlag(fs, "skip the cost confirmation and, for --source or a source build, the build confirmation; never implies --embedded")
+	fs.BoolVar(&c.grantBucket, "grant-bucket", false, "apply the keyholder's bucket grant, by its ServiceAccount's uid, under --confirm or this terminal's question (never with --yes)")
 	c.deployer.consent.register(fs)
 }
 
@@ -168,6 +280,56 @@ const (
 		"the bucket and the keyring were ensured, and nothing else was written"
 )
 
+// The bucket grant's texts (ADR 0023 M2.8, design §33, A33-24 to A33-28).
+const (
+	// msgGrantBucketYes is --grant-bucket's refusal beside --yes: the
+	// instance's name, twice ("<instance>" for one that is not valid).
+	msgGrantBucketYes = "--grant-bucket cannot be run with --yes: it changes the IAM policy of instance %q's bucket; " +
+		"confirm it in a terminal, or review 'farcast storage deploy %s --plan --grant-bucket' and pass --confirm <digest>"
+	// msgGrantBucketTerminal is its refusal with no terminal and no answer.
+	msgGrantBucketTerminal = "--grant-bucket needs a terminal to confirm" + consentSuffix
+	// msgBucketGrantUnreadable is the block of --grant-bucket where the
+	// stored credential may not read the bucket's policy: the bucket.
+	msgBucketGrantUnreadable = "the stored credential may not read gs://%s's IAM policy, so --grant-bucket cannot apply the keyholder's grant; " +
+		"plan without --grant-bucket and run the printed commands"
+	// msgBucketGrantIncapable is its block where the providers cannot read
+	// or change a bucket's IAM at all.
+	msgBucketGrantIncapable = "the instance's storage provider cannot read or change a bucket's IAM, so --grant-bucket cannot apply the keyholder's grant; " +
+		"plan without --grant-bucket and run the printed commands"
+	// msgBucketGrantPending is the notice of a grant not applied whose
+	// ServiceAccount does not exist yet: the bucket, as bucketShown names it.
+	msgBucketGrantPending = "The keyholder's ServiceAccount farcast-system/datasphered does not exist yet: this deploy creates it before the keyholder, " +
+		"and then prints the commands that grant it %s by its uid (and that remove the shared binding, when the bucket holds it). " +
+		"Until they are run and IAM has propagated (typically 2 minutes, up to 7 or more), the replicas restart on a 403 and an unseal fails. " +
+		"--grant-bucket applies the grant before the replicas start."
+	// msgBucketGrantNewBucket is the notice of a grant not applied on a first
+	// deploy whose ServiceAccount exists already: the bucket's name is drawn
+	// only when it is created, so the commands print then.
+	msgBucketGrantNewBucket = "The bucket this deploy creates does not exist yet: the deploy prints the commands that grant the keyholder's ServiceAccount " +
+		"farcast-system/datasphered read/write access to it by its uid once it does. " +
+		"Until they are run and IAM has propagated (typically 2 minutes, up to 7 or more), the replicas restart on a 403 and an unseal fails. " +
+		"--grant-bucket applies the grant before the replicas start."
+	// msgBucketGrantPresent is the notice of a grant in place: the bucket.
+	msgBucketGrantPresent = "gs://%s grants the keyholder's ServiceAccount farcast-system/datasphered, by its uid, roles/storage.objectAdmin and " +
+		"roles/storage.legacyBucketReader, and the principal every FarCast instance in the project shares holds neither"
+	// msgServiceAccountReplaced begins the refusal of an account whose uid is
+	// not the one the plan bound (A33-19): the namespace, the name, the uid
+	// read and the one bound; the clause of what was written follows.
+	msgServiceAccountReplaced = "the ServiceAccount %s/%s was replaced since the plan was made (its uid is %s, not %s); "
+	// msgGrantQuestion is the terminal's question when the grant adds the
+	// uid principal: the bucket, the principal, and msgGrantQuestionShared
+	// or nothing.
+	msgGrantQuestion       = "Grant roles/storage.objectAdmin and roles/storage.legacyBucketReader on %s to %s%s?"
+	msgGrantQuestionShared = ", and remove them from %s, which every FarCast instance in project %q shares"
+	// msgGrantQuestionRemove is its question when the grant only removes the
+	// shared principal: the bucket, the shared principal, the project.
+	msgGrantQuestionRemove = "Remove roles/storage.objectAdmin and roles/storage.legacyBucketReader on %s from %s, which every FarCast instance in project %q shares? " +
+		"The keyholder's uid already holds both."
+	// msgGrantPendingPrincipal names the uid principal in the question
+	// before the ServiceAccount exists.
+	msgGrantPendingPrincipal = "the keyholder's ServiceAccount farcast-system/datasphered, by the uid it has once this deploy creates it"
+)
+
 func (c *storageDeployCommand) Run(ctx context.Context, env *Env, args []string) (err error) {
 	// A 403 the writer met says whose it was, once (A20-9); one a plan's
 	// reader met says so already (A23-22), and writerRefused leaves it.
@@ -182,6 +344,21 @@ func (c *storageDeployCommand) Run(ctx context.Context, env *Env, args []string)
 	}
 	name := args[0]
 	c.ensureDefaults()
+	// --grant-bucket changes a bucket's IAM policy, so --yes never covers it,
+	// and it needs --plan, --confirm or this terminal's own question: refused
+	// otherwise, before anything is read (A33-2, A33-24).
+	if c.grantBucket {
+		switch {
+		case c.deployer.assumeYes:
+			shown := name
+			if validateInstanceName(name) != nil {
+				shown = "<instance>"
+			}
+			return usagef(msgGrantBucketYes, shown, shown)
+		case mode == consentNone && !c.isInteractive(env):
+			return usagef(msgGrantBucketTerminal)
+		}
+	}
 	c.deployer.component = components.Datasphered
 	c.deployer.fatlineImage = c.image
 	c.deployer.ensureDefaults()
@@ -229,7 +406,7 @@ func (c *storageDeployCommand) Run(ctx context.Context, env *Env, args []string)
 	ref := clusterRef{Dir: env.ConfigDir, Meta: meta, Warn: env.Err}
 	var cl clusterApplier
 	var ps pinStore
-	var rd pinPlanReader
+	var rd keyholderPlanReader
 	if mode == consentNone {
 		ref.Identity = kube.Writer
 		if cl, err = c.deployer.newCluster(ref); err != nil {
@@ -239,7 +416,7 @@ func (c *storageDeployCommand) Run(ctx context.Context, env *Env, args []string)
 		if ps, err = c.pinStoreOf(ref, cl); err != nil {
 			return fmt.Errorf("the key pin could not be reached, so nothing was deployed: %w", err)
 		}
-		rd = ps
+		rd = keyholderReader{ps, cl}
 	} else {
 		if err := requireGrantedReader(env.ConfigDir, meta, "storage deploy", mode); err != nil {
 			return err
@@ -253,7 +430,7 @@ func (c *storageDeployCommand) Run(ctx context.Context, env *Env, args []string)
 	// Only a run that can pass the cost gate ensures a registry the record
 	// does not name before its plan (A23-24's exception): one with no
 	// terminal and no --yes is refused, and writes nothing.
-	ensure := mode == consentNone && (c.deployer.assumeYes || isInteractive(env))
+	ensure := mode == consentNone && (c.deployer.assumeYes || c.isInteractive(env))
 	p, b, err := c.plan(ctx, env, meta, rd, mode, ensure)
 	if err != nil {
 		if mode == consentNone {
@@ -303,14 +480,32 @@ func (c *storageDeployCommand) Run(ctx context.Context, env *Env, args []string)
 }
 
 // deploy executes the plan's decisions, after consent or, under --confirm,
-// after the comparison and the writer's checks (A23-43): the bucket and the
-// keyring, minted and then read back; the registry ensure and the image the
-// plan decided, pushed or built and never looked up again; the keyholder's
-// server leaf, issued from the instance's CA; the pin, before the replicas
-// exist; the record; the bucket grant; and the apply.
+// after the comparison and the writer's checks (A23-43, A33-26), in this
+// order in every mode:
+//
+//  1. the bucket and the keyring, minted and then read back;
+//  2. the Namespace and the keyholder's ServiceAccount, applied (2a); the
+//     account's uid, read as the writer (2b); and the bucket grant's
+//     printed lines, rendered and checked with the real bucket and uid (2c);
+//  3. under --grant-bucket, the one policy write that grants the uid
+//     principal and removes the shared one (3b), before the image pushes,
+//     so IAM propagates meanwhile, and before any replica exists;
+//  4. the registry ensure and the image the plan decided, pushed or built
+//     and never looked up again; the keyholder's server leaf, issued from
+//     the instance's CA; the pin, before the replicas exist; the record;
+//  5. the grant's lines, when it is not applied; and the rest of the
+//     stream, each document applied once.
+//
+// Every refusal from 2a on says what was written before it (writtenSoFar).
 func (c *storageDeployCommand) deploy(ctx context.Context, env *Env, meta *config.InstanceMetadata, cl clusterApplier, ps pinStore,
 	p preparedStorageDeploy, m consentMode) error {
 	name := meta.Name
+	var written []string
+	// refused is a refusal from 2a on, with the clause of what was written;
+	// stopped is an apply's own failure, whose stream may be part-applied.
+	refused := func(err error) error { return withWritten(err, writtenSoFar(written, false)) }
+	stopped := func(err error) error { return withWritten(err, writtenSoFar(written, true)) }
+
 	// Mint the bucket and the keyring here rather than sending the operator
 	// away to create them.
 	//
@@ -346,35 +541,101 @@ func (c *storageDeployCommand) deploy(ctx context.Context, env *Env, meta *confi
 			}
 		}
 		meta = fresh
+		written = append(written, "the bucket and the keyring were ensured")
+	}
+	bucket := meta.Storage.Bucket
+
+	// 2a. The Namespace and the keyholder's ServiceAccount, before anything
+	// else of the keyholder: the grant names the account by its uid, which
+	// exists only once the account does, and neither document creates a pod
+	// (A33-26).
+	account, err := dsdeploy.RenderAccount(keyholderConfig(meta, "", bucket, meta.Storage.Provider, meta.Storage.Location, nil, nil, nil))
+	if err != nil {
+		return refused(err)
+	}
+	if err := cl.Apply(ctx, account); err != nil {
+		return stopped(fmt.Errorf("apply the keyholder's ServiceAccount: %w", err))
+	}
+	written = append(written, "the keyholder's ServiceAccount "+keyholderAccount+" was applied")
+
+	// 2b. Its uid, as the writer: a plan that bound one requires it still,
+	// and one that bound the placeholder adopts it (A33-19).
+	uid, err := readServiceAccountUID(ctx, cl, consentNone, name, tcdeploy.DefaultNamespace, dsdeploy.DefaultName, plan.GrantBucket)
+	switch {
+	case err != nil:
+		return refused(err)
+	case uid == "":
+		return refused(fmt.Errorf("the ServiceAccount %s was applied and then not found", keyholderAccount))
+	case !p.grant.pending() && uid != p.grant.uid:
+		return changedAfterPlan(m, fmt.Sprintf(msgServiceAccountReplaced, tcdeploy.DefaultNamespace, dsdeploy.DefaultName, uid, p.grant.uid)+
+			writtenSoFar(written, false))
+	}
+
+	// 2c. What this deploy prints of the grant, rendered now, with the real
+	// bucket and uid and every value checked (A33-15): the commands of a
+	// grant not applied, or the line of one in place; and under
+	// --grant-bucket the commands printed when the policy write is refused.
+	// A refusal here comes before the policy write, the pin and the record.
+	grantText, err := p.grant.printed(bucket, uid)
+	if err != nil {
+		return refused(err)
+	}
+
+	// 3b. The grant, under --grant-bucket's consent: one policy write that
+	// adds the uid principal to both roles and removes the shared one, its
+	// labels proved first. The replicas do not exist yet.
+	result := bucketGrantPrinted
+	if p.grant.fact.State == plan.GrantPresent && p.grant.fact.Shared == plan.GrantMissing {
+		result = bucketGrantPresent
+	}
+	if p.grant.writes() {
+		changed, err := c.applyBucketGrant(ctx, env, meta, p.grant, bucket, uid, grantText, written, m)
+		if err != nil {
+			return err
+		}
+		// changed is a write sent that may have made the change, so the
+		// shared principal's removal is never left out of a later
+		// refusal's clause (A33-26); unchanged is a grant found done before
+		// any write.
+		result = bucketGrantPresent
+		if changed {
+			result = bucketGrantApplied
+			written = append(written, fmt.Sprintf("gs://%s's IAM policy now grants the keyholder's uid principal %s and %s and no longer grants the shared principal",
+				bucket, bucketRoles[0], bucketRoles[1]))
+		}
 	}
 
 	// The registry ensure the plan bound, then the image the plan decided
 	// (A23-34).
 	reg, err := c.deployer.realizeRegistry(ctx, env, name, meta, p.reg, m)
 	if err != nil {
-		return err
+		return refused(err)
 	}
+	written = append(written, "the instance's registry was ensured and recorded")
 	resolved, err := c.deployer.realizeAndNote(ctx, env, reg, p.image)
 	if err != nil {
-		return err
+		return refused(err)
+	}
+	if p.image.pushes() {
+		written = append(written, "the keyholder's image was pushed to the instance's registry")
 	}
 	img := resolved.Ref
 
 	mtls, err := realizeIdentity(env, name, p.identity, m)
 	if err != nil {
-		return err
+		return refused(err)
 	}
 	// The keyholder gets its OWN server leaf, distinct from FatLine's, so the
 	// operator's session verifies that it is talking to the keyholder and not
 	// to the tunnel that carried it. The CA private key never leaves here.
 	certPEM, keyPEM, err := identity.IssueKeyholderServer(mtls.CACertPEM, mtls.CAKeyPEM, name)
 	if err != nil {
-		return fmt.Errorf("issue the keyholder's server identity: %w", err)
+		return refused(fmt.Errorf("issue the keyholder's server identity: %w", err))
 	}
-	manifests, err := dsdeploy.Render(keyholderConfig(meta, img, meta.Storage.Bucket, meta.Storage.Provider, meta.Storage.Location,
+	workload, err := dsdeploy.RenderWorkload(keyholderConfig(meta, img, bucket, meta.Storage.Provider, meta.Storage.Location,
 		mtls.CACertPEM, certPEM, keyPEM))
 	if err != nil {
-		return err
+		return refused(err)
 	}
 
 	// Before the replicas exist, and always: TechnoCore may create ConfigMaps
@@ -382,19 +643,23 @@ func (c *storageDeployCommand) deploy(ctx context.Context, env *Env, meta *confi
 	// created it. No apply touches it afterwards — an apply is
 	// last-writer-wins, and could move it backwards. Under --confirm the
 	// plan's pin is written once, at the version the plan read (A23-42).
+	var pinned pinWrite
 	if m == consentConfirm {
-		if _, err := pinOnce(ctx, ps, p.pin); err != nil {
+		if pinned, err = pinOnce(ctx, ps, p.pin); err != nil {
 			if kindOf(err) == kindPlanChanged {
-				return err
+				return refused(err)
 			}
-			return fmt.Errorf(msgDeployPinUnwritten, err, pinRemedy(name))
+			return refused(fmt.Errorf(msgDeployPinUnwritten, err, pinRemedy(name)))
 		}
-	} else if _, err := pinOnDeploy(ctx, ps, env, name); err != nil {
+	} else if pinned, err = pinOnDeploy(ctx, ps, env, name); err != nil {
 		var behind *pinBehind
 		if errors.As(err, &behind) {
-			return fmt.Errorf("%v; nothing was deployed", behind)
+			return refused(fmt.Errorf("%v; nothing was deployed", behind))
 		}
-		return fmt.Errorf(msgDeployPinUnwritten, err, pinRemedy(name))
+		return refused(fmt.Errorf(msgDeployPinUnwritten, err, pinRemedy(name)))
+	}
+	if pinned.Changed {
+		written = append(written, "the key pin was written")
 	}
 
 	// Recorded BEFORE the apply, like every other billable thing this CLI
@@ -413,21 +678,25 @@ func (c *storageDeployCommand) deploy(ctx context.Context, env *Env, meta *confi
 	recordSystemImage(meta, components.Datasphered.Name, resolved.Record)
 	meta.UpdatedAt = time.Now().UTC()
 	if err := env.ConfigDir.SaveInstanceMetadata(name, meta); err != nil {
-		return fmt.Errorf("record the keyholder before deploying it: %w", err)
+		return refused(fmt.Errorf("record the keyholder before deploying it: %w", err))
 	}
+	written = append(written, "the keyholder was recorded as deployed")
 
 	// Before the workload exists, not after: a replica that starts without
 	// this grant crash-loops, and an operator reading the fix underneath a
 	// deploy that has already failed is the wrong order. On stderr so it
 	// survives --output json, where the human result is never rendered. It
-	// names the bucket as it exists now, a first deploy's included.
-	writeBucketGrant(env.Err, meta.Project, meta.Storage.Bucket, dsdeploy.DefaultNamespace, dsdeploy.DefaultName)
+	// names the bucket as it exists now, a first deploy's included, and the
+	// ServiceAccount by the uid read at 2b. A grant applied prints nothing.
+	if !p.grant.writes() {
+		fprintf(env.Err, "%s", grantText)
+	}
 
-	if isInteractive(env) || env.Verbose {
+	if c.isInteractive(env) || env.Verbose {
 		fprintf(env.Err, "Deploying the keyholder to %q…\n", name)
 	}
-	if err := cl.Apply(ctx, manifests); err != nil {
-		return fmt.Errorf("deploy the keyholder: %w", err)
+	if err := cl.Apply(ctx, workload); err != nil {
+		return stopped(fmt.Errorf("deploy the keyholder: %w", err))
 	}
 
 	// Deliberately NO rollout wait. Every replica comes up sealed and a sealed
@@ -436,10 +705,116 @@ func (c *storageDeployCommand) deploy(ctx context.Context, env *Env, meta *confi
 	// interrupt the tool. The next step is the unseal, and it is said plainly.
 	return env.Printer.Print(deployResult{
 		Instance: name, Image: img, Replicas: keyholderReplicas,
-		Project: meta.Project, Bucket: meta.Storage.Bucket,
+		Project: meta.Project, Bucket: bucket,
 		Namespace: dsdeploy.DefaultNamespace, ServiceAccount: dsdeploy.DefaultName,
+		BucketGrant: result, firstDeploy: p.mintsStorage,
 	})
 }
+
+// applyBucketGrant is step 3b (A33-26, A33-27): the instance's bucket IAM,
+// opened with the installer's key, and the one policy write that grants the
+// keyholder's uid principal both roles and removes the shared principal from
+// them, each proved against the bucket's labels first. It reports whether a
+// write was sent and the policy then held the grant, which may be another
+// writer's change after a stale refusal (A35-2;
+// datasphere.BucketGrants.EnsureGrant). Its refusals say what was written
+// before them, and every one after a policy read prints the commands (text)
+// first but a policy that changed under both writes, plan_changed under
+// --confirm: a write that may have landed unseen says so, and its clause
+// names the write sent; a Google 403 names the bucket, never the cluster;
+// any other refusal of the write leaves the policy unchanged; and a failure
+// before any write was sent says that none was.
+func (c *storageDeployCommand) applyBucketGrant(ctx context.Context, env *Env, meta *config.InstanceMetadata, g bucketGrant,
+	bucket, uid, text string, written []string, m consentMode) (bool, error) {
+	clause := writtenSoFar(written, false)
+	member, err := workloadUIDPrincipal(g.number, g.project, uid)
+	if err != nil {
+		return false, withWritten(err, clause)
+	}
+	grants, err := c.openBucketGrants(ctx, env, meta)
+	if err != nil {
+		return false, withWritten(err, clause)
+	}
+	changed, err := grants.Ensure(ctx, bucket, bucketRoles, member, g.fact.SharedPrincipal)
+	switch {
+	case err == nil:
+		return changed, nil
+	case errors.Is(err, storage.ErrBucketUnproven):
+		return false, withKind(kindInternal, fmt.Errorf("%w; %s", err, clause))
+	case errors.Is(err, datasphere.ErrPolicyChanged):
+		return false, changedAfterPlan(m, fmt.Sprintf("gs://%s's IAM policy changed while the grant was written; %s", bucket, clause))
+	}
+	fprintf(env.Err, "%s", text)
+	switch {
+	case errors.Is(err, datasphere.ErrPolicyUnconfirmed):
+		// Sent, and no answer settles it, a refusal after an attempt that
+		// failed in transport, failed reading its body, or got a 5xx
+		// included, or followed by a read that failed, or by a read it
+		// would write from that came without an etag or held a policy it
+		// could not build: it may have landed, the shared principal's
+		// removal included, so it is never said to be unchanged, and the
+		// clause names the write sent. Checked first: what failed after it
+		// may be a 403.
+		sent := writtenSoFar(append(slices.Clone(written), "a write of gs://"+bucket+"'s IAM policy was sent"), false)
+		return false, withKind(kindInternal, fmt.Errorf("whether gs://%s's new IAM policy took effect is not known (%w); "+
+			"'farcast storage deploy %s --plan' reads it, and the printed commands finish the grant if it did not; %s", bucket, err, meta.Name, sent))
+	case errors.Is(err, datasphere.ErrPermissionDenied):
+		return false, withKind(kindForbidden, fmt.Errorf("the stored credential may not change gs://%s's IAM policy (%w); run the printed commands instead; %s",
+			bucket, err, clause))
+	case errors.Is(err, datasphere.ErrPolicyRejected):
+		return false, withKind(kindInternal, fmt.Errorf("Google refused the new IAM policy of gs://%s (%w); its policy is unchanged; run the printed commands, or report it; %s",
+			bucket, err, clause))
+	}
+	// No write was sent: the read failed, or farcast would not write what
+	// it read.
+	return false, withKind(kindInternal, fmt.Errorf("the grant on gs://%s was not written (%w); its policy is unchanged; run the printed commands, or report it; %s",
+		bucket, err, clause))
+}
+
+// writtenSoFar is the clause a refusal of deploy from step 2a on ends with
+// (A33-26): what was written, in the order it was, joined, then ", and
+// nothing else was written", or, for an apply's own failure, whose stream may
+// be part-applied (design D3), ", and the stream stopped at its first
+// failing document".
+func writtenSoFar(written []string, stopped bool) string {
+	end := "nothing else was written"
+	if stopped {
+		end = "the stream stopped at its first failing document"
+	}
+	switch len(written) {
+	case 0:
+		if stopped {
+			return end
+		}
+		return "nothing was written"
+	case 1:
+		return written[0] + ", and " + end
+	}
+	return strings.Join(written, ", ") + ", and " + end
+}
+
+// withWritten is err with clause, the one writtenSoFar made: before the
+// closing "run the same command with --plan…" of a plan_changed refusal,
+// and at its end otherwise. err's kind and chain are kept, so whose refusal
+// it was is still found.
+func withWritten(err error, clause string) error {
+	msg := err.Error()
+	if base, ok := strings.CutSuffix(msg, "; "+msgPlanAgain); ok {
+		msg = base + "; " + clause + "; " + msgPlanAgain
+	} else {
+		msg += "; " + clause
+	}
+	return &writtenError{msg: msg, err: err}
+}
+
+// writtenError is an error with what was written before it.
+type writtenError struct {
+	msg string
+	err error
+}
+
+func (e *writtenError) Error() string { return e.msg }
+func (e *writtenError) Unwrap() error { return e.err }
 
 // pinStoreOf is the pin storage deploy reads and writes: pinStoreFor, so the
 // writer the deploy opened serves the pin and the apply (A20-10).
@@ -490,6 +865,8 @@ type preparedStorageDeploy struct {
 	pin pinDecision
 	// cost is the plan's cost fact, which the question is asked from.
 	cost plan.CostFact
+	// grant is the keyholder's bucket grant as the plan read it (A33-25).
+	grant bucketGrant
 }
 
 // refusal is how an interactive or --yes run refuses a plan it could not
@@ -545,29 +922,39 @@ func keyholderLeafPlaceholder(instance, part string) []byte {
 	return []byte("farcast-placeholder:keyholder_leaf:" + identity.KeyholderServerName(instance) + ":" + part)
 }
 
-// plan is storage deploy's plan (design §9.4, A23-43). It reads the key pin,
-// then farcast-system's uid, which it binds as its target, through rd — the
-// reader under --plan and --confirm, its errors the reader's (planRead), and
-// in an interactive or --yes run the writer's pin store — and the keyring's
-// key ids. It decides the pin the deploy writes (decidePin, or the empty pin
-// with no keyring here): a keyring behind the pin blocks it, as does a pin
-// that refuses the keyring itself or that no replica could read, and nothing
-// more is read, Google included (A23-18). Otherwise it checks the instance's
-// mTLS material, reading the CA certificate alone (decideIdentity), reads
-// the registry the record names with the installer's key (deployRegistry),
-// and decides the keyholder's image (decideImage). Its facts are the cost;
-// the image; the registry's cloud facts, and the bucket a first deploy
-// creates; the mints, the keyholder's leaf and a first keyring; a restart of
-// the replicas a deployed keyholder runs; the pin and its write; each
-// document of the workload it would apply, rendered over the image it names,
-// the placeholder leaf and, on a first deploy, the placeholder bucket; and
-// its notices, the bucket grant among them.
+// plan is storage deploy's plan (design §9.4, A23-43, A33-25). It reads the
+// key pin, then farcast-system's uid, which it binds as its target, through
+// rd — the reader under --plan and --confirm, its errors the reader's
+// (planRead), and in an interactive or --yes run the writer's pin store and
+// the writer — and the keyring's key ids. It decides the pin the deploy
+// writes (decidePin, or the empty pin with no keyring here): a keyring
+// behind the pin blocks it, as does a pin that refuses the keyring itself or
+// that no replica could read, and nothing more is read, Google included
+// (A23-18). Otherwise it checks the record's project and bucket, reads the
+// keyholder's ServiceAccount through rd (its uid, or the placeholder when it
+// does not exist), checks the instance's mTLS material, reading the CA
+// certificate alone (decideIdentity), reads the registry the record names
+// with the installer's key (deployRegistry), decides the keyholder's image
+// (decideImage), and reads the bucket grant with the installer's key
+// (readBucketGrant): the project's number and, with a bucket recorded, the
+// bucket's labels and IAM policy. --grant-bucket where that policy cannot be
+// read, or where the providers cannot change it, is a block.
+//
+// Its facts are, in the order the command writes: the cost; the image; the
+// registry's cloud facts, and the bucket a first deploy creates; the mints,
+// the keyholder's leaf and a first keyring; a restart of the replicas a
+// deployed keyholder runs; the Namespace's and the ServiceAccount's writes;
+// the grant, and its policy write when --grant-bucket writes one; the pin
+// and its write; each other document of the workload it would apply,
+// rendered over the image it names, the placeholder leaf and, on a first
+// deploy, the placeholder bucket; and its notices, the bucket grant's among
+// them.
 //
 // With ensure (an interactive or --yes run, decided by the caller) a record
 // that names no registry is first given one (A23-24's exception), after the
 // pin, the uid, the blocks and the mTLS check. It reads no terminal and, but
 // for that ensure, writes nothing.
-func (c *storageDeployCommand) plan(ctx context.Context, env *Env, meta *config.InstanceMetadata, rd pinPlanReader, m consentMode, ensure bool) (preparedStorageDeploy, plan.Bound, error) {
+func (c *storageDeployCommand) plan(ctx context.Context, env *Env, meta *config.InstanceMetadata, rd keyholderPlanReader, m consentMode, ensure bool) (preparedStorageDeploy, plan.Bound, error) {
 	name := meta.Name
 	var p preparedStorageDeploy
 	if meta.Keyholder != nil {
@@ -582,7 +969,7 @@ func (c *storageDeployCommand) plan(ctx context.Context, env *Env, meta *config.
 		return p, plan.Bound{}, planRead(m, fmt.Errorf("read the uid of the instance's %s namespace: %w", dsdeploy.DefaultNamespace, err), name)
 	}
 	b := newBound("storage deploy", meta, "reader", uid)
-	b.Options = sortedOptions(c.deployer.imageOptions())
+	b.Options = sortedOptions(append(c.deployer.imageOptions(), plan.Option{Flag: "grant-bucket", Value: strconv.FormatBool(c.grantBucket)}))
 
 	// The keyring the pin is decided from: the one the mint makes, with no
 	// scopes, when the record names no bucket and this machine holds none;
@@ -625,6 +1012,21 @@ func (c *storageDeployCommand) plan(ctx context.Context, env *Env, meta *config.
 		return p, b, nil
 	}
 
+	// The record's values the bucket grant's commands print, checked before
+	// anything is read for them (A33-15): the project, and a recorded bucket.
+	if !projectIDShape.MatchString(meta.Project) {
+		return p, plan.Bound{}, withKind(kindInternal, fmt.Errorf(msgUnsafeRecord, name, "project ID", meta.Project))
+	}
+	if !p.mintsStorage && !bucketNameShape.MatchString(meta.Storage.Bucket) {
+		return p, plan.Bound{}, withKind(kindInternal, fmt.Errorf(msgUnsafeRecord, name, "storage bucket", meta.Storage.Bucket))
+	}
+	// The keyholder's ServiceAccount, before any Google read (A33-25 step 1):
+	// its uid, which the grant names, or "" when this deploy creates it.
+	accountUID, err := readServiceAccountUID(ctx, rd, m, name, tcdeploy.DefaultNamespace, dsdeploy.DefaultName, plan.GrantBucket)
+	if err != nil {
+		return p, plan.Bound{}, err
+	}
+
 	// The keyholder's leaf is issued from the instance's CA, which must be
 	// whole here (A26-2): connected, so never minted.
 	if p.identity, err = decideIdentity(env, name, true); err != nil {
@@ -648,16 +1050,44 @@ func (c *storageDeployCommand) plan(ctx context.Context, env *Env, meta *config.
 	} else {
 		p.bucket, p.provider, p.location = meta.Storage.Bucket, meta.Storage.Provider, meta.Storage.Location
 	}
-	manifests, err := dsdeploy.Render(keyholderConfig(meta, p.image.planTarget(), p.bucket, p.provider, p.location,
-		p.identity.caCertPEM, keyholderLeafPlaceholder(name, "cert"), keyholderLeafPlaceholder(name, "key")))
+
+	if p.grant, err = c.readBucketGrant(ctx, env, meta, p, accountUID); err != nil {
+		return p, plan.Bound{}, err
+	}
+	if p.grant.fact.Apply {
+		switch {
+		case !p.grant.capable:
+			b.Blocked = []plan.Block{blockOf(withKind(kindInternal, errors.New(msgBucketGrantIncapable)))}
+			return p, b, nil
+		case p.grant.fact.State == plan.GrantUnknown || p.grant.fact.Shared == plan.GrantUnknown:
+			b.Blocked = []plan.Block{blockOf(withKind(kindForbidden, fmt.Errorf(msgBucketGrantUnreadable, p.bucket)))}
+			return p, b, nil
+		}
+	}
+
+	cfg := keyholderConfig(meta, p.image.planTarget(), p.bucket, p.provider, p.location,
+		p.identity.caCertPEM, keyholderLeafPlaceholder(name, "cert"), keyholderLeafPlaceholder(name, "key"))
+	account, err := dsdeploy.RenderAccount(cfg)
 	if err != nil {
 		return p, plan.Bound{}, err
 	}
-	writes, err := applyFacts(manifests)
+	workload, err := dsdeploy.RenderWorkload(cfg)
+	if err != nil {
+		return p, plan.Bound{}, err
+	}
+	accountWrites, err := applyFacts(account)
+	if err != nil {
+		return p, plan.Bound{}, err
+	}
+	workloadWrites, err := applyFacts(workload)
 	if err != nil {
 		return p, plan.Bound{}, err
 	}
 	pins, err := pinFacts(p.pin, nil)
+	if err != nil {
+		return p, plan.Bound{}, err
+	}
+	notice, err := p.grant.notice(p.bucket, p.mintsStorage)
 	if err != nil {
 		return p, plan.Bound{}, err
 	}
@@ -677,10 +1107,15 @@ func (c *storageDeployCommand) plan(ctx context.Context, env *Env, meta *config.
 	if p.keyholderDeployed {
 		facts = append(facts, plan.RestartFact{Type: plan.TypeRestart, Component: components.Datasphered.Name, Because: plan.RestartBecause})
 	}
+	facts = append(facts, accountWrites...)
+	facts = append(facts, p.grant.fact)
+	if p.grant.writes() {
+		facts = append(facts, plan.CloudFact{Type: plan.TypeCloud, Service: plan.CloudStorage, Action: plan.CloudSetBucketGrant, Target: p.grant.fact.Target})
+	}
 	facts = append(facts, pins...)
-	facts = append(facts, writes...)
-	if grant := bucketGrantText(meta.Project, p.bucket); grant != "" {
-		facts = append(facts, noticeFact(grant))
+	facts = append(facts, workloadWrites...)
+	if notice != "" {
+		facts = append(facts, noticeFact(notice))
 	}
 	for _, line := range p.image.said() {
 		facts = append(facts, noticeFact(line))
@@ -689,11 +1124,94 @@ func (c *storageDeployCommand) plan(ctx context.Context, env *Env, meta *config.
 	return p, b, nil
 }
 
+// readBucketGrant is the plan's read of the keyholder's bucket grant
+// (A33-25 steps 3 to 5), as the installer's key, in every mode. uid is
+// datasphered's as the plan read it, "" when the account does not exist and
+// the grant names the uid placeholder (A33-19).
+//
+// Without planck.GrantReader the project's number is not known: both
+// principals are "", both states unknown, and nothing is read (MS-6).
+// Otherwise it reads the number, makes the two principals (A33-10), and:
+//   - on a first deploy, reads no policy, the bucket not existing: both
+//     states are missing; with --grant-bucket it opens the bucket IAM, which
+//     sends nothing, only to know that it can be changed;
+//   - with a bucket recorded, opens the bucket IAM and reads its policy
+//     once, the bucket's labels proved first, whether or not the account
+//     exists, so the shared principal is known. With the placeholder no
+//     binding can hold the principal, and its state is missing: the match
+//     is local, and nothing about the placeholder is sent. A provider
+//     without bucket IAM is unknown for both, with no read; a 403 is
+//     unknown for both.
+func (c *storageDeployCommand) readBucketGrant(ctx context.Context, env *Env, meta *config.InstanceMetadata, p preparedStorageDeploy, uid string) (bucketGrant, error) {
+	g := bucketGrant{
+		instance: meta.Name, project: meta.Project, uid: uid,
+		fact: plan.GrantFact{
+			Type: plan.TypeGrant, Name: plan.GrantBucket, Target: "gs://" + p.bucket, ServiceAccount: keyholderAccount,
+			Roles: slices.Clone(bucketRoles), State: plan.GrantUnknown, Shared: plan.GrantUnknown, Apply: c.grantBucket,
+		},
+	}
+	reader, ok := p.reg.provider.(planck.GrantReader)
+	if !ok {
+		return g, nil
+	}
+	number, err := reader.ProjectNumber(ctx)
+	if err != nil {
+		return bucketGrant{}, fmt.Errorf("read the number of project %q with instance %q's installer key: %w", meta.Project, meta.Name, err)
+	}
+	g.number = number
+	principalUID := uid
+	if g.pending() {
+		principalUID = saUIDPlaceholder(tcdeploy.DefaultNamespace, dsdeploy.DefaultName)
+	}
+	if g.fact.Principal, err = workloadUIDPrincipal(number, meta.Project, principalUID); err != nil {
+		return bucketGrant{}, err
+	}
+	if g.fact.SharedPrincipal, err = workloadNamePrincipal(number, meta.Project, tcdeploy.DefaultNamespace, dsdeploy.DefaultName); err != nil {
+		return bucketGrant{}, err
+	}
+	if p.mintsStorage {
+		g.fact.State, g.fact.Shared, g.capable = plan.GrantMissing, plan.GrantMissing, true
+		if !g.fact.Apply {
+			return g, nil
+		}
+		if _, err := c.openBucketGrants(ctx, env, meta); err != nil {
+			if errors.Is(err, storage.ErrNoBucketGrants) {
+				g.capable = false
+				return g, nil
+			}
+			return bucketGrant{}, err
+		}
+		return g, nil
+	}
+	grants, err := c.openBucketGrants(ctx, env, meta)
+	switch {
+	case errors.Is(err, storage.ErrNoBucketGrants):
+		return g, nil
+	case err != nil:
+		return bucketGrant{}, err
+	}
+	g.capable = true
+	state, shared, sharedRoles, err := grants.State(ctx, p.bucket, bucketRoles, g.fact.Principal, g.fact.SharedPrincipal)
+	switch {
+	case errors.Is(err, storage.ErrBucketUnproven):
+		return bucketGrant{}, err
+	case err != nil:
+		return bucketGrant{}, fmt.Errorf("read the IAM policy of gs://%s with instance %q's installer key: %w", p.bucket, meta.Name, err)
+	}
+	g.fact.State, g.fact.Shared, g.sharedRoles = string(state), string(shared), sharedRoles
+	if g.pending() && state != datasphere.GrantUnknown {
+		// A principal no account holds yet: no binding can grant it.
+		g.fact.State = plan.GrantMissing
+	}
+	return g, nil
+}
+
 // consented is an interactive or --yes run's consent to its plan: the cost,
 // asked from the plan's cost fact, then the build question when the image is
-// built from source. A version skew was refused before either
-// (imageDecision.say). A declined cost is no error, as it never was; a
-// declined build is.
+// built from source, then, when --grant-bucket writes the bucket's policy,
+// its own question (A33-24). A version skew was refused before any of them
+// (imageDecision.say). A declined cost or grant is no error, as a declined
+// cost never was; a declined build is.
 func (c *storageDeployCommand) consented(env *Env, meta *config.InstanceMetadata, p preparedStorageDeploy) (bool, error) {
 	ok, err := c.confirmCost(env, meta, p.cost)
 	if err != nil {
@@ -703,7 +1221,20 @@ func (c *storageDeployCommand) consented(env *Env, meta *config.InstanceMetadata
 		fprintln(env.Err, "Aborted.")
 		return false, nil
 	}
-	return true, c.deployer.buildConsent(env, p.image)
+	if err := c.deployer.buildConsent(env, p.image); err != nil {
+		return false, err
+	}
+	if !p.grant.writes() {
+		return true, nil
+	}
+	ok, err = newPrompter(env.In, env.Err).yesNo(p.grant.question(p.mintsStorage))
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		fprintln(env.Err, "Aborted.")
+	}
+	return ok, nil
 }
 
 // costWhatKeyholder is the keyholder's standing cost, as its cost fact names
@@ -742,12 +1273,26 @@ func (c *storageDeployCommand) confirmCost(env *Env, meta *config.InstanceMetada
 	if c.deployer.assumeYes {
 		return true, nil
 	}
-	if !isInteractive(env) {
+	if !c.isInteractive(env) {
 		return false, usagef(msgKeyholderCostYes, amount(f.Standing[0].MonthCents), f.Standing[0].Replicas)
 	}
 	fprintln(env.Err, keyholderCostQuestion(meta.Name, f))
 	return newPrompter(env.In, env.Err).yesNo("Deploy it?")
 }
+
+// What a deploy reports of the bucket grant (A33-28).
+const (
+	// bucketGrantApplied: a policy write was sent and the policy holds the
+	// grant: the write landed, or a read after one refused as stale found
+	// it done, which may be that write's, landed with its answer lost
+	// (datasphere.BucketGrants.EnsureGrant).
+	bucketGrantApplied = "applied"
+	// bucketGrantPresent: the grant was in place and the shared principal
+	// gone, so nothing was written.
+	bucketGrantPresent = "present"
+	// bucketGrantPrinted: the commands were printed, for a human to run.
+	bucketGrantPrinted = "printed"
+)
 
 type deployResult struct {
 	Instance       string `json:"instance"`
@@ -757,6 +1302,11 @@ type deployResult struct {
 	Bucket         string `json:"bucket,omitempty"`
 	Namespace      string `json:"namespace,omitempty"`
 	ServiceAccount string `json:"service_account,omitempty"`
+	// BucketGrant is bucketGrantApplied, bucketGrantPresent or
+	// bucketGrantPrinted.
+	BucketGrant string `json:"bucket_grant"`
+	// firstDeploy says the deploy created the bucket.
+	firstDeploy bool
 }
 
 func (r deployResult) Human(w io.Writer) error {
@@ -773,22 +1323,219 @@ func (r deployResult) Human(w io.Writer) error {
 	fprintf(w, "\nApplications deployed before this keyholder hold no storage identity and will be\n")
 	fprintf(w, "refused by it. Run 'farcast run' again for each of them to issue one.\n")
 
-	// The grant itself was printed BEFORE the deploy — see writeBucketGrant.
-	// All that belongs here is the reminder that it has to be in place before
-	// the unseal above will work.
-	if r.Project != "" && r.Bucket != "" {
+	// The grant itself was printed BEFORE the replicas were started — see
+	// writeBucketGrant — and only when it was not applied. All that belongs
+	// here is the reminder that it has to be in place before the unseal
+	// above will work, and on a first deploy what the replicas do until it
+	// is (A33-28, OQ-D).
+	if r.BucketGrant == bucketGrantPrinted {
 		fprintf(w, "\nThe bucket grant printed above has to be in place first. Without it the\n")
 		fprintf(w, "replicas crash-loop on a 403 at start-up and the unseal fails.\n")
+		if r.firstDeploy {
+			fprintf(w, "This first deploy's replicas restart until the grant has propagated (typically\n")
+			fprintf(w, "2 minutes, up to 7 or more); --grant-bucket grants it before they start.\n")
+		}
 	}
 	return nil
 }
 
-// writeBucketGrant prints the IAM binding the keyholder needs before it runs.
+// The keyholder's bucket grant (ADR 0023 M2.8, design §33, A33-4, A33-15,
+// A33-25): the two roles, on the bucket alone, for the keyholder's
+// ServiceAccount, named by its uid.
+var bucketRoles = []string{"roles/storage.objectAdmin", "roles/storage.legacyBucketReader"}
+
+// keyholderAccount is the keyholder's ServiceAccount as a grant fact and the
+// texts name it.
+const keyholderAccount = tcdeploy.DefaultNamespace + "/" + dsdeploy.DefaultName
+
+// bucketNameShape is the shape of the bucket names farcast mints
+// (datasphere.MintBucketName), the only ones a printed command takes
+// (A33-15).
+var bucketNameShape = regexp.MustCompile(`^farcast-[a-z0-9-]{1,55}$`)
+
+// bucketGrant is the keyholder's bucket grant as storage deploy's plan read
+// it (A33-25): the fact the plan binds, and what its printed commands and
+// its policy write are made from.
+type bucketGrant struct {
+	fact plan.GrantFact
+	// instance and project are the record's, the project checked; number is
+	// the project's, 0 when the provider states none.
+	instance, project string
+	number            int64
+	// uid is datasphered's uid as the plan read it, "" when the account did
+	// not exist and the plan bound the uid placeholder (A33-19).
+	uid string
+	// sharedRoles are the roles whose binding with no condition held the
+	// shared principal when the plan read the policy: the printed remove
+	// lines' roles (A33-11, A33-15).
+	sharedRoles []string
+	// capable says the providers can read and change a bucket's IAM: the
+	// compute provider states the project's number, and the storage provider
+	// has bucket IAM (or, on a first deploy without --grant-bucket, was not
+	// asked).
+	capable bool
+}
+
+// pending reports whether the plan bound the uid placeholder: the account
+// did not exist when the plan read it.
+func (g bucketGrant) pending() bool { return g.uid == "" }
+
+// writes reports whether the deploy writes the bucket's policy: under
+// --grant-bucket, when the uid principal lacks a role or the shared one
+// still holds one (A33-25).
+func (g bucketGrant) writes() bool {
+	return g.fact.Apply && (g.fact.State != plan.GrantPresent || g.fact.Shared == plan.GrantPresent)
+}
+
+// done reports whether the grant is in place and the shared principal gone.
+func (g bucketGrant) done() bool {
+	return g.fact.State == plan.GrantPresent && g.fact.Shared == plan.GrantMissing
+}
+
+// bucketShown names the bucket in a question or a notice: gs://<bucket>, or,
+// on a first deploy, the one the deploy creates.
+func bucketShown(bucket string, first bool) string {
+	if first {
+		return "the bucket this deploy creates"
+	}
+	return "gs://" + bucket
+}
+
+// notice is the plan's notice of the grant (A23-26, A33-25), "" when none is
+// due: none when --grant-bucket writes the policy, the cloud fact stating
+// it; the present line when the grant is in place and the shared principal
+// gone, applied or not; while the ServiceAccount does not exist, or on a
+// first deploy, which names no bucket yet, that the commands print once
+// they can be made; and otherwise the printed commands, then, unless the
+// policy could not be read, that a plan made before the grant cannot be
+// confirmed after it.
+func (g bucketGrant) notice(bucket string, first bool) (string, error) {
+	switch {
+	case g.writes():
+		return "", nil
+	case g.done():
+		return fmt.Sprintf(msgBucketGrantPresent, bucket), nil
+	case g.pending():
+		return fmt.Sprintf(msgBucketGrantPending, bucketShown(bucket, first)), nil
+	case first:
+		return msgBucketGrantNewBucket, nil
+	}
+	l, err := g.lines(bucket, g.uid)
+	if err != nil {
+		return "", err
+	}
+	text := bucketGrantText(l)
+	if g.fact.State != plan.GrantUnknown {
+		text += "\n" + msgPlanBeforeGrant
+	}
+	return text, nil
+}
+
+// printed is what a deploy prints of the grant (A33-26, step 2c), rendered
+// before the policy write with the real bucket and the uid read at 2b,
+// every value checked: the present line when the grant is in place and the
+// shared principal gone; otherwise the commands, which a grant not applied
+// prints before the replicas start and a refused policy write prints before
+// its refusal.
+func (g bucketGrant) printed(bucket, uid string) (string, error) {
+	if g.done() {
+		return fmt.Sprintf(msgBucketGrantPresent, bucket) + "\n", nil
+	}
+	l, err := g.lines(bucket, uid)
+	if err != nil {
+		return "", err
+	}
+	var w strings.Builder
+	writeBucketGrant(&w, l)
+	return w.String(), nil
+}
+
+// question is the terminal's question before --grant-bucket writes the
+// policy (A33-24): the bucket, the uid principal (or the account, before it
+// exists) and, when the bucket still grants it, the shared principal it
+// removes; or, when the uid principal holds both roles already, the removal
+// alone.
+func (g bucketGrant) question(first bool) string {
+	bucket := bucketShown(strings.TrimPrefix(g.fact.Target, "gs://"), first)
+	if g.fact.State == plan.GrantPresent {
+		return fmt.Sprintf(msgGrantQuestionRemove, bucket, g.fact.SharedPrincipal, g.project)
+	}
+	principal := g.fact.Principal
+	if g.pending() {
+		principal = msgGrantPendingPrincipal
+	}
+	shared := ""
+	if g.fact.Shared == plan.GrantPresent {
+		shared = fmt.Sprintf(msgGrantQuestionShared, g.fact.SharedPrincipal, g.project)
+	}
+	return fmt.Sprintf(msgGrantQuestion, bucket, principal, shared)
+}
+
+// lines are what writeBucketGrant prints for bucket and the account whose
+// uid is uid, with the plan's states, every value checked (A33-15): the
+// project and the bucket against their shapes, refused in msgUnsafeRecord's
+// words, and the uid, which must be the API server's, A33-10's refusal
+// otherwise; each kind internal, and nothing printed.
+func (g bucketGrant) lines(bucket, uid string) (bucketGrantLines, error) {
+	if !projectIDShape.MatchString(g.project) {
+		return bucketGrantLines{}, withKind(kindInternal, fmt.Errorf(msgUnsafeRecord, g.instance, "project ID", g.project))
+	}
+	if !bucketNameShape.MatchString(bucket) {
+		return bucketGrantLines{}, withKind(kindInternal, fmt.Errorf(msgUnsafeRecord, g.instance, "storage bucket", bucket))
+	}
+	if !serviceAccountUIDShape.MatchString(uid) {
+		return bucketGrantLines{}, withKind(kindInternal, errors.New(msgUnsafeGrantUID))
+	}
+	number, quote := g.number, "'"
+	if number == 0 {
+		// No number is known: the commands read it into PROJNUM, and name
+		// the principals with it, double-quoted.
+		number, quote = 1, `"`
+	}
+	member, err := workloadUIDPrincipal(number, g.project, uid)
+	if err != nil {
+		return bucketGrantLines{}, err
+	}
+	shared, err := workloadNamePrincipal(number, g.project, tcdeploy.DefaultNamespace, dsdeploy.DefaultName)
+	if err != nil {
+		return bucketGrantLines{}, err
+	}
+	if g.number == 0 {
+		member, shared = projnumPrincipal(member), projnumPrincipal(shared)
+	}
+	return bucketGrantLines{
+		bucket: bucket, project: g.project, projnum: g.number == 0,
+		member: quote + member + quote, sharedMember: quote + shared + quote,
+		state: g.fact.State, shared: g.fact.Shared, sharedRoles: slices.Clone(g.sharedRoles),
+	}, nil
+}
+
+// bucketGrantLines is what writeBucketGrant prints (A33-15), every value
+// checked before it was made (bucketGrant.lines): the bucket and the
+// project, single-quoted when printed; member and sharedMember, the uid
+// principal and the shared one, already quoted; projnum when no project
+// number is known; the plan's two states; and the roles that hold the shared
+// principal.
+type bucketGrantLines struct {
+	bucket, project      string
+	member, sharedMember string
+	projnum              bool
+	state, shared        string
+	sharedRoles          []string
+}
+
+// writeBucketGrant prints the commands that grant the keyholder's
+// ServiceAccount, by its uid, read/write access to its bucket, and that
+// remove the binding every FarCast instance in the project shares, for a
+// human to run in Cloud Shell before the keyholder runs.
 //
 // The keyholder reads and writes the bucket with a cloud-side identity (ADR
-// 0008 decision 8). FarCast does not apply it: that needs permission to change
-// a bucket's IAM, which the operator's credential is not required to carry and
-// which this CLI deliberately never asks for.
+// 0008 decision 8). Since ADR 0023 M2.8 FarCast applies the grant itself
+// under --grant-bucket's consent (a plan where a reader is granted, or a
+// terminal's question), in one policy write; otherwise these commands are
+// printed. Both name the ServiceAccount by its uid: the principal a name
+// makes is shared by every instance in the project's Workload Identity pool.
+// The uid principal on a bucket's policy is unverified until the M2 walk.
 //
 // It is printed BEFORE the workload is applied. It used to be printed after,
 // as part of the result — so the replicas were already crash-looping on a 403
@@ -796,31 +1543,69 @@ func (r deployResult) Human(w io.Writer) error {
 // broken. That happened twice, on the Phase 3.2 and Phase 4.4 walks, and the
 // second time cost a failed unseal as well (which is why unseal no longer
 // consumes a generation when every push fails).
-func writeBucketGrant(w io.Writer, project, bucket, namespace, serviceAccount string) {
-	if project == "" || bucket == "" {
-		return
+//
+// Each command is one line, with no backslash continuation, so a paste runs
+// each alone, and every value in it is single-quoted, or, with no project
+// number known, double-quoted around ${PROJNUM}, which the first command
+// sets. The adds come before the removes, so a running keyholder is never
+// cut off, and a remove names only a role that holds the shared principal,
+// since gcloud fails one that does not. With the state unknown both blocks
+// print, each introduced by its condition, the removes for both roles.
+func writeBucketGrant(w io.Writer, g bucketGrantLines) {
+	binding := func(verb, member, role string) string {
+		return fmt.Sprintf("  gcloud storage buckets %s-iam-policy-binding 'gs://%s' --member %s --role '%s' --condition=None", verb, g.bucket, member, role)
 	}
-	// The project and the bucket are the record's, printed into commands to
-	// paste, so a value that does not print as it is goes in Go-quoted
-	// (ADR 0023 M2.6d, A28-3); one that does is unchanged.
-	project, bucket = terminalText(project), terminalText(bucket)
-	fprintf(w, "\nBefore this keyholder can start, it needs read/write access to the bucket\n")
-	fprintf(w, "under its own identity. If you have not granted it for this instance yet, run:\n\n")
-	fprintf(w, "  PROJNUM=$(gcloud projects describe %s --format='value(projectNumber)')\n", project)
-	fprintf(w, "  PRINCIPAL=\"principal://iam.googleapis.com/projects/$PROJNUM/locations/global/workloadIdentityPools/%s.svc.id.goog/subject/ns/%s/sa/%s\"\n",
-		project, namespace, serviceAccount)
-	fprintf(w, "  gcloud storage buckets add-iam-policy-binding gs://%s \\\n", bucket)
-	fprintf(w, "    --member \"$PRINCIPAL\" --role roles/storage.objectAdmin\n")
-	fprintf(w, "  gcloud storage buckets add-iam-policy-binding gs://%s \\\n", bucket)
-	fprintf(w, "    --member \"$PRINCIPAL\" --role roles/storage.legacyBucketReader\n")
-	fprintf(w, "\nThe grant is on the BUCKET, not the project, and object access is\n")
-	fprintf(w, "separated from bucket reads so the keyholder cannot delete its own bucket.\n\n")
+	unknown := g.state == plan.GrantUnknown
+	adds := g.state != plan.GrantPresent
+	fprintln(w)
+	if adds {
+		fprintln(w, "Before this keyholder can start, its ServiceAccount farcast-system/datasphered needs read/write access to the bucket, "+
+			"granted to it by its uid. In Cloud Shell, run:")
+	}
+	if g.projnum {
+		fprintf(w, "  PROJNUM=$(gcloud projects describe '%s' --format='value(projectNumber)')\n", g.project)
+	}
+	add := func() {
+		for _, role := range bucketRoles {
+			fprintln(w, binding("add", g.member, role))
+		}
+	}
+	remove := func(roles []string) {
+		for _, role := range roles {
+			fprintln(w, binding("remove", g.sharedMember, role))
+		}
+	}
+	switch {
+	case unknown:
+		fprintf(w, "If gs://%s does not grant it yet:\n", g.bucket)
+		add()
+		fprintf(w, "If it still grants the principal every FarCast instance in project '%s' shares, wait for IAM, then:\n", g.project)
+		remove(bucketRoles)
+	default:
+		if adds {
+			add()
+		}
+		if g.shared != plan.GrantPresent {
+			break
+		}
+		if adds {
+			fprintf(w, "Then wait for IAM (typically 2 minutes, up to 7 or more), and remove the binding every FarCast instance in project '%s' shares:\n", g.project)
+		} else {
+			fprintf(w, "Remove the binding every FarCast instance in project '%s' shares:\n", g.project)
+		}
+		remove(g.sharedRoles)
+	}
+	if adds {
+		fprintln(w, "The grant is on the BUCKET, not the project, and object access is")
+		fprintln(w, "separated from bucket reads so the keyholder cannot delete its own bucket.")
+	}
+	fprintln(w)
 }
 
 // bucketGrantText is writeBucketGrant's lines as a plan's notice carries
-// them, without the blank lines around them, or "" when it prints none.
-func bucketGrantText(project, bucket string) string {
+// them, without the blank lines around them (A27-10).
+func bucketGrantText(g bucketGrantLines) string {
 	var w strings.Builder
-	writeBucketGrant(&w, project, bucket, dsdeploy.DefaultNamespace, dsdeploy.DefaultName)
+	writeBucketGrant(&w, g)
 	return strings.Trim(w.String(), "\n")
 }

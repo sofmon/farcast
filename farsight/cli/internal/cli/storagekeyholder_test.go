@@ -317,6 +317,7 @@ func TestDeployMintsTheBucketItNeeds(t *testing.T) {
 	// Connected, with no storage recorded: the plan reads the instance's
 	// material and registry before anything is minted (ADR 0023 M2.6c).
 	connectedInstance(t, dir, "prod")
+	withProject(t, dir, "prod")
 	env, _ := testEnv(dir, output.ModeHuman)
 
 	var minted []string
@@ -512,16 +513,20 @@ func TestSystemComponentsHaveDistinctImagePaths(t *testing.T) {
 // anything is created, ensured, pushed, applied or recorded. On a record
 // that names no registry such a run gives none first: only a run that can
 // pass the gate ensures before its plan, so it is refused in planRegistry's
-// words, the provider never opened and the record as it was.
+// words, the provider never opened and the record as it was. --grant-bucket
+// with no terminal and no answer is refused before anything is read (ADR
+// 0023 M2.8, design §33, A33-24).
 func storageDeployRefusalNamesThePlan(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		registry bool
+		flags    []string
 		want     string
 		exit     int
 	}{
-		{"the cost", true, fmt.Sprintf(msgKeyholderCostYes, amount(cents(keyholderMonthlyUSD)), keyholderReplicas), 2},
-		{"no registry recorded", false, fmt.Sprintf(msgNoRegistryRecorded, "p41", "p41"), 1},
+		{"the cost", true, nil, fmt.Sprintf(msgKeyholderCostYes, amount(cents(keyholderMonthlyUSD)), keyholderReplicas), 2},
+		{"no registry recorded", false, nil, fmt.Sprintf(msgNoRegistryRecorded, "p41", "p41"), 1},
+		{"--grant-bucket", true, []string{"--grant-bucket"}, msgGrantBucketTerminal, 2},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := config.Dir(t.TempDir())
@@ -534,7 +539,7 @@ func storageDeployRefusalNamesThePlan(t *testing.T) {
 			}
 			fc, fb := &fakeCluster{}, &fakeBuilder{resolveFn: notFoundForTags}
 			fp := &fakeProvider{}
-			c := withFlags(t, testStorageDeploy(fp, fb))
+			c := withFlags(t, testStorageDeploy(fp, fb), tc.flags...)
 			opened := 0
 			c.deployer.openProvider = func(*config.InstanceMetadata, *config.InstanceCredentials) (planck.Provider, error) {
 				opened++
@@ -609,10 +614,12 @@ func TestStorageDeployRefusesMaterialMissingAFileBeforeTheRegistry(t *testing.T)
 }
 
 // deployableInstance is connected AND has a bucket recorded — everything the
-// keyholder deploy needs before it reaches the cluster.
+// keyholder deploy needs before it reaches the cluster — in a project, which
+// the bucket grant's principals name (design §33, A33-15).
 func deployableInstance(t *testing.T, dir config.Dir, name string) *config.InstanceMetadata {
 	t.Helper()
 	meta := connectedInstance(t, dir, name)
+	meta.Project = "proj-1"
 	meta.Storage = &config.Storage{Bucket: "farcast-" + name + "-0a1b2c3d", Provider: "gcs", Location: "us-central1"}
 	if err := dir.SaveInstanceMetadata(name, meta); err != nil {
 		t.Fatal(err)
@@ -621,7 +628,7 @@ func deployableInstance(t *testing.T, dir config.Dir, name string) *config.Insta
 }
 
 func testStorageDeploy(fp *fakeProvider, fb *fakeBuilder) *storageDeployCommand {
-	c := &storageDeployCommand{}
+	c := &storageDeployCommand{openBucketGrants: (&fakeBucketGrants{}).open}
 	c.deployer.openProvider = func(*config.InstanceMetadata, *config.InstanceCredentials) (planck.Provider, error) {
 		return fp, nil
 	}
@@ -641,14 +648,16 @@ func TestDeployRecordsTheKeyholderBeforeApplying(t *testing.T) {
 	const name = "prod"
 	deployableInstance(t, dir, name)
 
-	fc := &fakeCluster{applyErr: errors.New("the API server said no")}
+	// The workload's apply fails; the keyholder's account, applied first
+	// since ADR 0023 M2.8 (design §33, A33-26), does not.
+	fc := failsTheWorkload()
 	c := testStorageDeploy(&fakeProvider{}, &fakeBuilder{})
 	c.deployer.assumeYes = true
 	c.deployer.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
 
 	env, _ := testEnv(dir, output.ModeHuman)
-	if err := c.Run(context.Background(), env, []string{name}); err == nil {
-		t.Fatal("a failed apply reported success")
+	if err := c.Run(context.Background(), env, []string{name}); err == nil || len(fc.applied) != 2 {
+		t.Fatalf("a failed apply = %v, after %d applies; want it refused, at the workload's", err, len(fc.applied))
 	}
 
 	after, err := dir.LoadInstanceMetadata(name)
@@ -664,6 +673,18 @@ func TestDeployRecordsTheKeyholderBeforeApplying(t *testing.T) {
 	if after.Keyholder.Replicas != keyholderReplicas {
 		t.Errorf("recorded %d replicas, want %d", after.Keyholder.Replicas, keyholderReplicas)
 	}
+}
+
+// failsTheWorkload is a cluster whose second apply, the keyholder's
+// workload after its account (design §33, A33-26), is refused.
+func failsTheWorkload() *fakeCluster {
+	fc := &fakeCluster{}
+	fc.onApply = func() {
+		if len(fc.applied) == 2 {
+			fc.applyErr = errors.New("the API server said no")
+		}
+	}
+	return fc
 }
 
 // withProject gives an instance the cloud project a real GKE instance always
@@ -696,7 +717,7 @@ func TestTheBucketGrantIsPrintedBeforeTheDeployNeedsIt(t *testing.T) {
 
 	withProject(t, dir, name)
 
-	fc := &fakeCluster{applyErr: errors.New("the API server said no")}
+	fc := failsTheWorkload()
 	c := testStorageDeploy(&fakeProvider{}, &fakeBuilder{})
 	c.deployer.assumeYes = true
 	c.deployer.newCluster = func(clusterRef) (clusterApplier, error) { return fc, nil }
@@ -759,10 +780,15 @@ func TestDeployDoesNotWaitForReadiness(t *testing.T) {
 	if fc.rollouts != 0 {
 		t.Errorf("deploy waited for a rollout %d times; sealed replicas never become Ready", fc.rollouts)
 	}
-	if len(fc.applied) != 1 {
-		t.Fatalf("applied %d manifests, want 1", len(fc.applied))
+	// The keyholder's account, then its workload (ADR 0023 M2.8, design §33,
+	// A33-26).
+	if len(fc.applied) != 2 {
+		t.Fatalf("applied %d manifests, want 2", len(fc.applied))
 	}
-	rendered := string(fc.applied[0])
+	if got := appliedKindsOf(t, fc.applied[0]); got != "Namespace/farcast-system ServiceAccount/datasphered" {
+		t.Errorf("the first apply is %s; want the keyholder's account", got)
+	}
+	rendered := string(fc.applied[1])
 	if !strings.Contains(rendered, "kind: StatefulSet") || !strings.Contains(rendered, "system/datasphered") {
 		t.Error("the applied manifest is not the keyholder workload")
 	}

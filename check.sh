@@ -31,7 +31,7 @@
 #      type-checked here and linted in step 5, never run
 #   5  golangci-lint, mandatory — a missing linter fails the check; the
 #      tagged files included
-#   6  go test -race
+#   6  go test -race, with a 30-minute timeout per test binary
 #   7  the Apple client: the source gate (only allowed file types and the
 #      one backdrop image, no links; the CLI's vectors and FatLine's PKI
 #      vectors copied byte for byte; no unsafe, unsafeFlags or attribute
@@ -314,7 +314,12 @@ ok "sdk/go: 0 issues"
 
 # ---- 6. race tests ---------------------------------------------------------------
 step "6 — go test -race"
-go test -mod=vendor -race ./...
+# The timeout is per test binary, against a hung test, not a speed budget.
+# The farsight/cli/internal/cli package runs its tests one after another,
+# because they swap package-level seams, and under -race it takes about ten
+# minutes: 576 s at ADR 0023 M2.8's step 0 and 609 s at M2.8a on the dev Mac,
+# with other work running. That is past go test's 10-minute default.
+go test -mod=vendor -race -timeout 30m ./...
 ok "root"
 (cd sdk/go && go test -race ./...)
 ok "sdk/go"

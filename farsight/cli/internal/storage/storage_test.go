@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -732,5 +734,196 @@ func TestTheApplicationScopeIsMintedWithTheKeyring(t *testing.T) {
 	}
 	if store == session.Store {
 		t.Error("a write into an application's own subtree routed to the master key space")
+	}
+}
+
+// ---------------------------------------------------------------- bucket IAM
+
+// grantsProvider is a fakeProvider with datasphere.BucketGrants, logging
+// every call in order, so that a test sees the labels proved before the
+// policy is read or written.
+type grantsProvider struct {
+	*fakeProvider
+	log         []string
+	state       datasphere.GrantState
+	sharedRoles []string
+	changed     bool
+}
+
+func (g *grantsProvider) Validate(ctx context.Context, ref datasphere.BucketRef) error {
+	g.log = append(g.log, "Validate "+ref.Name+" "+ref.Instance+" "+ref.Location)
+	return g.fakeProvider.Validate(ctx, ref)
+}
+
+func (g *grantsProvider) GrantState(_ context.Context, bucket string, roles []string, member, shared string) (datasphere.GrantState, datasphere.GrantState, []string, error) {
+	g.log = append(g.log, "GrantState "+bucket+" "+strings.Join(roles, ",")+" "+member+" "+shared)
+	return g.state, datasphere.GrantPresent, g.sharedRoles, nil
+}
+
+func (g *grantsProvider) EnsureGrant(_ context.Context, bucket string, roles []string, member, shared string) (bool, error) {
+	g.log = append(g.log, "EnsureGrant "+bucket+" "+strings.Join(roles, ",")+" "+member+" "+shared)
+	return g.changed, nil
+}
+
+// registerProvider registers p under a name unique to this test, as
+// registerFake does, and records each Config its factory is given.
+func registerProvider(t *testing.T, p datasphere.Provider, configs *[]datasphere.Config) string {
+	t.Helper()
+	suffix := strings.ReplaceAll(t.Name(), "/", "-")
+	storageName := "ds-grants-" + suffix
+	computeName := "compute-grants-" + suffix
+	datasphere.Register(storageName, func(cfg datasphere.Config) (datasphere.Provider, error) {
+		*configs = append(*configs, cfg)
+		return p, nil
+	})
+	storageProviders[computeName] = storageName
+	t.Cleanup(func() { delete(storageProviders, computeName) })
+	return computeName
+}
+
+// TestOpenBucketGrantsUsesTheInstallerKeyAlone: the bucket IAM helper opens
+// the provider with the key it is given, refuses a blank one before any
+// provider is opened (so no Application Default Credentials), and opens no
+// keyring, ensures no bucket and changes no record (design §33, A33-14).
+func TestOpenBucketGrantsUsesTheInstallerKeyAlone(t *testing.T) {
+	dir := newTestDir(t)
+	g := &grantsProvider{fakeProvider: newFakeProvider(dir, "prod")}
+	var configs []datasphere.Config
+	provider := registerProvider(t, g, &configs)
+	store := ensuredBucket("farcast-prod-0badc0de", "")
+	store.Location = "europe-west1"
+	recordInstance(t, dir, "prod", provider, store)
+	meta, err := dir.LoadInstanceMetadata("prod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(filepath.Join(string(dir), "instances", "prod", "metadata.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, blank := range []string{"", " \n\t"} {
+		if _, err := OpenBucketGrants(meta, blank); err == nil {
+			t.Errorf("a blank key %q opened the provider", blank)
+		}
+	}
+	if len(configs) != 0 {
+		t.Fatalf("a blank key opened the provider %d time(s)", len(configs))
+	}
+
+	grants, err := OpenBucketGrants(meta, `{"type":"service_account"}`)
+	if err != nil {
+		t.Fatalf("OpenBucketGrants: %v", err)
+	}
+	if len(configs) != 1 {
+		t.Fatalf("the provider was opened %d times, want once", len(configs))
+	}
+	if c := configs[0]; string(c.Credentials) != `{"type":"service_account"}` || c.Project != "proj-1" || c.Location != "us-central1" {
+		t.Errorf("the provider was opened with %s; want the key, the project and the region", c)
+	}
+	if _, _, _, err := grants.State(context.Background(), "farcast-prod-0badc0de", []string{"r"}, "m", "s"); err != nil {
+		t.Fatal(err)
+	}
+	if want := "Validate farcast-prod-0badc0de prod europe-west1"; len(g.log) == 0 || g.log[0] != want {
+		t.Errorf("the first call is %q, want %q: the bucket's recorded location", g.log, want)
+	}
+
+	if exists, _ := dir.InstanceKeyringExists("prod"); exists {
+		t.Error("OpenBucketGrants made a keyring")
+	}
+	if len(g.ensured) != 0 {
+		t.Errorf("OpenBucketGrants ensured a bucket: %+v", g.ensured)
+	}
+	after, err := os.ReadFile(filepath.Join(string(dir), "instances", "prod", "metadata.yaml"))
+	if err != nil || !bytes.Equal(before, after) {
+		t.Errorf("OpenBucketGrants changed the record (%v)", err)
+	}
+}
+
+// TestOpenBucketGrantsRefusesAProviderWithoutIt: a storage provider that
+// cannot read or change a bucket's IAM is ErrNoBucketGrants.
+func TestOpenBucketGrantsRefusesAProviderWithoutIt(t *testing.T) {
+	dir := newTestDir(t)
+	f := newFakeProvider(dir, "prod")
+	provider := registerFake(t, f)
+	recordInstance(t, dir, "prod", provider, ensuredBucket("farcast-prod-0badc0de", ""))
+	meta, err := dir.LoadInstanceMetadata("prod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenBucketGrants(meta, `{"type":"service_account"}`); !errors.Is(err, ErrNoBucketGrants) {
+		t.Errorf("OpenBucketGrants = %v, want ErrNoBucketGrants", err)
+	}
+	if len(f.validated) != 0 {
+		t.Errorf("a provider without bucket IAM was asked to validate %+v", f.validated)
+	}
+}
+
+// TestBucketGrantsProveTheLabelsFirst: State and Ensure each prove the
+// bucket's ownership labels name this instance before its policy is read or
+// written, so a record edited to name another instance's bucket reaches no
+// IAM call; an empty name, which Validate would read as a credentials probe,
+// is refused before any call.
+func TestBucketGrantsProveTheLabelsFirst(t *testing.T) {
+	dir := newTestDir(t)
+	g := &grantsProvider{fakeProvider: newFakeProvider(dir, "prod"), state: datasphere.GrantMissing,
+		sharedRoles: []string{"r2"}, changed: true}
+	var configs []datasphere.Config
+	provider := registerProvider(t, g, &configs)
+	recordInstance(t, dir, "prod", provider, ensuredBucket("farcast-prod-0badc0de", ""))
+	meta, err := dir.LoadInstanceMetadata("prod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	grants, err := OpenBucketGrants(meta, `{"type":"service_account"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	roles := []string{"r1", "r2"}
+
+	state, shared, sharedRoles, err := grants.State(ctx, "farcast-prod-0badc0de", roles, "member", "shared")
+	if err != nil || state != datasphere.GrantMissing || shared != datasphere.GrantPresent || !slices.Equal(sharedRoles, []string{"r2"}) {
+		t.Errorf("State = %s, %s, %q, %v", state, shared, sharedRoles, err)
+	}
+	changed, err := grants.Ensure(ctx, "farcast-prod-0badc0de", roles, "member", "shared")
+	if err != nil || !changed {
+		t.Errorf("Ensure = %v, %v", changed, err)
+	}
+	want := []string{
+		"Validate farcast-prod-0badc0de prod us-central1",
+		"GrantState farcast-prod-0badc0de r1,r2 member shared",
+		"Validate farcast-prod-0badc0de prod us-central1",
+		"EnsureGrant farcast-prod-0badc0de r1,r2 member shared",
+	}
+	if !slices.Equal(g.log, want) {
+		t.Errorf("calls:\n  %q\nwant\n  %q", g.log, want)
+	}
+
+	g.log = nil
+	g.validateErr = fmt.Errorf("%w: labelled for another instance", datasphere.ErrNotOwned)
+	// The refusal is ErrBucketUnproven too (design §33, A33-27), which adds
+	// nothing to its text: storage deploy tells it from a refused write by it.
+	if _, _, _, err := grants.State(ctx, "farcast-other-0badc0de", roles, "member", "shared"); !errors.Is(err, datasphere.ErrNotOwned) ||
+		!errors.Is(err, ErrBucketUnproven) ||
+		err.Error() != `the recorded storage bucket for "prod" did not validate: datasphere: bucket is not this instance's: labelled for another instance` {
+		t.Errorf("State of another instance's bucket = %v; want the validation's refusal", err)
+	}
+	if _, err := grants.Ensure(ctx, "farcast-other-0badc0de", roles, "member", "shared"); !errors.Is(err, datasphere.ErrNotOwned) || !errors.Is(err, ErrBucketUnproven) {
+		t.Errorf("Ensure of another instance's bucket = %v; want the validation's refusal", err)
+	}
+	if want := []string{"Validate farcast-other-0badc0de prod us-central1", "Validate farcast-other-0badc0de prod us-central1"}; !slices.Equal(g.log, want) {
+		t.Errorf("calls %q, want the validations alone", g.log)
+	}
+
+	g.log, g.validateErr = nil, nil
+	if _, _, _, err := grants.State(ctx, "", roles, "member", "shared"); err == nil {
+		t.Error("State read a bucket with no name")
+	}
+	if _, err := grants.Ensure(ctx, "", roles, "member", "shared"); err == nil {
+		t.Error("Ensure wrote a bucket with no name")
+	}
+	if len(g.log) != 0 {
+		t.Errorf("an empty bucket name reached %q", g.log)
 	}
 }

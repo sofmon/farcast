@@ -1,9 +1,11 @@
 package deploy
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -971,5 +973,98 @@ func TestRenderPinIsALabelledConfigMap(t *testing.T) {
 	}
 	if !strings.Contains(string(out), `"resourceVersion":"4711"`) {
 		t.Errorf("a replace does not carry the version it was read at: %s", out)
+	}
+}
+
+// renderSHA256 is the sha256 of Render(sampleConfig()) as it was before
+// ADR 0023 M2.8 split the stream (77a3667): the split changes no byte.
+const renderSHA256 = "b27fc06ae9b334b873268527e7a231750fd336ce0a9195e3b7797341a4dd2a5c"
+
+// TestRenderIsTheAccountThenTheWorkload (ADR 0023 M2.8, design §33,
+// A33-26): storage deploy applies the Namespace and the keyholder's
+// ServiceAccount first, reads the account's uid, and only then grants the
+// bucket and applies the rest. Render is exactly RenderAccount's documents,
+// a "---" line, then RenderWorkload's, byte-identical to the stream before
+// the split; the account's two documents are the Namespace and the
+// ServiceAccount alone, and the workload holds neither. RenderAccount needs
+// no image, mTLS material or bucket, which do not exist yet when it is
+// applied, and checks the namespace and the name; RenderWorkload refuses
+// whatever Render refuses.
+func TestRenderIsTheAccountThenTheWorkload(t *testing.T) {
+	defaults := sampleConfig()
+	defaults.Namespace, defaults.Name = DefaultNamespace, DefaultName
+	other := sampleConfig()
+	other.Namespace, other.Name, other.Replicas = "other-ns", "keyholder", 3
+	for name, c := range map[string]Config{"the defaults": defaults, "other names": other} {
+		t.Run(name, func(t *testing.T) {
+			whole, err := Render(c)
+			if err != nil {
+				t.Fatal(err)
+			}
+			account, err := RenderAccount(c)
+			if err != nil {
+				t.Fatal(err)
+			}
+			workload, err := RenderWorkload(c)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if joined := string(account) + "---\n" + string(workload); joined != string(whole) {
+				t.Fatalf("Render is not RenderAccount, ---, RenderWorkload:\n%s\nwant\n%s", whole, joined)
+			}
+			ns, sa := "Namespace/"+c.Namespace, "ServiceAccount/"+c.Name
+			got := keys(docsByID(t, account))
+			slices.Sort(got)
+			if want := []string{ns, sa}; !slices.Equal(got, want) {
+				t.Errorf("the account's documents are %q; want %q", got, want)
+			}
+			if !strings.HasPrefix(string(account), "apiVersion: v1\nkind: Namespace\n") {
+				t.Errorf("the account does not begin with the Namespace:\n%s", account)
+			}
+			for id := range docsByID(t, workload) {
+				if id == ns || id == sa {
+					t.Errorf("the workload renders %s again", id)
+				}
+			}
+		})
+	}
+	whole, err := Render(sampleConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fmt.Sprintf("%x", sha256.Sum256(whole)); got != renderSHA256 {
+		t.Errorf("Render's stream has the sha256 %s; want the stream before the split, %s", got, renderSHA256)
+	}
+
+	// The account alone: no image, material or bucket, as at storage
+	// deploy's step 2a, renders the defaults' two documents.
+	if account, err := RenderAccount(Config{}); err != nil || !strings.Contains(string(account), "kind: ServiceAccount\nmetadata:\n  name: datasphered\n  namespace: farcast-system\n") {
+		t.Errorf("RenderAccount of an empty Config = %v\n%s", err, account)
+	}
+	for _, c := range []Config{{Namespace: "Farcast_System"}, {Name: "datasphered\nkind: Secret"}, {Name: strings.Repeat("a", 64)}} {
+		if out, err := RenderAccount(c); err == nil {
+			t.Errorf("RenderAccount accepted the namespace %q and name %q:\n%s", c.Namespace, c.Name, out)
+		}
+		full := sampleConfig()
+		full.Namespace, full.Name = c.Namespace, c.Name
+		if _, err := Render(full); err == nil {
+			t.Errorf("Render accepted the namespace %q and name %q", c.Namespace, c.Name)
+		}
+	}
+	for name, mutate := range map[string]func(*Config){
+		"no image":       func(c *Config) { c.Image = "" },
+		"a tag":          func(c *Config) { c.Image = "example.test/repo/datasphered:latest" },
+		"no server leaf": func(c *Config) { c.ServerCertPEM = nil },
+		"no bucket":      func(c *Config) { c.Bucket = "" },
+		"no replicas":    func(c *Config) { c.Replicas = -1 },
+	} {
+		c := sampleConfig()
+		mutate(&c)
+		if _, err := RenderWorkload(c); err == nil {
+			t.Errorf("RenderWorkload accepted a Config with %s", name)
+		}
+		if _, err := RenderAccount(c); err != nil {
+			t.Errorf("RenderAccount refused a Config with %s, which its documents do not carry: %v", name, err)
+		}
 	}
 }

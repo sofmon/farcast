@@ -118,6 +118,43 @@ var (
 	//		warn(err) // deleted, but the cloud is still holding ciphertext
 	//	}
 	ErrRetentionForced = errors.New("datasphere: the cloud retains deleted objects")
+
+	// ErrPermissionDenied reports that the cloud refused this credential a
+	// read or a change of a bucket's IAM policy (BucketGrants): a 403, which
+	// is the credential's answer and not the bucket's state.
+	ErrPermissionDenied = errors.New("datasphere: the cloud refused this credential")
+
+	// ErrPolicyChanged reports that a bucket's IAM policy changed between its
+	// read and each of the writes built from it, and that a read after the
+	// last write found the grant not done (BucketGrants.EnsureGrant): the
+	// policy does not hold the grant.
+	ErrPolicyChanged = errors.New("datasphere: the bucket's IAM policy changed while it was written")
+
+	// ErrPolicyRejected reports that the cloud answered a write of a
+	// bucket's IAM policy with a refusal that is neither the credential's
+	// (ErrPermissionDenied) nor a stale read's (ErrPolicyChanged), such as
+	// a member it does not accept, or a redirect
+	// (BucketGrants.EnsureGrant). It is reported only when none of the
+	// write's earlier attempts failed in transport, failed reading its
+	// body, or got a 5xx, so the refused write did not change the policy;
+	// after one, the refusal is ErrPolicyUnconfirmed.
+	ErrPolicyRejected = errors.New("datasphere: the cloud refused the new IAM policy")
+
+	// ErrPolicyUnconfirmed reports that a write of a bucket's IAM policy was
+	// sent and may have taken effect unseen (BucketGrants.EnsureGrant): a
+	// write no answer settles (it was cancelled in flight, failed in
+	// transport, was answered only with 429s or 5xxs until the retries gave
+	// up, or got a response over the cap); a refusal other than a 409 or a
+	// 412 of a write one of whose earlier attempts failed in transport,
+	// failed reading its body, or got a 5xx; or, after any write was sent,
+	// a read that failed, or a read it would write from that came without
+	// an etag or held a policy it could not build. The read after the
+	// second stale write writes nothing, so its etag is not needed: done
+	// there is a change, not done is ErrPolicyChanged. It wraps the later
+	// failure's or the refusal's own error, ErrPermissionDenied included
+	// for a read, so it is checked first. A read of the policy says whether
+	// the write took effect.
+	ErrPolicyUnconfirmed = errors.New("datasphere: a write of the bucket's IAM policy was sent, and whether it took effect is not known")
 )
 
 // Factory builds a Provider from its configuration.

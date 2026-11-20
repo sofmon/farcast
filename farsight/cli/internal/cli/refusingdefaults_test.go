@@ -13,27 +13,31 @@ import (
 	"github.com/sofmon/farcast/planck"
 )
 
-// Nine seams refuse in the package's tests when a test leaves them unset
-// (ADR 0023 M2.6, A23-49, A25-20, and M2.7): the deployer's provider opener;
-// the image builder of the deployer commands, run and build; connect's dial
-// of the carrier; the deployer's search for a farcast checkout and its
-// question to that checkout's Go, which runs `go env` from PATH; the reader
-// a plan reads the cluster as (openReaderDefault, M2.6c), which run's plan
-// reader wraps, lazily, since M2.6d; storage deploy's mint of the bucket and
+// Ten seams refuse in the package's tests when a test leaves them unset
+// (ADR 0023 M2.6, A23-49, A25-20, M2.7 and M2.8): the provider opener of the
+// deployer, and, since M2.8, of build and run, which read the push grant
+// with it (design §33, A33-22); the image builder of the deployer commands,
+// run and build; connect's dial of the carrier; the deployer's search for a
+// farcast checkout and its question to that checkout's Go, which runs `go
+// env` from PATH; the reader a plan reads the cluster as (openReaderDefault,
+// M2.6c), which run's plan reader wraps, lazily, since M2.6d, and build's
+// since M2.8 (A33-21); storage deploy's mint of the bucket and
 // keyring (ensureStorageDefault, M2.6c); the opener of the keyholder of
 // storage key pin, storage key rotate and, since M2.6d, run, which dials the
 // tunnel (openKeyholderDefault, M2.6c), run's uses of the two adding no seam
 // (A28-11); and migrate's writer (migrateWriterDefault, M2.7), which here
 // opens the writer only for a record whose endpoint is a loopback test
 // server's, the cluster a test started, and refuses any other record before
-// it is opened. Their defaults refuse here, as defaultPinStore's does
+// it is opened; and, since M2.8, storage deploy's opener of the bucket's
+// IAM, with the installer's key (openBucketGrantsDefault, design §33,
+// A33-14). Their defaults refuse here, as defaultPinStore's does
 // (storagepin_test.go), so no test reaches a real provider, registry,
-// carrier, cluster, bucket or keyholder, runs this machine's Go, or binds
+// carrier, cluster, bucket, bucket policy or keyholder, runs this machine's Go, or binds
 // the checkout it runs in, through these by forgetting a fake; a test that
 // drives a command past one sets the seam to a fake of its own, or, through
 // the router, takes fakeDeployDefaults. Other seams keep their real
 // defaults, and some commands open a provider, storage or a tunnel directly,
-// so this guard is no wider than the nine.
+// so this guard is no wider than the ten.
 
 // errRefusingDefault is what a default seam answers in a test.
 var errRefusingDefault = errors.New("test: a seam was left at its default, which no test may reach; set it to a fake")
@@ -52,6 +56,9 @@ func init() {
 	}
 	openReaderDefault = func(clusterRef) (*cluster.Client, error) { return nil, errRefusingDefault }
 	ensureStorageDefault = func(context.Context, *Env, string) error { return errRefusingDefault }
+	openBucketGrantsDefault = func(context.Context, *Env, *config.InstanceMetadata) (bucketGrants, error) {
+		return nil, errRefusingDefault
+	}
 	openKeyholderDefault = func(context.Context, *Env, string) (sealStateClient, func(), error) {
 		return nil, nil, errRefusingDefault
 	}
@@ -84,7 +91,7 @@ func (refusingBuilder) PushEmbedded(context.Context, image.EmbeddedOptions, stri
 }
 
 // TestUnsetSeamsRefuseInTests: every command whose provider, builder, dial,
-// checkout, Go, plan reader, storage mint or keyholder seam is left unset
+// checkout, Go, plan reader, storage mint, bucket IAM or keyholder seam is left unset
 // gets the refusing default, never the real one; and migrate's writer, left
 // unset, opens no cluster but a loopback test server's.
 func TestUnsetSeamsRefuseInTests(t *testing.T) {
@@ -155,16 +162,32 @@ func TestUnsetSeamsRefuseInTests(t *testing.T) {
 	kp.ensureDefaults()
 	kr.ensureDefaults()
 	for name, open := range map[string]func(clusterRef) (pinPlanReader, error){
-		"storage deploy": sd.newPlanReader, "storage key pin": kp.newPlanReader, "storage key rotate": kr.newPlanReader,
+		"storage key pin": kp.newPlanReader, "storage key rotate": kr.newPlanReader,
 	} {
 		if rd, err := open(readerRef); !errors.Is(err, errRefusingDefault) || rd != nil {
 			t.Errorf("%s's default plan reader = %v, %v; want the refusing default", name, rd, err)
 		}
 	}
+	// storage deploy's, which since ADR 0023 M2.8 also reads the
+	// keyholder's ServiceAccount (design §33, A33-18).
+	if rd, err := sd.newPlanReader(readerRef); !errors.Is(err, errRefusingDefault) || rd != nil {
+		t.Errorf("storage deploy's default plan reader = %v, %v; want the refusing default", rd, err)
+	}
 	// run's, which wraps openReaderDefault when it is called (A28-11), and
-	// so refuses with it, returning no reader.
+	// so refuses with it, returning no reader; and build's, since ADR 0023
+	// M2.8 (design §33, A33-21), likewise.
 	if rd, err := run.newPlanReader(readerRef); !errors.Is(err, errRefusingDefault) || rd != nil {
 		t.Errorf("run's default plan reader = %v, %v; want the refusing default", rd, err)
+	}
+	if rd, err := build.newPlanReader(readerRef); !errors.Is(err, errRefusingDefault) || rd != nil {
+		t.Errorf("build's default plan reader = %v, %v; want the refusing default", rd, err)
+	}
+	// build's and run's provider opener, since ADR 0023 M2.8 (A33-22): the
+	// deployer's default.
+	for name, open := range map[string]providerOpener{"build": build.openProvider, "run": run.openProvider} {
+		if _, err := open(meta, &config.InstanceCredentials{Provider: meta.Provider, ServiceAccountKey: "{}"}); !errors.Is(err, errRefusingDefault) {
+			t.Errorf("%s's default provider opener = %v, want the refusing default", name, err)
+		}
 	}
 
 	// storage deploy's mint of the bucket and keyring, for an instance this
@@ -174,6 +197,12 @@ func TestUnsetSeamsRefuseInTests(t *testing.T) {
 	// same instance.
 	if err := sd.ensureStorage(cancelled, &Env{ConfigDir: config.Dir(empty)}, "atlas"); !errors.Is(err, errRefusingDefault) {
 		t.Errorf("storage deploy's default storage mint = %v, want the refusing default", err)
+	}
+	// storage deploy's bucket IAM (ADR 0023 M2.8, A33-14), for the same
+	// instance in a directory holding no key, so that even the real opener
+	// would refuse it before anything is opened.
+	if g, err := sd.openBucketGrants(cancelled, &Env{ConfigDir: config.Dir(empty)}, meta); !errors.Is(err, errRefusingDefault) || g != nil {
+		t.Errorf("storage deploy's default bucket IAM = %v, %v; want the refusing default", g, err)
 	}
 	for name, open := range map[string]keyholderOpener{"storage key pin": kp.newKeyholder, "storage key rotate": kr.newKeyholder, "run": run.newKeyholder} {
 		if _, _, err := open(cancelled, &Env{ConfigDir: config.Dir(empty)}, "atlas"); !errors.Is(err, errRefusingDefault) {

@@ -359,11 +359,13 @@ func renderRows() []renderRow {
 			}),
 
 		factRow("reader", plan.ReaderFact{Type: plan.TypeReader, Email: "f-email", IAMRole: "f-role", Scope: "f-scope",
-			Namespaces: []string{"f-rns1", "f-rns2"}, Resources: []string{"f-res1", "f-res2"}, ConfigMaps: []string{"f-cm"}},
+			Namespaces: []string{"f-rns1", "f-rns2"}, Resources: []string{"f-res1", "f-res2"}, ConfigMaps: []string{"f-cm"},
+			ServiceAccounts: []string{"f-sa1", "f-sa2"}},
 			map[string][]string{
 				"type": {"reader: "}, "email": {"reader: f-email (f-role)"}, "iam_role": {" (f-role), scope"},
 				"scope": {", scope f-scope: "}, "resources[]": {": f-res1, f-res2 in"}, "namespaces[]": {" in f-rns1, f-rns2;"},
-				"configmaps[]": {"; the ConfigMaps f-cm\n"},
+				"configmaps[]":       {"; the ConfigMaps f-cm; in farcast-system"},
+				"service_accounts[]": {"; in farcast-system, the ServiceAccounts f-sa1, f-sa2 (their uid)\n"},
 			}),
 
 		factRow("notice", plan.NoticeFact{Type: plan.TypeNotice, Text: "f-notice <&> line\nand its second"},
@@ -396,6 +398,59 @@ func renderRows() []renderRow {
 				"objects[].other_managers[]": {"; other managers kept: none\n"},
 				"local[]":                    {"; then delete no local file; "},
 				"irreversible":               {"; irreversible: no\n"},
+			}),
+
+		// The grant (A33-11): apply in both words, and each observation's
+		// three states.
+		factRow("grant", plan.GrantFact{Type: plan.TypeGrant, Name: plan.GrantBucket, Target: "f-gtarget",
+			ServiceAccount: "f-gsa", Principal: "f-gprincipal", Roles: []string{"f-grole1", "f-grole2"}, State: plan.GrantMissing,
+			SharedPrincipal: "f-gshared", Shared: plan.GrantPresent},
+			map[string][]string{
+				"type":             {"grant "},
+				"name":             {"grant bucket: f-gprincipal "},
+				"principal":        {": f-gprincipal (ServiceAccount"},
+				"service_account":  {"(ServiceAccount f-gsa) on"},
+				"target":           {") on f-gtarget as "},
+				"roles[]":          {" as f-grole1, f-grole2: "},
+				"state":            {"f-grole2: missing\n"},
+				"shared_principal": {"\n  the shared principal f-gshared, which every FarCast instance in the project shares: "},
+				"shared":           {"in the project shares: present\n"},
+				"apply":            {"present\n  not applied: the printed commands do it, or --grant-bucket\n"},
+			}),
+		factRow("grant, push, state present, shared missing", plan.GrantFact{Type: plan.TypeGrant, Name: plan.GrantPush,
+			Target: "f-gtarget2", ServiceAccount: "f-gsa2", Principal: "f-gprincipal2", Roles: []string{"f-grole3"},
+			State: plan.GrantPresent, SharedPrincipal: "f-gshared2", Shared: plan.GrantMissing},
+			map[string][]string{
+				"name":   {"grant push: f-gprincipal2 "},
+				"state":  {" as f-grole3: present\n"},
+				"shared": {"in the project shares: missing\n"},
+				"apply":  {"missing\n  not applied: this command never grants push access; the printed commands do it\n"},
+			}),
+		factRow("grant, applied, unread", plan.GrantFact{Type: plan.TypeGrant, Name: plan.GrantBucket, Target: "f-gtarget3",
+			ServiceAccount: "f-gsa3", Principal: "f-gprincipal3", Roles: []string{}, State: plan.GrantUnknown,
+			SharedPrincipal: "f-gshared3", Shared: plan.GrantUnknown, Apply: true},
+			map[string][]string{
+				"roles[]": {" on f-gtarget3 as none: unknown\n"},
+				"state":   {" as none: unknown\n"},
+				"shared":  {"in the project shares: unknown\n"},
+				"apply":   {"unknown\n  applied: one policy write adds the uid principal to both roles and removes the shared one from them\n"},
+			}),
+		factRow("grant, for an account this command creates", plan.GrantFact{Type: plan.TypeGrant, Name: plan.GrantBucket,
+			Target: "f-gtarget4", ServiceAccount: "f-gsa4", Roles: []string{"f-grole4"}, State: plan.GrantMissing, Shared: plan.GrantMissing,
+			Principal: "principal://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/proj-atlas.svc.id.goog/" +
+				"kubernetes.serviceaccount.uid/" + saUIDPlaceholder("f-gns", "f-gname"),
+			SharedPrincipal: "principal://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/proj-atlas.svc.id.goog/" +
+				"subject/ns/f-gns/sa/f-gname"},
+			map[string][]string{
+				"principal": {"grant bucket: the uid of ServiceAccount f-gns/f-gname, once this command creates it (ServiceAccount f-gsa4) on"},
+				"shared_principal": {"the shared principal principal://iam.googleapis.com/projects/123456789012/locations/global/" +
+					"workloadIdentityPools/proj-atlas.svc.id.goog/subject/ns/f-gns/sa/f-gname, which every"},
+			}),
+		factRow("grant, with no project number", plan.GrantFact{Type: plan.TypeGrant, Name: plan.GrantPush, Target: "f-gtarget5",
+			ServiceAccount: "f-gsa5", Roles: []string{"f-grole5"}, State: plan.GrantUnknown, Shared: plan.GrantUnknown},
+			map[string][]string{
+				"principal":        {"grant push: not known (the provider states no project number) (ServiceAccount f-gsa5)"},
+				"shared_principal": {"the shared principal not known (the provider states no project number), which every"},
 			}),
 	}
 }
@@ -498,8 +553,8 @@ func TestEveryBoundFactIsRendered(t *testing.T) {
 		planTypes[typ.Name()] = typ
 	}
 	names := factTypeNames(t)
-	if len(names) != 18 {
-		t.Errorf("the plan package has %d fact types, %v; ADR 0023 M2.7 has 18", len(names), names)
+	if len(names) != 19 {
+		t.Errorf("the plan package has %d fact types, %v; ADR 0023 M2.8 has 19", len(names), names)
 	}
 	for _, n := range names {
 		if _, ok := planTypes[n]; !ok {
@@ -573,6 +628,11 @@ func TestEveryBoundFactIsRendered(t *testing.T) {
 					for _, want := range renderedValues(reflect.ValueOf(f), "") {
 						if label, ok := labels[want]; ok {
 							want = label
+						}
+						// A principal that carries the uid placeholder renders
+						// as the account it stands for (design §33, A33-19).
+						if _, _, ok := placeholderServiceAccount(want); ok {
+							want = principalText(want)
 						}
 						if !strings.Contains(text, want) {
 							t.Errorf("fact %d (%s) binds %q, which its rendering does not show:\n%s", i, f.FactType(), want, text)

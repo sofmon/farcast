@@ -165,7 +165,10 @@ type iamCondition struct {
 	Location    string
 }
 
-var _ planck.RegistryProvider = (*provider)(nil)
+var (
+	_ planck.RegistryProvider = (*provider)(nil)
+	_ planck.GrantReader      = (*provider)(nil)
+)
 
 // registryClient lazily builds the GCP-backed registryAPI. Construction
 // resolves credentials, so — as with the cluster client — it is deferred out of
@@ -291,6 +294,66 @@ func (p *provider) RegistryToken(ctx context.Context) (planck.RegistryToken, err
 	return tok, nil
 }
 
+// ProjectNumber is the configured project's number (planck.GrantReader),
+// which the principals of the cluster's workload identities are named by. It
+// is the number grantPull builds the node account's email from, read again
+// on every call.
+func (p *provider) ProjectNumber(ctx context.Context) (int64, error) {
+	api, err := p.registryClient()
+	if err != nil {
+		return 0, err
+	}
+	num, err := api.projectNumber(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("gke: look up the number of project %q: %w", p.cfg.Project, err)
+	}
+	return num, nil
+}
+
+// RegistryGrant reads the instance repository's IAM policy, once, and says
+// whether role is granted to member and to shared (planck.GrantReader). It
+// resolves ref as DeleteRegistry does, so it reads the repository a printed
+// grant names. It never writes: the builder's push grant is a human's to
+// apply.
+//
+// A 403 is a policy this credential may not read, so both states are
+// unknown and the plan says so; a 404 is a repository that is not there,
+// and an error naming it.
+func (p *provider) RegistryGrant(ctx context.Context, ref planck.RegistryRef, role, member, shared string) (state, sharedState planck.GrantState, err error) {
+	if ref.Name == "" {
+		return "", "", fmt.Errorf("gke: registry name is required")
+	}
+	if role == "" || member == "" || shared == "" {
+		return "", "", fmt.Errorf("gke: a grant read needs a role, a member and the shared principal")
+	}
+	resolved := planck.RegistryRef{Name: repositoryName(ref.Name), Location: ref.Location}
+	if resolved.Location == "" {
+		resolved.Location = p.defaultLocation
+	}
+	api, err := p.registryClient()
+	if err != nil {
+		return "", "", err
+	}
+	pol, err := api.getPolicy(ctx, resolved)
+	switch {
+	case isHTTPStatus(err, http.StatusForbidden):
+		return planck.GrantUnknown, planck.GrantUnknown, nil
+	case isHTTPStatus(err, http.StatusNotFound):
+		return "", "", fmt.Errorf("gke: the repository %q in %s does not exist: %w", resolved.Name, resolved.Location, err)
+	case err != nil:
+		return "", "", fmt.Errorf("gke: read the IAM policy of repository %q: %w", resolved.Name, err)
+	}
+	return grantState(holds(pol, role, member)), grantState(holds(pol, role, shared)), nil
+}
+
+// grantState is a holds observation as a planck.GrantState.
+func grantState(held bool) planck.GrantState {
+	if held {
+		return planck.GrantPresent
+	}
+	return planck.GrantMissing
+}
+
 // planEnsureRegistry resolves a RegistrySpec into a defaults-filled
 // repositoryInput. spec.Cluster is not read here: today's node identity is the
 // project's default compute account, which the project number alone determines
@@ -369,19 +432,32 @@ func (p *provider) waitOperation(ctx context.Context, api registryAPI, op string
 	}
 }
 
+// holds reports whether a binding of role with no condition holds member
+// exactly. It is the one rule for "granted" that grantRole and RegistryGrant
+// share: a conditional grant is not a guarantee of access, so it never
+// counts.
+func holds(pol iamPolicy, role, member string) bool {
+	for _, b := range pol.Bindings {
+		if b.Role == role && b.Condition == nil && slices.Contains(b.Members, member) {
+			return true
+		}
+	}
+	return false
+}
+
 // grantRole adds member to role in pol without disturbing anything else, and
 // reports whether the policy actually changed. It only ever extends the
 // *unconditional* binding for the role: a conditional grant is not a guarantee
 // of access, so one must not be mistaken for the binding we need.
 func grantRole(pol iamPolicy, role, member string) (iamPolicy, bool) {
+	if holds(pol, role, member) {
+		return pol, false
+	}
 	next := pol
 	next.Bindings = slices.Clone(pol.Bindings)
 	for i, b := range next.Bindings {
 		if b.Role != role || b.Condition != nil {
 			continue
-		}
-		if slices.Contains(b.Members, member) {
-			return pol, false
 		}
 		b.Members = append(slices.Clone(b.Members), member)
 		next.Bindings[i] = b

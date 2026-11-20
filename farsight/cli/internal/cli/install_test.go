@@ -23,7 +23,8 @@ import (
 )
 
 // fakeProvider is a programmable planck.Provider — and planck.RegistryProvider
-// — for exercising install/connect/release without a cloud.
+// and planck.GrantReader — for exercising install/connect/release without a
+// cloud.
 type fakeProvider struct {
 	validateErr error
 	created     *planck.ClusterSpec
@@ -42,6 +43,51 @@ type fakeProvider struct {
 	regDeleteErr error
 	token        planck.RegistryToken
 	tokenErr     error
+
+	// The grant reader (design §33, A33-12): the project number (0 is
+	// design §33's fixture), each principal's state by member (missing when
+	// absent), injectable errors, and every call in order: "ProjectNumber",
+	// or "RegistryGrant", whose arguments are in grantReads.
+	projectNumber    int64
+	projectNumberErr error
+	grantStates      map[string]planck.GrantState
+	registryGrantErr error
+	grantCalls       []string
+	grantReads       []grantRead
+}
+
+// grantRead is one RegistryGrant call's arguments.
+type grantRead struct {
+	Ref                  planck.RegistryRef
+	Role, Member, Shared string
+}
+
+var _ planck.GrantReader = (*fakeProvider)(nil)
+
+func (f *fakeProvider) ProjectNumber(context.Context) (int64, error) {
+	f.grantCalls = append(f.grantCalls, "ProjectNumber")
+	if f.projectNumberErr != nil {
+		return 0, f.projectNumberErr
+	}
+	if f.projectNumber == 0 {
+		return 123456789012, nil
+	}
+	return f.projectNumber, nil
+}
+
+func (f *fakeProvider) RegistryGrant(_ context.Context, ref planck.RegistryRef, role, member, shared string) (planck.GrantState, planck.GrantState, error) {
+	f.grantCalls = append(f.grantCalls, "RegistryGrant")
+	f.grantReads = append(f.grantReads, grantRead{Ref: ref, Role: role, Member: member, Shared: shared})
+	if f.registryGrantErr != nil {
+		return "", "", f.registryGrantErr
+	}
+	state := func(m string) planck.GrantState {
+		if s, ok := f.grantStates[m]; ok {
+			return s
+		}
+		return planck.GrantMissing
+	}
+	return state(member), state(shared), nil
 }
 
 func (*fakeProvider) Name() string                     { return "fake" }

@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/sofmon/farcast/datasphere"
@@ -181,6 +182,109 @@ type KeySpace struct {
 	Prefix string
 	Scope  string
 	Store  *datasphere.Store
+}
+
+// ErrNoBucketGrants is OpenBucketGrants' refusal of a storage provider that
+// does not implement datasphere.BucketGrants.
+var ErrNoBucketGrants = errors.New("storage: the instance's storage provider cannot read or change a bucket's IAM")
+
+// ErrBucketUnproven is matched by State's and Ensure's refusal of a bucket
+// whose ownership labels did not prove it the instance's (or could not be
+// read): nothing of its policy was read or written. It adds nothing to the
+// refusal's text.
+var ErrBucketUnproven = errors.New("storage: the bucket's ownership labels did not prove it the instance's")
+
+// unprovenError is that refusal: Validate's error, under its sentence.
+type unprovenError struct {
+	instance string
+	err      error
+}
+
+func (e *unprovenError) Error() string {
+	return fmt.Sprintf("the recorded storage bucket for %q did not validate: %v", e.instance, e.err)
+}
+
+func (e *unprovenError) Unwrap() []error { return []error{e.err, ErrBucketUnproven} }
+
+// Grants is an instance's bucket IAM (ADR 0023 M2.8, design §33, A33-14): the
+// read a plan states the keyholder's grant from, and the write that applies
+// it. It holds the storage provider alone, opened with the installer's key:
+// no keyring, no Store, nothing minted.
+type Grants struct {
+	provider datasphere.Provider
+	grants   datasphere.BucketGrants
+	instance string
+	location string
+}
+
+// OpenBucketGrants opens meta's storage provider with serviceAccountKey for
+// its bucket IAM. A blank key is refused, so the adapter's fallback to
+// Application Default Credentials is never reached, and a provider without
+// datasphere.BucketGrants is ErrNoBucketGrants. It reads nothing and sends
+// nothing: the adapter resolves its credential on its first call.
+func OpenBucketGrants(meta *config.InstanceMetadata, serviceAccountKey string) (*Grants, error) {
+	if meta == nil {
+		return nil, errors.New("storage: OpenBucketGrants needs the instance's record")
+	}
+	if strings.TrimSpace(serviceAccountKey) == "" {
+		return nil, fmt.Errorf("storage: instance %q's bucket IAM needs the installer's service-account key, and none was given; "+
+			"farcast never reads or changes it as Application Default Credentials", meta.Name)
+	}
+	providerName, err := ProviderFor(meta)
+	if err != nil {
+		return nil, err
+	}
+	provider, err := datasphere.Open(providerName, datasphere.Config{
+		Credentials: []byte(serviceAccountKey),
+		Project:     meta.Project,
+		Location:    meta.Region,
+	})
+	if err != nil {
+		return nil, err
+	}
+	grants, ok := provider.(datasphere.BucketGrants)
+	if !ok {
+		return nil, ErrNoBucketGrants
+	}
+	location := meta.Region
+	if meta.Storage != nil && meta.Storage.Location != "" {
+		location = meta.Storage.Location
+	}
+	return &Grants{provider: provider, grants: grants, instance: meta.Name, location: location}, nil
+}
+
+// validate proves bucket is this instance's, by its ownership labels, before
+// its policy is read or written: the installer's role on the project's
+// farcast-* buckets would otherwise reach another instance's.
+func (g *Grants) validate(ctx context.Context, bucket string) error {
+	if bucket == "" {
+		// Validate reads no bucket for an empty name, so it would prove
+		// nothing.
+		return fmt.Errorf("storage: instance %q's bucket IAM needs the bucket's name", g.instance)
+	}
+	ref := datasphere.BucketRef{Name: bucket, Location: g.location, Instance: g.instance}
+	if err := g.provider.Validate(ctx, ref); err != nil {
+		return &unprovenError{instance: g.instance, err: err}
+	}
+	return nil
+}
+
+// State proves bucket is the instance's, then reads its policy once
+// (datasphere.BucketGrants.GrantState).
+func (g *Grants) State(ctx context.Context, bucket string, roles []string, member, shared string) (state, sharedState datasphere.GrantState, sharedRoles []string, err error) {
+	if err := g.validate(ctx, bucket); err != nil {
+		return "", "", nil, err
+	}
+	return g.grants.GrantState(ctx, bucket, roles, member, shared)
+}
+
+// Ensure proves bucket is the instance's, then grants member the roles and
+// removes shared from them (datasphere.BucketGrants.EnsureGrant).
+func (g *Grants) Ensure(ctx context.Context, bucket string, roles []string, member, shared string) (bool, error) {
+	if err := g.validate(ctx, bucket); err != nil {
+		return false, err
+	}
+	return g.grants.EnsureGrant(ctx, bucket, roles, member, shared)
 }
 
 // ProviderFor picks the storage provider for an instance, preferring what

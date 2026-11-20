@@ -2181,7 +2181,7 @@ func TestConfirmCoversTheReplacementItsPlanListed(t *testing.T) {
 			}
 			meta := r.meta(t)
 			want := carriedRegistryRef(meta, sc.component)
-			if len(r.fb.embedded) != 1 || len(r.fc.applied) != 1 || meta.SystemImages[sc.component].Image != want ||
+			if len(r.fb.embedded) != 1 || len(beyondTheAccount(t, r.fc.applied)) != 1 || meta.SystemImages[sc.component].Image != want ||
 				!strings.Contains(string(slices.Concat(r.fc.applied...)), "image: "+want) {
 				t.Errorf("pushed %d, applied %d, recorded %+v; want the carried image %s pushed, applied and recorded",
 					len(r.fb.embedded), len(r.fc.applied), meta.SystemImages[sc.component], want)

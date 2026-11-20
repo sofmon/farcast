@@ -42,7 +42,10 @@ import (
 	"testing"
 	"time"
 
+	dsdeploy "github.com/sofmon/farcast/datasphere/deploy"
 	"github.com/sofmon/farcast/farsight/cli/internal/kube"
+	pbuild "github.com/sofmon/farcast/planck/build"
+	tcdeploy "github.com/sofmon/farcast/technocore/deploy"
 )
 
 // The suite's environment (the runbook's R6).
@@ -166,6 +169,12 @@ func (s *realAPISender) scrub(msg string) string {
 // bearer, and returns the status and at most 64 MiB of the body. An error is
 // the request not answered, scrubbed.
 func (s *realAPISender) send(ctx context.Context, method, path string, q url.Values, contentType string, body []byte) (int, []byte, error) {
+	return s.sendWith(ctx, method, path, q, contentType, body, nil)
+}
+
+// sendWith is send with header's fields set on the request too, after the
+// sender's own: an Accept, or an Impersonate-User.
+func (s *realAPISender) sendWith(ctx context.Context, method, path string, q url.Values, contentType string, body []byte, header http.Header) (int, []byte, error) {
 	target := s.ep.BaseURL() + path
 	if e := q.Encode(); e != "" {
 		target += "?" + e
@@ -183,6 +192,9 @@ func (s *realAPISender) send(ctx context.Context, method, path string, q url.Val
 		req.Header.Set("Content-Type", contentType)
 	}
 	req.Header.Set("Authorization", "Bearer "+s.token)
+	for k, v := range header {
+		req.Header[k] = v
+	}
 	resp, err := s.hc.Do(req)
 	if err != nil {
 		var ue *url.Error
@@ -430,5 +442,82 @@ func TestEveryRenderedStreamAppliesOnARealServer(t *testing.T) {
 			}
 			t.Logf("fact: %s: %d of %d documents applied twice; the second apply moved the resourceVersion of: %s", sp.name, twice, len(sp.docs), strings.Join(moved, ", "))
 		})
+	}
+}
+
+// TestReaderReadsTheNamedServiceAccounts (design §33, A33-16, R2; written,
+// not run): on a real API server, the reader 'reader grant' renders may
+// read the metadata of the keyholder's and the builder's ServiceAccounts in
+// farcast-system, and nothing else of serviceaccounts: not another account
+// there, not a list, and not the same names in a metered namespace. The
+// suite's bearer is a system:masters user, which applies renderReaderRBAC's
+// stream for farcast-system and web, and the accounts; the reader's reads are
+// that user's, impersonating the reader's email (Impersonate-User), which
+// the server authorizes by the reader's RBAC alone. Each read asks for the
+// metadata as the plans' GetMeta does. The server's RBAC may answer a
+// binding just applied a moment late, so an allowed read is tried for up to
+// 10 s. What it records: each read's code, never a uid or a message.
+func TestReaderReadsTheNamedServiceAccounts(t *testing.T) {
+	s := openRealAPISender(t)
+	ctx := t.Context()
+	email := readerName("realapi") + "@realapi.invalid"
+	const metered = "web"
+	apply := func(stream []byte) {
+		t.Helper()
+		docs, err := kube.SplitStream(stream)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, d := range docs {
+			if _, err := s.apply(ctx, d); err != nil {
+				t.Fatalf("the apply of %s: %v", docIdentity(d), err)
+			}
+		}
+	}
+	for _, ns := range []string{tcdeploy.DefaultNamespace, metered} {
+		apply(fmt.Appendf(nil, "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: %s\n  labels:\n    app.kubernetes.io/managed-by: farcast\n", ns))
+		for _, name := range []string{dsdeploy.DefaultName, pbuild.ServiceAccount, "farcast-fetcher"} {
+			apply(fmt.Appendf(nil, "apiVersion: v1\nkind: ServiceAccount\nmetadata:\n  name: %s\n  namespace: %s\n  labels:\n    app.kubernetes.io/managed-by: farcast\n", name, ns))
+		}
+	}
+	rbac, err := renderReaderRBAC(email, []string{tcdeploy.DefaultNamespace, metered})
+	if err != nil {
+		t.Fatal(err)
+	}
+	apply(rbac)
+
+	asReader := http.Header{"Impersonate-User": {email}, "Accept": {"application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1"}}
+	k, _ := kube.KindOf("v1", "ServiceAccount")
+	read := func(path string, want int) {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			code, body, err := s.sendWith(ctx, http.MethodGet, path, nil, "", nil, asReader)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if code == want || want != http.StatusOK || time.Now().After(deadline) {
+				t.Logf("fact: the reader's GET of %s: %d", strings.TrimPrefix(path, "/api/v1/namespaces/"), code)
+				if code != want {
+					t.Errorf("the reader's GET of %s: %v; want %d", path, realAPIRefusal(code, body), want)
+				}
+				if code == http.StatusOK {
+					var o kube.Object
+					if json.Unmarshal(body, &o) != nil || !serviceAccountUIDShape.MatchString(o.Metadata.UID) {
+						t.Errorf("the reader's GET of %s answered no uid the API server issues", path)
+					}
+				}
+				return
+			}
+			time.Sleep(time.Second)
+		}
+	}
+	for _, name := range readerServiceAccounts {
+		read(k.Path(tcdeploy.DefaultNamespace, name), http.StatusOK)
+	}
+	read(k.Path(tcdeploy.DefaultNamespace, "farcast-fetcher"), http.StatusForbidden)
+	read(k.ListPath(tcdeploy.DefaultNamespace), http.StatusForbidden)
+	for _, name := range readerServiceAccounts {
+		read(k.Path(metered, name), http.StatusForbidden)
 	}
 }

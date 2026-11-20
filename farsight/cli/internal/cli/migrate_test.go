@@ -2115,6 +2115,10 @@ func firstTraceable(t *testing.T, b plan.Bound) (int, plan.WriteFact) {
 // another manager's, as the API server does (A30-28), so farcast's apply of
 // w is answered with a trace. It returns the object's name as Traces names
 // it.
+//
+// A ServiceAccount the fixture holds at a fixture uid keeps it: an object
+// re-seeded without its uid would be another object, whose new uid the
+// grant a plan bound would not name (design §33, A33-19).
 func seedTrace(s *kubetest.Server, w plan.WriteFact) string {
 	md := map[string]any{"name": w.Name, "managedFields": []any{map[string]any{
 		"manager": "kubectl-client-side-apply", "operation": "Update", "apiVersion": w.API,
@@ -2124,6 +2128,9 @@ func seedTrace(s *kubetest.Server, w plan.WriteFact) string {
 	if w.Namespace != "" {
 		md["namespace"] = w.Namespace
 		name = w.Kind + " " + w.Namespace + "/" + w.Name
+	}
+	if uid, ok := fixtureAccounts()[w.Name]; ok && w.Kind == "ServiceAccount" && w.Namespace == tcdeploy.DefaultNamespace {
+		md["uid"] = uid
 	}
 	s.Put(map[string]any{"apiVersion": w.API, "kind": w.Kind, "metadata": md})
 	return name

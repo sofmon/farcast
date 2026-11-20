@@ -28,6 +28,7 @@ import (
 	"github.com/sofmon/farcast/farsight/cli/internal/components"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/image"
+	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 	"github.com/sofmon/farcast/farsight/cli/internal/kube/kubetest"
 	"github.com/sofmon/farcast/farsight/cli/internal/oci"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
@@ -36,6 +37,7 @@ import (
 	"github.com/sofmon/farcast/fatline/identity"
 	"github.com/sofmon/farcast/fatline/tunnel"
 	"github.com/sofmon/farcast/planck"
+	tcdeploy "github.com/sofmon/farcast/technocore/deploy"
 )
 
 type fakeCluster struct {
@@ -60,6 +62,21 @@ type fakeCluster struct {
 	uidReads int
 	uid      string
 	uidErr   error
+
+	// accounts are the ServiceAccounts its farcast-system holds, by name,
+	// at their uids (accountMeta), none when nil (design §33, A33-18).
+	accounts map[string]string
+	// log, when set, has "apply <Kind/name …>" appended for each apply and
+	// "get <Kind>/<name>" for each GetMeta, for a test that orders them
+	// against other fakes' calls.
+	log *[]string
+}
+
+func (f *fakeCluster) GetMeta(_ context.Context, k kube.Kind, namespace, name string) (kube.Object, error) {
+	if f.log != nil {
+		*f.log = append(*f.log, "get "+k.Kind+"/"+name)
+	}
+	return accountMeta(f.accounts, k, namespace, name)
 }
 
 func (f *fakeCluster) NamespaceUID(context.Context, string) (string, error) {
@@ -73,11 +90,53 @@ func (f *fakeCluster) NamespaceUID(context.Context, string) (string, error) {
 func (f *fakeCluster) Apply(_ context.Context, m []byte) error {
 	checkApplied(m)
 	f.applied = append(f.applied, m)
+	f.createAccounts(m)
+	if f.log != nil {
+		var kinds []string
+		if docs, err := kube.SplitStream(m); err == nil {
+			for _, d := range docs {
+				kinds = append(kinds, d.Kind.Kind+"/"+d.Name)
+			}
+		}
+		*f.log = append(*f.log, "apply "+strings.Join(kinds, " "))
+	}
 	if f.onApply != nil {
 		f.onApply()
 	}
 	return f.applyErr
 }
+
+// createAccounts creates each ServiceAccount in farcast-system that m
+// applies and the cluster lacks, as the API server does on the first
+// apply of one (design §33, A33-26): at its fixture uid (fixtureAccounts),
+// or appliedAccountUID for any other name. An account it holds keeps its
+// uid.
+func (f *fakeCluster) createAccounts(m []byte) {
+	docs, err := kube.SplitStream(m)
+	if err != nil {
+		return
+	}
+	for _, d := range docs {
+		if d.Kind.Kind != "ServiceAccount" || d.Namespace != tcdeploy.DefaultNamespace {
+			continue
+		}
+		if f.accounts == nil {
+			f.accounts = map[string]string{}
+		}
+		if _, ok := f.accounts[d.Name]; ok {
+			continue
+		}
+		uid, ok := fixtureAccounts()[d.Name]
+		if !ok {
+			uid = appliedAccountUID
+		}
+		f.accounts[d.Name] = uid
+	}
+}
+
+// appliedAccountUID is the uid fakeCluster gives a ServiceAccount it creates
+// that the fixtures name no uid for.
+const appliedAccountUID = "00000000-0000-4000-8000-0000000000ff"
 
 func (f *fakeCluster) RolloutStatus(_ context.Context, _, _ string, _ time.Duration) error {
 	f.rollouts++
@@ -122,6 +181,8 @@ type fakeBuilder struct {
 	embedded  []image.EmbeddedOptions // PushEmbedded calls, in order
 	pushedRef string                  // PushEmbedded's answer; the Ref's repository @ opts.Manifest when empty
 	pushErr   error
+	// log, when set, has "push <ref>" appended for each PushEmbedded.
+	log *[]string
 
 	user, pass string // credentials the most recent call received
 }
@@ -167,6 +228,9 @@ func (f *fakeBuilder) BuildAndPush(_ context.Context, opts image.Options, user, 
 
 func (f *fakeBuilder) PushEmbedded(_ context.Context, opts image.EmbeddedOptions, user, pass string) (image.Pushed, error) {
 	f.embedded = append(f.embedded, opts)
+	if f.log != nil {
+		*f.log = append(*f.log, "push "+opts.Ref)
+	}
 	f.user, f.pass = user, pass
 	if f.pushErr != nil {
 		return image.Pushed{}, f.pushErr

@@ -48,11 +48,13 @@ func readerBackoffAt(attempt int) time.Duration {
 	return readerSteadyBackoff
 }
 
-// The texts design §7.2 pins for 'reader grant'.
+// The texts design §7.2 pins for 'reader grant', the prompt as §33 (A33-16)
+// amends it: its last %s is readerServiceAccounts.
 const (
 	msgReaderGrantPrompt = "Grant %s, which the Cloud Shell script gave " + readerIAMRole + ", read access in %q's cluster: " +
 		"namespaces (list); in farcast-system and every namespace the kernel meters, now and later (today %s): " +
-		"deployments, statefulsets, jobs, pods and their logs, and the ConfigMaps %s?"
+		"deployments, statefulsets, jobs, pods and their logs, and the ConfigMaps %s; " +
+		"in farcast-system alone, the ServiceAccounts %s (their uid, which a grant names)?"
 	// msgReaderGrantYes names the instance, or <instance> for a name that
 	// is not one (A23-41).
 	msgReaderGrantYes      = "reader grant cannot be run with --yes: it gives a Google identity read access to the cluster; confirm it in a terminal, or review 'farcast reader grant %s --plan' and pass --confirm <digest>"
@@ -141,7 +143,9 @@ It applies the reader's Kubernetes RBAC:
   - in farcast-system and in every namespace the kernel meters:
     deployments and statefulsets (get, list), pods (list), their logs (get),
     jobs (get), and the ConfigMaps technocore-namespaces, technocore-ledger,
-    technocore-profiles, fatline-egress-policy and datasphered-pin (get).
+    technocore-profiles, fatline-egress-policy and datasphered-pin (get);
+  - in farcast-system alone, the ServiceAccounts datasphered and
+    farcast-builder (get), whose uid a grant names.
 It binds the reader only in farcast-system and the namespaces the kernel
 meters, so never in a kube- namespace such as kube-system, which 'kernel
 meter' refuses to meter. GKE's other managed namespaces, such as
@@ -308,7 +312,8 @@ func (c *readerGrantCommand) Run(ctx context.Context, env *Env, args []string) e
 	// --confirm is the consent: the operator read the plan this one is.
 	if mode == consentNone {
 		ok, err := newPrompter(env.In, env.Err).yesNo(fmt.Sprintf(msgReaderGrantPrompt,
-			p.email, name, strings.Join(p.bound, ", "), strings.Join(readerConfigMaps, ", ")))
+			p.email, name, strings.Join(p.bound, ", "), strings.Join(readerConfigMaps, ", "),
+			strings.Join(readerServiceAccounts, ", ")))
 		if err != nil {
 			return err
 		}
@@ -368,9 +373,11 @@ type preparedReaderGrant struct {
 // plan is reader grant's plan (design §9.4, A23-41): it reads the record
 // alone, never the cluster or the terminal. Its facts are the reader fact,
 // then a write for each document of the RBAC: the cluster-wide namespaces
-// grant and its binding, the rule set, and one binding per bound
-// namespace. A reader that is not recorded, not uploaded, or not the one
-// farcast derives blocks it, with no fact (A23-18).
+// grant and its binding, the rule set, the ServiceAccounts' Role and its
+// RoleBinding in farcast-system (A33-16), and one binding per bound
+// namespace, 5 writes and 1 more per namespace. A reader that is not
+// recorded, not uploaded, or not the one farcast derives blocks it, with no
+// fact (A23-18).
 func (c *readerGrantCommand) plan(_ context.Context, env *Env, meta *config.InstanceMetadata) (preparedReaderGrant, plan.Bound, error) {
 	b := newBound("reader grant", meta, "none", "")
 	var p preparedReaderGrant
@@ -403,6 +410,7 @@ func (c *readerGrantCommand) plan(_ context.Context, env *Env, meta *config.Inst
 	reader := plan.ReaderFact{
 		Type: plan.TypeReader, Email: email, IAMRole: readerIAMRole, Scope: readerScopeMetered,
 		Namespaces: slices.Clone(p.bound), Resources: slices.Clone(readerResources), ConfigMaps: slices.Clone(readerConfigMaps),
+		ServiceAccounts: slices.Clone(readerServiceAccounts),
 	}
 	b.Facts = append([]plan.Fact{reader}, writes...)
 	return p, b, nil

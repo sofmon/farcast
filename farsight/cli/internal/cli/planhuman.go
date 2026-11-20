@@ -174,13 +174,15 @@ func factLines(f plan.Fact, keys map[string]string, minted string) []string {
 	case plan.ApplicationResetFact:
 		return resetLines(f)
 	case plan.ReaderFact:
-		return []string{fmt.Sprintf("reader: %s (%s), scope %s: %s in %s; the ConfigMaps %s",
+		return []string{fmt.Sprintf("reader: %s (%s), scope %s: %s in %s; the ConfigMaps %s; in farcast-system, the ServiceAccounts %s (their uid)",
 			terminalText(f.Email), terminalText(f.IAMRole), terminalText(f.Scope), listText(f.Resources),
-			listText(f.Namespaces), listText(f.ConfigMaps))}
+			listText(f.Namespaces), listText(f.ConfigMaps), listText(f.ServiceAccounts))}
 	case plan.NoticeFact:
 		return noticeLines(f)
 	case plan.MigrateFact:
 		return migrateLines(f)
+	case plan.GrantFact:
+		return grantLines(f)
 	}
 	return fallbackLines(f)
 }
@@ -490,6 +492,42 @@ func migrateLines(f plan.MigrateFact) []string {
 		lines = append(lines, "  "+migrateIrreversible)
 	}
 	return lines
+}
+
+// grantLines is a grant fact (ADR 0023 M2.8, A33-11): the uid principal, the
+// ServiceAccount it is, the target and the roles, and the principal's state;
+// then the principal every instance in the project shares, and its state;
+// then whether this command applies the grant.
+func grantLines(f plan.GrantFact) []string {
+	lines := []string{
+		fmt.Sprintf("grant %s: %s (ServiceAccount %s) on %s as %s: %s",
+			terminalText(f.Name), principalText(f.Principal), terminalText(f.ServiceAccount), terminalText(f.Target),
+			listText(f.Roles), terminalText(f.State)),
+		fmt.Sprintf("  the shared principal %s, which every FarCast instance in the project shares: %s",
+			principalText(f.SharedPrincipal), terminalText(f.Shared)),
+	}
+	switch {
+	case f.Apply:
+		return append(lines, "  applied: one policy write adds the uid principal to both roles and removes the shared one from them")
+	case f.Name == plan.GrantBucket:
+		return append(lines, "  not applied: the printed commands do it, or --grant-bucket")
+	case f.Name == plan.GrantPush:
+		return append(lines, "  not applied: this command never grants push access; the printed commands do it")
+	}
+	return append(lines, "  not applied")
+}
+
+// principalText is a grant's principal as its rendering names it: one that
+// carries the uid placeholder is the account this command creates (A33-19),
+// and "" is one no project number was known for.
+func principalText(principal string) string {
+	if principal == "" {
+		return "not known (the provider states no project number)"
+	}
+	if namespace, name, ok := placeholderServiceAccount(principal); ok {
+		return "the uid of ServiceAccount " + terminalText(namespace) + "/" + terminalText(name) + ", once this command creates it"
+	}
+	return terminalText(principal)
 }
 
 // noticeLines is a notice in the command's own words. A notice of several

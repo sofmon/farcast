@@ -16,6 +16,8 @@ import (
 // capability the way Planck's registry does: Planck's registry is optional
 // because a compute cloud without image hosting is still a complete compute
 // provider, whereas no object-storage provider is complete without a bucket.
+// A bucket's IAM, by contrast, is optional (BucketGrants): an adapter may
+// lack it, and a caller then prints the grant for a human to apply.
 //
 // The concurrency contract, stated here so a second adapter has something to
 // conform to rather than inheriting one cloud's accidents:
@@ -172,4 +174,73 @@ func (c Config) String() string {
 	}
 	return fmt.Sprintf("Config{Project:%s Location:%s Credentials:%s Extra:%v}",
 		c.Project, c.Location, cred, c.Extra)
+}
+
+// GrantState is what a read of a bucket's IAM policy says about one
+// principal's grant (ADR 0023 M2.8, design §33, A33-13).
+type GrantState string
+
+// The grant states. GrantUnknown is a policy the credential may not read.
+const (
+	GrantPresent GrantState = "present"
+	GrantMissing GrantState = "missing"
+	GrantUnknown GrantState = "unknown"
+)
+
+// BucketGrants is an optional capability: unlike bucket lifecycle, an
+// adapter may lack it. It reads and changes the IAM policy of one bucket, for
+// the grant the keyholder's own cloud identity needs.
+//
+// A grant is held when, for each role, a binding with no condition holds the
+// member exactly. A binding with a condition never counts and is never
+// rewritten. member is the principal the grant names; shared is the
+// principal it replaces, which every instance in the project shares.
+//
+// Neither method proves the bucket is the instance's: the caller validates
+// its ownership labels first (Provider.Validate).
+type BucketGrants interface {
+	// GrantState reads the policy once. state is member's: GrantPresent when
+	// every role holds it. sharedRoles are the roles, in roles' order, whose
+	// binding with no condition holds shared, and sharedState is
+	// GrantPresent exactly when there is one. A policy the credential may not
+	// read is GrantUnknown for both, with no error.
+	GrantState(ctx context.Context, bucket string, roles []string, member, shared string) (state, sharedState GrantState, sharedRoles []string, err error)
+
+	// EnsureGrant makes every role hold member, and no role's binding with
+	// no condition hold shared, in at most two policy writes, each carrying
+	// the etag of the read it was built from. After a second write refused
+	// as stale it reads once more and writes nothing. It reports changed
+	// when it sent a write and the policy holds the grant: a write refused
+	// as stale may be its own, landed with its answer lost, so a grant a
+	// read after one finds done is reported as a change too; a grant found
+	// done before any write is not.
+	//
+	// Its errors:
+	//   - ErrPolicyUnconfirmed, when a write may have landed unseen: a write
+	//     no answer settles (cancelled in flight, a transport failure,
+	//     retries of a 429 or a 5xx given up, a response over the cap), a
+	//     refusal other than a 409 or a 412 of a write one of whose earlier
+	//     attempts failed in transport, failed reading its body, or got a
+	//     5xx, or, after any write was sent, a read that failed, or a read
+	//     it would write from that came without an etag or held a policy it
+	//     could not build. A failed read's own error stays wrapped too,
+	//     ErrPermissionDenied included, so a caller checks
+	//     ErrPolicyUnconfirmed first. The read after the second stale write
+	//     writes nothing, so its etag is not needed: done there is a change,
+	//     not done is ErrPolicyChanged;
+	//   - ErrPermissionDenied, for the credential's refusal of a read, or
+	//     of a write none of whose earlier attempts failed in transport,
+	//     failed reading its body, or got a 5xx;
+	//   - ErrPolicyChanged, when both writes were refused as stale and the
+	//     read after them finds the grant not done;
+	//   - ErrPolicyRejected, for any other refusal of such a write.
+	//
+	// A refusal other than a 409 or a 412 settles a write, as one that did
+	// not change the policy, only when none of its earlier attempts failed
+	// in transport, failed reading its body, or got a 5xx. One case is not
+	// detected: a write of its own that landed with its answer lost and
+	// that another writer then undid before a read found the grant not
+	// done. A later refusal, or ErrPolicyChanged, then keeps its own
+	// sentinel.
+	EnsureGrant(ctx context.Context, bucket string, roles []string, member, shared string) (changed bool, err error)
 }

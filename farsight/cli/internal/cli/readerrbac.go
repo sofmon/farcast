@@ -10,6 +10,7 @@ import (
 	dsdeploy "github.com/sofmon/farcast/datasphere/deploy"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	fldeploy "github.com/sofmon/farcast/fatline/deploy"
+	pbuild "github.com/sofmon/farcast/planck/build"
 	tcdeploy "github.com/sofmon/farcast/technocore/deploy"
 	"github.com/sofmon/farcast/technocore/kernel"
 )
@@ -22,7 +23,11 @@ import (
 // reader's bindings as for the kernel's. GKE's other managed namespaces
 // (gke-managed-system, gmp-system and the like) are not refused, so the reader
 // is bound in one exactly when the operator meters it, as the kernel is. A
-// binding outlives 'kernel meter --remove', which deletes nothing.
+// binding outlives 'kernel meter --remove', which deletes nothing. Since
+// M2.8 (design §33, A33-16) a Role and its RoleBinding in farcast-system
+// alone add one more read there: a get of two ServiceAccounts, by name,
+// whose uid a grant names. farcast asks for their metadata alone; the rule
+// allows the whole object, which holds no secret value.
 
 // readerScopeMetered is Reader.Scope once 'reader grant' has verified the
 // reader read-only: the scope its consent named, farcast-system and every
@@ -32,9 +37,12 @@ const readerScopeMetered = "metered"
 
 // The names of the reader's RBAC objects. kube's kind table allows a
 // ClusterRoleBinding by the one name readerNamespacesRole only.
+// readerServiceAccountsRole names a Role and its RoleBinding, both in
+// farcast-system alone.
 const (
-	readerRole           = "farcast-reader"
-	readerNamespacesRole = "farcast-reader-namespaces"
+	readerRole                = "farcast-reader"
+	readerNamespacesRole      = "farcast-reader-namespaces"
+	readerServiceAccountsRole = "farcast-reader-serviceaccounts"
 )
 
 // readerConfigMaps are the ConfigMaps the reader may get, by name: exactly the
@@ -48,6 +56,18 @@ var readerConfigMaps = []string{
 	kernel.DefaultProfilesName,    // usage.go
 	fldeploy.PolicyConfigMap,      // runpolicy.go
 	dsdeploy.PinConfigMapName(""), // storagepin.go
+}
+
+// readerServiceAccounts are the ServiceAccounts the reader may get in
+// farcast-system, by name (design §33, A33-16): the keyholder's and the
+// builder's, whose uid the bucket and the push grants name. A get through
+// PartialObjectMetadata returns their metadata alone. They are granted by a
+// Role of their own in farcast-system, never by the ClusterRole readerRole,
+// which is bound in every metered namespace too
+// (TestReaderRoleNamesTheServiceAccountsPlansRead).
+var readerServiceAccounts = []string{
+	dsdeploy.DefaultName,  // the keyholder, datasphered
+	pbuild.ServiceAccount, // the builder, farcast-builder
 }
 
 // readerSubjectShape is every email a reader's RBAC may name: the derived
@@ -89,8 +109,11 @@ func readerBoundNamespaces(namespaces []string) ([]string, error) {
 // renderReaderRBAC is the whole of the reader's RBAC, as 'reader grant'
 // applies it: the cluster-wide namespaces list (a ClusterRole and its
 // ClusterRoleBinding), the per-namespace rule set (a ClusterRole never bound
-// cluster-wide), and one RoleBinding of that rule set in farcast-system and in
-// each of namespaces.
+// cluster-wide), the read of readerServiceAccounts (a Role and its
+// RoleBinding, both farcast-reader-serviceaccounts, in farcast-system alone;
+// since ADR 0023 M2.8, design §33, A33-16), and one RoleBinding of that rule
+// set in farcast-system and in each of namespaces: 5 documents, and 1 more
+// per namespace bound.
 func renderReaderRBAC(email string, namespaces []string) ([]byte, error) {
 	if err := checkReaderSubject(email); err != nil {
 		return nil, err
@@ -105,6 +128,11 @@ func renderReaderRBAC(email string, namespaces []string) ([]byte, error) {
 	buf.WriteString(strings.NewReplacer("{{EMAIL}}", email).Replace(readerNamespacesBindingTemplate))
 	buf.WriteString("---\n")
 	buf.WriteString(strings.NewReplacer("{{CONFIGMAPS}}", strings.Join(readerConfigMaps, ", ")).Replace(readerRoleTemplate))
+	buf.WriteString("---\n")
+	buf.WriteString(strings.NewReplacer("{{NAMESPACE}}", tcdeploy.DefaultNamespace,
+		"{{SERVICEACCOUNTS}}", strings.Join(readerServiceAccounts, ", ")).Replace(readerServiceAccountsRoleTemplate))
+	buf.WriteString("---\n")
+	buf.WriteString(strings.NewReplacer("{{NAMESPACE}}", tcdeploy.DefaultNamespace, "{{EMAIL}}", email).Replace(readerServiceAccountsBindingTemplate))
 	for _, ns := range bound {
 		b, err := renderReaderBinding(email, ns)
 		if err != nil {
@@ -129,9 +157,10 @@ func renderReaderBinding(email, namespace string) ([]byte, error) {
 	return []byte(strings.NewReplacer("{{EMAIL}}", email, "{{NAMESPACE}}", namespace).Replace(readerBindingTemplate)), nil
 }
 
-// The four document shapes of design §7.2. Every substituted value is checked
-// first: the email by checkReaderSubject, a namespace by validNamespace, and
-// the ConfigMap names are constants.
+// The six document shapes of design §7.2, as A33-16 amends it. Every
+// substituted value is checked first: the email by checkReaderSubject, a
+// namespace by validNamespace; the ConfigMap and ServiceAccount names, and
+// farcast-system, are constants.
 const (
 	readerNamespacesRoleDoc = `apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -186,6 +215,38 @@ rules:
   resources: [configmaps]
   resourceNames: [{{CONFIGMAPS}}]
   verbs: [get]
+`
+	readerServiceAccountsRoleTemplate = `# In farcast-system alone: the ServiceAccounts whose uid a grant names, by name.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: farcast-reader-serviceaccounts
+  namespace: {{NAMESPACE}}
+  labels:
+    app.kubernetes.io/managed-by: farcast
+    app.kubernetes.io/part-of: farcast-reader
+rules:
+- apiGroups: [""]
+  resources: [serviceaccounts]
+  resourceNames: [{{SERVICEACCOUNTS}}]
+  verbs: [get]
+`
+	readerServiceAccountsBindingTemplate = `apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: farcast-reader-serviceaccounts
+  namespace: {{NAMESPACE}}
+  labels:
+    app.kubernetes.io/managed-by: farcast
+    app.kubernetes.io/part-of: farcast-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: farcast-reader-serviceaccounts
+subjects:
+- apiGroup: rbac.authorization.k8s.io
+  kind: User
+  name: {{EMAIL}}
 `
 	readerBindingTemplate = `# One per namespace: farcast-system, and every metered namespace.
 apiVersion: rbac.authorization.k8s.io/v1

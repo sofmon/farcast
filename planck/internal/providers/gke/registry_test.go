@@ -6,6 +6,8 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -34,8 +36,9 @@ type fakeRegistryClient struct {
 	opCalls  int
 	opNames  []string
 
-	policy    iamPolicy
-	policyErr error
+	policy     iamPolicy
+	policyErr  error
+	policyRefs []planck.RegistryRef // every getPolicy's ref, in order
 
 	setPolicies []iamPolicy
 	setErr      error
@@ -86,7 +89,8 @@ func (f *fakeRegistryClient) operationDone(_ context.Context, op string) (bool, 
 	return f.opStates[i].done, f.opStates[i].err
 }
 
-func (f *fakeRegistryClient) getPolicy(context.Context, planck.RegistryRef) (iamPolicy, error) {
+func (f *fakeRegistryClient) getPolicy(_ context.Context, ref planck.RegistryRef) (iamPolicy, error) {
+	f.policyRefs = append(f.policyRefs, ref)
 	return f.policy, f.policyErr
 }
 
@@ -1017,6 +1021,229 @@ func TestDeleteRegistryAcceptsEitherNameForm(t *testing.T) {
 			}
 			if len(api.ownedChecks) != 1 || api.ownedChecks[0] != "farcast-demo/demo" {
 				t.Errorf("ownership check = %v, want farcast-demo checked on behalf of instance demo", api.ownedChecks)
+			}
+		})
+	}
+}
+
+// The grant reader (design §33, A33-12): the builder's push grant is read and
+// stated, never applied.
+
+const (
+	writerRole = "roles/artifactregistry.writer"
+	// uidMember and sharedMember are design §33's fixture principals for the
+	// builder: by its ServiceAccount's uid, and the one every instance in the
+	// project shares.
+	uidMember    = "principal://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/proj.svc.id.goog/kubernetes.serviceaccount.uid/00000000-0000-4000-8000-0000000000b5"
+	sharedMember = "principal://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/proj.svc.id.goog/subject/ns/farcast-system/sa/farcast-builder"
+)
+
+// TestRegistryGrantStates: one read of the repository's policy, as
+// DeleteRegistry resolves it, gives both observations; a binding with a
+// condition never counts; a 403 is unknown with no error; a 404 names the
+// repository; and nothing is ever written.
+func TestRegistryGrantStates(t *testing.T) {
+	conditioned := &iamCondition{Title: "until", Expression: "request.time < timestamp('2030-01-01T00:00:00Z')"}
+	for _, tc := range []struct {
+		name          string
+		bindings      []iamBinding
+		state, shared planck.GrantState
+	}{
+		{"an empty policy", nil, planck.GrantMissing, planck.GrantMissing},
+		{"the uid principal alone",
+			[]iamBinding{{Role: writerRole, Members: []string{"user:ops@example.com", uidMember}}},
+			planck.GrantPresent, planck.GrantMissing},
+		{"the shared principal alone",
+			[]iamBinding{{Role: writerRole, Members: []string{sharedMember}}},
+			planck.GrantMissing, planck.GrantPresent},
+		{"both",
+			[]iamBinding{{Role: writerRole, Members: []string{sharedMember, uidMember}}},
+			planck.GrantPresent, planck.GrantPresent},
+		{"both, only under a condition",
+			[]iamBinding{{Role: writerRole, Members: []string{uidMember, sharedMember}, Condition: conditioned}},
+			planck.GrantMissing, planck.GrantMissing},
+		{"both, in another role",
+			[]iamBinding{{Role: pullRole, Members: []string{uidMember, sharedMember}}},
+			planck.GrantMissing, planck.GrantMissing},
+		{"a conditioned binding beside an unconditioned one",
+			[]iamBinding{
+				{Role: writerRole, Members: []string{uidMember}, Condition: conditioned},
+				{Role: writerRole, Members: []string{"user:ops@example.com", uidMember}},
+			},
+			planck.GrantPresent, planck.GrantMissing},
+		{"a member that only begins like the uid principal",
+			[]iamBinding{{Role: writerRole, Members: []string{uidMember + "6", strings.ToUpper(sharedMember)}}},
+			planck.GrantMissing, planck.GrantMissing},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := &fakeRegistryClient{policy: iamPolicy{Etag: "e", Version: 3, Bindings: tc.bindings}}
+			p := newTestRegistryProvider(api)
+			state, shared, err := p.RegistryGrant(context.Background(), planck.RegistryRef{Name: "demo"}, writerRole, uidMember, sharedMember)
+			if err != nil {
+				t.Fatalf("RegistryGrant: %v", err)
+			}
+			if state != tc.state || shared != tc.shared {
+				t.Errorf("states = %s, %s; want %s, %s", state, shared, tc.state, tc.shared)
+			}
+			if want := []planck.RegistryRef{{Name: "farcast-demo", Location: "us-central1"}}; !slices.Equal(api.policyRefs, want) {
+				t.Errorf("policy reads = %+v, want one of %+v: the repository a printed grant names", api.policyRefs, want)
+			}
+			if len(api.setPolicies) != 0 || api.created != nil || len(api.deleted) != 0 {
+				t.Errorf("RegistryGrant wrote: set %d, created %v, deleted %v", len(api.setPolicies), api.created, api.deleted)
+			}
+		})
+	}
+
+	t.Run("a resolved name and a location are kept", func(t *testing.T) {
+		api := &fakeRegistryClient{}
+		p := newTestRegistryProvider(api)
+		if _, _, err := p.RegistryGrant(context.Background(), planck.RegistryRef{Name: "farcast-demo", Location: "europe-west1"},
+			writerRole, uidMember, sharedMember); err != nil {
+			t.Fatal(err)
+		}
+		if want := []planck.RegistryRef{{Name: "farcast-demo", Location: "europe-west1"}}; !slices.Equal(api.policyRefs, want) {
+			t.Errorf("policy reads = %+v, want %+v", api.policyRefs, want)
+		}
+	})
+
+	t.Run("a policy the credential may not read", func(t *testing.T) {
+		api := &fakeRegistryClient{policyErr: &apiError{Code: http.StatusForbidden, Status: "PERMISSION_DENIED", Message: "no"}}
+		p := newTestRegistryProvider(api)
+		state, shared, err := p.RegistryGrant(context.Background(), planck.RegistryRef{Name: "demo"}, writerRole, uidMember, sharedMember)
+		if err != nil || state != planck.GrantUnknown || shared != planck.GrantUnknown {
+			t.Errorf("a 403 gives %s, %s, %v; want unknown, unknown and no error", state, shared, err)
+		}
+	})
+
+	for _, tc := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"a repository that is not there", &apiError{Code: http.StatusNotFound, Status: "NOT_FOUND", Message: "gone"},
+			`the repository "farcast-demo" in us-central1 does not exist`},
+		{"a server failure", &apiError{Code: http.StatusInternalServerError, Message: "boom"},
+			`read the IAM policy of repository "farcast-demo"`},
+		{"a transport failure", errors.New("dial: refused"), `read the IAM policy of repository "farcast-demo"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := &fakeRegistryClient{policyErr: tc.err}
+			p := newTestRegistryProvider(api)
+			state, shared, err := p.RegistryGrant(context.Background(), planck.RegistryRef{Name: "demo"}, writerRole, uidMember, sharedMember)
+			if err == nil || !strings.Contains(err.Error(), tc.want) || !errors.Is(err, tc.err) {
+				t.Errorf("RegistryGrant = %s, %s, %v; want an error naming %q that wraps %v", state, shared, err, tc.want, tc.err)
+			}
+		})
+	}
+
+	for name, args := range map[string][4]string{
+		"no name":   {"", writerRole, uidMember, sharedMember},
+		"no role":   {"demo", "", uidMember, sharedMember},
+		"no member": {"demo", writerRole, "", sharedMember},
+		"no shared": {"demo", writerRole, uidMember, ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeRegistryClient{}
+			p := newTestRegistryProvider(api)
+			if _, _, err := p.RegistryGrant(context.Background(), planck.RegistryRef{Name: args[0]}, args[1], args[2], args[3]); err == nil {
+				t.Error("RegistryGrant read with a value missing")
+			}
+			if len(api.policyRefs) != 0 {
+				t.Errorf("RegistryGrant read %d policies with a value missing", len(api.policyRefs))
+			}
+		})
+	}
+}
+
+// TestProviderProjectNumberIsExported: the number grantPull builds the node
+// account from is a GrantReader method of the provider New returns, read
+// again on each call, and its failure names the project.
+func TestProviderProjectNumberIsExported(t *testing.T) {
+	orig := newRegistryClient
+	t.Cleanup(func() { newRegistryClient = orig })
+	fake := &fakeRegistryClient{number: 987654321098}
+	newRegistryClient = func(planck.Config) (registryAPI, error) { return fake, nil }
+
+	p, err := New(planck.Config{Project: "proj"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	gr, ok := p.(planck.GrantReader)
+	if !ok {
+		t.Fatal("the GKE provider must satisfy planck.GrantReader")
+	}
+	if _, ok := p.(planck.RegistryProvider); !ok {
+		t.Fatal("the GKE provider must still satisfy planck.RegistryProvider")
+	}
+	num, err := gr.ProjectNumber(context.Background())
+	if err != nil || num != 987654321098 {
+		t.Errorf("ProjectNumber = %d, %v; want the project's number", num, err)
+	}
+	fake.number = 123456789012
+	if num, err := gr.ProjectNumber(context.Background()); err != nil || num != 123456789012 {
+		t.Errorf("ProjectNumber = %d, %v; want it read again, not kept", num, err)
+	}
+
+	cause := &apiError{Code: http.StatusForbidden, Message: "no"}
+	fake.numberErr = cause
+	num, err = gr.ProjectNumber(context.Background())
+	if err == nil || num != 0 || !errors.Is(err, cause) || !strings.Contains(err.Error(), `project "proj"`) {
+		t.Errorf("ProjectNumber = %d, %v; want 0 and an error naming the project that wraps the cause", num, err)
+	}
+}
+
+// TestEnsureRegistryNeverGrantsPush: the one policy write the adapter makes
+// adds the node account to the pull role and nothing else, whatever the
+// repository already grants; push access stays a human's grant.
+func TestEnsureRegistryNeverGrantsPush(t *testing.T) {
+	for name, pol := range map[string]iamPolicy{
+		"an empty policy": {},
+		"a policy granting push by hand": {Etag: "e", Version: 3, Bindings: []iamBinding{
+			{Role: writerRole, Members: []string{uidMember}},
+			{Role: pullRole, Members: []string{"user:auditor@example.com"}},
+		}},
+		"a policy holding the shared principal": {Etag: "e", Version: 3, Bindings: []iamBinding{
+			{Role: writerRole, Members: []string{sharedMember}},
+		}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeRegistryClient{number: 42, policy: pol}
+			p := newTestRegistryProvider(api)
+			if _, err := p.EnsureRegistry(context.Background(), planck.RegistrySpec{Name: "demo"}); err != nil {
+				t.Fatalf("EnsureRegistry: %v", err)
+			}
+			if len(api.setPolicies) != 1 {
+				t.Fatalf("setPolicy called %d times, want 1", len(api.setPolicies))
+			}
+			want, _ := grantRole(pol, pullRole, nodeServiceAccountMember(42))
+			if got := api.setPolicies[0]; !reflect.DeepEqual(got, want) {
+				t.Errorf("the policy written is\n  %+v\nwant the read one with only the node account's pull grant added\n  %+v", got, want)
+			}
+			for _, b := range api.setPolicies[0].Bindings {
+				if b.Role == pullRole {
+					continue
+				}
+				var before []string
+				for _, o := range pol.Bindings {
+					if o.Role == b.Role {
+						before = append(before, o.Members...)
+					}
+				}
+				for _, m := range b.Members {
+					if !slices.Contains(before, m) {
+						t.Errorf("EnsureRegistry granted %s %s", b.Role, m)
+					}
+				}
+			}
+			for _, b := range api.setPolicies[0].Bindings {
+				if b.Role != pullRole {
+					continue
+				}
+				for _, m := range b.Members {
+					if strings.HasPrefix(m, "principal://") {
+						t.Errorf("EnsureRegistry granted pull to a workload principal, %s", m)
+					}
+				}
 			}
 		})
 	}

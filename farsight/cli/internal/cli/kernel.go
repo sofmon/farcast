@@ -1,7 +1,9 @@
 package cli
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -15,6 +17,7 @@ import (
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 	"github.com/sofmon/farcast/farsight/cli/internal/plan"
+	pbuild "github.com/sofmon/farcast/planck/build"
 	tcdeploy "github.com/sofmon/farcast/technocore/deploy"
 	"github.com/sofmon/farcast/technocore/kernel"
 )
@@ -148,7 +151,9 @@ Usage: farcast kernel deploy <instance> [--technocore-image REF@sha256:… | --s
                               [--namespaces a,b] [--adapt[=false]] [--adapt-cooldown D] [--interval D] [-y]
                               [--plan | --confirm <digest>]
 
-Deploy TechnoCore into an instance.
+Deploy TechnoCore into an instance. It also creates the builder's
+ServiceAccount, so the push grant can name it by its uid before the first
+build.
 
 Its image is the one this farcast carries, pushed into the instance's own
 registry when the version tag does not already hold it. --technocore-image
@@ -752,7 +757,15 @@ func (c *kernelDeployCommand) consented(env *Env, meta *config.InstanceMetadata,
 }
 
 // kernelManifests is the one stream 'kernel deploy' applies: TechnoCore's
-// workload, then the seed of the namespace list the kernel re-reads. The seed
+// workload, then the seed of the namespace list the kernel re-reads. The
+// builder's ServiceAccount (pbuild.RenderServiceAccount, the document every
+// build applies first) is the stream's second document, right after the
+// Namespace TechnoCore's workload begins with and before any TechnoCore
+// object (ADR 0023 M2.8, design §33 A33-20): the push grant names it by its
+// uid, which exists only once the account does, and with no account before
+// the first build that build would fail at its push, billed. The kernel
+// does not need it, so an apply of it that fails stops the stream before
+// TechnoCore's workload, its RoleBindings and the seed change. The seed
 // comes last, after the RoleBindings the workload holds, for meterManifest's
 // reason: a stream stopped between them must not leave the kernel told to
 // meter a namespace it cannot read (TestTheMeteredListIsAppliedAfterItsBindings).
@@ -771,10 +784,15 @@ func (c *kernelDeployCommand) consented(env *Env, meta *config.InstanceMetadata,
 // empty readerEmail, an instance whose reader was never granted the metered
 // scope, adds none.
 func kernelManifests(cfg tcdeploy.Config, readerEmail string) ([]byte, error) {
-	manifests, err := tcdeploy.Render(cfg)
+	workload, err := tcdeploy.Render(cfg)
 	if err != nil {
 		return nil, err
 	}
+	namespace, rest, ok := bytes.Cut(workload, []byte("\n---\n"))
+	if !ok || !bytes.HasPrefix(namespace, []byte("apiVersion: v1\nkind: Namespace\n")) {
+		return nil, errors.New("kernel deploy: TechnoCore's stream does not begin with its Namespace, which the builder's ServiceAccount follows")
+	}
+	manifests := slices.Concat(namespace, []byte("\n---\n"), pbuild.RenderServiceAccount(), []byte("---\n"), rest)
 	if readerEmail != "" {
 		for _, ns := range cfg.Meter {
 			b, err := renderReaderBinding(readerEmail, ns)

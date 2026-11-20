@@ -2204,3 +2204,54 @@ func TestEmulatedSeedMatchesKubectl(t *testing.T) {
 		})
 	}
 }
+
+// serviceAccountDoc is a ServiceAccount in the renderers' shape, the
+// builder's (planck/build) and the keyholder's (datasphere/deploy): its
+// name, its namespace and its app.kubernetes.io/name label.
+const serviceAccountDoc = `apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: %s
+  namespace: %s
+  labels:
+    app.kubernetes.io/name: %s
+    app.kubernetes.io/managed-by: farcast
+`
+
+// TestServiceAccountUIDSurvivesForcedApplyAndMigration (design §33, R1;
+// written, not run): the grants of ADR 0023 M2.8 name a ServiceAccount by
+// the uid the API server gave it, so nothing farcast does to the account
+// may give it another. A forced apply of the builder's ServiceAccount over
+// itself, as kernel deploy and every build apply it, keeps its uid; and a
+// keyholder's ServiceAccount kubectl's client-side apply created keeps its
+// uid through the migration's patch and the first forced apply after it.
+// What it records: whether each kept the uid, never the uid.
+func TestServiceAccountUIDSurvivesForcedApplyAndMigration(t *testing.T) {
+	r := openRealAPI(t)
+	ns := r.runNamespace(t, "sauid")
+	k := mustKind("v1", "ServiceAccount")
+
+	builder := fmt.Sprintf(serviceAccountDoc, "farcast-builder", ns, "farcast-builder")
+	r.apply(t, builder, true)
+	first := r.object(t, k, ns, "farcast-builder").Metadata
+	r.apply(t, builder, true)
+	second := r.object(t, k, ns, "farcast-builder").Metadata
+	fact(t, "a forced apply of an unchanged ServiceAccount: uid kept %t, resourceVersion moved %t",
+		second.UID == first.UID, second.ResourceVersion != first.ResourceVersion)
+	if first.UID == "" || second.UID != first.UID {
+		t.Errorf("a forced apply of an unchanged ServiceAccount gave it another uid, or none")
+	}
+
+	keyholder := fmt.Sprintf(serviceAccountDoc, "datasphered", ns, "datasphered")
+	r.seed(t, k, ns, keyholder, "")
+	seeded := r.object(t, k, ns, "datasphered").Metadata
+	m, err := r.migrateOne(t.Context(), k, ns, "datasphered")
+	r.check(t, err, "the migration of the ServiceAccount")
+	r.apply(t, keyholder, true)
+	applied := r.object(t, k, ns, "datasphered").Metadata
+	fact(t, "a ServiceAccount kubectl created: uid kept through the migration %t, through the first apply after it %t; entries %v",
+		m.after.Metadata.UID == seeded.UID, applied.UID == seeded.UID, entryNames(applied))
+	if seeded.UID == "" || m.after.Metadata.UID != seeded.UID || applied.UID != seeded.UID {
+		t.Errorf("the migration, or the first apply after it, gave the ServiceAccount another uid")
+	}
+}

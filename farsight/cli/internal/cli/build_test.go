@@ -2,7 +2,9 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -12,8 +14,11 @@ import (
 
 	"github.com/sofmon/farcast/farsight/cli/internal/cluster"
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
+	"github.com/sofmon/farcast/farsight/cli/internal/kube"
+	"github.com/sofmon/farcast/farsight/cli/internal/kube/kubetest"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
 	"github.com/sofmon/farcast/farsight/cli/internal/plan"
+	"github.com/sofmon/farcast/planck"
 	pbuild "github.com/sofmon/farcast/planck/build"
 	"github.com/sofmon/farcast/technocore/pricing"
 )
@@ -32,6 +37,22 @@ type fakeJobs struct {
 	// answers them.
 	uidReads int
 	uidErr   error
+	// accounts are the ServiceAccounts its farcast-system holds, by name,
+	// at their uids (accountMeta), none when nil; metaReads counts the
+	// reads of them, and metaErr, when set, answers every read, and
+	// metaErrApplied every read once a stream is applied.
+	accounts       map[string]string
+	metaReads      int
+	metaErr        error
+	metaErrApplied error
+	// createAccount is the uid an applied stream that holds the builder's
+	// ServiceAccount creates it at, when farcast-system does not hold it
+	// yet, as the API server would; "" creates none.
+	createAccount string
+	// events is each apply, account read and wait, in order; onWait runs as
+	// a wait is asked, before it answers.
+	events []string
+	onWait func()
 }
 
 func (f *fakeJobs) NamespaceUID(context.Context, string) (string, error) {
@@ -39,14 +60,39 @@ func (f *fakeJobs) NamespaceUID(context.Context, string) (string, error) {
 	return "", f.uidErr
 }
 
+func (f *fakeJobs) GetMeta(_ context.Context, k kube.Kind, namespace, name string) (kube.Object, error) {
+	f.metaReads++
+	f.events = append(f.events, "meta "+namespace+"/"+name)
+	switch {
+	case f.metaErr != nil:
+		return kube.Object{}, f.metaErr
+	case f.metaErrApplied != nil && len(f.applied) > 0:
+		return kube.Object{}, f.metaErrApplied
+	}
+	return accountMeta(f.accounts, k, namespace, name)
+}
+
 func (f *fakeJobs) Apply(_ context.Context, m []byte) error {
 	checkApplied(m)
 	f.applied = append(f.applied, m)
+	f.events = append(f.events, "apply")
+	if f.createAccount != "" && strings.HasPrefix(string(m), string(pbuild.RenderServiceAccount())) {
+		if f.accounts == nil {
+			f.accounts = map[string]string{}
+		}
+		if _, ok := f.accounts[pbuild.ServiceAccount]; !ok {
+			f.accounts[pbuild.ServiceAccount] = f.createAccount
+		}
+	}
 	return f.applyErr
 }
 
 func (f *fakeJobs) WaitJob(_ context.Context, ns, name string, _ time.Duration) (cluster.JobResult, error) {
 	f.waited = append(f.waited, ns+"/"+name)
+	f.events = append(f.events, "wait")
+	if f.onWait != nil {
+		f.onWait()
+	}
 	return f.result, f.waitErr
 }
 
@@ -54,21 +100,45 @@ func (f *fakeJobs) JobLogs(_ context.Context, _, _ string, _ int) (string, error
 	return f.logs, nil
 }
 
+// buildableInstance is a connected instance in project proj-1 whose
+// registry is recorded as the ensure records it: its prefix, and its
+// repository and location, which the push grant's read and its printed
+// commands name (ADR 0023 M2.8, design §33 A33-15).
 func buildableInstance(t *testing.T, dir config.Dir, name string) *config.InstanceMetadata {
 	t.Helper()
 	meta := connectedInstance(t, dir, name)
-	meta.Registry = &config.Registry{Prefix: "us-central1-docker.pkg.dev/proj-1/farcast-" + name}
+	meta.Project = "proj-1"
+	meta.Registry = &config.Registry{Prefix: "us-central1-docker.pkg.dev/proj-1/farcast-" + name, Repository: "farcast-" + name, Location: "us-central1"}
 	if err := dir.SaveInstanceMetadata(name, meta); err != nil {
 		t.Fatal(err)
 	}
 	return meta
 }
 
+// buildCmd is build with --yes, its writer fj and its builder a fake; its
+// provider, which the plan reads the push grant through (A33-22), answers
+// as fakeProvider does: the fixture number, and every grant missing.
 func buildCmd(fj *fakeJobs) *buildCommand {
 	c := &buildCommand{assumeYes: true}
 	c.newCluster = func(clusterRef) (jobWaiter, error) { return fj, nil }
 	c.newBuilder = func(func(string)) imageBuilder { return &fakeBuilder{} }
+	c.openProvider = providerOf(&fakeProvider{})
 	return c
+}
+
+// loopbackBuildReader is build's plan reader seam over loopbackReader: the
+// instance's reader, against a test's kubetest.
+func loopbackBuildReader(r clusterRef) (buildPlanReader, error) {
+	cl, err := loopbackReader(r)
+	if err != nil {
+		return nil, err
+	}
+	return cl, nil
+}
+
+// providerOf is a provider seam that opens p.
+func providerOf(p planck.Provider) providerOpener {
+	return func(*config.InstanceMetadata, *config.InstanceCredentials) (planck.Provider, error) { return p, nil }
 }
 
 func succeeded(digest string) cluster.JobResult {
@@ -207,25 +277,79 @@ func TestABuildThatReportsNoDigestIsAFailure(t *testing.T) {
 	}
 }
 
-// The push grant needs permission to change a repository's IAM, which this
-// CLI's credential is not required to carry. It is printed, like the
-// keyholder's bucket grant.
-func TestTheResultPrintsThePushGrant(t *testing.T) {
-	dir := config.Dir(t.TempDir())
-	meteringInstance(t, dir, "p42")
-	env, out := testEnv(dir, output.ModeHuman)
+// TestBuildPrintsThePushGrantOnlyWhenNotPresent (design §33, A33-22,
+// mutation 110d): the push grant is never applied, and its commands are a
+// notice only when the repository's own policy does not hold the builder's
+// uid principal, or still holds the shared one. A build whose plan read the
+// grant present, the shared principal gone, binds no notice, prints no
+// commands before it applies, and its result names none; one whose plan
+// read it missing prints the notice before it applies, in the plan's words,
+// and its result the commands, under the build. One whose plan read it
+// present while the shared principal still holds the role prints the
+// removal in its notice before it applies, and its result names no
+// commands: they print under the result only when the plan's state was not
+// present. Each result's JSON states the grant.
+func TestBuildPrintsThePushGrantOnlyWhenNotPresent(t *testing.T) {
+	member := "principal://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/proj-1.svc.id.goog/" +
+		"kubernetes.serviceaccount.uid/" + fixtureBuilderUID
+	shared := builderSharedMember(fixtureProjectNumber, "proj-1")
+	const add = "add-iam-policy-binding 'farcast-p42' --project 'proj-1' --location 'us-central1' --member '" // the uid principal's
+	for _, tc := range []struct {
+		name          string
+		states        map[string]planck.GrantState
+		state, shared string
+		// printed is the commands under the result; notice the plan's
+		// notice before the apply, "" for none.
+		printed bool
+		notice  string
+	}{
+		{"present", map[string]planck.GrantState{member: planck.GrantPresent}, plan.GrantPresent, plan.GrantMissing, false, ""},
+		{"missing", nil, plan.GrantMissing, plan.GrantMissing, true, msgPushGrantMissing},
+		{"present, the shared principal held", map[string]planck.GrantState{member: planck.GrantPresent, shared: planck.GrantPresent},
+			plan.GrantPresent, plan.GrantPresent, false, fmt.Sprintf(msgPushGrantShared, "proj-1")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := config.Dir(t.TempDir())
+			meteringInstance(t, dir, "p42")
+			fj := &fakeJobs{result: succeeded("sha256:" + strings.Repeat("c", 64)), accounts: fixtureAccounts()}
+			c := buildCmd(fj)
+			c.openProvider = providerOf(&fakeProvider{grantStates: tc.states})
+			c.repo, c.app, c.builderImage = "https://github.com/example/repo.git", "api", builderDigest
+			env, out, errb := testEnvBoth(dir, output.ModeHuman)
+			if err := c.Run(context.Background(), env, []string{"p42"}); err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.Contains(errb.String(), msgPushGrantMissing) && strings.Contains(errb.String(), add+member+"'"); got != tc.printed {
+				t.Errorf("before the apply, the notice and its commands printed: %v, want %v\n%s", got, tc.printed, errb)
+			}
+			if got := strings.Contains(out.String(), add+member+"'"); got != tc.printed {
+				t.Errorf("the result names the commands: %v, want %v\n%s", got, tc.printed, out)
+			}
+			if !tc.printed && strings.Contains(out.String(), "iam-policy-binding") {
+				t.Errorf("the result of a build whose plan read the grant present prints commands:\n%s", out)
+			}
+			switch {
+			case tc.notice == "" && (strings.Contains(errb.String()+out.String(), "iam-policy-binding") || strings.Contains(errb.String()+out.String(), "artifactregistry.writer")):
+				t.Errorf("a grant read present printed a notice or commands:\n%s%s", errb, out)
+			case tc.notice != "" && !strings.Contains(errb.String(), tc.notice):
+				t.Errorf("before the apply, stderr was\n%s\nwant the notice %q", errb, tc.notice)
+			}
 
-	fj := &fakeJobs{result: succeeded("sha256:" + strings.Repeat("c", 64))}
-	c := buildCmd(fj)
-	c.repo, c.app, c.builderImage = "https://github.com/example/repo.git", "api", builderDigest
-	if err := c.Run(context.Background(), env, []string{"p42"}); err != nil {
-		t.Fatal(err)
-	}
-	printed := out.String()
-	for _, want := range []string{"artifactregistry.writer", pbuild.ServiceAccount, "ONE repository"} {
-		if !strings.Contains(printed, want) {
-			t.Errorf("the result does not explain the push grant (%q missing):\n%s", want, printed)
-		}
+			env, out = testEnv(dir, output.ModeJSON)
+			fj.applied = nil
+			if err := c.Run(context.Background(), env, []string{"p42"}); err != nil {
+				t.Fatal(err)
+			}
+			var res struct {
+				PushGrant pushGrantResult `json:"push_grant"`
+			}
+			if err := json.Unmarshal(out.Bytes(), &res); err != nil {
+				t.Fatal(err)
+			}
+			if want := (pushGrantResult{Principal: member, State: tc.state, Shared: tc.shared}); res.PushGrant != want {
+				t.Errorf("the result's push_grant is %+v; want %+v", res.PushGrant, want)
+			}
+		})
 	}
 }
 
@@ -295,7 +419,7 @@ func TestAFailedBuildNamesTheGrantWhenThePushWasRefused(t *testing.T) {
 	meteringInstance(t, dir, "p42")
 	env, _ := testEnv(dir, output.ModeHuman)
 
-	fj := &fakeJobs{result: cluster.JobResult{Succeeded: false}, logs: arDenial}
+	fj := &fakeJobs{result: cluster.JobResult{Succeeded: false}, logs: arDenial, accounts: fixtureAccounts()}
 	c := buildCmd(fj)
 	c.repo, c.app, c.builderImage = "https://github.com/example/repo.git", "api", builderDigest
 
@@ -303,11 +427,37 @@ func TestAFailedBuildNamesTheGrantWhenThePushWasRefused(t *testing.T) {
 		t.Fatal("a failed build reported success")
 	}
 	errOut := env.Err.(interface{ String() string }).String()
-	for _, want := range []string{"not a problem with the Containerfile", "add-iam-policy-binding farcast-p42", "roles/artifactregistry.writer"} {
-		if !strings.Contains(errOut, want) {
-			t.Errorf("the failure does not name the grant (%q missing):\n%s", want, errOut)
+	// The plan's notice named the grant before the build; the explanation
+	// names it again, after the build's own output.
+	_, explained, _ := strings.Cut(errOut, "not a problem with the Containerfile")
+	for _, want := range []string{"add-iam-policy-binding 'farcast-p42' --project 'proj-1' --location 'us-central1'", "roles/artifactregistry.writer"} {
+		if !strings.Contains(explained, want) {
+			t.Errorf("the failure's explanation does not name the grant (%q missing):\n%s", want, errOut)
 		}
 	}
+
+	// A grant the plan read present, the push refused all the same: the
+	// explanation says what the plan read, and still prints the add (design
+	// §33, A33-22).
+	t.Run("a grant the plan read present", func(t *testing.T) {
+		member := uidMember(fixtureProjectNumber, "proj-1", fixtureBuilderUID)
+		env, _ := testEnv(dir, output.ModeHuman)
+		fj := &fakeJobs{result: cluster.JobResult{Succeeded: false}, logs: arDenial, accounts: fixtureAccounts()}
+		c := buildCmd(fj)
+		c.openProvider = providerOf(&fakeProvider{grantStates: map[string]planck.GrantState{member: planck.GrantPresent}})
+		c.repo, c.app, c.builderImage = "https://github.com/example/repo.git", "api", builderDigest
+		if err := c.Run(context.Background(), env, []string{"p42"}); err == nil {
+			t.Fatal("a failed build reported success")
+		}
+		errOut := env.Err.(interface{ String() string }).String()
+		_, explained, _ := strings.Cut(errOut, "not a problem with the Containerfile")
+		for _, want := range []string{"the repository's own policy granted it write access",
+			"add-iam-policy-binding 'farcast-p42' --project 'proj-1' --location 'us-central1' --member '" + member + "'"} {
+			if !strings.Contains(explained, want) {
+				t.Errorf("the failure's explanation is missing %q:\n%s", want, errOut)
+			}
+		}
+	})
 }
 
 // A build is a billed Job in farcast-system, which only a kernel meters. With
@@ -355,7 +505,10 @@ func buildRefusalNamesThePlan(t *testing.T) {
 }
 
 // buildPlanCmd is build with its flags parsed, its builder counting its
-// lookups and its writer counting its opens: the plan's view of build.
+// lookups and its writer counting its opens: the plan's view of build. Its
+// plan's reader, opened only as the reader, is a fake of the same cluster,
+// holding fj's ServiceAccounts (design §33, A33-21), and its provider
+// answers as fakeProvider does: the fixture number, every grant missing.
 func buildPlanCmd(t *testing.T, fj *fakeJobs, fb *fakeBuilder, opened *int, flags ...string) *buildCommand {
 	t.Helper()
 	c := withFlags(t, &buildCommand{}, flags...)
@@ -364,15 +517,41 @@ func buildPlanCmd(t *testing.T, fj *fakeJobs, fb *fakeBuilder, opened *int, flag
 		*opened++
 		return fj, nil
 	}
+	c.newPlanReader = func(r clusterRef) (buildPlanReader, error) {
+		if r.Identity != kube.Reader {
+			return nil, fmt.Errorf("test: build's plan reader was opened as %q", r.Identity)
+		}
+		return &fakeJobs{accounts: fj.accounts}, nil
+	}
+	c.openProvider = providerOf(&fakeProvider{})
 	return c
+}
+
+// grantedReader records a reader 'reader grant' verified for instance name
+// in project proj-1, and its key: build's plan reads the cluster as it
+// (design §33, A33-21).
+func grantedReader(t *testing.T, dir config.Dir, name string) {
+	t.Helper()
+	if _, err := dir.UpdateInstanceMetadata(name, func(m *config.InstanceMetadata) error {
+		m.Reader = &config.Reader{Email: readerEmail(name, m.Project), KeyID: readerTestKeyID, GrantedAt: readerGrantedAt}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := dir.SaveReaderKey(name, []byte("not read"), []byte("not read")); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // ADR 0023 M2.6 (A23-37): build's plan binds the build, its Job's cost, the
 // builder image as named or as the instance recorded it, and the three
 // documents it applies, byte for byte as the build renders them; its
-// options are its eight behaviour flags. It reads the record alone: it
-// opens no writer, reads no installer key, looks nothing up for a pinned
-// builder, prints nothing on stderr, and changes no file.
+// options are its eight behaviour flags. Since ADR 0023 M2.8 (design §33,
+// A33-21, A33-22) it reads the cluster as the instance's reader, and binds
+// the push grant right after the builder image: here the repository's
+// policy grants the builder's uid principal, so there is no notice. It opens
+// no writer, looks nothing up for a pinned builder, prints nothing on
+// stderr, and changes no file; it reads the installer's key for Google.
 func TestBuildPlanBindsTheBuildItRuns(t *testing.T) {
 	flags := []string{"--repo", "https://github.com/example/repo.git", "--app", "api", "--ref", "refs/heads/release",
 		"--context", "svc", "--containerfile", "svc/Containerfile", "--git-secret", "repo-cred"}
@@ -393,6 +572,7 @@ func TestBuildPlanBindsTheBuildItRuns(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := config.Dir(t.TempDir())
 			meta := meteringInstance(t, dir, "p42")
+			grantedReader(t, dir, "p42")
 			if tc.record != "" {
 				meta.Toolchain = &config.Toolchain{Builder: tc.record}
 				if err := dir.SaveInstanceMetadata("p42", meta); err != nil {
@@ -402,7 +582,10 @@ func TestBuildPlanBindsTheBuildItRuns(t *testing.T) {
 			before := treeFiles(t, string(dir))
 			reads := observeConfigReads(t)
 			fb, opened := &fakeBuilder{}, 0
-			c := buildPlanCmd(t, &fakeJobs{}, fb, &opened, append(append(slices.Clone(flags), tc.flags...), "--plan")...)
+			c := buildPlanCmd(t, &fakeJobs{accounts: fixtureAccounts()}, fb, &opened, append(append(slices.Clone(flags), tc.flags...), "--plan")...)
+			member := "principal://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/proj-1.svc.id.goog/" +
+				"kubernetes.serviceaccount.uid/" + fixtureBuilderUID
+			c.openProvider = providerOf(&fakeProvider{grantStates: map[string]planck.GrantState{member: planck.GrantPresent}})
 			env, out, errb := testEnvBoth(dir, output.ModeJSON)
 			if err := c.Run(context.Background(), env, []string{"p42"}); err != nil {
 				t.Fatalf("build --plan: %v", err)
@@ -430,6 +613,10 @@ func TestBuildPlanBindsTheBuildItRuns(t *testing.T) {
 					App: "api", Containerfile: "svc/Containerfile", Context: "svc", Tag: "release", Destination: destination},
 				cost,
 				plan.ImageFact{Type: plan.TypeImage, Component: "builder", Action: tc.action, Target: tc.builder, Current: tc.current},
+				plan.GrantFact{Type: plan.TypeGrant, Name: plan.GrantPush, Target: "us-central1-docker.pkg.dev/proj-1/farcast-p42",
+					ServiceAccount: "farcast-system/farcast-builder", Principal: member, Roles: []string{"roles/artifactregistry.writer"},
+					State: plan.GrantPresent, SharedPrincipal: "principal://iam.googleapis.com/projects/123456789012/locations/global/" +
+						"workloadIdentityPools/proj-1.svc.id.goog/subject/ns/farcast-system/sa/farcast-builder", Shared: plan.GrantMissing},
 			}, wantWrites(t, stream)...)
 			if !reflect.DeepEqual(b.Facts, want) {
 				t.Errorf("the plan binds\n%#v\nwant\n%#v", b.Facts, want)
@@ -445,16 +632,14 @@ func TestBuildPlanBindsTheBuildItRuns(t *testing.T) {
 			wantOptions := []plan.Option{{Flag: "app", Value: "api"}, {Flag: "builder-image", Value: builderFlag},
 				{Flag: "containerfile", Value: "svc/Containerfile"}, {Flag: "context", Value: "svc"}, {Flag: "git-secret", Value: "repo-cred"},
 				{Flag: "ref", Value: "refs/heads/release"}, {Flag: "repo", Value: "https://github.com/example/repo.git"}, {Flag: "tag", Value: ""}}
-			if !reflect.DeepEqual(b.Options, wantOptions) || b.Command != "build" || b.ClusterIdentity != "none" || b.Target.SystemNamespaceUID != "" {
+			if !reflect.DeepEqual(b.Options, wantOptions) || b.Command != "build" || b.ClusterIdentity != "reader" || b.Target.SystemNamespaceUID != "" {
 				t.Errorf("the plan is %s, as %s, reading farcast-system %q, with options %+v", b.Command, b.ClusterIdentity, b.Target.SystemNamespaceUID, b.Options)
 			}
 			if opened != 0 || len(fb.resolved)+len(fb.built)+len(fb.embedded) != 0 || errb.Len() != 0 {
 				t.Errorf("the plan opened the writer %d times, looked up %v and said %q", opened, fb.resolved, errb)
 			}
-			for _, p := range reads() {
-				if filepath.Base(p) == "credentials.yaml" {
-					t.Errorf("build --plan read %s", p)
-				}
+			if !slices.ContainsFunc(reads(), func(p string) bool { return filepath.Base(p) == "credentials.yaml" }) {
+				t.Errorf("build --plan read no installer key for the push grant (%q)", reads())
 			}
 			sameFiles(t, "build --plan", before, treeFiles(t, string(dir)))
 		})
@@ -483,6 +668,7 @@ func TestBuildConfirmAppliesThePlannedJobAfterTheComparison(t *testing.T) {
 	t.Run("the same plan", func(t *testing.T) {
 		dir := config.Dir(t.TempDir())
 		meteringInstance(t, dir, "p42")
+		grantedReader(t, dir, "p42")
 		doc := planOf(t, dir)
 		fj, opened := &fakeJobs{result: succeeded("sha256:" + strings.Repeat("c", 64))}, 0
 		c := buildPlanCmd(t, fj, &fakeBuilder{}, &opened, append(slices.Clone(flags), "--confirm", doc.Digest)...)
@@ -506,10 +692,16 @@ func TestBuildConfirmAppliesThePlannedJobAfterTheComparison(t *testing.T) {
 		if strings.Contains(errb.String(), "[y/N]") || !strings.Contains(out.String(), "@sha256:"+strings.Repeat("c", 64)) {
 			t.Errorf("--confirm asked, or printed no pinned result:\n%s%s", errb, out)
 		}
+		// The plan's notice, its account not created yet, printed once,
+		// right after the comparison (A23-26, design §33 A33-22).
+		if got := strings.Count(errb.String(), msgPushGrantPending+"\n"); got != 1 {
+			t.Errorf("--confirm printed the push grant's notice %d times; want once:\n%s", got, errb)
+		}
 	})
 	t.Run("a changed plan", func(t *testing.T) {
 		dir := config.Dir(t.TempDir())
 		meteringInstance(t, dir, "p42")
+		grantedReader(t, dir, "p42")
 		doc := planOf(t, dir)
 		if _, err := dir.UpdateInstanceMetadata("p42", func(m *config.InstanceMetadata) error {
 			m.CostLimit.Amount = 75
@@ -530,4 +722,70 @@ func TestBuildConfirmAppliesThePlannedJobAfterTheComparison(t *testing.T) {
 		}
 		sameFiles(t, "a changed build plan", before, treeFiles(t, string(dir)))
 	})
+}
+
+// TestBuildPlanReadsTheBuilderAsTheReader (design §33, A33-21, mutation
+// 136): build's plan reads the cluster as the instance's reader, under
+// --plan and in --confirm's recomputation: farcast-system's uid, which it
+// binds, and the builder's ServiceAccount, whose uid its push grant names.
+// The writer opens only after the comparison. An interactive or --yes build
+// reads the account through the writer it opened, and binds the uid its
+// preflight read.
+func TestBuildPlanReadsTheBuilderAsTheReader(t *testing.T) {
+	row := planCommandNamed(t, "build", "a named builder")
+	s, dir := planFixture(t, row)
+	doc, _ := runPlan(t, dir, row, output.ModeJSON)
+	b := decodedBound(t, doc)
+	if b.ClusterIdentity != "reader" || b.Target.SystemNamespaceUID != planSystemUID {
+		t.Errorf("the plan is read as %q and binds farcast-system %q; want the reader's %s", b.ClusterIdentity, b.Target.SystemNamespaceUID, planSystemUID)
+	}
+	var reads []string
+	for _, r := range s.Requests() {
+		if r.As != "reader" {
+			t.Errorf("build --plan sent %s %s as %q; want the reader alone", r.Method, r.Path, r.As)
+		}
+		if r.Path != "/token" {
+			reads = append(reads, r.Method+" "+r.Path)
+		}
+	}
+	if want := []string{"GET /api/v1/namespaces", "GET " + builderAccountPath}; !slices.Equal(reads, want) {
+		t.Errorf("build --plan read %q; want farcast-system's uid, then the builder's ServiceAccount", reads)
+	}
+	if !slices.Equal(row.fakes.readers, []kube.Identity{kube.Reader}) || row.fakes.writers != 0 {
+		t.Errorf("build --plan opened its reader seam as %v and the writer %d times", row.fakes.readers, row.fakes.writers)
+	}
+
+	// --confirm recomputes as the reader, then opens the writer, which the
+	// row refuses.
+	sent := len(s.Requests())
+	cmd := withFlags(t, row.cmd(), append(slices.Clone(row.flags), "--confirm", doc.Digest)...)
+	env, _, _ := testEnvBoth(dir, output.ModeJSON)
+	if err := cmd.Run(t.Context(), env, row.args); err == nil || !strings.Contains(err.Error(), "test: a plan opened the writer") {
+		t.Fatalf("build --confirm = %v; want it past the comparison, at the writer's open", err)
+	}
+	if !slices.ContainsFunc(s.Requests()[sent:], func(r kubetest.Request) bool { return r.As == "reader" && r.Path == builderAccountPath }) {
+		t.Error("build --confirm's recomputation did not read the builder's ServiceAccount as the reader")
+	}
+	if !slices.Equal(row.fakes.readers, []kube.Identity{kube.Reader, kube.Reader}) || row.fakes.writers != 1 {
+		t.Errorf("build --confirm opened its reader seam as %v and the writer %d times; want the reader again, then the writer", row.fakes.readers, row.fakes.writers)
+	}
+
+	// --yes reads through the writer.
+	d := config.Dir(t.TempDir())
+	meteringInstance(t, d, "p42")
+	fj := &fakeJobs{accounts: fixtureAccounts(), result: succeeded("sha256:" + strings.Repeat("c", 64))}
+	c := buildCmd(fj)
+	readers := 0
+	c.newPlanReader = func(clusterRef) (buildPlanReader, error) {
+		readers++
+		return nil, errors.New("test: an interactive build opened its plan's reader")
+	}
+	c.repo, c.app, c.builderImage = "https://github.com/example/repo.git", "api", builderDigest
+	env, _ = testEnv(d, output.ModeJSON)
+	if err := c.Run(t.Context(), env, []string{"p42"}); err != nil {
+		t.Fatal(err)
+	}
+	if readers != 0 || fj.metaReads != 1 || fj.uidReads != 1 {
+		t.Errorf("build --yes opened the reader %d times; the writer read the account %d times and farcast-system %d times; want the writer's, once each", readers, fj.metaReads, fj.uidReads)
+	}
 }

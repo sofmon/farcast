@@ -528,8 +528,9 @@ func TestReaderGrantNeedsATerminal(t *testing.T) {
 	}
 }
 
-// The consent prompt is design §7.2 step 4's, word for word, naming the
-// account, the instance, today's metered namespaces and every ConfigMap; a
+// The consent prompt is design §7.2 step 4's, word for word, as §33 (A33-16)
+// amends it, naming the account, the instance, today's metered namespaces,
+// every ConfigMap and, in farcast-system alone, the two ServiceAccounts; a
 // "no" applies, sends and records nothing.
 func TestReaderGrantAsksBeforeItApplies(t *testing.T) {
 	f := newGrantFixture(t, false, grantRBAC(t))
@@ -540,7 +541,8 @@ func TestReaderGrantAsksBeforeItApplies(t *testing.T) {
 	want := "Grant " + grantEmail + ", which the Cloud Shell script gave roles/container.clusterViewer, read access in \"atlas\"'s cluster: " +
 		"namespaces (list); in farcast-system and every namespace the kernel meters, now and later (today farcast-system, web): " +
 		"deployments, statefulsets, jobs, pods and their logs, and the ConfigMaps technocore-namespaces, technocore-ledger, " +
-		"technocore-profiles, fatline-egress-policy, datasphered-pin? [y/N]: Aborted.\n"
+		"technocore-profiles, fatline-egress-policy, datasphered-pin; in farcast-system alone, the ServiceAccounts datasphered, " +
+		"farcast-builder (their uid, which a grant names)? [y/N]: Aborted.\n"
 	if got := f.errb.String(); got != want {
 		t.Errorf("stderr:\n got %q\nwant %q", got, want)
 	}
@@ -751,7 +753,11 @@ func (f *grantFixture) grantOpens() (readers, appliers func() int) {
 // never asks whether stdin is a terminal, opens neither the reader nor the
 // writer, sends nothing and writes nothing; it binds the reader, its role and
 // its grant, then a write for each document of the RBAC it would apply, in
-// order, each with the hash of exactly the bytes apply would send.
+// order, each with the hash of exactly the bytes apply would send. Since ADR
+// 0023 M2.8 (A33-16) the grant names two ServiceAccounts in farcast-system,
+// and the writes are 5 and 1 more per namespace bound: the Role and the
+// RoleBinding farcast-reader-serviceaccounts come after the rule set and
+// before the per-namespace bindings.
 func TestReaderGrantPlanReadsNoClusterAndNeedsNoTerminal(t *testing.T) {
 	for _, mode := range []output.Mode{output.ModeJSON, output.ModeHuman} {
 		t.Run(fmt.Sprintf("mode %d", mode), func(t *testing.T) {
@@ -783,12 +789,16 @@ func TestReaderGrantPlanReadsNoClusterAndNeedsNoTerminal(t *testing.T) {
 			want.Facts = append([]plan.Fact{plan.ReaderFact{
 				Type: plan.TypeReader, Email: grantEmail, IAMRole: "roles/container.clusterViewer", Scope: "metered",
 				Namespaces: grantMetered, Resources: []string{"deployments", "statefulsets", "pods", "pods/log", "jobs"},
-				ConfigMaps: []string{"technocore-namespaces", "technocore-ledger", "technocore-profiles", "fatline-egress-policy", "datasphered-pin"},
+				ConfigMaps:      []string{"technocore-namespaces", "technocore-ledger", "technocore-profiles", "fatline-egress-policy", "datasphered-pin"},
+				ServiceAccounts: []string{"datasphered", "farcast-builder"},
 			}}, wantWrites(t, stream)...)
 			if mode == output.ModeHuman {
 				for _, line := range []string{
 					"farcast reader grant atlas, stage -, reading the cluster as none\n",
 					"reader: " + grantEmail + " (roles/container.clusterViewer), scope metered: deployments, statefulsets, pods, pods/log, jobs in farcast-system, web;",
+					"datasphered-pin; in farcast-system, the ServiceAccounts datasphered, farcast-builder (their uid)\n",
+					"write: apply Role farcast-system/farcast-reader-serviceaccounts (rbac.authorization.k8s.io/v1), force: yes, sha256 ",
+					"write: apply RoleBinding farcast-system/farcast-reader-serviceaccounts (rbac.authorization.k8s.io/v1), force: yes, sha256 ",
 					"write: apply RoleBinding web/farcast-reader (rbac.authorization.k8s.io/v1), force: yes, sha256 ",
 					"\ndigest: " + plan.DigestOf([]byte(mustCanonical(t, want))) + "\n",
 				} {
@@ -802,11 +812,16 @@ func TestReaderGrantPlanReadsNoClusterAndNeedsNoTerminal(t *testing.T) {
 			if got := string(doc.Bound); got != mustCanonical(t, want) {
 				t.Errorf("the plan binds\n%s\nwant\n%s", got, mustCanonical(t, want))
 			}
-			if got := writeTargets(decodedBound(t, doc)); !slices.Equal(got, []string{
+			got := writeTargets(decodedBound(t, doc))
+			if !slices.Equal(got, []string{
 				"ClusterRole /farcast-reader-namespaces", "ClusterRoleBinding /farcast-reader-namespaces", "ClusterRole /farcast-reader",
+				"Role farcast-system/farcast-reader-serviceaccounts", "RoleBinding farcast-system/farcast-reader-serviceaccounts",
 				"RoleBinding farcast-system/farcast-reader", "RoleBinding web/farcast-reader",
 			}) {
 				t.Errorf("the plan writes %q", got)
+			}
+			if len(got) != 5+len(grantMetered) {
+				t.Errorf("the plan makes %d writes; want 5 and 1 per namespace bound (%q), %d", len(got), grantMetered, 5+len(grantMetered))
 			}
 		})
 	}

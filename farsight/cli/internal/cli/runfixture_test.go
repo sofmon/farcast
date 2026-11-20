@@ -30,6 +30,7 @@ import (
 	fldeploy "github.com/sofmon/farcast/fatline/deploy"
 	"github.com/sofmon/farcast/fatline/policy"
 	"github.com/sofmon/farcast/manifest/parser"
+	"github.com/sofmon/farcast/planck"
 	pbuild "github.com/sofmon/farcast/planck/build"
 	pfetch "github.com/sofmon/farcast/planck/fetch"
 	"github.com/sofmon/farcast/technocore/cost"
@@ -80,7 +81,8 @@ func runOtherPolicy() *policy.Document {
 
 // runSeed is what runFixture's cluster holds (A28-11), each Job and pod at
 // a fixed uid:
-//   - farcast-system, at planSystemUID;
+//   - farcast-system, at planSystemUID, and the builder's ServiceAccount in
+//     it, at fixtureBuilderUID (runSeedOf);
 //   - the kernel's ledger, saved through its own ConfigMapStore, valid and
 //     below the limit, observed at freshAt, which runClock reads as fresh;
 //   - runOtherPolicy, the egress policy;
@@ -100,6 +102,14 @@ func runOtherPolicy() *policy.Document {
 // reads neither.
 func runSeed(t *testing.T, target bool) func(s *kubetest.Server) {
 	t.Helper()
+	return runSeedOf(t, target, true)
+}
+
+// runSeedOf is runSeed, with the builder's ServiceAccount in farcast-system
+// at its fixture uid when builder holds, as a kernel deploy or a build
+// leaves it, and without it otherwise (design §33, A33-20).
+func runSeedOf(t *testing.T, target, builder bool) func(s *kubetest.Server) {
+	t.Helper()
 	ledger := savedCheckpoint(t, cost.LevelOK.String(), freshAt)
 	body, err := runOtherPolicy().Marshal()
 	if err != nil {
@@ -107,6 +117,9 @@ func runSeed(t *testing.T, target bool) func(s *kubetest.Server) {
 	}
 	return func(s *kubetest.Server) {
 		systemNamespace(s)
+		if builder {
+			serviceAccountIn(s, pbuild.ServiceAccount, fixtureBuilderUID)
+		}
 		for _, cm := range []struct{ ns, name, key, value string }{
 			{tcdeploy.DefaultNamespace, kernel.DefaultCheckpointName, kernel.CheckpointKey(), ledger},
 			{fldeploy.DefaultNamespace, fldeploy.PolicyConfigMap, fldeploy.PolicyKey, string(body)},
@@ -221,6 +234,10 @@ func runWithFakes(f *planFakes) func() Command {
 			return cl, nil
 		}
 		c.newBuilder = func(func(string)) imageBuilder { return f.builder }
+		c.openProvider = func(*config.InstanceMetadata, *config.InstanceCredentials) (planck.Provider, error) {
+			f.opened++
+			return f.provider, nil
+		}
 		c.newKeyholder = func(context.Context, *Env, string) (sealStateClient, func(), error) {
 			f.keyholders++
 			return nil, nil, errors.New("test: a plan opened the keyholder")
@@ -584,8 +601,10 @@ func answeredLog() (kubetest.Option, func() []answeredRequest) {
 // TestConfirmRecomputesAsThePlansIdentity's run cases (A23-47, A23-50, rows
 // 76 and 76a), against runFixture through run's real reader and writer.
 //
-// run <F>: --confirm with the fetch plan's digest applies the read as the
-// writer — its token and its preflight first, before any apply — then one
+// run <F>: --confirm with the fetch plan's digest reads the builder's
+// ServiceAccount as the reader first (ADR 0023 M2.8, design §33 A33-22),
+// then applies the read as the writer — its token and its preflight first,
+// before any apply — then one
 // apply per document of the fetch plan, exactly its documents, each as the
 // writer with farcast's forced query (ADR 0023 M2.7, A30-31), and every
 // request after is the reader's: the Job's wait, its pod list and its log,
@@ -614,12 +633,17 @@ func runConfirmRecomputesAsThePlansIdentity(t *testing.T) {
 		}
 		confirmed := seen()[planned:]
 		writes := applyWrites(decodedBound(t, fetch))
-		want := []answeredRequest{{"writer", http.MethodPost, "/token", 0}, {"writer", http.MethodGet, "/api/v1/namespaces", 0}}
+		// The reader's read of the builder's ServiceAccount comes first,
+		// before anything bills (ADR 0023 M2.8, design §33 A33-22, OQ-C).
+		want := []answeredRequest{{"reader", http.MethodPost, "/token", 0},
+			{"reader", http.MethodGet, "/api/v1/namespaces/" + tcdeploy.DefaultNamespace + "/serviceaccounts/" + pbuild.ServiceAccount, 0},
+			{"writer", http.MethodPost, "/token", 0}, {"writer", http.MethodGet, "/api/v1/namespaces", 0}}
 		for i, w := range writes {
 			want = append(want, answeredRequest{"writer", http.MethodPatch, factPath(t, w), i})
 		}
 		if len(writes) == 0 || len(confirmed) <= len(want) || !slices.Equal(confirmed[:len(want)], want) {
-			t.Fatalf("the confirm's requests begin %+v;\nwant the writer's token, then its preflight, then one apply per document of the fetch plan\n%+v", confirmed, want)
+			t.Fatalf("the confirm's requests begin %+v;\nwant the reader's token and its read of the builder's account, then the writer's token, "+
+				"then its preflight, then one apply per document of the fetch plan\n%+v", confirmed, want)
 		}
 		for _, a := range confirmed[len(want):] {
 			if a.as != "reader" || a.applied != len(writes) {
@@ -981,6 +1005,12 @@ func runDeployNoticesAreFacts(t *testing.T) {
 	stoppedAtTheFirstApply(t, "--confirm <D>", s.Requests()[sent:])
 	if got := strings.Count(errb.String(), notice+"\n"); got != 1 {
 		t.Errorf("--confirm <D> printed the notice %d times; want once:\n%s", got, errb)
+	}
+	// The push grant's notice, the plan's last, is printed once there too
+	// (ADR 0023 M2.8, design §33 A33-22).
+	notices := noticesOf(decodedBound(t, doc))
+	if push := notices[len(notices)-1]; !strings.HasPrefix(push, msgPushGrantMissing) || strings.Count(errb.String(), push+"\n") != 1 {
+		t.Errorf("--confirm <D> printed the push grant's notice %q %d times; want once:\n%s", push, strings.Count(errb.String(), push+"\n"), errb)
 	}
 }
 

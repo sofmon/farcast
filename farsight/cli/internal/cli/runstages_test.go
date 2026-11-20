@@ -21,6 +21,7 @@ import (
 	fldeploy "github.com/sofmon/farcast/fatline/deploy"
 	"github.com/sofmon/farcast/fatline/policy"
 	"github.com/sofmon/farcast/manifest/parser"
+	"github.com/sofmon/farcast/planck"
 	pfetch "github.com/sofmon/farcast/planck/fetch"
 	"github.com/sofmon/farcast/technocore/cost"
 )
@@ -60,6 +61,11 @@ type stageRig struct {
 	kh     keyholderOpener
 	opened []kube.Identity
 	minted int
+	// fp is the provider the deploy plan reads the push grant through
+	// (design §33, A33-22), a fresh fakeProvider when nil; hideGrants
+	// hides its grant reader, a provider without the capability (MS-6).
+	fp         *fakeProvider
+	hideGrants bool
 }
 
 // newStageRig is a runnable instance whose reader 'reader grant' verified,
@@ -117,6 +123,15 @@ func (r *stageRig) cmd(flags ...string) *runCommand {
 		return runWriterWithPin{r.f, r.ps}, nil
 	}
 	c.newBuilder = func(func(string)) imageBuilder { return &fakeBuilder{} }
+	// The deploy plan's push grant reads the provider (design §33, A33-22).
+	var fp planck.Provider = r.fp
+	if r.fp == nil {
+		fp = &fakeProvider{}
+	}
+	if r.hideGrants {
+		fp = clusterOnlyProvider{fp}
+	}
+	c.openProvider = providerOf(fp)
 	c.newKeyholder = noKeyholder
 	if r.kh != nil {
 		c.newKeyholder = r.kh

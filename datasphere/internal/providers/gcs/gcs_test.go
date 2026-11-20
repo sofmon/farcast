@@ -22,7 +22,10 @@ import (
 // therefore drives the REAL adapter through a fake http.RoundTripper and
 // asserts on the exact method, URL, headers and body of every request — the
 // same discipline as the GKE registry adapter's wire tests, and with the same
-// cost: no listener, no network, no credentials, no cloud spend.
+// cost: no listener, no network, no credentials, no cloud spend. One test,
+// TestBucketGrantReplayRefusedAfterItsWriteLandedIsUnconfirmed, uses a
+// loopback listener and a real http.Transport instead: its point is how
+// net/http reports a connection the server closed after committing a write.
 //
 // Two package variables are the seams. newHTTPClient supplies the transport
 // (so credential resolution never runs) and retryBackoff collapses the retry

@@ -87,8 +87,28 @@ func (v pinReadView) NamespaceUID(ctx context.Context, name string) (string, err
 	return v.ps.NamespaceUID(ctx, name)
 }
 
-// The read-only view reads and cannot write.
-var _ pinPlanReader = pinReadView{}
+func (v pinReadView) GetMeta(ctx context.Context, k kube.Kind, namespace, name string) (kube.Object, error) {
+	return v.ps.GetMeta(ctx, k, namespace, name)
+}
+
+// The read-only view reads and cannot write; storage deploy's plan reads
+// the keyholder's ServiceAccount through it too.
+var (
+	_ pinPlanReader       = pinReadView{}
+	_ keyholderPlanReader = pinReadView{}
+)
+
+// testKeyholderPlanReader is testPinPlanReader as storage deploy's plan
+// reader seam, which also reads the keyholder's ServiceAccount (ADR 0023
+// M2.8, design §33, A33-18): the same read-only view.
+func testKeyholderPlanReader(r clusterRef) (keyholderPlanReader, error) {
+	if r.Meta == nil || r.Identity != kube.Reader {
+		return nil, fmt.Errorf("test pin reader: a plan reads the pin as the instance's reader, not %q", r.Identity)
+	}
+	ps := testPinStoreFor(r.Dir, r.Meta.Name)
+	ps.openedAs(r.Identity)
+	return pinReadView{ps}, nil
+}
 
 func init() {
 	defaultPinStore = testDefaultPinStore
@@ -112,6 +132,11 @@ type fakePinStore struct {
 	// uid and uidErr answer NamespaceUID: farcast-system's uid, "" for none.
 	uid    string
 	uidErr error
+	// accounts are the ServiceAccounts the store's farcast-system holds,
+	// by name, at their uids (accountMeta), none when nil: what GetMeta
+	// answers, as the reader or the writer reaches the same cluster (design
+	// §33, A33-18).
+	accounts map[string]string
 	// opened is the identity each open of the store asked for, in order:
 	// the writer's (testDefaultPinStore) or the reader's
 	// (testPinPlanReader).
@@ -135,6 +160,12 @@ func (f *fakePinStore) ConfigMapData(context.Context, string, string) (map[strin
 		return nil, "", false, nil
 	}
 	return map[string]string{dsdeploy.PinKey: f.value}, strconv.Itoa(f.version), true, nil
+}
+
+func (f *fakePinStore) GetMeta(_ context.Context, k kube.Kind, namespace, name string) (kube.Object, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return accountMeta(f.accounts, k, namespace, name)
 }
 
 // openedAs records an open of the store as id.
@@ -770,9 +801,10 @@ func TestRunThatCannotRaiseThePinWarnsAndDeploys(t *testing.T) {
 	}
 }
 
-// storage deploy writes the pin before anything is applied — the kernel may
-// create ConfigMaps in that namespace — and a pin it cannot write deploys
-// nothing.
+// storage deploy writes the pin before its workload is applied — the kernel
+// may create ConfigMaps in that namespace — and a pin it cannot write deploys
+// nothing of it: only the keyholder's account, which since ADR 0023 M2.8 is
+// applied first (design §33, A33-26), creates no pod.
 func TestStorageDeployWritesThePinBeforeApplying(t *testing.T) {
 	dir := config.Dir(t.TempDir())
 	deployableInstance(t, dir, "prod")
@@ -799,8 +831,8 @@ func TestStorageDeployWritesThePinBeforeApplying(t *testing.T) {
 	if err := c.Run(context.Background(), env, []string{"prod"}); err == nil || !strings.Contains(err.Error(), "nothing was deployed") {
 		t.Fatalf("deploy with an unwritable pin = %v", err)
 	}
-	if len(fc.applied) != 0 {
-		t.Error("deploy applied the keyholder without its pin")
+	if len(fc.applied) != 1 || appliedKindsOf(t, fc.applied[0]) != "Namespace/farcast-system ServiceAccount/datasphered" {
+		t.Errorf("deploy applied %d streams without its pin; want the keyholder's account alone", len(fc.applied))
 	}
 }
 
@@ -1213,16 +1245,25 @@ func foreignID(t *testing.T) datasphere.KeyID {
 
 // storageRig is storage deploy against writeInstance's fixture, its
 // material saved and its record changed by edit, as a release farcast
-// carrying the fake components: its provider, builder, writer and storage
-// mint fakes, its plan's reader the in-memory pin's read-only view, and its
-// writer's pin that same pin. The writer's cluster and the pin answer
-// farcast-system's uid u1.
+// carrying the fake components: its provider, builder, writer, storage mint
+// and bucket IAM fakes, its plan's reader the in-memory pin's read-only
+// view, and its writer's pin that same pin. The writer's cluster and the pin
+// answer farcast-system's uid u1, and hold one set of ServiceAccounts,
+// accounts, the keyholder's and the builder's at their fixture uids (design
+// §33, A33-40); an apply of an account it lacks creates it.
 type storageRig struct {
-	dir config.Dir
-	fp  *fakeProvider
-	fb  *fakeBuilder
-	fc  *fakeCluster
-	ps  *fakePinStore
+	dir      config.Dir
+	fp       *fakeProvider
+	fb       *fakeBuilder
+	fc       *fakeCluster
+	ps       *fakePinStore
+	bg       *fakeBucketGrants
+	accounts map[string]string
+	// fpOpen, when set, is what the provider opener answers in place of fp.
+	fpOpen planck.Provider
+	// openGrants, when set, is the command's bucket IAM opener in place of
+	// bg's.
+	openGrants func(context.Context, *Env, *config.InstanceMetadata) (bucketGrants, error)
 	// minted counts the storage mints, and mint is what each does (nothing
 	// when nil).
 	minted int
@@ -1252,8 +1293,10 @@ func newStorageRig(t *testing.T, edit func(meta *config.InstanceMetadata)) *stor
 	if meta.Registry != nil {
 		fp.registry = &planck.Registry{Ref: registryRefFor(meta), Prefix: meta.Registry.Prefix}
 	}
-	r := &storageRig{dir: dir, fp: fp, fb: &fakeBuilder{resolveFn: notFoundForTags}, fc: &fakeCluster{uid: "u1"}, ps: pinStoreOf(dir, writeName)}
+	r := &storageRig{dir: dir, fp: fp, fb: &fakeBuilder{resolveFn: notFoundForTags}, fc: &fakeCluster{uid: "u1"}, ps: pinStoreOf(dir, writeName),
+		bg: &fakeBucketGrants{}, accounts: fixtureAccounts()}
 	r.ps.uid = "u1"
+	r.fc.accounts, r.ps.accounts = r.accounts, r.accounts
 	return r
 }
 
@@ -1278,6 +1321,9 @@ func (r *storageRig) cmd(t *testing.T, flags ...string) *storageDeployCommand {
 	asRelease(&c.deployer, nil)
 	c.deployer.openProvider = func(*config.InstanceMetadata, *config.InstanceCredentials) (planck.Provider, error) {
 		r.opened++
+		if r.fpOpen != nil {
+			return r.fpOpen, nil
+		}
 		return r.fp, nil
 	}
 	c.deployer.newBuilder = func(func(string)) imageBuilder { return r.fb }
@@ -1292,7 +1338,11 @@ func (r *storageRig) cmd(t *testing.T, flags ...string) *storageDeployCommand {
 		return r.fc, nil
 	}
 	c.newPinStore = testDefaultPinStore
-	c.newPlanReader = testPinPlanReader
+	c.newPlanReader = testKeyholderPlanReader
+	c.openBucketGrants = r.bg.open
+	if r.openGrants != nil {
+		c.openBucketGrants = r.openGrants
+	}
 	c.ensureStorage = func(context.Context, *Env, string) error {
 		r.minted++
 		if r.mint != nil {
@@ -1311,10 +1361,10 @@ func (r *storageRig) run(t *testing.T, flags ...string) (stdout, stderr string, 
 	return out.String(), errb.String(), err
 }
 
-// plan is storage deploy's --plan.
-func (r *storageRig) plan(t *testing.T) plan.Document {
+// plan is storage deploy's --plan, with flags.
+func (r *storageRig) plan(t *testing.T, flags ...string) plan.Document {
 	t.Helper()
-	stdout, stderr, err := r.run(t, "--plan")
+	stdout, stderr, err := r.run(t, append([]string{"--plan"}, flags...)...)
 	if err != nil {
 		t.Fatalf("storage deploy --plan: %v\n%s", err, stderr)
 	}
@@ -1322,13 +1372,42 @@ func (r *storageRig) plan(t *testing.T) plan.Document {
 }
 
 // wroteNothing fails t if the rig minted storage, ensured the registry,
-// pushed or built an image, or applied anything.
+// pushed or built an image, applied anything, or wrote a bucket's policy.
 func (r *storageRig) wroteNothing(t *testing.T) {
 	t.Helper()
-	if r.minted+len(r.fp.ensured)+len(r.fb.embedded)+len(r.fb.built)+len(r.fc.applied) != 0 {
-		t.Errorf("minted storage %d times, ensured %d registries, pushed %d, built %d and applied %d",
-			r.minted, len(r.fp.ensured), len(r.fb.embedded), len(r.fb.built), len(r.fc.applied))
+	_, _, sets := r.bg.counts()
+	if r.minted+len(r.fp.ensured)+len(r.fb.embedded)+len(r.fb.built)+len(r.fc.applied)+sets != 0 {
+		t.Errorf("minted storage %d times, ensured %d registries, pushed %d, built %d, applied %d and wrote %d bucket policies",
+			r.minted, len(r.fp.ensured), len(r.fb.embedded), len(r.fb.built), len(r.fc.applied), sets)
 	}
+}
+
+// accountOnly fails t unless the rig applied the keyholder's account alone
+// (the Namespace and its ServiceAccount, A33-26's step 2a) and no other
+// stream, and wrote no pin and no keyholder record.
+func (r *storageRig) accountOnly(t *testing.T) {
+	t.Helper()
+	if len(r.fc.applied) != 1 || appliedKindsOf(t, r.fc.applied[0]) != "Namespace/farcast-system ServiceAccount/datasphered" {
+		t.Errorf("applied %d streams; want the keyholder's account alone", len(r.fc.applied))
+	}
+	if after, err := r.dir.LoadInstanceMetadata(writeName); err != nil || (after.Keyholder != nil && after.Keyholder.Image != "") {
+		t.Errorf("recorded the keyholder %+v (%v)", after.Keyholder, err)
+	}
+}
+
+// appliedKindsOf is the documents one applied stream holds, as
+// "Kind/name", in its order, space-separated.
+func appliedKindsOf(t *testing.T, stream []byte) string {
+	t.Helper()
+	docs, err := kube.SplitStream(stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, d := range docs {
+		out = append(out, d.Kind.Kind+"/"+d.Name)
+	}
+	return strings.Join(out, " ")
 }
 
 // ADR 0023 M2.6 (A23-42, A23-23, row 86): under --confirm the pin is
@@ -1359,20 +1438,23 @@ func TestConfirmNeverWritesAPinThePlanDidNotList(t *testing.T) {
 			t.Errorf("the pin is %s at version %d; want the other writer's %s, written once", ps.value, ps.version, other)
 		}
 	})
+	// storage deploy's refusal also says what it wrote before the pin, the
+	// keyholder's account, its registry and its image (ADR 0023 M2.8, design
+	// §33, A33-26), and applies nothing more.
 	t.Run("storage deploy", func(t *testing.T) {
 		r := newStorageRig(t, nil)
 		doc := r.plan(t)
 		other := raise(t, r.ps)
 		_, _, err := r.run(t, "--confirm", doc.Digest)
-		if err == nil || err.Error() != msgPinChanged || kindOf(classified(err)) != kindPlanChanged {
-			t.Fatalf("--confirm over another writer's pin = %v (kind %s); want plan_changed, %q", err, kindOf(classified(err)), msgPinChanged)
+		want := strings.TrimSuffix(msgPinChanged, msgPlanAgain) + "the keyholder's ServiceAccount farcast-system/datasphered was applied, " +
+			"the instance's registry was ensured and recorded, the keyholder's image was pushed to the instance's registry, and nothing else was written; " + msgPlanAgain
+		if err == nil || err.Error() != want || kindOf(classified(err)) != kindPlanChanged {
+			t.Fatalf("--confirm over another writer's pin = %v (kind %s); want plan_changed, %q", err, kindOf(classified(err)), want)
 		}
 		if r.ps.value != other || r.ps.version != 1 {
 			t.Errorf("the pin is %s at version %d; want the other writer's %s, written once", r.ps.value, r.ps.version, other)
 		}
-		if len(r.fc.applied) != 0 {
-			t.Errorf("applied %d streams after the pin was refused", len(r.fc.applied))
-		}
+		r.accountOnly(t)
 		if after, err := r.dir.LoadInstanceMetadata(writeName); err != nil || after.Keyholder.Image != "" {
 			t.Errorf("recorded the keyholder %+v (%v) after the pin was refused", after.Keyholder, err)
 		}
@@ -1482,8 +1564,8 @@ func TestConfirmPinThatLandedButLostItsAnswerSucceeds(t *testing.T) {
 		if _, stderr, err := r.run(t, "--confirm", doc.Digest); err != nil {
 			t.Fatalf("--confirm whose pin write lost its answer = %v\n%s", err, stderr)
 		}
-		if r.ps.version != 1 || len(r.fc.applied) != 1 {
-			t.Errorf("the pin was written %d times and %d streams applied; want once each", r.ps.version, len(r.fc.applied))
+		if r.ps.version != 1 || len(r.fc.applied) != 2 {
+			t.Errorf("the pin was written %d times and %d streams applied; want once, and the account and the workload", r.ps.version, len(r.fc.applied))
 		}
 		if got := r.ps.openedBy(); !slices.Equal(got, opens) || r.writers != 1 {
 			t.Errorf("the pin was opened as %v and the writer %d times; want %v, and the writer once", got, r.writers, opens)
@@ -1533,9 +1615,7 @@ func TestConfirmPinNon409FailureKeepsItsKind(t *testing.T) {
 		if kind := kindOf(classified(err)); err == nil || kind != kindClusterRejected || !strings.Contains(err.Error(), "the key pin could not be written, so nothing was deployed") {
 			t.Fatalf("--confirm whose pin write failed = %v (kind %s); want its own kind, %s", err, kind, kindClusterRejected)
 		}
-		if len(r.fc.applied) != 0 {
-			t.Errorf("applied %d streams after the pin failed", len(r.fc.applied))
-		}
+		r.accountOnly(t)
 	})
 	// With no keyring here the plan creates the empty pin. A create that
 	// failed reads back absent, which is not the empty pin written (row O33
@@ -1547,17 +1627,18 @@ func TestConfirmPinNon409FailureKeepsItsKind(t *testing.T) {
 			t.Fatal(err)
 		}
 		doc := r.plan(t)
-		if w := planWrites(decodedBound(t, doc)); len(w) == 0 || w[0].(plan.WriteFact).Name != dsdeploy.PinConfigMapName("") || w[0].(plan.WriteFact).Method != plan.WriteCreate {
-			t.Fatalf("the plan's first write is %+v; want the empty pin's create", w)
+		if w := pinWriteFact(decodedBound(t, doc)); w == nil || w.Method != plan.WriteCreate {
+			t.Fatalf("the plan's pin write is %+v; want the empty pin's create", w)
 		}
 		r.ps.failWrite = failed
 		_, _, err := r.run(t, "--confirm", doc.Digest)
 		if kind := kindOf(classified(err)); err == nil || kind != kindClusterRejected || !strings.Contains(err.Error(), "the key pin could not be written, so nothing was deployed") {
 			t.Fatalf("--confirm whose empty pin's create failed = %v (kind %s); want its own kind, %s", err, kind, kindClusterRejected)
 		}
-		if r.ps.exists || len(r.fc.applied) != 0 {
-			t.Errorf("the pin exists: %v, and %d streams were applied; want neither", r.ps.exists, len(r.fc.applied))
+		if r.ps.exists {
+			t.Errorf("the pin exists: %s", r.ps.value)
 		}
+		r.accountOnly(t)
 	})
 	// rotate's two pins: the hold's failure stops the rotation with the new
 	// keys held, and the final pin's leaves them in use; either is the
@@ -1760,7 +1841,7 @@ func TestStorageDeployWithNoKeyringKeepsAReadablePin(t *testing.T) {
 			r.ps.set(held.Marshal())
 			doc := r.plan(t)
 			b := decodedBound(t, doc)
-			if f := pinFactOf(t, b); !pinOfFact(t, f).Equal(held) || len(planWrites(b)) == 0 || planWrites(b)[0].(plan.WriteFact).Kind == "ConfigMap" {
+			if f := pinFactOf(t, b); !pinOfFact(t, f).Equal(held) || len(planWrites(b)) == 0 || pinWriteFact(b) != nil {
 				t.Fatalf("the plan binds the pin %+v and the writes %+v; want the readable pin kept, and no pin write", f, planWrites(b))
 			}
 			flags := []string{"--yes"}
@@ -1770,7 +1851,7 @@ func TestStorageDeployWithNoKeyringKeepsAReadablePin(t *testing.T) {
 			if _, stderr, err := r.run(t, flags...); err != nil {
 				t.Fatalf("storage deploy %s: %v\n%s", answer, err, stderr)
 			}
-			if r.ps.value != held.Marshal() || r.ps.version != 1 || len(r.fc.applied) != 1 {
+			if r.ps.value != held.Marshal() || r.ps.version != 1 || len(r.fc.applied) != 2 {
 				t.Errorf("the pin is %s at version %d, with %d streams applied; want the readable pin untouched, and the keyholder applied", r.ps.value, r.ps.version, len(r.fc.applied))
 			}
 		})

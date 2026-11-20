@@ -45,6 +45,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"text/template"
 )
@@ -150,34 +151,56 @@ func (c *Config) withDefaults() {
 	}
 }
 
-// Render produces the Kubernetes apply stream (Namespace, Secret, StatefulSet,
-// PodDisruptionBudget, and the data/status/unseal Services) as multi-document
-// YAML, applied in stream order.
+// Render produces the Kubernetes apply stream (Namespace, ServiceAccount,
+// Secret, NetworkPolicy, StatefulSet, PodDisruptionBudget, and the
+// data/status/unseal Services) as multi-document YAML, applied in stream
+// order. It checks the whole Config first, then is exactly RenderAccount's
+// documents, a "---" line, and RenderWorkload's.
 func Render(c Config) ([]byte, error) {
 	c.withDefaults()
-	if c.Image == "" {
-		return nil, errors.New("deploy: datasphered image is required")
+	if err := c.validate(); err != nil {
+		return nil, err
 	}
-	// A tag is a mutable pointer the registry's owner can re-aim. The one
-	// in-cluster component that holds key material is the last place to accept
-	// "whatever :latest means today", so the pin is enforced here rather than
-	// left to the caller's discipline (ADR 0008 decision 1).
-	if !hasDigest(c.Image) {
-		return nil, fmt.Errorf("deploy: datasphered image %q is not digest-pinned (want repo@sha256:<64 hex>)", c.Image)
+	account, err := RenderAccount(c)
+	if err != nil {
+		return nil, err
 	}
-	if len(c.CACertPEM) == 0 || len(c.ServerCertPEM) == 0 || len(c.ServerKeyPEM) == 0 {
-		return nil, errors.New("deploy: incomplete mTLS material (need CA cert + server leaf+key)")
+	workload, err := RenderWorkload(c)
+	if err != nil {
+		return nil, err
 	}
-	// A keyholder with no bucket would start, pass its probes and refuse every
-	// write, so the omission is caught here rather than in the cluster.
-	if c.Instance == "" || c.Bucket == "" {
-		return nil, errors.New("deploy: datasphered needs both an instance and a bucket to serve")
+	out := append(account, "---\n"...)
+	return append(out, workload...), nil
+}
+
+// RenderAccount produces the stream's first two documents alone: the
+// Namespace and the keyholder's ServiceAccount (ADR 0023 M2.8, design §33,
+// A33-26). storage deploy applies them before anything else, because the
+// bucket grant names the ServiceAccount by the uid the API server gives it,
+// and the keyholder must not start before its grant. Neither document
+// depends on the image, the mTLS material or the bucket, so only the
+// namespace and the name are checked: at that point the image is not yet
+// realized and the server leaf not yet issued.
+func RenderAccount(c Config) ([]byte, error) {
+	c.withDefaults()
+	if err := c.validateNames(); err != nil {
+		return nil, err
 	}
-	if c.Replicas < 1 {
-		return nil, fmt.Errorf("deploy: replicas must be at least 1, got %d", c.Replicas)
+	var buf bytes.Buffer
+	if err := accountTemplate.Execute(&buf, templateData{Namespace: c.Namespace, Name: c.Name}); err != nil {
+		return nil, fmt.Errorf("deploy: render the keyholder's account: %w", err)
 	}
-	if c.DataPort == c.StatusPort || c.DataPort == c.UnsealPort || c.StatusPort == c.UnsealPort {
-		return nil, fmt.Errorf("deploy: data (%d), status (%d) and unseal (%d) ports must differ", c.DataPort, c.StatusPort, c.UnsealPort)
+	return buf.Bytes(), nil
+}
+
+// RenderWorkload produces the rest of the stream, every document after the
+// ServiceAccount, once the whole Config checks: the mTLS Secret, the
+// NetworkPolicy, the StatefulSet, its PodDisruptionBudget and the three
+// Services.
+func RenderWorkload(c Config) ([]byte, error) {
+	c.withDefaults()
+	if err := c.validate(); err != nil {
+		return nil, err
 	}
 
 	data := templateData{
@@ -212,6 +235,55 @@ func Render(c Config) ([]byte, error) {
 		return nil, fmt.Errorf("deploy: render workload: %w", err)
 	}
 	return buf.Bytes(), nil
+}
+
+// dnsLabel is an RFC 1123 label: what a Kubernetes namespace and every object
+// name derived here must be.
+var dnsLabel = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
+
+// validateNames checks the namespace and the name, the only fields the
+// account's documents carry, after withDefaults.
+func (c Config) validateNames() error {
+	for _, v := range []struct{ field, value string }{{"namespace", c.Namespace}, {"name", c.Name}} {
+		if len(v.value) > 63 || !dnsLabel.MatchString(v.value) {
+			return fmt.Errorf("deploy: datasphered's %s %q is not a DNS label", v.field, v.value)
+		}
+	}
+	return nil
+}
+
+// validate checks the whole Config, after withDefaults: the names, the
+// image's digest, the mTLS material, the storage target, the replicas and
+// the ports.
+func (c Config) validate() error {
+	if err := c.validateNames(); err != nil {
+		return err
+	}
+	if c.Image == "" {
+		return errors.New("deploy: datasphered image is required")
+	}
+	// A tag is a mutable pointer the registry's owner can re-aim. The one
+	// in-cluster component that holds key material is the last place to accept
+	// "whatever :latest means today", so the pin is enforced here rather than
+	// left to the caller's discipline (ADR 0008 decision 1).
+	if !hasDigest(c.Image) {
+		return fmt.Errorf("deploy: datasphered image %q is not digest-pinned (want repo@sha256:<64 hex>)", c.Image)
+	}
+	if len(c.CACertPEM) == 0 || len(c.ServerCertPEM) == 0 || len(c.ServerKeyPEM) == 0 {
+		return errors.New("deploy: incomplete mTLS material (need CA cert + server leaf+key)")
+	}
+	// A keyholder with no bucket would start, pass its probes and refuse every
+	// write, so the omission is caught here rather than in the cluster.
+	if c.Instance == "" || c.Bucket == "" {
+		return errors.New("deploy: datasphered needs both an instance and a bucket to serve")
+	}
+	if c.Replicas < 1 {
+		return fmt.Errorf("deploy: replicas must be at least 1, got %d", c.Replicas)
+	}
+	if c.DataPort == c.StatusPort || c.DataPort == c.UnsealPort || c.StatusPort == c.UnsealPort {
+		return fmt.Errorf("deploy: data (%d), status (%d) and unseal (%d) ports must differ", c.DataPort, c.StatusPort, c.UnsealPort)
+	}
+	return nil
 }
 
 // PinConfigMapName names the ConfigMap that holds a keyholder's key pin.
@@ -330,18 +402,20 @@ type templateData struct {
 	RequestMemMiB   int
 }
 
-// workloadTemplate renders the keyholder. The Namespace document is
+// accountTemplate renders the stream's first two documents, the Namespace and
+// the keyholder's ServiceAccount (RenderAccount). The Namespace document is
 // deliberately byte-identical to FatLine's: both modules own their own
 // deployment shape and either stream may be applied first, so the shared
 // document has to converge rather than fight — identical content makes the
 // second apply a no-op instead of a field-ownership tug-of-war.
 //
-// The NetworkPolicy comes before the StatefulSet, because a stream stopped
-// part-way (farcast interrupted, or since ADR 0023 M2.7 the in-process apply
-// at its first failing document, design D3) leaves what came before it, so a
-// policy after its workload could leave the keyholder's pods running without
-// it.
-var workloadTemplate = template.Must(template.New("datasphered").Parse(`apiVersion: v1
+// Since ADR 0023 M2.8 (design §33, A33-4) the bucket grant names this
+// ServiceAccount by the uid the API server gave it, not by its namespace and
+// name: the principal a name makes is shared by every instance in the
+// project's Workload Identity pool. A ServiceAccount deleted and created
+// again therefore needs its grant again. The uid principal on a bucket's
+// policy is unverified until the M2 walk.
+var accountTemplate = template.Must(template.New("datasphered-account").Parse(`apiVersion: v1
 kind: Namespace
 metadata:
   name: {{.Namespace}}
@@ -367,8 +441,17 @@ metadata:
   labels:
     app.kubernetes.io/name: {{.Name}}
     app.kubernetes.io/managed-by: farcast
----
-apiVersion: v1
+`))
+
+// workloadTemplate renders the rest of the keyholder, after its
+// ServiceAccount (RenderWorkload).
+//
+// The NetworkPolicy comes before the StatefulSet, because a stream stopped
+// part-way (farcast interrupted, or since ADR 0023 M2.7 the in-process apply
+// at its first failing document, design D3) leaves what came before it, so a
+// policy after its workload could leave the keyholder's pods running without
+// it.
+var workloadTemplate = template.Must(template.New("datasphered").Parse(`apiVersion: v1
 kind: Secret
 metadata:
   name: {{.SecretName}}

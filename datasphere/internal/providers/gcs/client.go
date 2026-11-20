@@ -38,8 +38,9 @@ const (
 	uploadAPIBase = "https://storage.googleapis.com/upload/storage/v1/"
 
 	// storageScope is the narrowest OAuth2 scope covering bucket
-	// create/get/patch/delete plus object CRUD. cloud-platform would work and
-	// would also hand this token every other API in the project.
+	// create/get/patch/delete, a bucket's IAM policy (iam.go), plus object
+	// CRUD. cloud-platform would work and would also hand this token every
+	// other API in the project.
 	storageScope = "https://www.googleapis.com/auth/devstorage.full_control"
 
 	// maxResponseBytes caps an ordinary JSON response. A bucket resource and an
@@ -138,6 +139,12 @@ type reply struct {
 	status int
 	header http.Header
 	body   []byte
+	// unsettled is whether an earlier attempt of the same request failed in
+	// transport, failed reading its body, or got a status of 500 or more:
+	// the server may have processed it, and the final reply answers only
+	// the replay. A 429 does not set it, since the server did not process
+	// that attempt. Only putPolicy (iam.go) reads it.
+	unsettled bool
 }
 
 // send issues one request with retries, returning the final reply. body may be
@@ -148,9 +155,15 @@ func (p *provider) send(ctx context.Context, method, target, contentType string,
 	if err != nil {
 		return nil, err
 	}
+	return sendVia(ctx, hc, method, target, contentType, body, limit)
+}
 
+// sendVia is send through hc, for a request that needs a client of its own
+// (iam.go's, which follows no redirect).
+func sendVia(ctx context.Context, hc *http.Client, method, target, contentType string, body []byte, limit int64) (*reply, error) {
 	backoff := retryBackoff
 	var lastErr error
+	unsettled := false
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {
 			if err := sleepWithContext(ctx, jitter(backoff)); err != nil {
@@ -182,7 +195,7 @@ func (p *provider) send(ctx context.Context, method, target, contentType string,
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
-			lastErr = err
+			lastErr, unsettled = err, true
 			continue
 		}
 		// Read one byte past the cap so that hitting it is detectable. A
@@ -196,17 +209,18 @@ func (p *provider) send(ctx context.Context, method, target, contentType string,
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
-			lastErr = fmt.Errorf("read response: %w", readErr)
+			lastErr, unsettled = fmt.Errorf("read response: %w", readErr), true
 			continue
 		}
 		if retryableStatus(resp.StatusCode) {
 			lastErr = parseAPIError(resp.StatusCode, data)
+			unsettled = unsettled || resp.StatusCode >= 500
 			continue
 		}
 		if int64(len(data)) > limit {
 			return nil, fmt.Errorf("gcs: response body exceeds the %d-byte cap; refusing to return a truncated body", limit)
 		}
-		return &reply{status: resp.StatusCode, header: resp.Header, body: data}, nil
+		return &reply{status: resp.StatusCode, header: resp.Header, body: data, unsettled: unsettled}, nil
 	}
 	return nil, fmt.Errorf("gcs: giving up after %d attempts: %w", maxAttempts, lastErr)
 }
@@ -234,6 +248,12 @@ func (p *provider) doJSONLimit(ctx context.Context, method, target string, in, o
 	if err != nil {
 		return err
 	}
+	return decodeReply(rep, out)
+}
+
+// decodeReply returns a non-2xx reply as its *apiError, and decodes a 2xx
+// one into out (nil to discard it).
+func decodeReply(rep *reply, out any) error {
 	if !okStatus(rep.status) {
 		return parseAPIError(rep.status, rep.body)
 	}

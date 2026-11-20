@@ -102,3 +102,37 @@ func (t RegistryToken) String() string {
 	return fmt.Sprintf("RegistryToken{Username:%s Password:%s Expiry:%s}",
 		t.Username, pw, t.Expiry.Format(time.RFC3339))
 }
+
+// GrantState is what a read of an IAM policy says about one principal's
+// grant (design §33, A33-12).
+type GrantState string
+
+// The grant states. GrantUnknown is a policy the credential may not read.
+const (
+	GrantPresent GrantState = "present"
+	GrantMissing GrantState = "missing"
+	GrantUnknown GrantState = "unknown"
+)
+
+// GrantReader is an optional, read-only capability (design §33): what the
+// instance's registry grants. Callers type-assert it on a Provider, as they
+// assert RegistryProvider, and a provider without it leaves every grant
+// unknown. RegistryProvider stays three methods wide.
+//
+// It reads and never writes. The builder's push grant is printed for a human
+// to run and never applied: push access to the one registry the instance runs
+// from is a decision for a human, once.
+type GrantReader interface {
+	// ProjectNumber is the number of the provider's project, which the
+	// principals of its workload identities are named by. It is read on each
+	// call and never recorded, so a hand-edited record cannot steer it.
+	ProjectNumber(ctx context.Context) (int64, error)
+
+	// RegistryGrant reads the IAM policy of the registry ref names, as
+	// DeleteRegistry resolves it, once. state is member's: GrantPresent when
+	// a binding of role with no condition holds it. sharedState is the same
+	// observation of shared, the principal every instance in the project
+	// shares. A binding with a condition never counts. A policy the
+	// credential may not read is GrantUnknown for both, with no error.
+	RegistryGrant(ctx context.Context, ref RegistryRef, role, member, shared string) (state, sharedState GrantState, err error)
+}

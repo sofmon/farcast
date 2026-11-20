@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"go/ast"
 	goparser "go/parser"
 	"go/printer"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -23,6 +25,8 @@ import (
 	"github.com/sofmon/farcast/farsight/cli/internal/kube/kubetest"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
 	fldeploy "github.com/sofmon/farcast/fatline/deploy"
+	pbuild "github.com/sofmon/farcast/planck/build"
+	pfetch "github.com/sofmon/farcast/planck/fetch"
 	tcdeploy "github.com/sofmon/farcast/technocore/deploy"
 	"github.com/sofmon/farcast/technocore/kernel"
 	tkube "github.com/sofmon/farcast/technocore/kube"
@@ -173,6 +177,13 @@ func TestReaderRoleNamesTheConfigMapsReadsUse(t *testing.T) {
 // namespace, in farcast-system and the metered namespaces, so it reads
 // nothing in a namespace it is not bound in, kube-system among them. kubetest,
 // authorizing the reader with the rendered stream alone, agrees.
+//
+// Since ADR 0023 M2.8 (design §33, A33-16, mutation 128) the reader also gets
+// two ServiceAccounts, by name, through a Role and a RoleBinding of its own,
+// both farcast-reader-serviceaccounts, in farcast-system alone: never a rule
+// of farcast-reader, which is bound in every metered namespace. So it may get
+// datasphered and farcast-builder there and nowhere else, and no other
+// ServiceAccount, and it may list none.
 func TestReaderRBACBindsOnlyNamespacesClusterWide(t *testing.T) {
 	const name = "atlas"
 	email := readerName(name) + "@kubetest.invalid"
@@ -182,7 +193,9 @@ func TestReaderRBACBindsOnlyNamespacesClusterWide(t *testing.T) {
 	}
 	docs := rbacDocs(t, stream)
 
-	var clusterBindings, bindings []rbacDoc
+	// saRoles and saBindings are the ServiceAccounts' Role and RoleBinding,
+	// set apart from farcast-reader's bindings.
+	var clusterBindings, bindings, saRoles, saBindings []rbacDoc
 	roles := map[string]rbacDoc{}
 	for _, d := range docs {
 		if d.Metadata.Labels["app.kubernetes.io/managed-by"] != "farcast" || d.Metadata.Labels["app.kubernetes.io/part-of"] != "farcast-reader" {
@@ -192,7 +205,13 @@ func TestReaderRBACBindsOnlyNamespacesClusterWide(t *testing.T) {
 		case "ClusterRoleBinding":
 			clusterBindings = append(clusterBindings, d)
 		case "RoleBinding":
+			if d.Metadata.Name == readerServiceAccountsRole {
+				saBindings = append(saBindings, d)
+				continue
+			}
 			bindings = append(bindings, d)
+		case "Role":
+			saRoles = append(saRoles, d)
 		case "ClusterRole":
 			roles[d.Metadata.Name] = d
 		default:
@@ -243,8 +262,42 @@ func TestReaderRBACBindsOnlyNamespacesClusterWide(t *testing.T) {
 		t.Errorf("the per-namespace role is\n%+v\nwant\n%+v", got, want)
 	}
 
-	// The same stream, as kubetest's authorizer reads it.
+	// The ServiceAccounts' read: exactly one Role and one RoleBinding of that
+	// name, in farcast-system, the binding of that Role to the reader, and
+	// the Role's one rule naming the two accounts.
+	if len(saRoles) != 1 || len(saBindings) != 1 {
+		t.Fatalf("%d Roles and %d RoleBindings %s; want one of each", len(saRoles), len(saBindings), readerServiceAccountsRole)
+	}
+	saRole, saBinding := saRoles[0], saBindings[0]
+	if saRole.Metadata.Name != readerServiceAccountsRole || saRole.Metadata.Namespace != tcdeploy.DefaultNamespace {
+		t.Errorf("the Role is %s in %q; want %s in %s", saRole.Metadata.Name, saRole.Metadata.Namespace, readerServiceAccountsRole, tcdeploy.DefaultNamespace)
+	}
+	var saRules []rule
+	for _, r := range saRole.Rules {
+		saRules = append(saRules, rule{strings.Join(r.APIGroups, ","), strings.Join(r.Resources, ","), strings.Join(r.Verbs, ","), strings.Join(r.ResourceNames, ",")})
+	}
+	if want := []rule{{"", "serviceaccounts", "get", "datasphered,farcast-builder"}}; !slices.Equal(saRules, want) {
+		t.Errorf("the ServiceAccounts' role is\n%+v\nwant\n%+v", saRules, want)
+	}
+	if saBinding.Metadata.Namespace != tcdeploy.DefaultNamespace || saBinding.RoleRef.APIGroup != "rbac.authorization.k8s.io" ||
+		saBinding.RoleRef.Kind != "Role" || saBinding.RoleRef.Name != readerServiceAccountsRole || !subject(saBinding) {
+		t.Errorf("the ServiceAccounts' RoleBinding is %+v", saBinding)
+	}
+
+	// The same stream, as kubetest's authorizer reads it. Every ServiceAccount
+	// probed exists, so a read that is allowed answers, and one refused is
+	// refused by the RBAC, not for want of the object.
 	s := kubetest.New(t, kubetest.WithRBAC(email, stream))
+	uids := map[string]string{dsdeploy.DefaultName: fixtureKeyholderUID, pbuild.ServiceAccount: fixtureBuilderUID}
+	for _, ns := range []string{tcdeploy.DefaultNamespace, "web", "unmetered"} {
+		for _, sa := range []string{dsdeploy.DefaultName, pbuild.ServiceAccount, pfetch.ServiceAccount, "default"} {
+			md := map[string]any{"name": sa, "namespace": ns}
+			if uid, ok := uids[sa]; ok && ns == tcdeploy.DefaultNamespace {
+				md["uid"] = uid
+			}
+			s.Put(map[string]any{"apiVersion": "v1", "kind": "ServiceAccount", "metadata": md})
+		}
+	}
 	ep, err := kube.ParseEndpoint(s.Endpoint(), "", s.CAPEM())
 	if err != nil {
 		t.Fatal(err)
@@ -284,6 +337,369 @@ func TestReaderRBACBindsOnlyNamespacesClusterWide(t *testing.T) {
 	forbidden("the confirmations ConfigMap", err)
 	_, err = kc.GetService(ctx, "farcast-system", "fatline")
 	forbidden("a Service", err)
+
+	saKind, ok := kube.KindOf("v1", "ServiceAccount")
+	if !ok {
+		t.Fatal("kube's kind table has no ServiceAccount")
+	}
+	for _, sa := range readerServiceAccounts {
+		o, err := kc.GetObject(ctx, saKind, tcdeploy.DefaultNamespace, sa)
+		if err != nil {
+			t.Errorf("get the ServiceAccount %s/%s: %v", tcdeploy.DefaultNamespace, sa, err)
+		} else if o.Metadata.UID != uids[sa] {
+			t.Errorf("the ServiceAccount %s/%s reads with the uid %q; want %q", tcdeploy.DefaultNamespace, sa, o.Metadata.UID, uids[sa])
+		}
+	}
+	for _, sa := range []string{pfetch.ServiceAccount, "default"} {
+		_, err = kc.GetObject(ctx, saKind, tcdeploy.DefaultNamespace, sa)
+		forbidden("the ServiceAccount "+tcdeploy.DefaultNamespace+"/"+sa, err)
+	}
+	_, err = kc.ListObjects(ctx, saKind, tcdeploy.DefaultNamespace, "")
+	forbidden("serviceaccounts list in farcast-system", err)
+	_, err = kc.ListObjects(ctx, saKind, "", "")
+	forbidden("serviceaccounts list across every namespace", err)
+	for _, ns := range []string{"web", "unmetered"} {
+		for _, sa := range readerServiceAccounts {
+			_, err = kc.GetObject(ctx, saKind, ns, sa)
+			forbidden("the ServiceAccount "+ns+"/"+sa, err)
+		}
+	}
+}
+
+// ADR 0023 M2.8 (design §33, A33-16, mutations 127 and 128): the
+// ServiceAccounts the reader may get are the two whose uid a grant names, by
+// the constants their renderers use, and only in farcast-system. The Role
+// farcast-reader-serviceaccounts renders exactly readerServiceAccounts there,
+// and no other document of the reader's RBAC names serviceaccounts. Every
+// read of a ServiceAccount's metadata in this package's source (a GetMeta of
+// kind ServiceAccount, outside migrate.go, which reads every kind it migrates
+// as the writer) names one of them in farcast-system, followed through any
+// helper that passes its own parameters on, so a plan that reads another
+// account, or one elsewhere, fails here before a reader is refused it. The
+// scan is tested first on a fixture source, so a scan that finds nothing
+// cannot pass for one that finds every read.
+func TestReaderRoleNamesTheServiceAccountsPlansRead(t *testing.T) {
+	// Every expression a read may name its namespace or its ServiceAccount
+	// with, and its value.
+	known := map[string]string{
+		"tcdeploy.DefaultNamespace": tcdeploy.DefaultNamespace,
+		"dsdeploy.DefaultName":      dsdeploy.DefaultName,
+		"pbuild.ServiceAccount":     pbuild.ServiceAccount,
+	}
+	if want := []string{dsdeploy.DefaultName, pbuild.ServiceAccount}; !slices.Equal(readerServiceAccounts, want) {
+		t.Errorf("readerServiceAccounts is %q; want the keyholder's and the builder's, %q", readerServiceAccounts, want)
+	}
+	if want := []string{"datasphered", "farcast-builder"}; !slices.Equal(readerServiceAccounts, want) {
+		t.Errorf("readerServiceAccounts is %q; design §33 names %q", readerServiceAccounts, want)
+	}
+
+	stream, err := renderReaderRBAC(readerEmail("atlas", "proj-test1"), []string{"web"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rendered []string
+	for _, d := range rbacDocs(t, stream) {
+		for _, r := range d.Rules {
+			if !slices.Contains(r.Resources, "serviceaccounts") {
+				continue
+			}
+			if d.Kind != "Role" || d.Metadata.Name != readerServiceAccountsRole || d.Metadata.Namespace != tcdeploy.DefaultNamespace {
+				t.Errorf("the %s %s (namespace %q) grants serviceaccounts; only the Role %s in %s may",
+					d.Kind, d.Metadata.Name, d.Metadata.Namespace, readerServiceAccountsRole, tcdeploy.DefaultNamespace)
+				continue
+			}
+			rendered = append(rendered, r.ResourceNames...)
+		}
+	}
+	if !slices.Equal(rendered, readerServiceAccounts) {
+		t.Errorf("the reader's RBAC names the ServiceAccounts %q; readerServiceAccounts is %q", rendered, readerServiceAccounts)
+	}
+
+	t.Run("the scan", func(t *testing.T) {
+		const fixture = `package fixture
+
+var saKind, _ = kube.KindOf("v1", "ServiceAccount")
+
+func direct(ctx context.Context, rd reader) {
+	k, _ := kube.KindOf("v1", "ServiceAccount")
+	rd.GetMeta(ctx, k, tcdeploy.DefaultNamespace, dsdeploy.DefaultName)
+}
+
+func packageKind(ctx context.Context, rd reader) {
+	rd.GetMeta(ctx, saKind, tcdeploy.DefaultNamespace, pbuild.ServiceAccount)
+}
+
+func helper(ctx context.Context, rd reader, namespace, name string) {
+	k, _ := kube.KindOf("v1", "ServiceAccount")
+	rd.GetMeta(ctx, k, namespace, name)
+}
+
+func viaHelper(ctx context.Context, rd reader) {
+	helper(ctx, rd, tcdeploy.DefaultNamespace, pbuild.ServiceAccount)
+	helper(ctx, rd, "web", dsdeploy.DefaultName)
+}
+
+func secret(ctx context.Context, rd reader, name string) {
+	k, _ := kube.KindOf("v1", "Secret")
+	rd.GetMeta(ctx, k, tcdeploy.DefaultNamespace, name)
+}
+
+func kindGiven(ctx context.Context, rd reader, k kube.Kind) {
+	rd.GetMeta(ctx, k, tcdeploy.DefaultNamespace, dsdeploy.DefaultName)
+}
+`
+		fset := token.NewFileSet()
+		file, err := goparser.ParseFile(fset, "fixture.go", fixture, goparser.SkipObjectResolution)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reads, problems := serviceAccountReads(fset, []*ast.File{file}, known)
+		var got []string
+		for _, r := range reads {
+			got = append(got, r.namespace+"/"+r.name)
+		}
+		sort.Strings(got)
+		if want := []string{"farcast-system/datasphered", "farcast-system/farcast-builder", "farcast-system/farcast-builder"}; !slices.Equal(got, want) {
+			t.Errorf("the scan reads %q; want %q", got, want)
+		}
+		if len(problems) != 2 || !strings.Contains(problems[0]+problems[1], `"web"`) || !strings.Contains(problems[0]+problems[1], "the kind k") {
+			t.Errorf("the scan reports %q; want the literal \"web\" and the kind k it cannot read", problems)
+		}
+	})
+
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fset := token.NewFileSet()
+	var parsed []*ast.File
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") || f == "migrate.go" {
+			continue
+		}
+		file, err := goparser.ParseFile(fset, f, nil, goparser.SkipObjectResolution)
+		if err != nil {
+			t.Fatal(err)
+		}
+		parsed = append(parsed, file)
+	}
+	reads, problems := serviceAccountReads(fset, parsed, known)
+	for _, p := range problems {
+		t.Error(p)
+	}
+	for _, r := range reads {
+		if r.namespace != tcdeploy.DefaultNamespace || !slices.Contains(readerServiceAccounts, r.name) {
+			t.Errorf("%s reads the ServiceAccount %s/%s, which the reader may not get: the reader's Role names %q in %s alone",
+				r.site, r.namespace, r.name, readerServiceAccounts, tcdeploy.DefaultNamespace)
+		}
+	}
+}
+
+// serviceAccountRead is one read of a ServiceAccount's metadata the scanned
+// source makes: where, and the namespace and the name it reads.
+type serviceAccountRead struct{ site, namespace, name string }
+
+// serviceAccountReads finds, in files, every GetMeta call of kind
+// ServiceAccount and the namespace and name it reads, each an expression in
+// known. The kind must be an identifier assigned the first result of
+// kube.KindOf with two string literals, in the calling function or at the
+// package level. A namespace or a name that is the calling function's own
+// parameter is followed to each call of that function, and on through the
+// next. Whatever the scan cannot read, a kind or a value, is a problem, so a
+// read it does not understand fails rather than passes.
+func serviceAccountReads(fset *token.FileSet, files []*ast.File, known map[string]string) ([]serviceAccountRead, []string) {
+	text := func(e ast.Expr) string {
+		var b strings.Builder
+		if err := printer.Fprint(&b, fset, e); err != nil {
+			return fmt.Sprintf("<%v>", err)
+		}
+		return b.String()
+	}
+	// kube.KindOf("v1", "<Kind>") with two literals: its kind.
+	kindOfCall := func(e ast.Expr) (string, bool) {
+		call, ok := e.(*ast.CallExpr)
+		if !ok || text(call.Fun) != "kube.KindOf" || len(call.Args) != 2 {
+			return "", false
+		}
+		lit, ok := call.Args[1].(*ast.BasicLit)
+		if !ok || lit.Kind != token.STRING {
+			return "", false
+		}
+		kind, err := strconv.Unquote(lit.Value)
+		return kind, err == nil
+	}
+	// Package-level kinds, and every call by the name it is called with: a
+	// function's own name, or "." and a method's.
+	packageKinds := map[string][]string{}
+	type call struct {
+		in   *ast.FuncDecl
+		expr *ast.CallExpr
+	}
+	calls := map[string][]call{}
+	var funcs []*ast.FuncDecl
+	for _, f := range files {
+		for _, d := range f.Decls {
+			switch d := d.(type) {
+			case *ast.GenDecl:
+				for _, spec := range d.Specs {
+					if vs, ok := spec.(*ast.ValueSpec); ok && len(vs.Names) > 0 && len(vs.Values) == 1 {
+						if kind, ok := kindOfCall(vs.Values[0]); ok {
+							packageKinds[vs.Names[0].Name] = append(packageKinds[vs.Names[0].Name], kind)
+						}
+					}
+				}
+			case *ast.FuncDecl:
+				funcs = append(funcs, d)
+				if d.Body == nil {
+					continue
+				}
+				ast.Inspect(d.Body, func(n ast.Node) bool {
+					c, ok := n.(*ast.CallExpr)
+					if !ok {
+						return true
+					}
+					switch fun := c.Fun.(type) {
+					case *ast.Ident:
+						calls[fun.Name] = append(calls[fun.Name], call{d, c})
+					case *ast.SelectorExpr:
+						calls["."+fun.Sel.Name] = append(calls["."+fun.Sel.Name], call{d, c})
+					}
+					return true
+				})
+			}
+		}
+	}
+	// The kind an identifier names in fn: one kube.KindOf assigned to it
+	// there, or else at the package level.
+	kindIn := func(fn *ast.FuncDecl, e ast.Expr) (string, bool) {
+		id, ok := e.(*ast.Ident)
+		if !ok {
+			return "", false
+		}
+		var kinds []string
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			switch n := n.(type) {
+			case *ast.AssignStmt:
+				if len(n.Lhs) > 0 && len(n.Rhs) == 1 {
+					if lhs, ok := n.Lhs[0].(*ast.Ident); ok && lhs.Name == id.Name {
+						kind, _ := kindOfCall(n.Rhs[0])
+						kinds = append(kinds, kind)
+					}
+				}
+			case *ast.ValueSpec:
+				if len(n.Names) > 0 && n.Names[0].Name == id.Name {
+					kind := ""
+					if len(n.Values) == 1 {
+						kind, _ = kindOfCall(n.Values[0])
+					}
+					kinds = append(kinds, kind)
+				}
+			}
+			return true
+		})
+		if len(kinds) == 0 {
+			kinds = packageKinds[id.Name]
+		}
+		if len(kinds) != 1 || kinds[0] == "" {
+			return "", false
+		}
+		return kinds[0], true
+	}
+	// paramIndex is the position of e among fn's parameters, when e is one.
+	paramIndex := func(fn *ast.FuncDecl, e ast.Expr) (int, bool) {
+		id, ok := e.(*ast.Ident)
+		if !ok {
+			return 0, false
+		}
+		i := 0
+		for _, field := range fn.Type.Params.List {
+			for _, name := range field.Names {
+				if name.Name == id.Name {
+					return i, true
+				}
+				i++
+			}
+		}
+		return 0, false
+	}
+
+	var reads []serviceAccountRead
+	var problems []string
+	// resolve follows one read's namespace and name, exprs in fn, to values.
+	var resolve func(fn *ast.FuncDecl, site string, exprs [2]ast.Expr, depth int)
+	resolve = func(fn *ast.FuncDecl, site string, exprs [2]ast.Expr, depth int) {
+		var values [2]string
+		forwarded := [2]int{-1, -1}
+		for i, e := range exprs {
+			if v, ok := known[text(e)]; ok {
+				values[i] = v
+				continue
+			}
+			if p, ok := paramIndex(fn, e); ok && depth < 8 {
+				forwarded[i] = p
+				continue
+			}
+			problems = append(problems, fmt.Sprintf("%s reads a ServiceAccount named by %s, which this test cannot read: name the namespace "+
+				"tcdeploy.DefaultNamespace and the account dsdeploy.DefaultName or pbuild.ServiceAccount, or add the constant to this test", site, text(e)))
+			return
+		}
+		if forwarded == [2]int{-1, -1} {
+			reads = append(reads, serviceAccountRead{site: site, namespace: values[0], name: values[1]})
+			return
+		}
+		key := fn.Name.Name
+		if fn.Recv != nil {
+			key = "." + key
+		}
+		for _, c := range calls[key] {
+			var next [2]ast.Expr
+			for i := range exprs {
+				switch {
+				case forwarded[i] < 0:
+					next[i] = exprs[i]
+				case forwarded[i] < len(c.expr.Args):
+					next[i] = c.expr.Args[forwarded[i]]
+				default:
+					problems = append(problems, fmt.Sprintf("%s calls %s with %d arguments", fset.Position(c.expr.Pos()), fn.Name.Name, len(c.expr.Args)))
+					return
+				}
+			}
+			// A constant passed on keeps its expression, which known reads
+			// in any function.
+			resolve(c.in, site+" through "+fset.Position(c.expr.Pos()).String(), next, depth+1)
+		}
+	}
+	for _, fn := range funcs {
+		if fn.Body == nil {
+			continue
+		}
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			c, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := c.Fun.(*ast.SelectorExpr)
+			if !ok || sel.Sel.Name != "GetMeta" {
+				return true
+			}
+			site := fset.Position(c.Pos()).String()
+			if len(c.Args) != 4 {
+				problems = append(problems, fmt.Sprintf("%s: GetMeta with %d arguments; want (ctx, kind, namespace, name)", site, len(c.Args)))
+				return true
+			}
+			kind, ok := kindIn(fn, c.Args[1])
+			if !ok {
+				problems = append(problems, fmt.Sprintf("%s: GetMeta of the kind %s, which this test cannot read: assign it "+
+					"kube.KindOf(\"v1\", \"<Kind>\") in the function or at the package level", site, text(c.Args[1])))
+				return true
+			}
+			if kind == "ServiceAccount" {
+				resolve(fn, site, [2]ast.Expr{c.Args[2], c.Args[3]}, 0)
+			}
+			return true
+		})
+	}
+	return reads, problems
 }
 
 // The renderers refuse anything that would not stay one YAML scalar, or
@@ -417,6 +833,21 @@ func TestReaderBindingsFollowOnlyAConsentedScope(t *testing.T) {
 			dir := config.Dir(t.TempDir())
 			runnableInstance(t, dir, "p43")
 			withReader(t, dir, "p43", state)
+			if state == "unsafe" {
+				// Since ADR 0023 M2.8 run's deploy plan reads the push grant
+				// by the record's project, and refuses one Google does not
+				// issue (design §33, A33-15): the reader's unsafe value here
+				// is its key id.
+				meta, err := dir.LoadInstanceMetadata("p43")
+				if err != nil {
+					t.Fatal(err)
+				}
+				meta.Project = "proj-test1"
+				meta.Reader.Email, meta.Reader.KeyID = readerEmail("p43", "proj-test1"), "c0ffee'$(id)"
+				if err := dir.SaveInstanceMetadata("p43", meta); err != nil {
+					t.Fatal(err)
+				}
+			}
 			env, out, errb := testEnvBoth(dir, output.ModeHuman)
 			f := newFakeRun(twoAppManifest)
 			if err := runCmd(f).Run(context.Background(), env, []string{"p43", "github.com/example/my-platform"}); err != nil {

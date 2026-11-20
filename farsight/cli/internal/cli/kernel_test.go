@@ -1,7 +1,10 @@
 package cli
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -17,6 +20,7 @@ import (
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
 	"github.com/sofmon/farcast/farsight/cli/internal/plan"
 	"github.com/sofmon/farcast/planck"
+	pbuild "github.com/sofmon/farcast/planck/build"
 	tcdeploy "github.com/sofmon/farcast/technocore/deploy"
 )
 
@@ -825,4 +829,64 @@ func TestKernelDeployKnobsAreWholeSeconds(t *testing.T) {
 			t.Errorf("applied %d streams and recorded the interval %s; want the deploy, as recorded", len(r.fc.applied), meta.Kernel.Interval)
 		}
 	})
+}
+
+// TestKernelDeployCreatesTheBuilderAccount (design §33, A33-20, mutation
+// 141): kernel deploy creates the builder's ServiceAccount, so the push
+// grant can name it by its uid before the first build. Its plan binds the
+// write, and the stream it applies holds the document, byte for byte the
+// one every build's stream begins with, second: after the Namespace and
+// before TechnoCore's own ServiceAccount, so an apply of it that fails stops
+// the stream before any TechnoCore object.
+func TestKernelDeployCreatesTheBuilderAccount(t *testing.T) {
+	dir := config.Dir(t.TempDir())
+	connectedInstance(t, dir, "p44")
+	fc := &fakeCluster{}
+	c := testKernelDeploy(fc, &fakeBuilder{})
+	env, _ := testEnv(dir, output.ModeJSON)
+	if err := c.Run(t.Context(), env, []string{"p44"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(fc.applied) != 1 {
+		t.Fatalf("kernel deploy applied %d streams; want its one", len(fc.applied))
+	}
+	docs, err := kube.SplitStream(fc.applied[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	build, err := pbuild.Render(pbuild.Config{Instance: "p44", Deployment: "d", App: "a", Builder: builderDigest,
+		Repo: "https://github.com/example/repo.git", Destination: "registry.example/app/d/a:t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := kube.SplitStream(build)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for _, d := range docs {
+		ids = append(ids, d.Kind.Kind+" "+d.Namespace+"/"+d.Name)
+	}
+	if len(docs) < 3 || ids[0] != "Namespace /"+tcdeploy.DefaultNamespace || ids[1] != "ServiceAccount farcast-system/farcast-builder" ||
+		ids[2] != "ServiceAccount "+tcdeploy.DefaultNamespace+"/"+tcdeploy.DefaultName {
+		t.Fatalf("kernel deploy's stream begins %q; want the Namespace, the builder's ServiceAccount, then TechnoCore's", ids[:min(3, len(ids))])
+	}
+	if !bytes.Equal(docs[1].Raw, first[0].Raw) || !bytes.Equal(docs[1].Raw, pbuild.RenderServiceAccount()) {
+		t.Errorf("kernel deploy applies\n%s\nwant the build's own first document\n%s", docs[1].Raw, first[0].Raw)
+	}
+
+	// The plan binds the same write, in the same place.
+	row := planCommandNamed(t, "kernel deploy", "the carried image")
+	_, planDir := planFixture(t, row)
+	doc, _ := runPlan(t, planDir, row, output.ModeJSON)
+	b := decodedBound(t, doc)
+	targets := writeTargets(b)
+	if len(targets) < 3 || targets[0] != "Namespace /"+tcdeploy.DefaultNamespace || targets[1] != "ServiceAccount farcast-system/farcast-builder" ||
+		targets[2] != "ServiceAccount "+tcdeploy.DefaultNamespace+"/"+tcdeploy.DefaultName {
+		t.Errorf("kernel deploy's plan writes %q; want the builder's ServiceAccount second", targets)
+	}
+	sum := sha256.Sum256(pbuild.RenderServiceAccount())
+	if w := applyWrites(b); len(w) < 2 || w[1].SHA256 != hex.EncodeToString(sum[:]) {
+		t.Errorf("the plan's writes are %+v; want the builder's ServiceAccount second, its document's sha256 %x", w, sum)
+	}
 }

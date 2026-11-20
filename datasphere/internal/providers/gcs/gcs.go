@@ -6,7 +6,8 @@
 // above; there is no code path here that could leak a logical name or a
 // plaintext byte, because neither is ever passed in. What this package owns is
 // the unglamorous half: bucket lifecycle with ownership discipline, a hardened
-// posture the cloud cannot quietly relax, and four object operations.
+// posture the cloud cannot quietly relax, four object operations, and, as an
+// optional capability, the bucket's IAM policy (iam.go).
 package gcs
 
 import (

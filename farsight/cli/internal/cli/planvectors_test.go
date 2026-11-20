@@ -175,9 +175,11 @@ const vectorSystemUID = "00000000-0000-4000-8000-000000000026"
 
 // vectorCluster is the cluster the plan vectors of M2.6c read, as the
 // instance's reader: the atlas fixture's namespaces, farcast-system at
-// vectorSystemUID, and no key pin yet. It answers nothing else, and is
-// opened as nothing but the reader (vectorReader).
-type vectorCluster struct{}
+// vectorSystemUID, no key pin yet, and the ServiceAccounts the vector's
+// accounts name, each at its uid (ADR 0023 M2.8, design §33 A33-40), any
+// other not found. It answers nothing else, and is opened as nothing but the
+// reader (vectorReader).
+type vectorCluster struct{ accounts map[string]string }
 
 func (vectorCluster) Namespaces(context.Context) ([]string, error) {
 	return []string{"farcast-system", "shop"}, nil
@@ -191,13 +193,18 @@ func (vectorCluster) ConfigMapData(context.Context, string, string) (map[string]
 	return nil, "", false, nil
 }
 
-// vectorReader is a plan's reader seam over vectorCluster, which refuses any
-// identity but the reader's.
+func (c vectorCluster) GetMeta(_ context.Context, k kube.Kind, namespace, name string) (kube.Object, error) {
+	return accountMeta(c.accounts, k, namespace, name)
+}
+
+// vectorReader is a plan's reader seam over vectorCluster, holding the
+// keyholder's and the builder's ServiceAccounts at their fixture uids, which
+// refuses any identity but the reader's.
 func vectorReader(r clusterRef) (vectorCluster, error) {
 	if r.Identity != kube.Reader {
 		return vectorCluster{}, fmt.Errorf("test: a vector's plan opened the cluster as %q", r.Identity)
 	}
-	return vectorCluster{}, nil
+	return vectorCluster{accounts: fixtureAccounts()}, nil
 }
 
 // vectorPinReader is vectorReader as the storage commands' seam.
@@ -207,6 +214,28 @@ func vectorPinReader(r clusterRef) (pinPlanReader, error) {
 		return nil, err
 	}
 	return c, nil
+}
+
+// vectorKeyholderReader is vectorReader as storage deploy's seam, whose
+// cluster holds the ServiceAccounts accounts names (A33-40): the fixture's
+// for a deploy over the recorded bucket, and none for a first deploy, whose
+// plan binds the uid placeholder.
+func vectorKeyholderReader(accounts map[string]string) func(clusterRef) (keyholderPlanReader, error) {
+	return func(r clusterRef) (keyholderPlanReader, error) {
+		c, err := vectorReader(r)
+		if err != nil {
+			return nil, err
+		}
+		c.accounts = accounts
+		return c, nil
+	}
+}
+
+// vectorBucketGrants is the bucket IAM the storage vectors read (A33-40):
+// a policy that grants the roles to the principal every keyholder in the
+// project shares, and not to the keyholder's uid.
+func vectorBucketGrants(context.Context, *Env, *config.InstanceMetadata) (bucketGrants, error) {
+	return &fakeBucketGrants{shared: datasphere.GrantPresent}, nil
 }
 
 // vectorNoPinWriter and vectorNoKeyholder are the storage commands' writer
@@ -309,8 +338,17 @@ var (
 // vectorRunManifest; the kernel's ledger, fresh at the vectors' clock and
 // below the limit; atlas's namespaces; shop's web Deployment, which the
 // kernel adapted after farcast last applied it, and a StatefulSet beside it;
-// another deployment's egress policy at resourceVersion 41; and no key pin.
-type vectorRunCluster struct{ ledger string }
+// another deployment's egress policy at resourceVersion 41; no key pin; and
+// the ServiceAccounts accounts names, each at its uid, any other not found
+// (design §33, A33-40).
+type vectorRunCluster struct {
+	ledger   string
+	accounts map[string]string
+}
+
+func (c vectorRunCluster) GetMeta(_ context.Context, k kube.Kind, namespace, name string) (kube.Object, error) {
+	return accountMeta(c.accounts, k, namespace, name)
+}
 
 func (vectorRunCluster) NamespaceUID(context.Context, string) (string, error) {
 	return vectorSystemUID, nil
@@ -394,7 +432,7 @@ func (vectorRunWriter) RolloutStatus(context.Context, string, string, time.Durat
 // refused.
 func vectorRun(t *testing.T, flags ...string) Command {
 	c := withFlags(t, &runCommand{}, flags...)
-	cl := vectorRunCluster{ledger: savedCheckpoint(t, cost.LevelOK.String(), vectorNow.Add(-time.Minute))}
+	cl := vectorRunCluster{ledger: savedCheckpoint(t, cost.LevelOK.String(), vectorNow.Add(-time.Minute)), accounts: fixtureAccounts()}
 	c.newPlanReader = func(r clusterRef) (runPlanReader, error) {
 		if r.Identity != kube.Reader {
 			return nil, fmt.Errorf("test: a vector's plan read the cluster as %q", r.Identity)
@@ -408,6 +446,7 @@ func vectorRun(t *testing.T, flags ...string) Command {
 		return vectorRunWriter{cl}, nil
 	}
 	c.newBuilder = func(func(string)) imageBuilder { return &fakeBuilder{} }
+	c.openProvider = vectorPushProvider(map[string]planck.GrantState{vectorBuilderSharedPrincipal: planck.GrantPresent})
 	c.newKeyholder = vectorNoKeyholder
 	c.newPinStore = vectorNoPinWriter
 	c.mintCredential = func(string, string) (string, error) {
@@ -461,6 +500,29 @@ func vectorKubeconfig(t *testing.T, dir config.Dir) {
 	}
 }
 
+// vectorRegistryNamed is the atlas record with its registry's repository and
+// location recorded beside its prefix, as the ensure records them: build's
+// and run's plans refuse a record without them (design §33, A33-15).
+func vectorRegistryNamed(m *config.InstanceMetadata) {
+	m.Registry.Repository, m.Registry.Location = "farcast-atlas", "europe-west4"
+}
+
+// vectorPushProvider is the provider build's and run's vectors read the push
+// grant through (A33-40): the fixture number, and a repository policy that
+// holds the principals of states, each by its member, any other missing.
+func vectorPushProvider(states map[string]planck.GrantState) providerOpener {
+	return func(*config.InstanceMetadata, *config.InstanceCredentials) (planck.Provider, error) {
+		return &fakeProvider{grantStates: states}, nil
+	}
+}
+
+// The builder's two principals in the vectors' project, at the fixture
+// number: its uid one, and the one every instance in the project shares.
+const (
+	vectorBuilderPrincipal       = "principal://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/proj-atlas.svc.id.goog/kubernetes.serviceaccount.uid/" + fixtureBuilderUID
+	vectorBuilderSharedPrincipal = "principal://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/proj-atlas.svc.id.goog/subject/ns/farcast-system/sa/farcast-builder"
+)
+
 // vectorConfirmations is the confirmed window the kernel_confirm vector's
 // record already holds, so the plan's windows_after has two.
 func vectorConfirmations(m *config.InstanceMetadata) {
@@ -504,14 +566,23 @@ func planVectors() []planVector {
 			vectorDeployer(&c.fatlineDeployer)
 			return c
 		}, []string{"atlas"}, []string{"--embedded"}, vectorMaterial, false},
-		// build, its builder named: it reads the record alone.
-		{"build", nil, func(t *testing.T, flags ...string) Command {
+		// build, its builder named, read as the reader (design §33, A33-21):
+		// farcast-system's uid, the builder's ServiceAccount at its fixture
+		// uid, and, with the installer's key, a repository policy that
+		// grants it push by that uid and not the shared principal, so no
+		// notice.
+		{"build", vectorRegistryNamed, func(t *testing.T, flags ...string) Command {
 			c := withFlags(t, &buildCommand{}, flags...)
 			c.newBuilder = func(func(string)) imageBuilder { return &fakeBuilder{} }
 			c.newCluster = func(clusterRef) (jobWaiter, error) { return nil, errors.New("test: a plan opened the writer") }
+			c.newPlanReader = func(r clusterRef) (buildPlanReader, error) { return vectorReader(r) }
+			c.openProvider = vectorPushProvider(map[string]planck.GrantState{vectorBuilderPrincipal: planck.GrantPresent})
 			c.now = vectorClock
 			return c
-		}, []string{"atlas"}, []string{"--repo", "https://github.com/example/shop", "--app", "api", "--builder-image", builderDigest}, nil, false},
+		}, []string{"atlas"}, []string{"--repo", "https://github.com/example/shop", "--app", "api", "--builder-image", builderDigest}, func(t *testing.T, dir config.Dir) {
+			vectorKey(t, dir)
+			vectorReaderKey(t, dir)
+		}, false},
 		// kernel deploy, as the reader reads the cluster: the kernel's image,
 		// its settings, and every document of its workload.
 		{"kernel_deploy", nil, func(t *testing.T, flags ...string) Command {
@@ -524,19 +595,41 @@ func planVectors() []planVector {
 			vectorReaderKey(t, dir)
 		}, false},
 		// storage deploy over the recorded bucket: the keyholder's image, its
-		// leaf, a restart of the replicas deployed, the pin this keyring
-		// implies, created, and the keyholder's workload.
+		// leaf, a restart of the replicas deployed, the Namespace and the
+		// keyholder's ServiceAccount, its bucket grant by the account's uid,
+		// read missing while the shared principal holds both roles and not
+		// applied, the pin this keyring implies, created, the rest of the
+		// keyholder's workload, and the grant's commands as a notice (design
+		// §33, A33-40).
 		{"storage_deploy", nil, func(t *testing.T, flags ...string) Command {
 			c := withFlags(t, &storageDeployCommand{}, flags...)
 			vectorDeployer(&c.deployer)
-			c.newPlanReader = vectorPinReader
+			c.newPlanReader = vectorKeyholderReader(fixtureAccounts())
 			c.newPinStore = vectorNoPinWriter
+			c.openBucketGrants = vectorBucketGrants
 			c.ensureStorage = func(context.Context, *Env, string) error { return errors.New("test: a vector's plan minted storage") }
 			return c
 		}, []string{"atlas"}, nil, func(t *testing.T, dir config.Dir) {
 			vectorMaterial(t, dir)
 			vectorReaderKey(t, dir)
 			vectorKeyring(t, dir)
+		}, false},
+		// storage deploy's first deploy with --grant-bucket: the bucket and
+		// the keyholder's ServiceAccount do not exist yet, so the grant names
+		// both placeholders, reads no policy and binds both states missing,
+		// and is applied, as the cloud fact on the placeholder bucket says;
+		// no grant notice (A33-40).
+		{"storage_deploy_grant", func(m *config.InstanceMetadata) { m.Storage, m.Keyholder = nil, nil }, func(t *testing.T, flags ...string) Command {
+			c := withFlags(t, &storageDeployCommand{}, flags...)
+			vectorDeployer(&c.deployer)
+			c.newPlanReader = vectorKeyholderReader(map[string]string{})
+			c.newPinStore = vectorNoPinWriter
+			c.openBucketGrants = vectorBucketGrants
+			c.ensureStorage = func(context.Context, *Env, string) error { return errors.New("test: a vector's plan minted storage") }
+			return c
+		}, []string{"atlas"}, []string{"--grant-bucket"}, func(t *testing.T, dir config.Dir) {
+			vectorMaterial(t, dir)
+			vectorReaderKey(t, dir)
 		}, false},
 		// storage key pin: the pin this keyring implies, created.
 		{"storage_key_pin", nil, func(t *testing.T, flags ...string) Command {
@@ -567,13 +660,18 @@ func planVectors() []planVector {
 		// run's fetch plan: the manifest read, its Job's cost, the fetcher
 		// and the read's three documents. It reads keys.yaml for the scope
 		// every application once shared, and no cluster.
-		{"run_fetch", nil, vectorRun, vectorRunArgs, vectorRunFlags, vectorKeyring, false},
+		{"run_fetch", vectorRegistryNamed, vectorRun, vectorRunArgs, vectorRunFlags, vectorKeyring, false},
 		// run's deploy plan, as --confirm with the fetch plan's digest prints
 		// it, computed as the reader over vectorRunCluster: shop's two
 		// applications, web adapted by the kernel and its scope already
 		// minted, api new, with its scope and key and the pin they raise,
-		// and a StatefulSet kept.
-		{"run_deploy", nil, vectorRun, vectorRunArgs, vectorRunFlags, vectorRunMaterial, true},
+		// and a StatefulSet kept; and the builder's push grant, missing by
+		// its fixture uid while the shared principal holds it, with its
+		// notice (design §33, A33-40).
+		{"run_deploy", vectorRegistryNamed, vectorRun, vectorRunArgs, vectorRunFlags, func(t *testing.T, dir config.Dir) {
+			vectorRunMaterial(t, dir)
+			vectorKey(t, dir)
+		}, true},
 		// migrate (M2.7), read as the writer: atlas not yet migrated, the three
 		// objects of vectorMigrateCluster to rewrite, and kubeconfig.yaml to
 		// delete. It binds no byte of the Secret's data or annotation.

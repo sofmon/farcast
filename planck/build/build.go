@@ -33,7 +33,12 @@ const (
 	// ServiceAccount is the identity that pushes. It is separate from every
 	// other FarCast component's: the push grant is repo-scoped and belongs to
 	// exactly one workload, the same shape ADR 0008 decision 8 uses for the
-	// keyholder's bucket.
+	// keyholder's bucket. Since ADR 0023 M2.8 the grant names this account by
+	// the uid the API server gave it, which every cluster in the project's
+	// Workload Identity pool does not share, and 'farcast kernel deploy'
+	// creates it (RenderServiceAccount) so that uid exists before the first
+	// build. The uid member on a repository's policy is unverified until the
+	// M2 walk.
 	ServiceAccount = "farcast-builder"
 
 	// A build is the one FarCast workload where conservative requests cause
@@ -252,11 +257,28 @@ func Render(c Config) ([]byte, error) {
 		SecretGitUser:   SecretGitUser,
 		SecretGitToken:  SecretGitToken,
 	}
-	var buf bytes.Buffer
-	if err := workloadTemplate.Execute(&buf, data); err != nil {
+	buf := bytes.NewBuffer(serviceAccountDocument(c.Namespace))
+	buf.WriteString("---\n")
+	if err := workloadTemplate.Execute(buf, data); err != nil {
 		return nil, fmt.Errorf("build: render the build job: %w", err)
 	}
 	return buf.Bytes(), nil
+}
+
+// RenderServiceAccount is the builder's ServiceAccount, farcast-builder in
+// farcast-system: exactly the document Render begins with, which renders
+// it through the same template, so the two cannot drift. 'farcast kernel
+// deploy' applies it ahead of any build (ADR 0023 M2.8, design §33 A33-20):
+// the push grant names the account by its uid, which exists only once the
+// account does. A build's own forced apply of the same bytes, as the same
+// field manager, changes nothing, and the account keeps its uid.
+func RenderServiceAccount() []byte {
+	return serviceAccountDocument(Namespace)
+}
+
+// serviceAccountDocument renders the builder's ServiceAccount in namespace.
+func serviceAccountDocument(namespace string) []byte {
+	return fmt.Appendf(nil, serviceAccountFormat, ServiceAccount, namespace)
 }
 
 // dockerfileArg converts a repository-relative Containerfile path into what
@@ -346,16 +368,21 @@ type templateData struct {
 	TTLSeconds      int
 }
 
-var workloadTemplate = template.Must(template.New("build").Parse(`apiVersion: v1
+// serviceAccountFormat is the builder's ServiceAccount, by its name and its
+// namespace: the document Render begins with, and the one
+// RenderServiceAccount renders alone.
+const serviceAccountFormat = `apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: {{.ServiceAccount}}
-  namespace: {{.Namespace}}
+  name: %s
+  namespace: %s
   labels:
     app.kubernetes.io/name: farcast-builder
     app.kubernetes.io/managed-by: farcast
----
-apiVersion: networking.k8s.io/v1
+`
+
+// workloadTemplate renders the rest of a build, after its ServiceAccount.
+var workloadTemplate = template.Must(template.New("build").Parse(`apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: {{.JobName}}

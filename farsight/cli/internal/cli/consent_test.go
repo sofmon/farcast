@@ -797,9 +797,13 @@ func planFlagOfATopLevelCommand(t *testing.T) {
 			t.Errorf("farcast %q planned %q of %q; want %s's plan", tc.line, b.Command, b.Instance, tc.command)
 		}
 	}
+	// connect's and redeploy's plans read no cluster; build's reads it as
+	// the instance's reader alone (ADR 0023 M2.8, design §33 A33-21).
 	for _, s := range servers {
-		if got := s.Requests(); len(got) != 0 {
-			t.Errorf("a plan sent %d requests", len(got))
+		for _, r := range s.Requests() {
+			if r.As != "reader" || (r.Path != "/token" && r.Method != http.MethodGet) {
+				t.Errorf("a plan sent %s %s as %q; a plan reads as the reader alone", r.Method, r.Path, r.As)
+			}
 		}
 	}
 	sameFiles(t, "the top-level commands' plans", before, treeFiles(t, cwd))
@@ -837,7 +841,7 @@ func TestNonInteractiveRefusalsNameThePlan(t *testing.T) {
 		{"build", []string{msgBuildCostYes}, buildRefusalNamesThePlan},
 		{"run", []string{msgRunYes}, runRefusalNamesThePlan},
 		{"kernel deploy", []string{msgKernelCostYes, msgKernelBelowFloorYes}, kernelDeployRefusalsNameThePlan},
-		{"storage deploy", []string{msgKeyholderCostYes}, storageDeployRefusalNamesThePlan},
+		{"storage deploy", []string{msgKeyholderCostYes, msgGrantBucketTerminal}, storageDeployRefusalNamesThePlan},
 		{"storage key pin", []string{msgKeyPinLowerYes}, keyPinRefusalNamesThePlan},
 		{"storage key rotate", []string{msgRotateYes}, rotateRefusalNamesThePlan},
 		{"reader grant", []string{msgReaderGrantTerminal}, readerGrantRefusalNamesThePlan},
@@ -990,7 +994,13 @@ func confirmLineOnTheCommands(t *testing.T) {
 				flags = append(flags, f)
 			}
 		}
-		rows = append(rows, planCommand{name: name, shape: "through the router", args: wc.args, flags: flags, edit: wc.edit, prepare: wc.prepare})
+		row := planCommand{name: name, shape: "through the router", args: wc.args, flags: flags, edit: wc.edit, prepare: wc.prepare}
+		if name == "build" {
+			// build's plan reads the cluster as the reader (ADR 0023
+			// M2.8, design §33 A33-21).
+			row.readsCluster, row.identity, row.seed = true, "reader", builderAccountSeeded
+		}
+		rows = append(rows, row)
 	}
 	readsCluster := []string{"kernel deploy", "storage deploy", "storage key pin", "storage key rotate"}
 	for _, row := range planCommands() {
@@ -1085,7 +1095,7 @@ func confirmLineOnTheCommands(t *testing.T) {
 						t.Errorf("%s sent %s %s as %q at %d; want the writer's, and only its reads before the confirm line", row, r.Method, r.Path, r.As, i)
 					}
 				}
-			case !row.readsCluster || row.name == "kernel deploy" || row.name == "storage deploy":
+			case !row.readsCluster || row.name == "build" || row.name == "kernel deploy" || row.name == "storage deploy":
 				// The plan's reads, if it reads, then the writer: its
 				// preflight, if it makes one, and storage deploy's pin
 				// create, as its plan lists it, before its refused apply.
@@ -1099,8 +1109,14 @@ func confirmLineOnTheCommands(t *testing.T) {
 				switch row.name {
 				case "kernel meter", "kernel confirm", "reader grant":
 				case "storage deploy":
-					want = []string{"GET /api/v1/namespaces", "GET " + pinPath, "POST " + configMapsPath}
-					sameSHA256(t, "the pin's create", pinWriteBody(t, writerReqs), pinWriteFact(planned))
+					// Since ADR 0023 M2.8 its first apply is the keyholder's
+					// account, the plan's first applied document, before the
+					// pin (design §33, A33-26).
+					want = []string{"GET /api/v1/namespaces", "GET " + pinPath}
+					all := s.Requests()
+					if first := factPath(t, applyWrites(planned)[0]); all[len(all)-1].Path != first {
+						t.Errorf("%s's first apply was of %s; want the plan's first document, %s", row, all[len(all)-1].Path, first)
+					}
 				default:
 					want = []string{"GET /api/v1/namespaces"}
 				}

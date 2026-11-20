@@ -42,15 +42,18 @@ const rolloutTimeout = 5 * time.Minute
 // (fetchReader, JobState); the kernel's ledger, the namespaces and each
 // application's Deployment (liveReader); the egress policy and the key pin
 // whole, with their resourceVersions (configMapDataReader); the target
-// namespace's other workloads (lister); and farcast-system's uid, which the
-// plan binds as its target. Under --confirm it is the instance's reader; an
-// interactive or --yes run passes the writer it opened.
+// namespace's other workloads (lister); farcast-system's uid, which the
+// plan binds as its target; and the builder's ServiceAccount, whose uid the
+// push grant names (serviceAccountReader, design §33 A33-18). Under
+// --confirm it is the instance's reader; an interactive or --yes run passes
+// the writer it opened.
 type runPlanReader interface {
 	fetchReader
 	liveReader
 	configMapDataReader
 	lister
 	preflighter
+	serviceAccountReader
 	JobState(ctx context.Context, namespace, name string) (cluster.JobResult, bool, error)
 }
 
@@ -86,7 +89,12 @@ type runCommand struct {
 	// unset, and never the writer. An interactive or --yes run reads through
 	// the writer it opened instead (design §7.3).
 	newPlanReader func(clusterRef) (runPlanReader, error)
-	newBuilder    func(progress func(string)) imageBuilder
+	// openProvider opens the cloud provider the deploy plan reads the
+	// project number and the repository's IAM policy through, as the
+	// installer key, in every mode (design §33, A33-1, A33-22):
+	// openProviderDefault when unset. The fetch plan reads no Google.
+	openProvider providerOpener
+	newBuilder   func(progress func(string)) imageBuilder
 	// newKeyholder opens the session that hands new scopes to a running
 	// keyholder. It is a seam because the decision it guards — never unseal a
 	// sealed replica — is one no unit test could otherwise reach: the real
@@ -133,15 +141,21 @@ nothing: the Job that reads the manifest, its cost, the fetcher image and the
 three documents it applies. It reads the instance's record and keys.yaml, and
 no cluster. --confirm with that plan's digest runs the read and prints the
 second, the deploy, which it computes as the instance's reader ('farcast
-reader grant' must have verified it): what is built, its cost, the egress
-credentials, storage scopes and identities it would mint, every document it
-would write, what it resets of what runs now, and whether the instance's
-spending is at its limit. Nothing but the read is written. --confirm with the
-deploy plan's digest computes that plan again and deploys exactly it, asking
-nothing; it refuses, having written nothing, if anything the plan binds has
-changed, and, once the builds are written, if the ledger, an application,
-the egress policy or the key pin moved while they ran. A deploy digest is
-good while the fetch Job it read exists: 15 minutes after it finishes.
+reader grant' must have verified it): what is built, its cost, the builder's
+push grant, the egress credentials, storage scopes and identities it would
+mint, every document it would write, what it resets of what runs now, and
+whether the instance's spending is at its limit. Nothing but the read is
+written. Before the read is applied, the reader reads the builder's
+ServiceAccount, which the deploy plan needs. The deploy plan also reads the
+project number and the repository's IAM policy with the installer's key, in
+every mode; under --confirm with the fetch plan's digest those reads come
+after the read, which has billed, so a failure there prints no deploy plan.
+--confirm with the deploy plan's digest computes that plan again and deploys
+exactly it, asking nothing; it refuses, having written nothing, if anything
+the plan binds has changed, and, once the builds are written, if the ledger,
+an application, the egress policy or the key pin moved while they ran. A
+deploy digest is good while the fetch Job it read exists: 15 minutes after it
+finishes.
 
 The instance does the reading and the building. It clones the repository
 itself, so this works the same from a laptop that has never seen the source as
@@ -149,6 +163,15 @@ from the one that wrote it (ADR 0010). What it reports back is the resolved
 commit and a digest of the manifest it parsed, and the build is pinned to that
 same commit: a branch that moves between the read and the build cannot change
 what you approved.
+
+The builder pushes under its own ServiceAccount, farcast-system/farcast-builder,
+whose push grant this command never applies. When the repository's own
+policy does not hold it by the account's uid, the review prints the commands
+that grant it and remove the principal every FarCast instance in the project
+shares (a grant at the project, through a group or by a wider role does not
+show there), and an account that does not exist yet gets them right after
+the first build starts. The uid member on a repository's policy is
+unverified until the M2 walk.
 
 The gate is the external service declarations. Nothing an application can reach
 is implicit — FatLine denies every outbound host that the manifest does not
@@ -225,6 +248,9 @@ func (c *runCommand) ensureDefaults() {
 	}
 	if c.newBuilder == nil {
 		c.newBuilder = newBuilderDefault
+	}
+	if c.openProvider == nil {
+		c.openProvider = openProviderDefault
 	}
 	if c.mintCredential == nil {
 		c.mintCredential = mintEgressCredential
@@ -308,6 +334,14 @@ func (c *runCommand) Run(ctx context.Context, env *Env, args []string) (err erro
 	}
 	if meta.Registry == nil || meta.Registry.Prefix == "" {
 		return fmt.Errorf("instance %q has no image registry recorded; run 'farcast connect %s' first", name, name)
+	}
+	// The deploy plan reads the repository's IAM policy by the repository
+	// the record names, and prints commands from the record's project, its
+	// repository and its location (design §33, A33-15): a record that names
+	// none, or holds a value Google does not issue, is refused before the
+	// fetch, which bills, as one with no registry is.
+	if _, _, _, err := pushGrantRecord(meta); err != nil {
+		return err
 	}
 	// The fetch plan's refusals, read from the record and keys.yaml alone,
 	// before anything is opened, resolved or fetched, in every mode (A23-18,
@@ -405,6 +439,12 @@ func (c *runCommand) confirmed(ctx context.Context, env *Env, meta *config.Insta
 		rd, err := c.newPlanReader(reader)
 		if err != nil {
 			return err
+		}
+		// The deploy plan reads the builder's ServiceAccount as the
+		// reader; a reader that may not is refused now, before the fetch
+		// Job bills, not after it (design §33, A33-22, OQ-C).
+		if _, err := readServiceAccountUID(ctx, rd, consentConfirm, name, tcdeploy.DefaultNamespace, pbuild.ServiceAccount, plan.GrantPush); err != nil {
+			return fmt.Errorf("%w Nothing was written.", err)
 		}
 		cl, err := openConfirmed(ctx, env, meta, fb, c.newCluster)
 		if err != nil {
@@ -656,6 +696,11 @@ type preparedDeploy struct {
 	// notices are the lines a review prints that the plan carries (A23-26,
 	// A28-8), in order.
 	notices []string
+	// push is the builder's push grant as the plan read it, and pushNotice
+	// its notice, "" when none is due (design §33, A33-22): the last of
+	// notices, which the review prints too.
+	push       pushGrant
+	pushNotice string
 	// blocked is the plan's block as the error it was found as, for an
 	// interactive or --yes run (A28-8).
 	blocked error
@@ -673,6 +718,9 @@ func (p preparedDeploy) review(meta *config.InstanceMetadata) review {
 	}
 	if p.readerWarning != "" {
 		rev.Notices = []string{p.readerWarning}
+	}
+	if p.pushNotice != "" {
+		rev.Notices = append(rev.Notices, p.pushNotice)
 	}
 	return rev
 }
@@ -738,10 +786,15 @@ func (pp runPinPlan) write(ctx context.Context, ps pinStore, keys datasphere.Key
 // certificate, never a key (A23-25), and mints nothing: every secret it
 // renders is a placeholder (A23-30).
 //
+// Past every block, it reads the builder's ServiceAccount's uid through rd,
+// and the push grant as the installer key, in every mode (design §33,
+// A33-22): the project number and the repository's IAM policy. A blocked
+// plan reads neither.
+//
 // Its facts are the fetch plan's fetch fact, never its writes (A23-47); the
-// run; the cost; the builder image; what it would mint; every document it
-// would write, in the order it writes them; the key pin; what it resets of
-// what runs now; and its notices.
+// run; the cost; the builder image; the push grant; what it would mint;
+// every document it would write, in the order it writes them; the key pin;
+// what it resets of what runs now; and its notices, the push grant's last.
 func (c *runCommand) deployPlan(ctx context.Context, env *Env, meta *config.InstanceMetadata, pf preparedFetch, read fetched,
 	rd runPlanReader, m consentMode, writerUID string) (preparedDeploy, plan.Bound, error) {
 	name := meta.Name
@@ -940,13 +993,30 @@ func (c *runCommand) deployPlan(ctx context.Context, env *Env, meta *config.Inst
 		p.notices = append(p.notices, p.readerWarning)
 	}
 
+	// The push grant, after every block (A33-22): the builder's uid, then
+	// the installer key's reads.
+	builderUID, err := readServiceAccountUID(ctx, rd, m, name, tcdeploy.DefaultNamespace, pbuild.ServiceAccount, plan.GrantPush)
+	if err != nil {
+		return p, plan.Bound{}, err
+	}
+	var grant plan.GrantFact
+	if p.push, grant, err = readPushGrant(ctx, env, meta, c.openProvider, builderUID); err != nil {
+		return p, plan.Bound{}, err
+	}
+	if p.pushNotice, err = p.push.notice(); err != nil {
+		return p, plan.Bound{}, err
+	}
+	if p.pushNotice != "" {
+		p.notices = append(p.notices, p.pushNotice)
+	}
+
 	facts := []plan.Fact{pf.fact, plan.RunFact{
 		Type: plan.TypeRun, JobUID: read.UID, FetchPlanDigest: pf.digest,
 		Commit: read.Report.Commit, ManifestDigest: read.Report.ManifestDigest,
 		Namespace: ns, ReplacesRepository: c.replacedRepository(meta, ns, p.repo),
 		Apps: runApps(p.m), OtherDeploymentsKept: others, MeteringAdded: len(added) > 0,
 		LimitReached: p.live.Limit.Reached, LimitReason: p.live.Limit.Reason,
-	}, deployCost(meta, p.m), toolchainImageFact(meta, builderKind, p.builder, pf.builderSource)}
+	}, deployCost(meta, p.m), toolchainImageFact(meta, builderKind, p.builder, pf.builderSource), grant}
 	if p.storageWired {
 		for _, app := range p.m.Apps {
 			facts = append(facts, plan.MintFact{Type: plan.TypeMint, What: plan.MintAppLeaf, Subject: ns + "/" + app.Name})
@@ -1124,7 +1194,7 @@ func (c *runCommand) deploy(ctx context.Context, env *Env, meta *config.Instance
 	name, namespace := meta.Name, p.namespace
 
 	// 3. Build each application, pinned to the commit that was approved.
-	images, err := c.buildAll(ctx, env, cl, meta, p.builds)
+	images, err := c.buildAll(ctx, env, cl, meta, p.builds, p.push)
 	if err != nil {
 		return err
 	}
@@ -1304,14 +1374,23 @@ func (c *runCommand) recheckPlanned(ctx context.Context, env *Env, cl runCluster
 // bills the request, so three in parallel is three times the burn for the
 // length of the slowest — and a manifest with a dozen applications would open
 // a hole in the cost limit large enough to matter.
-func (c *runCommand) buildAll(ctx context.Context, env *Env, cl jobWaiter, meta *config.InstanceMetadata, builds []appBuild) (map[string]string, error) {
+//
+// push is the builder's push grant as the plan read it: when the plan bound
+// the uid placeholder, the commands that grant it print once, after the
+// first build's apply, from when the account exists (A33-22), and a refused
+// push names them.
+func (c *runCommand) buildAll(ctx context.Context, env *Env, cl jobWaiter, meta *config.InstanceMetadata, builds []appBuild, push pushGrant) (map[string]string, error) {
 	images := make(map[string]string, len(builds))
+	builderUID := push.uid
 	for i, b := range builds {
 		if isInteractive(env) || env.Verbose {
 			fprintf(env.Err, "\n[%d/%d] Building %s inside %q…\n", i+1, len(builds), b.app, meta.Name)
 		}
 		if err := cl.Apply(ctx, b.manifest); err != nil {
 			return nil, fmt.Errorf("start the build of %s: %w", b.app, err)
+		}
+		if i == 0 {
+			builderUID = pushGrantNow(ctx, env, cl, push)
 		}
 		res, err := cl.WaitJob(ctx, pbuild.Namespace, b.job, buildTimeout)
 		if err != nil {
@@ -1327,10 +1406,7 @@ func (c *runCommand) buildAll(ctx context.Context, env *Env, cl jobWaiter, meta 
 			// "prints it, like build does" — build printed it only on SUCCESS,
 			// and run printed it nowhere. The 5.1b walk spent four attempts and
 			// a mirrored toolchain finding that out.
-			explainPushDenial(env.Err, logs, pushGrant{
-				Instance: meta.Name, Project: meta.Project, Region: meta.Region,
-				Namespace: pbuild.Namespace, ServiceAccount: pbuild.ServiceAccount,
-			})
+			explainPushDenial(env.Err, logs, push.fact.State, func() string { return grantText(ctx, cl, push.denied(), &builderUID) })
 			return nil, fmt.Errorf(msgRunBuildFailed, b.app)
 		}
 		digest := strings.TrimSpace(res.Message)

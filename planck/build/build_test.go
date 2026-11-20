@@ -89,6 +89,33 @@ func TestRenderProducesTheWholeBuild(t *testing.T) {
 	}
 }
 
+// TestRenderBeginsWithTheServiceAccount: RenderServiceAccount, which
+// 'farcast kernel deploy' applies ahead of any build so the push grant can
+// name the account by its uid (ADR 0023 M2.8, design §33 A33-20), is
+// exactly the document a build's stream begins with, byte for byte, then
+// the stream's separator. A drift between the two would have kernel deploy
+// and every build fight over one object.
+func TestRenderBeginsWithTheServiceAccount(t *testing.T) {
+	out, err := Render(sampleConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	account := RenderServiceAccount()
+	if !strings.HasPrefix(string(out), string(account)+"---\n") {
+		t.Fatalf("the build's stream does not begin with RenderServiceAccount's document:\n%s\nwant it to begin with\n%s---", out, account)
+	}
+	var doc map[string]any
+	if err := yaml.Unmarshal(account, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc["kind"] != "ServiceAccount" || at(t, doc, "metadata", "name") != ServiceAccount || at(t, doc, "metadata", "namespace") != Namespace {
+		t.Errorf("RenderServiceAccount is %v; want the ServiceAccount %s in %s", doc, ServiceAccount, Namespace)
+	}
+	if strings.Count(string(account), "\n---\n")+strings.Count(string(account), "kind:") != 1 {
+		t.Errorf("RenderServiceAccount holds more than one document:\n%s", account)
+	}
+}
+
 // The one place FarCast cannot copy its own hardening. Kaniko builds by
 // extracting image layers into its own root filesystem: a read-only root does
 // not make it safer, it makes it non-functional. Every capability it does get
