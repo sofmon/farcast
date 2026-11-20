@@ -14,6 +14,7 @@ import (
 	"syscall"
 
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
+	"github.com/sofmon/farcast/farsight/cli/internal/kube"
 	"github.com/sofmon/farcast/farsight/cli/internal/output"
 )
 
@@ -57,6 +58,13 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 // It runs here and not in a package init, so the unit tests, which call run,
 // keep their environment. The planck harness keeps its own copy
 // (planck/cmd/planck).
+//
+// One setting it cannot undo: a GODEBUG holding http2debug=1 or http2debug=2
+// has already turned on Go's HTTP/2 logging, the bearer token included, when
+// this runs. run
+// refuses it for every command, with the kind unsafe_environment, once the
+// printer exists and before anything is read (unsafeEnvironment, ADR 0023
+// M2.8's step 0); an error here is printed with no kind, before -o is parsed.
 func hardenEnvironment() error {
 	for _, k := range []string{"GOOGLE_SDK_GO_LOGGING_LEVEL", "SSL_CERT_FILE", "SSL_CERT_DIR"} {
 		if err := os.Unsetenv(k); err != nil {
@@ -68,6 +76,12 @@ func hardenEnvironment() error {
 	}
 	return os.Unsetenv("GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES")
 }
+
+// unsafeEnvironment is kube.UnsafeEnvironment, a seam for the parent-side
+// test (TestUnsafeEnvironmentIsRefusedBeforeAnythingIsRead), which makes it
+// answer the refusal without GODEBUG. Its default is the real one, in the
+// tests too.
+var unsafeEnvironment = kube.UnsafeEnvironment
 
 func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	reg := defaultRegistry()
@@ -136,6 +150,16 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return 2
 	}
 	printer := &output.Printer{Mode: mode, Out: stdout, Err: stderr}
+
+	// No command runs while GODEBUG has turned on Go's HTTP/2 logging, which
+	// prints every request header, the bearer included, to stderr: not only
+	// the cluster client refuses it, but every Google client farcast uses
+	// would print it too. Nothing is read before this, so no key is loaded
+	// and no token minted.
+	if err := unsafeEnvironment(); err != nil {
+		printer.PrintError(classified(err), exitCodeOf(err))
+		return 1
+	}
 
 	dir, err := config.Resolve(opts.config)
 	if err != nil {

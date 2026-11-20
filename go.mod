@@ -8,6 +8,7 @@ require (
 	cloud.google.com/go/auth v0.18.2
 	cloud.google.com/go/container v1.52.0
 	github.com/goccy/go-yaml v1.19.2
+	golang.org/x/net v0.52.0
 	golang.org/x/sys v0.42.0
 	google.golang.org/api v0.274.0
 	google.golang.org/grpc v1.80.0
@@ -30,7 +31,6 @@ require (
 	go.opentelemetry.io/otel/metric v1.43.0 // indirect
 	go.opentelemetry.io/otel/trace v1.43.0 // indirect
 	golang.org/x/crypto v0.49.0 // indirect
-	golang.org/x/net v0.52.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/text v0.35.0 // indirect

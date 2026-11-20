@@ -6831,3 +6831,1014 @@ The fix-check's three lenses reported 16 findings; the skeptics confirmed 9 (two
 - **A32-9's option (a)** is unbuilt; the operator's remedy stands in for it.
 - **The known flake** `kube.TestANonStreamingAttemptHasADeadline` (about 1 in 200), whose fix is offered as its own commit.
 - **Size:** M2.7b against 0397826 is code +1,283/−877, tests +5,117/−1,537, vectors and testdata +48/−11, records +295/−169 in 26 Markdown files, and `exec-allowlist.txt` from 101 entries to 86 (−18 lines).
+
+## 33. Decided before M2.8's build (2026-11-19)
+
+M2.8 was mapped against the code at 77a3667 by workflow wf_28c7f9e5-6ba: four read-only lanes, then a completeness critic. The lanes were the bucket grant through the plan; the push grant's state and the project number; `farcast git-credential set` and `rm`; and the records and the cross-cutting rules. The critic confirmed 26 conflicts, refuted 7, found 12 missing items and put four questions to the operator. The operator answered the four on 2026-11-19, and then a fifth on the fourth's mechanism: on Workload Identity's shared principal the operator first chose to fix it in M2.8, then chose how. A second read-only lane of this workflow then mapped that mechanism, the ServiceAccount-UID principal. The raw maps are `m28-map-result.json` and `m28-uid-map.json`, working files that are not kept. This section wins over §0–§14 and over §15–§32 wherever it differs. Where it is silent, the earlier sections govern, and a lane's proposal in either map is advice, not a decision.
+
+Line numbers are at 77a3667 (HEAD fc52777 carries the same code). Builders find each site by its symbol and confirm the line. In the bold leads:
+- **CC-n** is the critic's n-th confirmed conflict, and **MS-n** its n-th missing item, both in the map's order;
+- **OD-n** is the critic's n-th orchestrator decision, all fourteen adopted as amended here;
+- **U-n** is the UID map's n-th proposal (1–17, in its order), and **OQ-A** to **OQ-F** its open questions;
+- **Ln-Cm** and **Q-Ln-m** are lane conflicts and questions, the lanes numbered 1–4 in the order above.
+
+Every lane conflict is folded into the amendment that names the critic conflict carrying it (the critic lists the lane ids beside each CC). Those refuted are in the list near the end.
+
+### Decided by the operator on 2026-11-19
+
+**A33-1 (O1; the critic's OQ-1, Q-L1-1): every mode reads Google for the grants.** Every `storage deploy` plan, `build` plan and `run` deploy plan D reads Google as the installer key, in every mode, interactive and `--yes` included. So every mode computes the same plan. The reads:
+- `storage deploy`: Resource Manager `projects.get` (the project number); with a bucket recorded, the bucket's labels (`Validate`) and its IAM policy (`getIamPolicy`, version 3);
+- `build` and `run` D: `projects.get`, and the repository's IAM policy (`getIamPolicy`, version 3);
+- `run`'s fetch plan F reads no Google, as today.
+
+Each new read is recorded under "What Google sees" (A33-36).
+- **§7.3** changes: the Google reads of plans are "the registry, the project number, a bucket's labels and IAM policy, and a repository's IAM policy".
+- **§9.4** changes: the per-command rows of A33-39.
+
+**A33-2 (O2; OQ-2, L4-C4, L4-Q1, MS-10): `--grant-bucket` takes terminal consent too. P2 of 2026-11-14 is revised.**
+- `--grant-bucket` is accepted with `--plan`, with `--confirm`, and in an interactive terminal run. That run asks its own question, naming the bucket, the principal, both roles and the shared binding it removes (A33-24).
+- With `--yes` it is refused, before anything is read, with words that name `--plan` (A33-24).
+- A run that is not interactive and has neither `--plan` nor `--confirm` refuses (A33-24).
+- **Why:** the probe walk (2026-11-16) found service-account key upload blocked in the operator's organization. No reader exists there, so `storage deploy` cannot plan, and `--grant-bucket` with plans only would be unusable there. `reader grant` and `migrate` already take terminal consent; the consent rule forbids only `--yes`.
+- **What changes:** §9.5's "`--yes` covers none of the first four" stands; §9.7's "accepted with `--plan` and with `--confirm`… refused otherwise" is replaced by A33-24; §12's P2 row gains `(revised 2026-11-19, O2: also accepted in a terminal run, with its own question; never with --yes)`.
+
+**A33-3 (O3; OQ-3, CC-2, Q-L2-1, L4-Q3): a missing push grant only warns.** When `build`'s or `run` D's plan reads the push grant as `missing`, there is:
+- the grant fact;
+- a notice;
+- the notice printed before the cost question in an interactive run (and right after the comparison under `--confirm`, A23-26);
+- the commands on a push failure (`explainPushDenial`).
+
+Nothing blocks or refuses. The text says `the repository's own policy does not hold it`, never `the push will fail`: the read cannot see a project-level grant, a group's, or a wider role's. §9.4's and §9.5's push rows stand with this wording.
+
+**A33-4 (O4; OQ-4, MS-1): the grants name the ServiceAccount's uid.**
+- **The finding.** Every GKE cluster in a project shares the project's Workload Identity pool, and IAM "doesn't distinguish between the clusters making the calls" ([doc](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/workload-identity)). So every FarCast instance in one project shares two principals:
+  - `…/subject/ns/farcast-system/sa/datasphered`, the keyholder's;
+  - `…/subject/ns/farcast-system/sa/farcast-builder`, the builder's.
+
+  Instance A's bucket grant therefore lets B's keyholder read, overwrite and delete A's ciphertext, and A's push grant lets B's builder push into A's registry. Every grant printed since Phase 3 names that shared principal (`writeBucketGrant`, `storagedeploy.go:799-818`; `writePushGrant`, `buildgrant.go:68-72`; `phase-3-2-validation.md:57-73`) [read], and the M1 walk applied it to a bucket (`adr-0023-m1-walk.md:145-150`) [read].
+- **The fix, in M2.8.** The grants name the principal Google documents for one ServiceAccount object: `principal://iam.googleapis.com/projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/PROJECT_ID.svc.id.goog/kubernetes.serviceaccount.uid/SERVICEACCOUNT_UID`, where the uid is "the UID of the ServiceAccount object in the API server" ([doc](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/workload-identity)).
+- **The consequences, accepted:**
+  - (a) each grant names the keyholder's or the builder's ServiceAccount uid, read from this instance's cluster;
+  - (b) the plan reads that uid, so the reader's role gains `get serviceaccounts` in `farcast-system` (A33-16), and `reader grant` is run once more on every existing instance; a plan whose reader lacks the rule refuses, naming `farcast reader grant` (A33-17);
+  - (c) a ServiceAccount deleted and created again needs its grant applied again; its state then reads `missing`;
+  - (d) under `--grant-bucket`'s consent, the shared name principal is removed from the bucket's two roles in the same policy write that adds the uid principal; for the push grant, which is never applied, the printed commands add the uid binding and then remove the shared one;
+  - (e) the records still recommend one project per instance for full separation, since every cluster in the pool must be trusted;
+  - (f) the uid principal on bucket and repository IAM is [doc] and unverified until the M2 walk (Q10).
+- **Not built:** per-instance ServiceAccount names.
+- **What changes:** §7.2 (the rule, A33-16); §7.3 (plans read two ServiceAccounts' metadata by name); §9.4 (the grant fact's fields, A33-11; the uid placeholder, A33-19; the per-command reads, A33-39); §9.5 (push: the printed commands add the uid binding and remove the shared one); §9.7 (A33-24 to A33-28).
+
+### Decided by the orchestrator on 2026-11-19
+
+**A33-5 (OD-11, L4-C9, L4-Q4): step 0, the http2debug refusal, is its own commit before M2.8.** *Reason:* under `GODEBUG=http2debug=1` the vendored `x/net/http2` logs every request header, the bearer included (`vendor/golang.org/x/net/http2/http2.go:54-58`, `transport.go:2059-2062`) [read]. The Google clients reach it through `httptransport` (`vendor/cloud.google.com/go/auth/httptransport/transport.go:125-129`) [read]. Only `kube.newClient` refuses it today (`kube/token.go:44-51`) [read]. The gap predates M2.8, which widens it to `build --plan`, `run` D and every `storage deploy`. Specified in A33-9.
+
+**A33-6: the commit shape.** *Reason:* it mirrors M2.7a and M2.7b, and every step below stays green.
+- **Step 0**, alone (A33-9).
+- **M2.8a, "begin M2.8: the grants":** the groundwork, the uid principal and the reader's RBAC, the push grant's state, the bucket grant (the build order's steps 1–4).
+- **M2.8b, "finish M2.8: git-credential and the records":** `git-credential set` and `rm`, then the records (steps 5–6).
+- Each is green with `./check.sh`. The one ordering constraint is that the RBAC rule (step 2) lands before any plan reads a ServiceAccount (steps 3–4), or `TestEveryReaderReadIsAllowedByTheRenderedRBAC` goes red (U-16). No adjustment is needed.
+- Commit only when the operator asks.
+
+**A33-7: the critic's 14 decisions and 26 conflict resolutions are adopted, each as amended below where O2 or O4 changes it.** The amendments that change one name it in their lead. In particular:
+- the grant fact's principal is the uid principal (A33-11);
+- CC-4's first deploy and CC-6's step 3b are derived again, because the keyholder's ServiceAccount must exist before its uid can be read or granted (A33-25, A33-26);
+- the printers print the uid principal and the removal of the shared binding (A33-15);
+- the mutation ids are the critic's (106–114, 109a–h, 110a–i, 111a, 114a, 115–124, 73c, 93d, 102b, 106b, 125), plus 126–143 for the uid principal, the reader's RBAC and the settled questions, and R1–R3 written for the real-API suite (the mutation table below), with the critic's rerun list widened;
+- the vectors are the critic's 14 to 17 files, with `reader_grant.json` and `kernel_deploy.json` also regenerated, the fixture project number `123456789012` and fixture uids in the vectors' `00000000-0000-4000-8000-0000000000xx` style (A33-40).
+
+**A33-8: the UID map's open questions, settled.** None is billable, irreversible, or a security or product choice O1–O4 leave open; two are listed as cheap vetoes at the end.
+- **OQ-A: B1.** `build`'s plan becomes a reader plan that reads `farcast-builder`'s uid (A33-21). *Reason:* O4 (b) puts the uid in the plan, and plans read the cluster only as the reader (A23-23). B6, a cluster-free plan with a placeholder uid and a permanent `unknown`, is what O1 and O3 reject: they want a stated grant. Interactive and `--yes` builds still read as the writer, so only `build --plan` and `--confirm` need a reader, as `storage deploy`'s and `run` D's already do.
+- **OQ-B: `kernel deploy` creates `farcast-builder`** (A33-20). *Reason:* with the uid principal no grant can exist before the account, and today only a build creates it, minutes before its own push. Every new instance's first build would then fail at push, billed: one clone and build, up to 1800 s at 1 vCPU and 2 GiB (`planck/build/build.go:39-49`) [read]. The account is free, and `requireKernel` puts `kernel deploy` before every build and run (`kernel.go:861-867`) [read]. That is the cost pillar's answer.
+- **OQ-C: yes.** `run --confirm <F>` reads `farcast-builder`'s metadata as the reader before it applies the fetch Job (A33-22). *Reason:* one reader GET before a billed Job; refuse before anything costs.
+- **OQ-D: accepted, and said.** A first `storage deploy` without `--grant-bucket` prints the uid commands only after the ServiceAccount exists, just before the StatefulSet. Its replicas restart on a 403 until the hand-run grant propagates (A33-26). *Reason:* the keyholder starts sealed, so a restart loses nothing (`datasphere/cmd/datasphere/serve.go:69-82`) [read]. Since O2, `--grant-bucket` works in a terminal too, and it grants before the replicas exist; a stopping variant would add a second execution mode.
+- **OQ-E: neither.** Other `kubernetes.serviceaccount.uid` members on the same roles are not reported and not removed. *Reason:* they cannot be attributed from a policy, and a stale uid grants nothing. The CLI and datasphere READMEs say that only this account's uid binding and the shared name binding are managed (A33-41).
+- **OQ-F: unverified, and walked.** That Cloud Storage and Artifact Registry accept and honour a uid member, and return it byte-equal from `getIamPolicy`, is marked [unverified] in every record (O4 (f)) and becomes W4's checks (A33-39, §10.7). Until then the gcs and gke tests pin the exact-match rule against fixtures.
+
+### Step 0: the http2debug refusal (its own commit)
+
+**A33-9 (OD-11; critic's step 0): every command refuses `GODEBUG=http2debug`.**
+- **Amends the orchestrator's step-0 wording in placement only.** The refusal is process-wide and kinded `unsafe_environment`, as decided. It runs in `run()` right after the printer exists (`cli.go:138`) [read], not inside `hardenEnvironment`, because `hardenEnvironment` runs before `-o` is parsed and `Main` prints its error with no kind (`cli.go:22-25`) [read]. `hardenEnvironment`'s doc names it. Nothing else changes.
+- **kube** (`kube/transport.go`, `kube/token.go`) gains `func UnsafeEnvironment() error` (name chosen here). It returns `refuse(ErrUnsafeEnvironment, msgHTTP2Debug)` while `http2Verbose` holds, and nil otherwise. `newClient` calls it in place of its own test (`token.go:49-51`), so there is one check. `http2Verbose`, `http2DebugLogging` and `msgHTTP2Debug` stay unexported and unchanged.
+- **cli** (`cli.go`) gains `var unsafeEnvironment = kube.UnsafeEnvironment`, a seam for the parent-side test. `run` calls it right after the printer is built (`cli.go:138`) and before `config.Resolve` (`:140`). A refusal prints through `printer.PrintError(classified(err), exitCodeOf(err))` and returns 1.
+  - **Why not inside `hardenEnvironment`:** it runs in `Main` before `-o` is parsed, and `Main` prints its error with no kind or envelope (`cli.go:22-25`) [read]. `hardenEnvironment`'s doc gains a sentence naming the refusal and where it runs.
+  - **Scope:** every command that reaches its `Run`, `help` and `version` included. The root usage and `--help`, rendered before the printer exists, make no call and do not refuse.
+- **The text** is `msgHTTP2Debug`, unchanged: `the environment's GODEBUG names http2debug, which makes Go's HTTP/2 client print every request header, the bearer token included, to stderr; unset it and run farcast again; nothing was sent`.
+- **The kind** is `unsafe_environment`, through `clusterKind`'s existing `kube.ErrUnsafeEnvironment` case (`kinds.go:123-124`) [read]. Exit 1. `kinds.json` and FarSightKit's copy do not move.
+- **Pinned by:**
+  - `TestEveryCommandRefusesHTTP2Debug` (chosen here). It re-executes the test binary with `GODEBUG=http2debug=1`, and again with `=2`, and a child marker (`FARCAST_TEST_HTTP2DEBUG_CHILD=1`), as `TestHTTP2DebugLoggingNeverPrintsTheBearer` does (`kube/token_wire_test.go:189-230`) [read]. The child runs `run` with `-o json <name>` for every command `defaultRegistry().Commands()` lists. Each exits 1 with an envelope of kind `unsafe_environment` and exactly that message, and `config.ObserveReads` is empty: nothing under the config directory is read, so no key is loaded and no token minted.
+  - `TestUnsafeEnvironmentIsRefusedBeforeAnythingIsRead`: the parent-side twin, with `unsafeEnvironment` set to return the refusal, for `world`, `storage deploy` and `build`.
+  - `TestHTTP2DebugLoggingRefusesEveryClient` (`kube/transport_test.go:480`) keeps its rows.
+- **Mutation row 125.**
+- **Records** (in the same commit): the CLI README's `unsafe_environment` row (`:1496`) reads `the process environment would make farcast print a credential (GODEBUG's http2debug, refused by every command since <date>); nothing was sent`; `hardenEnvironment`'s doc. The planck harness (`planck/cmd/planck`) keeps its own hardening and is not changed.
+
+### M2.8a step 1: the groundwork, wired into no command
+
+**A33-10 (U-1, CC-15 in part): the two principals, one place.** A new file `farsight/cli/internal/cli/grants.go` (chosen here) holds:
+- `func workloadUIDPrincipal(number int64, project, uid string) (string, error)`, which returns `principal://iam.googleapis.com/projects/%d/locations/global/workloadIdentityPools/%s.svc.id.goog/kubernetes.serviceaccount.uid/%s`;
+- `func workloadNamePrincipal(number int64, project, namespace, serviceAccount string) (string, error)`, the shared `…/subject/ns/%s/sa/%s`.
+
+Both refuse, with an internal error:
+- a project failing `projectIDShape` (`reader.go:37`), with `msgUnsafeRecord`'s text (`instance %q's record holds a project ID that is not one Google issues (%q); farcast renders nothing from it`);
+- a number of 0 or less.
+
+`workloadUIDPrincipal` also refuses a uid that is neither `serviceAccountUIDShape` (`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`) nor exactly a placeholder of `saUIDPlaceholder`. That refusal is internal, with its own text: `a ServiceAccount uid that is not one the API server issues reached a grant; farcast renders nothing from it`. It is defence in depth: A33-18 has already refused such a uid as `document_unreadable`. `msgUnsafeRecord` is kept for the record's values alone (project, bucket, repository, location), since its "record holds" would be false for a value the API server sent (`reader.go:44`) [read].
+
+`func saUIDPlaceholder(namespace, name string) string` is `farcast-placeholder:sa-uid:<namespace>/<name>` (A33-19). Both grants, both printers, the IAM reads and the PUT use these helpers, so the fact, the read, the write and the printed command agree. The fixture principal is `principal://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/proj-atlas.svc.id.goog/kubernetes.serviceaccount.uid/00000000-0000-4000-8000-0000000000d5`. **Pinned by** `TestWorkloadPrincipalsRefuseUnsafeValues` (a project with `$(` or `'`; a uid with `'`, a newline, upper case, or 35 characters; number 0). Mutation row 135.
+
+**A33-11 (OD-3, U-7, CC-1 in part): the grant fact.** In `plan/facts.go`:
+```go
+const TypeGrant = "grant"
+
+type GrantFact struct {
+	Type            string   `json:"type"`
+	Name            string   `json:"name"`             // GrantBucket or GrantPush
+	Target          string   `json:"target"`           // gs://<bucket>, or the registry prefix
+	ServiceAccount  string   `json:"service_account"`  // <namespace>/<name>
+	Principal       string   `json:"principal"`        // the uid principal; "" when no number is known
+	Roles           []string `json:"roles"`
+	State           string   `json:"state"`            // the uid principal's
+	SharedPrincipal string   `json:"shared_principal"` // the name principal; "" when no number is known
+	Shared          string   `json:"shared"`           // the name principal's
+	Apply           bool     `json:"apply"`
+}
+
+func (GrantFact) FactType() string { return TypeGrant }
+
+const (
+	GrantBucket  = "bucket"
+	GrantPush    = "push"
+	GrantPresent = "present"
+	GrantMissing = "missing"
+	GrantUnknown = "unknown"
+)
+```
+- **The two observations,** from one policy read:
+  - `state` is `present` when every role has an unconditioned binding (no `condition` key) whose members hold `principal` exactly;
+  - `shared` is `present` when `shared_principal` is a member of an unconditioned binding of at least one of the roles;
+  - the same read also yields `sharedRoles`, the roles whose unconditioned binding holds `shared_principal`. Only the printers use it (A33-15), and it is not bound into the fact: `shared` is `present` exactly when it is non-empty;
+  - a 403 on the read makes both `unknown`.
+  - A conditioned binding never counts and is never rewritten. A principal held only under a condition reads `missing`.
+- **The roles:** bucket `[roles/storage.objectAdmin, roles/storage.legacyBucketReader]`; push `[roles/artifactregistry.writer]`.
+- **The count** goes from 18 to 19 here (20 with `GitCredentialFact`, A33-29). The facts' comment (`facts.go:10`) says M2.8 added both.
+- **The rendering,** a `factLines` case `grantLines` (chosen here):
+  ```
+  grant %s: %s (ServiceAccount %s) on %s as %s: %s
+    the shared principal %s, which every FarCast instance in the project shares: %s
+    <apply line>
+  ```
+  - The fields are, in order: name, principal, `service_account`, target, `listText(roles)`, state; then `shared_principal` and shared.
+  - A principal carrying the uid placeholder prints `the uid of ServiceAccount <ns>/<name>, once this command creates it`. A `""` principal prints `not known (the provider states no project number)`.
+  - The apply line, for `apply` true: `  applied: one policy write adds the uid principal to both roles and removes the shared one from them`. For false, bucket: `  not applied: the printed commands do it, or --grant-bucket`. For false, push: `  not applied: this command never grants push access; the printed commands do it`.
+- **Tests:** `factSamples`, `TestFactFieldsFollowTheFactTable` (`type name target service_account principal roles state shared_principal shared apply`), `TestCanonicalWritesEmptyArraysNotNull` (roles), `TestEveryBoundFactIsRendered` (19 types; apply in both words, all three states of each observation), and the `factTypes` decode map (`writecommands_test.go:2233-2241`).
+
+**A33-12 (OD-1, CC-3, Q-L1-8, Q-L2-2, Q-L2-4): Planck's optional grant reader.** In `planck/registry.go`:
+```go
+type GrantState string
+
+const (
+	GrantPresent GrantState = "present"
+	GrantMissing GrantState = "missing"
+	GrantUnknown GrantState = "unknown"
+)
+
+// GrantReader is an optional, read-only capability (design §33).
+type GrantReader interface {
+	ProjectNumber(ctx context.Context) (int64, error)
+	RegistryGrant(ctx context.Context, ref RegistryRef, role, member, shared string) (state, sharedState GrantState, err error)
+}
+```
+- **Callers** type-assert it on `registryAccess.provider`, as they assert `RegistryProvider` (`fatline.go:621-625`) [read]. `RegistryProvider` stays three methods wide (`planck/registry.go:28-31`) [read], and the planck README's decision 5 gains a paragraph.
+- **gke** (`planck/internal/providers/gke/registry.go`):
+  - `ProjectNumber` wraps `registryClient().projectNumber` (`:670-682`).
+  - `RegistryGrant` first resolves `ref.Name` through `repositoryName` and an empty location to the default, as `DeleteRegistry` does (`:240-250`, `:406-411`) [read], so it reads the repository the printer names (A33-15). It then makes one `getPolicy` at version 3 (`:655-663`). With one role, `sharedRoles` (A33-11) is that role exactly when `shared` is present, so no third return is needed. A 403 gives `unknown, unknown, nil`; a 404 an error naming the repository; anything else an error. Otherwise both observations come from a shared `holds(pol, role, member) bool`, which `grantRole` (`:376-391`) also uses.
+  - `var _ planck.GrantReader = (*provider)(nil)`.
+- **The number** is fetched per plan and never recorded. A hand-edited record cannot steer it, and the record already carries `Registry.Puller` (`config/instance.go:149`) [read].
+- **The test `fakeProvider`** (`install_test.go:27-101`) implements it: a fixed number, a state map, injectable errors, and an ordered call log.
+- **Pinned by** `TestRegistryGrantStates`, `TestProviderProjectNumberIsExported` and `TestEnsureRegistryNeverGrantsPush` (gke). `TestClientPolicyRequests` already pins version 3.
+
+**A33-13 (OD-2, CC-7, CC-8, U-8, Q-L1-10): bucket IAM in gcs, behind an optional datasphere capability.**
+- **datasphere** (`types.go`, `datasphere.go`) gains:
+  ```go
+  type GrantState string // "present", "missing", "unknown"
+
+  var (
+  	ErrPermissionDenied = errors.New("datasphere: the cloud refused this credential")
+  	ErrPolicyChanged    = errors.New("datasphere: the bucket's IAM policy changed while it was written")
+  )
+
+  // BucketGrants is an optional capability: unlike bucket lifecycle, an
+  // adapter may lack it.
+  type BucketGrants interface {
+  	GrantState(ctx context.Context, bucket string, roles []string, member, shared string) (state, sharedState GrantState, sharedRoles []string, err error)
+  	EnsureGrant(ctx context.Context, bucket string, roles []string, member, shared string) (changed bool, err error)
+  }
+  ```
+  `types.go:15-18`'s doc gains the note that IAM is optional.
+- **gcs** gains `datasphere/internal/providers/gcs/iam.go`, over `doJSON` and `send` (`client.go:146-223`).
+  - **The read** is `GET b/<bucket>/iam?optionsRequestedPolicyVersion=3`. It decodes `{version, etag, bindings []json.RawMessage}` and peeks each binding's `role`, `members` and whether `condition` is present.
+  - **`GrantState`** applies A33-11's two rules and returns `sharedRoles` from the same read. A 403 is `unknown, unknown, nil, nil`; anything else non-2xx is an error.
+  - **`EnsureGrant`**:
+    1. reads, with the etag;
+    2. returns `false, nil` when the state is present and shared missing;
+    3. adds `member` to each role's unconditioned binding, creating `{role, members:[member]}` when none exists;
+    4. removes `shared` from every unconditioned binding of those roles, and drops a binding left with no member;
+    5. re-marshals only the bindings it changed, and writes every other binding back byte for byte, conditioned ones included;
+    6. sends `PUT b/<bucket>/iam` with `{"bindings":[…],"etag":"<read etag>","version":3}`;
+    7. on a 409 or 412 [unverified: GCS names neither for IAM], reads again. It finishes when the state is present and shared missing; otherwise it builds the PUT again from the fresh read and sends it once more. A second 409 or 412 returns an error wrapping `ErrPolicyChanged`. At most two policy writes are made; `send`'s own 429/5xx retries replay a write unchanged and are not counted (`client.go:146-206,254-256`) [read].
+    8. A 403 on the read or the PUT wraps `ErrPermissionDenied`.
+    9. Any other non-2xx on the PUT (a 400 `INVALID_ARGUMENT` is the likeliest while the uid member is unverified, OQ-F) is returned as an error the CLI reports as A33-27 says; the policy is then unchanged.
+  - `send`'s retry of 429 and 5xx replays the same etag, which is safe (`client.go:146-206,254-256`) [read].
+  - The scope `devstorage.full_control` already covers both calls ([doc](https://docs.cloud.google.com/storage/docs/oauth-scopes)). The keyholder binary links gcs, so its image changes; its identity holds neither IAM permission.
+- **Pinned by** gcs wire tests over the `newHTTPClient` round-trip seam:
+  - `TestBucketGrantUsesTheEtag` (row 107);
+  - `TestBucketGrantAsksForPolicyVersion3` (row 108);
+  - `TestBucketGrantKeepsConditionalBindings` (row 109);
+  - `TestBucketGrantKeepsEveryOtherBindingByteForByte` (109b);
+  - `TestGrantStateObservations` (109a; every combination of the A33-11 rules, 403, 404 and 500);
+  - `TestBucketGrantRetriesAStaleEtagOnce` (109d);
+  - `TestBucketGrantRemovesTheSharedBinding` (132);
+  - `TestBucketGrantLeavesConditionedSharedBindings` (131).
+
+**A33-14 (OD-2, CC-7, Q-L1-6): the storage helper, with no ADC and no keyring.** `farsight/cli/internal/storage` gains:
+```go
+var ErrNoBucketGrants = errors.New("storage: the instance's storage provider cannot read or change a bucket's IAM")
+
+func OpenBucketGrants(meta *config.InstanceMetadata, serviceAccountKey string) (*Grants, error)
+func (g *Grants) State(ctx context.Context, bucket string, roles []string, member, shared string) (state, sharedState datasphere.GrantState, sharedRoles []string, err error)
+func (g *Grants) Ensure(ctx context.Context, bucket string, roles []string, member, shared string) (bool, error)
+```
+- `OpenBucketGrants` refuses a blank key, so the gcs adapter's ADC fallback (`gcs/client.go:112-117`) is never reached. It opens `datasphere.Open(ProviderFor(meta), Config{Credentials: key, Project, Location: meta.Region})`, asserts `datasphere.BucketGrants` (`ErrNoBucketGrants` otherwise), opens no keyring and mints nothing.
+- `State` and `Ensure` each run `provider.Validate(BucketRef{Name: bucket, Location, Instance})` first, so a bucket whose labels are not this instance's is never read or written. The conditioned `storage.admin` covers every `farcast-*` bucket in the project (`phase-3-validation.md:60-65`) [read].
+- The CLI's seam is `storageDeployCommand.openBucketGrants func(ctx context.Context, env *Env, meta *config.InstanceMetadata) (bucketGrants, error)`, with `type bucketGrants interface{ State(…); Ensure(…) }`. Its default, `openBucketGrantsDefault`, runs `loadInstallerKey` (`clusterref.go:176-198`), then `storage.OpenBucketGrants`. It is a package variable that refuses in tests: the tenth refusing seam (`refusingdefaults_test.go:16`'s doc).
+
+**A33-15 (OD-7, CC-15, MS-5, MS-6, U-9, L2-C5): the printed commands.** Both printers drop `gcloud projects describe` and print from checked values.
+- **Each substituted value** is single-quoted and checked first:
+  - the project against `projectIDShape`;
+  - the uid against `serviceAccountUIDShape`;
+  - the bucket against `^farcast-[a-z0-9-]{1,55}$`, the shape of the names farcast mints;
+  - the repository and location from `registryRefFor(meta)` (`connect.go:868-880`), each against `^[a-z0-9-]{1,63}$`.
+
+  A record value that fails (the project, the bucket, the repository, the location) refuses the plan, kind internal, with `msgUnsafeRecord`'s text. A uid that fails is A33-10's internal error with its own text, never `msgUnsafeRecord`'s. Nothing is printed either way, and a printer is never handed a placeholder.
+- **A registry recorded without its repository or location.** `registryRefFor` falls back to the instance's name and region when `Registry.Repository` or `Registry.Location` is empty (`connect.go:868-880`) [read]. The gke adapter names the repository `farcast-<instance>` (`repositoryName`, `gke/registry.go:406-411`) [read], so the printer would name a repository that does not exist. `recordRegistry` always sets both (`connect.go:884-891`) [read], so only a hand-edited record reaches this. `build` and `run` D therefore refuse a record whose `Registry.Prefix` is set and whose `Repository` or `Location` is empty, kind internal, before any read or print: `instance %q's record names an image registry but not its repository or its location; farcast reads and renders nothing from it`. `RegistryGrant` resolves the name as well (A33-12).
+- **Each command** is one line with no backslash continuation, so a paste runs each one alone. The lines are not numbered, so a paste stays runnable. Both choices are made here.
+- **The bucket** (`writeBucketGrant(w io.Writer, g bucketGrantLines)`), when the grant is not applied. It opens with `Before this keyholder can start, its ServiceAccount farcast-system/datasphered needs read/write access to the bucket, granted to it by its uid. In Cloud Shell, run:` when add lines follow:
+  1. when `state` is not present, for each role: `gcloud storage buckets add-iam-policy-binding 'gs://<bucket>' --member '<uid principal>' --role '<role>' --condition=None`;
+  2. when `shared` is present: after add lines, `Then wait for IAM (typically 2 minutes, up to 7 or more), and remove the binding every FarCast instance in project '<project>' shares:`; with none, `Remove the binding every FarCast instance in project '<project>' shares:`. Then, for each role in `bucketGrantLines.sharedRoles` (A33-11) and only those, `gcloud storage buckets remove-iam-policy-binding 'gs://<bucket>' --member '<name principal>' --role '<role>' --condition=None`. A remove line for a role that does not hold the principal would fail in gcloud.
+  3. On `unknown`, both blocks print, the remove block with both roles, since no per-role state is known. The first is introduced by `If gs://<bucket> does not grant it yet:`, and the second by `If it still grants the principal every FarCast instance in project '<project>' shares, wait for IAM, then:`.
+  4. The closing sentence on the bucket and object separation stays (`storagedeploy.go:816-817`).
+- **The push** (`writePushGrant(w io.Writer, g pushGrantLines)`), when `state` is not present: `gcloud artifacts repositories add-iam-policy-binding '<repository>' --project '<project>' --location '<location>' --member '<uid principal>' --role 'roles/artifactregistry.writer' --condition=None`. Then, when `shared` is present, the same wait line (or, with no add line, the same `Remove …` line) and `gcloud artifacts repositories remove-iam-policy-binding … --member '<name principal>' --role 'roles/artifactregistry.writer' --condition=None`. Its introduction is the notice's text (A33-22). `--project` fixes today's reliance on gcloud's configured project (`buildgrant.go:71-72`) [read]. Both commands take `--condition=None` and `--location` ([doc](https://docs.cloud.google.com/sdk/gcloud/reference/artifacts/repositories/add-iam-policy-binding), [doc](https://docs.cloud.google.com/sdk/gcloud/reference/artifacts/repositories/remove-iam-policy-binding)), and so do the storage ones ([doc](https://docs.cloud.google.com/sdk/gcloud/reference/storage/buckets/remove-iam-policy-binding)).
+- **Adding before removing** never cuts a running keyholder or builder off.
+- **Built with their callers:** the push printer in step 3, the bucket printer in step 4, so no vector moves before its command does.
+- **When no number is known** (a provider without `GrantReader`, MS-6), and only then, the printers print `PROJNUM=$(gcloud projects describe '<project>' --format='value(projectNumber)')`. The members are then double-quoted with `${PROJNUM}`. Every other value in them passed its shape check, so no `$`, backtick or quote can occur.
+- **Pinned by:**
+  - `TestPrintedGrantAddsBeforeItRemoves` (row 133), for both printers, with a bucket case where only one role holds the shared principal: one remove line, for that role;
+  - the rawtext and shell rows (`rawtext_test.go:242-251`, widened; row 110i): a project carrying `$(` or `'`, and a uid carrying `'` or a newline, refuse with no marker printed;
+  - `TestPlaceholdersSurviveWhenNothingIsKnown` and `TestAPushDenialExplainsItselfWithTheCommandThatFixesIt` (`buildgrant_test.go:39-90`), moved to the new signatures;
+  - `TestNoPrintedGrantDescribesTheProject`: no `gcloud projects describe` when a number is known;
+  - `TestPushGrantRefusesARegistryRecordedWithoutItsRepository` (chosen here): `build --plan` and `run` D on a record with `Prefix` set and `Repository` empty, then `Location` empty, refuse with that text, with no provider call and nothing printed.
+
+### M2.8a step 2: the reader's RBAC
+
+**A33-16 (U-3, O4 (b)): the reader may read two ServiceAccounts' metadata in `farcast-system`, by name.**
+- **The rule is its own namespaced pair, as O4 (b) words it: `get serviceaccounts` in `farcast-system`.** `renderReaderRBAC` (`readerrbac.go:94-117`) renders two more documents after the ClusterRole `farcast-reader` and before the per-namespace RoleBindings:
+  - a Role `farcast-reader-serviceaccounts` in `farcast-system`, with `apiGroups [""]`, `resources [serviceaccounts]`, `resourceNames [{{SERVICEACCOUNTS}}]`, `verbs [get]`;
+  - a RoleBinding `farcast-reader-serviceaccounts` in `farcast-system`, of that Role to the reader's email.
+
+  Both carry the labels `app.kubernetes.io/managed-by: farcast` and `app.kubernetes.io/part-of: farcast-reader`. `{{SERVICEACCOUNTS}}` comes from a new `var readerServiceAccounts = []string{dsdeploy.DefaultName, pbuild.ServiceAccount}`. A `get` through `PartialObjectMetadata` returns metadata only.
+- **The ClusterRole `farcast-reader` is unchanged.** It is bound in `farcast-system` and in every metered namespace (`readerrbac.go:94-101,190-206`; `readergrant.go:386-392`) [read], so a rule there would let the reader read the two names in every metered namespace, which O4 (b) does not grant. `TestReaderResourcesFollowTheRoleRuleOrder`, `kernel_meter.json`, `kernel_deploy.json` and the meter facts do not move.
+- **Only `reader grant` applies the pair.** `kernel meter`, `kernel deploy` and `run` render only RoleBindings to `farcast-reader` (`renderReaderBinding`, `readerrbac.go:119-130`) [read]. kubetest's RBAC emulation already evaluates a Role bound by a RoleBinding (`kube/kubetest/rbac.go:279-303`) [read].
+- **The write count.** `reader grant` writes 5 + 1 per namespace (was 3 + 1), in §9.4's row (A33-39), its tests and its records.
+- **Its fact.** `ReaderFact` gains `ServiceAccounts []string `json:"service_accounts"`` after `configmaps`, rendered `; in farcast-system, the ServiceAccounts %s (their uid)`.
+- **Its prompt.** `msgReaderGrantPrompt` (`readergrant.go:53-55`) names the ServiceAccounts under `farcast-system` alone: `… deployments, statefulsets, jobs, pods and their logs, and the ConfigMaps %s; in farcast-system alone, the ServiceAccounts %s (their uid, which a grant names)?`. Its last argument is `strings.Join(readerServiceAccounts, ", ")`.
+- **Its Usage.** `reader grant`'s Usage lists the rule set verbatim (`readergrant.go:139-151`) [read], and step 2 makes it false. It gains `in farcast-system alone, the ServiceAccounts datasphered and farcast-builder (get), whose uid a grant names`, in step 2, with the CLI README's reader section (`:1376`).
+- **The design.** §7.2's YAML and its notes gain the Role and its RoleBinding. "No Secret, Service, write verb or `watch`" stands. "What it can read" gains "and the metadata of two ServiceAccounts in `farcast-system`".
+- **Its vector.** `reader_grant.json` is regenerated, with the two new writes, the new field and the digest. The ClusterRole's sha256 does not move.
+- **Pinned by:**
+  - `TestReaderRBACBindsOnlyNamespacesClusterWide`, amended (rows 55, 128). Its RoleBinding loop (`readerrbac_test.go:220-228`) [read] expects every binding to be `farcast-reader`'s, so it sets the new one apart: exactly one RoleBinding `farcast-reader-serviceaccounts`, in `farcast-system`, of the Role of that name, whose one rule is `{"", "serviceaccounts", "get", "datasphered,farcast-builder"}`. The ClusterRole's rule table (`:229-243`) is unchanged. Allowed probes: `GetObject` of `serviceaccounts` `datasphered` and `farcast-builder` in `farcast-system`. Forbidden probes: `farcast-fetcher` and `default` in `farcast-system`, a list of `serviceaccounts`, the same two names in a metered namespace (`web`), and in an unbound namespace.
+  - `TestReaderRoleNamesTheServiceAccountsPlansRead` (chosen here). `readerServiceAccounts` equals `{dsdeploy.DefaultName, pbuild.ServiceAccount}`, and every `GetMeta` call site of kind ServiceAccount outside `migrate.go` names one of them in `farcast-system`, by an AST scan like `TestReaderRoleNamesTheConfigMapsReadsUse`'s.
+  - `TestReaderResourcesFollowTheRoleRuleOrder` is unchanged.
+  - `TestReaderGrantPlanReadsNoClusterAndNeedsNoTerminal`, amended: `ServiceAccounts`, the human line and the two writes.
+
+**A33-17 (U-4, O4 (b)): a reader granted before M2.8 is told to run `reader grant` again.**
+- **The detection** is the RBAC 403 on the account read (A33-18). No record marker is used: the record cannot prove the cluster's RBAC, and `requireGrantedReader` keeps reading the record's state alone (`consent.go:156-170`) [read].
+- **On `forbiddenByRBAC(err)`** the plan refuses, kind `forbidden`, with `msgReaderLacksServiceAccounts = "the instance's reader may not read the ServiceAccount %s/%s, whose uid the %s grant names since ADR 0023 M2.8; run 'farcast reader grant %s' again, which adds that read, then plan again"`. The arguments are the namespace, the name, `bucket` or `push`, and the instance.
+- **Its construction** is exactly `&readerPhaseError{fmt.Errorf(msgReaderLacksServiceAccounts+" (%w)", ns, name, grant, instance, tkube.ErrForbidden)}`. It is marked as the reader's, so `writerRefused` adds nothing, but it does not go through `readerPhase()`: `readerRefused` would append `; run 'farcast reader grant <name>'` a second time (`clusterref.go:270-298`) [read]. It wraps the sentinel, not the server's error, so the server's message, which names the reader's email, is not echoed; `clusterKind` still gives `forbidden` (`kinds.go:133`) [read].
+- **An IAM-shaped 403** keeps `readerRefused`'s `msgReaderIAMRefused`.
+- **Pinned by** `TestPlanRefusesAReaderWithoutTheServiceAccountRule` (row 129). Under kubetest `WithRBAC` and the pre-M2.8 rule set, `storage deploy --plan`, `build --plan` and `run --confirm <D>` each refuse with that text, kind `forbidden` and no writer sentence, and send no Google request. `reader grant` appears exactly once in the error, and the reader's email not at all. A non-Status 403 gets `msgReaderIAMRefused`.
+
+### M2.8a step 3: reading the uid; `kernel deploy`, `build` and `run`
+
+**A33-18 (U-2): one narrow interface, one helper.**
+- **The interface.** `type serviceAccountReader interface{ GetMeta(ctx context.Context, k kube.Kind, namespace, name string) (kube.Object, error) }`, which `*cluster.Client` satisfies (`cluster/open.go:118-131`) [read]. It is not added to `pinPlanReader`, which `storage key pin` and `rotate` share, so their fakes are untouched.
+- **The helper.** `func readServiceAccountUID(ctx context.Context, rd serviceAccountReader, m consentMode, instance, namespace, name, grant string) (string, error)`, with the kind `kube.KindOf("v1", "ServiceAccount")`:
+  - a 404 (`tkube.ErrNotFound`) returns `""`;
+  - an RBAC 403 under `--plan` or `--confirm` returns A33-17's refusal;
+  - any other error goes through `planRead(m, …)`;
+  - a uid failing `serviceAccountUIDShape` is `fmt.Errorf("the ServiceAccount %s/%s has the uid %q, which is not one the API server issues: %w", …, kube.ErrUnreadable)`, kind `document_unreadable`. This is the only refusal a uid the server sent meets; A33-10's and A33-15's checks behind it are defence in depth.
+- **The seams:**
+  - `storage deploy`: `newPlanReader` returns `keyholderPlanReader` (`pinPlanReader` plus `serviceAccountReader`). An interactive or `--yes` run passes `keyholderReader{ps, cl}`, built from the pin store and the writer it opened.
+  - `clusterApplier` (`fatline.go:43-50`) gains `serviceAccountReader`, so the writer reads the uid at execution (A33-26). Its fake, `fakeCluster` (`connect_test.go:41`), gains `GetMeta`, as does any vector fake returned for it.
+  - `run`: `runPlanReader` gains `serviceAccountReader`.
+  - `build`: `jobWaiter` gains it, and `build` gains `newPlanReader` (A33-21).
+  - **The fakes** that gain `GetMeta` (the UID map's list): `fakePinStore`'s reader view, `recordedPins`, `pinsAt`, `vectorCluster`, `vectorRunCluster`, `fakeRunCluster`, `runWriterWithPin` and `fakeJobs`. `fakeMigrateCluster` already has it.
+
+**A33-19 (U-5): the placeholder, and the comparison.**
+- **The placeholder.** When the account does not exist, the plan binds `principal = workloadUIDPrincipal(number, project, saUIDPlaceholder(ns, name))`, and its `state` is `missing`: the policy is matched locally, no binding can hold that principal, and nothing about the placeholder is sent. `shared` is still read where a policy is read (A33-25).
+- **The comparison.** `--confirm` compares by digest, as for every fact. An account created between the plan and the recomputation binds a real uid, so the digests differ: `plan_changed`.
+- **A replaced account.** A plan that bound a real uid but finds another at execution (A33-26 step 2b) refuses: `msgServiceAccountReplaced = "the ServiceAccount %s/%s was replaced since the plan was made (its uid is %s, not %s); "`, followed by the clause of what was written (A33-26), through `changedAfterPlan`. That gives `plan_changed` with `msgPlanAgain` under `--confirm`, and internal otherwise.
+- **§9.4 and A23-30:** the placeholders gain `farcast-placeholder:sa-uid:<namespace>/<name>`.
+- **A23-31's list** (seven items with A27-12's) gains an eighth: the uid in a grant's principal, when the plan bound its placeholder. No document carries it, so `TestConfirmWritesThePlannedDocumentsExceptTheirSecrets`' masks are unchanged.
+- **Pinned by:**
+  - `TestFirstDeployBindsThePlaceholderUID`, with a `TestPlanIsDeterministic` row;
+  - `TestConfirmRefusesAServiceAccountReplacedSinceThePlan` (row 130). With a plan made at uid …d5 and the account seeded again at …d6, `--confirm` refuses `plan_changed` at the comparison, with no bucket made and no IAM read or write. Its twin replaces the account after the comparison and before step 2b, which refuses there, leaving the bucket, the keyring and the ServiceAccount and nothing else.
+
+**A33-20 (OQ-B): `kernel deploy` creates the builder's ServiceAccount.**
+- **planck/build** gains `func RenderServiceAccount() []byte` (chosen here). It is the exact ServiceAccount document `Render` begins with (`planck/build/build.go:349-356`) [read]; `Render` uses it, so the two cannot drift.
+- **`kernelManifests`** (`kernel.go:773-794`) puts it first in `kernel deploy`'s stream, right after the Namespace document `tcdeploy.Render` begins with (`technocore/deploy/deploy.go:217-223`) [read] and before any TechnoCore object. The account is optional for the kernel, so a refused or failed apply of it stops the stream before TechnoCore's workload, its RoleBindings and the seed change; placed after the workload, it would stop the stream with the workload applied and the seed not (`kernel.go:755-758`'s reason for the seed's place) [read]. The seed stays last (A17-7). `kernel deploy`'s plan gains one write fact, `ServiceAccount farcast-system/farcast-builder`, and `kernel_deploy.json` is regenerated.
+- **Not newly automated** (AGENTS.md, Consent): it is the same document every build already applies, `--yes` included; it grants nothing, and the grant that names its uid stays a human step.
+- A build's own forced apply of the same bytes, as the same manager, changes nothing, and the account keeps its uid (`kube/kubetest/writes.go:512-531`) [read].
+- An instance whose kernel was deployed before M2.8 gets the account at its next `kernel deploy` or its first build (A33-22).
+- `kernel deploy`'s Usage gains: `It also creates the builder's ServiceAccount, so the push grant can name it by its uid before the first build.`
+- **Pinned by** `TestKernelDeployCreatesTheBuilderAccount` (the write fact, the applied document byte-equal to `pbuild.Render`'s first, and its place: second in the stream, after the Namespace and before TechnoCore's ServiceAccount) and `TestRenderBeginsWithTheServiceAccount` (planck/build). Mutation row 141.
+
+**A33-21 (OQ-A as B1, U-12, CC-12, L4-C11): `build`'s plan reads the cluster as the reader.**
+- **The plan.** `newBound("build", meta, "reader", uid)`.
+  - **Under `--plan` and `--confirm`:** `requireGrantedReader(env.ConfigDir, meta, "build", mode)` runs right after `requireKernel`, and then the reader opens through a new seam, `buildCommand.newPlanReader func(clusterRef) (buildPlanReader, error)`, with `type buildPlanReader interface{ serviceAccountReader; preflighter }`. Its default goes through `openReaderDefault`.
+  - **An interactive or `--yes` run** opens the writer through `openReadyAt` (`fatline.go:731`), binds the uid its preflight read, as `run` D does with `writerUID`, and reads the account through that writer.
+  - **The read order:** `NamespaceUID`, then the builder image, the render, `farcast-builder`'s uid (A33-18), then the push grant's Google reads (A33-22).
+- **`--confirm`** moves from `openReady` to `openConfirmed` (`fatline.go:759`), so a writer that reaches another cluster is refused.
+- **The planCommands rows** for build become identity `reader` with `readsCluster` true. `build.json` binds `cluster_identity: reader` and `system_namespace_uid` `…026`.
+- **A23-1's list** moves `build` to the group whose `--plan` and `--confirm` refuse with `credential_missing` where no reader can be granted. Interactive and `--yes` builds are unchanged there.
+- **Texts:** `build`'s Usage (`build.go:78-88`, "no cluster and no installer key") and its plan comment (`:150-156`) are rewritten to say that the plan reads `farcast-system`'s uid and the builder's ServiceAccount as the reader, and the repository's IAM policy and the project number with the installer's key.
+- **Pinned by:**
+  - `TestBuildPlanReadsTheBuilderAsTheReader` (row 136);
+  - `TestPlansPresentOnlyTheReaderToken`'s build rows;
+  - `TestPlanWithoutAReaderIsRefused`' four build rows;
+  - `TestEveryReaderReadIsAllowedByTheRenderedRBAC`'s build rows;
+  - a build row in `TestConfirmChecksTheWritersClusterIsThePlans`.
+
+**A33-22 (OD-5, OD-6, O3, CC-2, CC-24, U-10, MS-7, OQ-C): the push grant in `build` and in `run` D.**
+- **The seams.** `buildCommand` and `runCommand` each gain `openProvider providerOpener`, whose default is `openProviderDefault` (`fatline.go:160-195`), already refusing in tests.
+- **The read.** `func readPushGrant(ctx context.Context, env *Env, meta *config.InstanceMetadata, open providerOpener, uid string) (pushGrant, plan.GrantFact, error)`, in `buildgrant.go`:
+  1. `loadInstallerKey`, which refuses a blank key before the provider opens;
+  2. open the provider and assert `planck.GrantReader`; without it, the fact has `principal` and `shared_principal` `""` and both states `unknown`, and nothing is read (MS-6);
+  3. `ProjectNumber`;
+  4. the two principals (A33-10);
+  5. `RegistryGrant(registryRefFor(meta), "roles/artifactregistry.writer", uidPrincipal, namePrincipal)`. With the placeholder uid, no binding can hold the principal, so the state reads `missing` and `shared` is still read; the match is local, and nothing about the placeholder is sent;
+  6. the fact is `{Name: push, Target: meta.Registry.Prefix, ServiceAccount: "farcast-system/farcast-builder", Roles: [writer], Apply: false}`.
+
+  A `projects.get` error refuses the plan with nothing applied: `TestPushGrantProjectNumberFailureRefusesThePlan`.
+- **Where the read runs.** In `build`'s plan, after the cluster reads (A33-21). In `run` D, after every block, immediately before the facts are assembled (after the meter stream and the notices, `run.go:936-943`): first `farcast-builder`'s uid (A33-18), then `readPushGrant`. So a blocked D (manifest, namespace, no CA key, unmetered namespace, pin) reads neither.
+- **The fact's position:** right after `image` (builder), in `build` and in `run` D.
+- **The notice** (A23-26) is emitted when `state` is not `present`, or `shared` is not `missing`. Its texts (chosen here):
+  - account present, state missing: `msgPushGrantMissing = "The builder's ServiceAccount farcast-system/farcast-builder pushes under its own cloud identity, and the repository's own policy does not hold roles/artifactregistry.writer for it by its uid (a grant at the project, through a group or by a wider role does not show here). If nothing wider covers it, the push is refused after the build has run. Grant it in Cloud Shell:"`, then the printer's lines, then `A plan made before this grant cannot be confirmed after it.`;
+  - state present, shared present: `msgPushGrantShared = "The repository's own policy grants the builder roles/artifactregistry.writer by its uid, and still grants it to the principal every FarCast instance in project %q shares. Remove that one in Cloud Shell:"`, then the remove lines;
+  - unknown: `msgPushGrantUnknown = "The stored credential may not read the repository's IAM policy, so whether the builder may push is not known."`, then both blocks (A33-15);
+  - account absent: `msgPushGrantPending = "The builder's ServiceAccount farcast-system/farcast-builder does not exist yet: this command creates it, and prints the commands that grant it by its uid right after the build starts. Until that grant is in place and IAM has propagated, the push is refused unless a wider grant covers it. 'farcast kernel deploy' creates the account ahead of any build."`.
+- **Printed, in the modes.** An interactive run prints the notice before the cost question (`build.go:382-394`; `run`'s review), and `--confirm` prints it right after the comparison.
+  - **Right after the build stream's `Apply` and before `WaitJob`,** in `build.Run` and `buildAll`, when the plan bound the placeholder: read the uid as the writer, and print `The builder's ServiceAccount exists now; grant it while the build runs, and a grant that lands before the push lets this build succeed:` and the commands. No extra read is made when the plan held a real uid. In `buildAll` the read and the lines come once, after the first build's `Apply` (`run.go:1313`) [read]: the account exists from then on.
+  - **That read is best-effort.** The Job is already applied and billed (up to 1800 s at 1 vCPU and 2 GiB, `planck/build/build.go:42-48`) [read], so an error never stops the command. It prints one line, `the builder's ServiceAccount farcast-system/farcast-builder could not be read (%v); 'farcast build <instance> … --plan' states the grant`, and goes on to `WaitJob`; the digest of a push that succeeds is still reported, and `run` still deploys.
+  - **`explainPushDenial`** prints the same commands with the known uid (read as the writer when the plan held the placeholder). Its read falls back the same way: on an error it prints that one line in place of the commands.
+  - **`buildResult`** gains `push_grant {principal, state, shared}`, and `Human` prints the commands only when the plan's state was not present.
+- **The state stays bound** (OD-6, CC-24). A plan made while the grant is missing, then the hand grant, then `--confirm`, is `plan_changed`. Each not-present notice says so.
+- **`run --confirm <F>` checks the builder read first (OQ-C).** Right after F's comparison and `requireRunReader`, and after the reader opens, `run` reads `farcast-builder` through `readServiceAccountUID` as the reader. That is before `openConfirmed` and before the fetch Job is applied (`run.go:403-416`). An RBAC 403 refuses with A33-17's text plus ` Nothing was written.`, and the fetch Job is never applied. A 404 goes on.
+- **A Google failure in D under `--confirm <F>`** comes after the billed fetch, and is accepted (MS-7). `run`'s Usage and the README's run section say so. `TestRunConfirmFetchGoogleFailurePrintsNoDeployPlan`: a `projects.get` error after F's apply prints no D and writes nothing more.
+- **Texts (CC-14).** `build.go:424-427`'s comment, the CLI README `:1185` and planck README `:311` give `buildgrant.go:52-61`'s reason, and drop "same reasoning as the bucket grant".
+- **Pinned by:**
+  - `TestPushGrantIsNeverApplied` (row 110). For `build` and `run` D in every mode, with the state missing, the fake provider's ordered call log for each plan computation is exactly `[ProjectNumber, RegistryGrant]`. Every grant fact has `apply` false, and `--grant-push` is an unknown flag (exit 2).
+  - `TestBuildPlanStatesThePushGrant` and `TestRunDeployPlanStatesThePushGrant` (110c, 110d);
+  - `TestPushGrantPrincipalCarriesTheProjectNumber` (110f);
+  - `TestConfirmRefusesAPushGrantChangedSinceThePlan` (110e);
+  - `TestBuildPrintsThePushGrantOnlyWhenNotPresent`;
+  - `TestPushCommandsPrintRightAfterTheBuildApply` (row 142), with a row where `GetMeta` fails after the `Apply`: `WaitJob` is still called, the fallback line is printed and the digest is reported; and a `run` row with two builds that reads and prints once;
+  - `TestGrantNamesTheServiceAccountUID` (row 126), its push rows: the push fact, the printed commands and the `RegistryGrant` member carry the fixture uid principal (…b5), and `subject/ns/` appears only as `shared_principal` and in remove lines;
+  - `TestGrantsWithoutTheCapabilityAreUnknown` (MS-6, chosen here), its push rows: `build` and `run` D with a `fakeProvider` lacking `GrantReader` bind principals `""` and both states `unknown`, make no read, and print the `PROJNUM` fallback;
+  - `TestRunConfirmFetchChecksTheBuilderReadFirst` (row 140).
+
+**A33-23 (OD-8, CC-13, Q-L2-3, L4-Q7): `set_pull_grant`'s target stays the repository.** `fatline.go:806-810`'s comment and A23-24's parenthesis now read: the target is the repository; the pull principal is recorded as `Registry.Puller` (`config/instance.go:149`). No vector moves, and `reconnect` stays out of the Google-read group.
+
+### M2.8a step 4: the bucket grant
+
+**A33-24 (O2, OD-4, U-11): the flag, its consent, and its option.**
+- **The flag.** `fs.BoolVar(&c.grantBucket, "grant-bucket", false, "apply the keyholder's bucket grant, by its ServiceAccount's uid, under --confirm or this terminal's question (never with --yes)")`.
+- **Right after `consent.mode`** (`storagedeploy.go:179`) and before anything is read:
+  - with `--yes`, `usagef(msgGrantBucketYes, shown, shown)`, where `msgGrantBucketYes = "--grant-bucket cannot be run with --yes: it changes the IAM policy of instance %q's bucket; confirm it in a terminal, or review 'farcast storage deploy %s --plan --grant-bucket' and pass --confirm <digest>"`. `shown` is `<instance>` for an invalid name (A23-41);
+  - not interactive (`isInteractive`) and `consentNone`: `usagef(msgGrantBucketTerminal)`, where `msgGrantBucketTerminal = "--grant-bucket needs a terminal to confirm" + consentSuffix`. It gets a `TestNonInteractiveRefusalsNameThePlan` gate.
+- **The option** `{grant-bucket, true|false}` is bound right after `newBound`, before the pin blocks (CC-4): `TestEveryBehaviourFlagIsBound` checks blocked plans' options too (`plancomplete_test.go:391-393`) [read].
+- **The question,** asked in `consented()` after the cost and build questions, and only when the grant would write (A33-25's `writes`): `Grant roles/storage.objectAdmin and roles/storage.legacyBucketReader on %s to %s%s?`.
+  - The first `%s` is `gs://<bucket>`, or `the bucket this deploy creates`.
+  - The second is the uid principal, or `the keyholder's ServiceAccount farcast-system/datasphered, by the uid it has once this deploy creates it`.
+  - The suffix is `, and remove them from %s, which every FarCast instance in project %q shares` when `shared` is present.
+  - With `state` present, the write only removes, so the question names that instead: `Remove roles/storage.objectAdmin and roles/storage.legacyBucketReader on %s from %s, which every FarCast instance in project %q shares? The keyholder's uid already holds both.`
+  - Declining prints `Aborted.` and writes nothing.
+- **Pinned by:**
+  - `TestBucketGrantNeedsConsent` (row 106; it replaces §9.7's `TestBucketGrantNeedsConfirm`). `--plan` and `--confirm` are accepted, and so is a terminal run with its question. `--yes` is refused with `msgGrantBucketYes` and `ObserveReads` empty; `--plan --yes` gives the three-way error first; a non-terminal run with no flag gets `msgGrantBucketTerminal`.
+  - `TestInteractiveGrantBucketAsksNamingEverything` (row 138). The question names everything above, with a row for `state` present and `shared` present that asks the remove-only question; declining leaves the IAM PUT counter at 0.
+
+**A33-25 (CC-4 amended, CC-5, CC-1, CC-11, MS-6, U-6, Q-L1-3, Q-L1-4, Q-L1-5): the plan.** After the blocks, in this order (every read is the plan's: the reader under `--plan` and `--confirm`, the writer otherwise):
+1. `readServiceAccountUID(rd, farcast-system, datasphered, "bucket")` (A33-18), before any Google read, so blocked plans' read sets, and `TestPlansPresentOnlyTheReaderToken`, are unchanged;
+2. `decideIdentity`, `deployRegistry`, `decideImage`, as today;
+3. `ProjectNumber` through `p.reg.provider.(planck.GrantReader)`. Without it: principals `""`, both states `unknown`, no read (MS-6);
+4. with a bucket recorded: `openBucketGrants`, then `State(bucket, roles, uidPrincipal, namePrincipal)`. That reads the policy whether or not the account exists, so `shared` is known; with the placeholder uid, `state` is `missing` (A33-19). An `ErrNoBucketGrants` gives `unknown`, with no read;
+5. a first deploy (no bucket recorded) makes no IAM read: target `gs://farcast-placeholder:bucket:<instance>`, both states `missing`.
+
+**The facts,** in the order the command writes:
+- cost, image and the registry's cloud facts;
+- `create_bucket` on a first deploy;
+- the mints and the restart;
+- **the writes of the stream's first two documents** (Namespace, ServiceAccount);
+- the grant fact;
+- `cloud{storage, set_bucket_grant, gs://<bucket>}` exactly when `writes` holds (CC-1; the constant exists, `facts.go:238`);
+- the pin and its write;
+- the stream's remaining writes;
+- the notices.
+
+`writes` is `apply && (state != present || shared == present)`.
+
+**The blocks** (A23-18 gains them for `storage deploy`):
+- `apply` with either state `unknown` and a provider that has the capability: kind `forbidden`, `the stored credential may not read gs://%s's IAM policy, so --grant-bucket cannot apply the keyholder's grant; plan without --grant-bucket and run the printed commands`;
+- `apply` with no capability: internal, `the instance's storage provider cannot read or change a bucket's IAM, so --grant-bucket cannot apply the keyholder's grant; plan without --grant-bucket and run the printed commands`.
+
+**The notice** (CC-11), only when it is printed:
+- not applied, account absent: `msgBucketGrantPending = "The keyholder's ServiceAccount farcast-system/datasphered does not exist yet: this deploy creates it before the keyholder, and then prints the commands that grant it %s by its uid (and that remove the shared binding, when the bucket holds it). Until they are run and IAM has propagated (typically 2 minutes, up to 7 or more), the replicas restart on a 403 and an unseal fails. --grant-bucket applies the grant before the replicas start."`;
+- not applied, account present, and `state != present` or `shared != missing`: `bucketGrantText`, the printer's lines without their outer blank lines (A27-10), then `A plan made before this grant cannot be confirmed after it.`;
+- `state` present and `shared` missing, applied or not: `msgBucketGrantPresent = "gs://%s grants the keyholder's ServiceAccount farcast-system/datasphered, by its uid, roles/storage.objectAdmin and roles/storage.legacyBucketReader, and the principal every FarCast instance in the project shares holds neither"`;
+- applied with `writes`: none, since the cloud fact states it.
+
+**Pinned by:**
+- `TestFirstDeployGrantIsMissingUnread` (0 IAM reads);
+- `TestBucketGrantUnknownStateIsBlocked` (109c);
+- `TestSharedPresentWithGrantPresentStillWrites` (a cloud fact and one PUT that only removes; present and missing give no fact and 0 PUTs);
+- `TestBucketGrantRefusesABucketNotTheInstances` (109h);
+- `TestPlanPrintsNoticesOnlyAsFacts`' bucket row;
+- `TestPlansWriteNothing` with an IAM-set counter at 0 (106b);
+- `TestGrantNamesTheServiceAccountUID` (row 126), its bucket rows: the bucket fact, the IAM PUT's member and the printed commands carry the fixture uid principal (…d5), and `subject/ns/` appears only as `shared_principal` and in remove lines;
+- `TestGrantsWithoutTheCapabilityAreUnknown` (MS-6), its bucket rows: a datasphere provider lacking `BucketGrants` gives both states `unknown` with no IAM read, and `--grant-bucket` there is the internal block above.
+
+**A33-26 (CC-6 amended, U-6, OQ-D, Q-L1-2): the execution order, in every mode.**
+
+`deploy()` (`storagedeploy.go:311-442`) becomes:
+1. `ensureStorage`, its re-read, and under `--confirm`, `sameRecord`, as today. `msgStorageRecordChanged` is unchanged, since nothing else is written yet.
+2. **2a:** `cl.Apply(account)`, where `account` is `dsdeploy.RenderAccount(keyholderConfig(meta, "", …))`. `func RenderAccount(c Config) ([]byte, error)` is a new export (chosen here) rendering exactly the Namespace and ServiceAccount documents. It applies `withDefaults` and validates only `Namespace` and `Name`, because at 2a the image is not realized and the leaf is not issued, and `Render`'s checks of the image digest, the mTLS material and the bucket (`datasphere/deploy/deploy.go:156-180`) [read] would always fail there. `Render` validates everything first, then returns `RenderAccount(c)` + `"---\n"` + `RenderWorkload(c)`, byte-identical to today (`TestRenderIsTheAccountThenTheWorkload`). Neither document depends on the leaf, the image or the bucket.
+3. **2b:** `readServiceAccountUID` through the writer `cl`, in mode `consentNone` so a 403 stays the writer's. A `""` is internal: `the ServiceAccount farcast-system/datasphered was applied and then not found; ` + the clause. When the plan bound a real uid and it differs: A33-19's `msgServiceAccountReplaced`. With the placeholder, the read uid is adopted.
+4. **2c:** the printed lines are rendered into a buffer, with the real bucket and uid and every shape check of A33-15: the lines of a grant not applied, or the present line, and under `--grant-bucket` the commands A33-27 prints when `Ensure` is refused. This is one step earlier than right after 3b, so that the refused-`Ensure` path has them too. A printer's refusal therefore comes before 3b, the pin and the saving of `meta.Keyholder{Deployed: true}`, and never leaves a keyholder recorded as deployed and not applied. Today's values pass those checks earlier (the project at plan time, the uid at 2b, a minted bucket name, `datasphere/bucket.go:52-71`) [read], so the refusal is unreachable today, but not excluded.
+5. **3b:** when `writes` holds: `openBucketGrants` (or the plan's handle) and `Ensure(bucket, roles, uidPrincipal(real uid), namePrincipal)`, which validates the labels first. This comes before `realizeRegistry`, so IAM propagates while the image pushes, and the replicas do not exist yet.
+6. `realizeRegistry`, `realizeAndNote`, `realizeIdentity`, `IssueKeyholderServer`, `RenderWorkload` with the real leaf, the pin, and the record, as today.
+7. When the grant is not applied: the bytes prepared at 2c are written to stderr, as today's `writeBucketGrant` call (`:424`). Nothing is checked or rendered here.
+8. `cl.Apply(workload)`: the remaining documents, each applied once.
+
+**The clause of what was written** is `writtenSoFar()` (chosen here), cumulative over a `written []string` that `deploy()` appends to as each step succeeds:
+- on the mint path, after step 1: `the bucket and the keyring were ensured`;
+- after 2a: `the keyholder's ServiceAccount farcast-system/datasphered was applied`;
+- after 3b, when `Ensure` returned `changed` true: `gs://<bucket>'s IAM policy now grants the keyholder's uid principal roles/storage.objectAdmin and roles/storage.legacyBucketReader and no longer grants the shared principal`;
+- after `realizeRegistry`: `the instance's registry was ensured and recorded`;
+- after `realizeAndNote`, when it pushed: `the keyholder's image was pushed to the instance's registry`;
+- after the pin: `the key pin was written`;
+- after the record: `the keyholder was recorded as deployed`.
+
+The clause joins the entries and ends `, and nothing else was written`. It is used for every refusal from 2a onward, 2a's own `Apply` failure included. An `Apply`'s own failure, at 2a or step 8, ends it instead with `, and the stream stopped at its first failing document`, since that stream may be part-applied (design D3). The refusals after 3b carry no clause today (`storagedeploy.go:353-398`) [read]. Without the cumulative entries, a refusal after a policy write would hide the shared principal's removal, which may just have cut a running pre-M2.8 keyholder off its working binding (risk 13).
+
+**Why this order:**
+- the grant needs the uid;
+- the keyholder must not start before its grant (`writeBucketGrant`'s walk history, `:793-798`; the crash loop, `serve.go:69-82`);
+- the Namespace and the ServiceAccount create no pod, so A30-17 (every NetworkPolicy before its workload) and A23-42 (the pin before the replicas) both hold;
+- a refusal leaves only free objects beyond the bucket and the keyring.
+
+**Rejected:** applying the whole stream, then granting. Every first deploy would crash-loop and fail an unseal run right after, the Phase 3.2 and 4.4 failure.
+
+**OQ-D, said:** `deployResult`'s text and the README say that a first deploy without `--grant-bucket` restarts its replicas until the printed grant propagates, and recommend `--grant-bucket`.
+
+**Pinned by:**
+- `TestStorageDeployAppliesTheAccountFirst` (row 137). The request order is the account PATCHes, the account GET as the writer, the IAM GET and PUT, the pushes, the pin, the record, then the remaining PATCHes; the write facts' order equals it.
+- `TestFirstDeployGrantNamesTheCreatedUID` (row 134);
+- `TestBucketGrantRefusedLeavesNoKeyholder` (109f; the ServiceAccount stays, nothing after it);
+- `TestRefusalAfterTheGrantNamesThePolicyChange` (row 143, chosen here): `Ensure` changes the policy, then a later step refuses (`realizeRegistry` answering with another registry, and `realizeIdentity`'s load); each error names, in the order they were written, the bucket and keyring (on the mint path), the ServiceAccount and the policy change, the shared principal's removal included. A row where 2a's own `Apply` fails ends with the stream's sentence;
+- `TestConfirmWithoutGrantBucketSetsNoPolicy` (109g);
+- `TestConfirmedBucketGrantPrintsNoCommands`;
+- `TestConfirmChecksTheWriterBeforeAnythingIrreversible`, whose storage deploy rows gain 0 IAM GETs and PUTs;
+- `TestConfirmWritesThePlannedDocumentsExceptTheirSecrets`, unchanged in its masks, every document applied exactly once.
+
+**A33-27 (CC-8, CC-9, Q-L1-7, L4-Q5): failures and their kinds.**
+- **A 403 on `Ensure`** (`ErrPermissionDenied`): `withKind(kindForbidden, fmt.Errorf("the stored credential may not change gs://%s's IAM policy (%w); run the printed commands instead; %s", bucket, err, writtenSoFar))`. The commands, prepared at 2c, are printed to stderr first. It never wraps `tkube.ErrForbidden`, so `writerRefused` adds no cluster sentence (`clusterref.go:326-336`). Row 109e, `TestBucketGrantRefusalNamesTheBucketNotTheCluster`.
+- **Still stale after the retry** (`ErrPolicyChanged`): `changedAfterPlan(m, fmt.Sprintf("gs://%s's IAM policy changed while the grant was written; %s", bucket, writtenSoFar))`.
+- **Any other non-2xx on the PUT** (a 400 `INVALID_ARGUMENT` is the likeliest first-walk failure while the uid member is [unverified], Q10, OQ-F): `withKind(kindInternal, fmt.Errorf("Google refused the new IAM policy of gs://%s (%w); its policy is unchanged; run the printed commands, or report it; %s", bucket, err, writtenSoFar))`, with the commands printed to stderr first (prepared at 2c).
+- **A `Validate` failure:** `the recorded storage bucket for %q did not validate: %w; ` + the clause, internal.
+- **No new kind.** `kinds.json` and FarSightKit do not move. The README's `forbidden` row (`:1500`) is widened in words: `…or, since ADR 0023 M2.8, Google refused storage deploy's read or change of the bucket's IAM policy`.
+
+**A33-28 (Q-L1-9): the result and the texts.**
+- `deployResult` gains `BucketGrant string `json:"bucket_grant"``: `applied` (a PUT changed the policy), `present` (nothing to write), or `printed`.
+- Its `Human` (`storagedeploy.go:776-782`) says `The bucket grant printed above has to be in place first…` only for `printed`, with OQ-D's sentence on a first deploy.
+- `writeBucketGrant`'s comment drops "which this CLI deliberately never asks for" and says that the grant is applied under `--grant-bucket`'s consent and printed otherwise, by the ServiceAccount's uid.
+- `storage deploy`'s Usage gains `--grant-bucket` (A33-24), the plan's new reads (A33-1) and OQ-D's sentence.
+
+### M2.8b: `farcast git-credential`
+
+**A33-29 (OD-9, CC-20, L3-Q2): the command.**
+```
+farcast git-credential set <instance> --name <secret> --username <user> --token-file <path|-> [--plan | --confirm <digest>]
+farcast git-credential rm  <instance> --name <secret> [--plan | --confirm <digest>]
+```
+- **No `--namespace`.** The Secret always goes to `farcast-system`, where the fetch and build Jobs run and resolve `secretKeyRef` (`planck/fetch/fetch.go:35,80-81`; `planck/build/build.go:31,93-94`) [read].
+- **A group** `git-credential` in a new `cli/gitcredential.go`, registered in `defaultRegistry` (`cli.go:204-232`). `-y` and `--yes` are registered so that they can be refused.
+- **Usage checks,** before anything is read:
+  - the argument count;
+  - the name as a DNS-1123 subdomain, `--name %q is not a Secret name (a DNS-1123 subdomain: lowercase letters, digits, '-' and '.', at most 253 characters)`;
+  - a reserved name, `fatline-mtls`, `datasphered-mtls` or one ending `-egress`: `%s/%s is a Secret FarCast renders, not a Git credential; choose another --name`;
+  - for `set`, both `--username` and `--token-file` given, and the username's shape (A33-30's text).
+- **The render.** One `data:` Secret of type Opaque, with the keys `pfetch.SecretGitUser` and `pfetch.SecretGitToken` (equal to `pbuild`'s), and the labels `app.kubernetes.io/managed-by: farcast` and `app.kubernetes.io/component: git-credential`.
+- **Placeholders** (L3-C9, chosen here): `farcast-placeholder:git_username:farcast-system/<name>` and `farcast-placeholder:git_token:farcast-system/<name>`.
+- **Its fact,** `GitCredentialFact{Type, Action, Namespace, Name}` (`git_credential`; action `set` or `rm`), then `applyFacts` of the placeholder rendering for `set`, and A33-31's delete fact for `rm`. `cluster_identity` is `none`. The options are `name` only.
+- **`renderedStreams`** gains the Secret rendered for `farcast-system/repo-git`.
+- **Pinned by** `TestGitCredentialRefusesEveryRenderedSecretName` (row 115). It is derived from `renderedStreams`, so a renderer's new Secret name is refused without a hand-kept list.
+
+**A33-30 (OD-9, CC-21, L3-Q3, L3-Q7, L4-Q6): consent, and the token.**
+- **The run order:**
+  1. `consent.mode`;
+  2. `--yes`: `usagef(msgGitCredentialYes, action, action, shown)`, with `msgGitCredentialYes = "git-credential %s cannot be run with --yes: it writes a credential every build and fetch can read; confirm it in a terminal, or review 'farcast git-credential %s %s --plan' and pass --confirm <digest>"`;
+  3. the usage checks;
+  4. not interactive and no flag: `usagef(msgGitCredentialTerminal)`, with `msgGitCredentialTerminal = "git-credential needs a terminal to confirm" + consentSuffix`;
+  5. `--token-file -` whenever `isTerminal(env.In)` holds, in every mode that reads the token (interactive and `--confirm`): `usagef("--token-file - reads the token from stdin, which is a terminal here; give a file, or pipe the token: --plan first, then --confirm <digest> with the token on stdin")`. `isInteractive` is not the test: a `--confirm` or `-o json` run whose stdin is a terminal is not interactive (`connect.go:946-948`) [read], and would read the token from that terminal with echo on. Under `--plan` nothing is read, so `-` is accepted there;
+  6. the record, `recordNamed`, `refuseUnmigrated`, then `defer writerRefused`;
+  7. the plan;
+  8. `--plan` prints; `--confirm` compares;
+  9. the writer opens through `newCluster` (local, sends nothing), before the prompt interactively and right after the comparison under `--confirm`. `set` defers `afterWrites`, and `rm` takes none;
+  10. the prompt;
+  11. `GetMeta`, the first network call;
+  12. for `set`, the token read, the checks, the render and `Apply`.
+- **The prompts:**
+  - `set`: `Write the Git credential %s/%s (user %s) into %q's cluster? Every build and fetch that names it with --git-secret can read it, and so can the cloud provider, for as long as it exists.` The username goes through `terminalText`.
+  - `rm`: `Delete the Git credential %s/%s from %q's cluster?`.
+- **The token** is read from `--token-file`, or from stdin for `-`, only after consent (`readToken` seam). One trailing `\n` or `\r\n` is trimmed and reported, as `secret set` does (`secret.go:193-305`) [read]. Then it must be 1–4096 bytes with no control byte. The username must be 1–256 printable bytes with no whitespace, checked with the usage checks (step 3).
+- **The refusal texts** carry no value and no byte count:
+  - `--username must be 1 to 256 printable bytes with no whitespace; nothing was read or written`;
+  - `the token read from --token-file is empty, longer than 4096 bytes, or holds a control byte; nothing was written`.
+- **The username is not a credential** (§9.8, Q11): it is on argv, in the interactive prompt and in the confirm line after `digest:` (CC-16), and nowhere else; the token is on none of them. This is the settled exception to "no username in a plan or on argv" for the username alone.
+- **The result** names the instance, the action, the namespace and the name, never the username, the token or a byte count.
+- **Pinned by** `TestGitCredentialRefusesATokenFileFromTheTerminal` (row 139): an interactive row and a `--confirm` row, each with stdin a terminal, refuse `--token-file -` before the record is read; a `--plan` row with stdin a terminal is accepted and reads nothing.
+
+**A33-31 (OD-3, CC-18, CC-22, CC-23, L3-Q5, MS-8, MS-9): the delete.**
+- **`cluster.Client.DeleteSecret(ctx, namespace, name, uid string) error`** runs `neverWrites` first, then `kube.Client.DeleteSecret` (`kube/apply.go:71-111`), then `flushWarnings`. Its doc says it is `git-credential rm`'s only. The package doc's list of writes that are not applies gains it.
+- **The delete write fact** has method `delete`, `sha256` `""`, `resource_version` `""` and force `false`, documented on `WriteFact`. `writeLine` (`planhuman.go:297-312`) gains a case: `write: delete Secret farcast-system/<name> (v1), on the uid read after consent, force: no`.
+- **`rm`'s answers:**
+  - a 404 on `GetMeta` or on the DELETE is success, with the note `%s/%s was not there`;
+  - a 409 is `cluster_rejected`, with `%s/%s was replaced between its read and its delete; nothing was deleted; run it again`.
+- **The label refusals,** internal:
+  - `set`: `%s/%s exists and is not a Git credential farcast wrote; nothing was written; choose another --name, or delete it from Cloud Shell`;
+  - `rm`: `%s/%s is not a Git credential farcast wrote; nothing was deleted; choose another --name, or delete it from Cloud Shell`.
+- **`set` keeps `Apply`.** The read-to-apply window is named in the README [inf].
+- **`TestEveryWriteNamesFarcast`** (`kube/apply_test.go:94-99`): DeleteSecret's exemption is permanent, since a DELETE takes no field manager. It pins the DELETE's empty query and exact body, and a source scan that only `git-credential rm` calls `cluster.Client.DeleteSecret` (row 102b). Row 102's "exempt until M2.8" is replaced.
+- **`TestDeleteSecretHonoursItsUIDPrecondition`** is written in `kube/realapi_test.go` (tag `realapi`) and recorded as not run (MS-8).
+- **A17-7 stays open:** DeleteSecret is Secret-only by design, and a RoleBinding delete needs its own plan-gated act (MS-9).
+
+**A33-32 (OD-10, CC-16, CC-17, CC-21, L3-Q1): the guards.**
+- `writeMethods` gains `DeleteSecret` (row 93d).
+- The seam map of `TestEveryProductionWriterIsAWriteCommand` gains `git-credential rm: newCluster`.
+- `consentForm` skips `--yes` for `reader grant` and both git-credential commands.
+- `applyingPlans` gains `git-credential set`, with `rolledBack` `nothing recorded`.
+- `writeCommands` has 14 rows; its doc says fourteen.
+- `TestEveryBehaviourFlagIsBound` gets the pinned exemption `{"git-credential set": {"username", "token-file"}}`, and asserts that neither appears in any option (row 111a).
+- `TestGitCredentialTokenNeverOnArgvOrInThePlan` (row 111) is narrowed for the plan and widened for the refusals. The marker username is absent from the JSON and from every human line before `digest:`; the confirm line repeats the command as typed. The marker token is absent everywhere. Both markers are absent from every error, result and JSON, the two refusal texts of A33-30 included.
+- `TestConfirmRefusesAnInstanceUnmigratedSinceItsPlan` gains `rm`'s plan row.
+- `TestUnsetSeamsRefuseInTests` gains `gitCredentialWriterDefault`, loopback-only as `migrateWriterDefault` is: the eleventh seam.
+- `TestNoCommandHelpNamesKubectl` covers the group.
+
+**A33-33 (L3-Q4 as the critic decided, L3-Q6, L3-Q9): what the Usage says.** It covers:
+- that the Secret is a Kubernetes Secret, not DataSphere (`farcast secret`), readable by the cloud provider for as long as it exists (ADR 0010:91);
+- that the token should be repository-scoped and read-only (ADR 0010 decision 3);
+- that the token is never taken from argv;
+- that the plan names the Secret by namespace and name only;
+- the read-to-apply window.
+
+### Cross-cutting
+
+**A33-34 (OD-12, Q-L2-5): one client for the plans' Google reads.** Plan-time reads keep the existing `cloud-platform` registry client and the `devstorage.full_control` gcs client. A `cloud-platform.read-only` client is deferred to M3b, which replaces the plans' Google identity.
+
+**A33-35 (CC-12, A23-24): the read groups after M2.8.** In `TestPlansStillReadTheInstallerKeyForGoogle`:
+- **read:** `connect` (first deploy, resume), `redeploy`, `kernel deploy`, `storage deploy`, `build`, `run` D's unblocked rows, and `migrate` (its writer, not Google);
+- **not read:** `kernel meter`, `kernel confirm`, `storage key pin`, `storage key rotate`, `reader grant`, `run` F, `run` D's blocked rows, `connect`'s reconnect, `kernel deploy` blocked by a missing namespace, `storage deploy` blocked by the pin, and both git-credential commands.
+
+Today's map (`writecommands_test.go:2615-2621`) [read] already holds `migrate: true`, `kernel deploy/a missing namespace: false` and `storage deploy/behind the pin: false`; `build` flips to true, the one `run` key (whose rows are F's) stays false and D's rows from `runDeployRows` gain keys, and the git-credential commands are added. A row in no group fails the test (`t.Fatalf`).
+
+**The ADC `--confirm` loop** (`writecommands_test.go:864-905`) [read]:
+- `build`'s row moves to `sampleDigest` and is refused before any plan: its plan's computation meets `loadInstallerKey` after its cluster reads and before any Google read, with the provider never opened.
+- `run`'s row, which confirms F's digest (`planDigest`, `:879-881`), keeps `planDigest`. It still refuses `credential_missing` at `openConfirmed`, and its `onlyThePlansReads` gains the reader's `farcast-builder` GET, which OQ-C puts before the writer's open (A33-22).
+
+**A33-36 (O1, U-17): what Google sees, and what a plan names.**
+- **Every `storage deploy`, in every mode,** calls as the installer: `projects.get`, and with a bucket recorded, the bucket's `GET` (its labels) and `getIamPolicy`. A bucket's `getIamPolicy` is a Data Access ADMIN_READ entry, and so is the bucket `GET` ("Getting bucket metadata"); Data Access logs are off by default ([doc](https://docs.cloud.google.com/storage/docs/audit-logging)).
+- **Every `build` and `run` D** calls `projects.get` and the repository's `getIamPolicy` [inf: Data Access, off by default].
+- **`--grant-bucket`'s `setIamPolicy`** is an Admin Activity entry, always on, naming the installer account as its caller ([doc](https://docs.cloud.google.com/storage/docs/audit-logging)).
+- **The bucket's and the repository's policies** now name each account's uid, which Google already holds through the cluster.
+- **The reader's two ServiceAccount GETs** are Kubernetes reads, audited at the Data Access level, off by default [inf].
+- **A23-4's pinned sentence** becomes `A plan names the instance's project, project number, cluster, endpoint, image registry, bucket, reader account, and the uids of the keyholder's and the builder's ServiceAccounts. Handle a plan document like the instance's metadata.yaml.` The vectors use the fixture number `123456789012` and fixture uids.
+
+**A33-37 (MS-11, MS-12): unchanged, stated so reviewers can check.**
+- kubetest already emulates a uid-preconditioned Secret DELETE (`kubetest/store.go:284-288`; `writes.go:1073-1132`) and serves a ServiceAccount's metadata GET.
+- The rehearsal answers only `world`'s reads and refuses a writer token (`rehearsal/answer.go:26-132`; `serve.go:186-193`).
+- No new error kind: `kinds.json` and FarSightKit's copy do not move.
+- `kernel_meter.json` does not move.
+- The exec allowlist does not change (no new process), nor do the 31 vendored modules or THIRD_PARTY_NOTICES. `./check.sh` steps 1b, 1c and 2 prove it.
+- No checked-in component digest moves. `datasphered`'s image changes at the next release, because gcs is linked into it.
+- **Not added:** the optional real-GCS IAM integration test. The M2 walk's W4 (c) checks a real policy.
+
+**A33-38: risks.** §14 gains:
+- **13.** The uid member is unverified on Cloud Storage and Artifact Registry (Q10). If GCS does not honour it, `--grant-bucket` on an instance whose keyholder runs on the shared binding removes the working binding in the same write. The README names the way back: the printed add command for the name principal. W4 (b) runs the swap on `$OLD` before any other use.
+- **14.** Any cluster in the project's pool can present any uid. The uid principal separates honest instances, not a compromised cluster in the same project; one project per instance is the full separation.
+- **15.** A ServiceAccount deleted and created again by hand reads `missing` until its grant is applied again, and its keyholder or builder is refused meanwhile. The old uid's binding stays and grants nothing.
+- **16.** `build --plan` and `--confirm` need a granted reader (A33-21); where key upload is blocked, `build` runs only interactively or with `--yes`.
+
+### Earlier sections, as amended
+
+**A33-39 (CC-10, CC-19, CC-25, CC-26; text only).** These replace the earlier text where it differs. Citations are by symbol (`writeBucketGrant`, `writePushGrant`, `validNamespace`, `registryRefFor`).
+- **§0's M2.8 row:** M2.8 is built as M2.8a and M2.8b (A33-6), after step 0.
+- **§1's Seam row and the M2.8 transitional row:**
+  - `cluster.Client` gains `DeleteSecret` (M2.8b);
+  - `clusterApplier`, `jobWaiter` and `runPlanReader` gain `GetMeta`;
+  - `storageDeployCommand` gains `openBucketGrants`; `buildCommand` gains `newPlanReader` and `openProvider`; `runCommand` gains `openProvider`;
+  - `planck.GrantReader` and `datasphere.BucketGrants` are new;
+  - `gitCredentialCommand.newCluster` holds `GetMeta`, `Apply` and `DeleteSecret`.
+- **§1's `--yes` row** stands. **§1's Reads row:** six reader plans.
+- **§7.2:** A33-16. **§7.3:** the table's Google reads (A33-1); plans read two ServiceAccounts' metadata in `farcast-system`, by name; `TestPlansStillReadTheInstallerKeyForGoogle`'s groups are A33-35's.
+- **§9.4:**
+  - the `grant` row is A33-11's;
+  - the `git_credential` placeholders are A33-29's;
+  - the placeholders gain `sa-uid` (A33-19);
+  - **the rows:**
+    - `reader grant` writes ×(5 + 1 per namespace), was ×(3 + 1 per namespace) (A33-16);
+    - `kernel deploy` writes `farcast-builder` (A33-20);
+    - `storage deploy` reads `GetMeta` (datasphered), and its facts are in A33-25's order;
+    - `build` is `reader`, reading `NamespaceUID` and `GetMeta` (farcast-builder), with the grant after `image`;
+    - `run` D also reads `GetMeta` (farcast-builder);
+    - `git-credential set|rm` take no `--namespace`.
+- **§9.5:** the push grant's printed commands add the uid binding and remove the shared one. **§9.6:** unchanged.
+- **§9.7:** replaced by A33-24 to A33-28. **§9.8:** amended by A33-29 to A33-33. The kernel hint is done (CC-19), and only ADR 0023 decision 8's dated note remains.
+- **§10.4:** the vector list (A33-40).
+- **§10.5:** the mutation table below.
+- **§10.7, W4 gains:**
+  - (a) on `$NEW`, `storage deploy --grant-bucket` in a terminal where no reader exists: the bucket's policy holds only the uid principal for both roles, the replicas validate and unseal, and `storage cp` works both ways; record IAM's lag;
+  - (b) on `$OLD` (W0's hand-applied name grant): the plan shows `shared` present, and `--grant-bucket` swaps it, with a `storage cp` loop running through the swap and through a replica deleted from Cloud Shell;
+  - (c) `getIamPolicy` returns the uid member byte-equal: the next plan reads `present` and shared `missing`;
+  - (d) the push commands on both repositories, then a build that pushes with only the uid binding; `kernel deploy` made `farcast-builder` before it;
+  - (e) optionally, with approval: a pod in `$OLD`'s cluster as `farcast-system/datasphered` is refused on `$NEW`'s bucket;
+  - (f) optionally: `datasphered` deleted and created again from Cloud Shell reads `missing` and is granted again.
+
+  `$OLD` and `$NEW` share one project on purpose, to exercise the swap. W4's `--plan` steps depend on A22-2's choice, and otherwise the walk runs the terminal path (MS-10).
+- **§11's M2.8 list:** replaced by A33-41.
+- **§12:** the P2 row's revision note (A33-2); Q11's row loses `--namespace`.
+- **§13's M2.8 row:** A33-42's size.
+- **§14:** A33-38.
+- **A23-1:** `build` moves to the refused group (A33-21); `storage deploy --grant-bucket` works in a terminal there.
+- **A23-24:** the groups (A33-35); the `set_pull_grant` parenthesis (A33-23).
+- **A23-26:** the bucket-grant exception covers the uid too. Its exceptions gain the push grant's lines printed after a build's `Apply` and on a refused push, which carry the uid that exists only then (A33-22).
+- **A23-30 and A23-31:** A33-19.
+- **A30-9 and row 102:** A33-31.
+- **A30-36's grants sentence:** `The grants farcast prints: build's push grant always by hand; storage deploy's bucket grant by hand, or since M2.8 under --grant-bucket's consent (a plan where a reader is granted, or a terminal); both name the ServiceAccount's uid.`
+- **CC-10:** the dated note goes into `phase-3-2-validation.md` §1a, not `phase-3-validation.md`. The latter's step 2 gets a one-line note.
+
+### Mutation rows (§10.5, M2.8)
+
+Each runs as an overlay (`go test -overlay`), never by editing the tree, behind the tunnel guard. Each mutation is reversed by edit, never by `git checkout`, and the full suite runs after.
+
+| # | Requirement | Mutation | Must fail | Run |
+|---|---|---|---|---|
+| 106 *(changed)* | Grant only with consent (O2) | accept `--grant-bucket --yes`; or refuse it with `--plan` | `TestBucketGrantNeedsConsent` | check.sh |
+| 106b | Never applied under `--plan` | call `Ensure` in `plan()` | `TestPlansWriteNothing` (storage deploy `--plan --grant-bucket` row) | check.sh |
+| 107 | Etag honoured | PUT without it | `TestBucketGrantUsesTheEtag` | check.sh |
+| 108 | Policy version 3 | drop `optionsRequestedPolicyVersion` | `TestBucketGrantAsksForPolicyVersion3` | check.sh |
+| 109 | Conditioned bindings kept | add the member to a conditioned binding | `TestBucketGrantKeepsConditionalBindings` | check.sh |
+| 109a | State ignores a conditioned binding | count conditioned bindings | `TestGrantStateObservations` (gcs) | check.sh |
+| 109b | Other bindings byte for byte | re-marshal through a typed struct | `TestBucketGrantKeepsEveryOtherBindingByteForByte` | check.sh |
+| 109c | 403 is unknown, and blocks `--grant-bucket` | treat 403 as missing | `TestBucketGrantUnknownStateIsBlocked` | check.sh |
+| 109d | One re-read, one retry | drop the re-read; or retry without bound | `TestBucketGrantRetriesAStaleEtagOnce` | check.sh |
+| 109e | A Google 403 names the bucket | wrap `tkube.ErrForbidden` | `TestBucketGrantRefusalNamesTheBucketNotTheCluster` | check.sh |
+| 109f | A refused grant leaves no keyholder | move 3b after the record or the final Apply | `TestBucketGrantRefusedLeavesNoKeyholder` | check.sh |
+| 109g | No PUT without the flag | apply whenever state is missing | `TestConfirmWithoutGrantBucketSetsNoPolicy` | check.sh |
+| 109h | Labels proved before IAM | skip `Validate` | `TestBucketGrantRefusesABucketNotTheInstances` | check.sh |
+| 110 | Push grant never applied | a provider write under `--confirm` | `TestPushGrantIsNeverApplied` | check.sh |
+| 110a | Blank key refused before the provider | drop `readPushGrant`'s `loadInstallerKey` | `TestPlansStillReadTheInstallerKeyForGoogle` (ADC rows) | check.sh |
+| 110b | `apply` false | bind true | `TestPushGrantIsNeverApplied` | check.sh |
+| 110c | The fact after `image` (builder) | move it after the writes | `TestBuildPlanStatesThePushGrant`, `TestPlanVectors` | check.sh |
+| 110d | Notice only when not present | emit it always | `TestBuildPrintsThePushGrantOnlyWhenNotPresent` | check.sh |
+| 110e | State bound, read before the comparison | leave it unbound; or read after | `TestConfirmRefusesAPushGrantChangedSinceThePlan` | check.sh |
+| 110f | The number, not the ID | put the project ID in the principal | `TestPushGrantPrincipalCarriesTheProjectNumber` | check.sh |
+| 110g | F reads no Google | read the push state in F | `TestPlansStillReadTheInstallerKeyForGoogle` (run F) | check.sh |
+| 110h | D reads after every block | read before D's blocks | the same test (blocked D rows) | check.sh |
+| 110i | Printed values checked and quoted | print the raw project | rawtext shell rows | check.sh |
+| 111 *(narrowed)* | Token never on argv or in the plan | accept `--token`; bind the real Secret's sha256 | `TestGitCredentialTokenNeverOnArgvOrInThePlan` | check.sh |
+| 111a | Data flags never bound | bind `--username` | `TestEveryBehaviourFlagIsBound` | check.sh |
+| 112 | `rm` deletes only its own | skip the label check | `TestGitCredentialRmDeletesOnlyItsOwn` | check.sh |
+| 112a *(changed)* | `set` writes only over its own | skip the read before `set` | `TestGitCredentialSetRefusesAnotherSecret` (its `farcast-system` rows) | check.sh |
+| 113 | `rm` is uid-preconditioned | delete without it | `TestGitCredentialRmCarriesTheUidPrecondition` | check.sh |
+| 114 | `--yes` never writes a credential | accept `set --yes` | `TestGitCredentialRefusesYes` | check.sh |
+| 114a | nor deletes one | accept `rm --yes` | the same | check.sh |
+| 115 | Reserved names from the renderers | drop `*-egress` or `datasphered-mtls` | `TestGitCredentialRefusesEveryRenderedSecretName` | check.sh |
+| 116 | Token read only after consent | read it before the comparison or prompt | `TestGitCredentialReadsTheTokenOnlyAfterConsent` | check.sh |
+| 117 | One trailing newline trimmed | keep it | `TestGitCredentialWritesTheKeysTheJobsRead` | check.sh |
+| 118 | `rm`'s 404 is success | fail on it | `TestGitCredentialRmOfAnAbsentSecretSucceeds` | check.sh |
+| 119 | `set` notes traces | drop its `afterWrites` | `TestAClientSideTraceAfterMigrationClearsTheRecord` (git-credential set) | check.sh |
+| 120 | Whose 403 it was | drop the `writerRefused` defer | `TestWritingCommandsCarryClusterKinds` (git-credential 403 rows) | check.sh |
+| 121 | Writer opened before the prompt | open it after | `TestWritingCommandsCarryClusterKinds/credential_missing` | check.sh |
+| 122 | A reader never deletes | drop `neverWrites` from `cluster.DeleteSecret` | `TestDeleteSecretIsTheWritersOnly` | check.sh |
+| 123 | `rm` refuses an unmigrated instance | drop `refuseUnmigrated` | `TestEveryClusterWriterRefusesAnUnmigratedInstance` | check.sh |
+| 124 | `rm`'s 409 says nothing was deleted | return it as `plan_changed` | `TestGitCredentialRmSaysAReplacedSecretWasNotDeleted` (L3's 124 duplicated 112a; the id is reused) | check.sh |
+| 73c | `build` reads Google | keep it out of the read group | `TestPlansStillReadTheInstallerKeyForGoogle` | check.sh |
+| 93d | A delete-only writer is a writer | drop `DeleteSecret` from `writeMethods`, with `rm`'s seam lacking `Apply` | `TestEveryProductionWriterIsAWriteCommand` | check.sh |
+| 102b | The DELETE's shape, and its one caller | call `DeleteSecret` from another command; or add `fieldManager` | `TestEveryWriteNamesFarcast` | check.sh |
+| 125 | http2debug refused by every command | remove the call in `run` | `TestEveryCommandRefusesHTTP2Debug`, `TestUnsafeEnvironmentIsRefusedBeforeAnythingIsRead` | check.sh |
+| 126 | The grant names the uid | name the shared principal | `TestGrantNamesTheServiceAccountUID`, `TestPlanVectors` | check.sh |
+| 127 | The reader may read the accounts | drop the Role `farcast-reader-serviceaccounts` or its RoleBinding | `TestEveryReaderReadIsAllowedByTheRenderedRBAC` | check.sh |
+| 128 | Only the two names, in `farcast-system` alone | grant the rule in the ClusterRole `farcast-reader`; or drop `resourceNames` | `TestReaderRBACBindsOnlyNamespacesClusterWide` (its probes in the metered namespace `web` and of `farcast-fetcher`) | check.sh |
+| 129 | An old reader is told to re-grant | treat the RBAC 403 as a 404 | `TestPlanRefusesAReaderWithoutTheServiceAccountRule` | check.sh |
+| 130 | The uid is bound | leave it unbound; or bind the placeholder over a present account | `TestConfirmRefusesAServiceAccountReplacedSinceThePlan` | check.sh |
+| 131 | A conditioned shared binding is left | remove the shared principal from it | `TestBucketGrantLeavesConditionedSharedBindings` | check.sh |
+| 132 | The shared binding goes | keep it | `TestBucketGrantRemovesTheSharedBinding` | check.sh |
+| 133 | Add before remove | print the remove lines first | `TestPrintedGrantAddsBeforeItRemoves` | check.sh |
+| 134 | The PUT names the created uid | PUT before 2b, or with the placeholder | `TestFirstDeployGrantNamesTheCreatedUID` | check.sh |
+| 135 | The uid's shape | skip `serviceAccountUIDShape` | `TestWorkloadPrincipalsRefuseUnsafeValues`, rawtext rows | check.sh |
+| 136 | `build` plans read as the reader | read the account as the writer under `--plan` | `TestPlansPresentOnlyTheReaderToken` (build rows) | check.sh |
+| 137 | The account first, the workload last | apply the account after the pin or the record | `TestStorageDeployAppliesTheAccountFirst`, `TestBucketGrantRefusedLeavesNoKeyholder` | check.sh |
+| 138 | The terminal question names everything | skip the question | `TestInteractiveGrantBucketAsksNamingEverything` | check.sh |
+| 139 | No token from the prompt's terminal | accept `--token-file -` in a terminal | `TestGitCredentialRefusesATokenFileFromTheTerminal` | check.sh |
+| 140 | F checks the builder read first | drop the pre-check | `TestRunConfirmFetchChecksTheBuilderReadFirst` | check.sh |
+| 141 | `kernel deploy` makes the builder's account | drop the document | `TestKernelDeployCreatesTheBuilderAccount` | check.sh |
+| 142 | Commands print once the account exists | print only on failure; or return the read's error | `TestPushCommandsPrintRightAfterTheBuildApply` | check.sh |
+| 143 | A refusal names every write before it | drop the IAM entry from `writtenSoFar` | `TestRefusalAfterTheGrantNamesThePolicyChange` | check.sh |
+| R1 | A forced apply and migrate's patch keep the uid | — (written, not run) | realapi `TestServiceAccountUIDSurvivesForcedApplyAndMigration` | **not run** |
+| R2 | The reader reads the two names on a real server | — | realapi `TestReaderReadsTheNamedServiceAccounts` (cli) | **not run** |
+| R3 | A mismatched uid is refused | — | realapi `TestDeleteSecretHonoursItsUIDPrecondition` | **not run** |
+
+**Rows to re-run after the new ones** (MS-2, U-15), by named test:
+- 73a, 73b and 75b (the Google reads);
+- 76c and 76d (the writer before anything irreversible; `TestConfirmChecksTheWriterBeforeAnythingIrreversible` gains 0 IAM GETs and PUTs);
+- 81, 81a, 81b and 81c (the rendering);
+- 91a, 91d, 91e and 91g (notices, the record re-read, key material);
+- 92, 93 and 93a–c (`refuseUnmigrated`);
+- 101 (traces);
+- 102 and 102a (the field manager);
+- 54 (the ConfigMap names), 55 (only `namespaces list` cluster-wide), 76b (every reader read granted), 84 and 85c (plans as the reader), and 85, 85a and 85b (a plan needs a granted reader).
+
+`git status` is the same before and after.
+
+### Vectors
+
+**A33-40 (MS-4, U-13): `testdata/plan` goes from 14 to 17 files.** `TestEveryVectorFileIsProduced` (`kindsvector_test.go:32`) keeps no hand list for them: it derives the plan files from `planVectors()` (`:44-46`) [read], 16 of the 17, and lists `error_plan_changed.json`, `TestPlanErrorVectors`', by hand (`:39`), as today. No FarSightKit copy moves (`check.sh:377-391`) [read].
+
+**The fixtures:**
+- the project number `123456789012`;
+- `datasphered`'s uid `00000000-0000-4000-8000-0000000000d5`;
+- `farcast-builder`'s uid `00000000-0000-4000-8000-0000000000b5`;
+- replaced accounts `…0000000000d6` and `…0000000000b6`, in tests only;
+- `farcast-system` stays `…026`.
+
+`vectorCluster` (today `struct{}`, `planvectors_test.go:180`) [read] and `vectorRunCluster` gain a per-vector set of present ServiceAccounts, and `GetMeta` returns `tkube.ErrNotFound` for any name outside it. `storage_deploy_grant` uses an empty set, so its plan binds the uid placeholder (A33-25 step 1 reads `datasphered` in every unblocked plan); `storage_deploy`, `build` and `run_deploy` use `{datasphered: …d5, farcast-builder: …b5}`. The vector provider fake answers `ProjectNumber` and `RegistryGrant`. These uids are free today (the UID map's grep).
+
+| File | | What it shows |
+|---|---|---|
+| `storage_deploy.json` | regenerated (M2.8a step 4) | a re-deploy with the bucket recorded: uid …d5, state missing, shared present, apply false; option `grant-bucket=false`; the Namespace and ServiceAccount writes before the pin; the notice with the add, wait and remove lines |
+| `storage_deploy_grant.json` | **new** (step 4) | a first deploy with `--grant-bucket`: the bucket placeholder and the uid placeholder, state and shared missing and unread, apply true, `cloud set_bucket_grant` on `gs://farcast-placeholder:bucket:atlas`, no grant notice |
+| `build.json` | regenerated (step 3) | `cluster_identity: reader`, uid …026; the push grant with …b5, present, shared missing; no notice |
+| `run_deploy.json` | regenerated (step 3) | the push grant with …b5, missing, shared present, and its notice |
+| `kernel_deploy.json` | regenerated (step 3) | the `farcast-builder` ServiceAccount write |
+| `reader_grant.json` | regenerated (step 2) | the two new writes (the Role and the RoleBinding `farcast-reader-serviceaccounts` in `farcast-system`) and `service_accounts`; the ClusterRole's sha256 does not move |
+| `git_credential_set.json` | **new** (M2.8b) | `--username <marker>` and a `--token-file` path that does not exist, proving nothing is read at plan time |
+| `git_credential_rm.json` | **new** (M2.8b) | the delete write fact |
+
+### Records
+
+**A33-41 (OD-13, MS-1, MS-10, U-17, and the UID map's records): M2.8's records.** Each says "built <date>, not walked". Each mention of `--grant-bucket`'s plan carries the reader qualifier, and each mention of the uid member carries "unverified until the M2 walk". M2.8a carries only the code comments and Usage texts its own changes falsify. Everything else moves with M2.8b.
+
+**`AGENTS.md`:**
+- `:33`: "five plans" becomes six (`build` joins); "The grants farcast prints are run by hand, in Cloud Shell" becomes A30-36's new sentence (A33-39).
+- `:48`: M2.8's built sentence. Every write names `farcast` but git-credential rm's uid-preconditioned Secret delete, which takes no field manager; that delete joins the writes that are not applies. The reader's plans are six.
+- `:52`: the reader may read two ServiceAccounts' metadata in `farcast-system`, by name. `reader grant` is run once more on instances granted before M2.8. The installer's token serves the plans' project-number and IAM-policy reads until M3b.
+- `:53`: "The Git credential and the bucket grant come with M2.8" becomes: `--grant-bucket` takes `--plan` and `--confirm` or a terminal's question, never `--yes`; `git-credential set|rm` likewise; push access stays a human step; the grants name the ServiceAccount's uid (unverified until the M2 walk).
+- The Key Design Decisions paragraph on ADR 0023: one sentence. Every instance in a project shared the keyholder's and the builder's Workload Identity principal; M2.8's grants name the ServiceAccount's uid instead; one project per instance is still the full separation.
+
+**`README.md:300`:** one M2.8 sentence, with the reader qualifier.
+
+**`PLAN.md`** (`:432`, `:436`, `:447`, `:454`, `:457`): M2.8 built, and "fourteen" commands. The consolidation stays M2.9's.
+
+**ADR 0023:**
+- `:3`: M2.8 built, not walked; fourteen commands; build's plan reads the cluster and the repository's IAM policy; the delete exception; Choice 7 "as its dated note records".
+- `:35`: `(<date>, M2.8: git-credential rm makes the one Kubernetes delete farcast makes, of a Secret it wrote, by the uid it read.)` (CC-23).
+- `:48-49`: re-cited by symbol. The bucket grant is offered; the push grant is printed and stated in plans; both name the uid; the Secret is `git-credential set`; the namespace hint went at M2.7.
+- `:118`: decision 3's rider on the plans' new Google reads, and the reader's two ServiceAccount reads.
+- `:213-218`, decision 8:
+  - `--yes` never covers `--grant-bucket` or git-credential;
+  - fourteen commands;
+  - the bucket grant is applied under consent, the push grant stays human, and both name the ServiceAccount's uid (the shared-principal finding, and its fix);
+  - git-credential is built; the namespace subcommand is not.
+- `:231`, Choice 7: `(Answered 2026-11-14 by the operator: offer it through the plan. Revised 2026-11-19 (O2): through the plan or a terminal's question, never --yes, because key upload is blocked where the probe walk ran. It names the keyholder ServiceAccount's uid and removes the principal every instance in the project shared (O4). Built <date>, not walked; the uid member on a bucket is unverified.)`
+- `:248-256`, What Google still sees: A33-36.
+- `:313`: M2.8's dated note.
+- `:369`: the M2.8 tests that hold the consent bullet.
+- `:384`: git-credential rm is the first plan-gated delete, and prunes nothing.
+- A dated note under decision 3: the reader may read two ServiceAccounts in `farcast-system` by name, through its own Role, and `reader grant` is run once more.
+
+**Other ADRs:**
+- **ADR 0008** decision 8 (`:66`) and **ADR 0010** decision 7 (`:73`): dated notes that the Workload Identity grant names the ServiceAccount's uid since M2.8, and that one project per instance is the full separation.
+- **ADR 0019** `:74` and `:79`: git-credential's set and rm are in Admin Activity at Metadata level, as the installer. `:95`: the plans' installer token for IAM-policy and project-number reads, and the reader's ServiceAccount GETs.
+- **ADR 0021** `:222`: M2.8's dated note.
+
+**`farsight/cli/README.md`:**
+- the command table and `:19`: a `git-credential` row; fourteen;
+- a new "`farcast git-credential`" section (A33-29 to A33-33);
+- storage deploy (`:880-886`): `--grant-bucket` with its three consents; the uid principal; the order of the account, the grant and the workload; OQ-D's crash loop; the plan's reads; risk 13's way back; and that one project per instance is the full separation (O4 (e));
+- build (`:1185`, `:1197`) and run (`:1070`, `:1083-1085`, `:1159`):
+  - the real reason the push grant is withheld (CC-14);
+  - the grant fact, read as the installer;
+  - the uid, and the commands printed after the apply and on failure;
+  - `kernel deploy`'s builder account;
+  - build's reader plan;
+  - `--git-secret` names a `git-credential set` Secret;
+- the reader section (`:1376`): the Role and RoleBinding `farcast-reader-serviceaccounts` in `farcast-system` alone, the write count (5 + 1 per namespace), and `reader grant` run once more (in step 2, with `reader grant`'s Usage);
+- plans and confirmation (`:1551`, `:1572`, `:1601-1614`, `:1640-1644`):
+  - the read groups and the Google reads;
+  - six reader plans;
+  - the delete among the writes that are not applies;
+  - what `--yes` never covers;
+  - A23-4's sentence (A33-36);
+  - the notices;
+- what each read tells the provider (`:1646-1650`): A33-36;
+- error kinds (`:1496`, `:1500`, `:1501`): `unsafe_environment` (step 0), `forbidden` widened, `cluster_rejected` with `rm`'s 409;
+- the layout, testing and vectors (17);
+- the statement that only this account's uid binding and the shared name binding are managed (OQ-E).
+
+**`planck/README.md`:**
+- `:249` and `:426`: decision 5 gains `GrantReader`;
+- `:311`: the push grant by the builder's uid, its state stated in plans and never applied, buildgrant's reason;
+- `:326`: `farcast-builder`, made by `kernel deploy` and each build, granted by its uid;
+- `:344`: `git-credential set` writes the Secret.
+
+**`datasphere/README.md`:**
+- "What the cloud still sees" (`:348-356`) gains a paragraph on who may read the bucket: the keyholder's ServiceAccount by its uid once M2.8's grant is in place; until it is removed, the shared name principal, which is every keyholder in the project; the installer's conditioned `storage.admin`; that any cluster in the pool could present the uid, so one project per instance is the full separation; and the plan's `getIamPolicy` and the grant's `setIamPolicy`, with their audit classes.
+- `:496`: the installer's `storage.admin` covers `getIamPolicy` and `setIamPolicy` on `farcast-*` buckets.
+- Decision 8: the adapter reads and sets bucket IAM.
+
+**Runbooks:**
+- `phase-3-2-validation.md` §1a (`:57-73`): a dated note. Since M2.8 (not walked), `storage deploy --grant-bucket` applies the grant to the uid principal and removes the shared binding; the printed commands carry the number and the uid. "deliberately never asks for" is qualified.
+- `phase-3-validation.md` step 2: a one-line note that this conditioned role is what the bucket IAM read and write use (CC-10).
+- `phase-4-2-validation.md` (`:57-66`, `:226`) and `phase-4-3-validation.md` (`:213`, its notes block `:23-26`): dated notes. The push grant names `farcast-builder`'s uid, which exists after `kernel deploy`; how to remove the shared binding; and, in place of `kubectl create secret … --from-literal`, `git-credential set`'s two working forms (A33-30 refuses `--token-file -` from a terminal, and a run with no terminal and no `--plan` or `--confirm`):
+  - in a terminal: `farcast git-credential set "$INSTANCE" --name <n> --username <user> --token-file <path>`, the file created with `umask 077` and removed afterwards;
+  - without a prompt: `farcast git-credential set "$INSTANCE" --name <n> --username <user> --plan`, then `printf '%s' "$TOKEN" | farcast git-credential set "$INSTANCE" --name <n> --username <user> --token-file - --confirm <digest>`.
+- The M2.9 walk runbook (written in M2.9): W4 (a)–(f), and the shared project on purpose.
+
+**Code comments and Usage:**
+- `writeBucketGrant` (`:786-798`), `deployResult` (`:776-782`), storage deploy's Usage;
+- `writePushGrant`'s comment; `build.go:150-156`, `:424-427` and its Usage (`:78-88`); run's Usage (the D reads, MS-7);
+- `reader grant`'s Usage (`readergrant.go:139-151`): the ServiceAccounts rule, in step 2, which falsifies it, and `renderReaderRBAC`'s doc (`readerrbac.go:89-93`);
+- `kernel deploy`'s Usage (A33-20);
+- `fatline.go:806-810` (A33-23);
+- `datasphere/deploy`'s ServiceAccount comment (`:351-361`) and `planck/build`'s (`:33-37`): the grant names this account's uid;
+- `plan/facts.go:10`;
+- `writecommands_test.go:138-140` and `:2594-2600`; `kube/apply_test.go:96-99`; `refusingdefaults_test.go`'s seam count;
+- `hardenEnvironment`'s doc (step 0).
+
+**Not touched,** stated (A33-37): the rehearsal; `kinds.json` and FarSightKit; `kernel_meter.json`; the exec allowlist; the 31 vendored modules.
+
+### Refuted, kept out
+
+- **The critic's seven refutations** stand:
+  - 46 facts spot-checked;
+  - the number is recorded as `Registry.Puller`, so L4-Q2 is no operator question;
+  - the 409 marked [doc] for GCS (CC-8);
+  - "missing means the push fails" (CC-2);
+  - L3-Q4 as an operator question;
+  - `TestEveryBehaviourFlagIsBound` covering `--grant-bucket` "automatically";
+  - "30 constructions" (12 direct, in 6 files).
+- **Deleting `CloudSetBucketGrant`** (L4-C5): the cloud fact is kept (CC-1).
+- **Blocking on a missing push grant** (L4-Q3): O3.
+- **Per-instance ServiceAccount names:** O4.
+- **A record marker for an old reader:** A33-17.
+- **The `serviceaccounts` rule in the shared ClusterRole `farcast-reader`:** A33-16. O4 (b) grants the read in `farcast-system`, and that ClusterRole is bound in every metered namespace too.
+- **B6, a cluster-free `build` plan:** A33-8.
+- **A stopping variant for a first deploy without `--grant-bucket`** (OQ-D): A33-8.
+- **Reporting or removing other uid members** (OQ-E): A33-8.
+- **Changing `set_pull_grant`'s target:** A33-23.
+- **`--namespace` on git-credential:** CC-20.
+- **Numbered printed lines:** A33-15.
+- **A `cloud-platform.read-only` client:** M3b (A33-34).
+- **The real-GCS integration test:** A33-37.
+
+### Questions for the operator
+
+None. Nothing left open is billable or irreversible, and no security or product choice is left that O1–O4 do not cover.
+
+**Decisions taken here that the operator may veto cheaply:**
+
+| # | Decision | Its cost |
+|---|---|---|
+| V1 | `build`'s plan reads the cluster as the reader (OQ-A as B1, A33-21) | Where key upload is blocked, as in the operator's organization, `build --plan` and `--confirm` refuse; `build` runs interactively or with `--yes`. B6 would keep them, with a push grant always `unknown`. |
+| V2 | `kernel deploy` creates `farcast-builder` (OQ-B, A33-20) | One more free object in `kernel deploy`'s plan, and `kernel_deploy.json` moves. The alternative bills a failed first build on every new instance. |
+
+### The build order
+
+**Step 0: one commit, "refuse GODEBUG http2debug in every command"** (A33-9).
+- **Files:** `farsight/cli/internal/kube/transport.go`, `token.go` and `transport_test.go`; `farsight/cli/internal/cli/cli.go` and a new `cli/http2debug_test.go`; `farsight/cli/README.md` (`:1496`).
+- **Tests:** `TestEveryCommandRefusesHTTP2Debug`, `TestUnsafeEnvironmentIsRefusedBeforeAnythingIsRead`; then mutation row 125.
+- **Stays green:** all of `./check.sh`. No vector moves.
+- **Size:** about 25 code and 90 test lines.
+
+**M2.8a: one commit, "begin M2.8: the grants", green on its own with `./check.sh`.**
+
+**Step 1, the groundwork, wired into no command** (A33-10 to A33-14; A33-15's printers come in steps 3 and 4).
+- **Files:**
+  - `cli/grants.go` (new);
+  - `plan/facts.go`, `plan_test.go`, `cli/planhuman.go`, `planhuman_test.go` and `writecommands_test.go` (`factTypes`);
+  - `planck/registry.go`, `planck/internal/providers/gke/registry.go` and `registry_test.go`;
+  - `datasphere/types.go`, `datasphere.go`, `datasphere/internal/providers/gcs/iam.go` (new) and `iam_test.go` (new);
+  - `farsight/cli/internal/storage/storage.go` and its test;
+  - `cli/install_test.go` (`fakeProvider` implements `GrantReader`).
+- **Tests:** rows 107, 108, 109, 109a, 109b, 109d, 131, 132 and 135; `TestRegistryGrantStates`, `TestProviderProjectNumberIsExported` and `TestEnsureRegistryNeverGrantsPush`; the fact table at 19.
+- **Stays green:** everything. Nothing calls the additions yet; the printers move with their callers (A33-15), so no vector moves.
+
+**Step 2, the reader's RBAC** (A33-16).
+- **Files:** `cli/readerrbac.go` (the Role and RoleBinding `farcast-reader-serviceaccounts`, `renderReaderRBAC`'s doc), `readergrant.go` (the prompt and the Usage, `:139-151`), `plan/facts.go` (`ReaderFact`), `planhuman.go`, `readerrbac_test.go`, `readergrant_test.go`, `plan_test.go`, `testdata/plan/reader_grant.json`, and the CLI README's reader section (`:1376`), which step 2 falsifies.
+- **Tests:** rows 55, 127 and 128; `TestReaderRoleNamesTheServiceAccountsPlansRead`; the write count of 5 + 1 per namespace.
+- **Stays green:** everything, since no plan reads an account yet. This step precedes 3 and 4.
+
+**Step 3, the uid reads, `kernel deploy`, `build` and `run`** (A33-17 to A33-23, A33-35).
+- **Files:**
+  - `cli/grants.go` (`readServiceAccountUID`);
+  - `fatline.go` (`clusterApplier`, the `fatline.go:806-810` comment);
+  - `kernel.go`, `planck/build/build.go` and its test;
+  - `build.go`, `run.go` and `buildgrant.go` (`readPushGrant`, the push printer);
+  - `refusingdefaults_test.go`, `connect_test.go`, `build_test.go`, `buildgrant_test.go`, `rawtext_test.go`, `run_test.go`, `runfixture_test.go`, `storagepin_test.go`, `storagekey_test.go`, `writecommands_test.go`, `planvectors_test.go` and `kernel_test.go`;
+  - `testdata/plan/build.json`, `run_deploy.json` and `kernel_deploy.json`;
+  - `kube/realapi_test.go` and `cli/realapi_test.go` (R1, R2; written, not run).
+- **Tests:** rows 73c, 110–110i, 126 (its push rows), 129, 130 (its build row: …b5 replaced by …b6 is `plan_changed` at the comparison), 133 (the push printer), 135's rawtext rows, 136, 140, 141 and 142; `TestGrantsWithoutTheCapabilityAreUnknown`'s push rows; `TestPushGrantRefusesARegistryRecordedWithoutItsRepository`; the regrouped read-group and ADC rows.
+- **Stays green:** all of `./check.sh`. `storage_deploy.json` is unchanged.
+
+**Step 4, the bucket grant** (A33-24 to A33-28).
+- **Files:**
+  - `cli/storagedeploy.go` (the flow and the bucket printer);
+  - `datasphere/deploy/deploy.go` (`RenderAccount`, `RenderWorkload`) and its test;
+  - `refusingdefaults_test.go` (the tenth seam), `fakeDeployDefaults`, `rawtext_test.go`, `storagekeyholder_test.go`, `storagepin_test.go`, `writecommands_test.go`, `costgate_test.go`, `consent_test.go`, `plancomplete_test.go` and `planvectors_test.go`;
+  - `testdata/plan/storage_deploy.json` and `storage_deploy_grant.json`.
+- **Tests:** rows 106, 106b, 109c, 109e–109h, 126 (its bucket rows), 130, 133 (the bucket printer, its one-role case included), 134, 137, 138 and 143; `TestFirstDeployGrantIsMissingUnread`, `TestSharedPresentWithGrantPresentStillWrites`, `TestConfirmedBucketGrantPrintsNoCommands`, `TestGrantsWithoutTheCapabilityAreUnknown`'s bucket rows and `TestRenderIsTheAccountThenTheWorkload`.
+- **Stays green:** all of `./check.sh`.
+- **M2.8a's records:** the code comments and Usage texts its changes falsify (A33-41's last list but `facts.go:10`'s git-credential half and `kube/apply_test.go`).
+- **Then:** M2.8a's rows as overlays, and `git status` unchanged after them.
+
+**M2.8b: one commit, "finish M2.8: git-credential and the records".**
+
+**Step 5, `git-credential set` and `rm`** (A33-29 to A33-33).
+- **Files:**
+  - `cli/gitcredential.go` (new) and `gitcredential_test.go` (new);
+  - `cli/cli.go`; `cluster/open.go` and its test; `plan/facts.go` and `plan_test.go`; `planhuman.go` and `planhuman_test.go`;
+  - `plancomplete_test.go`, `writecommands_test.go`, `migrate_test.go`, `consent_test.go`, `manifests_test.go`, `refusingdefaults_test.go`, `planvectors_test.go` and `kindsvector_test.go`;
+  - `kube/apply_test.go`; `kube/realapi_test.go` (R3, written, not run);
+  - `testdata/plan/git_credential_set.json` and `git_credential_rm.json`.
+- **Tests:** rows 93d, 102b, 111–124 and 139; the fact table at 20.
+- **Stays green:** all of `./check.sh`. The realapi suite is vetted, not run.
+
+**Step 6, the records and the mutation runs** (A33-41, the mutation table).
+- **Files:** A33-41's list.
+- **Then:**
+  1. every M2.8 row as an overlay;
+  2. the rerun list;
+  3. a records grep for `M2\.8`, `twelve`, `five plans`, `not built`, `deliberately never asks`, `projects describe`, `create secret generic`, `reads the record alone`, `reads no Google`, `only for the registry`, `three methods`, `subject/ns/`, `as a notice` and `exempt until`, each hit updated or justified;
+  4. `git status` unchanged.
+- **Stays green:** all of `./check.sh`.
+
+**A33-42: the size [inf].** It replaces §13's M2.8 row of ~550 + ~650 lines and 3–4 days.
+
+| | Code | Tests |
+|---|---|---|
+| Step 0 | ~25 | ~90 |
+| M2.8a | ~1,050 (950–1,300) | ~2,400 (2,100–2,800) |
+| M2.8b | ~480 (420–550) | ~1,000 (900–1,200) |
+| **Total** | about 1,550 (1,350–1,850) | about 3,500 (3,100–4,100) |
+
+Plus 3 new and 5 regenerated plan vectors, and about 22 Markdown records (+260/−80). About 6–8 working days. M2.6 and M2.7 each ran 2–4 times their estimates.
+
+## 34. Amendments after M2.8's step 0 (2026-11-19)
+
+Step 0 was built as A33-9 specifies and passed `./check.sh`. It was then reviewed read-only on its own tree, in three lenses (safety; tests and mutation; conformance and records), each finding put to a skeptic: 13 findings, 8 confirmed, 5 refuted. These amendments record what changed. Where they differ from A33-9, they win.
+
+**A34-1 (S-1, C-3): the rule is `http2debug=1` or `http2debug=2`, not any `http2debug`.** `kube.http2DebugLogging` refuses a GODEBUG holding the substring `http2debug=1` or `http2debug=2`, which is the test both Go copies apply at init: the vendored `golang.org/x/net/http2` and go1.27.4's `net/http` [read]. `http2debug=0` and `http2debug=3` are not refused, and turn nothing on; `http2debug=10` is refused, and does turn the logging on. A33-9's pinned README text ("GODEBUG's http2debug") said more than the code does. The CLI README's `unsafe_environment` row now reads: before it reads anything, every command refuses a GODEBUG holding `http2debug=1` or `http2debug=2`, which makes Go's HTTP/2 clients print every request header, the bearer included, to stderr. `hardenEnvironment`'s doc and the test's doc say the same. `msgHTTP2Debug` is unchanged: it is printed only when the test holds.
+
+**A34-2 (S-2): the test ties farcast's rule to x/net's.** Nothing compared `http2DebugLogging` with what the vendored `x/net/http2` turns on. A newer x/net that logged under another setting would have left every test green while the Google clients printed the bearer. `TestEveryCommandRefusesHTTP2Debug`'s child now checks that `kube.UnsafeEnvironment() != nil` equals `http2.VerboseLogs`, for each of seven GODEBUG values the parent runs it with: `http2debug=1`, `http2debug=2`, `a=1,http2debug=2` and `http2debug=10` are refused, and `http2debug=0`, `http2debug=3` and ` http2debug = 1` are not. A child that is not refused runs no command. `net/http`'s own copy cannot be read from a test; the toolchain pin holds it. The test imports `golang.org/x/net/http2`, so `go.mod` lists `golang.org/x/net` as a direct requirement, no longer `// indirect`. No module is added, `vendor/` is unchanged, and the count stays 31.
+
+**A34-3 (T-1): `Main` is pinned too.** Both tests called `run`, never `Main`. A refusal added to `hardenEnvironment`, the placement A33-9 rejects because `Main` prints its error with no kind, passed the suite. The refused child now also calls `Main` with `version`: exit 1, an envelope of kind `unsafe_environment`, nothing on stderr.
+
+**A34-4 (T-2): the order before `config.Resolve` is pinned.** Both tests passed `--config`, so the check could move after `config.Resolve` unseen. `TestUnsafeEnvironmentIsRefusedBeforeAnythingIsRead` gains a run with no `--config` and with `FARCAST_CONFIG_HOME`, `XDG_CONFIG_HOME` and `HOME` empty: the refusal comes, not Resolve's error.
+
+**A34-5 (C-1, C-5, C-4): records and comments beyond A33-9's list.**
+- The CLI README's `world` paragraph listed `unsafe_environment` among the failures reported per cluster section, and then said none of them refuses the command. Both are now false for it. It leaves the list, and one sentence says the command refuses it before any section is read, so it is never a section's error.
+- The CLI README's *The process environment* gains a paragraph on the refusal, beside the variables `farcast` sets and unsets.
+- The doc of `cli`'s `unsafeEnvironment` seam said a test drives `run` past it. The test makes it answer the refusal instead, and the doc says so.
+
+**Mutation rows (§10.5, M2.8), added:**
+
+| # | Requirement | Mutation | Must fail | Run |
+|---|---|---|---|---|
+| 125a | The refusal carries its kind from `Main` | also refuse in `hardenEnvironment` | `TestEveryCommandRefusesHTTP2Debug` (its `Main` call) | check.sh |
+| 125b | The refusal precedes `config.Resolve` | move the check after `config.Resolve` | `TestUnsafeEnvironmentIsRefusedBeforeAnythingIsRead` (its no-config run) | check.sh |
+| 125c | farcast's rule is x/net's | `http2DebugLogging` also matches `http2debug=0` | `TestEveryCommandRefusesHTTP2Debug`, `TestHTTP2DebugLoggingRefusesEveryClient` | check.sh |
+| 125d | farcast's rule is x/net's | `http2DebugLogging` drops `http2debug=2` | `TestEveryCommandRefusesHTTP2Debug`, `TestHTTP2DebugLoggingRefusesEveryClient` | check.sh |
+
+**Refuted, kept out:**
+- **S-3:** that the planck harness leaks a token under `http2debug=2`. Its only client is the container gRPC client, which signs a self-signed JWT locally (`EnableJwtWithScope`) and makes no token exchange to log. The harness stays as A33-9 leaves it.
+- **T-3:** that `build atlas .` is too malformed to pin anything. `config.Load` runs before every command's own argument checks, and the read observer sees it, so the row pins "before anything is read" as strictly as a well-formed line would.
+- **C-2:** the writing commands' envelope bullet. "The command" there means the farcast invocation, and nothing it says is false.
+- **C-6:** the keeper's exit table and Usage. Both are scoped to what a pass found, and under the refusal no pass runs, as with the other exits before a pass.
+- **C-7:** pinning that root usage and `--help` print under the setting. Moving the check above them would fail closed, and nothing promises it.

@@ -71,9 +71,22 @@ const (
 // (go1.27.4 src/net/http/internal/http2/http2.go, init); this package's
 // variables are initialized after net/http's, from the same environment, so
 // this is exactly what net/http saw. Unsetting GODEBUG later cannot turn the
-// logging off, so newClient refuses instead (D14's kind of leak, through
-// another variable).
+// logging off, so UnsafeEnvironment refuses instead (D14's kind of leak,
+// through another variable).
 var http2Verbose = http2DebugLogging(os.Getenv("GODEBUG"))
+
+// UnsafeEnvironment refuses, with ErrUnsafeEnvironment and msgHTTP2Debug,
+// while http2Verbose holds, and is nil otherwise. It is the one test of it:
+// newClient asks it before anything else, and farcast's router asks it before
+// every command reads anything (ADR 0023 M2.8's step 0), because the vendored
+// Google clients' HTTP/2 transport (golang.org/x/net/http2) reads the same
+// GODEBUG setting at its own init and logs the same headers.
+func UnsafeEnvironment() error {
+	if http2Verbose {
+		return refuse(ErrUnsafeEnvironment, msgHTTP2Debug)
+	}
+	return nil
+}
 
 // http2DebugLogging is net/http's own test of GODEBUG for HTTP/2 logging,
 // with its two settings (go1.27.4 src/net/http/internal/http2/http2.go).
@@ -81,7 +94,7 @@ func http2DebugLogging(godebug string) bool {
 	return strings.Contains(godebug, "http2debug=1") || strings.Contains(godebug, "http2debug=2")
 }
 
-// msgHTTP2Debug is newClient's refusal while http2Verbose holds.
+// msgHTTP2Debug is UnsafeEnvironment's refusal while http2Verbose holds.
 const msgHTTP2Debug = "the environment's GODEBUG names http2debug, which makes Go's HTTP/2 client print every request header, the bearer token included, to stderr; unset it and run farcast again; nothing was sent"
 
 // newTransport is the one transport shape every one of a client's HTTP

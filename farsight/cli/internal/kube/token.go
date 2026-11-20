@@ -41,13 +41,13 @@ const (
 // and mints nothing. A nil mint is the 2LO provider of §3.3, which is what New
 // passes.
 //
-// Before anything else it refuses, with ErrUnsafeEnvironment, while GODEBUG
-// has turned on Go's HTTP/2 logging (http2Verbose), which would print the
-// bearer token, and with http2debug=2 the signed assertion and the minted
+// Before anything else it refuses, with UnsafeEnvironment's error, while
+// GODEBUG has turned on Go's HTTP/2 logging (http2Verbose), which would print
+// the bearer token, and with http2debug=2 the signed assertion and the minted
 // token, to stderr.
 func newClient(cfg Config, mint tokenFunc) (*Client, error) {
-	if http2Verbose {
-		return nil, refuse(ErrUnsafeEnvironment, msgHTTP2Debug)
+	if err := UnsafeEnvironment(); err != nil {
+		return nil, err
 	}
 	if err := pair(cfg.Endpoint, cfg.Credential); err != nil {
 		return nil, err
