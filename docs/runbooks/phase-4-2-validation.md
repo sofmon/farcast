@@ -66,6 +66,8 @@ gcloud artifacts repositories add-iam-policy-binding "farcast-$INSTANCE" \
 
 **The grant is on the one repository, not the project.**
 
+*(2026-11-20, [ADR 0023](../adr/0023-one-download-farcast.md) M2.8, built 2026-11-19 to 2026-11-20, not walked: the principal above, `…/subject/ns/farcast-system/sa/farcast-builder`, is shared by every FarCast instance in the project, so a grant to it lets another instance's builder push into this registry. Since M2.8 the grant names the builder's ServiceAccount, `farcast-system/farcast-builder`, by its uid, which exists once `farcast kernel deploy` has created the account, or once a build has applied it. FarCast still never applies it. `farcast build` and `farcast run` read the repository's IAM policy with the installer's key, and, when it does not hold the uid principal or cannot be read, or still grants the shared one, print the commands to run in Cloud Shell, with the project number and the uid already in them: the add of the uid binding first, where it is missing. Where the policy cannot be read, both commands print, each under its condition. Where the shared principal is still bound, as on an instance walked with the block above, they then print a wait for IAM and its remove, or the remove alone once the uid binding is there, one line: `gcloud artifacts repositories remove-iam-policy-binding 'farcast-<instance>' --project '<project>' --location '<location>' --member '<shared principal>' --role 'roles/artifactregistry.writer' --condition=None`. `farcast build "$INSTANCE" … --plan` states the grant; it reads the cluster as the instance's reader, which `farcast reader grant` must have verified. That a repository honours a grant to the uid is [unverified] until the M2 walk.)*
+
 ## 3. Build — the step that proves the whole decision
 
 ```bash
@@ -230,6 +232,20 @@ farcast build "$INSTANCE" --repo https://github.com/<you>/<private>.git \
 ```
 
 *(Corrected 2026-10-08: `--builder-image "$KANIKO"` dropped; the mirrored builder from step 1 is used.)*
+
+*(2026-11-20, [ADR 0023](../adr/0023-one-download-farcast.md) M2.8, built 2026-11-20, not walked: in place of `kubectl create secret generic … --from-literal`, which puts the token on argv and in shell history, `farcast git-credential set` writes the same Secret, `farcast-system/demo-git` with the keys `username` and `token`, labelled as a Git credential farcast wrote. It never takes the token from argv, and refuses `--token-file -` where stdin is a terminal, and a `--token-file` that names a character device, such as a terminal. It also refuses a run with no terminal and neither `--plan` nor `--confirm`, and `--yes`. Its two working forms follow. The `--plan` form takes `--token-file -` too, which it does not read, so its confirm line is the command the token is piped to.)*
+
+```bash
+# In a terminal, one line at a time: a file only you can read, the token put in it, removed afterwards.
+( umask 077 && touch ./demo-git.token )
+# Put the token into ./demo-git.token with an editor, never with echo or on a command line.
+farcast git-credential set "$INSTANCE" --name demo-git --username <user> --token-file ./demo-git.token
+rm ./demo-git.token
+
+# Without a prompt: the plan, then the token piped to its --confirm.
+farcast git-credential set "$INSTANCE" --name demo-git --username <user> --token-file - --plan
+printf '%s' "$TOKEN" | farcast git-credential set "$INSTANCE" --name demo-git --username <user> --token-file - --confirm <digest>
+```
 
 Expected: the clone succeeds and the credential appears **nowhere in the Job's arguments** — `kubectl -n "$NS" get job build-… -o yaml` should show it only as a `secretKeyRef`.
 

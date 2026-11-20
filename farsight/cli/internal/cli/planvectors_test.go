@@ -43,7 +43,8 @@ import (
 // image's version tag, as a release farcast at the vector stamp that carries
 // the fake components. They are produced in Go and are not copied to
 // FarSightKit until ADR 0021 step 7.1. Each part of M2.6 adds the vectors of
-// the commands it wires, and M2.7 migrate's.
+// the commands it wires, M2.7 migrate's, and M2.8 git-credential's, which
+// read the record alone.
 //
 //	FARCAST_UPDATE_VECTORS=1 go test ./farsight/cli/internal/cli/ -run Vector
 //
@@ -686,6 +687,41 @@ func planVectors() []planVector {
 			c.now = vectorClock
 			return c
 		}, []string{"atlas"}, nil, vectorKubeconfig, false},
+		// git-credential set (M2.8, design §33, A33-40): the Secret
+		// farcast-system/repo-git, rendered from the placeholders. Its
+		// --username is a marker, which no plan binds, and its --token-file
+		// names a file that does not exist, which no plan reads.
+		{"git_credential_set", nil, vectorGitCredential(plan.GitCredentialSet), []string{"atlas"},
+			[]string{"--name", "repo-git", "--username", vectorGitUsername, "--token-file", vectorGitTokenFile}, nil, false},
+		// git-credential rm: the delete of farcast-system/repo-git, on the
+		// uid its read finds after consent.
+		{"git_credential_rm", nil, vectorGitCredential(plan.GitCredentialRm), []string{"atlas"},
+			[]string{"--name", "repo-git"}, nil, false},
+	}
+}
+
+// The git_credential_set vector's data flags (A33-40): a username marker,
+// which no plan may bind, and a token file that does not exist, which no
+// plan may read.
+const (
+	vectorGitUsername  = "VECTOR-GIT-USERNAME-MARKER"
+	vectorGitTokenFile = "/nonexistent/farcast-vector/git-token"
+)
+
+// vectorGitCredential is git-credential set or rm for its vectors: its clock
+// the vectors', and its writer and its token refused, for a plan opens and
+// reads neither.
+func vectorGitCredential(action string) func(t *testing.T, flags ...string) Command {
+	return func(t *testing.T, flags ...string) Command {
+		c := withFlags(t, &gitCredentialCommand{action: action}, flags...)
+		c.newCluster = func(clusterRef) (gitCredentialCluster, error) {
+			return nil, errors.New("test: a vector's plan opened the writer")
+		}
+		c.readToken = func(*Env, string) ([]byte, error) {
+			return nil, errors.New("test: a vector's plan read the token")
+		}
+		c.now = vectorClock
+		return c
 	}
 }
 

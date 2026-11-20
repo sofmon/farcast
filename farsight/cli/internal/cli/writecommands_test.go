@@ -137,10 +137,14 @@ type writeCommand struct {
 	prepare func(t *testing.T, dir config.Dir)
 }
 
-// writeCommands is the twelve commands that write to an instance's cluster:
-// ADR 0023 M2.7's migrate is the twelfth (A30-26). Its row answers its
-// typed-name question as runWrite answers every prompt, "y", which is not
-// the instance's name, so it aborts having written nothing.
+// writeCommands is the fourteen commands that write to an instance's
+// cluster: ADR 0023 M2.7's migrate is the twelfth (A30-26), and M2.8's
+// git-credential set and rm the thirteenth and fourteenth (design §33,
+// A33-32). migrate's row answers its typed-name question as runWrite answers
+// every prompt, "y", which is not the instance's name, so it aborts having
+// written nothing. git-credential's rows ask through their interactive seam,
+// as reader grant's does, since --yes is refused, and set's reads its token
+// from a fake (gitCredentialTokenOf): runWrite's stdin answers the question.
 func writeCommands() []writeCommand {
 	return []writeCommand{
 		{name: "connect", args: []string{writeName}, cmd: func() Command { return newConnectCommand() },
@@ -161,6 +165,12 @@ func writeCommands() []writeCommand {
 			return &readerGrantCommand{interactive: func(*Env) bool { return true }}
 		}},
 		{name: "migrate", args: []string{writeName}, cmd: func() Command { return &migrateCommand{interactive: func(*Env) bool { return true }} }},
+		{name: "git-credential set", args: []string{writeName}, flags: gitCredentialSetFlags(), cmd: func() Command {
+			return &gitCredentialCommand{action: plan.GitCredentialSet, interactive: func(*Env) bool { return true }, readToken: gitCredentialTokenOf(gitCredentialToken + "\n")}
+		}},
+		{name: "git-credential rm", args: []string{writeName}, flags: []string{"--name", gitCredentialName}, cmd: func() Command {
+			return &gitCredentialCommand{action: plan.GitCredentialRm, interactive: func(*Env) bool { return true }}
+		}},
 	}
 }
 
@@ -614,6 +624,65 @@ func TestWritingCommandsCarryClusterKinds(t *testing.T) {
 		}
 	}
 
+	// ADR 0023 M2.8 (design §33, A33-30, row 120): git-credential's calls
+	// before its write, and rm's delete, which applies nothing, each
+	// refused: a 403 is forbidden, with the writer's sentence once by its
+	// shape, and a 500 cluster_rejected. Every request is the writer's, and
+	// nothing is applied or deleted after the refusal.
+	for _, row := range []struct {
+		name, method string
+	}{
+		{"git-credential set/the read", http.MethodGet},
+		{"git-credential rm/the read", http.MethodGet},
+		{"git-credential rm/the delete", http.MethodDelete},
+	} {
+		for _, f := range []struct {
+			name     string
+			code     int
+			status   kube.Status
+			kind     string
+			sentence string
+		}{
+			{"answering 500", http.StatusInternalServerError, kube.Status{}, kindClusterRejected, ""},
+			{"forbidden by RBAC", http.StatusForbidden, kube.Status{}, kindForbidden, msgWriterRBACRefused},
+			{"forbidden at the endpoint", http.StatusForbidden, iamShaped, kindForbidden, msgWriterIAMRefused},
+		} {
+			t.Run(row.name+" "+f.name, func(t *testing.T) {
+				s := kubetest.New(t)
+				gitCredentialSeeded(s)
+				dir, _ := writeInstance(t, s, true)
+				s.Fail(row.method, gitCredentialPath, f.code, f.status)
+				command, _, _ := strings.Cut(row.name, "/")
+				_, _, err := runWrite(t, dir, writeCommandNamed(t, command))
+				if kind := kindOf(classified(err)); kind != f.kind {
+					t.Fatalf("%s = %v; kind %q, want %q", row.name, err, kind, f.kind)
+				}
+				msg := err.Error()
+				for _, sentence := range []string{msgWriterRBACRefused, msgWriterIAMRefused} {
+					want := 0
+					if sentence == f.sentence {
+						want = 1
+					}
+					if got := strings.Count(msg, sentence); got != want {
+						t.Errorf("%s = %q;\nsays %q %d times, want %d", row.name, msg, sentence, got, want)
+					}
+				}
+				var after int
+				for i, r := range s.Requests() {
+					if r.As != "writer" {
+						t.Errorf("%s %s as %q; want the writer", r.Method, r.Path, r.As)
+					}
+					if r.Method == row.method && r.Path == gitCredentialPath {
+						after = len(s.Requests()) - i - 1
+					}
+				}
+				if after != 0 || len(appliedRequests(s)) != 0 {
+					t.Errorf("%s sent %d requests after its refused call, %d of them applies", row.name, after, len(appliedRequests(s)))
+				}
+			})
+		}
+	}
+
 	// connect, redeploy, build and run, with fakes: the preflight read
 	// refused, before anything is applied; and kube-shaped failures after
 	// the first Apply.
@@ -975,11 +1044,12 @@ func (p applyingPlan) String() string {
 	return p.row.String()
 }
 
-// applyingPlans is a plan of each of the nine commands that apply, and both
+// applyingPlans is a plan of each of the ten commands that apply, and both
 // of run's (ADR 0023 M2.7): connect's first deploy, redeploy, build, kernel
-// deploy, kernel meter, kernel confirm, storage deploy, reader grant, and
-// run's fetch and deploy plans into runTarget. build's Job is seeded
-// finished, so its apply keeps that status and its wait ends at once.
+// deploy, kernel meter, kernel confirm, storage deploy, reader grant, run's
+// fetch and deploy plans into runTarget, and, since M2.8, git-credential set
+// of a credential the cluster lacks (design §33, A33-32). build's Job is
+// seeded finished, so its apply keeps that status and its wait ends at once.
 func applyingPlans(t *testing.T) []applyingPlan {
 	t.Helper()
 	return []applyingPlan{
@@ -995,6 +1065,7 @@ func applyingPlans(t *testing.T) []applyingPlan {
 		{row: planCommandNamed(t, "reader grant", "a recorded reader")},
 		{row: runDeployRowNamed(t, "deploy into a metered namespace"), fetch: true},
 		{row: runDeployRowNamed(t, "deploy into a metered namespace")},
+		{row: planCommandNamed(t, "git-credential set", "a new credential")},
 	}
 }
 
@@ -1003,8 +1074,9 @@ func applyingPlans(t *testing.T) []applyingPlan {
 // instance unmigrated; connect and redeploy record FatLine only once it is
 // applied; kernel deploy and storage deploy record their workload before
 // the apply and keep it, unapplied; kernel meter and kernel confirm put back
-// what they recorded before the apply; and build, run and reader grant
-// record nothing until they are done.
+// what they recorded before the apply; build, run and reader grant record
+// nothing until they are done; and git-credential set records nothing at
+// all.
 func (p applyingPlan) rolledBack(before, after *config.InstanceMetadata) string {
 	if after.ServerSideApply == nil {
 		return "unmigrated"
@@ -1039,6 +1111,8 @@ func (p applyingPlan) rolledBack(before, after *config.InstanceMetadata) string 
 		}
 	case "reader grant":
 		return same("the reader", before.Reader, after.Reader)
+	case "git-credential set":
+		return same("the record", before, after)
 	case "build", "run":
 		if why := same("the deployments", before.Deployments, after.Deployments); why != "" {
 			return why
@@ -1199,6 +1273,8 @@ func realWriter(t *testing.T, cmd Command) Command {
 	case *runCommand:
 		c.newCluster = nil
 	case *migrateCommand:
+		c.newCluster = nil
+	case *gitCredentialCommand:
 		c.newCluster = nil
 	case *kernelMeterCommand, *kernelConfirmCommand, *readerGrantCommand:
 		// Their rows leave every writing seam to its default, the writer.
@@ -1473,7 +1549,8 @@ func TestNoCommandHelpNamesKubectl(t *testing.T) {
 		}
 	}
 	walk("", defaultRegistry())
-	for _, want := range []string{"migrate", "build", "run", "redeploy", "kernel meter", "reader grant", "usage", "storage key pin", "storage key rotate"} {
+	for _, want := range []string{"migrate", "build", "run", "redeploy", "kernel meter", "reader grant", "usage", "storage key pin", "storage key rotate",
+		"git-credential", "git-credential set", "git-credential rm"} {
 		if !slices.Contains(seen, want) {
 			t.Errorf("the walk never reached %q; it reached %q", want, seen)
 		}
@@ -1677,9 +1754,10 @@ type planFakes struct {
 	grants *fakeBucketGrants
 	// opened counts the provider's opens, writers the writer's (a pin
 	// store's included), dialled the carrier's dials, storages storage
-	// deploy's mints of the bucket and keyring, and keyholders the
-	// keyholder's opens.
-	opened, writers, dialled, storages, keyholders int
+	// deploy's mints of the bucket and keyring, keyholders the keyholder's
+	// opens, and tokens git-credential set's reads of its token (ADR 0023
+	// M2.8, design §33, A33-30).
+	opened, writers, dialled, storages, keyholders, tokens int
 	// readers is the identity the plan's reader seam was asked to open, at
 	// each open (A23-49).
 	readers []kube.Identity
@@ -2023,6 +2101,26 @@ func planCommands() []planCommand {
 		}
 	}
 	migrating, nothingToMigrate := fakes(nil), fakes(nil)
+	// git-credential set and rm (M2.8, design §33, A33-29), whose plans read
+	// the record alone: the writer the instance's, against the fixture's
+	// kubetest (gitCredentialWriterDefault, loopback only here), counted as
+	// a writer open, and set's token a fake that counts its reads. The token
+	// file is -, which a plan never reads.
+	gitCredential := func(action string, f *planFakes) func() Command {
+		return func() Command {
+			return &gitCredentialCommand{action: action,
+				newCluster: func(r clusterRef) (gitCredentialCluster, error) {
+					f.writers++
+					return gitCredentialWriterDefault(r)
+				},
+				readToken: func(env *Env, path string) ([]byte, error) {
+					f.tokens++
+					return gitCredentialTokenOf(gitCredentialToken+"\n")(env, path)
+				},
+			}
+		}
+	}
+	credentialSet, credentialRm := fakes(nil), fakes(nil)
 
 	return []planCommand{
 		{name: "kernel meter", shape: "add", identity: "none", args: []string{writeName, writeNewNamespace}, cmd: meter},
@@ -2135,6 +2233,13 @@ func planCommands() []planCommand {
 			edit: func(m *config.InstanceMetadata) { m.ServerSideApply = nil }, seed: clientSideSeeded, fakes: migrating},
 		{name: "migrate", shape: "nothing to migrate", identity: "writer", args: []string{writeName}, cmd: migrate(nothingToMigrate),
 			seed: systemNamespace, fakes: nothingToMigrate},
+		// git-credential's plans (M2.8): set of a credential the cluster
+		// lacks, and rm of one farcast wrote, which the fixture's cluster
+		// holds (gitCredentialSeeded). Neither reads the cluster.
+		{name: "git-credential set", shape: "a new credential", identity: "none", args: []string{writeName}, flags: gitCredentialSetFlags(),
+			cmd: gitCredential(plan.GitCredentialSet, credentialSet), fakes: credentialSet},
+		{name: "git-credential rm", shape: "a credential farcast wrote", identity: "none", args: []string{writeName}, flags: []string{"--name", gitCredentialName},
+			cmd: gitCredential(plan.GitCredentialRm, credentialRm), seed: gitCredentialSeeded, fakes: credentialRm},
 	}
 }
 
@@ -2316,7 +2421,7 @@ var factTypes = map[string]reflect.Type{
 	plan.TypeRun: reflect.TypeFor[plan.RunFact](), plan.TypeBuild: reflect.TypeFor[plan.BuildFact](),
 	plan.TypeApplicationReset: reflect.TypeFor[plan.ApplicationResetFact](), plan.TypeReader: reflect.TypeFor[plan.ReaderFact](),
 	plan.TypeNotice: reflect.TypeFor[plan.NoticeFact](), plan.TypeMigrate: reflect.TypeFor[plan.MigrateFact](),
-	plan.TypeGrant: reflect.TypeFor[plan.GrantFact](),
+	plan.TypeGrant: reflect.TypeFor[plan.GrantFact](), plan.TypeGitCredential: reflect.TypeFor[plan.GitCredentialFact](),
 }
 
 // decodedBound decodes a printed plan's bound member, its facts typed.
@@ -2440,9 +2545,9 @@ func TestPlansWriteNothing(t *testing.T) {
 				if row.identity == "writer" {
 					opens = 2
 				}
-				if f.writers != opens || f.dialled+f.storages+f.keyholders != 0 {
-					t.Errorf("%s --plan opened the writer %d times (want %d), dialled %d, minted storage %d times and opened the keyholder %d times",
-						row, f.writers, opens, f.dialled, f.storages, f.keyholders)
+				if f.writers != opens || f.dialled+f.storages+f.keyholders+f.tokens != 0 {
+					t.Errorf("%s --plan opened the writer %d times (want %d), dialled %d, minted storage %d times, opened the keyholder %d times and read a Git token %d times",
+						row, f.writers, opens, f.dialled, f.storages, f.keyholders, f.tokens)
 				}
 				// No plan writes a bucket's policy, --grant-bucket's
 				// included (design §33, A33-24, row 106b).
@@ -2693,8 +2798,9 @@ func TestConnectPlanFactsFollowItsState(t *testing.T) {
 // writer that applies the manifest read, before a deploy plan exists
 // (A28-11). Each deploy plan is computed as --confirm of a digest that is no
 // plan's computes it (runDeployDigest). migrate's plan (M2.7, A30-26) reads
-// it too, not for Google: it reads the cluster as the writer. A plan of the
-// read group on an instance installed without a key (Application Default
+// it too, not for Google: it reads the cluster as the writer. git-credential
+// set's and rm's plans (M2.8) read the record alone. A plan of the read
+// group on an instance installed without a key (Application Default
 // Credentials) is refused credential_missing, before the provider opens.
 func TestPlansStillReadTheInstallerKeyForGoogle(t *testing.T) {
 	// By command, or by command/shape where its shapes differ.
@@ -2704,6 +2810,8 @@ func TestPlansStillReadTheInstallerKeyForGoogle(t *testing.T) {
 		"kernel deploy": true, "kernel deploy/a missing namespace": false,
 		"storage deploy": true, "storage deploy/behind the pin": false, "storage key pin": false,
 		"storage key rotate": false, "run": false, "migrate": true,
+		// git-credential's plans read the record alone (design §33, A33-35).
+		"git-credential set": false, "git-credential rm": false,
 		// run's deploy plans (design §33, A33-35): those past every block
 		// read the push grant; a blocked one reads no key.
 		"run/deploy into a metered namespace": true, "run/deploy into a new namespace": true,

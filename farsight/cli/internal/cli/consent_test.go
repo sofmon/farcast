@@ -463,7 +463,8 @@ func TestNoticesPrintOnceInTheCommandsWords(t *testing.T) {
 // and --confirm: ADR 0023 M2.6 wired all eleven (M2.6a kernel meter, kernel
 // confirm and reader grant, M2.6b connect, redeploy and build, M2.6c kernel
 // deploy, storage deploy, storage key pin and storage key rotate, M2.6d run),
-// and M2.7's migrate is the twelfth (A30-26). The list is derived, not
+// M2.7's migrate is the twelfth (A30-26), and M2.8's git-credential set and
+// rm the thirteenth and fourteenth (design §33, A33-32). The list is derived, not
 // written here: the rows are checked against the commands with plans that
 // farcast's router reaches (consentCommands), so a row that registers no
 // --plan or no --confirm, a row whose command is not the router's, and a
@@ -513,8 +514,13 @@ func commandLine(dir config.Dir, wc writeCommand, extra ...string) []string {
 
 // runLine runs one command line through the router.
 func runLine(line []string) (stdout, stderr string, code int) {
+	return runLineIn(line, "")
+}
+
+// runLineIn is runLine with stdin, which is no terminal, reading stdin.
+func runLineIn(line []string, stdin string) (stdout, stderr string, code int) {
 	var out, errb bytes.Buffer
-	code = run(context.Background(), line, strings.NewReader(""), &out, &errb)
+	code = run(context.Background(), line, strings.NewReader(stdin), &out, &errb)
 	return out.String(), errb.String(), code
 }
 
@@ -818,9 +824,10 @@ func planFlagOfATopLevelCommand(t *testing.T) {
 // cost question), run's (its review), kernel deploy's (its cost question,
 // below the floor or not, and the build question), storage deploy's (its
 // cost question, and the build question), storage key pin's (lowering the
-// pin with --replace), storage key rotate's (its question) and migrate's
-// (ADR 0023 M2.7: its typed name, A30-26): kernel meter and kernel confirm
-// ask nothing, so a run without a terminal is not refused (A23-9).
+// pin with --replace), storage key rotate's (its question), migrate's
+// (ADR 0023 M2.7: its typed name, A30-26) and git-credential set's and rm's
+// (M2.8, design §33, A33-30: their questions): kernel meter and kernel
+// confirm ask nothing, so a run without a terminal is not refused (A23-9).
 //
 // The gates are derived, not only listed (design §28's step 9b): every
 // usage error in this package's source that names the route
@@ -846,6 +853,8 @@ func TestNonInteractiveRefusalsNameThePlan(t *testing.T) {
 		{"storage key rotate", []string{msgRotateYes}, rotateRefusalNamesThePlan},
 		{"reader grant", []string{msgReaderGrantTerminal}, readerGrantRefusalNamesThePlan},
 		{"migrate", []string{msgMigrateTerminal}, migrateRefusalNamesThePlan},
+		{"git-credential set", []string{msgGitCredentialTerminal}, gitCredentialRefusalNamesThePlan("git-credential set")},
+		{"git-credential rm", []string{msgGitCredentialTerminal}, gitCredentialRefusalNamesThePlan("git-credential rm")},
 	}
 	planned := consentCommands(t)
 	gated := map[string]bool{}
@@ -943,6 +952,31 @@ func migrateRefusalNamesThePlan(t *testing.T) {
 	}
 }
 
+// gitCredentialRefusalNamesThePlan is TestNonInteractiveRefusalsNameThePlan's
+// row for git-credential set or rm (ADR 0023 M2.8, design §33, A33-30 step
+// 4): with no terminal and no answer it refuses, exit 2, naming the plan's
+// route, through the router, before it reads the record or sends anything.
+func gitCredentialRefusalNamesThePlan(name string) func(t *testing.T) {
+	return func(t *testing.T) {
+		s := kubetest.New(t)
+		dir, _ := writeInstance(t, s, true)
+		wc := writeCommandNamed(t, name)
+		reads := observeConfigReads(t)
+		stdout, stderr, code := farcastIn(t, dir, append(append(strings.Fields(name), wc.args...), wc.flags...)...)
+		if code != 2 || stdout != "" || !strings.HasPrefix(stderr, "farcast git-credential: "+msgGitCredentialTerminal+"\n") {
+			t.Errorf("%s without a terminal: exit %d, %q %q", name, code, stdout, stderr)
+		}
+		for _, p := range reads() {
+			if strings.HasPrefix(p, dir.InstancePath(writeName)) {
+				t.Errorf("%s without a terminal read %s", name, p)
+			}
+		}
+		if got := s.Requests(); len(got) != 0 {
+			t.Errorf("%s without a terminal sent %d requests", name, len(got))
+		}
+	}
+}
+
 // confirmLineOnTheCommands is TestTheConfirmLineRunsTheSameCommand's rows
 // through run(), for the commands that have plans: the line a plan prints, split as a shell splits
 // it and run as farcast runs it, recomputes the same plan, so it passes the
@@ -980,6 +1014,12 @@ func migrateRefusalNamesThePlan(t *testing.T) {
 // writer, and stops at its refused apply of the fetch. Its deploy plan has
 // its own row (runConfirmLinesRunTheSameCommand): the fetch plan's line
 // prints the deploy plan, whose line confirms it alone.
+//
+// git-credential's rows (ADR 0023 M2.8, design §33, A33-30) run through the
+// router too, the writer the package's loopback default: their plans read
+// nothing, and the line reads the Secret's metadata as the writer. set's
+// line, its token piped to it on stdin (--token-file -), stops at its
+// refused apply; rm's deletes the Git credential its fixture holds, exit 0.
 func confirmLineOnTheCommands(t *testing.T) {
 	pinPlanClock(t)
 	pinRunClock(t)
@@ -1007,7 +1047,7 @@ func confirmLineOnTheCommands(t *testing.T) {
 		switch {
 		case row.fakes == nil:
 			rows = append(rows, row)
-		case slices.Contains(readsCluster, row.name) || row.name == "run" || row.identity == "writer":
+		case slices.Contains(readsCluster, row.name) || row.name == "run" || row.identity == "writer" || strings.HasPrefix(row.name, "git-credential "):
 			row.fakes, row.cmd = nil, nil
 			rows = append(rows, row)
 		}
@@ -1045,12 +1085,22 @@ func confirmLineOnTheCommands(t *testing.T) {
 			planned := decodedBound(t, printedDocument(t, []byte(jsonPlan)))
 			reads := len(s.Requests())
 			s.FailNextApply(http.StatusInternalServerError, kube.Status{})
-			out, errb, code := runLine(words)
+			stdin := ""
+			if strings.HasPrefix(row.name, "git-credential ") {
+				// set's line reads its token from stdin, piped, after the
+				// comparison.
+				stdin = gitCredentialToken + "\n"
+			}
+			out, errb, code := runLineIn(words, stdin)
 			if strings.Contains(errb, "the plan for this command is now") {
 				t.Fatalf("the confirm line computed another plan: %s", errb)
 			}
 			noop := row.shape == "already metered" || row.shape == "an empty window"
 			switch {
+			case row.name == "git-credential rm":
+				if code != 0 || !strings.Contains(out, "deleted the Git credential") {
+					t.Errorf("the confirm line: exit %d, %q %q; want the credential deleted", code, out, errb)
+				}
 			case noop && (code != 0 || out == ""):
 				t.Errorf("the confirm line of a plan that writes nothing: exit %d, %q %q", code, out, errb)
 			case row.name == "storage key pin" || row.String() == "storage key rotate/no keyholder" || row.identity == "writer":
@@ -1072,6 +1122,25 @@ func confirmLineOnTheCommands(t *testing.T) {
 				t.Errorf("the confirm line: exit %d, %q; want it past the comparison, at its first apply, refused", code, errb)
 			}
 			switch {
+			case strings.HasPrefix(row.name, "git-credential "):
+				// The writer alone, and only after the comparison: the
+				// Secret's read, then set's refused apply or rm's delete.
+				var sent []string
+				for _, r := range s.Requests()[reads:] {
+					if r.As != "writer" {
+						t.Errorf("%s --confirm sent %s %s as %q; want the writer alone", row, r.Method, r.Path, r.As)
+					}
+					if r.Path != "/token" {
+						sent = append(sent, r.Method+" "+r.Path)
+					}
+				}
+				last := "PATCH " + gitCredentialPath
+				if row.name == "git-credential rm" {
+					last = "DELETE " + gitCredentialPath
+				}
+				if want := []string{"GET " + gitCredentialPath, last}; !slices.Equal(sent, want) {
+					t.Errorf("%s --confirm sent %q; want %q", row, sent, want)
+				}
 			case noop || row.String() == "storage key rotate/no keyholder":
 				onlyThePlansSent(t, row, s.Requests()[reads:], consentConfirm)
 			case row.String() == "storage deploy/a first deploy":

@@ -381,6 +381,13 @@ All four are now fixed, and each has a test that fails without the fix:
   IAM, which this CLI deliberately never asks for ([ADR 0008](../adr/0008-in-cluster-key-delivery.md)
   decision 8) — but the operator now reads it before the replicas start rather
   than underneath a crash loop.
+  *(2026-11-20, [ADR 0023](../adr/0023-one-download-farcast.md) M2.8, built
+  2026-11-19 to 2026-11-20, not walked: "deliberately never asks for" held
+  until M2.8. `storage deploy --grant-bucket` now applies the grant after its
+  own question in a terminal, or under `--confirm` of a plan made with it,
+  which needs a granted reader, and never with `--yes`. It names the
+  keyholder's ServiceAccount by its uid, which is [unverified] until the M2
+  walk. Without the flag its commands are still printed before the workload.)*
 
 Confirmed in passing: [ADR 0008](../adr/0008-in-cluster-key-delivery.md) decision
 9's fix, live for the first time — the `app` scope was present in the keyring

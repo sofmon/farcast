@@ -54,14 +54,15 @@ func unmigratedInstance(t *testing.T, s *kubetest.Server, wc writeCommand) confi
 }
 
 // consentForm is wc as it runs past every question: with --yes, or, for
-// reader grant, which refuses --yes, through the interactive seam its row
-// already sets; or, with planned, under --plan in place of --yes.
+// reader grant and git-credential set and rm, which refuse --yes, through
+// the interactive seam its row already sets (ADR 0023 M2.8, design §33,
+// A33-32); or, with planned, under --plan in place of --yes.
 func consentForm(wc writeCommand, planned bool) writeCommand {
 	flags := slices.DeleteFunc(slices.Clone(wc.flags), func(f string) bool { return f == "--yes" })
 	switch {
 	case planned:
 		flags = append(flags, "--plan")
-	case wc.name != "reader grant":
+	case !slices.Contains([]string{"reader grant", "git-credential set", "git-credential rm"}, wc.name):
 		flags = append(flags, "--yes")
 	}
 	wc.flags = flags
@@ -265,8 +266,9 @@ func TestEveryClusterWriterRefusesAnUnmigratedInstance(t *testing.T) {
 // cluster, confirmed then, is refused not_migrated, exit 1, with nothing
 // sent, printed on stdout or stderr, or written: each plan of
 // applyingPlans, through its command's real writer, and each plan of
-// storage key pin, and of storage key rotate with a keyholder, the two
-// commands applyingPlans leaves out.
+// storage key pin, of storage key rotate with a keyholder, and of
+// git-credential rm (ADR 0023 M2.8, design §33, A33-32), the three commands
+// applyingPlans leaves out, which write and apply nothing.
 func TestConfirmRefusesAnInstanceUnmigratedSinceItsPlan(t *testing.T) {
 	unmigrate := func(t *testing.T, dir config.Dir) {
 		t.Helper()
@@ -303,9 +305,11 @@ func TestConfirmRefusesAnInstanceUnmigratedSinceItsPlan(t *testing.T) {
 			sameFiles(t, p.String()+" --confirm, unmigrated since its plan", before, treeFiles(t, string(c.dir)))
 		})
 	}
-	var keyRows int
+	var keyRows, rmRows int
 	for _, row := range planCommands() {
-		if (row.name != "storage key pin" && row.name != "storage key rotate") || row.shape == "no keyholder" {
+		if row.name == "git-credential rm" {
+			rmRows++
+		} else if (row.name != "storage key pin" && row.name != "storage key rotate") || row.shape == "no keyholder" {
 			continue
 		}
 		keyRows++
@@ -321,8 +325,8 @@ func TestConfirmRefusesAnInstanceUnmigratedSinceItsPlan(t *testing.T) {
 			sameFiles(t, row.String()+" --confirm, unmigrated since its plan", before, treeFiles(t, string(dir)))
 		})
 	}
-	if keyRows < 2 {
-		t.Errorf("planCommands holds %d plans of storage key pin and storage key rotate with a keyholder; want each command's", keyRows)
+	if keyRows < 2+rmRows || rmRows == 0 {
+		t.Errorf("planCommands holds %d plans of storage key pin, storage key rotate with a keyholder and git-credential rm, %d of them rm's; want each command's", keyRows, rmRows)
 	}
 }
 
@@ -2131,6 +2135,12 @@ func seedTrace(s *kubetest.Server, w plan.WriteFact) string {
 	}
 	if uid, ok := fixtureAccounts()[w.Name]; ok && w.Kind == "ServiceAccount" && w.Namespace == tcdeploy.DefaultNamespace {
 		md["uid"] = uid
+	}
+	// A Git credential carries the labels by which git-credential set writes
+	// over it (design §33, A33-31): one without them it refuses, writing
+	// nothing.
+	if w.Kind == "Secret" && w.Namespace == gitCredentialNamespace && w.Name == gitCredentialName {
+		md["labels"] = gitCredentialLabels()
 	}
 	s.Put(map[string]any{"apiVersion": w.API, "kind": w.Kind, "metadata": md})
 	return name

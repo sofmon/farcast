@@ -196,6 +196,18 @@ func renderRows() []renderRow {
 				"resource_version": {", at the version the hold-stage write produced, "},
 				"force":            {", force: no, "},
 			}),
+		// git-credential rm's delete (ADR 0023 M2.8, design §33, A33-31): no
+		// document, so no sha256, on the uid read after consent.
+		factRow("write, git-credential rm's delete", plan.WriteFact{Type: plan.TypeWrite, API: "f-api3", Kind: "f-kind3", Namespace: "f-ns3",
+			Name: "f-name3", Method: plan.WriteDelete},
+			map[string][]string{
+				"method": {"write: delete f-kind3 f-ns3/f-name3 (f-api3), on the uid read after consent, force: no\n"},
+			}),
+		factRow("write, a delete that binds what none does", plan.WriteFact{Type: plan.TypeWrite, API: "f-api4", Kind: "f-kind4", Namespace: "f-ns4",
+			Name: "f-name4", Method: plan.WriteDelete, Force: true, ResourceVersion: "f-rv4", SHA256: "f-sha4"},
+			map[string][]string{
+				"resource_version": {", on the uid read after consent, at resourceVersion f-rv4, force: yes, sha256 f-sha4\n"},
+			}),
 
 		factRow("mint", plan.MintFact{Type: plan.TypeMint, What: "f-what", Subject: "f-subject"},
 			map[string][]string{"type": {"mint f-what"}, "what": {"mint f-what: f-subject\n"}, "subject": {": f-subject\n"}}),
@@ -446,6 +458,22 @@ func renderRows() []renderRow {
 				"shared_principal": {"the shared principal principal://iam.googleapis.com/projects/123456789012/locations/global/" +
 					"workloadIdentityPools/proj-atlas.svc.id.goog/subject/ns/f-gns/sa/f-gname, which every"},
 			}),
+		// The Git credential (A33-29): set, rm, and an action this farcast
+		// has no words for, which still shows.
+		factRow("git_credential", plan.GitCredentialFact{Type: plan.TypeGitCredential, Action: plan.GitCredentialSet,
+			Namespace: "f-gcns", Name: "f-gcname"},
+			map[string][]string{
+				"type":      {"git credential: "},
+				"action":    {"git credential: set Secret"},
+				"namespace": {" Secret f-gcns/f-gcname; "},
+				"name":      {"/f-gcname; its token is read only after consent, and the plan binds neither the username nor the token\n"},
+			}),
+		factRow("git_credential, rm", plan.GitCredentialFact{Type: plan.TypeGitCredential, Action: plan.GitCredentialRm,
+			Namespace: "f-gcns2", Name: "f-gcname2"},
+			map[string][]string{"action": {"git credential: rm Secret f-gcns2/f-gcname2, only if it is a Git credential farcast wrote\n"}}),
+		factRow("git_credential, another action", plan.GitCredentialFact{Type: plan.TypeGitCredential, Action: "f-gcaction",
+			Namespace: "f-gcns3", Name: "f-gcname3"},
+			map[string][]string{"action": {"git credential: f-gcaction Secret f-gcns3/f-gcname3\n"}}),
 		factRow("grant, with no project number", plan.GrantFact{Type: plan.TypeGrant, Name: plan.GrantPush, Target: "f-gtarget5",
 			ServiceAccount: "f-gsa5", Roles: []string{"f-grole5"}, State: plan.GrantUnknown, Shared: plan.GrantUnknown},
 			map[string][]string{
@@ -553,8 +581,8 @@ func TestEveryBoundFactIsRendered(t *testing.T) {
 		planTypes[typ.Name()] = typ
 	}
 	names := factTypeNames(t)
-	if len(names) != 19 {
-		t.Errorf("the plan package has %d fact types, %v; ADR 0023 M2.8 has 19", len(names), names)
+	if len(names) != 20 {
+		t.Errorf("the plan package has %d fact types, %v; ADR 0023 M2.8 has 20", len(names), names)
 	}
 	for _, n := range names {
 		if _, ok := planTypes[n]; !ok {

@@ -2255,3 +2255,73 @@ func TestServiceAccountUIDSurvivesForcedApplyAndMigration(t *testing.T) {
 		t.Errorf("the migration, or the first apply after it, gave the ServiceAccount another uid")
 	}
 }
+
+// gitCredentialDoc is a Git credential in git-credential set's shape (ADR
+// 0023 M2.8, design §33, A33-29): its name and its namespace, then a
+// placeholder's data, which carries no credential.
+const gitCredentialDoc = `apiVersion: v1
+kind: Secret
+metadata:
+  name: "%s"
+  namespace: "%s"
+  labels:
+    app.kubernetes.io/managed-by: farcast
+    app.kubernetes.io/component: git-credential
+type: Opaque
+data:
+  username: "cmVhbGFwaS11c2Vy"
+  token: "cmVhbGFwaS10b2tlbg=="
+`
+
+// TestDeleteSecretHonoursItsUIDPrecondition (design §33, A33-31, R3;
+// written, not run): git-credential rm deletes a Secret on the uid it read,
+// so one replaced since that read is never deleted. On a real API server a
+// delete on the stored uid deletes the Secret. A Secret deleted and created
+// again under its name since the read is refused 409, unwrapping to
+// tkube.ErrConflict, and kept. A delete of a Secret that is gone is a 404,
+// unwrapping to tkube.ErrNotFound. What it records: the codes, and whether
+// the Secret was deleted or kept, never a uid.
+func TestDeleteSecretHonoursItsUIDPrecondition(t *testing.T) {
+	r := openRealAPI(t)
+	ns := r.runNamespace(t, "delete")
+	ctx := t.Context()
+	text := fmt.Sprintf(gitCredentialDoc, "repo-git", ns)
+
+	// A delete that succeeds comes back as no error for any 2xx, so its code
+	// is not known here, and is not recorded as one; a refusal's is.
+	answer := func(err error) string {
+		t.Helper()
+		if err == nil {
+			return "a 2xx, its code not kept"
+		}
+		return strconv.Itoa(r.answered(t, err))
+	}
+
+	r.apply(t, text, true)
+	read := r.object(t, kindSecret, ns, "repo-git").Metadata
+	err := r.c.DeleteSecret(ctx, ns, "repo-git", read.UID)
+	_, gone := r.c.GetObject(ctx, kindSecret, ns, "repo-git")
+	fact(t, "a delete on the stored uid: %s; the Secret deleted: %t", answer(err), errors.Is(gone, tkube.ErrNotFound))
+	if err != nil || !errors.Is(gone, tkube.ErrNotFound) {
+		t.Errorf("a delete on the stored uid answered %s, and the Secret is still there: %t", answer(err), !errors.Is(gone, tkube.ErrNotFound))
+	}
+
+	r.apply(t, text, true)
+	again := r.object(t, kindSecret, ns, "repo-git").Metadata
+	if again.UID == "" || again.UID == read.UID {
+		t.Fatal("the Secret created again under its name has no uid, or the deleted one's")
+	}
+	err = r.c.DeleteSecret(ctx, ns, "repo-git", read.UID)
+	kept := r.object(t, kindSecret, ns, "repo-git").Metadata
+	fact(t, "a delete on the uid read before the Secret was created again: %s; the new Secret kept: %t", answer(err), kept.UID == again.UID)
+	if !errors.Is(err, tkube.ErrConflict) || kept.UID != again.UID {
+		t.Errorf("a delete on a uid that is no longer the stored one answered %s, not a 409 unwrapping to tkube.ErrConflict, or the new Secret is gone", answer(err))
+	}
+
+	r.check(t, r.c.DeleteSecret(ctx, ns, "repo-git", again.UID), "the delete on the new Secret's uid")
+	err = r.c.DeleteSecret(ctx, ns, "repo-git", again.UID)
+	fact(t, "a delete of a Secret that is gone: %s", answer(err))
+	if !errors.Is(err, tkube.ErrNotFound) {
+		t.Errorf("a delete of a Secret that is gone answered %s, not a 404 unwrapping to tkube.ErrNotFound", answer(err))
+	}
+}

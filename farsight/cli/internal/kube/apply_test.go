@@ -4,7 +4,15 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"io/fs"
 	"net/http"
+	"os"
+	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -91,12 +99,19 @@ func TestApplyIsOneServerSideApply(t *testing.T) {
 	}
 }
 
-// TestEveryWriteNamesFarcast (design §1, A30-9, mutation row 102): every
-// write the package makes names farcast's field manager explicitly, so the
-// API server never derives one from the User-Agent: Apply, the pin's create
-// and replace (CreateConfigMap, ReplaceConfigMap) and the migration's
-// PatchJSON, each sent as the writer. DeleteSecret is exempt until ADR 0023
-// M2.8: a DELETE carries DeleteOptions, which has no field manager.
+// TestEveryWriteNamesFarcast (design §1, A30-9, mutation rows 102 and 102b):
+// every write the package makes names farcast's field manager explicitly, so
+// the API server never derives one from the User-Agent: Apply, the pin's
+// create and replace (CreateConfigMap, ReplaceConfigMap) and the migration's
+// PatchJSON, each sent as the writer. DeleteSecret is exempt, for good (ADR
+// 0023 M2.8, design §33, A33-31): a DELETE carries DeleteOptions, which has
+// no field manager. Its exemption is pinned instead: one DELETE as the
+// writer, with no query and exactly the uid-preconditioned DeleteOptions;
+// and, by a scan of farsight/cli's source that counts every call, method
+// value and method expression named DeleteSecret, in a function or in a
+// package-level value, its one caller is cluster.Client.DeleteSecret, whose
+// one caller is git-credential rm. The scan's root is checked to be all of
+// farsight/cli, cmd/ included, by what it holds.
 func TestEveryWriteNamesFarcast(t *testing.T) {
 	s := kubetest.New(t)
 	s.Put(clientSideApplied("v1", "ConfigMap", "web", "settings", nil))
@@ -169,6 +184,155 @@ func TestEveryWriteNamesFarcast(t *testing.T) {
 			t.Errorf("%s sent ?%s as %q; want exactly one fieldManager=farcast, as the writer", w.name, r.RawQuery, r.As)
 		}
 	}
+
+	// The exemption: DeleteSecret's one DELETE.
+	s.Put(obj("v1", "Secret", "farcast-system", "repo-git", map[string]any{"metadata": map[string]any{"uid": "00000000-0000-4000-8000-0000000000e1"}}))
+	before := len(s.Requests())
+	if err := c.DeleteSecret(ctx, "farcast-system", "repo-git", "00000000-0000-4000-8000-0000000000e1"); err != nil {
+		t.Fatalf("DeleteSecret: %v", err)
+	}
+	var deletes []kubetest.Request
+	for _, r := range s.Requests()[before:] {
+		if r.Path != "/token" {
+			deletes = append(deletes, r)
+		}
+	}
+	const deleteBody = `{"apiVersion":"v1","kind":"DeleteOptions","preconditions":{"uid":"00000000-0000-4000-8000-0000000000e1"}}`
+	if len(deletes) != 1 || deletes[0].Method != http.MethodDelete || deletes[0].Path != "/api/v1/namespaces/farcast-system/secrets/repo-git" ||
+		deletes[0].RawQuery != "" || string(deletes[0].Body) != deleteBody || deletes[0].As != "writer" {
+		t.Errorf("DeleteSecret sent %+v; want one DELETE of the Secret as the writer, with no query and the body %s", deletes, deleteBody)
+	}
+
+	// Its callers, from the source: all of farsight/cli, its cmd/ as well as
+	// its internal/. The root is told by what it holds, not by its name, so a
+	// mutation run may point it at a copy of farsight/cli.
+	for _, held := range []string{"cmd/farcast/main.go", "internal/cluster/open.go"} {
+		if _, err := os.Stat(filepath.Join(deleteSecretScanRoot, filepath.FromSlash(held))); err != nil {
+			t.Fatalf("the scan's root %s holds no %s; want farsight/cli, whose cmd/ and internal/ it scans", deleteSecretScanRoot, held)
+		}
+	}
+	callers, err := deleteSecretCallers(deleteSecretScanRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"cli:gitCredentialCommand.remove", "cluster:Client.DeleteSecret"}; !slices.Equal(callers, want) {
+		t.Errorf("DeleteSecret is called from %q; want %q, git-credential rm's alone", callers, want)
+	}
+	t.Run("deleteSecretCallers", func(t *testing.T) {
+		root := t.TempDir()
+		files := map[string]string{
+			"one/one.go": "package one\n\ntype c struct{}\n\nfunc (c) DeleteSecret() {}\nfunc (x *c) remove() { x.DeleteSecret() }\n" +
+				"func free(x c) { x.DeleteSecret() }\nfunc (c) Run(d interface{ DeleteSecret() }) { d.DeleteSecret() }\n" +
+				// A method value, called through a variable, and one returned.
+				"func value(x c) { del := x.DeleteSecret; del() }\nfunc returned(x c) func() { return x.DeleteSecret }\n",
+			"one/seams.go": "package one\n\n" +
+				// A seam's default, a package-level func literal.
+				"var writerDefault = func(x interface{ DeleteSecret() }) { x.DeleteSecret() }\n" +
+				// A method expression, at package level.
+				"var methodExpr = c.DeleteSecret\n" +
+				// Two names, two values; and two names set by one value.
+				"var plain, viaLiteral = 1, func(x c) { x.DeleteSecret() }\n" +
+				"var both, ok = pair(func(x c) { x.DeleteSecret() })\nfunc pair(any) (int, bool) { return 0, true }\n" +
+				"var unrelated = func(x interface{ Delete() }) { x.Delete() }\n",
+			"one/one_test.go":  "package one\n\nfunc (x *c) tested() { x.DeleteSecret() }\nvar testSeam = c.DeleteSecret\n",
+			"two/deep/deep.go": "package deep\n\nfunc g(x interface{ DeleteSecret() }) { x.DeleteSecret() }\n",
+			"two/other.go":     "package two\n\nfunc h(x interface{ deleteSecret() }) { x.deleteSecret() }\n",
+			// A command's main, as under farsight/cli/cmd.
+			"cmd/tool/main.go": "package main\n\nfunc main() { var x interface{ DeleteSecret() }; x.DeleteSecret() }\n",
+		}
+		for name, src := range files {
+			if err := os.MkdirAll(filepath.Join(root, filepath.Dir(name)), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(root, name), []byte(src), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		got, err := deleteSecretCallers(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []string{"deep:g", "one:both,ok", "one:c.Run", "one:c.remove", "one:free", "one:methodExpr", "one:returned", "one:value", "one:viaLiteral", "one:writerDefault", "tool:main"}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("deleteSecretCallers = %q; want %q", got, want)
+		}
+	})
+}
+
+// deleteSecretScanRoot is farsight/cli, whose source, internal/ and cmd/,
+// TestEveryWriteNamesFarcast scans for DeleteSecret's callers.
+var deleteSecretScanRoot = "../.."
+
+// deleteSecretCallers is every place in the non-test Go source below root
+// that names a method DeleteSecret, called or not: a call, a method value
+// and a method expression alike, in a function's body or in a package-level
+// value such as a seam's default func literal. Each is "<its package's
+// directory>:<receiver type>.<method>" or "<directory>:<function>" inside a
+// function, and "<directory>:<variable>" in a package-level value (its
+// names joined by "," where one value sets several), sorted, once each. It
+// reads the files from disk, so a mutation made through go test -overlay is
+// not in what it reads.
+func deleteSecretCallers(root string) ([]string, error) {
+	var found []string
+	note := func(caller string, n ast.Node) {
+		ast.Inspect(n, func(n ast.Node) bool {
+			if sel, ok := n.(*ast.SelectorExpr); ok && sel.Sel.Name == "DeleteSecret" && !slices.Contains(found, caller) {
+				found = append(found, caller)
+			}
+			return true
+		})
+	}
+	fset := token.NewFileSet()
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return err
+		}
+		f, err := parser.ParseFile(fset, path, nil, parser.SkipObjectResolution)
+		if err != nil {
+			return err
+		}
+		dir := filepath.Base(filepath.Dir(path))
+		for _, decl := range f.Decls {
+			switch decl := decl.(type) {
+			case *ast.FuncDecl:
+				if decl.Body == nil {
+					continue
+				}
+				name := decl.Name.Name
+				if decl.Recv != nil && len(decl.Recv.List) == 1 {
+					rt := decl.Recv.List[0].Type
+					if star, ok := rt.(*ast.StarExpr); ok {
+						rt = star.X
+					}
+					if id, ok := rt.(*ast.Ident); ok {
+						name = id.Name + "." + name
+					}
+				}
+				note(dir+":"+name, decl.Body)
+			case *ast.GenDecl:
+				for _, spec := range decl.Specs {
+					vs, ok := spec.(*ast.ValueSpec)
+					if !ok {
+						continue
+					}
+					var names []string
+					for _, n := range vs.Names {
+						names = append(names, n.Name)
+					}
+					for i, v := range vs.Values {
+						name := strings.Join(names, ",")
+						if len(vs.Values) == len(vs.Names) {
+							name = names[i]
+						}
+						note(dir+":"+name, v)
+					}
+				}
+			}
+		}
+		return nil
+	})
+	slices.Sort(found)
+	return found, err
 }
 
 // TestApplyConflictSurfacesFieldConflicts: a 409 whose causes are

@@ -99,9 +99,13 @@ gcloud artifacts repositories add-iam-policy-binding "farcast-$INSTANCE" --locat
 ```
 The grant is on the one repository, not the project. Apply it now: the registry can take several minutes to honour it (the 5.1 walk measured nine and more), and S4–S6 give it that time before S7's first build.
 
+*(2026-11-20, [ADR 0023](../adr/0023-one-download-farcast.md) M2.8, built 2026-11-19 to 2026-11-20, not walked: the principal above is the one every FarCast instance in the project shares. `farcast build`'s and `farcast run`'s deploy plans now state the push grant. They print its commands when the grant is missing or unread, or the shared principal is still bound: an add for `farcast-builder`'s uid, then, while the repository still grants it, the remove of the shared principal. The uid member is [unverified] until the M2 walk. That ServiceAccount exists once `farcast kernel deploy` has run. The push grant is still never applied by farcast.)*
+
 **S4.** `farcast storage deploy`, and the bucket grant it prints; wait for the grant to propagate.
 
 *(2026-11-10: until the grant lands, the replicas crash-loop on a 403 for the bucket, and they start sealed within seconds of it. The printed grant uses `gcloud storage buckets add-iam-policy-binding`. A gcloud whose bundled Python cannot load the `storage` command group crashes before it changes anything; the walk's did, with `ssl.PROTOCOL_TLSv1` under Python 3.14. In that case, apply the same two bucket-level bindings through the Storage JSON API: GET `storage/v1/b/<bucket>/iam`, add `roles/storage.objectAdmin` and `roles/storage.legacyBucketReader` for the printed principal, and PUT the policy back with its `etag`.)*
+
+*(2026-11-20, [ADR 0023](../adr/0023-one-download-farcast.md) M2.8, built 2026-11-19 to 2026-11-20, not walked: the printed grant names the keyholder's ServiceAccount by its uid, [unverified] until the M2 walk. While the bucket still grants the principal every instance in the project shares, it then removes that one. `farcast storage deploy --grant-bucket` applies the grant itself, in one write of the bucket's IAM policy, after its own question in a terminal, or under `--confirm` of a plan made with it, which needs a granted reader, and never with `--yes`.)*
 - *Key pin created before the replicas:* `kubectl -n farcast-system get configmap datasphered-pin -o json` exists, its `pin` is `{"version":1,"require":[],"retired":[]}`, and it carries no scope name.
 - 3.2 c2/c3: no data endpoints while sealed; the status endpoint answers.
 - `farcast storage unseal` on the empty instance — *expect* "holding no application scopes: this instance has no applications yet" (5.3 c15).

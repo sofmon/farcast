@@ -169,8 +169,10 @@ func TestEveryWritingCommandHasAPlanRow(t *testing.T) {
 }
 
 // writeMethods are the methods of a seam that writes to a cluster: an apply,
-// the pin's create and replace, and migrate's rewrite (A30-26).
-var writeMethods = []string{"Apply", "CreateConfigMap", "ReplaceConfigMap", "PatchManagedFields"}
+// the pin's create and replace, migrate's rewrite (A30-26), and
+// git-credential rm's delete (ADR 0023 M2.8, design §33, A33-32, row 93d),
+// so a seam that only deletes is a writer too.
+var writeMethods = []string{"Apply", "CreateConfigMap", "ReplaceConfigMap", "PatchManagedFields", "DeleteSecret"}
 
 // productionWriters is every command farcast's router reaches, by the name
 // a command line gives it, each built by defaultRegistry and walked down
@@ -288,8 +290,9 @@ func refusingTypes(dir string) (map[string]bool, error) {
 // it. The writers are derived from farcast itself (productionWriters), never
 // listed: their names must be exactly writeCommands' names. The walk reaches
 // a seam held in an embedded fatlineDeployer (connect), in a named one
-// (kernel meter's deployer), and of a named func type (storage key pin's
-// pinStoreOpener). And every such command's type but migrateCommand has a
+// (kernel meter's deployer), of a named func type (storage key pin's
+// pinStoreOpener), and git-credential rm's, whose writer deletes (ADR 0023
+// M2.8, row 93d). And every such command's type but migrateCommand has a
 // method that calls refuseUnmigrated, while migrateCommand has none: migrate
 // never refuses an unmigrated instance, which is how one comes to be
 // recorded (A30-20).
@@ -308,10 +311,11 @@ func TestEveryProductionWriterIsAWriteCommand(t *testing.T) {
 		t.Errorf("the commands farcast's router reaches that write to a cluster are %q; writeCommands holds %q", got, want)
 	}
 	for name, seam := range map[string]string{
-		"kernel meter":    "deployer.newCluster",
-		"connect":         "fatlineDeployer.newCluster",
-		"storage key pin": "newPinStore",
-		"migrate":         "newCluster",
+		"kernel meter":      "deployer.newCluster",
+		"connect":           "fatlineDeployer.newCluster",
+		"storage key pin":   "newPinStore",
+		"migrate":           "newCluster",
+		"git-credential rm": "newCluster",
 	} {
 		if writers[name] != seam {
 			t.Errorf("%s writes through %q; want it found through %q", name, writers[name], seam)
@@ -399,10 +403,14 @@ func free() error        { return refuseUnmigrated("c") }
 // for A23-28's exceptions: kernel confirm's --amount, --from and --to bind
 // their resolved values, and kernel deploy's --adapt, --adapt-cooldown and
 // --interval bind "" when not given, their effective values being the
-// kernel_settings fact's.
+// kernel_settings fact's. And one pinned exemption (ADR 0023 M2.8, design
+// §33, A33-32, row 111a): git-credential set binds neither --username nor
+// --token-file, which supply the Secret's data, rendered in a plan from
+// placeholders, and no option of any plan names either.
 func TestEveryBehaviourFlagIsBound(t *testing.T) {
 	resolved := map[string][]string{"kernel confirm": {"amount", "from", "to"}}
 	emptyUnlessGiven := map[string][]string{"kernel deploy": {"adapt", "adapt-cooldown", "interval"}}
+	dataFlags := map[string][]string{"git-credential set": {"username", "token-file"}}
 	commands := consentCommands(t)
 	for _, row := range everyPlanShape(t) {
 		t.Run(row.String(), func(t *testing.T) {
@@ -410,13 +418,22 @@ func TestEveryBehaviourFlagIsBound(t *testing.T) {
 			if !ok {
 				t.Fatalf("%s is no command with a plan that farcast's router reaches", row.name)
 			}
-			want := behaviourFlags(c)
+			flags := behaviourFlags(c)
+			for _, f := range dataFlags[row.name] {
+				if !slices.Contains(flags, f) {
+					t.Errorf("%s registers no --%s; this test's exemption is stale", row.name, f)
+				}
+			}
+			want := slices.DeleteFunc(flags, func(f string) bool { return slices.Contains(dataFlags[row.name], f) })
 			_, dir := planFixture(t, row)
 			doc, _ := runPrintedPlan(t, dir, row, output.ModeJSON)
 			b := decodedBound(t, doc)
 			var got []string
 			for _, o := range b.Options {
 				got = append(got, o.Flag)
+				if slices.Contains(dataFlags["git-credential set"], o.Flag) {
+					t.Errorf("%s's plan binds --%s, which supplies a Git credential's data and is never bound", row, o.Flag)
+				}
 			}
 			slices.Sort(got)
 			if !slices.Equal(got, want) {

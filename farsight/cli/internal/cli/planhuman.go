@@ -183,6 +183,8 @@ func factLines(f plan.Fact, keys map[string]string, minted string) []string {
 		return migrateLines(f)
 	case plan.GrantFact:
 		return grantLines(f)
+	case plan.GitCredentialFact:
+		return []string{gitCredentialLine(f)}
 	}
 	return fallbackLines(f)
 }
@@ -298,6 +300,9 @@ func describeObject(kind, namespace, name string) string {
 
 func writeLine(f plan.WriteFact) string {
 	line := fmt.Sprintf("write: %s %s (%s)", terminalText(f.Method), describeObject(f.Kind, f.Namespace, f.Name), terminalText(f.API))
+	if f.Method == plan.WriteDelete {
+		return deleteLine(line, f)
+	}
 	switch {
 	case f.ResourceVersion != "":
 		line += ", at resourceVersion " + terminalText(f.ResourceVersion)
@@ -311,6 +316,41 @@ func writeLine(f plan.WriteFact) string {
 		force = "yes"
 	}
 	return line + ", force: " + force + ", sha256 " + terminalText(f.SHA256)
+}
+
+// deleteLine ends writeLine for a delete, git-credential rm's (ADR 0023
+// M2.8, design §33, A33-31): a delete writes no document, so the plan binds
+// no sha256 of one, and it is preconditioned on the uid its read finds after
+// consent. A resourceVersion or a sha256, which no plan's delete binds,
+// would still show.
+func deleteLine(line string, f plan.WriteFact) string {
+	line += ", on the uid read after consent"
+	if f.ResourceVersion != "" {
+		line += ", at resourceVersion " + terminalText(f.ResourceVersion)
+	}
+	force := "no"
+	if f.Force {
+		force = "yes"
+	}
+	line += ", force: " + force
+	if f.SHA256 != "" {
+		line += ", sha256 " + terminalText(f.SHA256)
+	}
+	return line
+}
+
+// gitCredentialLine is the git_credential fact (ADR 0023 M2.8, design §33,
+// A33-29): the action and the Secret, which the plan names by its namespace
+// and name alone.
+func gitCredentialLine(f plan.GitCredentialFact) string {
+	line := fmt.Sprintf("git credential: %s %s", terminalText(f.Action), describeObject("Secret", f.Namespace, f.Name))
+	switch f.Action {
+	case plan.GitCredentialSet:
+		line += "; its token is read only after consent, and the plan binds neither the username nor the token"
+	case plan.GitCredentialRm:
+		line += ", only if it is a Git credential farcast wrote"
+	}
+	return line
 }
 
 func mintLine(f plan.MintFact, minted string) string {

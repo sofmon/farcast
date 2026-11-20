@@ -9,11 +9,12 @@ import (
 	"github.com/sofmon/farcast/farsight/cli/internal/config"
 	"github.com/sofmon/farcast/farsight/cli/internal/image"
 	"github.com/sofmon/farcast/farsight/cli/internal/kube"
+	"github.com/sofmon/farcast/farsight/cli/internal/plan"
 	"github.com/sofmon/farcast/fatline/tunnel"
 	"github.com/sofmon/farcast/planck"
 )
 
-// Ten seams refuse in the package's tests when a test leaves them unset
+// Eleven seams refuse in the package's tests when a test leaves them unset
 // (ADR 0023 M2.6, A23-49, A25-20, M2.7 and M2.8): the provider opener of the
 // deployer, and, since M2.8, of build and run, which read the push grant
 // with it (design §33, A33-22); the image builder of the deployer commands,
@@ -30,14 +31,15 @@ import (
 // server's, the cluster a test started, and refuses any other record before
 // it is opened; and, since M2.8, storage deploy's opener of the bucket's
 // IAM, with the installer's key (openBucketGrantsDefault, design §33,
-// A33-14). Their defaults refuse here, as defaultPinStore's does
+// A33-14), and git-credential's writer (gitCredentialWriterDefault, A33-32),
+// loopback-only as migrate's is. Their defaults refuse here, as defaultPinStore's does
 // (storagepin_test.go), so no test reaches a real provider, registry,
 // carrier, cluster, bucket, bucket policy or keyholder, runs this machine's Go, or binds
 // the checkout it runs in, through these by forgetting a fake; a test that
 // drives a command past one sets the seam to a fake of its own, or, through
 // the router, takes fakeDeployDefaults. Other seams keep their real
 // defaults, and some commands open a provider, storage or a tunnel directly,
-// so this guard is no wider than the ten.
+// so this guard is no wider than the eleven.
 
 // errRefusingDefault is what a default seam answers in a test.
 var errRefusingDefault = errors.New("test: a seam was left at its default, which no test may reach; set it to a fake")
@@ -72,6 +74,16 @@ func init() {
 		}
 		return cl, nil
 	}
+	gitCredentialWriterDefault = func(r clusterRef) (gitCredentialCluster, error) {
+		if r.Meta == nil || !loopbackEndpoint(r.Meta.Endpoint) {
+			return nil, errRefusingDefault
+		}
+		cl, err := openWriter(r)
+		if err != nil {
+			return nil, err
+		}
+		return cl, nil
+	}
 }
 
 // refusingBuilder is the image builder a test gets by default: every call
@@ -92,8 +104,8 @@ func (refusingBuilder) PushEmbedded(context.Context, image.EmbeddedOptions, stri
 
 // TestUnsetSeamsRefuseInTests: every command whose provider, builder, dial,
 // checkout, Go, plan reader, storage mint, bucket IAM or keyholder seam is left unset
-// gets the refusing default, never the real one; and migrate's writer, left
-// unset, opens no cluster but a loopback test server's.
+// gets the refusing default, never the real one; and migrate's writer and
+// git-credential's, left unset, open no cluster but a loopback test server's.
 func TestUnsetSeamsRefuseInTests(t *testing.T) {
 	var d fatlineDeployer
 	d.ensureDefaults()
@@ -220,6 +232,18 @@ func TestUnsetSeamsRefuseInTests(t *testing.T) {
 		remote := &config.InstanceMetadata{Name: "atlas", Provider: "gke", Region: "us-central1", Endpoint: endpoint}
 		if w, err := mc.newCluster(clusterRef{Dir: config.Dir(empty), Meta: remote, Identity: kube.Writer}); !errors.Is(err, errRefusingDefault) || w != nil {
 			t.Errorf("migrate's default writer for endpoint %q = %v, %v; want the refusing default", endpoint, w, err)
+		}
+	}
+	// git-credential's (ADR 0023 M2.8, design §33, A33-32), the same way, for
+	// both its commands.
+	for _, action := range []string{plan.GitCredentialSet, plan.GitCredentialRm} {
+		gc := &gitCredentialCommand{action: action}
+		gc.ensureDefaults()
+		for _, endpoint := range []string{"192.0.2.10:443", ""} {
+			remote := &config.InstanceMetadata{Name: "atlas", Provider: "gke", Region: "us-central1", Endpoint: endpoint}
+			if w, err := gc.newCluster(clusterRef{Dir: config.Dir(empty), Meta: remote, Identity: kube.Writer}); !errors.Is(err, errRefusingDefault) || w != nil {
+				t.Errorf("git-credential %s's default writer for endpoint %q = %v, %v; want the refusing default", action, endpoint, w, err)
+			}
 		}
 	}
 }

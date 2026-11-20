@@ -82,6 +82,8 @@ gcloud projects add-iam-policy-binding "$PROJECT_ID" --member "serviceAccount:${
 > neither a Bucket nor an Object, so the first disjunct is true and the condition
 > allows it. Nothing here needs the fallback that warning described.
 
+*(2026-11-20, [ADR 0023](../adr/0023-one-download-farcast.md) M2.8, built 2026-11-19 to 2026-11-20, not walked: on the installer service account, this conditioned `roles/storage.admin` is also what `farcast storage deploy`'s read of a `farcast-*` bucket's IAM policy, and `--grant-bucket`'s write of it, run under.)*
+
 Download the key — this is the credential DataSphere will use:
 
 ```bash

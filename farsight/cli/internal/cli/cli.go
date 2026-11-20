@@ -252,6 +252,7 @@ func defaultRegistry() *Registry {
 	reg.Register(newKeeperCommand())
 	reg.Register(newKernelCommand())
 	reg.Register(newReaderCommand())
+	reg.Register(newGitCredentialCommand())
 	reg.Register(newStub("chat", "Terminal AI chat through AllThing", "6.2"))
 
 	return reg

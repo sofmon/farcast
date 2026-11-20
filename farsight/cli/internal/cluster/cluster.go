@@ -1,14 +1,16 @@
 // Package cluster is FarCast's operations on an instance's cluster: apply a
 // manifest stream, await a rollout, read a Service's external IP, read the
 // kernel's checkpoint and an application Deployment's state, create or
-// compare-and-replace the keyholder's key pin, and (ADR 0023 M2.7) the
-// migration's metadata reads and managed-fields patch. Every Client is built
-// by Open, as one of the instance's two identities, and works in-process
-// through internal/kube: the reader for the read commands and the plans, and
-// the writer for a writing command's reads and every write. Every write is a
-// server-side apply as farcast, except the pin's create and replace and the
-// migration's patch. It starts no program: kubectl, its allowlisted
-// environment and the Runner seam went in ADR 0023 M2.7.
+// compare-and-replace the keyholder's key pin, (ADR 0023 M2.7) the
+// migration's metadata reads and managed-fields patch, and (M2.8)
+// git-credential rm's delete of a Secret. Every Client is built by Open, as
+// one of the instance's two identities, and works in-process through
+// internal/kube: the reader for the read commands and the plans, and the
+// writer for a writing command's reads and every write. Every write is a
+// server-side apply as farcast, except the pin's create and replace, the
+// migration's patch, and git-credential rm's uid-preconditioned Secret
+// delete, which takes no field manager. It starts no program: kubectl, its
+// allowlisted environment and the Runner seam went in ADR 0023 M2.7.
 package cluster
 
 import (

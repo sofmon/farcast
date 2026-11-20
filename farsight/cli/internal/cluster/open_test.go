@@ -418,3 +418,68 @@ func TestAWritersConfigMapWritesWriteTheirWarnings(t *testing.T) {
 		t.Errorf("after a refused create: %q appended, want its own warning", got)
 	}
 }
+
+// ADR 0023 M2.8 (design §33, A33-31, row 122): DeleteSecret is the writer's
+// only. A reader client refuses it before anything is sent, its token
+// included, and the Secret stays. A writer deletes it on the uid it read: one
+// DELETE, as the writer, preconditioned on that uid, the warning its answer
+// carried written after it; a uid that is no longer the stored one is a 409
+// that unwraps to tkube.ErrConflict, and an absent Secret a 404.
+func TestDeleteSecretIsTheWritersOnly(t *testing.T) {
+	secrets, ok := kube.KindOf("v1", "Secret")
+	if !ok {
+		t.Fatal("no Secret kind")
+	}
+	const path = "/api/v1/namespaces/farcast-system/secrets/repo-git"
+	s := kubetest.New(t, kubetest.WithWarnings(func(r kubetest.Request) []string {
+		if r.Method == http.MethodDelete {
+			return []string{"deleted"}
+		}
+		return nil
+	}))
+	s.Put(map[string]any{"apiVersion": "v1", "kind": "Secret", "metadata": map[string]any{
+		"name": "repo-git", "namespace": "farcast-system", "uid": "00000000-0000-4000-8000-0000000000e1"}})
+	ctx := t.Context()
+
+	reader := openReader(t, s, nil)
+	if err := reader.DeleteSecret(ctx, "farcast-system", "repo-git", "00000000-0000-4000-8000-0000000000e1"); !errors.Is(err, errNeverWrites) {
+		t.Errorf("a reader's DeleteSecret = %v; want the reader's refusal", err)
+	}
+	if got := s.Requests(); len(got) != 0 {
+		t.Fatalf("the refused delete sent %d requests, the token's included", len(got))
+	}
+
+	var w bytes.Buffer
+	writer := openWriter(t, s, &w)
+	if _, err := writer.GetMeta(ctx, secrets, "farcast-system", "repo-git"); err != nil {
+		t.Fatalf("the Secret is gone after a reader's refused delete: %v", err)
+	}
+	if err := writer.DeleteSecret(ctx, "farcast-system", "repo-git", "00000000-0000-4000-8000-0000000000e2"); !errors.Is(err, tkube.ErrConflict) {
+		t.Errorf("a delete on another uid = %v; want tkube.ErrConflict", err)
+	}
+	if err := writer.DeleteSecret(ctx, "farcast-system", "repo-git", "00000000-0000-4000-8000-0000000000e1"); err != nil {
+		t.Fatalf("the writer's delete on the uid it read: %v", err)
+	}
+	var deletes []kubetest.Request
+	for _, r := range apiRequests(s) {
+		if r.As != "writer" {
+			t.Errorf("%s %s was sent as %q, not the writer", r.Method, r.Path, r.As)
+		}
+		if r.Method == http.MethodDelete {
+			deletes = append(deletes, r)
+		}
+	}
+	const body = `{"apiVersion":"v1","kind":"DeleteOptions","preconditions":{"uid":"00000000-0000-4000-8000-0000000000e1"}}`
+	if len(deletes) != 2 || deletes[1].Path != path || deletes[1].RawQuery != "" || string(deletes[1].Body) != body {
+		t.Errorf("the deletes sent: %+v; want two, the last %s with no query and %s", deletes, path, body)
+	}
+	if got := w.String(); got != "Warning (cluster): deleted\n" {
+		t.Errorf("the deletes' warnings: %q, want the one text once", got)
+	}
+	if _, err := writer.GetMeta(ctx, secrets, "farcast-system", "repo-git"); !errors.Is(err, tkube.ErrNotFound) {
+		t.Errorf("after the delete, the Secret's read = %v; want tkube.ErrNotFound", err)
+	}
+	if err := writer.DeleteSecret(ctx, "farcast-system", "repo-git", "00000000-0000-4000-8000-0000000000e1"); !errors.Is(err, tkube.ErrNotFound) {
+		t.Errorf("a delete of an absent Secret = %v; want tkube.ErrNotFound", err)
+	}
+}

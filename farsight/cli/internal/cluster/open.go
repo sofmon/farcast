@@ -30,11 +30,12 @@ var errNeverWrites = errors.New("cluster: a reader client never writes")
 // before the client is built, with nothing sent.
 //
 // Either identity answers every read, CanI and NamespaceUID in-process. A
-// reader refuses Apply, CreateConfigMap, ReplaceConfigMap and
-// PatchManagedFields before anything is sent; since ADR 0023 M2.4 it is how
-// 'world', 'ps', 'costs', 'usage' and 'logs' read the cluster. A writer
-// applies, creates and replaces a ConfigMap (the storage key pin), and
-// patches managed fields (migrate), all of it as cfg's credential, the
+// reader refuses Apply, CreateConfigMap, ReplaceConfigMap,
+// PatchManagedFields and DeleteSecret before anything is sent; since ADR
+// 0023 M2.4 it is how 'world', 'ps', 'costs', 'usage' and 'logs' read the
+// cluster. A writer applies, creates and replaces a ConfigMap (the storage
+// key pin), patches managed fields (migrate), and deletes a Secret on its
+// uid (git-credential rm, M2.8), all of it as cfg's credential, the
 // instance's stored installer key.
 //
 // warnings receives each distinct API Warning header text, once, as
@@ -147,6 +148,27 @@ func (c *Client) PatchManagedFields(ctx context.Context, k kube.Kind, namespace,
 	}
 	blankLastApplied(&o)
 	return o, nil
+}
+
+// DeleteSecret deletes the Secret namespace/name, preconditioned on its uid:
+// kube.Client.DeleteSecret, with the warnings its answer carried written
+// after it (ADR 0023 M2.8, design §33, A33-31). It is git-credential rm's
+// only, the one delete farcast makes, of a Git credential it wrote, by the
+// uid it read. A reader client refuses it before anything is sent, a token
+// included. A uid that is no longer the stored one is a 409 that unwraps to
+// tkube.ErrConflict, and nothing is deleted; an absent Secret is a 404 that
+// unwraps to tkube.ErrNotFound. It is not an apply: a DELETE takes no field
+// manager. It is never retried on 429 or 503. A 401 is sent once more with a
+// fresh token, as every call is (§3.4): the server refuses a 401 before
+// processing the call [inf], and the second DELETE is preconditioned on the
+// same uid.
+func (c *Client) DeleteSecret(ctx context.Context, namespace, name, uid string) error {
+	if err := c.neverWrites(); err != nil {
+		return err
+	}
+	err := c.kube.DeleteSecret(ctx, namespace, name, uid)
+	c.flushWarnings()
+	return err
 }
 
 // neverWrites refuses a write on a reader client before anything is sent. It

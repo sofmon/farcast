@@ -246,6 +246,7 @@ func factSamples() map[string]Fact {
 		"NoticeFact":           NoticeFact{},
 		"MigrateFact":          MigrateFact{},
 		"GrantFact":            GrantFact{},
+		"GitCredentialFact":    GitCredentialFact{},
 	}
 }
 
@@ -334,8 +335,8 @@ func TestFactTypesAreCanonical(t *testing.T) {
 	if declared := factTypesDeclared(t); !reflect.DeepEqual(declared, sampled) {
 		t.Fatalf("the fact types declared are\n  %v\nbut the samples are\n  %v", declared, sampled)
 	}
-	if len(sampled) != 19 {
-		t.Errorf("ADR 0023 M2.8 has 19 fact types, not %d", len(sampled))
+	if len(sampled) != 20 {
+		t.Errorf("ADR 0023 M2.8 has 20 fact types, not %d", len(sampled))
 	}
 
 	seen := map[reflect.Type]bool{}
@@ -388,8 +389,8 @@ func jsonPaths(typ reflect.Type, prefix string) []string {
 
 func TestFactFieldsFollowTheFactTable(t *testing.T) {
 	// §9.4's fact table as A23-33 amends it, with A30-12's migrate fact,
-	// A33-11's grant fact and A33-16's service_accounts, and §9.3's Bound
-	// and Document.
+	// A33-11's grant fact, A33-16's service_accounts and A33-29's
+	// git_credential fact, and §9.3's Bound and Document.
 	want := map[string]string{
 		TypeCost: "type currency period limit_cents " +
 			"standing standing[].what standing[].replicas standing[].cpu_milli standing[].mem_mib standing[].month_cents standing[].max_month_cents " +
@@ -418,7 +419,8 @@ func TestFactFieldsFollowTheFactTable(t *testing.T) {
 		TypeNotice: "type text",
 		TypeMigrate: "type objects objects[].api objects[].kind objects[].namespace objects[].name objects[].uid " +
 			"objects[].csa_managers objects[].csa_fields_sha256 objects[].annotation objects[].other_managers local irreversible",
-		TypeGrant: "type name target service_account principal roles state shared_principal shared apply",
+		TypeGrant:         "type name target service_account principal roles state shared_principal shared apply",
+		TypeGitCredential: "type action namespace name",
 	}
 	samples := factSamples()
 	if len(samples) != len(want) {

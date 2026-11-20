@@ -24,6 +24,7 @@ Everything below was designed against fakes and rendered YAML. The claims that m
 - *(2026-11-15, [ADR 0023](../adr/0023-one-download-farcast.md) M2.5: `run`'s cluster reads, and its raise of the storage key pin, now run in-process as the instance's installer service account, from the key `install --credentials` stored in `credentials.yaml`. Its applies still use kubectl as the gcloud session above until M2.7, so a re-walk needs both. Not yet walked. The results below are not rewritten.)*
 - *(2026-11-16: ADR 0023's [M2 probe walk](adr-0023-m2-probe-walk.md) found that GKE's DNS endpoint refuses farcast's cluster token, scoped to `userinfo.email` alone. So at 2482810 `ps`, `logs` and `costs` are refused against GKE, and so are `run`'s cluster reads and its raise of the storage key pin. A re-walk could not pass until `cloud-platform` came back. That fix was built later on 2026-11-16 and is not walked: every cluster token now carries `cloud-platform` and `userinfo.email`, so a leaked one works for every Google API the account's IAM allows, not only the cluster.)*
 - *(2026-11-18, [ADR 0023](../adr/0023-one-download-farcast.md) M2.7, built, not walked: `run`'s applies run in-process too, as the instance's installer service account, so a re-walk needs no gcloud session for farcast. An instance an older farcast wrote must first be migrated: `farcast migrate`.)*
+- *(2026-11-20, [ADR 0023](../adr/0023-one-download-farcast.md) M2.8, built 2026-11-19 to 2026-11-20, not walked: the push grant the 4.2 runbook applied names the principal every FarCast instance in the project shares. Since M2.8 the grant names the builder's ServiceAccount, `farcast-system/farcast-builder`, by its uid, which exists once `farcast kernel deploy` has created the account. `run` still does not apply it. Its deploy plan reads the repository's IAM policy with the installer's key, and the review prints the commands when the policy does not hold the uid principal or cannot be read, or still grants the shared one: the add of the uid binding where it is missing, then, while the shared principal is still bound, a wait for IAM and the remove of the shared binding, or the remove alone once the uid binding is there, `gcloud artifacts repositories remove-iam-policy-binding 'farcast-<instance>' --project '<project>' --location '<location>' --member '<shared principal>' --role 'roles/artifactregistry.writer' --condition=None`. Where the policy cannot be read, both commands print, each under its condition. Under `--confirm`, `run` reads the builder's ServiceAccount as the instance's reader, so there a reader granted before M2.8 needs `farcast reader grant` once more. That a repository honours a grant to the uid is [unverified] until the M2 walk.)*
 - The repository is this one, `github.com/sofmon/farcast`, and it is public, so no Git credential is involved. Step 10 covers the private case and is optional.
 
 ## 0. Set shared variables
@@ -214,6 +215,20 @@ kubectl -n "$NS" create secret generic my-repo-git \
   --from-literal=username=<user> --from-literal=token=<read-only PAT>
 
 farcast run "$INSTANCE" github.com/<you>/<private-repo> --git-secret my-repo-git
+```
+
+*(2026-11-20, [ADR 0023](../adr/0023-one-download-farcast.md) M2.8, built 2026-11-20, not walked: in place of `kubectl create secret generic … --from-literal`, `farcast git-credential set` writes the same Secret, `farcast-system/my-repo-git` with the keys `username` and `token`. It never takes the token from argv, and refuses `--token-file -` where stdin is a terminal, and a `--token-file` that names a character device, such as a terminal. It also refuses a run with no terminal and neither `--plan` nor `--confirm`, and `--yes`. Its two working forms follow. The `--plan` form takes `--token-file -` too, which it does not read, so its confirm line is the command the token is piped to.)*
+
+```bash
+# In a terminal, one line at a time: a file only you can read, the token put in it, removed afterwards.
+( umask 077 && touch ./my-repo-git.token )
+# Put the token into ./my-repo-git.token with an editor, never with echo or on a command line.
+farcast git-credential set "$INSTANCE" --name my-repo-git --username <user> --token-file ./my-repo-git.token
+rm ./my-repo-git.token
+
+# Without a prompt: the plan, then the token piped to its --confirm.
+farcast git-credential set "$INSTANCE" --name my-repo-git --username <user> --token-file - --plan
+printf '%s' "$TOKEN" | farcast git-credential set "$INSTANCE" --name my-repo-git --username <user> --token-file - --confirm <digest>
 ```
 
 Expected: the same flow. One Secret serves both the read and the build.

@@ -60,6 +60,8 @@ Expect two pods on **different nodes** (the hostname topology spread), a PodDisr
 
 The keyholder reads and writes the bucket under its *own* cloud identity — a dedicated `datasphered` ServiceAccount resolved through Workload Identity, with no token mounted. FarCast does not create the binding: granting it needs permission to change a bucket's IAM, which the operator's credential is not required to carry and which the CLI deliberately never asks for. `storage deploy` prints the exact commands; run them once per instance.
 
+*(2026-11-20, [ADR 0023](../adr/0023-one-download-farcast.md) M2.8, built 2026-11-19 to 2026-11-20, not walked: "deliberately never asks for" held until M2.8. `farcast storage deploy --grant-bucket` now applies the grant itself, under `--confirm` of a plan made with it, which reads as the instance's reader `farcast reader grant` must have verified, or after its own question in a terminal, and never with `--yes`. It grants both roles to the keyholder's ServiceAccount by its uid, and removes from them, in the same policy write, the shared principal the block below names, which every FarCast instance in the project shares. Without the flag, `storage deploy` prints the commands before any replica starts, with the project number and the uid already in them; the block below is no longer what it prints. That a bucket honours a grant to the uid is [unverified] until the M2 walk. [The CLI README](../../farsight/cli/README.md#farcast-storage-deploy--where-the-keyholders-image-comes-from) has the rest.)*
+
 ```bash
 PROJNUM=$(gcloud projects describe "$PROJECT" --format='value(projectNumber)')
 PRINCIPAL="principal://iam.googleapis.com/projects/$PROJNUM/locations/global/workloadIdentityPools/$PROJECT.svc.id.goog/subject/ns/$NS/sa/datasphered"

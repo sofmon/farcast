@@ -7,8 +7,8 @@ package plan
 // Money is integer cents, CPU integer millicores, memory integer MiB, and a
 // time a string written by Time.
 //
-// M2.7 added MigrateFact (A30-12); M2.8 added GrantFact (design §33, A33-11),
-// and adds GitCredentialFact.
+// M2.7 added MigrateFact (A30-12); M2.8 added GrantFact (design §33, A33-11)
+// and GitCredentialFact (A33-29).
 
 // The type words, one per fact type.
 const (
@@ -31,6 +31,7 @@ const (
 	TypeNotice           = "notice"
 	TypeMigrate          = "migrate"
 	TypeGrant            = "grant"
+	TypeGitCredential    = "git_credential"
 )
 
 // ------------------------------------------------------------------ cost
@@ -147,16 +148,21 @@ type WriteFact struct {
 	Kind      string `json:"kind"`
 	Namespace string `json:"namespace"`
 	Name      string `json:"name"`
-	// Method is one of the Write* constants.
+	// Method is one of the Write* constants. WriteDelete is git-credential
+	// rm's delete of a Secret (ADR 0023 M2.8, design §33, A33-31): it writes
+	// no document, so its SHA256 and its ResourceVersion are "", and it is
+	// preconditioned on the uid its read finds after consent, which no plan
+	// binds.
 	Method string `json:"method"`
 	// Force is true for every apply since ADR 0023 M2.7; false for the pin's
-	// create and replace, which are not applies.
+	// create and replace and git-credential rm's delete, which are not
+	// applies.
 	Force bool `json:"force"`
 	// ResourceVersion is "" except for a replace, and for the documents whose
 	// content depends on what the cluster holds.
 	ResourceVersion string `json:"resource_version"`
 	// SHA256 is the lowercase hex SHA-256 of the document as the plan renders
-	// it, placeholders included.
+	// it, placeholders included; "" for a delete.
 	SHA256 string `json:"sha256"`
 }
 
@@ -584,4 +590,26 @@ const (
 	GrantPresent = "present"
 	GrantMissing = "missing"
 	GrantUnknown = "unknown"
+)
+
+// ------------------------------------------------------------------ git_credential
+
+// GitCredentialFact is the Git credential farcast git-credential writes or
+// deletes (ADR 0023 M2.8, design §33, A33-29): the Secret, by its namespace
+// and name alone. It never holds the username or the token, nor any hash of
+// either.
+type GitCredentialFact struct {
+	Type string `json:"type"`
+	// Action is GitCredentialSet or GitCredentialRm.
+	Action    string `json:"action"`
+	Namespace string `json:"namespace"`
+	Name      string `json:"name"`
+}
+
+func (GitCredentialFact) FactType() string { return TypeGitCredential }
+
+// The git-credential actions.
+const (
+	GitCredentialSet = "set"
+	GitCredentialRm  = "rm"
 )

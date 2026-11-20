@@ -41,7 +41,7 @@ import (
 // the command calls. A rendered stringData, an unknown kind, a missing
 // namespace or a YAML anchor fails the build.
 //
-// Thirteen places apply a stream today, and this table covers each:
+// Fourteen places apply a stream today, and this table covers each:
 //   - connect and redeploy: renderWorkload, on both carriers, with and
 //     without Shrike;
 //   - kernel deploy: kernelManifests, TechnoCore's workload and the seed,
@@ -53,7 +53,8 @@ import (
 //   - kernel confirm: the confirmations ConfigMap;
 //   - storage deploy: the keyholder's workload;
 //   - run: the egress policy, then the workloads with and without storage;
-//   - run and build: the build Job; run: the fetch Job.
+//   - run and build: the build Job; run: the fetch Job;
+//   - git-credential set: the Git credential's Secret (ADR 0023 M2.8).
 //
 // Beside this table, every stream an existing command test applies through a
 // fake cluster is checked too (checkApplied, and TestMain), so a composition
@@ -495,6 +496,12 @@ func renderedStreams(t *testing.T) []renderedStream {
 		})
 		add(fmt.Sprintf("fetch gitSecret=%t", secret != ""), b, err)
 	}
+
+	// git-credential set: the Git credential's Secret, as its plan renders
+	// it, from the placeholders (ADR 0023 M2.8, design §33, A33-29).
+	user, token := gitCredentialPlaceholders("repo-git")
+	b, err = renderGitCredential("repo-git", user, token)
+	add("git-credential", b, err, "Secret "+gitCredentialNamespace+"/repo-git")
 	return out
 }
 
