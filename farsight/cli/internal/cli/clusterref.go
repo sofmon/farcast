@@ -255,8 +255,10 @@ func derivedReader(email, name, project string, mode kube.Mode) (derived string,
 }
 
 // msgReaderIAMRefused is what a 403 the reader met at the cluster's endpoint,
-// rather than in Kubernetes' RBAC, says to do (design §8.1). What an IAM
-// refusal looks like on the wire is not walked; the probe walk pins it.
+// rather than in Kubernetes' RBAC, says to do (design §8.1). The 2026-11-16
+// probe walk saw the endpoint's IAM refusal as a 403 whose body is an HTML
+// page, not a Kubernetes Status, as forbiddenByRBAC tells it (design A22-4).
+// That was for an account holding no role; no reader could be set up there.
 const msgReaderIAMRefused = "the cluster's endpoint refused the identity (IAM); if the reader was just set up, IAM changes can take 7 minutes or longer, otherwise check the Cloud Shell step"
 
 // readerRefused is err with one sentence appended when the cluster refused
@@ -320,9 +322,11 @@ func planRead(m consentMode, err error, name string) error {
 // included, is returned as it is, and so is any error when meta is nil (a
 // command that failed before it read the record reached no cluster), and any
 // a plan's reader met (readerPhaseError), which says whose it was already.
-// What an IAM refusal looks like on the wire is not walked; the probe walk
-// pins it. Since ADR 0023 M2.7 an apply's 403 carries tkube.ErrForbidden, so
-// the writer's sentence applies to applies too.
+// The 2026-11-16 probe walk saw the endpoint's IAM refusal, for an account
+// holding no role, as a 403 whose body is an HTML page, not a Status (design
+// A22-4); the installer's own IAM refusal was not seen. Since ADR 0023 M2.7
+// an apply's 403 carries tkube.ErrForbidden, so the writer's sentence applies
+// to applies too.
 func writerRefused(err error, meta *config.InstanceMetadata) error {
 	// A plan's reader met it, and readerPhase already said whose it was.
 	var reader *readerPhaseError

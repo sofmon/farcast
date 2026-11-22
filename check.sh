@@ -317,8 +317,9 @@ step "6 — go test -race"
 # The timeout is per test binary, against a hung test, not a speed budget.
 # The farsight/cli/internal/cli package runs its tests one after another,
 # because they swap package-level seams, and under -race it takes about ten
-# minutes: 576 s at ADR 0023 M2.8's step 0 and 609 s at M2.8a on the dev Mac,
-# with other work running. That is past go test's 10-minute default.
+# to eleven minutes on the dev Mac, with other work running: 576 s at ADR 0023
+# M2.8's step 0, 609 s at M2.8a, 651 s to 676 s at M2.8b and 663 s at M2.9a's
+# step 1. That is past go test's 10-minute default.
 go test -mod=vendor -race -timeout 30m ./...
 ok "root"
 (cd sdk/go && go test -race ./...)

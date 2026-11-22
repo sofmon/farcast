@@ -129,7 +129,7 @@ Unit tests pin:
 - release's report;
 - the kinds an application deployment renders.
 
-Live verification is deferred to the next walk. Before it spends anything, confirm that the project has no GKE Enterprise enablement and no fleet registration, because a control-plane default would fail install by design. Also record the project's effective Data Access audit configuration, including what it inherits.
+Live verification is deferred to the next walk. Before it spends anything, confirm that the project has no GKE Enterprise enablement and no fleet registration, because a control-plane default would fail install by design. Also record the project's effective Data Access audit configuration, including what it inherits. *(2026-11-22, [ADR 0023](0023-one-download-farcast.md) M2.9b: the runbook of ADR 0023's M2 walk, [adr-0023-m2-walk.md](../runbooks/adr-0023-m2-walk.md), written and not run, records this precondition and the Data Access audit configuration in its baseline, and offers this section's checklist as an optional step, W5.3, which the operator takes or leaves before the walk.)*
 
 After any application has logged:
 1. Read back the cluster's logging and monitoring config. Logging must be SYSTEM_COMPONENTS only. Record monitoring as found. It is expected to list GKE's packages (decision 3), and it is not enforced. Also confirm that a kube state series exists for a `datasphered` replica, for example its container readiness. That shows the 24-month disclosure rather than inferring it.

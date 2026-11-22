@@ -271,8 +271,8 @@ func imageLines(f plan.ImageFact) []string {
 // describeObject names one cluster object as an operator reads it: <Kind>
 // <namespace>/<name>, or <Kind> <name> for a cluster-scoped one (namespace
 // ""), each through terminalText, since the namespace and the name may be the
-// server's. A write's object and a Git credential's Secret are named by it
-// (A30-13).
+// server's. A write's object and a Git credential's Secret are named by it.
+// A30-13 defined it for migrate's fact, which M2.9a removed (design A37-12).
 func describeObject(kind, namespace, name string) string {
 	obj := terminalText(name)
 	if namespace != "" {

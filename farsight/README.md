@@ -8,4 +8,4 @@ FarSight is the UX layer of FarCast. It is one product called "farcast" with thr
 - **cli/** — Go command line interface for operators and automation
 - **server/** — Go server running inside the FarCast instance that keeps the tile registry, sessions and layout state
 
-The CLI is specified and implemented through Phase 2.3 (`install`, `release`, `connect`, `redeploy`) — see [`cli/README.md`](cli/README.md). The client (native, Phase 7, [ADR 0021](../docs/adr/0021-farsight-native-client.md)) and server components are scaffold-only. Their specifications will follow.
+The CLI is specified and implemented as [`cli/README.md`](cli/README.md) records. The client (native, Phase 7, [ADR 0021](../docs/adr/0021-farsight-native-client.md)) and server components are scaffold-only. Their specifications will follow.

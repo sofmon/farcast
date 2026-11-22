@@ -83,13 +83,16 @@ type readerReview struct {
 
 // readerReviews are the five SelfSubjectAccessReviews 'reader grant' makes as
 // the reader, each of which must answer allowed: false. GKE allows what
-// either IAM or RBAC grants, so an IAM role stronger than clusterViewer,
-// edited into the Cloud Shell paste, shows here if it can do one of these, and
-// if GKE's reviews consult IAM as well as RBAC (not yet walked): write a
-// Deployment or its scale, read a Secret, or read beyond the reader's RBAC,
-// sampled by listing pods in kube-system, where no farcast RBAC ever binds the
-// reader. They sample; a role whose only extra powers are others, such as
-// pods/exec or serviceaccounts/token, does not show here.
+// either IAM or RBAC grants, and its reviews consult IAM: in the 2026-11-16
+// probe walk an account holding roles/container.developer and no RBAC was
+// allowed by its review, "access granted by IAM permissions" (design A22-4).
+// No review was run as a reader there. So an IAM role stronger than
+// clusterViewer, edited into the Cloud Shell paste, shows here if it can do
+// one of these: write a Deployment or its scale, read a Secret, or read
+// beyond the reader's RBAC, sampled by listing pods in kube-system, where no
+// farcast RBAC ever binds the reader. They sample; a role whose only extra
+// powers are others, such as pods/exec or serviceaccounts/token, does not
+// show here.
 var readerReviews = []readerReview{
 	{"create deployments in " + tcdeploy.DefaultNamespace, readerCanWrite,
 		kube.ResourceAttributes{Namespace: tcdeploy.DefaultNamespace, Verb: "create", Group: "apps", Resource: "deployments"}},

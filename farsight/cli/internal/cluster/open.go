@@ -87,9 +87,10 @@ func (c *Client) NamespaceUID(ctx context.Context, name string) (string, error) 
 const lastAppliedAnnotation = "kubectl.kubernetes.io/last-applied-configuration"
 
 // blankLastApplied keeps the last-applied annotation's key on o and empties
-// its value (ADR 0023 §6.4). No caller reads the annotation. A Secret anyone
-// applied with kubectl carries its data in that value, and the blank keeps
-// it out of what a caller prints or binds.
+// its value. ADR 0023 M2.7 made it for the migration (design §6.4), and
+// M2.9a kept it when it removed the migration (design A37-7). No caller
+// reads the annotation. A Secret anyone applied with kubectl carries its data
+// in that value, and the blank keeps it out of what a caller prints or binds.
 func blankLastApplied(o *kube.Object) {
 	if _, ok := o.Metadata.Annotations[lastAppliedAnnotation]; ok {
 		o.Metadata.Annotations[lastAppliedAnnotation] = ""

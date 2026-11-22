@@ -413,7 +413,8 @@ const (
 	settledIngressIP = "203.0.113.10"
 
 	// The labels the API server's Job defaulting gives a Job created with no
-	// selector, and its template [unverified; design A30-10].
+	// selector, and its template (design A30-10) [seen on an envtest
+	// kube-apiserver 1.36.2 on 2026-11-18, design §31; not on Autopilot].
 	jobControllerUID = "batch.kubernetes.io/controller-uid"
 	jobName          = "batch.kubernetes.io/job-name"
 	legacyJobUID     = "controller-uid"

@@ -110,8 +110,11 @@ type stored struct {
 var serverSetMetadata = []string{"uid", "resourceVersion", "creationTimestamp", "managedFields", "generation", "deletionTimestamp", "selfLink"}
 
 // generationKinds are the kinds whose metadata.generation the server keeps
-// and moves when their spec changes [unverified, from memory of the
-// Kubernetes registry strategies; the rollout rules read it on Deployments].
+// and moves when their spec changes. On an envtest kube-apiserver 1.36.2 on
+// 2026-11-18 (design §31), Deployments, StatefulSets, Jobs and
+// NetworkPolicies carried one, and Services and Secrets none.
+// PodDisruptionBudget's is [unverified, from memory of the Kubernetes
+// registry strategies]. The rollout rules read it on Deployments.
 var generationKinds = map[string]bool{"Deployment": true, "StatefulSet": true, "Job": true, "PodDisruptionBudget": true, "NetworkPolicy": true}
 
 // Put seeds an object (JSON-marshalled).

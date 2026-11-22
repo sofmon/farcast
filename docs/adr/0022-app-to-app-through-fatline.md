@@ -35,7 +35,7 @@ Reading the code to ground that decision turned up three things.
 
 - **The caller's identity at FatLine.** Each application presents its own 256-bit credential in `FARCAST_FATLINE_PROXY`, and FatLine names it on every decision ([ADR 0013](0013-per-application-egress-identity.md) decisions 1, 6 and 7).
 - **The callee's identity end to end.** `farcast run` already mints a per-application leaf, `farcast://<instance>/app/<namespace>/<name>`, from the operator-held CA, and delivers it in the application's own Secret ([ADR 0018](0018-thin-device-storage.md) decisions 1 and 6; `identity.IssueAppClient`). Today it is a client leaf, and only when storage is wired.
-- **One port per application.** Planck assumes every application serves on `DefaultPort` (8080) and publishes a ClusterIP Service on it ([`planck/translate/translate.go:84`](../../planck/translate/translate.go)). The manifest names no port and does not need to.
+- **One port per application.** Planck assumes every application serves on `DefaultPort` (8080) and publishes a ClusterIP Service on it ([`DefaultPort`, `planck/translate/translate.go`](../../planck/translate/translate.go)). The manifest names no port and does not need to.
 - **A proxy that copies and does not read.** The CONNECT path tunnels opaquely, peeks the ClientHello for SNI, and emits one event per decision with byte counts and connection timings ([ADR 0015](0015-what-the-boundary-can-measure.md)).
 - **A monitor that keys by application.** Shrike's tables are per application, and a separate table already exists for traffic that is not egress, the tunnel streams, split off by `Proto` ([ADR 0015](0015-what-the-boundary-can-measure.md) decision 7).
 

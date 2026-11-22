@@ -256,8 +256,10 @@ func WithoutRecording() Option {
 //   - a Service of type LoadBalancer with no ingress gets
 //     status.loadBalancer.ingress [{ip: 203.0.113.10}] (RFC 5737);
 //   - a Job created with no spec.selector gets the API server's own default
-//     [unverified; the real-API suite's TestReapplyingAnUnchangedJobIsANoOp
-//     records it]: spec.selector.matchLabels
+//     [seen on an envtest kube-apiserver 1.36.2 on 2026-11-18, by the real-API
+//     suite's TestReapplyingAnUnchangedJobIsANoOp (design §31): the selector
+//     key and the four template labels; that the selector's value is the
+//     Job's uid is inferred; not seen on Autopilot]: spec.selector.matchLabels
 //     {batch.kubernetes.io/controller-uid: <its uid>}, and the template labels
 //     batch.kubernetes.io/controller-uid, batch.kubernetes.io/job-name,
 //     controller-uid and job-name; an apply to a stored Job keeps the stored

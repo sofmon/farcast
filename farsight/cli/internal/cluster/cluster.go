@@ -4,12 +4,14 @@
 // compare-and-replace the keyholder's key pin, and (ADR 0023 M2.8) read one
 // object's metadata and delete git-credential rm's Secret. Every Client is
 // built by Open, as one of the instance's two identities, and works
-// in-process through internal/kube: the reader for the read commands and the
-// plans, and the writer for a writing command's reads and every write. Every
-// write is a server-side apply as farcast, except the pin's create and
-// replace, and git-credential rm's uid-preconditioned Secret delete, which
-// takes no field manager. It starts no program: kubectl, its allowlisted
-// environment and the Runner seam went in ADR 0023 M2.7.
+// in-process through internal/kube: the reader for the read commands, for
+// reader grant's check, and for a plan's reads under --plan and --confirm;
+// the writer for a writing command's other reads, an interactive or --yes
+// run's plan among them, and every write. Every write is a server-side apply
+// as farcast, except the pin's create and replace, and git-credential rm's
+// uid-preconditioned Secret delete, which takes no field manager. It starts
+// no program: kubectl, its allowlisted environment and the Runner seam went
+// in ADR 0023 M2.7.
 package cluster
 
 import (
@@ -45,8 +47,11 @@ type Client struct {
 // design §5.3): the stream is split and checked by kube.SplitStream, and each
 // document is sent as its own forced server-side apply (kube.Client.Apply,
 // force=true, as fieldManager farcast), in stream order, the warnings each
-// answer carried written after it. It is idempotent: re-applying an
-// unchanged document changes nothing.
+// answer carried written after it. Re-applying an unchanged document is
+// meant to change nothing: on an envtest kube-apiserver 1.36.2 on
+// 2026-11-19, every stream rendered on M2.7b's tree, before its commit,
+// applied twice with nothing moved (docs/runbooks/adr-0023-m2-realapi.md,
+// Run 2). Under Autopilot's admission it is not walked.
 //
 // A reader client refuses it before anything is sent, and so does a stream
 // SplitStream refuses or one that holds no document. Apply stops at the first

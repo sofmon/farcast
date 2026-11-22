@@ -8612,3 +8612,624 @@ S1 to S3 are the safety review's mutants. 208 and 209 are the last skeptic's. Ro
 - **The full `./check.sh`** has not run on any M2.9a tree. The `cli` package ran under `-race` once, at step 1 (663 s), before the wire step and the review's fixes, and without `-race` after them (296 s and 285 s). `check.sh`'s step 7 ran through a scratch copy of its lines on the tree before the review, and passed: 306 FarSightKit tests on `swift test` and on both `xcodebuild test` destinations. The fixes after it change no Swift file and no vector. After the last fix, `go build`, `go vet` with and without the tags, `golangci-lint` (0 issues), the pinned `gofmt -l` of kube and kube's tests under `-race` passed.
 
 The full `./check.sh` is run on the final tree before the commit, and its result is in the commit message.
+
+## 39. Decided before M2.9b's build (2026-11-22)
+
+M2.9b was mapped against the code at 9d97958, M2.9a's commit, on a clean tree, by a workflow of three read-only lanes and a critic. The lanes were the records, the code comments and the walk's outline. The critic checked every item at HEAD. Of the lanes' 72 items it kept 41, amended 10 and dropped 21. It also made 17 corrections to the outline, found 3 missing items and put 11 questions. The original M2.9 plan, made 2026-11-20 before M2.9a, was read only for what §37 left standing: everything in it about `migrate`, the older instance, W0 and W2 is gone. The raw maps are working files that are not kept. This section wins over §0–§38 wherever it differs. Where it is silent, the earlier sections govern, and a lane's proposal is advice, not a decision.
+
+Line numbers are at 9d97958. Builders find each site by the text quoted here and confirm the line. In the bold leads, **Rn** is the records lane's n-th item, **Cn** and **Nn** the code lane's, and the critic's verdict on each is keep, amend or drop. The operator decided nothing for M2.9b beyond starting it. The questions are in A39-28, each with the default the build follows until the operator answers.
+
+### Decided by the orchestrator on 2026-11-22
+
+**A39-1: the dates.**
+- M2.9b's records say "built 2026-11-22". The walk's runbook says "written 2026-11-22, not run".
+- A rider M2.9b writes is dated 2026-11-22, also when it states an M2.9a fact. It dates the fact inside: "since M2.9a, built 2026-11-20 and not walked". *Why:* a note dated 2026-11-20 would read as if M2.9a's commit wrote it (the critic's first question, settled this way). The records lane drafted R04 to R10, R13, R15 and R21 with a 2026-11-20 prefix; the texts below are re-dated.
+- Nothing M2.9b writes names a time of day.
+
+**A39-2: the form of a rider.**
+- A rider is inline: at the end of its line, or right after the note it extends. No edit in the sweep adds or removes a line, so every line number here holds after it. ADR 0023 `:100` is named in `client_test.go:199`'s subtest, and ADR 0021 `:105` and `:343` are cited by line from ADR 0023 `:213` and `:268` and from this design (`:6315`) [read].
+- Inside ADR 0023 a rider says "M2.9b"; in any other file, "ADR 0023 M2.9b".
+- No record outside this design uses the label Q10. Records say "needs the operator's approval".
+- Walked text stays as walked. A dated note true on its date is not rewritten, and a later note goes beside it (A36-11, A36-13).
+- Every link to `docs/runbooks/adr-0023-m2-walk.md` lands in the commit that adds that file, or it is a dead link.
+
+**A39-3: the living sentences that say M2.9b is not started, or that M2 is begun.**
+- "M2.9b (the records sweep and the M2 walk runbook) and every later milestone are not started" is living text in ADR 0023 `:3`, `AGENTS.md :48` and `PLAN.md :457` [read]. Each becomes a statement that M2.9b is built, 2026-11-22; that M2's walk is written, has not run, and needs the operator's approval; and that what remains is that walk, then M3a and every later milestone, none started (A39-4, A39-8, A39-9).
+- ADR 0023 `:319`'s copy of the sentence sits in a dated note of 2026-11-20. It stays, and gets a note after it (A39-4).
+- "M2 is begun" is living text in `AGENTS.md :48`, `PLAN.md :436`, `:454` and `:457`, and `README.md :300` [read]. Each becomes "built", and keeps "not walked".
+- Outside this design, `git grep` finds M2.9, as distinct from M2.9a, or M2.9b named only in these lines, in ADR 0021 `:222` (A39-6) and in the probe walk's `:3` and `:25` (A39-12) [ran].
+
+### The records sweep, by file
+
+Texts in the quotes are exact. "Append" means after a space, at the end of the named line or right after the named note.
+
+**A39-4 (R01 amended, R02): ADR 0023's status line and its M2 row.**
+- `:3`, four in-place edits. The rest of the line stays, "Until M2.8 `build`'s read no cluster either" included [read].
+  - (a) After "with no fallback to the installer's account (decision 3's dated notes)." insert:
+    > Where service-account key upload is blocked no reader can be set up, so those reads read nothing, those plans are refused (`run --plan` still prints its fetch plan), and the plans' commands run only interactively or with `--yes`.
+  - (b) "M2.8's three tests against a real API server are written and not run." becomes:
+    > M2.8's three tests against a real API server are written and not run, and no run has applied the streams M2.8 changed or added: `kernel deploy`'s, with the builder's ServiceAccount, and `reader grant`'s, with the Role and RoleBinding `farcast-reader-serviceaccounts`, both built 2026-11-19, and the Git credential's Secret, built 2026-11-20. M2.9a removed four of the thirteen tests with the migration, and of the others renamed two and reseeded one, each now starting from farcast's forced apply; the suite as it now stands, twelve tests, has not run against a real server.
+  - (c) "M2 is not walked: its billable walk (*Phasing*, the M2 row) has not run." becomes:
+    > M2 is built and not walked: its billable walk (*Phasing*, the M2 row) has not run. Its runbook is [adr-0023-m2-walk.md](../runbooks/adr-0023-m2-walk.md), written 2026-11-22, and the walk needs the operator's approval.
+  - (d) "M2.9b (the records sweep and the M2 walk runbook) and every later milestone are not started." becomes:
+    > M2.9b, built 2026-11-22, swept the records and wrote the M2 walk's runbook. What remains of M2 is that walk; M3a and every later milestone are not started.
+  - *Evidence:* at 081efda, the second real-API run's tree, `kernel.go` has no `RenderServiceAccount`, `readerrbac.go` no `farcast-reader-serviceaccounts` and `manifests_test.go` no Git-credential stream. a39e3cb has the first two, and 37ce50b all three [ran, the critic]. `kube/realapi_test.go` holds 10 top-level tests and `cli/realapi_test.go` 2 [read]. "Four of the thirteen … renamed two and reseeded one" is the CLI README's `:1586` (A38-4).
+- `:319`, the M2 row of *Phasing*. Append only, so its dated notes stay.
+  - The Milestone cell, after its 2026-11-20 M2.9a note:
+    > *(2026-11-22: M2.9b built that day: the records swept and this walk's runbook written, not run. M2 is built; what remains of it is its billable walk, which needs the operator's approval. M3a and every later milestone are not started.)*
+  - The What-it-removes cell, after "where SA keys are allowed":
+    > *(2026-11-22: since M2.7, built 2026-11-18 to 2026-11-19 and not walked, farcast starts no kubectl, plugin or gcloud. The writes need the installer's key, where key creation is allowed. The reader's uploaded key serves the cluster reads of `world`, `ps`, `costs`, `usage` and `logs` and six plans; where upload is blocked those reads read nothing and those plans are refused (`run --plan` still prints its fetch plan).)*
+  - The Verified-by cell, after its M2.9a note:
+    > *(2026-11-22: run again 2026-11-19 on M2.7b's tree; the suite as M2.9a left it, twelve tests, has not run, and no run has applied the streams M2.8 changed or added)*
+  - The Cloud cell, after its M2.9a note:
+    > *(2026-11-22, M2.9b: written as [adr-0023-m2-walk.md](../runbooks/adr-0023-m2-walk.md), not run; it needs the operator's approval)*
+  - The Effort cell, "3–4 weeks", stays. It is the ADR's estimate, and the status cell carries the build's dates.
+
+**A39-5 (R03 amended, R05 amended, R04, R06 to R12, R35, R36): ADR 0023's other lines.** Each rider is appended inline.
+- `:34` (R03; A37-19's M11; C15 merged in), at the end of the bullet:
+  > *(2026-11-22, M2.9b: this bullet is as at 6b62d3f, where the 15 were 13 exported methods and two unexported helpers. Since M2.9a, built 2026-11-20 and not walked, `cluster.Client` has 20 exported methods, 16 in `cluster.go` and 4 in `open.go`: the 13, and seven that M2 added, `CanI` (M2.3), `NamespaceUID` (M2.5), `DeploymentState` and `JobState` (M2.6), `GetMeta` and `ApplyAt` (M2.7) and `DeleteSecret` (M2.8). M2.7 also added `ListMeta`, `PatchManagedFields` and `Traces`, which M2.9a removed. Since M2.7 none starts a program.)*
+
+  *Evidence:* the exported methods counted in `cluster/*.go` outside tests, each one's commit found with `git log -S`, and no `os/exec` import in the package [ran, the lanes and the critic].
+- `:49` (R35; A33-41 asked `:48-49` re-cited by symbol, and `:49` was not). The parenthesis that cites `phase-4-2-validation.md:224` and `phase-4-3-validation.md:208`, and the hint's citation of `kernel.go:237`, become:
+  > ([phase-4-2's "8. Optional — a private repository"](../runbooks/phase-4-2-validation.md#8-optional--a-private-repository), [phase-4-3's "10. A private repository (optional)"](../runbooks/phase-4-3-validation.md#10-a-private-repository-optional)), and a `kubectl create namespace` hint in `kernel deploy` (`kernel.go:237` at 6b62d3f)
+
+  The headings are at `phase-4-2-validation.md:223` and `phase-4-3-validation.md:209` [read].
+- `:95` (R05 amended; §38's open list), after its 2026-11-18 note. One note, not the lane's two:
+  > *(2026-11-22, M2.9b: since M2.9a, built 2026-11-20 and not walked, there is no migration. The test is now `TestForcedApplyRemovesAFieldDroppedFromTheManifest`: each of the seven cases is applied v1 forced, then v2 forced, and the dropped field must be gone. It first checks that v1's forced apply stored what v2 drops (the M2 design's A38-17). It has not run against a real server. The M2 walk ([adr-0023-m2-walk.md](../runbooks/adr-0023-m2-walk.md), written, not run) removes the kernel's `--adapt` argument from the live Deployment under Autopilot with `kernel deploy --adapt=false`. A container's args are an atomic list in server-side apply [inf], so that shows the forced apply took effect; the field-by-field removal stays this test's.)*
+- `:99` (R04):
+  > *(2026-11-22, M2.9b: since M2.9a, built 2026-11-20 and not walked, `not_migrated` is retired with `farcast migrate`, so `retiredKinds` lists six and the set is 20. `instances` no longer carries `migrated`, and both documents stay at schema 2.)*
+- `:109` (R12), after its 2026-11-18 note:
+  > *(2026-11-22, M2.9b: the 15 were 6b62d3f's; since M2.9a, built 2026-11-20 and not walked, `cluster.Client` has 20 exported methods, all in-process.)*
+- `:118` (R06), after its 2026-11-20 M2.8 note:
+  > *(2026-11-22, M2.9b: since M2.9a, built 2026-11-20 and not walked, `migrate` is removed, and with it the M2.7 note's exception. Under `--plan` and `--confirm` no plan reads the cluster as the installer, and no `--plan` mints the installer's cluster token; an interactive or `--yes` run still makes a plan's reads as the installer, and the plans' Google reads keep the installer's key until M3b. M5's broker has no `migrate` to keep terminal-only.)*
+- `:213` (R07):
+  > *(2026-11-22, M2.9b: since M2.9a, built 2026-11-20 and not walked, there is no `migrate`, so `--yes` is refused by `reader grant`, `storage deploy --grant-bucket`, `git-credential set` and `git-credential rm`.)*
+- `:214` (R08):
+  > *(2026-11-22, M2.9b: since M2.9a, built 2026-11-20 and not walked, `migrate` is removed, so thirteen commands do.)*
+- `:216` (R36): the citation "`buildgrant.go:52-61`" becomes "`writePushGrant`'s comment, `buildgrant.go`". The quoted words are there at HEAD, in `writePushGrant`'s comment (`buildgrant.go:293-311`) [read].
+- `:217` (R36): the citation "`storagedeploy.go:328-334`" becomes "`storagedeploy.go:328-334` at 6b62d3f; since M2.8 `writeBucketGrant`'s comment says the grant is applied under `--grant-bucket`'s consent". The quoted words are gone at HEAD, and `writeBucketGrant`'s comment says so (`storagedeploy.go:1522-1548`) [read].
+- `:218` (R09), right after "*(Built at M2.7, 2026-11-18 to 2026-11-19, not walked.)*":
+  > *(2026-11-22, M2.9b: M2.9a, built 2026-11-20 and not walked, removed the command, as decision 2's dated note says.)*
+- `:375` (R10), at the end of the item:
+  > *(2026-11-22, M2.9b: since M2.9a, built 2026-11-20 and not walked, the migration's bullet and its tests are gone with `migrate`, so the consent bullet holds for thirteen commands. `farcast migrate` is an unknown command (`TestMigrateIsAnUnknownCommand`), and exactly thirteen commands write to a cluster (`TestEveryProductionWriterIsAWriteCommand`).)*
+- `:379` (R11):
+  > *(2026-11-22, M2.9b: M2's walk is written as [adr-0023-m2-walk.md](../runbooks/adr-0023-m2-walk.md) and has not run; it needs the operator's approval.)*
+- *Evidence:* `errorKinds` holds 20 and `retiredKinds` six (`kinds.go`); `plancomplete_test.go:268` requires exactly 13 writers; `TestMigrateIsAnUnknownCommand` is at `cli_test.go:124`; `consent.go:142-149` says an interactive or `--yes` run reads as the writer [read].
+
+**A39-6 (R13, R14, R15 amended, R39 amended): ADR 0021.** M2.9a did not touch it [read].
+- `:3` (R13), right after the 2026-11-18 note that gives `farcast migrate` the same two answers:
+  > *(2026-11-22: ADR 0023 M2.9a, built 2026-11-20 and not walked, removed `farcast migrate`. Since M2.7 `farcast` starts no `kubectl`, auth plugin or `gcloud`; the reader's cluster reads still need a key upload the organization allows, and the writes the installer's key.)*
+- `:91` (R39 amended: inline, so `:98`, `:105` and `:343` do not move), at the end of "1. **Most dashboard data does not travel through FatLine today.**":
+  > *(2026-11-22, ADR 0023 M2.9b: this section describes the code at acceptance, 2026-11-11, and its line numbers are that tree's. Since ADR 0023 M2.4 `costs`, `usage`, `ps` and `logs` read in-process as the instance's reader; since M2.6 every command that writes to a cluster takes `--plan` and `--confirm`; since M2.7 farcast starts no `kubectl`, plugin or `gcloud`. Built, not walked.)*
+- `:222` (R14), after its 2026-11-20 note:
+  > *(2026-11-22: ADR 0023's M2 is built, M2.1 to M2.8 2026-11-14 to 2026-11-20, M2.9a 2026-11-20 and M2.9b 2026-11-22, and not walked beyond the probe walk of 2026-11-16. M2.9a removed `farcast migrate`, so thirteen commands that write to a cluster take `--plan` and `--confirm`. M2.9b swept the records and wrote the runbook of M2's billable walk, [adr-0023-m2-walk.md](../runbooks/adr-0023-m2-walk.md), which has not run. All of M5 is not built.)*
+- `:295` (R15 amended: the lane's draft lacked the Google-reads qualifier, without which "no `--plan` mints the installer's cluster token" reads as no installer key at all), after its 2026-11-18 note:
+  > *(2026-11-22: ADR 0023 M2.9a, built 2026-11-20 and not walked, removed `migrate`, and with it the M2.7 note's exception. Under `--plan` and `--confirm` no plan reads the cluster as the installer, and no `--plan` mints the installer's cluster token; an interactive or `--yes` run still makes a plan's reads as the installer, and the plans' Google reads (the registry lookups, and since M2.8 the project number and the bucket's or repository's IAM policy) keep the installer's key until M3b. M5's broker has no `migrate` to keep terminal-only.)*
+
+**A39-7 (the critic's third missing item; R38; R40 left): ADR 0019 and ADR 0022.**
+- ADR 0019 `:132`, the "next walk" records. Append:
+  > *(2026-11-22, [ADR 0023](0023-one-download-farcast.md) M2.9b: the runbook of ADR 0023's M2 walk, [adr-0023-m2-walk.md](../runbooks/adr-0023-m2-walk.md), written and not run, records this precondition and the Data Access audit configuration in its baseline, and offers this section's checklist as an optional step, W5.3, which the operator takes or leaves before the walk.)*
+- The other records that defer to "the next walk" stay as they are: ADR 0019 `:3`, `:98` and `:149`, `README.md :274`, planck's README `:357`, `:378`, `:379` and `:383`, the SDK's README `:94` and `:237`, the CLI README `:397` and `phase-5-session-a.md :384` (the critic's list). Each stays true while the walk has not run, and the walk's Results add their dated notes.
+- ADR 0022 `:38` (R38): the link text "`planck/translate/translate.go:84`" becomes "`DefaultPort`, `planck/translate/translate.go`". `DefaultPort` was at `:84` at 6b62d3f and is at `:85` at HEAD [ran], so M2 moved it.
+- ADR 0020 `:101`, `:102` and `:221` (R40) are left. `warnPacketDisclosure` was at `keeper.go:533` at 6b62d3f too [ran], so these citations were stale before M2, and they are not M2's records. This overrules the critic's keep.
+
+**A39-8 (R16, R31 amended): AGENTS.md.**
+- `:48`, six in-place edits. The rest of the line stays; its key-upload sentence is already there [read].
+  - (a) "M2 is begun: M2.1 to M2.8 were built 2026-11-14 to 2026-11-20, and none of it is walked against Google beyond the probe walk below." becomes:
+    > M2 is built: M2.1 to M2.8 were built 2026-11-14 to 2026-11-20, M2.9a 2026-11-20 and M2.9b 2026-11-22, and none of it is walked against Google beyond the probe walk below.
+  - (b) After "and a `/scale` write of 2 was recorded under no manager either." insert:
+    > M2.9a removed four of the thirteen tests with the migration, and of the others renamed two and reseeded one, each now starting from farcast's forced apply; the suite as it now stands, twelve tests, has not run against a real server.
+  - (c) "M2's billable walk (ADR 0023 *Phasing*, the M2 row) has not run." becomes:
+    > M2's billable walk (ADR 0023 *Phasing*, the M2 row; [runbook](docs/runbooks/adr-0023-m2-walk.md), written 2026-11-22) has not run, and needs the operator's approval.
+  - (d) "M2.8 was built 2026-11-19 to 2026-11-20 and is not walked; its three tests against a real API server are written and not run." becomes:
+    > M2.8's three tests against a real API server are written and not run, and no run has applied the streams M2.8 changed or added: `kernel deploy`'s, with the builder's ServiceAccount, and `reader grant`'s, with the Role and RoleBinding `farcast-reader-serviceaccounts`, both built 2026-11-19, and the Git credential's Secret, built 2026-11-20.
+  - (e) "M2.8's grants name the ServiceAccount's uid instead" becomes "M2.8's grants (built 2026-11-19 to 2026-11-20, not walked) name the ServiceAccount's uid instead", which keeps the date (d) drops.
+  - (f) "M2.9b (the records sweep and the M2 walk runbook) and every later milestone are not started." becomes:
+    > M2.9b swept the records and wrote the M2 walk's runbook. What remains of M2 is that walk; M3a and every later milestone are not started.
+- `:70` (R31 amended: scoped as A38-15 REC-4 scoped ADR 0019 `:95`). "The cluster reads of `world`, `ps`, `costs`, `usage` and `logs`, `reader grant`'s check, and the reads of the plans that read the cluster run as the instance's reader." becomes:
+  > The cluster reads of `world`, `ps`, `costs`, `usage` and `logs`, `reader grant`'s check, and, under `--plan` and `--confirm`, the reads of the plans that read the cluster run as the instance's reader; an interactive or `--yes` run makes a plan's reads as the installer. Where key upload is blocked there is no reader, so those reads read nothing and those plans are refused.
+
+**A39-9 (R17 amended here, R18 amended, R19 to R22): PLAN.md.**
+- `:457`, the M2 bullet, is replaced: §37 gave M2.9b its consolidation. The lane's draft keeps every fact and qualifier. It drops only the second listing of the reader plans and "`build`'s read none until M2.8", which ADR 0023 `:3` and `:118` keep as history. One amendment here: the reader-plan sentence is scoped to `--plan` and `--confirm`, and the installer's sentence names an interactive or `--yes` run's plan, because such a run's plan reads as the writer (`consent.go:142-149`) [read]. The bullet becomes:
+  > - **M2, in-process Kubernetes client: with step 3.** *Built: M2.1 to M2.3 2026-11-14, M2.4 and M2.5 2026-11-15, M2.6 2026-11-16 to 2026-11-17, M2.7 2026-11-18 to 2026-11-19, M2.8 2026-11-19 to 2026-11-20, M2.9a 2026-11-20 and M2.9b 2026-11-22, none of it walked. Secrets render as `data:`, and the reader identity's commands (`farcast reader init`, `record` and `grant`) are built. Since M2.4 the cluster reads of `world`, `ps`, `costs`, `usage` and `logs` run in-process as the reader, `pin-gcloud` and the gcloud identity guard are retired, and both CLI documents the app reads are at schema 2. Since M2.6 the plans of `kernel deploy`, `storage deploy`, `storage key pin`, `storage key rotate` (only with a keyholder deployed) and `run`'s deploy plan, and since M2.8 `build`'s, read the cluster under `--plan` and `--confirm` as the instance's reader too, which `reader grant` must have verified; there is no fallback to the installer's key, and their `--confirm` refuses a writer whose cluster is not the one the plan read. Where service-account key upload is blocked no reader can be set up, so those reads read nothing, those six plans are refused (`run --plan` still prints its fetch plan), and their commands run only in a terminal or with `--yes`. Everything else a command that writes does, its reads (since M2.5), an interactive or `--yes` run's plan among them, and every write (since M2.7), runs in-process as the stored installer key, whose token is project-wide, and `install` refuses a missing `--credentials`. Since M2.7 `farcast` starts no kubectl, auth plugin or gcloud: every apply is a forced server-side apply as `farcast`, and the kernel names its writes `technocore`. No command refuses an instance an older farcast wrote: M2.9a (built 2026-11-20, not walked) removed M2.7's one-time `farcast migrate` and that refusal, because no FarCast instance runs anywhere and none persists until FarSight is finished, and such an instance is not supported. M2.6 gave the eleven commands that then wrote to a cluster `--plan` and `--confirm <digest>`, M2.7 gave them to `migrate`, which M2.9a removed, and M2.8 to `git-credential set` and `rm`: thirteen commands. A `--confirm` opens the writer only after the comparison. The plans of `kernel confirm`, `kernel meter`, `reader grant`, `connect`, `redeploy`, `git-credential set` and `git-credential rm` read no cluster. `connect`'s and `redeploy`'s read the recorded image registry with the installer's key and never deploy FatLine without Shrike. The two decide both images before any question or, under `--confirm`, before the recomputed plan is compared, and ensure a recorded registry, push and build only after consent. `run` has two plans: confirming the first runs the manifest read and prints the second. While the kernel's ledger reads the instance's spending at its limit, `run --yes` deploys nothing. Since M2.8 the bucket and push grants name the keyholder's and the builder's ServiceAccounts by their uid, not by the principal every FarCast instance in the project shares; the uid member is [unverified] until the M2 walk, and one project per instance is still the full separation. `storage deploy`'s and `build`'s plans and `run`'s deploy plan read, with the installer's key and in every mode, the project's number and the recorded bucket's labels and IAM policy or the repository's IAM policy, and state the grant. `storage deploy --grant-bucket` applies the bucket grant under `--confirm` of its plan, which needs a granted reader, or after a terminal's question, never with `--yes`; the push grant is only printed. `kernel deploy` creates the builder's ServiceAccount. The reader may get it and the keyholder's by name in `farcast-system`, so `reader grant` is run once more on an instance granted before M2.8. `git-credential set` and `rm` write and delete a private repository's Git credential; `rm`'s delete, preconditioned on the uid it read, is the one write farcast makes that names no field manager. The test against a real API server ran 2026-11-18 on a loopback envtest kube-apiserver 1.36.2 and etcd (no controllers, none of Autopilot's admission) ([runbook](docs/runbooks/adr-0023-m2-realapi.md)). Ten of its thirteen tests passed, among them the migration's stuck-field cases, its single patch and a stale resourceVersion's 409. The other three met two server facts that M2.7 answers: an `ingress: []` in the build and fetch policies moved their generation on every apply, and the kernel's `/scale` write of 0 was recorded under no manager. A second run on 2026-11-19, on M2.7b's tree before its commit, passed all thirteen: the build and fetch policies applied twice with nothing moved, the egress policy as `run` renders and splits it was refused 409 at a stale resourceVersion and applied at the stored one, and a `/scale` write of 2 was recorded under no manager either. M2.8's three tests against a real API server are written and not run, and no run has applied the streams M2.8 changed or added: `kernel deploy`'s, with the builder's ServiceAccount, and `reader grant`'s, with the Role and RoleBinding `farcast-reader-serviceaccounts`, both built 2026-11-19, and the Git credential's Secret, built 2026-11-20. M2.9a removed four of the thirteen tests with the migration, and of the others renamed two and reseeded one, each now starting from farcast's forced apply; the suite as it now stands, twelve tests, has not run against a real server. None of it is walked against Google beyond what the M2 probe walk below records. The probe walk ran 2026-11-16 ([runbook](docs/runbooks/adr-0023-m2-probe-walk.md)): GKE's DNS endpoint refuses farcast's cluster token, scoped to `userinfo.email` alone, and accepts one with `cloud-platform`. So at 2482810 the in-process cluster calls of M2.4 and M2.5 did not work against GKE. The fix was built later on 2026-11-16 and is not walked: every cluster token now carries `cloud-platform` and `userinfo.email`, with the trade-off that a leaked one works for every Google API the account's IAM allows, not only the cluster. It is tested against a local API server only; the writer's evidence is the walk's 200 to exactly this pair through the probe, and the reader has none. The walk's project is in an organization that blocked key upload, so no reader was set up. M2.9b swept the records and wrote the runbook of M2's billable walk; that walk has not run, and needs the operator's approval. M3a and every later milestone are not started.* Every command that writes to a cluster gains `--plan` and `--confirm` (ADR 0023 decision 8), which widens step 3's consent protocol. `kubectl`, the plugin, `gcloud` and the pinned gcloud account leave the explicit environment (since M2.7 and M2.4). **Billable walk, needing approval:** install a fresh instance ([runbook](docs/runbooks/adr-0023-m2-walk.md), written 2026-11-22, not run); since M2.9a there is no live instance to migrate.
+- `:454` (R18 amended: "built and not walked" sat two sentences before "M2's probe walk ran"). "M2 is begun:" becomes "M2 is built, and not walked beyond its probe walk:". After "leaving plans on thirteen commands." insert:
+  > M2.9b was built 2026-11-22: it swept the records and wrote the runbook of M2's billable walk ([runbook](docs/runbooks/adr-0023-m2-walk.md)).
+
+  The rest stays. Its per-part date chain is history, so the fuller consolidation is not taken.
+- `:432` (R19). "its M2.1 to M2.8 built 2026-11-14 to 2026-11-20 and M2.9a 2026-11-20, with plans on all thirteen commands that write to a cluster, `git-credential` included and `migrate` removed at M2.9a, part of step 3, not walked.**" becomes:
+  > its M2 built, M2.1 to M2.8 2026-11-14 to 2026-11-20, M2.9a 2026-11-20 and M2.9b 2026-11-22, with plans on all thirteen commands that write to a cluster, `git-credential` included and `migrate` removed at M2.9a, part of step 3, not walked; the runbook of M2's billable walk written, not run.**
+- `:436` (R20). "M2 begun, M2.1 to M2.8 built 2026-11-14 to 2026-11-20 and M2.9a 2026-11-20," becomes "M2 built, M2.1 to M2.8 2026-11-14 to 2026-11-20, M2.9a 2026-11-20 and M2.9b 2026-11-22,". "; the second-host gate not yet run" becomes "; the runbook of M2's billable walk written 2026-11-22 and not run; the second-host gate not yet run". The rest of the parenthesis stays.
+- `:447` (R21; one note in place of the lane's two), after its 2026-11-20 note:
+  > *(2026-11-22, ADR 0023 M2.9b: since M2.9a, built 2026-11-20 and not walked, `migrate` is removed, so thirteen commands do. Where service-account key upload is blocked no reader can be granted, so the six plans that read the cluster are refused (`run --plan` still prints its fetch plan), and their commands run only in a terminal or with `--yes`.)*
+- `:448` (R22), after its 2026-11-18 note:
+  > *(2026-11-22, M2.9b: that is, since M2.7 farcast starts no kubectl, plugin or gcloud; the writes need the installer's key, where key creation is allowed, and the reader's reads a key upload the organization allows.)*
+
+**A39-10 (R23, R30 amended, R34, the critic's second missing item): README.md and farsight/README.md.**
+- README `:280` (R30 amended, as A39-8's `:70`). "The cluster reads of `farcast world`, `ps`, `costs`, `usage` and `logs`, `farcast reader grant`'s check, and the reads of the plans that read the cluster run as the instance's own read-only service account." becomes:
+  > The cluster reads of `farcast world`, `ps`, `costs`, `usage` and `logs`, `farcast reader grant`'s check, and, under `--plan` and `--confirm`, the reads of the plans that read the cluster run as the instance's own read-only service account; an interactive or `--yes` run makes a plan's reads as the installer service account. Where service-account key upload is blocked there is no reader, so those reads read nothing and those plans are refused.
+- README `:300` (R23). "Its M2 is begun." becomes "Its M2 is built, 2026-11-14 to 2026-11-22, and not walked beyond a probe walk." Before "The rest is not yet built." insert:
+  > Its M2.9b, built 2026-11-22, swept the records and wrote the runbook of M2's billable walk ([runbook](docs/runbooks/adr-0023-m2-walk.md)); that walk has not run, and needs the operator's approval.
+- README `:365` (missing; M2.9a only took `migrate` out of it). The line becomes:
+  > *Implemented today: `install`, `connect`, `redeploy`, `release`, `instances`, `world`, `storage`, `secret`, `keeper`, `kernel`, `toolchain`, `reader`, `git-credential`, `build`, `run`, `ps`, `logs`, `costs` and `usage` (plus `version` and `help`). Only `chat` is still a stub, waiting on Phase 6.2.*
+
+  Every one is registered in `defaultRegistry` (`cli.go:228-258`) [read].
+- README `:420` (R34), the FarSight row's third cell. After its status mark, "CLI: the full `install → connect → run → release` lifecycle, plus `storage`, `secret`, `keeper`, `kernel`, `toolchain`, `ps`, `logs`, `costs`, `usage`; engine-less image build (GUI is Phase 7)" becomes:
+  > CLI: the full `install → connect → run → release` lifecycle, plus `redeploy`, `instances`, `world`, `storage`, `secret`, `keeper`, `kernel`, `toolchain`, `reader`, `git-credential`, `ps`, `logs`, `costs`, `usage`; engine-less image build (`build`); `--plan` and `--confirm` on every command that writes to a cluster (ADR 0023 M2, built, not walked) (GUI is Phase 7)
+- `farsight/README.md :11` (R34). "The CLI is specified and implemented through Phase 2.3 (`install`, `release`, `connect`, `redeploy`) — see [`cli/README.md`](cli/README.md)." becomes "The CLI is specified and implemented as [`cli/README.md`](cli/README.md) records."
+
+**A39-11 (R24, R25, R32, R33, R51): the CLI README.** Three tests read this file (`kinds_test.go:28`, `gitcredential_test.go:1523`, `readerrbac_test.go:970`) [read]. No edit here touches what they quote.
+- `:19` (R24). The parenthesis "(since M2.7, twelve: `migrate` too; since M2.8, built 2026-11-20 and not walked, fourteen: `git-credential set` and `rm` too)" becomes:
+  > (since M2.7, twelve: `migrate` too; since M2.8, built 2026-11-20 and not walked, fourteen: `git-credential set` and `rm` too; since M2.9a, built 2026-11-20 and not walked, thirteen: `migrate` removed)
+- `:552` (R32). "now no kubectl, auth plugin or gcloud is needed." becomes "now farcast starts no kubectl, auth plugin or gcloud, and applies with the installer's key."
+- `:858` (R33). "*(Since ADR 0023 M2.7, built 2026-11-18 to 2026-11-19, not walked: no farcast command needs them.)*" becomes:
+  > *(Since ADR 0023 M2.7, built 2026-11-18 to 2026-11-19, not walked: farcast starts none of them, and the pin is written with the installer's key.)*
+- `:1586` (R51). Append:
+  > *(2026-11-22, ADR 0023 M2.9b: M2's billable walk, [its runbook](../../docs/runbooks/adr-0023-m2-walk.md), is to check these; it is written and has not run.)*
+- `:1884` (R25: "every rendered stream also ran" overstates at HEAD). Append:
+  > That was every stream as rendered on those days' trees. No run has applied the streams M2.8 changed or added, `kernel deploy`'s, with the builder's ServiceAccount, and `reader grant`'s, with the Role and RoleBinding `farcast-reader-serviceaccounts`, both built 2026-11-19, and the Git credential's Secret, built 2026-11-20; and the suite as M2.9a left it has not run.
+
+**A39-12 (R26, R27, R28, R29 amended): the probe-walk and real-API runbooks.** Both are walked, so they get dated notes only.
+- The probe walk's `:3` (R26; §38's open list). Append:
+  > *(2026-11-22: "M2.9's billable walk", here and in the approval paragraph below, is M2's billable walk. [ADR 0023](../adr/0023-one-download-farcast.md) M2.9b wrote its runbook, [adr-0023-m2-walk.md](adr-0023-m2-walk.md), and did not run it; it needs its own approval.)*
+
+  `:25` is not changed; the note on `:3` names it.
+- The real-API runbook's `:258` (R28), after its M2.8 note's last sentence. Append:
+  > *(2026-11-22, [ADR 0023](../adr/0023-one-download-farcast.md) M2.9b: `TestEveryRenderedStreamAppliesOnARealServer`'s table also now holds the streams M2.8 changed or added: `kernel deploy`'s, with the builder's ServiceAccount, and `reader grant`'s, with the Role and RoleBinding `farcast-reader-serviceaccounts`, both built 2026-11-19, and the Git credential's Secret, built 2026-11-20. No run has applied them.)*
+
+  It writes no stream count: none was counted.
+- The real-API runbook's `:273` (R27; A38-17's last paragraph). Append:
+  > *(2026-11-22, [ADR 0023](../adr/0023-one-download-farcast.md) M2.9b: since M2.9a's review, built 2026-11-20 and not run against a real server, the three renamed tests and the reseeded one check their precondition before they act (the M2 design's A38-17). The stuck-field test requires a raw GET after v1's forced apply to hold exactly what v2 drops, or the subtest fails with text that does not start `stuck field: `. The other-manager test requires farcast's Apply to own `spec.replicas` after its first apply, and not after the merge PATCH. The uid test requires the keyholder's ServiceAccount to have a uid and lack the added label before the relabel. The metadata-only test requires a full GET to find a non-empty value under both Secret keys; it checks presence only and prints no value.)*
+- The real-API runbook's `:385` (R29 amended: the runbook keeps W3, so the note names its steps). Append:
+  > *(2026-11-22, [ADR 0023](../adr/0023-one-download-farcast.md) M2.9b: there is no migration since M2.9a. The billable walk is [adr-0023-m2-walk.md](adr-0023-m2-walk.md), written, not run; its W3.2 and W3.3 record whether an unchanged forced re-apply moves `metadata.generation` under Autopilot, and whether a ReplicaSet is made.)*
+- The real-API runbook's `:246` names a loopback address and port in an instruction line. It predates M2.9 and is walked text, so it is left (A39-28, question 5).
+
+### What M2.9b does not change
+
+**A39-13: items dropped, one line each.**
+- **R37:** ADR 0023's other 6b62d3f citations (`:168`, `:175`, `:214`, `:358`). `:331` and `:394` declare them as at 6b62d3f, and A39-5's `:34` note covers the Context section.
+- **R40:** ADR 0020's citations (A39-7). Stale before M2.
+- **R41:** `AGENTS.md :33`. Nothing in it goes stale at M2.9b.
+- **R42:** ADR 0021 `:222`'s earlier notes. Dated notes true on their dates (A36-11); A39-6 appends.
+- **R43:** ADR 0004 `:56`. Its own 2026-11-18 note corrects it (A30-37).
+- **R44:** ADR 0021 `:440`. A dated history list.
+- **R45, C1 to C6:** `instances --account` and everything for it went at M2.9a (A37-11; rows 67 and 195).
+- **C7:** the M1 walk's `:21` and `:153` notes. Walked notes, still true: a usage error, exit 2, that writes nothing.
+- **R46 to R48, R50:** duplicates of C8 to C12 and C16, which carry the fuller texts.
+- **R49, C13:** renaming `client_test.go:199`'s subtest changes what `go test -run` matches. It is moot while no rider adds a line above ADR 0023 `:100` (A39-2).
+- **C14:** the twelve "unverified until the M2 walk" sites in code, and the same words in the records. They stay true until the walk runs, and change with its results.
+- **C15:** merged into R03 (A39-5).
+
+**A39-14: what the build does not touch.**
+- This design above §39.
+- Any Go behaviour, any Usage or printed text, any test, and any vector. The code lane changes comments only.
+- Walked text: the M1 walk; the probe walk's procedure and Results; the real-API runbook's procedure and Results, Run 2's stream count included; every phase runbook.
+- No line moves in ADR 0023, so `:100` stays where `client_test.go:199` points. ADR 0023 `:319`'s Effort cell stays.
+- `PLAN.md :436` and `:454` beyond A39-9's edits.
+- `check.sh`'s behaviour. Only its comment at `:319-321` changes.
+
+### The code comments
+
+**A39-15 (C8 to C12, C16, N1, N2 amended, N3 to N5): comments only.** No behaviour changes, so no mutation row is needed. Each block replaces the named lines whole.
+
+`farsight/cli/internal/cli/readergrant.go:84-92` (C8). The 2026-11-16 probe walk settled that GKE's reviews consult IAM, for an account with an IAM role and no RBAC. No review ran as a reader (A22-4; the probe walk's Results, item 4) [read].
+
+```go
+// readerReviews are the five SelfSubjectAccessReviews 'reader grant' makes as
+// the reader, each of which must answer allowed: false. GKE allows what
+// either IAM or RBAC grants, and its reviews consult IAM: in the 2026-11-16
+// probe walk an account holding roles/container.developer and no RBAC was
+// allowed by its review, "access granted by IAM permissions" (design A22-4).
+// No review was run as a reader there. So an IAM role stronger than
+// clusterViewer, edited into the Cloud Shell paste, shows here if it can do
+// one of these: write a Deployment or its scale, read a Secret, or read
+// beyond the reader's RBAC, sampled by listing pods in kube-system, where no
+// farcast RBAC ever binds the reader. They sample; a role whose only extra
+// powers are others, such as pods/exec or serviceaccounts/token, does not
+// show here.
+```
+
+`farsight/cli/internal/cli/clusterref.go:257-259` (C9). The probe walk's item 6 saw the endpoint's IAM refusal, for an account with no role [read].
+
+```go
+// msgReaderIAMRefused is what a 403 the reader met at the cluster's endpoint,
+// rather than in Kubernetes' RBAC, says to do (design §8.1). The 2026-11-16
+// probe walk saw the endpoint's IAM refusal as a 403 whose body is an HTML
+// page, not a Kubernetes Status, as forbiddenByRBAC tells it (design A22-4).
+// That was for an account holding no role; no reader could be set up there.
+```
+
+`farsight/cli/internal/cli/clusterref.go:323-325` (C10), in `writerRefused`'s doc. The walk saw the writer's 401 from its token's scope, and never the installer refused by IAM [read].
+
+```go
+// The 2026-11-16 probe walk saw the endpoint's IAM refusal, for an account
+// holding no role, as a 403 whose body is an HTML page, not a Status (design
+// A22-4); the installer's own IAM refusal was not seen. Since ADR 0023 M2.7
+// an apply's 403 carries tkube.ErrForbidden, so the writer's sentence applies
+// to applies too.
+```
+
+`farsight/cli/internal/kube/kubetest/kubetest.go:258-261` (C11). The real-API run of 2026-11-18 recorded the selector's key and the four template labels; it printed keys only, so the selector's value being the uid stays inferred (§31; A31-7) [read]. Lines `:262` onward stay.
+
+```go
+//   - a Job created with no spec.selector gets the API server's own default
+//     [seen on an envtest kube-apiserver 1.36.2 on 2026-11-18, by the real-API
+//     suite's TestReapplyingAnUnchangedJobIsANoOp (design §31): the selector
+//     key and the four template labels; that the selector's value is the
+//     Job's uid is inferred; not seen on Autopilot]: spec.selector.matchLabels
+//     {batch.kubernetes.io/controller-uid: <its uid>}, and the template labels
+```
+
+`farsight/cli/internal/kube/kubetest/writes.go:415-416` (C12), the same evidence.
+
+```go
+	// The labels the API server's Job defaulting gives a Job created with no
+	// selector, and its template (design A30-10) [seen on an envtest
+	// kube-apiserver 1.36.2 on 2026-11-18, design §31; not on Autopilot].
+```
+
+`farsight/cli/internal/kube/kubetest/store.go:112-114` (N4). §31's table saw a generation on Deployments, StatefulSets, Jobs and NetworkPolicies, and none on Services and Secrets; PodDisruptionBudget was not seen [read]. The map at `:115` stays.
+
+```go
+// generationKinds are the kinds whose metadata.generation the server keeps
+// and moves when their spec changes. On an envtest kube-apiserver 1.36.2 on
+// 2026-11-18 (design §31), Deployments, StatefulSets, Jobs and
+// NetworkPolicies carried one, and Services and Secrets none.
+// PodDisruptionBudget's is [unverified, from memory of the Kubernetes
+// registry strategies]. The rollout rules read it on Deployments.
+```
+
+`farsight/cli/internal/cluster/open.go:89-92` (N1). "ADR 0023 §6.4" is this design's §6.4, the migration's resourceVersion guard, which §37 superseded; M2.9a kept the blank for `GetMeta`'s callers (A37-7) and kept the cite [read].
+
+```go
+// blankLastApplied keeps the last-applied annotation's key on o and empties
+// its value. ADR 0023 M2.7 made it for the migration (design §6.4), and
+// M2.9a kept it when it removed the migration (design A37-7). No caller
+// reads the annotation. A Secret anyone applied with kubectl carries its data
+// in that value, and the blank keeps it out of what a caller prints or binds.
+```
+
+`farsight/cli/internal/cluster/cluster.go:7-8` (N3). The reader serves a plan only under `--plan` and `--confirm` (`consent.go:142-149`), and also `reader grant`'s check; the scoping is A38-15 REC-4's [read]. Line `:9` onward stays.
+
+```go
+// in-process through internal/kube: the reader for the read commands, for
+// reader grant's check, and for a plan's reads under --plan and --confirm;
+// the writer for a writing command's other reads, an interactive or --yes
+// run's plan among them, and every write. Every
+```
+
+`farsight/cli/internal/cluster/cluster.go:48-49` (N2 amended: shorter, and scoped to the tree Run 2 applied, which held no M2.8 stream). "It is idempotent" is a living claim that §37 leaves to the walk under Autopilot.
+
+```go
+// answer carried written after it. Re-applying an unchanged document is
+// meant to change nothing: on an envtest kube-apiserver 1.36.2 on
+// 2026-11-19, every stream rendered on that day's tree applied twice with
+// nothing moved (docs/runbooks/adr-0023-m2-realapi.md, Run 2). Under
+// Autopilot's admission it is not walked.
+```
+
+`farsight/cli/internal/cli/planhuman.go:274-275` (N5). A30-13 defined `describeObject` for `migrate`'s fact, which A37-12 removed; its callers at HEAD are `writeLine` and the Git credential's line [read].
+
+```go
+// server's. A write's object and a Git credential's Secret are named by it.
+// A30-13 defined it for migrate's fact, which M2.9a removed (design A37-12).
+```
+
+`check.sh:319-321` (C16). The timings stop at M2.8a; A36-15 and §38 recorded later ones. The 30-minute timeout is unchanged. M2.9b's own `check.sh` time is not added: the edit comes before the run. It goes into the commit message and §40.
+
+```bash
+# because they swap package-level seams, and under -race it takes about ten
+# to eleven minutes on the dev Mac, with other work running: 576 s at ADR 0023
+# M2.8's step 0, 609 s at M2.8a, 651 s to 676 s at M2.8b and 663 s at M2.9a's
+# step 1. That is past go test's 10-minute default.
+```
+
+### The walk
+
+§37's *The walk* is written as `docs/runbooks/adr-0023-m2-walk.md`, from the walk lane's outline as the critic corrected it and as decided here. This section states the decisions and the order. The runbook lane writes the steps' lines from the outline, and changes them where these entries say. The runbook is written 2026-11-22 and not run. Walking it needs the operator's approval (Q10), in the session that walks it.
+
+**A39-16: the runbook's frame.**
+- **The file** is the runbook lane's only file. Its title: "ADR 0023 M2 — the billable walk: one fresh instance, written by M2 alone".
+- **Its status line** says: "*Written 2026-11-22 (ADR 0023 M2.9b), against the code at the commit it lands in. Not run.*" Then: it needs the operator's own approval in the session that walks it, at G0a and G0b; the approval that had ADR 0023 M2.9b write it is not approval to walk it; no earlier walk's approval carries over. It names no design label such as Q10 and quotes no chat words (the critic's correction 5).
+- **Its opening** says what the walk shows and why (the outline's paragraph), and lists the deviations from the M2 design's §37 (A39-25).
+- **Labels.** The sections keep §10.7's names, so §37 and A33-39's (a) to (f) read across. W0, W1 and W2 are gone; W1's other checks are W4's reader steps. A step that A22-2's choice changes is marked [U] (key upload allowed) or [B] (blocked). Every other step runs the same on both.
+- **Placeholders:** `$INSTANCE` and `$PROJECT`, and `$TOKEN` only in `git-credential set`'s silent read. Every other value is in words: "the walk directory", "the installer's key file", "the private repository chosen at G0a", "the Secret's name chosen at G0a", and so on. No other placeholder is used. The shell's own `$HOME`, `$TMPDIR` and `$PWD` are not placeholders.
+- **Host names** are not written. Each is given by reference to the earlier runbook section that names it: the probe walk's P0.5, the M1 walk's W0.3, `phase-5-session-a.md`'s S3 and `phase-3-2-validation.md`'s repository line (A39-28, question 2).
+
+**A39-17: the order.**
+1. *Throughout*: T1 to T8 (A39-18 below).
+2. **G0a**, the walk's choices, with no spend. It comes first, before any step that names the project or changes it (the critic's correction 1; §37: A22-2's choice comes before the walk).
+3. **WP.1 to WP.9**, setup, with no spend.
+4. **G0b**, the approval to spend, right before W4.1.
+5. **W4.1 to W4.17**, billable from W4.1.
+6. **W3.1 to W3.4**.
+7. **W5.1 to W5.3**, the audit.
+8. **W6.1 to W6.8**, the release and the cloud at zero.
+9. **R**, the Results template, then *What this walk settles, and what it does not* (A39-27).
+
+**A39-18: Throughout,** as outlined, with these changes.
+- **T1, the scrub rule,** for every record the walk makes: the Results, the design and every dated note. No address, host name, account name or port; no path under a home directory; no uid, resourceVersion, pid, key id, token byte or plan digest; no project id or number, bucket name, endpoint, registry path or principal string. Dates only, never a time of day. Raw outputs and FAIL lines are never copied; a value withheld is written "withheld". Three texts name a time of day and are never recorded: `reader grant`'s IAM line, `run`'s reset line, and every plan's `generated_at`.
+- **T2, two places.** The walk shell on the Mac runs `farcast`, and the system's own tools from `/usr/bin` and `/bin`, none of which reaches a cloud (the critic's correction 14). Cloud Shell runs every observation. The Mac runs no gcloud or kubectl and reads no kubeconfig. No step needs the keeper VM.
+- **T3, credentials:** every install passes `--credentials`; no Application Default Credentials; Cloud Shell runs only as the operator's FarCast account, checked by eye; no token is printed, ever; the walk shell has no `GODEBUG`, Google logging or credentials variable, proxy variable or `KUBECONFIG`.
+- **T4, who does what:** the agent runs farcast's non-interactive lines. The operator does every Cloud Shell step, every typed answer, the org-policy change and Little Snitch, and relays only counts, kinds, states and booleans.
+- **T5, output.** The agent never moves its own shell: it creates the walk directory with `mktemp -d` and uses its path by value, never recorded (the critic's correction 2). Each step's lines go into `step.zsh`, which starts with `source ./walk.zsh` (correction 3), and run in a subshell under `env -i`, with stdin from `/dev/null` unless the step pipes into it. Each farcast line writes its stdout and stderr to the step's files and echoes its exit. Every `-o json` document is one line (`output.go:52-54`) [read], so a count is `grep -o … | sort | uniq -c` or `grep -o … | wc -l`, never `grep -c` on a JSON document (correction 4). Never `2>&1 >/dev/null |`, which zsh's MULTIOS still pipes.
+- **T6 to T8** as outlined: a HARD STOP records what was seen and goes to W6, and anything else unexpected is a finding that stops for the operator; Cloud Shell's idle reset and its helper lines run again; an instance path is written `"${INSTANCE}:…"`, because zsh reads a bare `$INSTANCE:w` as a modifier.
+
+**A39-19: G0a, the walk's choices (no spend).** The agent presents; the operator answers in the walking session; the answers and G0a's date are recorded.
+- **A22-2's branch, first.**
+  - [U1]: allow key upload for the walk's project, by the operator's own org-policy change. Its spelling, and who may make it, are [unverified]. W6.4 restores or keeps it, as decided here.
+  - [U2]: a project outside the organization, which has no such policy. It is offered as a form of A22-2's first option, "allow upload for the project", not as a fourth option (the critic's correction 10; question 3). It brings its own setup, baseline and W6.8.
+  - [B]: upload stays blocked. The walk takes the refusal and terminal path, the reader is not walked, and M2's records keep "reader not walked".
+- **The project.** The probe walk's project, whose baseline is known ([U1] or [B]), or a fresh one ([U2]). For a fresh project, whether W6.8 keeps it or shuts it down.
+- **The Org Policy API.** WP.7's unsilenced managed check may ask to enable it (A22-3). W6.4 turns it off again if the walk enabled it.
+- **The optional steps:**
+  - (f) with its same-name refusal, recommended, because it stands for (e) (A39-24);
+  - the git-credential step, which needs a private repository with a `./farcast` manifest not named `sdk-demo`, and a read-only token scoped to it, typed only by the operator and revoked at W6.7. The provider can read its Secret while it exists;
+  - ADR 0019's checklist as W5.3;
+  - W4.17's read of the resized application's field managers.
+- **(e)** is dropped (A39-24). To overrule that, the runbook first gains (e)'s steps under a second instance placeholder the operator approves. That is not written now.
+- **Optionally, before G0b:** the real-API suite on the keeper VM, by its own runbook and approval. It is not part of this walk.
+- The cost is shown here for information (A39-26). The yes to spend is G0b's.
+
+**A39-20: WP, the setup (no cloud spend),** as outlined, with these decisions.
+- **WP.1:** `./check.sh` in the checkout's root, from a clean tree. The commit and the summary are recorded.
+- **WP.2:** the walk directory is made by value (T5). `bin/` and `walk.zsh` are written by path. `walk.zsh` holds three helpers, `digest`, `kinds` and `grant`, which print digests, counts and states only. `config/` is not made: farcast makes it 0700, and `mkdir -p` under umask 022 makes it 0755, which farcast refuses (`config/config.go:56-65`) [read, the lane].
+- **WP.3:** the release farcast from `farcast-release`, its sums checked. `vcs.revision` must equal WP.1's commit and `vcs.modified` must be false, or stop.
+- **WP.4:** the walk shell. Nothing of kubectl, the auth plugin, gcloud, go or gofmt resolves on its `PATH` (a HARD STOP otherwise), and the variables T3 bars are absent. `version` shows four components, each built with go1.27.4.
+- **WP.5:** Little Snitch, a rule per destination for the walk's `farcast`, the destinations by reference (A39-16). A held binary shows as an EOF or a timeout. No walk probe is built unless a 401 or 403 needs diagnosis.
+- **WP.6:** Cloud Shell's helpers, each printing counts, names, generations or manager pairs only. Their spellings are [unverified].
+- **WP.7:** the baseline, in the project G0a chose, counts only. The critic adds two records (corrections 6 and 7):
+  - the project's effective Data Access audit configuration, inherited settings included, as levels or booleans (ADR 0019 `:132`). W5.1's "no reader entries" depends on it;
+  - yes or no: the installer holds the roles `storage deploy` and `build` need in the project, the conditioned `roles/storage.admin` (phase 3's condition) and the registry role. The probe walk ran neither command there, and a missing role found at W4.8 would bill an hour first.
+
+  Stop if any cluster exists in the project: every cluster in it shares the Workload Identity pool, and any of them can present any uid. Stop if the GKE Enterprise and fleet check fails: a control-plane logging default would fail install by design (ADR 0019).
+- **WP.8:** the branch's preparation. [U1]: the operator's org-policy change, then WP.7's two key-upload checks again. [U2]: the operator's per-project setup (phase 1's §1 and §2, phase 3's condition, billing linked), the installer's key to the Mac at 0600 only, and WP.7 taken there. [B]: nothing.
+- **WP.9:** free checks: the public repository's main holds the `sdk-demo` manifest and the SDK's demo.
+
+**A39-21: G0b, the approval to spend.** Right before W4.1, the agent presents, then waits for the operator's explicit yes in the walking session. With no yes, nothing billable starts.
+- The cost: under USD 5 [inf] (A39-26).
+- What the walk creates: one Autopilot cluster, with its registry, bucket and load balancer; [U] one reader account, with an uploaded key and project-wide `roles/container.clusterViewer`; the bucket's uid grant, through `--grant-bucket`; the repository's uid push grant, by hand in Cloud Shell; perhaps the Org Policy API.
+- The teardown, W6. It names `release --delete-data`, which deletes for good the bucket's objects, the walk's secret and its test file, with the instance (the critic's correction 13).
+- G0a's choices, restated.
+
+The yes and its date are recorded.
+
+**A39-22: W4, the fresh instance.** The steps run in this order, each as outlined, with these decisions.
+- **W4.1** `install`, with `--credentials` and `--cost-limit 100`. **W4.2** `world` before a reader gives `credential_missing` on the cluster sections.
+- **W4.3 and W4.4,** the reader, follow `phase-1-validation.md`'s §7b, the reader's procedure (`:197`), and link it. The Results then add §7b's dated walked note (the critic's correction 12). [U]: `reader init`, the paste, `reader record`; then `reader grant`'s plan, and its interactive run under `time`, IAM's lag recorded in minutes. [B]: the paste stops at its policy check; then `reader grant`'s blocked plan, and its refusal, `credential_missing`.
+- **W4.5** the cluster's Kubernetes version, for §10.6's minor. The probe walk saw 1.36 (A22-4).
+- **W4.6** `connect`, by plan and `--confirm`, on both branches: its plan reads no cluster. [U]: the reader's first `world` read follows it.
+- **W4.7** `kernel deploy --adapt --adapt-cooldown 1m`. [U] by plan and `--confirm`; [B] the plan's refusal, then `--yes`. `farcast-builder` exists after it (A33-20).
+- **W4.8, (a):** `storage deploy --grant-bucket`. [U] by plan and the operator's `--confirm`; [B] the terminal path (A33-39). Per role the bucket holds the uid once, no other uid, and no shared principal. IAM's lag is recorded. *The stop, corrected* (correction 8): "uid not honoured" is recorded only when the keyholder's start-up bucket check is seen refused. That check exits on `provider.Validate` (`datasphere/cmd/datasphere/serve.go:74-82`) [read], and is seen by the replica's restarts and a log count whose "403" is [inf]. A replica not Ready for another reason, such as an image pull, is a finding recorded as its state.
+- **W4.9, (a):** `storage cp` both ways. It shows the installer's path (`storage.go:26-28`) [read, the lane]; the keyholder's path under the uid is W4.13's.
+- **W4.10, (c):** the grant read back. [U]: the next plan reads `present`, shared `missing`, and writes nothing. [B]: `storage deploy --yes` reports `present`, then an unseal, because every `storage deploy` mints a keyholder leaf and rolls both replicas.
+- **W4.11** `toolchain`: the builder and fetcher pinned by digest. §10.7 left it out, and `run` and `build` need both.
+- **W4.12, (d):** the push grant. The plan, or the terminal's notice on [B], prints the add, which the operator runs in Cloud Shell. The plan is not confirmed, and on [B] the build is answered no, so nothing is billed. After at least 10 minutes the repository holds the uid once and no shared principal.
+- **W4.13** `run` of `sdk-demo`. [U]: F, then D within 15 minutes; D's push grant reads `present`. [B]: F; `--confirm` of F refused with `credential_missing`; then `--yes`. Then a secret is set, and alpha's state read. A refused push waits 10 minutes and runs once more; refused again, the record says Artifact Registry did not honour the uid, and W3.4 is skipped.
+- **W4.14** the reader's reads after the run: `world`, `ps` (alpha and beta counted with `grep -o`, correction 4) and `costs`. [B]: `credential_missing` from each.
+- **W4.15, (f),** optional and recommended. From Cloud Shell, `datasphered` is deleted and created again, and a replica restarted; it must fail its start-up bucket check. The record gives its restarts, and a log count whose "403" is [inf] (correction 17). Then `--grant-bucket` in the walk terminal on both branches, and per role the bucket holds the new uid once, the stale uid once (farcast leaves it, A33-8 OQ-E), and no shared principal. Then an unseal, and alpha `present` again.
+- **W4.16,** optional: `git-credential set`, a private `run`, then `git-credential rm`, the Secret gone. The token is piped from a silent read, because `--token-file -` refuses a terminal or `/dev/null` under `--confirm` [ran, the lane's parse check].
+- **W4.17,** one adaptation. The kernel's resizes are counted every 10 minutes, at most 90 minutes after W4.13: `MinSamples` is 120 at a 30-second tick, about an hour for one Pod (`technocore/usage/profile.go:24`) [read]. If chosen at G0a, the resized application's managed fields are read with WP.6's `managers` helper, and their manager and operation pairs recorded: W2's `technocore` half, read-only and free (A39-25, item 11).
+
+**A39-23: W3, W5, W6 and R.**
+- **W3,** on `$INSTANCE` after the run and one adaptation. Generations and ReplicaSets are read before and after each step.
+  - **W3.1, the adapt flag removed:** `kernel deploy --adapt=false`, [U] by plan and `--confirm`, [B] `--yes`. "Without `--adapt`" would keep it, because the kernel's settings are recorded and carried forward (`kernel.go`'s Usage, `:181-187`) [read]. The live args must hold no `--adapt`, and the manager and operation pairs are recorded. A container's args are an atomic list in server-side apply [inf], so this shows that the forced apply took effect, not a field-by-field removal, which stays `TestForcedApplyRemovesAFieldDroppedFromTheManifest`'s (correction 9). `--adapt` still present stops every write, and the walk goes to W5.
+  - **W3.2,** the same `kernel deploy`, unchanged: whether the generation moved, whether a ReplicaSet was made, and, if it moved, the spec paths that differ, paths only.
+  - **W3.3,** `redeploy`, unchanged, by plan and `--confirm` on both branches: the same records for FatLine's Deployment. `redeploy` mints nothing, so this is FatLine's unchanged forced re-apply.
+  - **W3.4,** the second `run`. It is never unchanged, because it mints leaves and resets requests. It records the reset lines per application, counted with `grep -o … | wc -l` and never the time they name, the requests after it, and alpha `present`.
+- **W5.1** reads the cluster's Admin Activity entries into a Cloud Shell file, checking their number against the limit asked for. They are grouped by the principal's class (never an email), by user agent (exactly `farcast`, or other), by method and by body or none, and the counts recorded. **W5.2:** entries with the agent `farcast` from any principal but the installer, and installer entries with another agent, both 0. **W5.3,** if chosen: ADR 0019's Verification steps, in counts and levels. The field names are [unverified].
+- **W6.1** `release --delete-data --yes`. **W6.2** the two reader lines it prints, run by the operator, and the reader accounts back at the baseline's count. **W6.3** every WP.7 count retaken against the cloud, not against release's report. **W6.4** the Org Policy API turned off if the walk enabled it, and [U1]'s change restored or kept as G0a decided. **W6.5** Cloud Shell's walk directory deleted. **W6.6** `instances` lists nothing, then the walk directory deleted. **W6.7** the Git token revoked, if W4.16 ran. **W6.8** [U2]'s project kept or shut down, as G0a decided.
+- **R,** the Results: one table, `Step | Result | Notes`, as the M1 and probe walks have. Its opening sentence gives the date walked, the commit, G0a's and G0b's dates and choices, the instance's hours and its USD by the floor model. A row may hold exits, kinds, counts, states, booleans, rounded minutes, the four manifests' first 12 hex, the sha256 of `SHA256SUMS`, the commit, the GKE version, requests, manager names, spec paths and principal classes; never what T1 bars. Afterwards each record the walk bears on gets a dated note, and walked text stays as walked.
+
+**A39-24: W4 (e) is dropped, and W4.15's same-name refusal stands for it.** §37 left (e) to this runbook. Reasons:
+1. **Cost and exposure.** A second fresh instance for about an hour is about USD 0.1 to 0.2 by the floor model, plus up to USD 0.10 an hour if the free tier waives the cluster fee for one cluster only (ADR 0003 `:26`), [unverified] for this billing account. It adds about 15 minutes of install and release, and a second cluster in the project's Workload Identity pool all that time. (e) also needs a hand-made Pod in that cluster, as `farcast-system/datasphered`, trying on purpose to reach another instance's bucket.
+2. **The placeholder.** A second instance needs a second instance placeholder, which the scrub rule does not allow without the operator's approval.
+3. **The evidence.** The grant names the account by uid alone. Every cluster in a project shares one pool, so another instance's keyholder is a ServiceAccount of the same namespace and name with another uid. W4.15 makes exactly that on `$INSTANCE`'s own cluster: `datasphered` is deleted and created again, and a replica restarted before the re-grant must fail its start-up check, then validate after `--grant-bucket`. The only difference from (e) is the cluster. Google documents the principal per ServiceAccount uid in the project's pool, not per cluster (A33-4), so this check stands for the cross-cluster case [inf].
+4. **What local tests pin.** farcast's own refusal of the wrong cluster: `TestConfirmChecksTheWritersClusterIsThePlans` (`writecommands_test.go:4127`), its storage rows (`:4252`), `run`'s `runConfirmChecksTheWritersCluster` (`runfixture_test.go:507`) and `TestPlanAgainstAReplacedSystemNamespaceIsRefused` (cited by name; the critic's correction 16). And farcast's half of the grant, the uid member and not the shared one: `TestBucketGrantRemovesTheSharedBinding` (`datasphere/internal/providers/gcs/iam_test.go:719`) [read]. None pins Google's half, which (a), (c) and (f) walk.
+
+So the records will say: separation by uid is walked on one cluster, where a replaced account of the same name is refused until granted again, and not across two clusters. Neither (e) nor W4.15 reaches a compromised cluster in the same pool, which can present any uid (ADR 0023 `:217`; the CLI README `:889`). One project per instance stays the full separation.
+
+**A39-25: the runbook's deviations from §37's letter.** The runbook lists them in its opening, and they are accepted here.
+1. W3.1 uses `--adapt=false`, because "without `--adapt`" keeps the recorded setting.
+2. W3.1 is not "the walk's only live stuck-field check": it shows that the forced apply took effect, the args being atomic [inf].
+3. The reader's first `world` read follows `connect`; `ps`, `logs` and `costs` follow the run (W4.13, W4.14). Right after the install `ps` lists nothing, `logs` has no application and `costs` has no kernel. `world`'s `credential_missing` before a reader stays right after the install (W4.2).
+4. (f) and the git-credential step run inside the adaptation's wait, before W3, so the wait bills no idle hour.
+5. W3 adds an unchanged `kernel deploy` (W3.2) beside §37's `redeploy`, and the second `run` records reset lines, not generation.
+6. §37 says that on [B] "every `--plan` step cannot run". The plans that read no cluster still run on [B]: `connect`'s, `redeploy`'s and `git-credential`'s, and `reader grant`'s blocked plan (A23-1).
+7. G0 is split into G0a and G0b.
+8. W4.11, `toolchain`, is added.
+9. (e) is dropped (A39-24).
+10. [U2] is offered, as a form of A22-2's first option.
+11. W2's `technocore` half is an optional free read at W4.17. §37 left it unwalked.
+12. WP.7 gains the Data Access audit record and the installer's roles.
+
+**A39-26: the cost [inf].** G0b asks for under USD 5, §37's figure. By the repository's floor model [read; the totals are inf]:
+- one instance is about USD 0.106 an hour (`floorFull`, `farsight/cli/internal/cli/floor.go`): the modelled cluster line of USD 37 a month (`:21`, unverified), the carrier at USD 0.025 an hour (`technocore/pricing/pricing.go:51`), and five system Pods at the Autopilot rates (`:28-29`);
+- W4.1 to W6.1 is about 4 to 4.5 hours: about USD 0.45 to 0.5;
+- four to six builds, each at most about USD 0.027 (1 vCPU and 2 GiB for at most 1,800 s, `planck/build/build.go:47-53`): at most about USD 0.16;
+- the per-Pod floor without bursting: about USD 0.2;
+- the cluster fee of USD 0.10 an hour, if the free tier does not waive it for this cluster (ADR 0003 `:26`; [unverified] for this billing account): up to about USD 0.45;
+- the registry, image pulls and egress: cents.
+
+The total is about USD 0.7 to 1.5. The IAM objects, the reader's key, the Org Policy API and the grants bill nothing. Dropping (e) saves a second instance-hour or so, and perhaps a second cluster fee.
+
+**A39-27: what the walk settles, and what it does not.** Each item holds only if its step passes; a failure is recorded as the answer the other way.
+- **It settles:**
+  - whether Autopilot's mutations converge under farcast's forced apply: W3.2's and W3.3's unchanged re-applies move no generation and make no ReplicaSet, or the record names the spec paths that moved. This answers §14's risk 3 as §37 restated it;
+  - that farcast's forced apply takes effect under Autopilot's admission (W3.1), not field by field;
+  - the audit's caller identity and user agent for M2's writes, and the levels of the Secret and ConfigMap entries (W5.1, W5.2);
+  - A33-4 (f) and OQ-F: Cloud Storage accepts a uid member, and the keyholder validates and serves under it alone (W4.8, W4.13); `getIamPolicy` returns it byte-equal to farcast's exact match (W4.10); Artifact Registry honours it for a push (W4.12, W4.13) and, on [U], returns it byte-equal; a replaced ServiceAccount reads `missing`, is refused until granted again, and is granted again (W4.15);
+  - R-R10: the installer's conditioned `roles/storage.admin` may read and write the bucket's policy (W4.8). As a by-product, the installer's roles allow the plans' Google reads (A33-1);
+  - A33-20: `kernel deploy` creates `farcast-builder` before any build (W4.7);
+  - the cluster's version (W4.5), and `run`'s reset lines live (W3.4) if an adaptation happened by W4.17's limit;
+  - [U] only: the reader end to end with farcast's scope pair, A22-7's open reader evidence (W4.3 to W4.6, W4.14); three of the six reader plans with their `--confirm`, those of `kernel deploy`, of `storage deploy` with `--grant-bucket` and of `run`'s deploy plan; `build`'s plan, printed and not confirmed; `--grant-bucket`'s terminal consent (W4.15);
+  - [B] only: the reader plans' `credential_missing` refusals live, with nothing written, and `--grant-bucket`'s terminal path where no reader can exist;
+  - both: `connect`'s and `redeploy`'s plan and `--confirm`; with W4.16, `git-credential set` and `rm`, and a private repository fetched and built through them.
+- **It does not settle:**
+  - Cloud Storage's answer to a stale-etag policy write (A33-13, A35-6). No step writes one, and the old optional (g) is not carried;
+  - separation by uid across two clusters, which was (e) (A39-24);
+  - W4 (b), the swap of a shared grant on a live keyholder, pinned against fixtures only;
+  - the kernel's `/scale` write under Autopilot (A31-12): no step reaches the cost limit. W2's `technocore` half beyond W4.17's optional read;
+  - the real-API suite's twelve tests (§38, *What is still not run*), A38-17's preconditions included;
+  - R0, the second host;
+  - `storage key pin` and `storage key rotate` with a keyholder, and their plans; `kernel meter` and `kernel confirm`; `reader grant`'s and `build`'s `--confirm`;
+  - writes through the keyholder under the uid. Only its start-up check and its reads are observed; `objectAdmin` covering writes is [inf];
+  - [B]: the reader end to end, and every reader plan under `--confirm`. [U]: the blocked organization's refusals beyond the paste's stop, walked 2026-11-16;
+  - A22-3, the init script's silenced managed check. It is not fixed, and the walk can meet it;
+  - risk 5 (removed applications keep billing) and risk 7 (two runs racing on the egress policy);
+  - ADR 0019's checklist, unless W5.3 is chosen;
+  - any instance an older farcast wrote: none exists, and no migration remains (M2.9a);
+  - M3a and M3b, M4, M5, and every FarSight client claim.
+
+### Questions for the operator
+
+**A39-28: five questions, and the default the build follows until each is answered.** None is billable to answer. The walk's own choices are G0a's and G0b's (A39-19, A39-21), asked in the session that walks it. These five shape what M2.9b builds.
+1. **W4 (e).** Accept that (e) is dropped, and that W4.15's same-name refusal on one cluster stands for it [inf]? Or approve a second fresh instance in the walk, with its price and a second instance placeholder? *Default:* dropped; the runbook has no (e) step (A39-24).
+2. **Host names in the runbook.** May it name the hosts the earlier runbooks name: Google's token endpoint, the cluster's DNS endpoint domain, the upstream image registries and the public repository's host? *Default:* no; it points to the sections that name them (A39-16).
+3. **[U2].** Offer a project outside the organization at G0a, as a form of A22-2's "allow upload for the project", with its own setup, baseline and W6.8? *Default:* offered (A39-19).
+4. **The real-API suite before M2.9b's commit.** Re-run it on the keeper VM? It costs no cloud, takes about 45 minutes and needs its own approval. *Default:* not run. Every record says the suite as M2.9a left it has not run. If it runs before the commit, those clauses carry its results instead, and §40 records the run.
+5. **The real-API runbook's `:246`.** It names a loopback address and port in an instruction line, which predates M2.9 and breaks the scrub rule. *Default:* left, as walked text; changing it is the operator's call.
+
+### The lanes and the build order
+
+**A39-29: three lanes, sharing no file.**
+- **Records:** Markdown outside `docs/design/` and outside the new runbook. The files are `AGENTS.md`, `PLAN.md`, `README.md`, `farsight/README.md`, `farsight/cli/README.md`, ADRs 0019, 0021, 0022 and 0023, `docs/runbooks/adr-0023-m2-probe-walk.md` and `docs/runbooks/adr-0023-m2-realapi.md` (A39-3 to A39-12). Every link to the new runbook is this lane's, to `docs/runbooks/adr-0023-m2-walk.md`, relative from each file.
+- **Code:** Go comments and `check.sh` comments (A39-15). The files are `readergrant.go`, `clusterref.go` and `planhuman.go` in `cli`; `cluster.go` and `open.go` in `cluster`; `kubetest.go`, `writes.go` and `store.go` in `kube/kubetest`; and `check.sh`.
+- **Runbook:** `docs/runbooks/adr-0023-m2-walk.md` only (A39-16 to A39-27). It writes no other file and runs nothing against a cloud. It may parse-check its farcast lines against a dev build of the tree, offline, as the outline's lane did.
+- Only the orchestrator writes this design. Amendments after the build go into a §40.
+
+**A39-30: the build order and its checks.**
+0. This section, docs only.
+1. The three lanes, in any order.
+2. The checks, all offline. Every go command runs with `GOWORK=off GOTOOLCHAIN=go1.27.4 GOPROXY=off GOFLAGS=-mod=vendor`, and every `FARCAST_*` variable unset.
+   - Code: `go build` and `go vet` of `./farsight/cli/...`, with and without `-tags=integration,walk,realapi`; the pinned `gofmt -l` of `cli`, `cluster`, `kube` and `kube/kubetest`, never the repository's root; `golangci-lint` as `check.sh` step 5 runs it; and a diff check that every changed line in a `.go` file or in `check.sh` is a comment.
+   - Records and the runbook: every link the sweep adds resolves to a file in the tree; `git diff --check`; and a scrub of the whole diff for addresses, ports, host names, placeholders other than A39-16's, and times of day.
+3. A read-only review, each finding put to a skeptic. Fixes, and anything else that changes, go into §40.
+4. `./check.sh` in full on the final tree. It reads the CLI README in three tests. Its result goes into the commit message and §40.
+
+No mutation test is needed: the code lane changes comments only. Commit only when the operator asks.
+
+**The size [inf]:** 43 record lines edited in 11 files, about 57 comment lines written in 9 code files, and one new runbook of about 600 to 800 lines. One build session of about 3 to 5 hours with `check.sh`.
+
+### Superseded
+
+§39 supersedes, where they differ:
+- **§10.7 and §37's *The walk*:** by A39-16 to A39-27. §10.7's "written in M2.9" is M2.9b's.
+- **§11's M2.9 list** (`:2617-2621`): ADR 0023's M2 row is `:319`, not `:308`, and `:34`'s count is A39-5's.
+- **§37's *Records*,** its last list (M2.9b's sweep), **§38's open item for M2.9b** (`:8549`) and **A38-17's last paragraph:** by A39-3 to A39-12.
+- **§38's *What is still not run*,** its walk bullet: once M2.9b is built, the walk is written, 2026-11-22, and has not run.
+- **The lanes' drafts,** where A39-1, A39-7 or A39-9 change them.
+
+M2.9b runs nothing billable, and no walk. It runs the real-API suite only if the operator answers question 4 with a yes.
+
+## 40. M2.9b's build and review (2026-11-22)
+
+M2.9b was built on 9d97958's tree by §39's three lanes: the records, the code comments and the walk's runbook. A read-only review followed, and each finding was put to a skeptic. A fixer then applied the findings that survived, with the skeptic's corrected fixes. This section records what the lanes did beyond §39's letter, what the review changed, and what is still not verified. It wins over §39 where they differ. Line numbers are in the tree as M2.9b leaves it, unless an entry says 9d97958.
+
+### The build lanes' deviations
+
+**A40-1: `connect` before `reader grant` (the runbook's deviation 13).** The runbook's order is W4.4 `connect`, W4.5 `reader grant`, and W4.6 the Kubernetes version and the reader's first reads. A39-22 had `reader grant` at W4.4, the version at W4.5 and `connect` at W4.6.
+- *Why* [read]: the reader's RBAC is a Role and RoleBindings in `farcast-system` and no Namespace (`renderReaderRBAC`, `readerrbac.go:117`; `readerBoundNamespaces`, `:96`, always binds `farcast-system`). `install` does not create `farcast-system`. `connect` does, through FatLine's workload template (`fatline/deploy/deploy.go:314`). So on a fresh instance a grant before `connect` would fail its apply [inf: the namespace's 404]. Phase 1's step 7b already says so in its step 4.
+- A39-22's W4.4 to W4.6 are superseded by this order. A39-27's reader range "W4.3 to W4.6" is now "W4.3, W4.5, W4.6, W4.14", and its "the cluster's version (W4.5)" is W4.6, as the runbook's *What this walk settles* has them.
+- No record outside this design cites W4.4, W4.5 or W4.6 [ran: `git grep`].
+
+**A40-2: W3.4 on [U] counts `application_reset` facts (the runbook's deviation 14).** A39-23's count of "adapted by the kernel at" in a JSON deploy plan would always be 0.
+- A JSON plan carries `application_reset` facts in the state `adapted` (`plan.ApplicationResetFact`, `plan/facts.go:427`) [read].
+- The review's reset line (`appState.resetLine`, `runreset.go:197`, through `review.printResets`, `runreview.go:106`) is printed only by an interactive or `--yes` run, to stderr [read].
+- So on [U] the runbook counts the D plan's facts by application and state with a helper, `resets`, tested offline on `testdata/plan/run_deploy.json` [ran, the runbook lane]. On [B] it counts the review lines in the `--yes` run's stderr, as A39-23 says.
+
+**A40-3: no Q10 in the runbook.** The build's task asked the runbook's top to say that it runs only with the operator's approval, by the label Q10. A39-2 and A39-16 bar that label outside this design. So the status line says the walk needs "the operator's own approval in the session that walks it: the choices at G0a, and the yes to spend at G0b". Q10 appears nowhere in the runbook [ran].
+
+**A40-4: W4.1 checks that a registry is recorded.**
+- `connect --plan` refuses a record that names no registry (`msgNoRegistryRecorded`, `fatline.go:588`) [read].
+- `install` only warns when it cannot ensure one (`installCommand.ensureRegistry`, `install.go:258`) [read].
+
+So W4.1 counts the record's `registry:` line. With none, that is a finding, and W4.4 runs as `connect --yes`, which ensures it.
+
+**A40-5: the helpers that replace `kinds`.** A39-20's WP.2 named three helpers: `digest`, `kinds` and `grant`. A generic count of `"kind":"…"` is wrong on these documents. `world` carries kinds on its lines and alerts (`worlddoc.go`), and every plan carries the top-level `"kind":"plan"` [read, the runbook lane].
+- `walk.zsh` holds `digest`, `grant` and seven narrower helpers: `blocked`, `errkind`, `sections`, `reader`, `writes`, `resets` and `apps`.
+- Each was tested offline against the `plan` and `world` vectors or a crafted document [ran, the runbook lane].
+- `sections` is anchored on `"sections":{`, because an unanchored first version also matched other objects in the world vectors.
+
+**A40-6: W5.2 excludes the reader too.** A39-23's W5.2 counted the entries with the agent `farcast` from any principal but the installer. The reader's five SelfSubjectAccessReview creates also carry that agent, and whether Admin Activity logs them is [unverified]. So W5.2 counts the entries with the agent `farcast` by a principal that is neither the installer nor the reader. W5.1's classes also include the operator's own account, for W4.15's hand steps.
+
+**A40-7: WP.4 counts and does not print.** The agent's WP.4 lines count (`command -v … | wc -l`, `env | grep -ci …`). Printing the matches would show a matched variable or path. The operator's own walk terminal keeps the plain `command -v`. WP.3's "every line OK" is likewise the `OK` count checked against `SHA256SUMS`' line count.
+
+**A40-8: smaller choices within §39's rules** [read, the runbook lane].
+- W4.8 [U]: the operator types the `--confirm` with `-o json` into `w4-8.json`, so the agent can read `bucket_grant`. On [B], the terminal path's human result has no grant state (`deployResult.Human`, `storagedeploy.go:1307`), so the operator records whether any grant commands were printed.
+- W4.11: the operator reads and accepts the two digests the tag refusal prints, before the agent mirrors them. The refusal is a usage error, exit 2, that lists the builder first and then the fetcher (`toolchainCommand.settle`). The digests are taken from the step's stderr by pattern.
+- W5.1: the Admin Activity log's name is not written, because it holds a Google domain. The operator types it from Google's pages.
+- WP.7 and W6.4 name the APIs by reference to phase 1's and phase 3's step 1 and the probe walk's P7.6, because the service names are host names.
+
+**A40-9: PLAN.md `:448`'s rider says "ADR 0023 M2.9b".** A39-9 quotes it as "*(2026-11-22, M2.9b: that is, …", but A39-2 says that a rider outside ADR 0023 says "ADR 0023 M2.9b". The records lane followed A39-2, as the sibling rider on `:447` does. The rest is A39-9's text. Settled here: A39-2 governs, and the rider stays.
+
+**A40-10: `isTerminal` counts `/dev/null` as a terminal.** `isTerminal` (`prompt.go:14`) is true for any character device on stdin, `/dev/null` included [read]. So an agent line run with stdin from `/dev/null` that would ask a question gets past a "needs a terminal" refusal. It then reads end of input ("input closed") and stops. That is safe, and the code is unchanged. The runbook's T5 says so, and every agent line passes `--yes` or `--confirm`, or asks nothing [read, the runbook lane]. `--token-file -` under `--confirm` still refuses a terminal or `/dev/null`, so W4.16 pipes the token (A39-22).
+
+**A40-11: the code lane's line moves.** Each A39-15 block replaced its lines whole, so the lines below a longer block moved down. With the review's fixes (A40-13), the net moves against 9d97958 are:
+- `readergrant.go`: +3 below `:92`;
+- `clusterref.go`: +2 below `:259`, and +4 below `:325`;
+- `cluster.go`: +2 below `:12`, and +5 below `:49`;
+- `open.go`: +1 below `:92`;
+- `kubetest.go`: +2 below `:260`;
+- `store.go`: +3 below `:114`;
+- `writes.go`: +1 below `:416`;
+- `check.sh`: +1 below `:321`;
+- `planhuman.go`: none.
+
+A39-2's rule binds the records, not the code. No record cites these lines at HEAD [ran: `git grep`]. ADR 0023 `:31` to `:59` cite `cluster.go` as at 6b62d3f, as its `:34` rider says. ADR 0021 `:104` cites it as at its acceptance tree, as its `:91` rider says. ADR 0023 `:100` and `client_test.go:199` are untouched. §39's own citations of these files are at 9d97958, as its preamble says.
+
+### The review
+
+**A40-12: the lenses.** Four lenses appear in the surviving findings: records, runbook-commands, runbook-safety and code-comments. Fourteen findings survived. The list of refuted findings given to the fixer was empty, so none is recorded here.
+
+**A40-13: what survived, one line each, and what was applied.** Every one was applied, as the skeptic corrected it.
+- **R1 (records, nit):** AGENTS.md `:48` and ADR 0023 `:3` said that the six plans' cluster reads run as the reader, unscoped, against AGENTS.md `:70` and PLAN.md `:457` as §39 scoped them. Both now say "under `--plan` and `--confirm`" (`consent.go:142-149`) [read]. The edits are in place and add no line (A40-14).
+- **F1 (runbook-commands, defect):** W4.2 expected `credential_missing` for `spend`. `world` reports `kernel_absent` from the record first (`gatherer.spend`, `world.go:502-505`) [read; ran by the reviewer on a crafted record]. W4.2's Expect and Stop now say so. This also corrects §37's `:8339` and A39-22's W4.2.
+- **F2 (runbook-commands, defect):** a sealed keyholder replica is never Ready, so every "until both replicas are Ready" before an unseal never ended. A redeploy also replaces `datasphered-1` first, and waits there until it is unsealed. The evidence [read]: `datasphere/deploy/deploy.go`'s readiness probe and its `updateStrategy` note, and `storagedeploy.go`'s rollout note and its restart fact. `keyholder` gains a STARTED column, and W4.8 waits for both replicas to start. W4.10 [B] and W4.15 wait for `datasphered-1`, unseal, wait for `datasphered-0`'s replacement, and unseal again. This corrects A39-22's W4.8, W4.10 and W4.15.
+- **F3 (runbook-commands, defect):** W3.2's and W3.3's "before" spec snapshot depended on a result known only after the step. Each step now writes `specpaths` before and after it, `tc.before` and `tc.after` for the kernel and `fl.before` and `fl.after` for FatLine. Only the diff's paths are recorded.
+- **F4 (runbook-commands, nit):** `connect --confirm` dials the carrier before it exits, for up to `carrierWarmup` (`connect.go:94`) [read]. So WP.5 and W4.4 allow it during W4.4, not after.
+- **F5 (runbook-commands, nit):** `logs` refuses a name that two namespaces share (`logs.go:151`) [read], and the private run may add another `alpha`. W4.13's [U] line now names `--namespace sdk-demo`.
+- **walk-g0b-premade-changes (runbook-safety, defect):** G0b listed three changes as ones the walk creates, but WP.7 and WP.8 had already made them, and a no at G0b had no way back. The three are marked as already made. A no now runs W6.4, W6.5, W6.6 and W6.8, and ends the walk.
+- **walk-g0a-gitcred-audit-retention (runbook-safety, defect):** G0a said only that the provider can read the Secret while it exists. It now says that Admin Activity keeps the Secret's name and the private repository's address, ref, manifest path and each built commit for 400 days, which W6 cannot remove (ADR 0019).
+- **walk-w416-external-unreviewed (runbook-safety, defect):** no step had a human approve the private manifest's external declarations before the agent confirmed its deploy plan.
+  - At G0a the operator reads and approves that manifest.
+  - On [U], the operator reads D's `external` lists in the walk terminal before the agent confirms D.
+  - On [B], G0a's approval stands for the review that the `--yes` run prints to stderr.
+  - WP.9 checks that `sdk-demo`'s manifest declares no external host.
+- **walk-g0b-teardown-omits-retained (runbook-safety, nit):** G0b's teardown did not say what W6 cannot remove. It now names 400 days of Admin Activity, 30 days of logs by default and 24 months of metrics (`release`'s Usage; ADR 0019).
+- **walk-t4-relay-too-narrow (runbook-safety, nit):** T4 let the operator relay less than the steps record. It now also lists the GKE version, rounded minutes, requests, manager and operation pairs, spec paths, audit levels and methods.
+- **walk-days-placeholder (runbook-safety, nit):** W4.3's `--days <N>` was a one-letter placeholder, against A39-16. The value is now described in words.
+- **CC-1 (code-comments, defect):** `cluster.go`'s `Apply` doc said "every stream rendered on that day's tree". 2026-11-19 is also the date of M2.8's unapplied streams. It now says "on M2.7b's tree, before its commit", the real-API runbook's words for Run 2's tree.
+- **CC-2 (code-comments, nit):** the package doc's N3 block ended in a 48-column line. Its lines `:10` to `:14` are rewrapped with the words unchanged, and the paragraph keeps its five lines.
+
+**A40-14: where the fixes depart from §39.**
+- R1 departs from A39-4's and A39-8's "the rest of the line stays", scoped as A38-15 REC-4 and A39-8's `:70`. Each file gets one in-place edit and adds no line (A39-2).
+- CC-1 changes A39-15's N2 block. CC-2 departs from A39-15's "`:9` onward stays" in layout only, and `cluster.go` keeps its 339 lines.
+- F1, F2 and the T4 fix correct A39-22's W4.2, W4.8, W4.10 and W4.15 and A39-18's T4. The runbook's opening gains a deviation 15 that names them. The fixer added it beyond the findings' fixes, so that the runbook's list stays complete.
+- The runbook's `INSTANCE=<name>` in T5, WP.4 and WP.6 is left as it is. It is a word, which the skeptic called a lesser matter than `<N>`.
+
+### Questions and what is not verified
+
+**A40-15: A39-28's five questions, as the operator settled them on 2026-11-22.** Four of the five are settled, each as its default:
+1. W4 (e): dropped, by the operator's answer. W4.15's same-name refusal on one cluster stands for it [inf].
+2. Host names: not put to the operator, because the standing scrub rule settles it. They are not written, and the runbook points to the sections that name them.
+3. [U2]: not settled. Asked whether G0a should offer a project outside the organization, the operator asked instead whether the reader could take a key the provider creates and the operator downloads, as the installer's is, in place of an uploaded one. The aim is not to depend on what a provider closes by default, with the same procedure on every provider. Until that is decided, the runbook keeps [U2] offered at G0a, the build's default.
+4. The real-API suite before M2.9b's commit: not run, by the operator's answer. Every record says that the suite as M2.9a left it, twelve tests, has not run.
+5. The real-API runbook's `:246`: left as walked text, by the operator's answer.
+
+**A40-16: what is not verified.**
+- Every Cloud Shell spelling in the runbook. This includes the review's additions, `keyholder`'s STARTED column and `specpaths`' before and after files, besides the runbook lane's list: `--dns-endpoint`, the bucket label filter, `jq` in Cloud Shell, `count`'s `--format` on every list, the fleet and GKE Enterprise check, the expiry-hours check, the folder and organization audit reads, the audit's field names and the Admin Activity filter.
+- The uid member, in the bucket's and the repository's policies. It is [unverified] until the M2 walk.
+- The real-API suite as M2.9a left it, twelve tests. It has not run against a real server (A40-15, question 4).
+- The walk itself. It is written and has not run, and it needs the operator's approval.
+- The full `./check.sh` on the final tree. It runs next (A39-30 step 4), and its result and time go into the commit message. Neither is known as this is written.
+
+**A40-17: the fixer's checks, all offline.** Every go command ran with `GOWORK=off GOTOOLCHAIN=go1.27.4 GOPROXY=off GOFLAGS=-mod=vendor`, and with no `FARCAST_` variable or `GOEXPERIMENT` set.
+- `go build ./...` and `go vet ./...` passed, and so did `go vet` of `./farsight/cli/...` with `-tags=integration,walk,realapi`.
+- The pinned `gofmt -l` of `cli`, `cluster`, `kube` and `kube/kubetest` printed nothing.
+- Every changed line in a `.go` file is a `//` comment, and every changed line in `check.sh` is a `#` comment.
+- `go test -count=1` passed for `cluster` and `kube/kubetest`, and so did `cli`'s README-reading tests.
+- In the records, `git diff HEAD --numstat` shows each file's adds equal to its removes.
+- `git diff --check` passed, on the runbook too.
+- Every link in the runbook and in the records' changed lines resolves, anchors included. §39's quoted riders hold links relative to the files they go into, not to this design.
+- A scrub scan of every added line and of the whole runbook found no address, port, home path, account name, uid, key id, token byte or time of day. Its host-name hits are in text that the in-place edits kept from HEAD, and in Kubernetes label keys. The placeholders are `$INSTANCE`, `$PROJECT` and `$TOKEN`, besides the shell's own `$HOME`, `$TMPDIR` and `$PWD`.
+- `zsh -n` passed on the runbook's `walk.zsh` block, which the review did not change, and `bash -n` on its Cloud Shell helpers.
