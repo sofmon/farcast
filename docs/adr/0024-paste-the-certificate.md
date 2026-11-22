@@ -1,0 +1,668 @@
+# ADR 0024 — The Operator's Cloud Credential: Paste the Certificate the Installer Shows
+
+**Status:** Accepted in part (2026-11-22) by the operator; everything else proposed the same day. What the operator decided on 2026-11-22, and only that, is accepted:
+- **the procedure** (decision 1): the operator's cloud credential is the same on every provider, *paste the certificate the installer shows*. The installer (the `farcast` CLI today, the FarSight app later) makes its own keys on the device and shows public certificates. A human creates the identity once, in the provider's console or its cloud shell, and pastes them in. Nothing secret leaves the device;
+- **the fallback rule** (decision 2): a provider-made secret is used only where the certificate route is closed, and then it is named and consented;
+- **M3a first** (decision 3): [ADR 0023](0023-one-download-farcast.md)'s M3a, the identity probe, is brought forward, before M2's billable walk;
+- **the order** (decision 11): M2's billable walk runs on its own after M3a, then M3b. There is no merged walk;
+- **the projects** (decisions 3 and 11): M3a and M2's walk use a project in the operator's own organization, and a project with no organization comes later, when most of FarSight is ready. So M2's walk takes its branch [B]: key upload is blocked there, the installer's Google-made key is an exception to this ADR that the operator approves at the walk's G0a, time-boxed and deleted at teardown, and the reader is not walked in M2;
+- **who enrols** (decision 9; ADR 0023 *Choices* 5): human only. Every device addition, renewal and revocation is a human's paste, and no FarCast identity can enrol devices.
+
+Every other decision, and every specific of an accepted one that the list above does not name, is proposed, with its default under *Choices left to the operator*, and gains a dated note here when the operator answers it. Google's mechanism, X.509 federation, is gated on M3a, which has not run. The AWS and Azure mappings are gated on their own probes, which are defined and not run. Nothing in this ADR is built or walked, and no cloud call was made for it. The design behind it is [`docs/design/adr-0024-design.md`](../design/adr-0024-design.md) (v3, written 2026-11-22 against 5ef5ee8). It carries M3a in full, and this ADR names its decisions as "the design's D1" to "D11". Tags: **[read]** read in the repository at 5ef5ee8, or in its vendored source; **[ran]** run locally and offline on the dev Mac with go1.27.4, against loopback fakes only; **[doc: KEY]** a page listed under *Sources*, fetched 2026-11-22; **[inf]** inference; **[unverified]** not settled by any source read.
+
+**Date:** 2026-11-22
+
+**Relates to:**
+- **Answers** [ADR 0023](0023-one-download-farcast.md) *Choices* 1 in its procedure, *Choices* 5, and the options its 2026-11-16 note at :119 left open (the M2 design's A22-2).
+- **Amends,** by the operator's decisions of 2026-11-22, ADR 0023's milestone order (M3a before M2's walk, M2's walk on its own, then M3b), the organization of M3a's and M2's walk's project, and M2's walk's branch [B]; and **proposes to amend** ADR 0023 decisions 5 and 7, M3a's content, W-FED in M2's walk, its Phasing rows for M3b and M5, and its revisit trigger on M3a. Each amendment is a dated note at the end of ADR 0023's own line or, in a Phasing table row, at the end of the cell it amends, as ADR 0023's earlier Phasing notes are.
+- **Keeps** ADR 0023:115-117's "reads never mint an admin token", by key separation as well as by code.
+- **Departs from** [ADR 0007](0007-instance-owned-image-registry.md) decision 2's "no hand-rolled JWT, signing, or token refresh", if decision 8 is accepted.
+- **Uses** [ADR 0020](0020-instance-pki-ecdsa-p256.md)'s P-256, and **keeps** ADR 0020's instance PKI apart from cloud identity.
+- **Constrained by:**
+  - [ADR 0019](0019-what-the-cluster-tells-its-provider.md): what the provider logs, Admin Activity always on for 400 days (:29);
+  - [ADR 0018](0018-thin-device-storage.md):33: a thin device never holds a cloud credential;
+  - [ADR 0021](0021-farsight-native-client.md) decision 7: a shared contract with conformance vectors, which the Swift leaf template follows.
+
+---
+
+## Context
+
+### What `farcast` uses today
+
+- **The writer is a Google-made key.** Phase 1's step 2 downloads it ([`phase-1-validation.md:85-86`](../runbooks/phase-1-validation.md)), and `install --credentials` stores it ([`install.go:58`](../../farsight/cli/internal/cli/install.go), `:167-170`) [read]. Google made the private key, and it travelled as a download. It does not expire (ADR 0023:290). One installer serves a whole project, so its token can write every cluster in it (ADR 0023:113). Since ADR 0023's M2.7 every cluster write runs as that account, in-process, and so does every read a writing command makes outside a plan the reader reads (ADR 0023:3).
+- **The reader is already a certificate paste,** in its service-account-key-upload form. `farcast reader init` makes an RSA-2048 key on the device, with a `CN=unused` certificate valid for up to 3650 days ([`kube/readerkey.go:14-72`](../../farsight/cli/internal/kube/readerkey.go)). The human uploads only the certificate, from Cloud Shell ([`readerinit.go:395-432`](../../farsight/cli/internal/cli/readerinit.go)) [read]. The account's name is `farcast-reader-` and eight hex characters of the instance name's hash ([`reader.go:20-27`](../../farsight/cli/internal/cli/reader.go)), and its display name names the product and the instance (`readerinit.go:412-414`) [read].
+- **Where no reader can exist.** The operator's own organization blocks key upload and allows key creation (ADR 0023:119's 2026-11-16 note; [`adr-0023-m2-probe-walk.md:337`](../runbooks/adr-0023-m2-probe-walk.md)). There no reader can be set up, so `world`, `ps`, `costs`, `usage` and `logs` read no cluster, and six plans are refused.
+- **Reads never mint an admin token** for the cluster (ADR 0023:115-117). The reader's key cannot write, and `world` never opens `credentials.yaml` [read]. Some reads still mint the installer's token: plans' registry lookups; the project-number and IAM-policy reads of `storage deploy`'s, `build`'s and `run`'s deploy plan; and `storage ls`, `storage usage`, `storage cp`'s downloads and `secret ls` (ADR 0023:118, :258-259).
+- **ADR 0023 decision 5** (ADR 0023:153-176) proposed the replacement: a device P-256 key signing an ES256 JWT, an uploaded JWKS and a `.invalid` issuer, through Workload Identity Federation, impersonating a per-instance service account. It is gated on M3a, which has not run.
+- **M2 is built and not walked** beyond the 2026-11-16 probe walk. Its billable walk is written ([`adr-0023-m2-walk.md`](../runbooks/adr-0023-m2-walk.md)) and has not run.
+
+### What the providers offer (researched 2026-11-22)
+
+Every page was fetched 2026-11-22, and each is listed again under *Sources*. No cloud call was made.
+
+**Google.**
+- **Service-account keys are closed by default in newer organizations.** Organizations created on or after 2024-05-03 block key creation and key upload, and restrict policy members to the organization's domain ([SBD](https://docs.cloud.google.com/resource-manager/docs/secure-by-default-organizations); [DRS](https://docs.cloud.google.com/organization-policy/domain-restricted-sharing)). Neither `iam.workloadIdentityPoolProviders` nor its managed twin is in that set [doc: SBD].
+- **X.509 Workload Identity Federation** has been GA since 2025-05-07 ([RN](https://docs.cloud.google.com/iam/docs/release-notes)). An X509 provider holds a trust store of CA certificates; the console's X509 form has a Trust anchors field that takes them as PEM ([X509](https://docs.cloud.google.com/iam/docs/workload-identity-federation-with-x509-certificates)).
+  - The device proves possession by mutual TLS at STS's mTLS token endpoint. The subject token type is `urn:ietf:params:oauth:token-type:mtls`, and the subject token is a JSON list of base64 DER certificates whose first item must be the handshake's leaf [doc: X509]; ([STS](https://docs.cloud.google.com/iam/docs/reference/sts/rest/v1/TopLevel/token)).
+  - It takes P-256 and P-384, and RSA from 2048 to 4096 bits. Its limits table gives 3 trust anchors and 10 intermediate certificates per trust store, and a 390-day maximum leaf lifetime; a certificate valid for longer stops working [doc: X509]. Whether that rule also binds anchors is not stated.
+  - The REST reference states no maximum, and allows one CA certificate in each trust anchor's PEM ([TS](https://docs.cloud.google.com/iam/docs/reference/rest/v1/TrustStore)).
+  - The page mentions no CRL or OCSP. Its mapping attributes include `issuer.dn.cn` and `subject.dn.cn`, and Google advises a unique, unchanging subject [doc: X509].
+- **OIDC with an uploaded JWKS,** ADR 0023 decision 5's route. The console takes the JWKS only as a file upload, and a subject JWT is a bearer credential until its `exp` ([OIDC](https://docs.cloud.google.com/iam/docs/workload-identity-federation-with-other-providers)). An upload replaces every key already uploaded ([PROV](https://docs.cloud.google.com/iam/docs/reference/rest/v1/projects.locations.workloadIdentityPools.providers)), so every key rotation is a human step.
+- **Impersonation and GKE.** GKE's authentication page describes federation as credentials that impersonate service accounts, and requires `userinfo.email` ([GKEAUTH](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/api-server-authentication)). GKE's RBAC page lists no pool principal among its subject kinds ([GKERBAC](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/role-based-access-control)). GKE does not log the delegating identity; services that log delegation put it under `serviceAccountDelegationInfo` in Admin Activity ([AUD](https://docs.cloud.google.com/iam/docs/audit-logging/examples-workload-identity)).
+- **What the IAM policy history keeps.** A `SetIamPolicy` Admin Activity entry carries the binding delta with its member ([POLHIST](https://docs.cloud.google.com/iam/docs/review-iam-policy-history); [AUDLOG](https://docs.cloud.google.com/logging/docs/audit/understanding-audit-logs)).
+- **Organization policy can close federation:** by a custom constraint on trust anchors, available since 2026-04-07 ([CUS](https://docs.cloud.google.com/iam/docs/workload-identity-federation-custom-constraints); [doc: RN]); by `iam.workloadIdentityPoolProviders`, whose documented values are issuer URIs ([MGMT](https://docs.cloud.google.com/iam/docs/manage-workload-identity-pools-providers)); or by `iam.allowedPolicyMemberDomains` [doc: DRS].
+- **Limits and price.** IAM is offered at no additional charge, and no page prices STS or impersonation ([PRICE](https://docs.cloud.google.com/iam/docs/billing-questions)). `google.subject` is at most 127 bytes, and the number of providers per pool is undocumented ([QUOTA](https://docs.cloud.google.com/iam/quotas)). A deleted pool's or provider's ID stays reserved for about 30 days [doc: MGMT, PROV].
+- **Embedded sign-in.** Google blocks Google Account sign-in from embedded browser frameworks ([WV-2020](https://developers.googleblog.com/2020/08/guidance-for-our-effort-to-block-less-secure-browser-and-apps.html); [WV-HELP](https://support.google.com/accounts/answer/7675428)), and its OAuth policy names WKWebView among the web views that do not comply ([WV-2021](https://developers.googleblog.com/en/upcoming-security-changes-to-googles-oauth-20-authorization-endpoint-in-embedded-webviews/)). Whether the Cloud console's own sign-in fails inside a macOS WKWebView is [unverified].
+
+**AWS.**
+- **IAM Roles Anywhere** takes a pasted CA certificate as a trust anchor, an "External certificate bundle" ([RA-START](https://docs.aws.amazon.com/rolesanywhere/latest/userguide/getting-started.html)). The anchor must be a CA with Certificate Sign, and the end entity not a CA, with Digital Signature ([RA-TRUST](https://docs.aws.amazon.com/rolesanywhere/latest/userguide/trust-model.html)). `CreateSession` is signed with the leaf key, a data signature with no TLS identity ([RA-SIGN](https://docs.aws.amazon.com/rolesanywhere/latest/userguide/authentication-sign-process.html)). An account holds 50 trust anchors, adjustable ([RA-QUOTA](https://docs.aws.amazon.com/general/latest/gr/rolesanywhere.html)). Whether it accepts P-256 for FarCast's profile is [unverified].
+- **Accounts from "Sign up for AWS (new)"** have Roles Anywhere closed by AWS-managed SCPs ([AWS-SCP](https://docs.aws.amazon.com/accounts/latest/reference/scps-and-rcps-for-projects.html)) until "Activate advanced AWS features", which cannot be undone and removes the account's spend limit ([AWS-ADV](https://docs.aws.amazon.com/accounts/latest/reference/activate-advanced-features.html)).
+
+**Azure.**
+- **Entra certificate credentials** are RSA only, uploaded per app registration, with no CA-level trust. The client assertion carries `x5t#S256` ([ENTRA-CERT](https://learn.microsoft.com/en-us/entra/identity-platform/certificate-credentials); [ENTRA-RSA](https://learn.microsoft.com/en-us/entra/identity-platform/howto-create-self-signed-certificate)). A tenant can cap a certificate's lifetime ([ENTRA-POL](https://learn.microsoft.com/en-us/entra/identity/enterprise-apps/configure-app-management-policies)).
+- **Entra federated identity credentials** need a public HTTPS issuer and take RS256 only ([ENTRA-FIC](https://learn.microsoft.com/en-us/entra/workload-id/workload-identity-federation-create-trust)).
+- **Service-principal sign-in logs** keep the certificate's thumbprint, key ID, address, ASN and user agent, for 7 days on Free and 30 on P1 or P2 ([ENTRA-LOG](https://learn.microsoft.com/en-us/azure/azure-monitor/reference/tables/aadserviceprincipalsigninlogs); [ENTRA-RET](https://learn.microsoft.com/en-us/entra/identity/monitoring-health/reference-reports-data-retention)).
+
+### The offline evidence
+
+The client mechanics ran offline on the dev Mac, in session prototypes that are not in the repository [ran]:
+- `proto/`: the mutual-TLS exchange and `generateAccessToken`, 224 non-blank lines, passing `go test -race` against a loopback server that requires a client certificate.
+- `twoanchor/`: decision 4's profile exactly, against loopback fakes of STS's exchange and IAM Credentials. Its `perrole_test.go` walks one provider per role:
+  - each role's leaf exchanges at its own provider and impersonates its own service account only;
+  - a chain made by the reader anchor's key and carrying the writer's ID is refused at both per-role providers, even by a verifier that ignores path length. The same chain reaches the writer's account when both anchors share one provider;
+  - a substituted subject token, a missing client certificate, a foreign CA, another device's leaf or ID, and an expired or not-yet-valid leaf are refused;
+  - an anchor PEM is 644 or 648 bytes, and a leaf PEM 635 or 639, over twenty runs.
+
+This is a fake, not Google. It shows the client mechanics and the logic of the trust store and the condition only. Every Google, AWS and Azure behaviour in this ADR is documented or inferred, not observed.
+
+### The operator's install vision
+
+The app shows three surfaces side by side: the provider's console, a step-by-step guide, and a paste-and-drop surface. A non-technical person gets through by following the guide; a professional pastes. The operator's decisions of 2026-11-22, listed under *Status*, make that the one procedure on every provider. The rest of this ADR is the design that follows from them, and it is proposed.
+
+---
+
+## Decisions
+
+**1. The procedure: paste the certificate the installer shows, the same on every provider.** *Accepted 2026-11-22.* Its specifics are *proposed*. (The design's D7.)
+- *The four steps,* on every provider:
+  1. the installer makes its keys on the device and shows the certificates and a guide;
+  2. a human creates the identity once, in the provider's console or by one paste of public material into its cloud shell, pasting those certificates in;
+  3. the human pastes back one non-secret line, only where the installer cannot learn it;
+  4. `farcast` verifies, by minting a token and making one harmless read, and reads back what was created (decision 9).
+- *The three surfaces:* the provider's console, the guide, and the paste-and-drop surface, which shows the certificates with Copy buttons and takes the line back. The app never scripts the console page. *Proposed:* if Google refuses sign-in in an embedded web view, the console surface is the system browser beside the app. A no-cost check settles it before the GUI install flow is built; it is not an M3a item (*Choices* 10).
+- *Google, in the CLI (proposed):*
+  - `farcast install --name $INSTANCE --project $PROJECT …` takes no `--credentials`. It first refuses a name already recorded, a local read, before it makes any key. That is `install.go:114-121`'s refusal, moved ahead of `planck.Open` and `Validate` (`:105-112`), which then need the credential the paste makes. It refuses a name with a pending install too, naming `--coordinates` to resume it and `--abandon`. Then it makes the device's keys in a pending directory at 0700, outside any instance record. It shows the anchor PEMs, the setup block with its SHA-256, and the console steps, and makes no cloud call until the line comes back. `--setup-only` prints and exits, and `--coordinates` takes the line back later.
+  - **The setup block** holds only public material. It names neither FarCast nor the instance, with one exception: the writer's storage condition names `farcast-` buckets, an existing mark (*What each provider sees*); that condition gets a title drawn at random per instance, from the alphabet a condition title allows, so no fixed word repeats across FarCast projects, and no description. Its shape follows `readerinit.go:378-432` (`sh -s` reading a here-document, `set -eu`, single-quoted values checked to a narrow alphabet, a bounded retry for IAM calls), with two changes: a neutral here-document tag, where readerinit's names FarCast, and a y/N on the project it names, read from the terminal. In order it enables the APIs; prints decision 9's two Workload Identity counts, and if either is not 0 asks y/N to go on, from the terminal, so a no stops it before it creates anything; creates the pool if absent; creates one X509 provider per role, each from a temporary trust-store file, the YAML document Google's X509 provider reads, holding that role's anchor alone and no intermediate, its PEM in Google's one-line form, each newline written `\n` inside a double-quoted scalar [doc: X509], with decision 5's mapping and that role's condition; creates the three service accounts, the reader's, the writer's and the nodes' (decision 9), with no display name, and grants their roles; binds each role ID's principal on its own account; and prints one line, the coordinates.
+  - **The coordinates,** in words: the project's ID and number, the pool's ID, the device's provider IDs (one per role), and the three accounts' IDs. STS's audience needs the project's number, and the installer holds no credential that could read it. If M3a shows the audience accepts the project's ID (its I5), the line becomes optional whenever `--project` was given. Plans still need the number, for the uid principals (`buildgrant.go:167-178`; `storagedeploy.go:1152`), so `install` then reads it once, as the writer, after verification and under its own consent, and stores it in the record (decision 7) [inf].
+  - The once-per-project part folds into the block, so it is idempotent. With one project per instance, the recommended layout, that is one paste per instance.
+  - **The console route,** about 40 actions for a writer-capable device [inf]: enable the APIs; create the pool; one X509 provider form per role, pasting that role's anchor into Trust anchors and setting the mapping and condition from copy buttons; create the three accounts and grant their roles, the writer's `roles/iam.serviceAccountUser` on the node account alone; grant `workloadIdentityUser` to each role's principal; copy the project's number back. This route makes no Workload Identity check (decision 9); the guide says so.
+  - After `connect`, `reader grant` writes the reader's RBAC as today.
+- *Pending installs (proposed):* until `install` creates the instance's record, the keys live outside any record. It creates the record after verification and moves the keys and the coordinates into it then, before `CreateCluster`, as `install.go:149-175` records intent before provisioning today.
+  - `farcast instances` lists each pending install with its state (keys made; setup shown; coordinates received) and its age.
+  - Every command warns about a pending install older than 7 days.
+  - `farcast install --name $INSTANCE --abandon` prints the teardown block for what the setup created, the bindings first, and erases the pending keys. It acts on a pending install's entry alone, so a pending install can always be abandoned, and never on a finished record, which is `release`'s. The device cannot know how far the setup ran, so each line of the block skips an object that is absent, as `readerinit.go:412`'s `describe ||` does in reverse; `release`'s and `device rm`'s blocks do the same. For the pool and a provider, absent means not found, or found in the state `DELETED`, which Google keeps for about 30 days after a delete [doc: PROV]; a provider's line is also skipped once the pool is absent. Whether a describe returns a soft-deleted object is [unverified].
+  - Nothing erases pending keys by age alone.
+- *The guided default (proposed):* the Cloud Shell block, with the console form beside it (*Choices* 7). The guide says to paste only what your own installer shows.
+- *Why:*
+  - nothing secret leaves the device or crosses a browser, wherever the route is open;
+  - one verb, show, paste, line back, verify, serves a non-technical operator and a scripted one;
+  - it is the artifact both Google's X509 form and AWS's trust anchor take (decisions 6 and 10).
+- *What it costs:*
+  - `install` gains a pause for the human, and a line back;
+  - the setup still runs in an Owner-level shell, or across many console pages, with two provider forms for a writer-capable device;
+  - an Owner-level paste is a phishing pattern: an attacker's block would trust the attacker's CA. The read-back and `device ls` (decision 9) reduce this and do not remove it. The block's digest, shown as ADR 0023:219 asks, binds nothing about a block that came from elsewhere, and neither does any ID a block prints;
+  - Google's console changes without notice, which breaks the guided console steps. The block is more stable.
+- *Rejected:*
+  - keeping the line back where the project's ID works, for sameness alone: a line that need not be pasted is not asked for;
+  - polling STS after the paste: it leaves a run of refused exchanges in STS's Data Access log at every enrolment. The device exchanges when the human says done, with a bounded retry.
+
+**2. The fallback rule: a provider-made secret only where the certificate route is closed, named and consented.** *Accepted 2026-11-22.* The order of the fallbacks and their per-provider forms are *proposed*. (The design's D7.)
+- *Google's fallbacks, in order (proposed).* Each applies only where the one before is closed. Each is named in a plan fact, `identity_route`, and shown in the `instances` and `world` documents.
+  1. **OIDC with an uploaded single-key JWKS of a device key** ("paste the public key"). Only if M3a recorded V5 passing and the organization admits it. It is a paste only in Cloud Shell; the console takes the JWKS as a file, which the app offers on its drop surface. As on the X.509 route there is one provider per role, each with a single-key JWKS, because a claim is not bound to a key (ADR 0023:161). An organization that blocks X.509 by a custom constraint on trust anchors [doc: CUS] may still admit it.
+  2. **Service-account key upload of a device-made RSA-2048 certificate:** today's reader mechanism, for the reader, and the same way for the writer, where upload is allowed. It is still a certificate paste, and nothing secret leaves the device. The RSA key cannot live in the Secure Enclave, which holds P-256 keys only, so on the Mac it is a 0600 file, as `reader.key` is today, and the broker cannot protect it [inf]. `reader init` and `reader record` become this fallback at M3b.
+  3. **A Google-made key download:** today's `--credentials`, where key creation is allowed. It is a provider-made secret. It needs its own flag, and a plan fact or a terminal question stating that Google made it and that it does not expire. `--yes` never selects it.
+  4. **None open:** `farcast` names the policy that closed each route. It never asks the operator to relax a security default.
+- If M3a refuses every X.509 shape, not by a policy, and V5 passes, fallback 1 becomes Google's route, by a dated note here.
+- *M2's walk is not fallback 3.* It uses a Google-made installer key before any of this is built, as an exception to this ADR that the operator approves at the walk's G0a, time-boxed and deleted at teardown (decision 11).
+- AWS's and Azure's forms are decision 10's.
+- *Why:* a provider-made secret is a private key someone else made, and it travels. Device-made public material ranks first, so the JWKS, a device key's public half, ranks above the service-account key upload [inf].
+- *What it costs:* some organizations, AWS accounts and Azure tenants land on a secret. Each route is one more code path, with its own tests.
+- *Rejected:*
+  - **the key upload before the JWKS,** with the JWKS only as a route-level outcome: the JWKS is device-made public material and needs no service-account key;
+  - **relaxing a security default,** the first of ADR 0023:119's options: never proposed;
+  - **ADR 0023 *Choices* 1 (b),** an OAuth client the operator registers: it keeps a refresh token at rest, a provider-made secret, so it is proposed as not planned (*Choices* 17).
+
+**3. M3a comes before M2's billable walk, in a project in the operator's own organization.** *Accepted 2026-11-22.* The run in a project with no organization is deferred until most of FarSight is ready. Which project in the organization is *proposed*: one fresh scratch project there, approved with M3a (*Choices* 1). M3a's content is *proposed*. (The design's D8; M3a in full is [the design's §6](../design/adr-0024-design.md#6-m3a-in-full).)
+- *What it is:* the X.509 probe. It creates free IAM objects only and makes no cluster. Its probe, `farsight/cli/internal/cli/walkm3a_test.go` (`//go:build walk`, not yet written), is to call decision 8's product code, so what M3a walks is what M3b ships. It is to be built once with `go test -c` to a fixed path, so the firewall's per-binary rules hold, and to print only statuses, OAuth error codes, lifetimes, settle times as deltas, scope sets, counts and "yes or no", never a token, key, email, project number or ID. M3a also lands `devicekey` and `kube/federated.go`, tested offline and wired into no command, and the W-FED mode M2's walk can use (decision 11).
+- *What it creates:* the IAM, IAM Credentials, STS and Resource Manager APIs; one pool with a random ID; providers in it, each anchor made on the operator's Mac with a random role ID; two service accounts with no role but the reader's pool viewer; Data Access logs for STS and IAM Credentials, in the probe project for the session only; and the Org Policy API, only if reading the effective policies needs it.
+- *The variants:* V1, a writer-capable device with a reader provider and a writer provider, created by the setup paste; V1b, a reader-only device; V1c, a writer-capable device created through the console's forms; V1x and V1y, Google's example extensions and a leaf whose DN differs from its issuer's, only if V1 is refused in all four chain shapes; V2, an anchor and its leaf on one key; V3, one certificate as anchor and leaf; V4, RSA-2048; V5, OIDC with an uploaded JWKS, the fallback; V6 and V7, the 390-day rule on anchors; V8, a constant subject per role (decision 5).
+- *What gates:*
+  - T1 to T4 for V1, and T1 and T2 for V1b: each role's leaf exchanges at its own provider, tried in four chain shapes; `generateAccessToken` with both scopes, for each role's own account; a renewed leaf with no console step; and the read-back;
+  - the negatives N1 to N6, N9 and N10, each refused: a leaf from a CA in no provider; a leaf, or an intermediate CA and its leaf, naming another device's ID; another device's leaf; another device's token at the writer's account; a subject token that is not the handshake's leaf; no client certificate; a reader-anchor leaf carrying the writer's ID, and each role's leaf at the other role's provider; and the reader's federated token at the writer's account;
+  - a new exchange refused after a provider is disabled and after it is deleted.
+
+  N7 (path length and client-sent intermediates), N8 (expired and not-yet-valid leaves), the variants other than V1 and V1b, renewal in place (P6), and the information rows I1 to I7 are recorded and do not gate. One part of N7 does gate: its chain carrying the writer's ID, accepted at the reader provider, fails M3a as N9 does, and accepted at the writer provider, as N1 does.
+- *The settle rule:* IAM changes take time to apply. After any change, a gating positive is polled with backoff for up to 10 minutes [inf: Google's propagation time is not measured]; a negative is checked at once and again after that bound. Each wait is recorded as a delta, never a time, and M3b's enrolment retry takes its bound from them.
+- *The pass rule:* the route passes in an organization project if the organization admits it and, in that project, every gating test holds after the settle rule's bound. A refusal by a named policy is not a pass. If that policy is one Google sets by default in new organizations [doc: SBD], the route fails the operator's own rule, no route a provider closes by default, and the operator re-decides. P9 records the organization's effective policies, `iam.workloadIdentityPoolProviders` and its managed twin included, which of Google's secure-by-default set it carries, and the effective `iam.automaticIamGrantsForDefaultServiceAccounts`, which decides whether a new project's default compute account gets the project Editor grant [inf] (decision 9).
+- *The outcomes:*
+  - **pass:** M3b proceeds on decisions 4 to 8. The no-organization row reads "not run; deferred until most of FarSight is ready", and the route there stays an inference (ADR 0023:165);
+  - **refused by a named policy:** M3b does not start on it, as above;
+  - **V1 refused in all four shapes, and V1x, V1y, V2 or V3 passes:** that shape becomes the route by a dated note on decision 4. V3 is Google-only, so AWS keeps the pair;
+  - **every X.509 shape refused, not by a policy, and V5 passes:** fallback 1 becomes Google's route by a dated note here;
+  - **a gating negative accepted, and no shape closes it:** fail, whatever else passed;
+  - **everything refused:** decision 2's order, and the operator re-decides.
+- *Its record:* a runbook, `docs/runbooks/adr-0024-m3a-probe.md`, shaped like [`adr-0023-m2-probe-walk.md`](../runbooks/adr-0023-m2-probe-walk.md) and written with M3a's build; then its Results table, Deviations, and dated notes here and in ADR 0023's Verification 4.
+- *Why first:* M3a costs nothing and decides whether the route exists, before weeks of M3b are built on it and before another billable session. It runs where the operator's own projects are: an organization that blocks key upload, as newer organizations do by default.
+- *What it costs:*
+  - approval before anything is created (ADR 0023:279), in the session that walks it. Deleted IDs stay reserved for about 30 days, so it is a hard-to-reverse step under the ask-first rule;
+  - USD 0 (*Cost*);
+  - about 3 to 4 days to build, offline with `./check.sh` green, then one session of 3 to 4 hours, the settle waits included [inf];
+  - if it passes, the route is proven in an organization project only, until the deferred run in a project with no organization.
+- *Rejected:*
+  - **a project with no organization now,** beside the organization project (ADR 0023:166's plan): deferred by the operator until most of FarSight is ready;
+  - **leaving OIDC out of M3a,** and probing it only after a failure: V5 costs one free provider and a few minutes, and saves a second approval round in each case that needs it.
+
+**4. The artifact: per role, a device-made anchor and a leaf it issues, in a provider of its own.** *Proposed.* (The design's D2.)
+- *Roles and keys.* For each instance it serves, an operator device holds one or two roles, reader and writer. For each role it makes two P-256 keys, an anchor key and a leaf key. A reader-only device holds two keys; a writer-capable device four. No key is an instance-PKI key (ADR 0020), and none is reused across instances, across roles or across a revoke.
+- *The profile:*
+
+  | | The anchor (pasted; one per role) | The leaf (never pasted; one per role) |
+  |---|---|---|
+  | Subject | CN = the role ID, and nothing else | the same |
+  | Issuer | itself | the role's anchor |
+  | Serial | 128 random bits | 128 random bits |
+  | basicConstraints | critical, CA:TRUE, path length 0 | critical, CA:FALSE |
+  | keyUsage | critical, keyCertSign | critical, digitalSignature |
+  | extendedKeyUsage | clientAuth, as Google's example CA carries [doc: X509] | clientAuth |
+  | Validity | NotBefore one hour back, truncated to the second; NotAfter = NotBefore + 390 days | NotBefore the same way; NotAfter = NotBefore + 90 days, or the anchor's NotAfter if sooner; renewed at half its life |
+  | Key identifiers | the subject key identifier Go adds [ran] | an authority key identifier set to the anchor's; no subject key identifier [ran] |
+  | Anything else | no O, OU, SAN, policy, AIA or CRL distribution point | the same |
+
+  - NotAfter is NotBefore plus the lifetime, as `kube/readerkey.go:54-59` does for the reader certificate [read], so the total is exactly 390 or 90 days.
+  - The authority key identifier is set on purpose. The leaf's DN equals its issuer's, and Go's `crypto/x509` then leaves the field out [ran]. Whether Google accepts such a leaf is [unverified]; M3a's T1 tests this shape, and V1y one whose DN differs.
+  - keyEncipherment, in Google's RSA example, is left out of the EC leaf. Whether Google requires it is [unverified]; M3a tries Google's example extensions verbatim (V1x) before reading any other variant as the route.
+- *The role IDs:* 128 random bits, written as 32 lowercase hex characters. Each is drawn once per device, per instance, per role, kept in the device's record of that instance, and kept across anchor renewals, so the principal and its grant do not change. It is never derived from a key, the instance's name or a counter. It fits `google.subject`'s 127 bytes [doc: QUOTA]. No human compares it by eye: a block printed elsewhere could print any ID, so a shown value binds nothing. The binding checks are the read-back and `device ls` (decision 9).
+- *One provider per role, on Google.* Each role of each device has an X509 provider of its own, in one pool per instance. A reader-only device has one, holding its reader anchor; a writer-capable device two, a reader's and a writer's. Each trust store holds that role's one anchor, inside both the page's limit of three and the REST reference's one CA certificate per PEM [doc: X509, TS], and each condition pins that role's own ID (decision 5). The Cloud Shell block creates both of a writer-capable device's providers in one paste; the console takes two provider forms.
+- *Key custody.* It keeps ADR 0023:115-117 by key separation, not only by code:
+  - read commands, and every plan under `--plan` and `--confirm`, open only the reader keys. The reader leaf renews silently at half its life inside any command, with the reader anchor key;
+  - the writer leaf key opens only in a command after its consent (`--confirm`, or a terminal's question), or at enrolment: for decision 9's one verification exchange and, in `install`, its one read of the project's number (decision 1). It never opens in a read command or a plan. *Proposed, for the operator to confirm:* on the CLI, `--yes` also counts as that consent wherever a command accepts it today, so a scripted run can still write; on the Mac, the broker keeps ADR 0023:116's `--confirm` alone;
+  - the writer anchor key opens only to renew the writer leaf inside such a command, or in `device renew`. It also opens at enrolment, in `install` and `device add --role writer`, and when `device renew` makes a new anchor, to issue the first writer leaf under that anchor, which is exchanged once for verification (decision 9). So a writer leaf may lapse while unused; the next consented command renews it before its exchange;
+  - on the Mac at M5, the broker holds all four keys in the Secure Enclave and issues reader tokens by default, and a writer token only to a child started with `--confirm` (ADR 0023:116, :195).
+- *Why:*
+  - **Two roles, two anchors.** With one principal per device, every read on the CLI, a terminal `farcast`, Linux and Windows would open a key that mints writer power, and the anchor key could mint any number of such leaves. ADR 0023:115 names that outcome: "the read path would become the most privileged path". Two anchors with their own principals and grants make Google refuse a reader key acting as the writer (M3a's N7 chain carrying the writer's ID, N9 and N10), so the split holds outside the Mac's broker too.
+  - **One provider per role.** With two anchors in one provider, the split would rest on Google enforcing the anchor's path length. The reader anchor's key can make an intermediate CA whose CN is the writer's ID, and a condition that reads the leaf's immediate issuer would then admit a writer principal. None of the Google pages read says X.509 federation enforces path length [unverified]. A provider per role needs no such assumption: the reader's provider admits only the reader's ID, and the writer's provider trusts only the writer's anchor, so such a chain is refused at both [ran, against fakes]. M3a's N7 records path length for information. Its chain carrying the writer's ID still gates: accepted at either provider, it fails M3a as N9 or N1 does.
+  - **It is the documented common shape.** AWS requires a CA anchor with Certificate Sign and an end entity that is not a CA, with Digital Signature [doc: RA-TRUST]. One pair per role serves both providers.
+  - **Two keys per role,** because neither provider documents a CA and a leaf sharing one key [unverified]. M3a measures the shared key (V2), so a later dated note may halve the key count.
+  - **Random role IDs.** A CN that is its own key's hash would let Google find every FarCast anchor it holds with one hash, with no false positives, and it would stop being true at the first anchor renewal. A random ID marks nothing; it is a pseudonym (*What each provider sees*).
+  - **390 days for the anchor.** It meets the 390-day rule whether Google applies it to anchors or only to leaves [unverified], and a device that is forgotten, or stolen unnoticed, stops on its own within about a year.
+  - **90 days for the leaf,** as `leafValidity` (`fatline/internal/crypto/crypto.go:45`). Within a role both keys share one custody, one 0600 directory or one Secure Enclave, so a shorter leaf protects nothing the anchor key does not also expose [inf].
+  - **Human-only enrolment holds by construction** [inf] (decision 9). An anchor reaches Google only by a human's paste, and an anchor can renew only its own role on its own device, because its provider trusts it alone and its condition names only its own ID. It holds only while no account the writer can act as holds pool-admin rights, by actAs or through GKE's Workload Identity, which decision 9's *How it holds* addresses.
+- *What it costs:*
+  - four keys on a writer-capable device: two Secure Enclave pairs on the Mac at M5, four 0600 files elsewhere. V2 would halve it if Google accepts it;
+  - two providers per writer-capable device: two console forms, two providers in `device ls`, two deletes at revocation, and twice the providers per pool, whose limit is undocumented [doc: QUOTA];
+  - each anchor key is a long-lived signing secret Google trusts. The writer anchor's power is the installer's project-wide roles, with actAs on the node account alone and revocable per device. It is confined to one instance only where the project holds one instance. A stolen 0600 writer anchor key mints writer tokens for that instance until a human deletes the writer's provider, or for up to 390 days;
+  - a paste per device per instance each year, covering all its providers;
+  - at M5 the Swift app must build the leaf's to-be-signed bytes with no ASN.1 library, from a fixed template and Go conformance vectors, as ADR 0020's request is built (ADR 0020:159-164; ADR 0021 decision 7).
+- *Rejected:*
+  - **ADR 0020's instance CA as the anchor.** Its CN names FarCast and the instance (`fatline/internal/crypto/crypto.go:245`). It lives two years (`crypto.go:44`). It is minted only at `connect`, after `install` needs a cloud identity (`farsight/cli/internal/cli/connect.go:643`). Whoever holds `ca.key` could enrol Google identities with no human step. And presenting its leaves to Google would let Google compute `LeafToken`, which `fatline/identity/identity.go:111-121` keeps unknown to the cloud [read].
+  - **A per-instance federation CA:** its holder enrols any device with no paste, which breaks human-only enrolment, and its theft compromises every device until each is pasted again.
+  - **One self-signed certificate as both anchor and leaf:** undocumented on Google and forbidden on AWS. M3a measures it as V3.
+  - **One principal per device for both roles:** every read would hold writer-capable material.
+  - **Two leaves under one anchor,** with distinct subject CNs: the one anchor key, opened to renew the reader leaf silently, could also mint the writer leaf.
+  - **Two anchors in one provider per device,** with a condition over both IDs: fewer console forms, one provider per device, but the split would rest on path length (above).
+  - **A role ID that is its own key's fingerprint:** it marks every FarCast anchor (above).
+  - **Anchors of five years or two:** a shorter-lived trusted key is the security pillar's side of the trade. The operator may lengthen it if M3a shows the rule binds leaves alone (*Choices* 6).
+  - **Seven-day leaves:** they protect nothing the anchor key does not also expose (above).
+  - **A NotBefore truncated to the UTC day:** a midnight NotBefore would be a profile marker of its own [inf], and the creation date is in Admin Activity anyway. One hour back is the reader certificate's precedent [read].
+
+**5. Mapping, condition, grants and names.** *Proposed.* (The design's D3.)
+- *Mapping:* `google.subject` is `assertion.issuer.dn.cn`, the role ID, fixed by the role's anchor and stable across leaf renewals [doc: X509]. Nothing else is mapped: no `attribute.*` key and no `google.groups`.
+- *Condition, per provider:* the issuer's CN and the subject's CN (`assertion.issuer.dn.cn` and `assertion.subject.dn.cn`) each equal that provider's one role ID, quoted. A writer-capable device's reader provider names its reader ID, and its writer provider its writer ID. No condition names two IDs.
+- *Principal:* the documented `principal://` form for a pool subject, ending in `/subject/` and the role ID [doc: X509]. Hex keeps `/`, `+` and `=` out of the path.
+- *Grants:* the reader ID's principal gets `roles/iam.workloadIdentityUser` on the instance's reader account only, and the writer ID's on the writer account only. Neither principal gets a project or cluster role (decision 6).
+- *Names:* the pool and the three accounts, the reader's, the writer's and the nodes', get random IDs drawn per instance, and each provider a random ID drawn per device and role, each from the alphabet its ID allows, starting with a letter, with no fixed prefix. None says `farcast`, names the instance or names the role, and none is derived from the instance's name. No display name and no description is set. The IDs are kept as non-secret coordinates in the instance's record.
+- *Why:*
+  - **Pool scope.** Principals are scoped to the pool, not the provider [inf, from the documented principal form]. The mapping takes the leaf's issuer's CN, so a leaf whose own CN names another ID maps to its anchor's ID still. But without the condition, a device's anchor key could make an intermediate CA named with another device's ID, issue a leaf under it, and act as that device, unless Google enforces the anchor's path length 0 [unverified]: the X.509 form of ADR 0023:161's caveat. The condition's issuer clause names only its provider's ID, so any other ID is refused there. Its subject clause refuses a leaf whose own CN names another ID.
+  - **Issuer equals subject** ties the principal to the chain-verified issuer. A holder of a provider's one anchor key can make an intermediate CA with any CN, and in a provider per role that gains nothing: the condition refuses every CN but the provider's own ID [ran, against fakes].
+  - **The leaf's fingerprint** changes with every leaf [doc: X509], so it cannot be the subject.
+  - **One grant per role** keeps least privilege, and enforces in Google what decision 4's custody enforces on the device.
+  - **Random object IDs.** Today's reader account names the product, and the instance by a guessable hash that repeats in every project (`reader.go:20-27`, `readerinit.go:412-414`) [read]. A deleted pool's or provider's ID stays reserved for about 30 days [doc: MGMT, PROV], so IDs derived from the instance's name would also collide on a reinstall.
+- *V8, the alternative kept open.* A provider could map `google.subject` to a constant per role, drawn at random per instance, so every device's reader shares one principal and every writer another.
+  - *What it gains:* the bindings name the two constants once, at install, so enrolling a device adds no `SetIamPolicy` entry with its IDs, and delegation entries carry the constant;
+  - *what it does not gain:* each provider's condition still names its role ID, each provider's creation is in Admin Activity, and the device count stays visible;
+  - *what it costs:* it goes against Google's advice of a unique, unchanging subject [doc: X509]; revocation could no longer cut one device's live federated token by removing its binding; Google's own logs could no longer tell devices apart;
+  - *the rule:* M3a measures it. If M3b's walk finds Artifact Registry or Cloud Storage delegation entries carry the role ID, and V8 passed, the operator decides between the two (*Choices* 12).
+- *What it costs:*
+  - the console route has one more field per provider, the condition, which the guide shows with a copy button; the read-back catches a mistake;
+  - random IDs are unreadable in Google's console; the app labels them;
+  - the marks of FarCast that exist today stay until a separate decision (*Choices* 13): cluster names (ADR 0023:256); the repository prefix and its labels (`planck/internal/providers/gke/registry.go:44-48`, `:705`), which `registry.go:44-47` chose for recognisability on purpose; the `farcast-` bucket prefix (`datasphere/internal/providers/gcs/gcs.go:28`), which the writer's storage condition names in the project's IAM policy (`phase-3-validation.md:60-65`); the installer account's name (`phase-1-validation.md:67`); and the user agent and field manager `farcast` (`farsight/cli/internal/kube/client.go:13-18`) [read].
+- *Rejected:*
+  - **mapping the subject's CN:** the leaf's subject is the device's choice, and the issuer is chain-verified. The condition pins both, so the difference is only which field names the principal;
+  - **a grant to the whole pool** (`principalSet` and `*`): it makes every enrolled device a writer, and any provider added to the pool, rogue or phished, a writer at once;
+  - **fixed name prefixes per object kind:** a fixed pattern across every FarCast pool is itself a mark [inf].
+
+**6. Google's route and the token path: X.509 federation, then impersonation.** *Proposed,* gated on M3a. (The design's D1 and D5.)
+- *The route:* each role's anchor is the one trust anchor of that role's X509 provider (decision 4). The device exchanges the role's leaf at STS's mTLS token endpoint, naming that role's provider in the audience, with the mTLS subject token type and a subject token whose first item is the handshake's leaf [doc: X509, STS], and scope `cloud-platform`. It keeps the federated token in memory, one per role per instance.
+- *The token path:* it then calls `generateAccessToken` on that role's account only, with `cloud-platform` and `userinfo.email` in `kube.TokenScopes`'s order (`farsight/cli/internal/kube/client.go:34-46`), for 3600 seconds. The account's token goes only to the cluster endpoint's host, as today (`TestAuthorizationOnlyToTheEndpointHost`, `kube/transport_test.go:179`).
+  - Read commands, and every plan under `--plan` and `--confirm`, exchange only the reader leaf and impersonate only the reader. A command that writes exchanges the writer leaf only after its consent, and on the Mac only through the broker for `--confirm`. `TestWorldNeverOpensAWriterCredential` (`nosecrets_test.go:59`) gains "never opens a writer key".
+  - RBAC subjects stay the accounts' emails (`readerrbac.go:188-191`). The accounts' tokens stay in FarCast's `tokenCache`, with its re-mint after a 401 (`kube/token.go:153-199`) [read].
+  - **The writer's account** holds phase 1's installer roles, `roles/container.admin`, `roles/iam.serviceAccountUser` and `roles/artifactregistry.admin` (`phase-1-validation.md:72-83`), except that `roles/iam.serviceAccountUser` is granted on the node service account alone, not project-wide as phase 1 grants it today (decision 9), and phase 3's `roles/storage.admin` under its condition (`phase-3-validation.md:60-65`), with a random title and no description.
+  - **The reader's account** holds `roles/container.clusterViewer`, the pool viewer of decision 9, and, from M3b, decision 7's resource-scoped reads.
+- *OIDC is not the route.* ADR 0023 decision 5's uploaded JWKS is measured once in M3a, as V5, so it is a measured fallback for three cases only: Google's route, if M3a refuses every X.509 shape, not by a policy, and V5 passes; decision 2's fallback 1, in an organization that closes X.509 and admits OIDC, built in M3b if V5 passed; and the Mac app's route alone, if M5 finds that a Secure Enclave key cannot form a TLS client identity.
+- *Why X.509:*
+  - **It is literally the procedure.** The console's X509 form takes the anchor as pasted PEM [doc: X509]; the OIDC form takes the JWKS only as a file [doc: OIDC].
+  - **There is no issuer URI,** which removes ADR 0023:164's `.invalid` workaround. It does not remove the organization-policy question: `iam.workloadIdentityPoolProviders`'s documented values are issuer URIs [doc: MGMT], so whether a restricted list admits an X.509 provider, and under which value, is [unverified]. M3a's P9 records it.
+  - **Possession is proved on every exchange,** by the handshake, if STS binds the subject token's first item to the handshake's certificate. The page says the handshake's leaf must be that item [doc: X509]; that STS enforces it is [unverified], and M3a's N5 and N6 gate it. A subject JWT is a bearer credential until its `exp` [doc: OIDC].
+  - **Leaves renew without a human,** under a pasted anchor. A JWKS upload replaces every uploaded key [doc: PROV], so each JWKS rotation is a human step.
+  - **It is the artifact AWS takes** [doc: RA-START]: one artifact and one verb on both.
+  - It has been GA since 2025-05-07 and takes P-256 [doc: RN, X509], and its provider constraint is not in Google's secure-by-default set [doc: SBD], so the route is open by default where no one restricted it [inf].
+- *Why impersonation:*
+  - GKE does not log the delegating identity, so cluster entries name only the account [doc: AUD]. Direct `principal://` grants would put the role ID into the always-on Admin Activity entries of GKE writes [inf].
+  - GKE describes federation as credentials that impersonate service accounts, and requires `userinfo.email` [doc: GKEAUTH]. Its RBAC page lists no pool principal [doc: GKERBAC]. STS's documented scope is `cloud-platform` [doc: X509].
+  - A leaked reader federated token reaches only the reader's account, and a leaked writer federated token only the writer's [inf].
+- *Unproven until a cluster exists:* that GKE's DNS endpoint accepts an impersonated token carrying the scope pair (ADR 0023:121), which is an ordinary service-account access token [inf]; that Kubernetes then sees the account's email as the username [inf]; and what Artifact Registry and Cloud Storage writes record under `serviceAccountDelegationInfo`. M2's walk can settle the first two in its optional W-FED step (decision 11); otherwise M3b's walk does. M3b's walk settles the third.
+- *What it costs:*
+  - the proof is mutual TLS, so on the Mac at M5 each Secure Enclave leaf key must become a TLS client identity, not only a signer. Go's `crypto/tls` asks a signer to sign a digest, and Apple DTS advised against `SecIdentityCreate` (ADR 0020:57), so a keychain-formed identity, with its keychain item and access-group entitlement, may be needed (ADR 0023:198, reopened). Letting the Go helper drive the handshake through a remote signer would break the broker's rule, because the broker could not tell what it signs [inf];
+  - the vendored X.509 credential source cannot be used (decision 8);
+  - Google stores every field of every anchor and sees every leaf, so every field says as little as possible (decision 4);
+  - there is no CRL or OCSP [doc: X509]: revoking is deleting;
+  - two operator accounts per instance, beside its node account (decision 9), and two calls per fresh account token;
+  - the writer's roles are project-wide, so one project per instance stays the full separation (ADR 0023:113; AGENTS.md:48);
+  - the writer's federated token can impersonate the writer, so on the Mac the broker keeps it inside the Swift app and hands the helper account tokens only.
+- *Rejected:*
+  - **OIDC with an uploaded JWKS as the route:** above. It is fallback 1;
+  - **direct principal grants,** Google's own recommendation: for the privacy reason above;
+  - **certificate-based access through the library:** farcast presents its certificates only through its own transport, and ADR 0023:81's `GOOGLE_API_USE_CLIENT_CERTIFICATE=false` stands.
+
+**7. The reads that mint the installer's token today move to the reader.** *Proposed,* decided per read in M3b's build. (The design's D5.)
+- *The reads,* none of them covered by the reader's roles [read]:
+  - the registry image lookups in plans: `planRegistry` mints a registry token from the installer's key (`farsight/cli/internal/cli/fatline.go:608-625`);
+  - `projects.get` and the repository's `getIamPolicy` in `build`'s and `run`'s deploy plans (`buildgrant.go:155-180`);
+  - `projects.get`, the bucket's `GET` (its labels) and its `getIamPolicy` in `storage deploy`'s plan (`storagedeploy.go:1140-1202`; ADR 0023:258-259);
+  - `storage ls`, `storage usage` and `storage cp`'s downloads, which open storage with the installer's key (`farsight/cli/internal/storage/storage.go:82-100`; ADR 0023:118);
+  - `secret ls`, which reads the bucket's metadata, lists the objects under each application's secrets prefix, and fetches an object's header only where a listing entry's name mirror is missing or does not open (`secret.go:354-418`; `datasphere/store.go:179-199`, `:304-321`). It decrypts names on the device and never reads a value.
+- *The default:*
+  - from M3b these reads run as the reader;
+  - the reader gains read-only grants scoped to the instance's own repository and bucket, never project-wide and never the writer's: on the repository, reading images and its IAM policy; on the bucket, reading its metadata and its IAM policy, and listing and reading its objects. The smallest role that covers each is [unverified], and is chosen in M3b's build;
+  - neither resource exists when the setup block runs, and `install` has no `--plan` [read]. So the writer applies the reader's grant on the repository in `connect`'s plan, and on the bucket in `storage deploy`'s, each as a plan fact never covered by `--yes` (ADR 0023 decision 8) [inf]. The first such plan runs before its grant exists: its own lookups are stated in the plan as not yet readable by the reader, and made after the grant, under the same consent. The exact shape is M3b's build's;
+  - `projects.get` goes from plans: the record holds the project's number, from the coordinates or, where the line was not asked for, from `install`'s one read after verification (decision 1), so plans read it from the record.
+- *Why:* it extends "reads never mint an admin token" to the Google reads. With the writer, plans would hold a writer token, which breaks ADR 0023:116's broker rule, and every `storage ls` would open the writer's keys.
+- *What it costs:* the reader then reaches ciphertext under opaque names, image layers, and the two resources' policies. A leaked reader token could copy the ciphertext out, and pull the instance's images, which are not encrypted: FarCast's own components and the operator's application images, in plaintext. The keyring stays on the device, so it cannot decrypt the storage ciphertext. That is more than today's reader reaches, and it is the operator's call (*Choices* 9).
+- *Rejected:*
+  - **the writer, after consent:** above;
+  - **project-wide read grants:** they would reach every bucket and repository in the project, FarCast's or not.
+
+**8. The code: hand-rolled on the standard library.** *Proposed.* (The design's D6.)
+- *What:* FarCast's own code, on `crypto/x509`, `crypto/tls`, `net/http` and `encoding/json`. No vendored external-account code is used. `vendor/` does not change, `VENDORED_MODULES` stays 31 (`check.sh:66`), and `exec-allowlist.txt` gains no line.
+- **`farsight/cli/internal/devicekey`** (new; built in M3a, wired into no command until M3b):
+  - per instance and per role, the anchor key and the leaf key as PKCS#8 files at 0600 with their certificates, in a new `identity/` directory at 0700 in the instance's config directory; the role IDs and provider IDs in the instance's record;
+  - decision 4's two templates, the random role IDs, and leaf and anchor renewal;
+  - one opening function per role and purpose (read, consented write, renewal, enrolment), so decision 4's custody rules are tested in one place;
+  - every key behind `crypto.Signer`, so M5's broker signer and a Secure Enclave signer fit later.
+- **`farsight/cli/internal/kube/federated.go`** (new; built in M3a):
+  - the exchange and `generateAccessToken`, their URLs Go constants with the values the X.509 page and the IAM Credentials reference give, never read from a file or the environment;
+  - an mTLS token transport: `Proxy` nil, the system roots, TLS 1.2 or later, no redirects;
+  - the client certificate presented only to STS's host, and to IAM Credentials' mTLS host only if M3a's I1 shows that endpoint is needed;
+  - no `Authorization` header to STS, and the bearer only to IAM Credentials' host;
+  - no `x-goog-api-client` header, and the user agent of `kube.UserAgent`;
+  - response bodies size-limited and never put into an error; errors typed by step, status and OAuth error code. That goes beyond `tokenError` (`kube/token.go:125-146`), which names a refusal by its status alone and never carries the body.
+- *M3b's wiring:*
+  - `kube.Credential` (`credential.go:13-20`) gains a federated variant, minted beside `twoLegged` (`token.go:48-123`), and `kubetest` gains a loopback STS that requires and verifies a client certificate, and an IAM Credentials fake;
+  - `planck.Config` (`planck/types.go:98`) and `datasphere.Config` (`datasphere/types.go:162`) gain a token-provider field for the CLI, given the reader's or the writer's provider as decision 6 says, through the vendored `auth.NewCredentials`;
+  - the service-account JSON loaders and their service-account-only guard (`registry.go:588-600`) stay, for fallbacks 2 and 3;
+  - `DetectDefault` stays only in the in-cluster `datasphered`, which opens storage with no credential unless given `--credentials` (`datasphere/cmd/datasphere/main.go:315-324`) and so falls back to it (`datasphere/internal/providers/gcs/client.go:113-119`). Application Default Credentials leave the CLI;
+  - `GOOGLE_API_CERTIFICATE_CONFIG` joins the variables `hardenEnvironment` and the planck harness unset (`cli.go:66-78`; `planck/cmd/planck/main.go:47-57`). This is defence in depth [inf].
+- *Why:*
+  - **The vendored X.509 source cannot be used.** It reads the certificate and key paths from a config file (`vendor/cloud.google.com/go/auth/credentials/internal/externalaccount/x509_provider.go:58-70`). It loads an unencrypted PEM key on every handshake, so it can never take a `crypto.Signer` or a Secure Enclave key (`x509_provider.go:200-219`; `vendor/cloud.google.com/go/auth/internal/transport/cert/workload_cert.go:94-102`). It clones the default transport, with its environment proxy. And it reads its URLs from a file, against ADR 0023:168 [read].
+  - **The public `credentials/externalaccount` package** is not vendored, and adding it would keep the module count at 31 [inf]. But the vendored internal code it wraps sends `x-goog-api-client` with the Go version (`externalaccount.go:303`, `:424-431`), its layered caches defeat `tokenCache`'s re-mint, and its errors carry response bodies (`stsexchange/sts_exchange.go:106-108`, `impersonate/impersonate.go:134-136`) [read].
+  - **It is small.** The prototype is 224 non-blank lines and passes `go test -race` offline [ran]. Product code is about 350 lines, plus about 600 of tests, with the second role [inf].
+- *What it costs:*
+  - it departs from ADR 0007 decision 2's "no hand-rolled JWT, signing, or token refresh" (ADR 0007:32), and from ADR 0023:168's "The exchange and refresh stay in the vendored library". The departure is smaller than the JWT route's: the standard library signs, there is no JWT, and the refresh has been FarCast's own `tokenCache` since ADR 0023's M2.1;
+  - FarCast must track changes to Google's endpoints itself, and only a FarCast release fixes a drift.
+- *Rejected:*
+  - **vendoring the public external-account package:** above (*Choices* 15);
+  - **a cross-provider adapter interface now:** no AWS or Azure adapter is scheduled. The sameness is a product rule, recorded here, and an interface is written when a second adapter starts;
+  - **a `kube/wif` sub-package:** the keys also serve AWS, Azure and M5's signer, so they sit apart from the wire code;
+  - **a neutral user agent on the identity path:** Go's default would mark Go instead; the identity calls appear only in Data Access logs, off by default, while the same project's cluster writes already carry `farcast` in the always-on log; and two rules would double the marks decision's work (*Choices* 14).
+
+**9. Enrolment, revocation and renewal.** Human-only enrolment is *accepted 2026-11-22* (ADR 0023 *Choices* 5). The mechanics are *proposed*. (The design's D4.)
+- *Accepted:* only a human enrols a device. Every device addition, renewal and revocation is a human's paste, and no FarCast identity can enrol devices. *Proposed reading, for the operator to confirm:* the renewal in those words is a device's anchor renewal (`device renew`), which is a human's paste. A leaf's renewal on the device, under an anchor a human pasted, is neither an enrolment nor such a renewal: it adds nothing Google trusts.
+- *How it holds (proposed):* no FarCast identity holds pool-admin rights or any right over a project's or a service account's IAM policy. The writer's role list is an allowlist, tested in the setup generator, that excludes `roles/iam.workloadIdentityPoolAdmin`, `roles/iam.serviceAccountAdmin`, `roles/resourcemanager.projectIamAdmin` and `roles/iam.serviceAccountTokenCreator`. The writer's `roles/iam.serviceAccountUser` is granted on the node service account alone, never at the project level, and the allowlist test checks that. Phase 1 grants it project-wide today (`phase-1-validation.md:76-78`), and with `roles/container.admin` that lets the installer run a node as any service account in the project and take its token [inf], so any such account holding pool-admin rights would let it enrol a device with no paste.
+  - *The node account* is to be a dedicated per-instance one (ADR 0007 decision 3's recorded follow-up), because the default compute account keeps its automatic project Editor grant wherever that grant is not disabled (ADR 0007:34); whether Editor covers pool admin is [unverified]. The actAs rule is built so that it does not rest on that grant. M3a's P9 records the organization's effective `iam.automaticIamGrantsForDefaultServiceAccounts`, which decides whether a new project's default compute account gets it [inf]. The setup block makes the node account, with a random ID and no display name. It holds `roles/container.defaultNodeServiceAccount` on the project, the minimum GKE documents for a node account ([GKESA](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/service-accounts)), and the pull grant on the instance's repository, which the writer applies when it ensures the repository (ADR 0007 decision 3). It holds no other role.
+  - *What planck must change for it.* `buildCluster` sets no node account today, so Autopilot nodes run as the default compute account (`planck/internal/providers/gke/client.go:160-174`), and `grantPull` binds the pull role to that account (`registry.go:63-68`, `:384-399`) [read]. M3b has `buildCluster` name the dedicated account through the cluster's autoprovisioning defaults (the vendored API's `AutoprovisioningNodePoolDefaults.ServiceAccount` [read]; that Autopilot takes it at creation is [inf]), has `grantPull` and the instance's metadata name it in place of the default account, and tests that the create request names it. Until then the writer needs actAs on the default compute account, and with it whatever that account holds.
+  - *A second route, through GKE's Workload Identity.* `roles/container.admin` alone lets the writer make a cluster in the project, and a namespace and a Kubernetes ServiceAccount of any name in it. Such a ServiceAccount is a principal of the project's one pool, `$PROJECT.svc.id.goog`, named by namespace and name (`grants.go:41`). So the writer can act as any such principal, and as any Google account that grants one `workloadIdentityUser`, with no actAs [inf]. The property therefore also needs that no principal of that pool holds pool-admin, project-IAM or service-account-IAM rights, directly or through an account it can impersonate. FarCast's own grants to such principals are the bucket grant and the push grant, and neither carries those rights (`storagedeploy.go:1340`; `buildgrant.go:43`) [read]; another workload in a shared project may hold more.
+  - *The two Workload Identity counts.* The setup block prints them, counts only, before it creates anything (decision 1). Each is expected to be 0. If either is not, the block asks y/N to go on, and a no stops it with nothing created. The counts are not pasted back, so `install` never sees them.
+    - *Those rights* are the permissions `iam.workloadIdentityPoolProviders.create`, `iam.workloadIdentityPoolProviders.update`, `resourcemanager.projects.setIamPolicy` and `iam.serviceAccounts.setIamPolicy`. A role carries them if its permission list holds any of them, a basic or custom role included.
+    - *A member of that pool* is written in either form: `principal://` or `principalSet://` on the pool `$PROJECT.svc.id.goog`, as `grants.go:39-41` writes it, or `serviceAccount:$PROJECT.svc.id.goog[…]`, the form GKE's Workload Identity pages use to link a Kubernetes ServiceAccount to an account [unverified: not among the pages read].
+    - The first count is the bindings, on the project and on each of its accounts, of a role carrying those rights to a member of that pool. The second is the project's accounts that hold such a role and let such a member act as them: a binding, on the account or on the project, to such a member, of a role whose permission list holds `iam.serviceAccounts.getAccessToken` or `iam.serviceAccounts.actAs`, `roles/iam.workloadIdentityUser` and `roles/iam.serviceAccountTokenCreator` included.
+    - Not counted: bindings inherited from a folder or the organization, which the block does not read, and chains through more than one account.
+  - Until M3b's build settles both routes, "by construction" is [inf]. It holds by construction only in a project that holds one instance and nothing else.
+- *The first device* is enrolled inside `install` (decision 1). It is writer-capable: two providers, two anchors, two leaves, two grants.
+- *Adding a device:*
+  1. on an enrolled device, `farcast device coordinates $INSTANCE` shows the instance's coordinates line;
+  2. on the new device, `farcast device add $INSTANCE --role reader|writer` takes that line. The role defaults to reader (*Choices* 8). It makes the role keys and a first leaf per role, and shows the anchor PEMs, a Cloud Shell block with its digest, and the console steps;
+  3. the block, or the console steps, create the device's one or two providers, one per role, and its one or two bindings;
+  4. when the human says the paste is done, the device exchanges and verifies, retrying within a bound under M3a's settle rule. Nothing is pasted back;
+  5. it ends by printing the device's provider IDs and their roles, one non-secret line. *Proposed:* the human may give that line to `farcast device known $INSTANCE` on each other enrolled device, so its `device ls` labels them, and a revocation run there can name them.
+- *Adding the writer role to a reader-only device:* `farcast device add $INSTANCE --role writer` makes the writer keys and prints one block, which creates the writer's own provider and binds the writer ID's principal on the writer's account. The reader's provider is not touched. Run on that device, `device rm $INSTANCE --role writer` does the reverse and erases the writer keys.
+- *Verifying every enrolment,* `install`'s included:
+  - for each role, an exchange at its provider and `generateAccessToken` for its account;
+  - **the read-back:** the reader reads the device's providers back, holding `roles/iam.workloadIdentityPoolViewer` [unverified role name], and the device refuses unless each trust store holds exactly that role's one anchor and the mapping and condition are exactly what it made;
+  - a failure names the field to fix, and nothing billable has started.
+- *Listing devices:* `farcast device ls $INSTANCE` reads the pool's providers through the reader, names the role of those this machine made or was told of by `device known` (proposed), and marks every other provider as unknown, another enrolled device's included. `world` carries the same mark. On a machine told of every device, a rogue or phished provider in the instance's own pool is the one unknown. Otherwise the human must account for each unknown provider, and a rogue one shows only as one more. A binding of another principal on the writer's account does not show: the reader cannot read the accounts' IAM policies. Nor can `device ls` pair the providers of a device this machine was not told of, because nothing in Google links a device's two provider IDs.
+- *Revoking a device:* `farcast device rm $INSTANCE <provider>…`, where each `<provider>` is a provider's ID as `device ls` shows it, or FarSight, prints the lines that first remove the device's principals' bindings on both accounts, whatever each principal's role, each line skipping a binding that is absent, which stops new account tokens once IAM applies it, and then delete its providers, which stops new exchanges. The human runs them. A principal ends in its role ID, not its provider's ID, so for a provider this machine did not make `device rm` first reads that provider's condition through the reader, as the read-back does, and takes the role ID from it. The console route works from any browser, so a lost device is revoked from anywhere: on each operator account's permissions page, remove the device's principals' grants; then the pool, each provider, Delete. `device rm` erases this machine's keys only for a role whose provider it names and this machine made. From another machine, a lost writer-capable device's revocation must name both its providers. That machine knows them only if it was told of them (`device known`); otherwise nothing there says which unknown providers are the lost device's (*Listing devices*). What is left [inf; M3a measures it]: an account token already issued, for up to one hour; and, if Google lets a federated token issued before the deletion still impersonate, up to about two hours, which removing the bindings first narrows. FarSight warns before revoking an instance's last writer-capable device; the instance keeps running and billing, and an Owner can always enrol again.
+- *Renewing:*
+  - the reader leaf renews silently at half its life, with a new leaf key, inside any command, with no network and no human;
+  - the writer leaf renews the same way, but only inside a consented command or `device renew` (decision 4);
+  - **the anchors:** from 45 days before an anchor's end, every command and FarSight warn. `farcast device renew $INSTANCE` makes a new anchor key and anchor for each of the device's roles, each with the same role ID as its CN, and one block, or console steps, that replace each provider's trust store with its new anchor alone. The principals, mapping, conditions and grants do not change, and the old anchor keys stop once the trust-store update applies, within the settle bound M3a measures (P6). If M3a shows a trust store cannot be replaced (its P6), renewal becomes new providers and bindings plus the old providers' revocation, in one block;
+  - **a missed renewal** stops that device. The instance keeps running, and TechnoCore keeps enforcing the cost limit in the cluster. The same block, pasted late, recovers it.
+- *Releasing:* `release` prints one block that deletes the providers, the pool, the three accounts and their bindings, bindings first and the node account after the cluster, each line skipping an object that is absent, extending the reader lines it prints today (ADR 0023:238's 2026-11-14 note).
+- *Why:*
+  - **human only:** a device that can add providers holds pool-admin rights, so one stolen device could enrol keys that outlive its own revocation (ADR 0023:229);
+  - **replacing anchors in place:** fewer console steps, and the old key stops once the update applies. Replacing the identity instead gains no privacy: Google would see the old provider go and the new one come in the same pool on the same day [inf].
+- *What it costs:*
+  - every addition, role change, renewal and revocation needs a human with IAM admin rights on the project. That is the price of human-only enrolment;
+  - revocation is not instant;
+  - the reader's pool-viewer role exposes the pool's configuration, which is public material, to reader tokens;
+  - a lost Mac's Secure Enclave keys cannot be backed up (ADR 0021:358), so recovery is a new enrolment;
+  - a yearly paste per device per instance is friction.
+- *Rejected:*
+  - **an enrolled device that may add providers** (ADR 0023 *Choices* 5's other answer): the operator chose human only;
+  - **renewal as a new identity plus the old one's revocation:** above;
+  - **keeping the old and new anchors in one trust store:** the old key would keep working;
+  - **every added device a writer by default:** reader by default keeps writer power off devices that do not need it;
+  - **enrolment with no bindings,** which only a pool-wide grant allows (decision 5);
+  - **a decoy exchange at every enrolment:** if M3a passes, its gating negatives show that Google enforces such a condition, and the read-back checks each provider's condition text.
+
+**10. AWS and Azure: the same procedure, each departure named.** *Proposed,* gated on their probes. (The design's D7.) Neither adapter is scheduled.
+- **AWS:**
+  - *The artifact* is the same pair per role. Each anchor is pasted as a Roles Anywhere trust anchor, an external certificate bundle [doc: RA-START]: one or two per device per instance, from a quota of 50 per account, adjustable [doc: RA-QUOTA].
+  - *Per instance:* a writer role and a reader role that trust Roles Anywhere, and one profile. Each role's trust names, per device, `ArnEquals aws:SourceArn` equal to that role's anchor and `StringEquals aws:PrincipalTag/x509Subject/CN` equal to that role's ID [doc: RA-TRUST]. A reader anchor is trusted by the reader role only, and a writer anchor by the writer role only.
+  - *The exchange* is `CreateSession`, signed `AWS4-X509-ECDSA-SHA256` with the leaf key [doc: RA-SIGN]. It is a data signature, so the Secure Enclave fits with no TLS identity. Then HMAC SigV4 and the EKS token, all hand-rolled.
+  - *The departures:* an enrolment edits one or two trust policies; P-256 acceptance is [unverified] and is an AWS probe; the end-entity expiry notices are turned off per anchor, because leaves renew themselves [inf]; and there is no CRL URL, because it would be a central dependency, so revocation deletes the anchor.
+  - *New sign-up accounts:* where AWS-managed SCPs close Roles Anywhere [doc: AWS-SCP], FarCast never asks for the activation that opens it, because it cannot be undone and removes the account's spend limit [doc: AWS-ADV]. There the fallback is an IAM user access key, a provider-made secret, consented like Google's fallback 3.
+- **Azure:**
+  - *The artifact* is a self-signed RSA-2048 certificate per role, from a software key at 0600, never the Secure Enclave, because Entra takes RSA only and offers no CA-level trust [doc: ENTRA-RSA, ENTRA-CERT].
+  - *Setup:* each certificate is uploaded under the app registration's certificates to its role's registration, reader or writer, with neutral names. The portal takes a file, so the app offers the file on its drop surface; Azure Cloud Shell is the alternative [unverified syntax]. Role assignments are made at the resource group.
+  - *The exchange* is a PS256 client assertion carrying `x5t#S256` [doc: ENTRA-CERT], hand-rolled.
+  - *The departures:* no P-256 and no Secure Enclave; every new certificate is a human paste, up to the tenant's maximum lifetime [doc: ENTRA-POL].
+  - *Fallback:* a client secret, where tenant policy blocks certificates, consented like Google's fallback 3.
+- *Why:* the operator's rule is one procedure on every provider. Where a provider cannot meet part of it, the departure is named here, not hidden.
+- *What it costs:* AWS and Azure each break one part of the sameness, and some AWS accounts and some Azure tenants land on a provider-made secret.
+- *Rejected:*
+  - **Entra federated identity credentials:** they need a public HTTPS issuer, which is a central dependency, and take RS256 only [doc: ENTRA-FIC];
+  - **AWS's CRL fetching:** a central dependency;
+  - **AWS's advanced-features activation:** it removes the spend limit, against the cost pillar.
+
+**11. The order and the projects: M3a, then M2's billable walk on its own, then M3b.** *Accepted 2026-11-22.* W-FED and the specifics of the walk's key are *proposed*. (The design's D9.)
+- *Accepted:* M3a first. Then M2's billable walk on its own, on M2's code, in a project in the operator's own organization, taking G0a's branch [B]. Then M3b. There is no merged walk. *Proposed,* as a revisit trigger: if M2's walk has not run when M3b's build is done, the operator decides again.
+- *Under [B], accepted:* key upload is blocked in that organization, which allows key creation (`adr-0023-m2-probe-walk.md:337`). The installer's Google-made key is an exception to this ADR that the operator approves at the walk's G0a, time-boxed to the walk and deleted at teardown. The reader is not walked in M2: `reader init` stops at its first policy check (`readerinit.go:402-411`), and M2's records keep "reader not walked". [U1], allowing upload for the project, is withdrawn: the walk takes [B], and FarCast is not to ask for a security default to be relaxed (decision 2's fallback 4, proposed). Today's `reader init` still says its reader cannot be set up until an organization administrator allows upload (`readerinit.go:404`, `:409`); M3b rewords it. [U2] is deferred with the project that has no organization, until most of FarSight is ready.
+- *The key's deletion, accepted:* the walk's key is deleted at teardown. *Its specifics (proposed, Choices 23):* the walk uses the installer's existing key if the operator holds one, or one made at WP.8 as phase 1's step 2 makes it. The Mac runs no `gcloud` in the walk, so that key is made in Cloud Shell or the console, downloaded through the browser, and moved at once to 0600 on the Mac, every other copy deleted. WP.8 counts the installer's user-managed keys, a count only, once the walk's key exists. The count expected is 1; any other count stops the walk to ask the operator, because any other key is G0a's to decide. After W6.1's release the operator deletes the key in Google from Cloud Shell, at W6.2, and the key file on the Mac, and checks the count is WP.8's less one: 0 when WP.8 found 1, and then the installer holds no user-managed key. W6.6 deletes the config home's copy. A no at G0b, or any stop that ends the walk once the key exists, deletes them too. The walked commit may carry M3a's packages, which no command uses, so the walked `farcast` is M2's [inf].
+- *W-FED (proposed):* an optional step, with its own approval at G0a, offered only if M3a passed in the organization project. It runs after W5 and before W6.1, while the cluster exists.
+  1. In the walk's project, in Cloud Shell, M3a's setup paste for one fresh writer-capable device, made by the probe, creates the pool, the device's two providers and the two accounts, with their bindings. The writer's account gets no role.
+  2. The reader's account gets `roles/container.viewer` on the walk's project, for this step only, so IAM authorises its reads with no RBAC and no reader record (ADR 0023:121's 2026-11-16 note). That it is the smallest such role is [unverified].
+  3. The probe, with the impersonated reader token at the cluster's DNS endpoint, reads the API server's version, lists namespaces, and posts a SelfSubjectReview, recording the username the cluster sees as "email matches: yes or no". That the cluster serves SelfSubjectReview is [inf].
+  4. Once more with a direct federated token, recording 401 against 403: 401 means the endpoint refuses that kind of token; 403, that it authenticated it and IAM or RBAC refused it.
+  5. The grant, the bindings, the providers, the pool and the accounts are deleted under the settle rule, and the device's keys go with the walk directory.
+
+  It records statuses, counts and "yes or no" only. Its steps are appended to M2's walk runbook with M3a's build, because they use M3a's probe.
+- *[U2], when it runs (proposed):* a project outside any organization where key upload is open, so the installer and the reader are both fallback 2, device-made RSA certificates uploaded in Cloud Shell, and no Google-made key exists. The reader is set up by `reader init` and `reader record`, as today. The installer would be set up by a walk-tagged helper, `walkm2key_test.go`, that makes the key with `kube.NewReaderKey`, prints the Cloud Shell lines, and assembles at 0600 the service-account JSON M2's code reads (`install.go:384-405`, `kube/credential.go:47-98`, `registry.go:588-600`) [read; not run]. The helper is not built now.
+- *Why this order:*
+  - M2's walk tests what still ships under M3b: the service-account token path that fallbacks 2 and 3 share (`kube/credential.go:47-98`, `registry.go:588-600`) [inf], and every part of M2 that M3b does not change, which is the in-process client, server-side apply, the plans and the uid grants (M2.8's uid member is [unverified] until that walk). It tests them with the only credential shown to work at the DNS endpoint, a service-account token (the probe walk's 200);
+  - W-FED moves M3b's largest unknown onto a cluster that exists anyway, at a few minutes' cost, before weeks of M3b are built on it;
+  - it runs where the operator's own projects are: an organization where key upload is blocked, as newer organizations are by default.
+- *What it costs:*
+  - two billable walks;
+  - one Google-made installer key, an approved exception, for the walk's duration. Its deletion is a human step, and a walk that stops early must still reach it (the M2 walk runbook's T6 note);
+  - the reader is not walked in M2: the M2 design's A22-7 reader evidence stays open until M3b's walk, except the federated reader's cluster reads if W-FED runs;
+  - fallback 2's reader and installer stay unwalked until the deferred project with no organization.
+- *Rejected:*
+  - **one merged walk for M2 and M3b:** it would have saved a billable session, about USD 0.7 to 1.5 by G0b's floor model with USD 5 the approval cap (`adr-0023-m2-walk.md:7`, `:235-243`), and made no service-account key. Against it: two sets of unknowns in one session, M3b built on an unproven premise, and M2.1 to M2.9b unwalked for weeks longer. The operator chose the separate walk;
+  - **a project with no organization now** ([U2]): it would have made no Google-made key. The operator deferred it until most of FarSight is ready;
+  - **[U1], allowing key upload for the project:** it relaxes a security default.
+
+---
+
+## What each provider sees
+
+This ADR does not change what the provider sees of an instance. The provider stays blind to content and sees metadata, as AGENTS.md says. What changes is what it sees of the operator. (The design's D11.)
+
+**Google, today:**
+- **the writer,** a Google-made key. Google made the private key, and it travelled as a download. One installer serves the whole project, so its token writes every cluster in it. It does not expire. Entries name the account [read: ADR 0023:113, :290];
+- **the reader,** an uploaded device-made RSA key. Google holds a `CN=unused` certificate valid for up to 3650 days (`kube/readerkey.go:14-21`). The account's name and display name carry the product's name and the instance's (decision 5).
+
+**Google, under this ADR,** as proposed, from M3b:
+- **what it holds:** the pool; one provider per role per device per instance, each holding one anchor certificate (a random role ID, a public key, its dates and its serial) and a condition naming that ID; and three service accounts, the reader's, the writer's and the nodes', and their bindings, all under random IDs;
+- **on each exchange,** about hourly while a role is in use (the reader's on reads, the writer's only in consented commands): the leaf, in the handshake and in the subject token, with the source address and the time, then a `generateAccessToken` call;
+- **Admin Activity** (always on, 400 days, undeletable; ADR 0019:29):
+  - the creation and deletion of the pool, the providers and the accounts. Whether a provider's entry keeps its request in full, the anchor PEM and the condition with the role ID, is [unverified]; M3a's P8 reads it;
+  - every enrolment's `SetIamPolicy` on the accounts. Its entry carries the binding delta with its member: the principal, with its role ID [doc: POLHIST, AUDLOG]. So each role ID is in the always-on log for 400 days, whatever delegation logging does. P8 reads these entries too;
+  - cluster writes, naming the account;
+  - the role ID under `serviceAccountDelegationInfo`, only in services that log delegation, which GKE does not [doc: AUD]. Artifact Registry and Cloud Storage are recorded at M3b's walk.
+
+  With random IDs these are pseudonyms, not marks: an ID says nothing but itself.
+- **Data Access** (off by default; a parent can force it on, ADR 0019:29): STS's `principalSubject`, the mapped principal and the anchor's `keyInfo` fingerprint (a Preview feature), and IAM Credentials' federated principal [doc: AUD].
+
+**New to Google:**
+- how many operator devices an instance has, which of them are writer-capable (a provider whose principal is bound on the writer's account is a writer's, and a device's two providers are created in one paste on the same day [inf]), and when each was enrolled, changed and revoked;
+- which device and role made which call, where delegation or Data Access is logged.
+
+That is a stable pseudonym per device and role, the kind `fatline/identity/identity.go:111-121` keeps out of provider logs for FatLine's leaves. It is stated here rather than hidden. V8 (decision 5) is the measured way to narrow it, and it narrows less than it seems: the conditions and the providers' creation still carry the IDs.
+
+**Removed,** from M3b on, wherever the certificate route or a device-made fallback is open:
+- every Google-made private key, and the download. Fallback 3 keeps one, named and consented, where every other route is closed; M2's walk keeps one, as the approved, time-boxed exception (decision 11);
+- the shared, non-expiring installer key, on the same condition;
+- the product and instance names in the reader's display name, on the certificate route. Fallback 2's `reader init` keeps them, unless it adopts decision 5's random names;
+- linkage across instances by key or by ID, since each instance has its own anchor keys and random IDs.
+
+**Linkability that remains:**
+- the operator's source address calling several projects. That holds on every route, because control-plane calls do not pass through FatLine (ADR 0019);
+- the profile traits below.
+
+**Marks of FarCast this ADR does not remove** (*Choices* 13):
+- **existing marks:** cluster names; the repository prefix and its labels; the `farcast-` bucket prefix, which the writer's storage condition names in the project's IAM policy (`phase-3-validation.md:60-65`), so it sits in an always-on Admin Activity entry from the setup on; the installer's and the reader's account names, until M3b; the user agent and field manager `farcast`; and the same embedded component digests pushed into every instance's registry since ADR 0023's M1 [inf];
+- **the anchor profile's traits,** shared by every FarCast anchor. Each is common alone; together they let Google cluster FarCast's anchors [inf]:
+  - a self-signed CA with path length 0 and the clientAuth extended key usage;
+  - a subject that is a CN alone, of 32 lowercase hex characters, and a leaf whose DN equals its issuer's;
+  - the key identifiers Go adds: the anchor's subject key identifier is the first 20 bytes of SHA-256 of its subjectPublicKey [ran], which tools that use SHA-1 do not produce [inf]; the leaf has an explicit authority key identifier and no subject key identifier [ran];
+  - providers made in pairs in one paste, each trust store holding one such anchor, and each condition of the same shape;
+  - lifetimes of 390 and 90 days to the second, and a one-hour backdating to a whole second;
+  - 128-bit serials.
+
+**AWS,** when its adapter starts. The design's readers took these from the trust-model page [doc: RA-TRUST] and from CloudTrail pages not listed under *Sources*, so each is [unverified] here until the AWS probe:
+- CloudTrail records `CreateSession` as a management event;
+- every later event carries `sourceIdentity`, the leaf's CN, which is the role ID, and the session name, the leaf's serial in hex;
+- the Subject resource keeps recent leaf certificates, for a retention that is [unverified];
+- expiry notices are on by default.
+
+**Azure,** when its adapter starts:
+- `keyCredentials` stores the certificate;
+- service-principal sign-in logs keep its thumbprint, key ID, address, ASN and user agent [doc: ENTRA-LOG], for 7 days on Free and 30 on P1 or P2 [doc: ENTRA-RET].
+
+## Cost
+
+- **No new standing cost.** IAM is offered at no additional charge [doc: PRICE]. No page found prices STS or impersonation, so that they are free is [inf]. Roles Anywhere with a self-made CA, and Entra certificate credentials, carry no charge [inf]. Cloud Shell is free (ADR 0023, *Cost*).
+- **M3a is USD 0.** It creates free IAM objects only, and a session's Data Access entries fit inside Cloud Logging's free ingestion [inf]. It still needs approval, because deleted IDs stay reserved for about 30 days.
+- **M2's walk is billable,** as its runbook sets out: about USD 0.7 to 1.5 by G0b's floor model, with USD 5 the approval cap (`adr-0023-m2-walk.md:7`, `:235-243`). M3b's walk is billable too. Each is a separate session the operator approves before anything is created.
+- **A missed anchor renewal** leaves the instance running and billing under TechnoCore's in-cluster limit, recoverable by one paste. The cost guard does not depend on the operator's device identity.
+- **AWS's activation path is refused** because it removes the account's spend limit (decision 10).
+
+## Consequences
+
+**Positive**
+- No provider-made secret on any route where the certificate route is open, from M3b on.
+- Reads hold no key that can write, on every platform, not only behind the Mac's broker.
+- Per-device, per-role revocation.
+- The reader/writer split rests on each provider's trust store and condition, not on Google enforcing path length.
+- It works where Google blocks service-account keys, if M3a passes.
+- One procedure for a non-technical operator, the same verb on Google and AWS.
+- Leaves renew themselves.
+
+**Negative**
+- Up to four keys and two providers per device per instance.
+- A yearly paste per device per instance; a missed one locks that device out while the instance bills under its in-cluster limit.
+- Stable per-device, per-role pseudonyms in Admin Activity, and in Data Access and delegation entries where those are logged.
+- The reader reaches the instance's ciphertext, and its images, which are not encrypted, from M3b.
+- FarCast owns its token-exchange code, and only a FarCast release fixes a drift from Google's protocol.
+- Azure's key is not in the Secure Enclave.
+- Some organizations, AWS accounts and Azure tenants land on a secret.
+- An Owner-level paste is a phishing pattern.
+- M2's walk keeps one Google-made key, as an approved, time-boxed exception.
+- If M3a passes, the route is proven in an organization project only, until the deferred run in a project with no organization. An operator without an organization meets it first.
+- M3b grows to 3 to 4 weeks [inf], which delays FarSight, sequenced ahead of AllThing.
+
+## Alternatives considered
+
+Each is rejected under the decision named, with its reason there.
+- OIDC with an uploaded JWKS as the route (decision 6; kept as fallback 1).
+- ADR 0020's instance CA as the anchor (decision 4).
+- A per-instance federation CA (decision 4).
+- One certificate as anchor and leaf (decision 4; measured as V3).
+- One principal per device for both roles (decision 4).
+- Two leaves under one anchor (decision 4).
+- Two anchors in one provider per device, with a condition over both IDs (decision 4).
+- A role ID derived from the key (decision 4).
+- Direct principal grants (decision 6).
+- A grant to the whole pool (decision 5).
+- The writer for the installer-minted reads (decision 7).
+- Vendoring the public external-account package (decision 8).
+- A cross-provider adapter interface now (decision 8).
+- An operator-registered OAuth client, ADR 0023 *Choices* 1 (b) (decision 2).
+- An enrolled device that may add providers, ADR 0023 *Choices* 5's other answer (decision 9).
+- One merged billable walk for M2 and M3b (decision 11).
+- Azure federated credentials (decision 10).
+- AWS's CRL fetching (decision 10).
+- AWS's advanced-features activation (decision 10).
+
+## Choices left to the operator
+
+Each answered choice says so, with its answer. Each open one has the default this ADR follows until it is answered. The numbers are the design's §9 questions.
+1. **Approve M3a** as decision 3 lists it: the objects, the project, Data Access for STS and IAM Credentials in the probe project for the session only, and the Org Policy API if needed. The project's organization is answered (3). *Default:* approve exactly that list, in the session that walks it, with one fresh scratch project in the operator's own organization.
+2. **The order.** *Answered 2026-11-22:* M2's walk runs on its own after M3a, then M3b. There is no merged walk. *Default,* as a revisit trigger: if M2's walk has not run when M3b's build is done, the operator decides again.
+3. **A project with no organization.** *Answered 2026-11-22:* M3a and M2's walk use a project in the operator's own organization, and a project with no organization comes later, when most of FarSight is ready. So M2's walk takes [B], with the installer's Google-made key as an approved, time-boxed exception, and the reader is not walked in M2.
+4. **ADR 0023 *Choices* 5, who enrols.** *Answered 2026-11-22:* human only. Every device addition, renewal and revocation is a human's paste, and no FarCast identity can enrol devices. *Still proposed, for the operator to confirm:* that the renewal here is a device's anchor renewal, so a leaf renews on the device with no paste (decision 9).
+5. **Two roles per writer-capable device,** at the cost of four keys and two providers. *Default:* yes, with one provider per role, so reads never hold a key that can write and the split does not rest on path length. V2 is measured; if Google accepts it, a dated note may halve the key count.
+6. **The anchor's life.** *Default:* 390 days, warned from 45 days ahead, and renewed by one paste that keeps the role IDs and grants. Up to two years only if M3a shows the rule binds leaves alone, and you choose it.
+7. **The guided default** for a non-technical person. *Default:* the Cloud Shell block, with the console form beside it. *Alternative:* the block for the instance, and the console form for each further device.
+8. **A newly added device's role.** *Default:* reader only, unless writer is chosen in its paste.
+9. **The installer-minted reads at M3b.** *Default:* the reader, with read-only grants on the instance's own repository and bucket applied by the writer as consented acts, and `projects.get` replaced by the recorded number. The reader then reaches ciphertext, and the instance's images, which are not encrypted: FarCast's own components and the operator's application images. *Alternative:* the writer, after consent, which puts writer tokens into plans.
+10. **The console surface,** if Google refuses sign-in in an embedded web view. *Default:* the system browser beside the app, checked at no cost before the GUI install flow is built.
+11. **Pending installs.** *Default:* listed by `instances` with state and age; every command warns after 7 days; `install --abandon` prints the teardown block and erases the keys; nothing is erased by age alone.
+12. **A per-device subject, or V8's constant per role,** if M3b's walk finds the role ID in Artifact Registry or Cloud Storage delegation entries and V8 passed. *Default:* per device, revisited at that walk.
+13. **The marks.** Neutralise, as a separate item: cluster names; the repository prefix and labels; the `farcast-` bucket prefix that the writer's storage condition names, where a random per-instance bucket prefix is the candidate (a planck and datasphere naming change); the installer's and reader's names; the user agent and field manager; the identical digests; and the anchor profile's traits. `registry.go:44-47` chose recognisability on purpose. *Default:* open the item and decide it before M3b's walk. Nothing persists yet, so now is the cheapest time.
+14. **The user agent on the identity path.** *Default:* `kube.UserAgent`, revisited with 13. *Alternative:* no product name there.
+15. **Hand-roll the exchange,** departing from ADR 0007 decision 2, or vendor the public external-account package, with its Go-version header, its caches and its body-bearing errors. *Default:* hand-roll, with the departure recorded here.
+16. **The installer and writer on the certificate route.** *Answered 2026-11-22 by decisions 1 and 2:* the installer and writer use the certificate route, and a Google-made key is only fallback 3, where the certificate route is closed. Still proposed: that this lands at M3b, and fallback 3's flag and plan fact. *Default:* at M3b.
+17. **ADR 0023 *Choices* 1 (b),** the operator-registered OAuth client with a refresh token at rest. *Default:* not planned, recorded as considered. Revisit only if the app is ever to create projects or link billing.
+18. **AWS accounts from "Sign up for AWS (new)".** *Default:* never ask for the irreversible activation that removes the spend limit; use the consented IAM user access key fallback there.
+19. **Azure.** *Default:* a software RSA-2048 certificate per role (0600, never the Secure Enclave), pasted again at each renewal; a client secret only where tenant policy blocks certificates; federated credentials rejected.
+20. **AWS and Azure probes.** *Default:* deferred to their adapters, with no accounts or tenants made now.
+21. **M5, if a Secure Enclave key cannot form a TLS identity** without a keychain item and access-group entitlement. *Default:* decide at M5, leaning to a keychain-formed identity as ADR 0020's keeper does. ADR 0023:198's no-keychain premise is reopened now. V5 for the Mac on Google only if M3a recorded it passing.
+22. **The records:** this ADR, the dated notes, the summaries rewritten in place, the design in `docs/design/`, the M2 design's §41, and the M2 walk runbook's notes, in one commit made only when the operator asks. M3a's runbook and W-FED's steps come with M3a's build. *Default:* yes.
+23. **M2's walk under [B]: the key and W-FED.** The exception itself is answered (3): the walk's key is time-boxed to the walk and deleted at teardown. If WP.8 counts 1 key, the installer holds no user-managed key after W6.2. Which key, the deletion's steps, and W-FED are asked at the walk's G0a. *Default:* the walk uses the installer's existing key if the operator holds one, or one made at WP.8; the operator deletes it in Google and on the Mac after W6.1's release, at W6.2. W-FED is offered if M3a passed in the organization project, with its own approval and `roles/container.viewer` for the reader's account for that step only.
+24. **`--yes` and the writer keys on the CLI.** *Default:* on the CLI, `--yes` counts as consent to open the writer keys wherever a command accepts `--yes` today, so a scripted run can still write. It never covers what ADR 0023 already keeps from `--yes`, and never selects fallback 3 (decision 2). On the Mac, the broker keeps ADR 0023:116's `--confirm` alone.
+
+## Phasing
+
+ADR 0023's Phasing table keeps its rows, and each changed cell gains a dated note there. This table restates the order.
+
+| # | Milestone | Cloud | Effort |
+|---|---|---|---|
+| **M3a** | The X.509 probe (decision 3; [the design's §6](../design/adr-0024-design.md#6-m3a-in-full)), and the offline `devicekey` and `kube/federated.go`. Brought forward 2026-11-22, before M2's walk. A project in the operator's own organization (accepted 2026-11-22); one fresh scratch project there (proposed). Its runbook, `docs/runbooks/adr-0024-m3a-probe.md`, and W-FED's steps, appended to M2's walk runbook, are written with its build | Free IAM objects; approval needed | 3–4 days, plus one session [inf] |
+| **M2's walk** | On its own, after M3a, before M3b (accepted 2026-11-22). G0a: [B], in a project in the operator's own organization; the installer's Google-made key an exception the operator approves, time-boxed and deleted at teardown; the reader not walked. [U1] withdrawn; [U2] deferred with a project with no organization. Optional W-FED, with its own approval, if M3a passed in the organization project (decision 11) | Billable; approval needed | as its runbook |
+| **M3b** | Below. Built after M3a passes, walked after M2's walk. If M2's walk has not run when M3b's build is done, the operator decides again (proposed) | Billable walk; approval needed | 3–4 weeks [inf], up from ADR 0023's 2–3 |
+| **M5** | As ADR 0023, plus a Secure Enclave TLS client identity for each role's leaf, for STS. If it fails, the Mac app takes V5 on Google if M3a recorded it passing, or else 0600 keys, as the operator decides then (*Choices* 21) | Billable walk | unchanged |
+| **GUI install** | Before it is built: a no-cost check of Cloud console sign-in in an embedded web view. On refusal, the console surface is the system browser beside the app | None | under an hour [inf] |
+| **M3a, no organization** | Deferred until most of FarSight is ready: M3a's run in a project with no organization, and with it M2's [U2] if the operator wants it then | Free IAM objects; approval needed | one session |
+| **AWS adapter** | Not scheduled. Its probes: P-256 `CreateSession` under a pasted anchor; a Secure Enclave signature; one key or two per role; the CloudTrail fields; a new sign-up account's refusal | Free objects; approval needed | — |
+| **Azure adapter** | Not scheduled. Its probes: PS256 against RS256; an EC certificate refused; the sign-in log fields; an AKS token | Free objects; approval needed | — |
+
+**M3b, as this ADR proposes it.** Built after M3a passes; the build may overlap M2's walk.
+- The certificate route on Google for the installer and writer as well as the reader: `install --name $INSTANCE` takes no `--credentials` (decision 1). The pending directory makes `install` resumable at the paste, with no compatibility work, since no instance persists.
+- Pending installs, listed, warned and abandonable (decision 1).
+- Two roles per device, each with its own provider, with decision 4's custody rules in `devicekey`.
+- `farcast device add`, `ls`, `rm`, `renew` and `coordinates`, and the proposed `device known` (decision 9), including adding and removing the writer role and its provider; the read-back in every enrolment; `world` marking unknown providers.
+- Random IDs, a pool and three accounts per instance, and `release`'s teardown block.
+- The setup-block generator, with its digest, its readerinit-style shell, its neutral tags, its random condition title, one provider per role, each trust store in Google's YAML form, the dedicated node account, the two Workload Identity counts, and the writer's tested role allowlist, `roles/iam.serviceAccountUser` never at the project level among its checks; and the console guide's text.
+- The dedicated node account in planck: `buildCluster` names it as the nodes' account, `grantPull` and the instance's metadata name it in place of the default compute account, and a test checks that the create request names it (decision 9).
+- Decision 8's wiring. The callers of `creds.ServiceAccountKey` move: `fatline.go:168`, `release.go:143`, `storage/storage.go:98`, and `storagedeploy.go:140`, through `storage.OpenBucketGrants` (`storage/storage.go:238`); and `clusterref.go:159`, with its check at `:193`, the writer's cluster credential, which the federated `kube.Credential` replaces.
+- Decision 7's reads, each decided in this build.
+- Fallbacks 2 and 3 behind their flags and plan facts; fallback 1, with one provider per role, if M3a recorded V5 passing. `reader init`'s policy message (`readerinit.go:404`, `:409`), which says an organization administrator must allow upload, is reworded to name the policy and the routes still open.
+- Application Default Credentials out of the CLI.
+- The `instances` and `world` documents gain the identity route, the roles and pending installs, and the Swift app's documents follow in lockstep.
+- **Its walk,** after M2's walk: a fresh install from the paste, with no service-account key on the machine, in a project in the operator's own organization; the reader end to end, which M2's walk under [B] does not walk; the DNS endpoint, unless W-FED settled it; the reader's resource-scoped reads and the writer's consented acts that grant them; revocation timing on a live instance; and one Artifact Registry and one Cloud Storage Admin Activity entry made through the identity, read back, recording what they name. That decides V8 (*Choices* 12).
+
+## Records this changes
+
+On this ADR's partial acceptance (2026-11-22) these records gain dated notes or in-place rewrites. Each note is appended at the end of an existing line or, in a table row, at the end of the cell it amends, so no cited line moves. The anchors are [the design's §4 and §5](../design/adr-0024-design.md#4-adr-0023s-dated-notes); the applied texts were revised from the texts given there, and the edited files are the record.
+- **ADR 0023:** dated notes on its Status line and *Relates to*; the milestone list; decisions 1, 3, 5, 7 and 8; *Choices* 1 and 5; *What stays outside the app*; *What Google … still see*; *Cost*; *Alternatives*; *Consequences*; the Phasing rows of M2, M3a, M3b and M5; *Records*; Verification 4; and the revisit trigger on M3a.
+- **ADR 0007:** decision 2's departure, and M3b's push token (:32, :38).
+- **ADR 0019:** each operator read's token, from M3b (:95).
+- **ADR 0020:** the M5 probe's TLS client identity (:266). It changes nothing ADR 0020 decided.
+- **Runbooks:** phase 1's key download (:95) and phase 3's storage condition (:71); M2's walk runbook's Status line, what is left to choose at G0a, deviation 10, T6's stops, G0a's branch, project and optional steps, WP.8, G0b's no, G0b's list of what the walk creates and its teardown, W6.2, W6.8, and the Results rows of WP.8 and W6.2.
+- **The M2 design** gains §41, which answers A22-2 and supersedes its open lines.
+- **AGENTS.md, PLAN.md and README.md** summarise, so their sentences are rewritten in place.
+- **Not changed now,** by ADR 0023:331's convention that a sentence describing built code keeps until the code changes: `farsight/cli/README.md`, `planck/README.md:354` and the code comments at `registry.go:588-600`. They change at M3b.
+- **Written with M3a's build,** not now: M3a's runbook, and W-FED's steps appended to M2's walk runbook.
+
+## Verification
+
+1. **M3a's Results table,** in its runbook (decision 3; [the design's §6](../design/adr-0024-design.md#6-m3a-in-full)), recorded with dated notes here and in ADR 0023's Verification 4.
+2. **Unit and mutation tests at M3b,** against fakes, each shown to fail with its defect restored:
+   - a bearer sent to a host other than IAM Credentials';
+   - the client certificate presented to a host other than STS's (and IAM Credentials' mTLS host, only if M3a's I1 required it);
+   - the environment proxy honoured, or a URL taken from input or a file;
+   - a read command or a plan that opens a writer key, exchanges the writer leaf, or impersonates the writer;
+   - a reader leaf renewed with the writer anchor key, or a writer leaf renewed outside a consented command or `device renew`;
+   - a writer key opened under any purpose but a consented write, a renewal or an enrolment;
+   - a role ID derived from a key, a name or a counter, or changed by an anchor renewal;
+   - one of decision 7's reads presenting a writer token;
+   - a response body in an error;
+   - a provider accepted by the read-back whose trust store holds other than its role's one anchor, or whose condition names other than its role's one ID;
+   - a setup block that puts two anchors in one provider, names two IDs in one condition, or contains `farcast` outside the storage condition's prefix, or the instance's name;
+   - a trust-store file that does not parse as Google's YAML trust store with exactly one anchor and no intermediate, or whose parsed `pemCertificate` does not decode to the anchor's DER, byte for byte;
+   - a Workload Identity count that misses either member form, a basic or custom role carrying a counted permission, or a binding on one of the project's accounts or on the project; or a count other than 0 that does not stop the block, at a no, before it creates anything;
+   - a cluster create request that does not name the dedicated node account;
+   - a teardown block, `install --abandon`'s, `release`'s or `device rm`'s, that stops at an absent object, run against a fake with each prefix of the setup applied, then again after each prefix of itself, with the pool and providers it deleted left in the state `DELETED`;
+   - `device rm` printing, for a provider this machine did not make, a binding removal not taken from that provider's condition, or erasing this machine's keys for a provider it did not make;
+   - a pending install not listed, or listed without its state or age; a warning before 7 days, or none after; `install --abandon` printing other than the teardown of exactly what the setup creates, leaving a pending key, refusing a pending install, or acting on a finished record;
+   - an `install` that makes a key, or shows a block, for a name already recorded or already pending; or that calls `CreateCluster` before the record holds the keys and the coordinates.
+3. **The DNS endpoint and an impersonated token,** and the Kubernetes username: M2's walk's W-FED if it runs, otherwise M3b's walk.
+4. **M5's Secure Enclave TLS client identity,** for each role's leaf.
+5. **The AWS and Azure probes,** when their adapters start.
+6. **The no-cost embedded-sign-in check,** before the GUI install flow is built.
+7. **M3a's deferred run in a project with no organization,** when most of FarSight is ready.
+
+## Revisit triggers
+
+- **M3a fails.** Decision 2's order comes in, and the operator re-decides.
+- **M3a is refused by a policy Google sets by default in new organizations.** That fails the operator's own rule, no route a provider closes by default, and the operator re-decides.
+- **An organization the operator uses blocks X.509 providers.**
+- **The deferred run in a project with no organization differs** from the organization run.
+- **Google documents that X.509 federation enforces a CA's path length.** That would reopen two anchors in one provider, with fewer console forms.
+- **GKE refuses impersonated tokens,** or maps them to a username the reader's RoleBindings do not name. The fallback would be direct grants, which change RBAC subjects and the logs.
+- **Artifact Registry or Cloud Storage delegation entries carry the role ID.** That reopens V8 (*Choices* 12).
+- **Google adds CRL support,** or certificate-bound tokens leave Preview.
+- **Google prices STS or impersonation.**
+- **AWS documents P-256 for Roles Anywhere,** or changes the new accounts' SCPs.
+- **Entra accepts EC certificates.**
+- **A Secure Enclave TLS identity fails at M5.**
+- **Google admits or refuses Cloud console sign-in in an embedded web view.**
+- **M2's walk has not run when M3b's build is done.** The operator decides again.
+
+## Sources
+
+- The repository at 5ef5ee8, as cited inline. Line numbers are at that commit.
+- The design: [`docs/design/adr-0024-design.md`](../design/adr-0024-design.md), v3, 2026-11-22, with M3a in full, the dated notes' texts and the history of each decision.
+- Offline prototypes on the dev Mac, 2026-11-22: go1.27.4 under `GOWORK=off GOTOOLCHAIN=go1.27.4 GOPROXY=off GOFLAGS=-mod=vendor`, no `FARCAST_*` set, against loopback fakes only. `proto/`, `variantb/` (an earlier profile, which does not apply here) and `twoanchor/`, with `perrole_test.go`. They are session working files, not in the repository, so a [ran] result is reproduced only by repeating it.
+- Pages, all fetched 2026-11-22, under the keys the text cites:
+  - Google IAM — X.509 federation [X509]: https://docs.cloud.google.com/iam/docs/workload-identity-federation-with-x509-certificates · TrustStore [TS]: https://docs.cloud.google.com/iam/docs/reference/rest/v1/TrustStore · providers [PROV]: https://docs.cloud.google.com/iam/docs/reference/rest/v1/projects.locations.workloadIdentityPools.providers · managing pools and providers [MGMT]: https://docs.cloud.google.com/iam/docs/manage-workload-identity-pools-providers · STS token [STS]: https://docs.cloud.google.com/iam/docs/reference/sts/rest/v1/TopLevel/token · WIF audit examples [AUD]: https://docs.cloud.google.com/iam/docs/audit-logging/examples-workload-identity · WIF with other providers [OIDC]: https://docs.cloud.google.com/iam/docs/workload-identity-federation-with-other-providers · WIF custom constraints [CUS]: https://docs.cloud.google.com/iam/docs/workload-identity-federation-custom-constraints · quotas [QUOTA]: https://docs.cloud.google.com/iam/quotas · billing [PRICE]: https://docs.cloud.google.com/iam/docs/billing-questions · release notes [RN]: https://docs.cloud.google.com/iam/docs/release-notes · policy history [POLHIST]: https://docs.cloud.google.com/iam/docs/review-iam-policy-history
+  - Google organization policy and logging — domain-restricted sharing [DRS]: https://docs.cloud.google.com/organization-policy/domain-restricted-sharing · secure-by-default organizations [SBD]: https://docs.cloud.google.com/resource-manager/docs/secure-by-default-organizations · audit logs [AUDLOG]: https://docs.cloud.google.com/logging/docs/audit/understanding-audit-logs
+  - GKE — API server authentication [GKEAUTH]: https://docs.cloud.google.com/kubernetes-engine/docs/how-to/api-server-authentication · RBAC [GKERBAC]: https://docs.cloud.google.com/kubernetes-engine/docs/how-to/role-based-access-control · node service accounts [GKESA]: https://docs.cloud.google.com/kubernetes-engine/docs/how-to/service-accounts
+  - Google sign-in in embedded views — 2020 [WV-2020]: https://developers.googleblog.com/2020/08/guidance-for-our-effort-to-block-less-secure-browser-and-apps.html · 2021 [WV-2021]: https://developers.googleblog.com/en/upcoming-security-changes-to-googles-oauth-20-authorization-endpoint-in-embedded-webviews/ · help [WV-HELP]: https://support.google.com/accounts/answer/7675428
+  - AWS — Roles Anywhere trust model [RA-TRUST]: https://docs.aws.amazon.com/rolesanywhere/latest/userguide/trust-model.html · getting started [RA-START]: https://docs.aws.amazon.com/rolesanywhere/latest/userguide/getting-started.html · signing [RA-SIGN]: https://docs.aws.amazon.com/rolesanywhere/latest/userguide/authentication-sign-process.html · quotas [RA-QUOTA]: https://docs.aws.amazon.com/general/latest/gr/rolesanywhere.html · SCPs for new accounts [AWS-SCP]: https://docs.aws.amazon.com/accounts/latest/reference/scps-and-rcps-for-projects.html · advanced features [AWS-ADV]: https://docs.aws.amazon.com/accounts/latest/reference/activate-advanced-features.html
+  - Microsoft Entra — certificate credentials [ENTRA-CERT]: https://learn.microsoft.com/en-us/entra/identity-platform/certificate-credentials · self-signed certificates [ENTRA-RSA]: https://learn.microsoft.com/en-us/entra/identity-platform/howto-create-self-signed-certificate · federated credentials [ENTRA-FIC]: https://learn.microsoft.com/en-us/entra/workload-id/workload-identity-federation-create-trust · app management policies [ENTRA-POL]: https://learn.microsoft.com/en-us/entra/identity/enterprise-apps/configure-app-management-policies · sign-in logs [ENTRA-LOG]: https://learn.microsoft.com/en-us/azure/azure-monitor/reference/tables/aadserviceprincipalsigninlogs · data retention [ENTRA-RET]: https://learn.microsoft.com/en-us/entra/identity/monitoring-health/reference-reports-data-retention
+
+---
+
+*This ADR is a living record. Revisit it on any trigger above.*

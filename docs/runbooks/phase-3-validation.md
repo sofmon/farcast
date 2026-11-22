@@ -68,7 +68,7 @@ gcloud projects add-iam-policy-binding "$PROJECT_ID" --member "serviceAccount:${
 > **Verified 2026-08-27: this condition works, and it does *not* block
 > `storage.buckets.list`.** It was also verified on the **installer** service account —
 > the shape production uses, where one account holds container, Artifact Registry and
-> conditional storage grants together.
+> conditional storage grants together. *(2026-11-22, [ADR 0024](../adr/0024-paste-the-certificate.md): from its M3b, as proposed, this grant goes to the writer SA, with a condition title drawn at random per instance and no description. The `farcast-` prefix stays a mark of FarCast in the project's IAM policy until the marks decision, ADR 0024's marks question.)*
 >
 > One operational wrinkle: `add-iam-policy-binding` immediately after
 > `service-accounts create` can fail with `Service account … does not exist` while IAM

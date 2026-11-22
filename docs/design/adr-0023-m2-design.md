@@ -3435,7 +3435,7 @@ The walk ran at 2482810, with the two walk-time probe options described below. T
 
 **A22-2 (§7.2, product): key upload can be blocked.**
 - **The finding.** The walk's organization enforces `iam.disableServiceAccountKeyUpload`, so no reader could be set up. In such an organization, which Google makes the default for newer ones, the five read commands read no cluster. Key creation was allowed there.
-- **The options**, each the operator's to choose:
+- **The options**, each the operator's to choose: *(2026-11-22: answered by the operator, through [ADR 0024](../adr/0024-paste-the-certificate.md): the third is the route, the second is not built, and the first is not proposed (§41, A41-2).)*
   - allow upload for the project;
   - a new command that imports a Google-created reader key. That is a design change: Google generates the private key, and it travels as a download;
   - ADR 0023 M3a/M3b, Workload Identity Federation, which needs no service-account key.
@@ -3495,7 +3495,7 @@ M2.6 was mapped against the code at 39ca9e3 in six read-only lanes: the plan pac
   - `reader grant --plan` prints a blocked plan (its key id is never recorded there), and its `--confirm` refuses;
   - `connect`, `redeploy`, `build`, `kernel meter`, `kernel confirm`, and `storage key rotate` with no keyholder plan and confirm normally;
   - interactive and `--yes` runs of all eleven are unchanged.
-- **A22-2's choice** (allow upload for the project; a command that imports a Google-created reader key; M3a/M3b) is decided separately, before the billable M2 walk (Q10). Until then, in such an organization, Q10 can walk only the reader plans' refusals, not the plans themselves; the reader and its scope pair stay unwalked.
+- **A22-2's choice** (allow upload for the project; a command that imports a Google-created reader key; M3a/M3b) is decided separately, before the billable M2 walk (Q10). Until then, in such an organization, Q10 can walk only the reader plans' refusals, not the plans themselves; the reader and its scope pair stay unwalked. *(2026-11-22: decided by the operator: the walk takes [B], after ADR 0024's M3a, so it walks the reader plans' refusals and not the reader (§41, A41-3).)*
 - **Pinned by** `TestPlanWithoutAReaderIsRefused` (A23-21). The records say it (A23-52).
 
 **A23-2 (O2; C30, L5.3, L5.14): P1's re-read moves before the egress policy.** On every path (`--confirm`, `--yes`, non-interactive, interactive), the re-read of each application's `DeploymentState` and the ledger, and, under `--confirm`, the egress policy's resourceVersion (with the pin's, A23-48), runs after the builds and before the egress policy is read and applied (`run.go:284-296`), not before the workload apply (`run.go:326`). A refusal there leaves only the builds written.
@@ -8346,7 +8346,7 @@ Each runs as an overlay (`go test -overlay`), never by editing the tree, and beh
   - `kernel deploy` without `--adapt`: the `--adapt` argument is gone from the live Deployment. It is still the walk's only live stuck-field check, now of farcast's forced apply alone under Autopilot's admission;
   - then `redeploy` and a second `run`. Record whether an unchanged forced re-apply moves `metadata.generation`, and whether a ReplicaSet is made;
   - record the application's requests after `run`, and the review's reset lines (P1).
-- **A22-2's choice** still comes before the walk. Where key upload is blocked, the reader steps and every `--plan` step cannot run, and the walk takes the terminal path (A33-39).
+- **A22-2's choice** still comes before the walk. Where key upload is blocked, the reader steps and every `--plan` step cannot run, and the walk takes the terminal path (A33-39). *(2026-11-22: decided by the operator: the walk takes [B], after ADR 0024's M3a and before M3b (§41, A41-3).)*
 - **W5** audits `$INSTANCE`'s writes. **W6** releases every instance the walk installed, runs the reader lines each `release` prints, and checks the cloud at zero.
 - **Its cost [inf]:** `$OLD`'s six instance-hours go. `$INSTANCE` lives longer by W1's and W3's steps, about four hours, which is about USD 0.5 by §10.7's model. The approval asked for stays under USD 5.
 - **What only this walk settles:**
@@ -8955,10 +8955,10 @@ Texts in the quotes are exact. "Append" means after a space, at the end of the n
 - **T6 to T8** as outlined: a HARD STOP records what was seen and goes to W6, and anything else unexpected is a finding that stops for the operator; Cloud Shell's idle reset and its helper lines run again; an instance path is written `"${INSTANCE}:…"`, because zsh reads a bare `$INSTANCE:w` as a modifier.
 
 **A39-19: G0a, the walk's choices (no spend).** The agent presents; the operator answers in the walking session; the answers and G0a's date are recorded.
-- **A22-2's branch, first.**
-  - [U1]: allow key upload for the walk's project, by the operator's own org-policy change. Its spelling, and who may make it, are [unverified]. W6.4 restores or keeps it, as decided here.
-  - [U2]: a project outside the organization, which has no such policy. It is offered as a form of A22-2's first option, "allow upload for the project", not as a fourth option (the critic's correction 10; question 3). It brings its own setup, baseline and W6.8.
-  - [B]: upload stays blocked. The walk takes the refusal and terminal path, the reader is not walked, and M2's records keep "reader not walked".
+- **A22-2's branch, first.** *(2026-11-22: answered by the operator: [B] (§41, A41-3).)*
+  - [U1]: allow key upload for the walk's project, by the operator's own org-policy change. Its spelling, and who may make it, are [unverified]. W6.4 restores or keeps it, as decided here. *(2026-11-22: withdrawn. FarCast is not to ask for a security default to be relaxed (§41, A41-2).)*
+  - [U2]: a project outside the organization, which has no such policy. It is offered as a form of A22-2's first option, "allow upload for the project", not as a fourth option (the critic's correction 10; question 3). It brings its own setup, baseline and W6.8. *(2026-11-22: deferred with a project with no organization, until most of FarSight is ready. When it runs, ADR 0024 proposes that the installer and the reader are both its fallback 2, not a form of "allow upload" (§41, A41-3).)*
+  - [B]: upload stays blocked. The walk takes the refusal and terminal path, the reader is not walked, and M2's records keep "reader not walked". *(2026-11-22: the operator's branch. The installer's Google-made key is an exception the operator approves at G0a, time-boxed and deleted at teardown (§41, A41-4).)*
 - **The project.** The probe walk's project, whose baseline is known ([U1] or [B]), or a fresh one ([U2]). For a fresh project, whether W6.8 keeps it or shuts it down.
 - **The Org Policy API.** WP.7's unsilenced managed check may ask to enable it (A22-3). W6.4 turns it off again if the walk enabled it.
 - **The optional steps:**
@@ -9085,7 +9085,7 @@ The total is about USD 0.7 to 1.5. The IAM objects, the reader's key, the Org Po
 **A39-28: five questions, and the default the build follows until each is answered.** None is billable to answer. The walk's own choices are G0a's and G0b's (A39-19, A39-21), asked in the session that walks it. These five shape what M2.9b builds.
 1. **W4 (e).** Accept that (e) is dropped, and that W4.15's same-name refusal on one cluster stands for it [inf]? Or approve a second fresh instance in the walk, with its price and a second instance placeholder? *Default:* dropped; the runbook has no (e) step (A39-24).
 2. **Host names in the runbook.** May it name the hosts the earlier runbooks name: Google's token endpoint, the cluster's DNS endpoint domain, the upstream image registries and the public repository's host? *Default:* no; it points to the sections that name them (A39-16).
-3. **[U2].** Offer a project outside the organization at G0a, as a form of A22-2's "allow upload for the project", with its own setup, baseline and W6.8? *Default:* offered (A39-19).
+3. **[U2].** Offer a project outside the organization at G0a, as a form of A22-2's "allow upload for the project", with its own setup, baseline and W6.8? *Default:* offered (A39-19). *(2026-11-22: superseded by the operator's decisions: [U2] is deferred. When it runs, ADR 0024 proposes it as its fallback 2, not a form of "allow upload" (§41, A41-3).)*
 4. **The real-API suite before M2.9b's commit.** Re-run it on the keeper VM? It costs no cloud, takes about 45 minutes and needs its own approval. *Default:* not run. Every record says the suite as M2.9a left it has not run. If it runs before the commit, those clauses carry its results instead, and §40 records the run.
 5. **The real-API runbook's `:246`.** It names a loopback address and port in an instruction line, which predates M2.9 and breaks the scrub rule. *Default:* left, as walked text; changing it is the operator's call.
 
@@ -9212,7 +9212,7 @@ A39-2's rule binds the records, not the code. No record cites these lines at HEA
 **A40-15: A39-28's five questions, as the operator settled them on 2026-11-22.** Four of the five are settled, each as its default:
 1. W4 (e): dropped, by the operator's answer. W4.15's same-name refusal on one cluster stands for it [inf].
 2. Host names: not put to the operator, because the standing scrub rule settles it. They are not written, and the runbook points to the sections that name them.
-3. [U2]: not settled. Asked whether G0a should offer a project outside the organization, the operator asked instead whether the reader could take a key the provider creates and the operator downloads, as the installer's is, in place of an uploaded one. The aim is not to depend on what a provider closes by default, with the same procedure on every provider. Until that is decided, the runbook keeps [U2] offered at G0a, the build's default.
+3. [U2]: not settled. Asked whether G0a should offer a project outside the organization, the operator asked instead whether the reader could take a key the provider creates and the operator downloads, as the installer's is, in place of an uploaded one. The aim is not to depend on what a provider closes by default, with the same procedure on every provider. Until that is decided, the runbook keeps [U2] offered at G0a, the build's default. *(2026-11-22: settled by the operator's decisions, recorded in ADR 0024. The credential is the certificate the installer shows, the same on every provider, and a provider-made secret is used only where that route is closed, named and consented. So M2's walk imports no Google-made reader key: it takes [B], the reader is not walked, and [U2] is deferred (§41).)*
 4. The real-API suite before M2.9b's commit: not run, by the operator's answer. Every record says that the suite as M2.9a left it, twelve tests, has not run.
 5. The real-API runbook's `:246`: left as walked text, by the operator's answer.
 
@@ -9233,3 +9233,75 @@ A39-2's rule binds the records, not the code. No record cites these lines at HEA
 - Every link in the runbook and in the records' changed lines resolves, anchors included. §39's quoted riders hold links relative to the files they go into, not to this design.
 - A scrub scan of every added line and of the whole runbook found no address, port, home path, account name, uid, key id, token byte or time of day. Its host-name hits are in text that the in-place edits kept from HEAD, and in Kubernetes label keys. The placeholders are `$INSTANCE`, `$PROJECT` and `$TOKEN`, besides the shell's own `$HOME`, `$TMPDIR` and `$PWD`.
 - `zsh -n` passed on the runbook's `walk.zsh` block, which the review did not change, and `bash -n` on its Cloud Shell helpers.
+
+## 41. Decided by the operator on 2026-11-22: A22-2 and the walk's branch
+
+On 2026-11-22 the operator decided how FarCast's operator holds a cloud credential, and with it A22-2 (§22) and the branch of M2's billable walk. [ADR 0024](../adr/0024-paste-the-certificate.md) records the decisions, and [its design](adr-0024-design.md) the reasoning. This section records what they change here. It wins over §0–§40 wherever it differs. Nothing in it is built or walked, and neither ADR 0024's M3a nor M2's walk has run.
+
+Line numbers are at 5ef5ee8. No line above this section was added or removed: each line it supersedes gets a dated note at its end.
+
+### Decided by the operator on 2026-11-22
+
+**A41-1: the decisions.** These are accepted, as ADR 0024's Status records them.
+1. **The procedure.** The operator's cloud credential is the same on every provider: paste the certificate the installer shows. The installer makes its own keys on the device and shows public certificates. A human creates the identity once, in the provider's console or its cloud shell, and pastes them in. Nothing secret leaves the device.
+2. **The fallback rule.** A provider-made secret is used only where the certificate route is closed. It is named and consented.
+3. **M3a first.** ADR 0023's M3a, the identity probe, is brought forward, before M2's billable walk.
+4. **The order.** M2's billable walk runs on its own after M3a, then M3b. There is no merged walk. (ADR 0024 proposes, as a revisit trigger, that if M2's walk has not run when M3b's build is done, the operator decides again. That is not one of the operator's decisions.)
+5. **The projects.** M3a and M2's walk use a project in the operator's own organization. A project with no organization comes later, when most of FarSight is ready.
+6. **ADR 0023 *Choices* 5: human only.** Every device addition, renewal and revocation is a human's paste. No FarCast identity can enrol devices.
+
+Everything else in ADR 0024 is proposed, with its default. On Google its mechanism, X.509 federation, is proposed and gated on M3a.
+
+**A41-2: A22-2 is answered.** Of A22-2's three options (`:3439-3441`):
+- **the third,** ADR 0023's M3a and M3b, with no service-account key, is the route. The procedure is accepted. Its mechanism on Google is proposed, gated on M3a;
+- **the second,** a new command that imports a Google-made reader key, is not built. By the fallback rule, a Google-made key is used only where the certificate route is closed. ADR 0024 proposes that as its fallback 3: its own flag and a stated consent, never `--yes`. M2's walk keeps one Google-made key, the installer's, as an approved exception (A41-4). It imports no reader key;
+- **the first,** allowing upload for the project, relaxes a security default. It is not proposed: FarCast is not to ask for a security default to be relaxed, ADR 0024's proposed rule. Today's `reader init` still says an organization administrator must allow upload (`readerinit.go:404`, `:409`); ADR 0024's M3b rewords it.
+
+**A41-3: M2's walk takes [B].**
+- It runs after ADR 0024's M3a, on its own, before M3b, in a project in the operator's own organization: the probe walk's, or a fresh one there. That organization blocks key upload and allows key creation (the probe walk's Results).
+- G0a's branch is [B]. Key upload stays blocked, and the walk takes the refusal and terminal path. The reader is not walked, and M2's records keep "reader not walked". A22-7's reader evidence stays open until M3b's walk, except the federated reader's cluster reads if W-FED runs (A41-5).
+- **[U1] is withdrawn,** for A41-2's reason on the first option.
+- **[U2] is deferred** with a project with no organization, until most of FarSight is ready. That is the operator's decision. How it runs is ADR 0024's proposal, not decided: a project outside any organization, where upload is open and the installer and the reader are both ADR 0024's fallback 2: device-made RSA certificates uploaded in Cloud Shell, with no Google-made key. It is not a form of "allow upload", as A39-19 and A39-28's question 3 had it. Its installer helper, a walk-tagged test that makes the key with `kube.NewReaderKey`, is described in ADR 0024's design (D9) and is not built.
+- A fresh project in the organization is set up at WP.8 as [U2]'s list there says, and W6.8 keeps it or shuts it down, as G0a decides.
+
+**A41-4: the installer's key under [B].** M2's code writes only as the stored installer account, through a service-account key. Where upload is blocked, that key can only be one Google made, a download, as [phase 1's step 2](../runbooks/phase-1-validation.md#2-create-the-installer-service-account--key) makes it. So the walk keeps one Google-made key. It is an exception to ADR 0024 that the operator approves at G0a, time-boxed to the walk and deleted at teardown. Its specifics are proposed, and asked at G0a, each with its default:
+- the walk uses the installer's existing key if the operator holds one, or one made at WP.8 as phase 1's step 2 makes it, in Cloud Shell or on the console's Keys tab, because the Mac runs no `gcloud` in the walk. It reaches the Mac through the browser's download and is kept at 0600 there, never in a checkout or Cloud Shell's home. The download folder's copy and Cloud Shell's are deleted at once;
+- WP.8 records how many user-managed keys the installer holds, a count only, once the walk's key exists. The count expected is 1; any other count stops the walk to ask the operator, because any other key is G0a's to decide;
+- after W6.1's release the operator deletes the key in Google, from Cloud Shell, and the key file on the Mac (W6.2), and W6.6 deletes the walk directory's copy. A no at G0b, or any stop that ends the walk once the key exists (T6's note), deletes them too;
+- the deletion itself is the operator's decision, not a G0a choice. W6.2 checks it, a count only: WP.8's count less one, which is 0 when WP.8 found 1, and then the installer holds no user-managed key after the walk.
+
+**A41-5: W-FED, an optional step.** Proposed. It is offered at G0a only if M3a passed in the organization project, and it needs its own approval there.
+- It runs after W5 and before W6.1, while the cluster exists.
+- In the walk's project, M3a's setup paste for one fresh writer-capable device creates the pool, the device's two providers and the two service accounts, with their bindings. The writer account gets no role.
+- The reader account gets `roles/container.viewer` on the project for this step only. That it is the smallest role that authorises the three reads is [unverified].
+- M3a's probe, with the impersonated reader token at the cluster's DNS endpoint, reads the API server's version, lists namespaces and posts a SelfSubjectReview, recording "email matches: yes or no". Then it makes the same reads with a direct federated token, recording 401 against 403.
+- Everything the step made is then deleted, and the device's keys go with the walk directory.
+
+Its steps use M3a's probe, so they are appended at the runbook's end with M3a's build, and no line moves. They are not written now.
+
+**A41-6: the runbook's dated notes.** [adr-0023-m2-walk.md](../runbooks/adr-0023-m2-walk.md) gets a dated note of 2026-11-22 at the end of each line below, at 5ef5ee8's numbering. No line is added or removed.
+- `:5`, the Status line;
+- `:9`, what is left to choose at G0a;
+- `:21`, deviation 10;
+- `:70`, T6: any stop that ends the walk once the installer's key exists also deletes it;
+- `:80` to `:84` and `:86`: G0a's branch, [U1], [U2], [B], the project and the optional steps;
+- `:215` to `:217` and `:223`: WP.8;
+- `:233`: G0b's no, which also deletes the key;
+- `:251` and `:252`: G0b's list of what the walk creates, and its teardown, which on [B] also deletes the key;
+- `:629`: W6.2, the key's deletion in Google. W6 had no step that deletes the installer's key there, so without it "deleted at teardown" would rest on G0a's note alone;
+- `:636`: W6.8, for a fresh project under [B];
+- `:656` and `:687`: the Results rows of WP.8 and W6.2, each note in the row's last cell, for the key counts.
+
+W4.3 (`:282-296`) and W4.5 (`:309-325`) are unchanged: [B]'s paths there already hold.
+
+### Superseded
+
+§41 supersedes, where they differ. Each line named here gets a dated note at its end:
+- **A22-2's options** (`:3436-3441`), with one note at `:3438`;
+- **§23's A22-2 bullet** (`:3498`), "decided separately, before the billable M2 walk";
+- **§37's A22-2 bullet** (`:8349`), "A22-2's choice still comes before the walk";
+- **A39-19's branches** (`:8958-8961`), one note on each line;
+- **A39-28's question 3** (`:9088`), [U2] as a form of "allow upload";
+- **A40-15's question 3** (`:9215`), which the decisions answer.
+
+It also supersedes, with no note, the lines that offer [U2] or tie a fresh project to it: A39-19's project (`:8962`), A39-20's WP.8 (`:8985`) and A39-25's deviation 10 (`:9041`).

@@ -2,11 +2,11 @@
 
 Since [ADR 0023](../adr/0023-one-download-farcast.md) M2.7, `farcast` starts no `kubectl`, auth plugin or `gcloud`. Every cluster call is in-process. The read commands, and the plans under `--plan` and `--confirm`, read as the instance's reader. Every write, and an interactive or `--yes` run's reads, run as the stored installer account, and each apply is a forced server-side apply named `farcast`. Since M2.8 the bucket grant and the push grant name the ServiceAccount by its uid. None of this is walked. The [probe walk](adr-0023-m2-probe-walk.md) of 2026-11-16 settled only the writer's scope pair. This walk installs one fresh instance with the M2 release farcast, from a shell with no `kubectl`, plugin or `gcloud` on `PATH`. It walks the M2 design's revised §10.7 ([§37](../design/adr-0023-m2-design.md#37-decided-before-m29as-build-2026-11-20), as [§39](../design/adr-0023-m2-design.md#39-decided-before-m29bs-build-2026-11-22) decides it), and releases everything at its end.
 
-**Status.** *Written 2026-11-22 (ADR 0023 M2.9b), against the code at the commit it lands in. Not run.* It needs the operator's own approval in the session that walks it: the choices at G0a, and the yes to spend at G0b. The approval that had ADR 0023 M2.9b write this runbook is not approval to walk it. No earlier walk's approval carries over.
+**Status.** *Written 2026-11-22 (ADR 0023 M2.9b), against the code at the commit it lands in. Not run.* It needs the operator's own approval in the session that walks it: the choices at G0a, and the yes to spend at G0b. The approval that had ADR 0023 M2.9b write this runbook is not approval to walk it. No earlier walk's approval carries over. *(2026-11-22, [ADR 0024](../adr/0024-paste-the-certificate.md): by the operator's decisions of that day, this walk runs after ADR 0024's M3a, on its own, before M3b, in a project in the operator's own organization, under [B]. A22-2 is answered (G0a). An optional W-FED step, with its own approval, is to be appended to this runbook with M3a's build. Neither M3a nor this walk has run.)*
 
 **It is billable.** One Autopilot instance, installed with `--cost-limit 100` (USD a month), for about 4 to 4.5 hours. G0b asks for under USD 5 [inf]. By the repository's floor model the walk costs about USD 0.7 to 1.5 (G0b has the arithmetic). The walk also creates IAM objects, which cost nothing, and W6 removes them.
 
-**What is left to choose at G0a:** A22-2's branch first ([U1], [U2] or [B]); the project; whether the Org Policy API may be turned on; and the optional steps: (f), the `git-credential` step, ADR 0019's checklist as W5.3, and W4.17's read of field managers.
+**What is left to choose at G0a:** A22-2's branch first ([U1], [U2] or [B]); the project; whether the Org Policy API may be turned on; and the optional steps: (f), the `git-credential` step, ADR 0019's checklist as W5.3, and W4.17's read of field managers. *(2026-11-22, ADR 0024: the branch is [B], by the operator's decision. [U1] is withdrawn, and [U2] is deferred with a project with no organization. G0a also approves the installer's Google-made key as ADR 0024's exception, chooses the existing key or one made at WP.8, and offers W-FED if M3a passed.)*
 
 **Its deviations from the M2 design.** Items 1 to 12 are from §37's letter, and the design's A39-25 accepts them. Items 13 to 15 are from §39's letter: 13 and 14 found while this runbook was written, 15 in its review. The code is cited where it decides.
 1. W3.1 passes `--adapt=false`. "Without `--adapt`" would keep it: the kernel's settings are recorded and carried forward (`kernel deploy`'s Usage) [read].
@@ -18,7 +18,7 @@ Since [ADR 0023](../adr/0023-one-download-farcast.md) M2.7, `farcast` starts no 
 7. G0 is split into G0a, before anything names or changes the project, and G0b, right before the first billable step.
 8. W4.11, `toolchain`, is added: `run` and `build` need both images pinned by digest.
 9. W4 (e) is dropped. W4.15's same-name refusal on one cluster stands for it [inf] (the design's A39-24).
-10. [U2] is offered, as a form of A22-2's first option, "allow upload for the project".
+10. [U2] is offered, as a form of A22-2's first option, "allow upload for the project". *(2026-11-22, ADR 0024: superseded. [U2] is deferred until most of FarSight is ready. When it runs, it is a project outside any organization, and ADR 0024 proposes that upload is open there, so that the installer and the reader are both device-made certificates uploaded (its proposed fallback 2), not a form of "allow upload".)*
 11. W2's `technocore` half is an optional, free read at W4.17. §37 left it unwalked.
 12. WP.7 records the Data Access audit configuration and the installer's roles.
 13. `connect` comes before `reader grant`: W4.4 is `connect`, W4.5 `reader grant`, W4.6 the version and the reader's first reads. §39 ordered `reader grant` (W4.4) before `connect` (W4.6). The reader's RBAC holds a Role and RoleBindings in `farcast-system` and no Namespace (`renderReaderRBAC`), and `install` does not create `farcast-system`, which `connect` does (FatLine's workload template) [read]. So on a fresh instance the grant's apply would fail before `connect` [inf], as [phase 1's step 7b](phase-1-validation.md#7b-the-instances-reader-identity--not-yet-walked) says in its step 4.
@@ -67,7 +67,7 @@ Since [ADR 0023](../adr/0023-one-download-farcast.md) M2.7, `farcast` starts no 
   - The agent prints only exits, kinds, counts and states, through `walk.zsh`'s helpers (WP.2).
   - Every `-o json` document is one line (`output.Printer`) [read]. So a count is `grep -o … | sort | uniq -c` or `grep -o … | wc -l`, never `grep -c` on a JSON document.
   - A plan and its human text name the project, its number, the endpoint, the registry, the bucket, the reader and the uids. They stay in the walk directory. The operator reads a plan's human text in the walk terminal when a step says so.
-- **T6, stops.** A **HARD STOP** records what was seen, then goes to W6. Anything else unexpected is a finding: record it, stop, and ask the operator.
+- **T6, stops.** A **HARD STOP** records what was seen, then goes to W6. Anything else unexpected is a finding: record it, stop, and ask the operator. *(2026-11-22, ADR 0024: on [B], once the installer's key G0a approved exists, any stop that ends the walk, G0b's no included, deletes that key in Google, its file on the Mac and every other copy, as W6.2's note says, and records the count.)*
 - **T7, Cloud Shell.** Its session resets when idle, and then WP.6's lines are run again. Every `kubectl` block comes after `kc`. A list that failed, for example with "Reauthentication failed", counts nothing: check that each list ran before recording its count.
 - **T8, zsh.** An instance path is written `"${INSTANCE}:walk/…"`, with the braces. zsh reads a bare `$INSTANCE:w…` as a modifier.
 
@@ -77,13 +77,13 @@ Since [ADR 0023](../adr/0023-one-download-farcast.md) M2.7, `farcast` starts no 
 
 Before any step that names the project or changes it, the agent presents these, and the operator answers in the session that walks. Record the answers and G0a's date.
 
-1. **A22-2's branch, first.**
-   - **[U1]:** allow service-account key upload for the walk's project, by the operator's own org-policy change. Its spelling, and who may make it, are [unverified]. W6.4 restores it or keeps it, as decided here.
-   - **[U2]:** a project outside the organization, which has no such policy. This is a form of A22-2's first option, "allow upload for the project", not a fourth option. It brings its own setup (WP.8), its own baseline (WP.7) and W6.8.
-   - **[B]:** upload stays blocked. The walk takes the refusal and terminal path. The reader is not walked, and M2's records keep "reader not walked".
-2. **The project.** The probe walk's project, whose baseline is known ([U1] or [B]), or a fresh one ([U2]). For a fresh project, whether W6.8 keeps it or shuts it down.
+1. **A22-2's branch, first.** *(2026-11-22, ADR 0024: answered by the operator. The walk takes [B], in a project in the operator's own organization.)*
+   - **[U1]:** allow service-account key upload for the walk's project, by the operator's own org-policy change. Its spelling, and who may make it, are [unverified]. W6.4 restores it or keeps it, as decided here. *(2026-11-22, ADR 0024: withdrawn. The walk takes [B], and FarCast is not to ask for a security default to be relaxed (ADR 0024's proposed fallback 4). Today's `reader init` still says an organization administrator must allow upload (`readerinit.go:404`, `:409`), the message W4.3 [B] stops at; ADR 0024's M3b rewords it.)*
+   - **[U2]:** a project outside the organization, which has no such policy. This is a form of A22-2's first option, "allow upload for the project", not a fourth option. It brings its own setup (WP.8), its own baseline (WP.7) and W6.8. *(2026-11-22, ADR 0024: deferred with a project with no organization, until most of FarSight is ready; see deviation 10's note.)*
+   - **[B]:** upload stays blocked. The walk takes the refusal and terminal path. The reader is not walked, and M2's records keep "reader not walked". *(2026-11-22, ADR 0024: the operator's branch. The installer's Google-made key is an exception to ADR 0024 that the operator approves here, time-boxed to the walk and deleted at teardown: the operator holds it at 0600 on the Mac only for the walk, deletes it in Google and deletes the key file on the Mac after W6.1's release (W6.2's note), and W6.6 deletes the config home's copy. If WP.8 counts 1 key, the installer then holds no user-managed key after the walk. Here the operator also says whether the walk uses the installer's existing key or one made at WP.8.)*
+2. **The project.** The probe walk's project, whose baseline is known ([U1] or [B]), or a fresh one ([U2]). For a fresh project, whether W6.8 keeps it or shuts it down. *(2026-11-22, ADR 0024: a project in the operator's own organization: the probe walk's, or a fresh one there. A fresh one is set up at WP.8 as [U2]'s list there says, and W6.8 keeps it or shuts it down, as decided here.)*
 3. **The Org Policy API.** WP.7's unsilenced managed check may ask to turn it on (A22-3). W6.4 turns it off again if the walk turned it on.
-4. **The optional steps:**
+4. **The optional steps:** *(2026-11-22, ADR 0024: and W-FED, offered only if ADR 0024's M3a passed in the organization project, with its own approval. Its steps are to be appended to this runbook with M3a's build.)*
    - **(f)**, W4.15, with its same-name refusal. Recommended, because it stands for (e). It deletes and creates again `farcast-system/datasphered` from Cloud Shell, and restarts the keyholder twice;
    - **the `git-credential` step**, W4.16. It needs a private repository with a `./farcast` manifest whose name is not `sdk-demo`, which the operator reads here, external declarations included, and approves; and a read-only token scoped to it, typed only by the operator and revoked at W6.7. The Secret's name and the Git username are chosen here, in words, and never recorded. The provider can read the Secret while it exists. Its audit log also keeps, for 400 days, the Secret's name and the private repository's address, ref, manifest path and each built commit, which the fetch and build Jobs carry as literals. W6 cannot remove them ([ADR 0019](../adr/0019-what-the-cluster-tells-its-provider.md#what-the-provider-still-sees));
    - **ADR 0019's checklist** as W5.3: about 20 minutes, no cost beyond instance time, one seal and unseal;
@@ -212,15 +212,15 @@ count()       { local out; out=$("$@" --project "$PROJECT" --format='value(name)
   - **if the GKE Enterprise or fleet check fails.** A control-plane logging default would fail the install by design (ADR 0019);
   - **if the installer lacks a role** W4 needs. The operator decides.
 
-**WP.8, A22-2's preparation (operator).**
-- **[U1]:** the operator's own org-policy change, so that neither key-upload constraint is enforced on the project. Then WP.7's two key-upload checks again: both `False`.
-- **[U2]:** in the fresh project, in Cloud Shell, the per-project setup:
+**WP.8, A22-2's preparation (operator).** *(2026-11-22, ADR 0024: [B] only.)*
+- **[U1]:** the operator's own org-policy change, so that neither key-upload constraint is enforced on the project. Then WP.7's two key-upload checks again: both `False`. *(2026-11-22, ADR 0024: not run; see G0a.)*
+- **[U2]:** in the fresh project, in Cloud Shell, the per-project setup: *(2026-11-22, ADR 0024: not run as a branch; see G0a. If G0a chose a fresh project, this list is still its per-project setup, made under [B].)*
   - the APIs, the installer account, its roles and its key, as [phase 1's steps 1 and 2](phase-1-validation.md#1-enable-the-apis) set them up;
   - `roles/storage.admin` under phase 3's condition;
   - billing linked.
 
   The key goes to the Mac at 0600, never into a checkout or Cloud Shell's home. WP.7 is then taken in that project.
-- **[B]:** nothing.
+- **[B]:** nothing. *(2026-11-22, ADR 0024: except the installer's key, G0a's approved exception. If G0a chose a new one, it is made here, as [phase 1's step 2](phase-1-validation.md#2-create-the-installer-service-account--key) makes it, but not on the Mac, which runs no `gcloud` (T2): in Cloud Shell, in WP.6's directory, after `umask 077`, `gcloud iam service-accounts keys create <a file name> --iam-account "<the installer's email>" --project "$PROJECT"`, or on the console's Keys tab. It reaches the Mac through the browser's download and is moved at once to a 0600 file outside any checkout. The download folder's copy and Cloud Shell's are deleted at once, not moved to the Trash. It never goes into a checkout or Cloud Shell's home. The operator also records here, in Cloud Shell, how many user-managed keys the installer holds, a count only, once the walk's key exists: `count gcloud iam service-accounts keys list --iam-account "<the installer's email>" --managed-by user`, the email typed, never recorded, the flag's spelling [unverified]. The count expected is 1. Any other count stops the walk to ask the operator, because any other key is G0a's to decide.)*
 
 **WP.9, free checks (operator, or the agent with a web view).**
 - The public repository's main holds `manifest/examples/sdk-demo/farcast` and `sdk/go/examples/demo`, and that manifest declares no external host.
@@ -230,7 +230,7 @@ count()       { local out; out=$("$@" --project "$PROJECT" --format='value(name)
 
 ## G0b. The approval to spend (right before W4.1)
 
-The agent presents, then waits for the operator's explicit yes in the session that walks. With no yes, nothing billable starts. The operator runs W6.4, W6.5 and W6.8, the agent deletes the walk directory (W6.6), the no and its date are recorded, and the walk ends.
+The agent presents, then waits for the operator's explicit yes in the session that walks. With no yes, nothing billable starts. The operator runs W6.4, W6.5 and W6.8, the agent deletes the walk directory (W6.6), the no and its date are recorded, and the walk ends. *(2026-11-22, ADR 0024: on [B], after a no the operator also deletes, in Cloud Shell, the installer's key G0a approved, and the key file on the Mac, as W6.2's note says.)*
 
 - **The cost:** under USD 5 [inf]. By the repository's floor model [read; the totals are inf]:
   - one instance is about USD 0.106 an hour (`floorFull`, `farsight/cli/internal/cli/floor.go`): the modelled cluster line of USD 37 a month (unverified), the carrier at USD 0.025 an hour (`technocore/pricing/pricing.go`), and five system Pods at the Autopilot rates;
@@ -248,8 +248,8 @@ The agent presents, then waits for the operator's explicit yes in the session th
   - the bucket's uid grant, through `--grant-bucket`;
   - the repository's uid push grant, by hand in Cloud Shell;
   - perhaps the Org Policy API, already turned on at WP.7 if G0a allowed it;
-  - [U2] the fresh project's setup, already made at WP.8.
-- **The teardown, W6.** It runs `farcast release "$INSTANCE" --delete-data --yes`. That deletes for good, with the instance, the bucket's objects: the walk's secret, `walk/a.bin` and anything the applications wrote. Soft delete is off on the bucket by design. W6 cannot remove what the project keeps of the walk: Admin Activity entries for 400 days, with every workload's spec and the repository and commit of each build; logs for 30 days by default; metrics for 24 months (ADR 0019; `release` prints the dates).
+  - [U2] the fresh project's setup, already made at WP.8. *(2026-11-22, ADR 0024: and under [B], a fresh project's setup, if G0a chose one, and the installer's key, if made at WP.8.)*
+- **The teardown, W6.** It runs `farcast release "$INSTANCE" --delete-data --yes`. That deletes for good, with the instance, the bucket's objects: the walk's secret, `walk/a.bin` and anything the applications wrote. Soft delete is off on the bucket by design. W6 cannot remove what the project keeps of the walk: Admin Activity entries for 400 days, with every workload's spec and the repository and commit of each build; logs for 30 days by default; metrics for 24 months (ADR 0019; `release` prints the dates). *(2026-11-22, ADR 0024: on [B], W6.2 also deletes the installer's key in Google and on the Mac.)*
 - **G0a's choices, restated.**
 
 **Record:** the yes and its date.
@@ -626,14 +626,14 @@ Record each as ADR 0019 asks, in counts and levels.
 1. **Agent:** `farcast release "$INSTANCE" --delete-data --yes > w6-1.out 2> w6-1.err; echo "exit $?"`.
    - **Expect:** exit 0 within 15 minutes. If a wait runs out, run it again: it waits for the same delete.
    - It ends with a reader line naming two Cloud Shell commands, which stays in `w6-1.out`. `--delete-data` is needed: the bucket holds the secret and `walk/a.bin`.
-2. **Operator:** read the two reader commands in the walk terminal (`cat w6-1.out`), and run them in Cloud Shell, in order. Then the count of `farcast-reader-` accounts equals the baseline's.
+2. **Operator:** read the two reader commands in the walk terminal (`cat w6-1.out`), and run them in Cloud Shell, in order. Then the count of `farcast-reader-` accounts equals the baseline's. *(2026-11-22, ADR 0024: on [B], the operator then deletes, in Cloud Shell, the installer's key G0a approved: `gcloud iam service-accounts keys delete <the walk's key's id> --iam-account "<the installer's email>" --project "$PROJECT"`. The key to delete is the one whose id equals the key file's `private_key_id` field, both read on screen and never recorded. The operator deletes the key file on the Mac, and checks that no copy is left in the download folder or in Cloud Shell. Then WP.8's `count` line again: WP.8's count less one, which is 0 when WP.8 found 1.)*
    - On [B] they answer "not found", which is harmless (the probe walk's P7.3 note), unless W4.3 recorded "managed check silenced". Then they remove a real account.
 3. **Operator:** every WP.7 count again, against the cloud, not against `release`'s report. Each equals the baseline. A difference is a finding, removed by hand only with the operator's yes.
 4. **Operator:** turn the Org Policy API off, if the walk turned it on, as [the probe walk's P7.6](adr-0023-m2-probe-walk.md#p7-teardown) does. [U1]: the override restored or kept, as G0a decided.
 5. **Operator:** delete Cloud Shell's walk directory, with its kubeconfig and `audit.json`.
 6. **Agent:** `farcast -o json instances > w6-6.json 2> w6-6.err; echo "exit $?"; grep -o '"instances":\[\]' w6-6.json` prints `"instances":[]`: no instance is recorded. Then delete the walk directory: the release, the config home with the installer key's copy, the CA keys, the keyring and the reader's key, the plans and the outputs.
 7. **Operator:** revoke the Git token at the Git host, if W4.16 ran.
-8. **[U2]:** the fresh project kept or shut down, as G0a decided. This is the operator's.
+8. **[U2]:** the fresh project kept or shut down, as G0a decided. This is the operator's. *(2026-11-22, ADR 0024: and under [B], if G0a chose a fresh project.)*
 
 ---
 
@@ -653,7 +653,7 @@ Not run. When it runs, one table, `Step | Result | Notes`, as the M1 and probe w
 | WP.7 the installer's roles; the APIs | Not run | |
 | WP.7 key-upload checks; key expiry | Not run | |
 | WP.7 ADR 0019's precondition; Data Access configuration | Not run | |
-| WP.8 the branch's preparation | Not run | |
+| WP.8 the branch's preparation | Not run | *(2026-11-22, ADR 0024: on [B], also the installer's user-managed key count, expected 1.)* |
 | G0a choices; G0b yes | Not run | |
 | W4.1 install: exit, minutes, endpoint, registry | Not run | |
 | W4.2 `world` and `instances` before a reader | Not run | |
@@ -684,7 +684,7 @@ Not run. When it runs, one table, `Step | Result | Notes`, as the M1 and probe w
 | W5.2 the cross-check | Not run | |
 | W5.3 ADR 0019's checklist | Not run | |
 | W6.1 `release` | Not run | |
-| W6.2 the reader lines; reader accounts at the baseline | Not run | |
+| W6.2 the reader lines; reader accounts at the baseline | Not run | *(2026-11-22, ADR 0024: on [B], also the installer's key deleted, and its count after, expected WP.8's less one: 0 when WP.8 found 1.)* |
 | W6.3 the cloud at the baseline | Not run | |
 | W6.4 to W6.8 the Org Policy API, Cloud Shell, the walk directory, the token, the project | Not run | |
 

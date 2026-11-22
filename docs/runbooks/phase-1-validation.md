@@ -92,7 +92,7 @@ chmod 600 "$KEY"
 > role that can create a repository (`repoAdmin` cannot) and it also carries the
 > repository-level `setIamPolicy` the node-SA pull grant needs — so the stored
 > credential never holds project-IAM power. If your SA is already Owner/Editor you
-> can skip the bindings.
+> can skip the bindings. *(2026-11-22, [ADR 0024](../adr/0024-paste-the-certificate.md): the key this step downloads is a provider-made secret. By the operator's rule of that day, once the certificate route is built (ADR 0024's M3b, proposed), it is used only where that route is closed, named and consented (proposed fallback 3). Until then it is `install`'s only installer credential, and in ADR 0023's M2 walk under [B] it is an exception the operator approves at its G0a, time-boxed and deleted at teardown.)*
 
 ## 3. Build the binaries
 
