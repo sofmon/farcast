@@ -2,7 +2,7 @@
 
 Since [ADR 0023](../adr/0023-one-download-farcast.md) M2.7, `farcast` starts no `kubectl`, auth plugin or `gcloud`. Every cluster call is in-process. The read commands, and the plans under `--plan` and `--confirm`, read as the instance's reader. Every write, and an interactive or `--yes` run's reads, run as the stored installer account, and each apply is a forced server-side apply named `farcast`. Since M2.8 the bucket grant and the push grant name the ServiceAccount by its uid. None of this is walked. The [probe walk](adr-0023-m2-probe-walk.md) of 2026-11-16 settled only the writer's scope pair. This walk installs one fresh instance with the M2 release farcast, from a shell with no `kubectl`, plugin or `gcloud` on `PATH`. It walks the M2 design's revised §10.7 ([§37](../design/adr-0023-m2-design.md#37-decided-before-m29as-build-2026-11-20), as [§39](../design/adr-0023-m2-design.md#39-decided-before-m29bs-build-2026-11-22) decides it), and releases everything at its end.
 
-**Status.** *Written 2026-11-22 (ADR 0023 M2.9b), against the code at the commit it lands in. Not run.* It needs the operator's own approval in the session that walks it: the choices at G0a, and the yes to spend at G0b. The approval that had ADR 0023 M2.9b write this runbook is not approval to walk it. No earlier walk's approval carries over. *(2026-11-22, [ADR 0024](../adr/0024-paste-the-certificate.md): by the operator's decisions of that day, this walk runs after ADR 0024's M3a, on its own, before M3b, in a project in the operator's own organization, under [B]. A22-2 is answered (G0a). An optional W-FED step, with its own approval, is to be appended to this runbook with M3a's build. Neither M3a nor this walk has run.)*
+**Status.** *Written 2026-11-22 (ADR 0023 M2.9b), against the code at the commit it lands in. Not run.* It needs the operator's own approval in the session that walks it: the choices at G0a, and the yes to spend at G0b. The approval that had ADR 0023 M2.9b write this runbook is not approval to walk it. No earlier walk's approval carries over. *(2026-11-22, [ADR 0024](../adr/0024-paste-the-certificate.md): by the operator's decisions of that day, this walk runs after ADR 0024's M3a, on its own, before M3b, in a project in the operator's own organization, under [B]. A22-2 is answered (G0a). An optional W-FED step, with its own approval, is to be appended to this runbook with M3a's build. Neither M3a nor this walk has run.)* *(2026-11-23, ADR 0024's M3a: built 2026-11-22 to 2026-11-23. W-FED is appended below, after line 733, with its own approval at G0a ([W-FED](#w-fed-the-federated-reader-at-the-cluster-optional-adr-0024)). Neither M3a nor this walk has run.)*
 
 **It is billable.** One Autopilot instance, installed with `--cost-limit 100` (USD a month), for about 4 to 4.5 hours. G0b asks for under USD 5 [inf]. By the repository's floor model the walk costs about USD 0.7 to 1.5 (G0b has the arithmetic). The walk also creates IAM objects, which cost nothing, and W6 removes them.
 
@@ -83,7 +83,7 @@ Before any step that names the project or changes it, the agent presents these, 
    - **[B]:** upload stays blocked. The walk takes the refusal and terminal path. The reader is not walked, and M2's records keep "reader not walked". *(2026-11-22, ADR 0024: the operator's branch. The installer's Google-made key is an exception to ADR 0024 that the operator approves here, time-boxed to the walk and deleted at teardown: the operator holds it at 0600 on the Mac only for the walk, deletes it in Google and deletes the key file on the Mac after W6.1's release (W6.2's note), and W6.6 deletes the config home's copy. If WP.8 counts 1 key, the installer then holds no user-managed key after the walk. Here the operator also says whether the walk uses the installer's existing key or one made at WP.8.)*
 2. **The project.** The probe walk's project, whose baseline is known ([U1] or [B]), or a fresh one ([U2]). For a fresh project, whether W6.8 keeps it or shuts it down. *(2026-11-22, ADR 0024: a project in the operator's own organization: the probe walk's, or a fresh one there. A fresh one is set up at WP.8 as [U2]'s list there says, and W6.8 keeps it or shuts it down, as decided here.)*
 3. **The Org Policy API.** WP.7's unsilenced managed check may ask to turn it on (A22-3). W6.4 turns it off again if the walk turned it on.
-4. **The optional steps:** *(2026-11-22, ADR 0024: and W-FED, offered only if ADR 0024's M3a passed in the organization project, with its own approval. Its steps are to be appended to this runbook with M3a's build.)*
+4. **The optional steps:** *(2026-11-22, ADR 0024: and W-FED, offered only if ADR 0024's M3a passed in the organization project, with its own approval. Its steps are to be appended to this runbook with M3a's build.)* *(2026-11-23, ADR 0024's M3a: W-FED's steps are appended below ([W-FED](#w-fed-the-federated-reader-at-the-cluster-optional-adr-0024)), with its approval, which the agent presents here.)*
    - **(f)**, W4.15, with its same-name refusal. Recommended, because it stands for (e). It deletes and creates again `farcast-system/datasphered` from Cloud Shell, and restarts the keyholder twice;
    - **the `git-credential` step**, W4.16. It needs a private repository with a `./farcast` manifest whose name is not `sdk-demo`, which the operator reads here, external declarations included, and approves; and a read-only token scoped to it, typed only by the operator and revoked at W6.7. The Secret's name and the Git username are chosen here, in words, and never recorded. The provider can read the Secret while it exists. Its audit log also keeps, for 400 days, the Secret's name and the private repository's address, ref, manifest path and each built commit, which the fetch and build Jobs carry as literals. W6 cannot remove them ([ADR 0019](../adr/0019-what-the-cluster-tells-its-provider.md#what-the-provider-still-sees));
    - **ADR 0019's checklist** as W5.3: about 20 minutes, no cost beyond instance time, one seal and unseal;
@@ -161,7 +161,7 @@ cmp <the walk directory>/rel/farcast-darwin-arm64 <the walk directory>/bin/farca
 - the builder's and the fetcher's upstream registries, which [`phase-5-session-a.md`'s S3](phase-5-session-a.md#bring-up) names (W4.11);
 - during W4.4, the carrier's address on FatLine's port, as P0.5 names it: `connect --confirm` dials it before it exits, so allow it when Little Snitch asks, for that destination only.
 
-A held binary shows as an EOF or a timeout, not as a refusal (P0.5's note). No walk probe is built. If a 401 or a 403 needs a diagnosis, build it once, as the probe walk's P0.4 does.
+A held binary shows as an EOF or a timeout, not as a refusal (P0.5's note). No walk probe is built. If a 401 or a 403 needs a diagnosis, build it once, as the probe walk's P0.4 does. *(2026-11-23, ADR 0024's M3a: one exception, under W-FED's own approval: WF.0 builds W-FED's probe, M3a's, before WP.4.)*
 
 **WP.6, Cloud Shell (operator).** Signed in as an Owner of the project, the FarCast account checked by eye. Typed, never recorded:
 ```bash
@@ -731,3 +731,79 @@ Each item holds only if its step passes. A failure is recorded as the answer the
 - ADR 0019's checklist, unless W5.3 is chosen;
 - any instance an older farcast wrote: none exists, and no migration remains (M2.9a);
 - M3a and M3b, M4, M5, and every FarSight client claim.
+
+---
+
+## W-FED. The federated reader at the cluster (optional; ADR 0024)
+
+Written 2026-11-22 with ADR 0024's M3a build, and amended 2026-11-23 by its review. Offered at G0a only if M3a passed in the organization project, with its own approval. It runs after W5 and before W6.1, while the cluster exists.
+
+It tests M3b's largest unknown on a cluster that exists anyway: whether GKE's DNS endpoint accepts a token made from a device's own certificate. One fresh writer-capable device, made by M3a's probe ([its runbook](adr-0024-m3a-probe.md)), gets the M3a setup in this walk's project; its reader's federated token impersonates its reader SA; and that SA token reads the cluster. Then the federated token itself is tried, unimpersonated. The probe prints statuses, counts and yes/no only, never a token, an email or an ID, and every record here keeps T1.
+
+**Its approval.** At G0a the agent presents these and waits for the operator's yes, which WF.0's row records with its date. G0b's list of what the walk creates does not name W-FED's objects, so when G0a approved W-FED the agent presents them again at G0b.
+- **What it creates,** in this walk's project: one pool; two X509 providers, one per role, each holding that role's one anchor; two service accounts with no display name, the writer's with no role; two `roles/iam.workloadIdentityUser` bindings, each role's ID on its own SA; and those of the IAM, IAM Credentials, STS and Resource Manager APIs that are off, recorded in a randomly named file in Cloud Shell's home.
+- **Its one privileged grant:** `roles/container.viewer` on the project, for the reader SA, from WF.3 to WF.5. It is project-wide: while it stands, the device's reader can read every cluster in the project, not only `$INSTANCE`'s.
+- **The cost.** The IAM objects bill nothing ([M3a's runbook](adr-0024-m3a-probe.md)). W-FED keeps the instance up longer, by up to about an hour: three pastes, the settle waits of up to 10 minutes from `wfed-setup` and from `wfed-viewer`, `wfed`'s 20-minute bound and `wfed-gone`'s 15-minute bound. At G0b's floor of about USD 0.106 an hour that is about USD 0.1 more [inf], outside G0b's "W4.1 to W6.1 is about 4 to 4.5 hours".
+- **Hard to reverse:** a deleted pool's or provider's ID stays reserved for about 30 days ([Google](https://docs.cloud.google.com/iam/docs/manage-workload-identity-pools-providers)), which W-FED's random IDs absorb.
+- **The teardown,** WF.5, and that Google may leave on the APIs W-FED enabled: without `--force` it refuses to disable a service used in the last 30 days (M3a's deviation 21).
+- **Its exceptions to this runbook's rules,** named here: T2's (the Mac also runs a probe binary); WP.5's ("No walk probe is built": WF.0 builds one); and T5's (the agent reads the probe's own `.out` files, which the probe has scrubbed, not only exits, kinds, counts and states through `walk.zsh`). The firewall stays the operator's (T4).
+
+- **WF.0, before WP.4 (only if G0a approved W-FED).**
+  - The agent builds the probe once, from the walked commit, outside the walk shell, which has no `go` (WP.4):
+    ```bash
+    mkdir -m 700 <the walk directory>/probe
+    env GOWORK=off GOTOOLCHAIN=go1.27.4 GOPROXY=off GOFLAGS=-mod=vendor \
+      go test -C <the checkout> -tags walk -c -o <the walk directory>/probe/walkprobe.test ./farsight/cli/internal/cli/
+    ```
+    `probe/` is not on the walk shell's `PATH`; the steps below name the binary by its path.
+  - The operator adds Little Snitch rules for that path (T4), and nothing else: STS's mTLS endpoint `sts.mtls.googleapis.com:443`, IAM Credentials' endpoint `iamcredentials.googleapis.com:443`, and the cluster's DNS endpoint, each named as WP.5 names its rules.
+- **WF.1 (agent).**
+  - `mkdir -m 700 wfed` in the walk directory, then `ls -led . wfed | cut -c1-11`. *Expect* exactly two `drwx------` lines, with no `+` after either and no further line. A `+`, or any further line, is an access control list, which can let another account read the device's 0600 keys: `devicekey` and the probe check mode bits only (`devicekey.Store`'s comment). Then stop, remove `wfed`, and make it again where no ACL is inherited.
+  - Run `wfed-init`, then `wfed-blocks`, as `step.zsh` lines (T5), each in the form:
+    ```bash
+    env FARCAST_WALK=1 FARCAST_WALK_CWD="$PWD" FARCAST_WALK_M3A_DIR="$PWD/wfed" FARCAST_WALK_PROJECT="$PROJECT" FARCAST_WALK_M3A_STEP=wfed-init \
+      ./probe/walkprobe.test -test.run '^TestWalkM3a$' -test.v -test.count=1 -test.timeout 0 > wf-1a.out 2> wf-1a.err; echo "exit $?"
+    ```
+    Every later step is the same line with its own `FARCAST_WALK_M3A_STEP`, its own inputs, and its own output files. `mark <name>` below means `FARCAST_WALK_M3A_STEP=mark FARCAST_WALK_M3A_MARK=<name>`. A mark is taken only after the block printed its change; on `refused` or `absent`, record the line and paste again (M3a's P5 rule).
+  - Record the counts `wfed-init` printed, and that `wfed-blocks` wrote its three blocks.
+- **WF.2 (operator).**
+  - First, W-FED's own baseline, in Cloud Shell, counts and yes/no only: the pools, DELETED excluded (`count gcloud iam workload-identity-pools list --location=global`); the service accounts (`count gcloud iam service-accounts list`); the members of `roles/container.viewer` in the project's policy (`gcloud projects get-iam-policy "$PROJECT" --format=json | jq '[.bindings[] | select(.role == "roles/container.viewer") | .members[]] | length'`); and, yes or no each, whether the IAM, IAM Credentials, STS and Resource Manager APIs are on, read from `gcloud services list --enabled --project "$PROJECT"` on screen. WP.7 counts none of these but the service accounts.
+  - Paste `wfed-setup.sh` (`pbcopy < wfed/blocks/wfed-setup.sh`, by the agent). It asks y/N for the project, then creates:
+    - the pool and the device's two providers, each holding its role's one anchor, with D3's mapping and that role's condition;
+    - the two SAs, with no display name, the writer SA with no role;
+    - the two bindings: the device's reader ID on the reader SA, its writer ID on the writer SA.
+
+    It records the APIs it enabled in a randomly named file in Cloud Shell's home. After a failure part way it can be pasted again: what exists prints `exists`. Each binding is retried for up to 210 s, since a new service account may take 60 s or more before it can be used, and the block prints its last line, the coordinates, only when both bindings printed `added`; otherwise it prints `setup not complete` and exits 1 (M3a's deviation 23). Paste it again then, unless a policy refused a binding: then W-FED stops, and WF.5's teardown follows.
+  - Relay its labelled lines, and copy its last line as soon as it prints.
+  - The agent runs `pbpaste > wfed/line`, then `coordinates` with `FARCAST_WALK_M3A_LINE="$PWD/wfed/line"`, then `rm wfed/line`, then `mark wfed-setup`. None of these prints the line.
+- **WF.3 (operator).**
+  - Paste `wfed-viewer.sh`. It grants the reader SA `roles/container.viewer` on the project, for this step only. That it is the smallest role whose IAM grant authorises the three reads is [unverified] (ADR 0023:121's 2026-11-16 note).
+  - When it printed `added`, the agent runs `mark wfed-viewer`.
+- **WF.4 (agent).** Run `wfed` with `FARCAST_WALK_INSTANCE="$INSTANCE"` and `FARCAST_WALK_M3A_SHAPE=<M3a's simplest passing shape>`. It reads the instance's record and endpoint as farcast does, under `FARCAST_CONFIG_HOME`. Record:
+  - the reader's exchange and impersonation lines;
+  - the impersonated token's three reads' statuses, `GET /version`, the namespace list (the writing commands' preflight read) and a `SelfSubjectReview`, each under the settle rule from `wfed-viewer`;
+  - "email matches: yes/no", from the review;
+  - the federated token's three statuses: 401 (the endpoint refuses the token) or 403 (authenticated, then refused), or another status.
+- **WF.5 (operator, then agent).**
+  - Paste `wfed-teardown.sh`. It removes the viewer grant first, then the bindings, then the providers, the pool, the SAs, and the APIs it enabled, each tried once without `--force`. Each line skips an absent object. An API Google will not disable prints `kept enabled` and stays in the block's record, which the block then keeps (`API record: kept`); the operator decides whether to disable it with `--force`, which also disables the services that depend on it, after reading `gcloud services list --enabled --project "$PROJECT"` for dependents.
+  - Once the block printed its deletions, the agent runs `mark wfed-teardown`, then `wfed-gone` with the same `FARCAST_WALK_M3A_SHAPE` as WF.4's (it has no default), and only after `wfed-gone` has exited, `rm -rf wfed`, which removes the device's keys. Record `wfed-gone`'s lines: each role's exchange, both polled until refused in one loop from the mark, so each delta is its own. No positive control exists once everything is deleted, so each refusal is read alone. No impersonation is polled: the teardown deletes the SAs too, so its refusal would say nothing about the federation.
+  - Then W-FED's baseline again, as WF.2 took it, and compare.
+- **WF.6.** W-FED is torn down when WF.5's counts equal WF.2's: the pools, the service accounts and the members of `roles/container.viewer` back at the baseline, and each API back as it was, or kept on and named with the operator's `--force` decision. Once that decision is made, if `wfed-teardown.sh` printed `API record: kept`, the operator removes the record from Cloud Shell's home: it is the file named on the block's `RECORD=` line, which they read in their own viewer, as M3a's P10 (e) does. W6.5 removes Cloud Shell's walk directory, not that file. W6.3 repeats WP.7's counts, which see W-FED only through the service accounts.
+
+**What it settles:** that GKE's DNS endpoint accepts an impersonated token carrying the scope pair; what username Kubernetes sees, as "email matches"; and how the endpoint answers a direct federated token.
+
+**What it does not settle:** the reader's RBAC with farcast's own RoleBindings, since the grant here is IAM's `container.viewer`; and the delegation entries of Artifact Registry and Cloud Storage, which are M3b's walk's.
+
+### W-FED's Results
+
+Not run. One row per step; statuses, counts and yes/no only, never a token, email or ID (T1).
+
+| Step | Result | Notes |
+|---|---|---|
+| WF.0 the approval's yes and its date; the probe built; its firewall rules | Not run | |
+| WF.1 the directory's ACL check; `wfed-init`'s counts; `wfed-blocks` | Not run | |
+| WF.2 W-FED's baseline; `wfed-setup.sh`'s lines; coordinates; `mark wfed-setup` | Not run | |
+| WF.3 the viewer grant; `mark wfed-viewer` | Not run | |
+| WF.4 the exchange; the three reads with the SA token; email matches; the federated token's three statuses | Not run | |
+| WF.5 `wfed-teardown.sh`'s lines; `wfed-gone`; the baseline again | Not run | |
+| WF.6 W-FED's counts against its baseline; any API kept enabled, and the `--force` decision; the API record removed | Not run | |

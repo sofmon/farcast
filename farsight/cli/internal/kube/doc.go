@@ -30,4 +30,7 @@
 //   - rollout.go and reads.go port kubectl's rollout status rules and its
 //     choice of a workload's pod for logs;
 //   - readerkey.go makes the reader identity's key and generic certificate.
+//
+// federated.go is the identity path's wire code (ADR 0024 decision 8), wired
+// into no command until M3b.
 package kube

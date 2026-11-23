@@ -9236,7 +9236,7 @@ A39-2's rule binds the records, not the code. No record cites these lines at HEA
 
 ## 41. Decided by the operator on 2026-11-22: A22-2 and the walk's branch
 
-On 2026-11-22 the operator decided how FarCast's operator holds a cloud credential, and with it A22-2 (§22) and the branch of M2's billable walk. [ADR 0024](../adr/0024-paste-the-certificate.md) records the decisions, and [its design](adr-0024-design.md) the reasoning. This section records what they change here. It wins over §0–§40 wherever it differs. Nothing in it is built or walked, and neither ADR 0024's M3a nor M2's walk has run.
+On 2026-11-22 the operator decided how FarCast's operator holds a cloud credential, and with it A22-2 (§22) and the branch of M2's billable walk. [ADR 0024](../adr/0024-paste-the-certificate.md) records the decisions, and [its design](adr-0024-design.md) the reasoning. This section records what they change here. It wins over §0–§40 wherever it differs. Nothing in it is built or walked, and neither ADR 0024's M3a nor M2's walk has run. *(2026-11-23, ADR 0024's M3a: built 2026-11-22 to 2026-11-23, offline and wired into no command, with W-FED's probe steps (A41-5). Neither M3a nor M2's walk has run.)*
 
 Line numbers are at 5ef5ee8. No line above this section was added or removed: each line it supersedes gets a dated note at its end.
 
@@ -9275,9 +9275,9 @@ Everything else in ADR 0024 is proposed, with its default. On Google its mechani
 - In the walk's project, M3a's setup paste for one fresh writer-capable device creates the pool, the device's two providers and the two service accounts, with their bindings. The writer account gets no role.
 - The reader account gets `roles/container.viewer` on the project for this step only. That it is the smallest role that authorises the three reads is [unverified].
 - M3a's probe, with the impersonated reader token at the cluster's DNS endpoint, reads the API server's version, lists namespaces and posts a SelfSubjectReview, recording "email matches: yes or no". Then it makes the same reads with a direct federated token, recording 401 against 403.
-- Everything the step made is then deleted, and the device's keys go with the walk directory.
+- Everything the step made is then deleted, and the device's keys go with the walk directory. *(2026-11-23, ADR 0024's M3a: all but an API Google will not disable without `--force`, which W-FED's WF.5 leaves on, in its record, for the operator's decision (M3a's deviation 21).)*
 
-Its steps use M3a's probe, so they are appended at the runbook's end with M3a's build, and no line moves. They are not written now.
+Its steps use M3a's probe, so they are appended at the runbook's end with M3a's build, and no line moves. They are not written now. *(2026-11-23, ADR 0024's M3a: written with M3a's build, 2026-11-22 to 2026-11-23, as the runbook's W-FED section after its line 733, with W-FED's own approval, counts and results table. Not run.)*
 
 **A41-6: the runbook's dated notes.** [adr-0023-m2-walk.md](../runbooks/adr-0023-m2-walk.md) gets a dated note of 2026-11-22 at the end of each line below, at 5ef5ee8's numbering. No line is added or removed.
 - `:5`, the Status line;

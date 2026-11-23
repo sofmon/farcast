@@ -2,7 +2,7 @@
 
 *(2026-11-22: kept in the repository from here on, with ADR 0024's records. It was drafted outside it, so the sizing prototypes it cites (`proto/`, `variantb/` and `twoanchor/`, with `twoanchor/perrole_test.go`), the critique of v1 and the earlier versions were working files in a scratch directory, and are not kept. A [ran] result is reproduced only by repeating it. Code citations are file:line at 5ef5ee8, and paths are relative to the repository root. A bare file name is in `farsight/cli/internal/cli/`, or is cited with its directory earlier in this design; `kube/` is `farsight/cli/internal/kube/`.)*
 
-This is the design behind [ADR 0024](../adr/0024-paste-the-certificate.md), the operator's cloud credential, and behind [ADR 0023](../adr/0023-one-download-farcast.md)'s milestone M3a, the identity probe. It was written 2026-11-22 against the repository at 5ef5ee8 (ADR 0023 M2.9b). Nothing in it is built or walked, M3a has not run, and no cloud call was made.
+This is the design behind [ADR 0024](../adr/0024-paste-the-certificate.md), the operator's cloud credential, and behind [ADR 0023](../adr/0023-one-download-farcast.md)'s milestone M3a, the identity probe. It was written 2026-11-22 against the repository at 5ef5ee8 (ADR 0023 M2.9b). Nothing in it is built or walked, M3a has not run, and no cloud call was made. *(2026-11-23: M3a's part of it was built 2026-11-22 to 2026-11-23: `devicekey`, `kube/federated.go`, the probe, its runbook and W-FED's steps, offline and wired into no command (§11). M3a has not run.)*
 
 This is v3. All three versions are of 2026-11-22.
 - **v1** merged three designs written from three priorities: privacy, the operator's procedure, and uniformity across providers. Where they disagreed, privacy and cost control won, then the operator's procedure, then uniformity. Each decision says which answer it took, and why the others lost where that is still true.
@@ -125,7 +125,7 @@ OIDC with an uploaded JWKS, ADR 0023 decision 5's proposal, is **not** the route
 
 ### D2. The artifact: per role, an anchor and a leaf the device issues, in a provider of its own *(proposed)*
 
-**Decision.** For each instance it serves, an operator device holds one or two **roles**, reader and writer. For each role it makes two P-256 keys: an **anchor key** and a **leaf key**.
+**Decision.** For each instance it serves, an operator device holds one or two **roles**, reader and writer. For each role it makes two P-256 keys: an **anchor key** and a **leaf key**. *(2026-11-23: built offline in M3a's `devicekey`, wired into no command. Where the build departs, and what its reviews changed, are in §11.)*
 - A **reader-only device** makes a reader anchor key and a reader leaf key: two keys.
 - A **writer-capable device** also makes a writer anchor key and a writer leaf key: four keys.
 - No key is ever an instance-PKI key (ADR 0020), and none is reused across instances, across roles or across a revoke.
@@ -369,7 +369,7 @@ M2's walk can settle the first two in its optional W-FED step (D9), if M3a passe
 
 ### D6. The code: hand-rolled on the standard library *(proposed)*
 
-**Decision.** FarCast's own code, on `crypto/x509`, `crypto/tls`, `net/http` and `encoding/json`. No vendored external-account code is used. `vendor/` does not change, `VENDORED_MODULES` stays 31 (`check.sh:66`), and `exec-allowlist.txt` gains no line.
+**Decision.** FarCast's own code, on `crypto/x509`, `crypto/tls`, `net/http` and `encoding/json`. No vendored external-account code is used. `vendor/` does not change, `VENDORED_MODULES` stays 31 (`check.sh:66`), and `exec-allowlist.txt` gains no line. *(2026-11-23: built in part in M3a's `devicekey` and `kube/federated.go`, offline and wired into no command. Where the build departs from the list below is in §11: among other things, the exchange's TLS floor is 1.3, and kubetest's fakes came with M3a.)*
 
 - **`farsight/cli/internal/devicekey`** (new, built in M3a, wired into no command until M3b):
   - per instance and per role, the anchor key and the leaf key as PKCS#8 files at 0600, with their certificates, in a new `identity/` directory at 0700 in the instance's config directory; the role IDs and the provider IDs in the instance's record;
@@ -938,7 +938,7 @@ Every edit below appends to the end of an existing line, or rewrites a sentence 
 | V8 | Reader-only: D2's profile, with the mapping setting `google.subject` to a random per-instance constant, the condition still naming its ID | no; D3's privacy alternative |
 
 - **Two SAs** with no role but the reader's pool viewer. `workloadIdentityUser` is bound on the reader SA for V1's reader ID, and on the writer SA for V1's writer ID. Every other variant's principal is bound on the reader SA alone.
-- **Data Access audit logs** for STS and IAM Credentials, in the probe project only, turned off at teardown.
+- **Data Access audit logs** for STS and IAM Credentials, in the probe project only, turned off at teardown. *(2026-11-23: M3a's runbook turns on Admin Read, Data Read and Data Write for STS and IAM Credentials, and Admin Read for the IAM API; §11.)*
 
 **Projects.**
 - **The organization project:** a project in the operator's own organization, by the operator's decision of 2026-11-22. *Proposed:* one fresh scratch project there, approved with M3a (§9, question 1). That organization blocks key upload and not key creation (`docs/runbooks/adr-0023-m2-probe-walk.md:337`). Whether enabling STS or IAM Credentials needs a billing link is [unverified]. If it does, the runbook stops and asks.
@@ -952,7 +952,7 @@ Every edit below appends to the end of an existing line, or rewrites a sentence 
 - A refusal that a removal should bring (P7) is polled the same way, up to the same bound.
 - Each wait is recorded as a delta, never a time. M3b's enrolment retry (D4) takes its bound from these deltas.
 
-**The runbook,** `docs/runbooks/adr-0024-m3a-probe.md`, shaped like `adr-0023-m2-probe-walk.md`. It is written with M3a's build, not in the records commit (D10).
+**The runbook,** `docs/runbooks/adr-0024-m3a-probe.md`, shaped like `adr-0023-m2-probe-walk.md`. It is written with M3a's build, not in the records commit (D10). *(2026-11-23: written 2026-11-22 to 2026-11-23 with M3a's build, not run. Its Deviations list numbers this design's departures as §11 gives them.)*
 - **G0, approval and choices (no spend).** The exact object list above, the project, the temporary Data Access change, and the Org Policy API if needed. A billing link stops the walk. Whether the scratch project is kept after teardown is chosen here.
 - **P0, setup on the dev Mac (no cloud).**
   - Build the probe once with `go test -c` to a fixed path, with `GOWORK=off GOTOOLCHAIN=go1.27.4 GOPROXY=off GOFLAGS=-mod=vendor` and no `FARCAST_*`.
@@ -1118,7 +1118,7 @@ ADR 0023's table keeps its rows. Each changed cell gets §4's dated note. ADR 00
 
 | # | Milestone | Cloud | Effort |
 |---|---|---|---|
-| **M3a** | The X.509 probe (§6) and the offline `devicekey` and `kube/federated.go`. Brought forward 2026-11-22, before M2's walk. A project in the operator's own organization (accepted 2026-11-22); one fresh scratch project there (proposed); the run in a project with no organization is deferred until most of FarSight is ready. Its runbook, `docs/runbooks/adr-0024-m3a-probe.md`, and W-FED's steps, appended to M2's walk runbook, are written with its build, not in the records commit | Free IAM objects; approval needed | 3–4 days, plus one session |
+| **M3a** | The X.509 probe (§6) and the offline `devicekey` and `kube/federated.go`. Brought forward 2026-11-22, before M2's walk. A project in the operator's own organization (accepted 2026-11-22); one fresh scratch project there (proposed); the run in a project with no organization is deferred until most of FarSight is ready. Its runbook, `docs/runbooks/adr-0024-m3a-probe.md`, and W-FED's steps, appended to M2's walk runbook, are written with its build, not in the records commit *(2026-11-23: built 2026-11-22 to 2026-11-23, not walked; §11)* | Free IAM objects; approval needed | 3–4 days, plus one session |
 | **M2's walk** | On its own, after M3a, before M3b (accepted 2026-11-22). G0a: [B], in a project in the operator's own organization; the installer's Google-made key is an exception the operator approves, time-boxed and deleted at teardown; the reader is not walked. [U1] withdrawn; [U2] deferred with a project with no organization. Optional W-FED, with its own approval, if M3a passed in the organization project | Billable; approval needed | as its runbook |
 | **M3b** | §7. Built after M3a passes, walked after M2's walk. If M2's walk has not run when M3b's build is done, the operator decides again (proposed) | Billable walk; approval needed | 3–4 weeks [inf] |
 | **M5** | As ADR 0023, plus a Secure Enclave TLS client identity for each role's leaf, for STS. On failure, the Mac app takes V5 on Google if M3a recorded it passing, or else 0600 keys, as the operator decides then | Billable walk | unchanged |
@@ -1133,7 +1133,7 @@ ADR 0023's table keeps its rows. Each changed cell gets §4's dated note. ADR 00
 
 Each answered question says so, with the answer. Each open one has the default this design follows until it is answered.
 
-1. **Approve M3a** as §6 lists it: the objects, the project, Data Access for STS and IAM Credentials in the probe project for the session only, and the Org Policy API if needed. Its project's organization is answered (question 3); which project there is approved here. *Default:* approve exactly that list, in the session that walks it, with one fresh scratch project in the operator's own organization.
+1. **Approve M3a** as §6 lists it: the objects, the project, Data Access for STS and IAM Credentials in the probe project for the session only, and the Org Policy API if needed. Its project's organization is answered (question 3); which project there is approved here. *Default:* approve exactly that list, in the session that walks it, with one fresh scratch project in the operator's own organization. *(2026-11-23: M3a's runbook asks G0 for more than this list: Admin Read on the IAM API besides Data Access for STS and IAM Credentials, and the deviations G0 accepts, among them I6 gating as N6 under Q1's default, proposed (its deviation 9; §11).)*
 2. **D9, the order.** *Answered 2026-11-22:* M2's walk runs on its own after M3a, then M3b (branch S). There is no merged walk. *Default,* as a revisit trigger: if M2's walk has not run when M3b's build is done, the operator decides again.
 3. **A project with no organization.** *Answered 2026-11-22:* M3a and M2's walk use a project in the operator's own organization. A project with no organization comes later, when most of FarSight is ready. So M2's walk takes [B]: key upload is blocked there, the installer's Google-made key is an exception to ADR 0024 that the operator approves at the walk's G0a, time-boxed and deleted at teardown, and the reader is not walked in M2.
 4. **ADR 0023 Choices 5,** human-only enrolment. *Answered 2026-11-22:* human only. Every device addition, renewal and revocation is a human's paste, and no FarCast identity can enrol devices. *Still proposed, for you to confirm:* that the renewal here is a device's anchor renewal, so a leaf renews on the device with no paste (D4).
@@ -1200,5 +1200,111 @@ Each answered question says so, with the answer. Each open one has the default t
 - Where ADR 0024's AWS and Azure probes run, decided when their adapters start.
 - Whether Data Access in the operator's organization is forced on by a parent, recorded at M3a's P9.
 - The route in a project with no organization: M3a's run there, and M2's [U2], deferred until most of FarSight is ready.
-- W-FED's exact steps, and whether `roles/container.viewer` is the smallest role for its three reads, written with M3a's build.
+- W-FED's exact steps, and whether `roles/container.viewer` is the smallest role for its three reads, written with M3a's build. *(2026-11-23: W-FED's steps are written, appended to M2's walk runbook with M3a's build, and have not run. That `roles/container.viewer` is the smallest role for the three reads stays [unverified], as its WF.3 says: W-FED's run would show whether the role is enough, not whether it is the smallest.)*
 - M2's walk's key under [B]: the existing key or one made at WP.8 (§9, question 23, at the walk's G0a). Its deletion at teardown is the operator's decision, not open.
+
+---
+
+## 11. M3a's build (2026-11-22 to 2026-11-23)
+
+M3a was built 2026-11-22 to 2026-11-23, on 2b7f461, from a build spec that took this design's D2 to D7, D9's W-FED and §6. The spec, its critique and the review rounds' reports were working files in a scratch directory, and are not kept. Nothing had been committed when this section was written. Nothing has run against Google, and the probe has never run. Deviation numbers here are the M3a runbook's.
+
+### What landed
+
+- **`farsight/cli/internal/devicekey/`**, new, with its tests and two conformance vectors in `testdata/`: random role IDs and object IDs, D2's profile, the signers, the store (0600 files in 0700 directories), one opening function per role and purpose, and Google's text (the mapping, the condition, the principal, the trust store's YAML and the read-back's check).
+- **`farsight/cli/internal/kube/federated.go`**, new, with `federated_test.go` and `federated_wire_test.go`: STS's mTLS exchange and `generateAccessToken`. `kube/export_test.go` gains test hooks, and `kube/doc.go` one sentence.
+- **`farsight/cli/internal/kube/kubetest/federation.go`**, new, with `federation_test.go`: a loopback STS that requires and verifies a client certificate, and an IAM Credentials fake.
+- **The probe,** `farsight/cli/internal/cli/walkm3a_test.go` (`//go:build walk`), which compiles and has never run, and its two untagged companions, `walkm3ablocks_test.go` and `walkm3achains_test.go`, whose tests run offline.
+- **The runbooks:** `docs/runbooks/adr-0024-m3a-probe.md`, new, and W-FED, appended after line 733 of `docs/runbooks/adr-0023-m2-walk.md`. Neither has run.
+- **Wired into nothing.** No command calls the new code. Only tests and the probe import `devicekey`, and `farcast` does not link it (`go list -deps`). `vendor/` stays at 31 modules. `exec-allowlist.txt`, `errorKinds` and `hardenEnvironment` are unchanged, and no new file names an exec function.
+
+### The five open questions, each at its default
+
+The operator has not answered them. The build took each default, which stays proposed until the operator answers.
+- **Q1, I6 accepted:** I6 gates as N6 does, so an acceptance at I6 fails M3a (deviation 9).
+- **Q2, token info:** by POST only, with the token in the body. Any status but 200 reads "not answered by POST", and T2 then holds on `generateAccessToken`'s 200 alone.
+- **Q3, the read-back's host:** T4's read-back at IAM's API host is the probe's own (deviation 1). Default: IAM's API host becomes the read-back's one further bearer host, for the reader's SA token only, by a dated note on D6 when M3b builds it.
+- **Q4, the TLS floor:** 1.3 wherever a client certificate is carried, that is the exchange and the probe's I1 client; 1.2 for impersonation (deviation 10). If T1 meets a protocol-version alert, the walk stops and the operator decides.
+- **Q5, the records:** in this build, made last, as dated notes and in-place rewrites only. They were made before `./check.sh` ran as a whole, where the default puts them after it passes; it then passed on the tree they describe, and no check reads a record.
+
+### Departures from this design
+
+By the number the M3a runbook's Deviations list gives each:
+1. T4's read-back sends the reader's SA token to IAM's API host, from the probe; D6's bearer rule holds in `federated.go`.
+2. I1, I6 and V5's exchange are probe-only paths, built with the product's body builders.
+3. The firewall has six destinations, not four: STS's plain endpoint (V5, I6) and IAM's API host (T4) join.
+4. P7 (c) deletes V1's providers while their bindings stand; P10 (b) removes the bindings after.
+5. Each settle delta runs from a named mark taken after a paste, so it is a lower bound on Google's settle time.
+6. P7's held tokens wait for a mark, read by a background probe, not for stdin.
+7. W-FED runs a probe binary in M2's walk, under its own approval and firewall rules.
+8. P7 (b) re-enables V1's writer provider, so that P7 (c) can hold a writer token.
+9. I6 gates as N6 does (Q1), checked twice beside V5's exchange as its control.
+10. The exchange's TLS floor is 1.3 (Q4); impersonation keeps 1.2.
+11. Every gating negative, and every gating poll for a refusal, carries a positive control; only a decision is a refusal, and `INCONCLUSIVE` gates.
+12. P7's information timings run to the held token's end, not to the 10-minute bound: up to about 2.5 hours more.
+13. An anchor renewal is staged, and committed only after its verification exchange; `renew-discard` drops one Google did not take.
+14. I4 runs twice: as designed, and nested inside V6's backdated anchor.
+15. `blocks` runs twice, because `console-v1c.txt`'s principals name the project's number.
+16. The steps that make a leaf record it in the probe's state, for `audit.sh`.
+17. P9 reads the secure-by-default baseline's seven constraints, the legacy protocol-forwarding one, and the managed and non-managed twins of the IAM, key and contact constraints.
+18. `audit.sh`'s key-path scrub also replaces any field name of 20 or more characters.
+19. `wfed-gone` has no positive control, and polls the two exchanges only, in one loop.
+20. P3 runs straight after P1's mark, before Data Access and P2.
+21. The teardown leaves on an API Google will not disable without `--force`, and keeps its record for the operator.
+22. `t1` also polls V1b and each role's first impersonation, in one round-robin from the setup mark.
+23. `setup.sh` and `wfed-setup.sh` print the coordinates only when every grant and binding was added.
+
+The code's own departures, which the runbook does not number:
+- the anchor's subject key identifier is set explicitly, to the bytes Go adds by default, so no `GODEBUG` setting can change it (D2: "the subject key identifier Go adds");
+- `kube.ExchangeRequest` carries M3a's knobs in product code: a separate subject chain, no certificate, and other scopes. M3b may narrow it;
+- the exchange is HTTP/1.1, on a fresh transport per call, with no session resumed. That STS takes HTTP/1.1 is [inf];
+- kubetest's STS and IAM Credentials fakes came with M3a; D6 placed them in M3b's wiring;
+- `devicekey` takes a directory, and reads the role ID from the anchor's CN. The `identity/` directory and the instance's record are M3b's wiring;
+- object IDs have fixed lengths, 32 for pools and providers and 30 for accounts: one more trait of a FarCast project, for D11;
+- Data Access is changed in the console, not by a block, which would rewrite the project's whole IAM policy.
+
+### What the review rounds changed in D2, D6 and §6
+
+- **A staged writer leaf needs consent.** `OpenStaged(Writer)` takes a consent, as D2's custody rule asks of the current writer leaf.
+- **Secrets two pointers deep.** `kube.ClientIdentity`, `ExchangeRequest` and `ExchangeAnswer` hold their contents two pointers deep, as `devicekey.RoleID` and `Identity` do, so they format as fixed text even inside another struct's unexported field.
+- **Erase and RemoveRole** refuse a symlink or a non-directory, but not a widened mode, so a widened store can still be removed.
+- **FederationError's alert words.** It carries a TLS alert's words when they are in shape, and nothing else of the server's.
+- **An alert while an answer is read** is no refusal. It reads as unreachable, with no status.
+- **A 3xx with an unparsable Location** is the answer itself: the header is dropped, so no server text reaches the error.
+- **An answer Go cannot parse** names nothing. kube keeps words only from a short list of Go's own network errors, and otherwise reads "no readable answer".
+- **The probe's refusal rule.** Only a 400, 401 or 403, or a certificate alert that ends the exchange's handshake, is a refusal. Anything else, `handshake_failure` and `decrypt_error` included, is no decision and reads `INCONCLUSIVE`.
+- **INCONCLUSIVE positives.** A gating positive whose last answer was no decision reads `INCONCLUSIVE`, and gates until it is rerun.
+- **T2's token info.** When token info answers 200, it must list both scopes, or T2 fails.
+- **The P1 to P3 order.** `t1` runs straight after the setup mark, in one round-robin with V1b and the first impersonations (deviations 20 and 22). Every positive's line says whether its delta can be read as a settle time.
+- **Data Access sub-types.** Admin Read, Data Read and Data Write for STS and IAM Credentials, and Admin Read for the IAM API, which Google's audit-logging page for workload identity federation asks for. P0.7 records the baseline, and P10 (c) restores it.
+- **The teardown keeps what Google will not disable.** Each API is tried once without `--force`. What stays on stays in the record, and the operator decides.
+
+### What stays open
+
+- **The macOS ACL limit** (round 2's X2). `devicekey` and the probe check mode bits only, and an inherited ACL can let another account read a 0600 key. Reading an ACL needs libSystem's ACL API, against `devicekey`'s rule of no platform-only call. The limit is documented in the package and on `Store`, and both runbooks check for an ACL with `ls -led` (P0.2, WF.1). Where M3b places the store needs the same check, or a decision to enforce it.
+- **The read-back's host** (Q3), at M3b.
+- **Q1, Q2, Q4 and Q5,** until the operator answers.
+- **`handshake_failure` and `decrypt_error`.** A row they leave `INCONCLUSIVE` is the operator's call (P4).
+- **`--yes` as writer consent** (ADR 0024 *Choices* 24). `devicekey` has no consent kind for it until that is answered.
+- Round 3 deferred nothing.
+
+### How it was checked
+
+- **The spec.** A critique of its first version found 1 blocker, 13 major and 22 minor findings. Each was checked against the repository, go1.27.4's source or a public page, then applied, applied in part or refuted.
+- **Round 1:** three reviews (security, correctness, tests) reported 11 findings, 4 major and 7 minor, two of them the same defect. Each held when checked against the code and go1.27.4's source, and each was fixed.
+- **Mutation testing,** after round 1, one record per area. Each mutation was applied to a copy only, and compiled in with `-overlay`:
+  - `devicekey`: 55 rows, 74 mutants. 52 rows were killed at once, 2 after a test was strengthened, and 1 is equivalent;
+  - `kube` and kubetest: 46 rows, 58 mutants. 44 were killed at once and 2 after a test was strengthened; none is equivalent;
+  - the probe's companions: 36 rows, 37 mutants. 30 mutants (29 rows) were killed at once and 5 after a test was strengthened. 2 reached only the walk-tagged file; round 2 moved that code into a companion, whose new test kills both.
+- **Round 2:** three reviews (an attacker's lens, the walk's operability, the runbooks) reported 26 findings, 7 major and 19 minor; two pairs named the same defect. Each held when checked. All were fixed but X2, fixed in part (above).
+- **Round 3:** three reviews (the product code, a dry run of the walk, Google's pages) reported 19 findings, 4 major and 15 minor. Each held against the code, go1.27.4's source or Google's pages, and each was fixed.
+- **The fixers' mutants.** Rounds 2 and 3 proved 11 and 15 more mutants by overlay, each failing its named test. Two of round 2's are the companions' two walk-only mutants, run again against the new test.
+- **The network guard.** The test binaries of `devicekey`, `kube`, kubetest and the cli package, the mutants' included, ran under macOS's `sandbox-exec`, with a profile that refuses every outbound connection but loopback and local sockets, and refuses the system resolver's socket.
+- **The last gates,** 2026-11-23: `gofmt -l` prints nothing; `go vet` passes untagged and with the integration, walk and realapi tags; `golangci-lint` with those tags reports 0 issues on the three trees; `go test -race` passes for `devicekey`, `kube` and kubetest, for the probe's 36 companion tests, and once for the whole cli package. `./check.sh` passes on this tree, on the dev Mac, 2026-11-23.
+- **Google's pages** were read with WebFetch on 2026-11-22 and 2026-11-23, from Google's documentation site only. No cloud call was made.
+
+### What is not verified
+
+- **Every Google behaviour:** whether STS takes D2's profile and a leaf whose DN equals its issuer's; whether it binds the subject token to the handshake; path length; the 390-day rule's reach; HTTP/1.1 and TLS 1.3 at STS's mTLS endpoint; settle times and the revocation window; what the audit logs carry, and which sub-type `generateAccessToken` logs under; and whether enabling STS or IAM Credentials needs a billing link.
+- **Every Cloud Shell line** beyond what a fetched page settles. The 17 generated scripts pass `sh -n`, and `setup.sh` ran against a fake `gcloud` only. No `gcloud` ran.
+- **The walk itself,** and W-FED. The probe compiles and has never run.
