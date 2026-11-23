@@ -9236,7 +9236,7 @@ A39-2's rule binds the records, not the code. No record cites these lines at HEA
 
 ## 41. Decided by the operator on 2026-11-22: A22-2 and the walk's branch
 
-On 2026-11-22 the operator decided how FarCast's operator holds a cloud credential, and with it A22-2 (§22) and the branch of M2's billable walk. [ADR 0024](../adr/0024-paste-the-certificate.md) records the decisions, and [its design](adr-0024-design.md) the reasoning. This section records what they change here. It wins over §0–§40 wherever it differs. Nothing in it is built or walked, and neither ADR 0024's M3a nor M2's walk has run. *(2026-11-23, ADR 0024's M3a: built 2026-11-22 to 2026-11-23, offline and wired into no command, with W-FED's probe steps (A41-5). Neither M3a nor M2's walk has run.)*
+On 2026-11-22 the operator decided how FarCast's operator holds a cloud credential, and with it A22-2 (§22) and the branch of M2's billable walk. [ADR 0024](../adr/0024-paste-the-certificate.md) records the decisions, and [its design](adr-0024-design.md) the reasoning. This section records what they change here. It wins over §0–§40 wherever it differs. Nothing in it is built or walked, and neither ADR 0024's M3a nor M2's walk has run. *(2026-11-23, ADR 0024's M3a: built 2026-11-22 to 2026-11-23, offline and wired into no command, with W-FED's probe steps (A41-5). Neither M3a nor M2's walk has run.)* *(2026-11-23, ADR 0024's M3a walked: M3a was walked 2026-11-23 and passes in a project in the operator's own organization. M2's walk has not run.)*
 
 Line numbers are at 5ef5ee8. No line above this section was added or removed: each line it supersedes gets a dated note at its end.
 
@@ -9270,14 +9270,14 @@ Everything else in ADR 0024 is proposed, with its default. On Google its mechani
 - after W6.1's release the operator deletes the key in Google, from Cloud Shell, and the key file on the Mac (W6.2), and W6.6 deletes the walk directory's copy. A no at G0b, or any stop that ends the walk once the key exists (T6's note), deletes them too;
 - the deletion itself is the operator's decision, not a G0a choice. W6.2 checks it, a count only: WP.8's count less one, which is 0 when WP.8 found 1, and then the installer holds no user-managed key after the walk.
 
-**A41-5: W-FED, an optional step.** Proposed. It is offered at G0a only if M3a passed in the organization project, and it needs its own approval there.
+**A41-5: W-FED, an optional step.** Proposed. It is offered at G0a only if M3a passed in the organization project, and it needs its own approval there. *(2026-11-23, ADR 0024's M3a walked: it passed there on 2026-11-23, so W-FED is offered.)*
 - It runs after W5 and before W6.1, while the cluster exists.
 - In the walk's project, M3a's setup paste for one fresh writer-capable device creates the pool, the device's two providers and the two service accounts, with their bindings. The writer account gets no role.
 - The reader account gets `roles/container.viewer` on the project for this step only. That it is the smallest role that authorises the three reads is [unverified].
 - M3a's probe, with the impersonated reader token at the cluster's DNS endpoint, reads the API server's version, lists namespaces and posts a SelfSubjectReview, recording "email matches: yes or no". Then it makes the same reads with a direct federated token, recording 401 against 403.
 - Everything the step made is then deleted, and the device's keys go with the walk directory. *(2026-11-23, ADR 0024's M3a: all but an API Google will not disable without `--force`, which W-FED's WF.5 leaves on, in its record, for the operator's decision (M3a's deviation 21).)*
 
-Its steps use M3a's probe, so they are appended at the runbook's end with M3a's build, and no line moves. They are not written now. *(2026-11-23, ADR 0024's M3a: written with M3a's build, 2026-11-22 to 2026-11-23, as the runbook's W-FED section after its line 733, with W-FED's own approval, counts and results table. Not run.)*
+Its steps use M3a's probe, so they are appended at the runbook's end with M3a's build, and no line moves. They are not written now. *(2026-11-23, ADR 0024's M3a: written with M3a's build, 2026-11-22 to 2026-11-23, as the runbook's W-FED section after its line 733, with W-FED's own approval, counts and results table. Not run.)* *(2026-11-23, ADR 0024's M3a walked: M3a was walked 2026-11-23 and passes in an organization project; W-FED and M2's walk have not run.)*
 
 **A41-6: the runbook's dated notes.** [adr-0023-m2-walk.md](../runbooks/adr-0023-m2-walk.md) gets a dated note of 2026-11-22 at the end of each line below, at 5ef5ee8's numbering. No line is added or removed.
 - `:5`, the Status line;
