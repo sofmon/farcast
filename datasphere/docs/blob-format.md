@@ -1,4 +1,4 @@
-# DataSphere blob format v1
+# DataSphere blob formats v1 and v2
 
 > Normative. This is data at rest: an unpinned change here is silent data loss for
 > every object already stored. The version byte is the only supported way to change

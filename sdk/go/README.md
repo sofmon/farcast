@@ -6,7 +6,7 @@ The Go SDK is the library an application imports to talk to the FarCast environm
 
 This document is the specification for the Go SDK. It describes the full capability surface, the way each capability reaches its backing module, and — in detail — the logging capability that is implemented first.
 
-> **Status.** [`PLAN.md`](../../PLAN.md) phases **0.2** (core interfaces) and **0.3** (logging implementation) are done: the package, interface types, capability accessors, context helpers, and error sentinels are in place, and logging is a working structured logger (`go test -race`, `go vet`, and `golangci-lint` all clean). **Storage is wired** as of phase 3.2: `farcast.Storage()` talks to the instance's DataSphere keyholder, with `ErrStorageSealed` as a first-class application state. **Config and Secrets are wired** as of phase 5.3: `farcast.Config()` reads the process environment (refusing the platform's own namespace), and `farcast.Secrets()` reads operator-provisioned secrets that are encrypted at rest in DataSphere and never placed in a Kubernetes Secret — read [ADR 0017](../../docs/adr/0017-application-secrets.md) for what that boundary is, because it is the **instance**, not the application. `Net()` and `AI()` return stubs until they are wired to their modules; see the [roadmap](#roadmap).
+> **Status.** [`PLAN.md`](../../PLAN.md) phases **0.2** (core interfaces) and **0.3** (logging implementation) are done: the package, interface types, capability accessors, context helpers, and error sentinels are in place, and logging is a working structured logger (`go test -race`, `go vet`, and `golangci-lint` all clean). **Storage is wired** as of phase 3.2: `farcast.Storage()` talks to the instance's DataSphere keyholder, with `ErrStorageSealed` as a first-class application state. **Config and Secrets are wired** as of phase 5.3: `farcast.Config()` reads the process environment (refusing the platform's own namespace), and `farcast.Secrets()` reads operator-provisioned secrets that are encrypted at rest in DataSphere and never placed in a Kubernetes Secret — read [Secrets](#secrets--farcastsecrets) for what that boundary is: since [ADR 0018](../../docs/adr/0018-thin-device-storage.md) it is the **application**, where [ADR 0017](../../docs/adr/0017-application-secrets.md) recorded the instance. `Net()` and `AI()` return stubs until they are wired to their modules; see the [roadmap](#roadmap).
 
 ---
 
@@ -91,9 +91,9 @@ Five accessors form the syscall surface. Each returns an interface backed by a F
 
 ### The boundary, and why logging is first
 
-Logging is the only capability that needs **no round-trip to a module**. A FarCast application is a container; its stdout is captured by the node it runs on, kept there and read on demand by `farcast logs`. The cluster is configured not to ship it to the cloud provider's logging, the node itself is the provider's, and the next walk checks that the provider honours that configuration ([ADR 0019](../../docs/adr/0019-what-the-cluster-tells-its-provider.md)). So "log" means *write one JSON object per line to stdout* — nothing more. That is why logging is the first concrete capability: it has zero dependencies, behaves identically in production and on a laptop, and every later phase can rely on it. *(2026-11-24, ADR 0023's M2 walked: it does: Cloud Logging held no container entry from FarCast's namespaces or the application's from install on. `farcast logs` needs the reader, which was not walked; `kubectl logs` read the lines from the nodes.)*
+Logging is the only capability that needs **no round-trip to a module**. A FarCast application is a container; its stdout is captured by the node it runs on, kept there and read on demand by `farcast logs`. The cluster is configured not to ship it to the cloud provider's logging, the node itself is the provider's, and ADR 0023's M2 walk checked that the provider honours that configuration ([ADR 0019](../../docs/adr/0019-what-the-cluster-tells-its-provider.md)). So "log" means *write one JSON object per line to stdout* — nothing more. That is why logging is the first concrete capability: it has zero dependencies, behaves identically in production and on a laptop, and every later phase can rely on it. *(2026-11-24, ADR 0023's M2 walked: it does: Cloud Logging held no container entry from FarCast's namespaces or the application's from install on. `farcast logs` needs the reader, which was not walked; `kubectl logs` read the lines from the nodes.)*
 
-The other capabilities are thin clients to modules running **inside the same instance**. `Storage()` calls DataSphere, which encrypts before writing to object storage. `Net()` hands back an HTTP client whose traffic is forced through FatLine, which permits only declared `external` hosts and lets Shrike watch every connection. `AI()` calls AllThing, which fronts whichever provider the operator chose. In every case the application talks to a local FarCast endpoint — never to the cloud, never holding a credential. The module endpoints are injected into the environment by the platform when the app is deployed (the SDK ships as a sidecar/init container; see [`PLAN.md`](../../PLAN.md) phase 4.2).
+The other capabilities are thin clients to modules running **inside the same instance**. `Storage()` calls DataSphere, which encrypts before writing to object storage. `Net()` hands back an HTTP client whose traffic is forced through FatLine, which permits only declared `external` hosts and lets Shrike watch every connection. `AI()` calls AllThing, which fronts whichever provider the operator chose. In every case the application talks to a local FarCast endpoint — never to the cloud, never holding a credential. The module endpoints are injected into the environment by the platform when the app is deployed (from the application's ConfigMap and egress Secret, with no sidecar or init container; see [`PLAN.md`](../../PLAN.md) phase 4.2).
 
 ---
 
@@ -234,7 +234,7 @@ if err := store.Write(ctx, key, data); err != nil {
 
 ### Privacy
 
-Logs go to stdout, and nothing in FarCast collects or forwards them. Each line stays in the container's log file on the node that ran it, and `farcast logs` reads it on demand through the provider-run Kubernetes API server. The node and its disk are the provider's. The cluster is configured not to send stdout to the provider's logging, and the next walk checks that the provider honours that ([ADR 0019](../../docs/adr/0019-what-the-cluster-tells-its-provider.md)). So a log line is protected by the provider not looking, not hidden from it: do not log what you would not show the provider. An application that wants logs to reach an external service must route them through `farcast.Net()` to a host it declared in its manifest — at which point FatLine and Shrike govern that traffic like any other outbound connection. *(2026-11-24, ADR 0023's M2 walked: the provider honoured it: 0 `k8s_container` entries from FarCast's namespaces or the application's since install ([its Results](../../docs/runbooks/adr-0023-m2-walk.md#results)).)*
+Logs go to stdout, and nothing in FarCast collects or forwards them. Each line stays in the container's log file on the node that ran it, and `farcast logs` reads it on demand through the provider-run Kubernetes API server. The node and its disk are the provider's. The cluster is configured not to send stdout to the provider's logging, and ADR 0023's M2 walk checked that the provider honours that ([ADR 0019](../../docs/adr/0019-what-the-cluster-tells-its-provider.md)). So a log line is protected by the provider not looking, not hidden from it: do not log what you would not show the provider. An application that wants logs to reach an external service must route them through `farcast.Net()` to a host it declared in its manifest — at which point FatLine and Shrike govern that traffic like any other outbound connection. *(2026-11-24, ADR 0023's M2 walked: the provider honoured it: 0 `k8s_container` entries from FarCast's namespaces or the application's since install ([its Results](../../docs/runbooks/adr-0023-m2-walk.md#results)).)*
 
 ### Testing the logger
 
@@ -455,7 +455,7 @@ type NetAPI interface {
 }
 ```
 
-Implementation: FatLine's core proxy shipped in phase 2, but `Net()` stays a stub until applications get the FatLine data path — the sidecar templating and per-app allowlists of [`PLAN.md`](../../PLAN.md) phases 4.2/4.4.
+Implementation: FatLine's core proxy shipped in phase 2, and since [`PLAN.md`](../../PLAN.md) phases 4.2 and 4.4 every application reaches it through `FARCAST_FATLINE_PROXY`, which carries its own egress credential, with no sidecar; `Net()` itself is still a stub, and no phase yet names its wiring.
 
 ### AI — `farcast.AI()`
 
@@ -515,7 +515,7 @@ Per [`../../AGENTS.md`](../../AGENTS.md) ("Language guardrails") and [ADR 0002](
 | Logging — `Log()` | phase 0.2 | **phase 0.3** |
 | Config — `Config()` | phase 0.2 | ✅ phase 5.3 |
 | Storage — `Storage()` | phase 0.2 | ✅ phase 3.2 |
-| Net — `Net()` | phase 0.2 | with the app data path (phase 4.2/4.4; FatLine core shipped in phase 2) |
+| Net — `Net()` | phase 0.2 | not yet named (the app data path it waited on shipped at 4.2/4.4; FatLine core in phase 2) |
 | AI — `AI()` | phase 0.2 | phase 6.3 |
 | Secrets — `Secrets()` | phase 5.3 | ✅ phase 5.3 |
 

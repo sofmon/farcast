@@ -8,7 +8,7 @@ The `./farcast` manifest declares **what** a repository deploys, not **how** to 
 
 A single manifest can describe one or more applications grouped as a single deployment. Planck (see [`planck/README.md`](../planck/README.md)) translates the manifest into a Kubernetes namespace containing one workload per application. This lets a monorepo deploy its full set of services with one file.
 
-See the root [README.md](../README.md#L169-L195) for the design intent and [AGENTS.md](../AGENTS.md#L21) for the guiding principle.
+See the root [README.md](../README.md#the-farcast-manifest) for the design intent and [AGENTS.md](../AGENTS.md#architectural-principles) for the guiding principle.
 
 ---
 
@@ -133,7 +133,7 @@ context: ../shared
 
 #### `external`
 
-A list of outbound network endpoints this application is permitted to reach. FarCast denies all outbound traffic by default. An application can only connect to hosts declared here, and each declaration must include a human-readable reason that the operator reviews at `farcast run` time. Shrike (see [`shrike/README.md`](../shrike/README.md)) enforces this contract at runtime and treats any undeclared connection as a violation.
+A list of outbound network endpoints this application is permitted to reach. FarCast denies all outbound traffic by default. An application can only connect to hosts declared here, and each declaration must include a human-readable reason that the operator reviews at `farcast run` time. FatLine ([`fatline/README.md`](../fatline/README.md)) enforces this contract at runtime, refusing any undeclared connection, and Shrike ([`shrike/README.md`](../shrike/README.md)) watches its decisions and treats each undeclared connection as a violation.
 
 `external` is **per-app**. Application A cannot use application B's declarations; each app's allowlist is scoped strictly to itself.
 
@@ -262,7 +262,7 @@ apps:
 
 The `api` and `worker` apps use `context: .` so their Containerfiles can `COPY ./shared/proto` from the repository root. The `web` app omits `context`, so its build context defaults to `./services/web`.
 
-Planck will deploy this manifest as a single Kubernetes namespace called `my-platform` containing three workloads: `api`, `worker`, and `web`. Each workload has its own independent `external` allowlist enforced by Shrike.
+Planck will deploy this manifest as a single Kubernetes namespace called `my-platform` containing three workloads: `api`, `worker`, and `web`. Each workload has its own independent `external` allowlist, enforced by FatLine and watched by Shrike.
 
 ---
 
@@ -338,7 +338,7 @@ The following are deliberately absent from Phase 0.1. They are listed here so re
 - **Base images, build steps, language runtimes.** Expressed in the Containerfile.
 - **Startup command.** Expressed in the Containerfile via `CMD` / `ENTRYPOINT`.
 - **Health checks and probes.** TechnoCore monitors applications automatically.
-- **Wildcard hosts** (e.g. `*.stripe.com`) and **IP address hosts**. A future version of the specification may add these; Phase 0.1 is DNS-hostname-only to keep Shrike's Phase 2 enforcement model simple.
+- **Wildcard hosts** (e.g. `*.stripe.com`) and **IP address hosts**. A future version of the specification may add these; Phase 0.1 is DNS-hostname-only to keep FatLine's Phase 2 enforcement, and Shrike's monitoring of it, simple.
 - **Schema version field.** Strict unknown-key rejection leaves room to introduce `schema_version` additively in a future version without ambiguity.
 
 ---
@@ -349,7 +349,7 @@ A compact summary for implementers. Formal types are for illustration; YAML does
 
 ```
 Manifest       := { name: Name, apps: [App, ...] }
-Name           := string matching /^[a-z][a-z0-9-]{0,61}[a-z0-9]$/  (1..63 chars)
+Name           := string matching /^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$/  (1..63 chars)
 App            := { name: Name,
                     containerfile: RelPath,
                     context?: RelPath,

@@ -63,7 +63,7 @@ Throughout:
    - `$WALK/walkprobe.test`: `*.gke.goog:443` and `oauth2.googleapis.com:443`, and nothing else.
    - `kubectl`, the GKE auth plugin and gcloud keep the rules they had. Until M2.7 every apply still runs kubectl as the active gcloud configuration. *(2026-11-18, ADR 0023 M2.7, built, not walked: farcast starts none of the three, so a re-walk gives `farcast` no rules or tools for them; they serve only observation, which a re-walk runs from Cloud Shell.)* *(2026-11-24, ADR 0023's M2 walked: its walk shell resolved none of the three, and every `gcloud` and `kubectl` observation ran in Cloud Shell; one read was in the console's Metrics Explorer ([the M2 walk's deviation 28](adr-0023-m2-walk.md#deviations-found-while-walking-2026-11-24)).)*
    - *(2026-11-16: a firewall that has not yet allowed `walkprobe.test` does not show as a refusal. The probe prints `NOT ANSWERED: EOF` from the token endpoint, after about 16 s. Allow it for its two destinations, and run the probe again.)*
-6. **Three tools for the applies.** Link `kubectl`, the GKE auth plugin and `gcloud` one by one into `$WALK/tools`, never a whole tool directory. *(2026-11-18, ADR 0023 M2.7, built, not walked: farcast starts none of the three, so a re-walk gives `farcast` no rules or tools for them; they serve only observation, which a re-walk runs from Cloud Shell.)* For this walk:
+6. **Three tools for the applies.** Link `kubectl`, the GKE auth plugin and `gcloud` one by one into `$WALK/tools`, never a whole tool directory. *(2026-11-18, ADR 0023 M2.7, built, not walked: farcast starts none of the three, so a re-walk gives `farcast` no rules or tools for them; they serve only observation, which a re-walk runs from Cloud Shell.)* For this walk: *(2026-11-24, ADR 0023's M2 walked: M2.7 is walked; its walk shell resolved none of the three, and every `gcloud` and `kubectl` observation ran in Cloud Shell.)*
    ```bash
    for t in kubectl gke-gcloud-auth-plugin gcloud; do ln -s "$(command -v "$t")" "$WALK/tools/$t"; done
    ```
@@ -77,7 +77,7 @@ Throughout:
    ```bash
    STATE="$HOME/Library/Application Support/farcast"
    export KUBECONFIG="$STATE/instances/$INSTANCE/kubeconfig.yaml"   # P1 writes it
-   # (2026-11-18, ADR 0023 M2.7, built, not walked) Neither install nor connect writes kubeconfig.yaml any more. (2026-11-20, M2.9a, built, not walked: farcast migrate, which deleted one an older farcast left, is removed; only release deletes it now, with the instance's directory.) A re-walk observes with kubectl from Cloud Shell (ADR 0023 Phasing), not over a file farcast wrote; an exported KUBECONFIG naming the absent file fails rather than falling back to ~/.kube/config [inf].
+   # (2026-11-18, ADR 0023 M2.7, built, not walked) Neither install nor connect writes kubeconfig.yaml any more. (2026-11-20, M2.9a, built, not walked: farcast migrate, which deleted one an older farcast left, is removed; only release deletes it now, with the instance's directory.) A re-walk observes with kubectl from Cloud Shell (ADR 0023 Phasing), not over a file farcast wrote; an exported KUBECONFIG naming the absent file fails rather than falling back to ~/.kube/config [inf]. (2026-11-24, ADR 0023's M2 walked: M2.7 is walked; that walk ran every kubectl observation in Cloud Shell, and its walk shell had no KUBECONFIG.)
    cd "$WALK"
    env | grep -E '^(GODEBUG|GOOGLE_SDK_GO_LOGGING_LEVEL|HTTPS?_PROXY|ALL_PROXY)=' && echo "STOP: unset these"
    probe() { (cd "$WALK" && env FARCAST_WALK=1 FARCAST_WALK_INSTANCE="$INSTANCE" FARCAST_WALK_CWD="$WALK" "$@" \
@@ -90,7 +90,7 @@ Throughout:
    INSTANCE=<name>; WALK=<the same directory>
    STATE="$HOME/Library/Application Support/farcast"
    export KUBECONFIG="$STATE/instances/$INSTANCE/kubeconfig.yaml"
-   # (2026-11-18, ADR 0023 M2.7, built, not walked) Neither install nor connect writes kubeconfig.yaml any more. (2026-11-20, M2.9a, built, not walked: farcast migrate, which deleted one an older farcast left, is removed; only release deletes it now, with the instance's directory.) A re-walk observes with kubectl from Cloud Shell (ADR 0023 Phasing), not over a file farcast wrote; an exported KUBECONFIG naming the absent file fails rather than falling back to ~/.kube/config [inf].
+   # (2026-11-18, ADR 0023 M2.7, built, not walked) Neither install nor connect writes kubeconfig.yaml any more. (2026-11-20, M2.9a, built, not walked: farcast migrate, which deleted one an older farcast left, is removed; only release deletes it now, with the instance's directory.) A re-walk observes with kubectl from Cloud Shell (ADR 0023 Phasing), not over a file farcast wrote; an exported KUBECONFIG naming the absent file fails rather than falling back to ~/.kube/config [inf]. (2026-11-24, ADR 0023's M2 walked: M2.7 is walked; that walk ran every kubectl observation in Cloud Shell, and its walk shell had no KUBECONFIG.)
    export CLOUDSDK_ACTIVE_CONFIG_NAME=<your FarCast gcloud configuration>
    ```
    Record the counts of clusters, registries, buckets, forwarding rules, addresses, target pools, disks and VMs in the project now, for P7 to compare with. Record counts only.

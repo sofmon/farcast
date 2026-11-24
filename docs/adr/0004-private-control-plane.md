@@ -77,7 +77,7 @@ All three are mutable after creation (`gcloud … clusters update`, or `ClusterU
 **Negative / constraints**
 
 - Operators need the `container.clusters.connect` IAM permission and connectivity to Google APIs (true for anyone who can run `farcast install`).
-- The returned kubeconfig is DNS-based and relies on the `gke-gcloud-auth-plugin` exec credential + an IAM token, not a static client cert — slightly more moving parts than a public-IP kubeconfig. *(The exec credential went at ADR 0023 M2.7, built 2026-11-18 to 2026-11-19, not walked; the IAM token remains, minted by farcast.)*
+- The returned kubeconfig is DNS-based and relies on the `gke-gcloud-auth-plugin` exec credential + an IAM token, not a static client cert — slightly more moving parts than a public-IP kubeconfig. *(The exec credential went at ADR 0023 M2.7, built 2026-11-18 to 2026-11-19, not walked; the IAM token remains, minted by farcast.)* *(2026-11-24, ADR 0023's M2 walked: farcast's in-memory token reached the cluster through the DNS endpoint, from a shell with no auth plugin or `gcloud`.)*
 - This governs only the control plane; **node egress is not yet locked down** (private nodes are deferred), so the full "no Pod reaches the internet except via FatLine" guarantee still depends on the NetworkPolicy boundary (ADR 0003) until the FatLine egress phase.
 
 **Per-module implications**

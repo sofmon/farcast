@@ -25,7 +25,7 @@ FARCAST_STATE="${FARCAST_CONFIG_HOME:-$HOME/Library/Application Support/farcast}
 INSTANCE_DIR="$FARCAST_STATE/instances/$INSTANCE"
 
 export KUBECONFIG="$INSTANCE_DIR/kubeconfig.yaml"
-# (2026-11-18, ADR 0023 M2.7, built, not walked) Neither install nor connect writes kubeconfig.yaml any more. (2026-11-20, M2.9a, built, not walked: farcast migrate, which deleted one an older farcast left, is removed; only release deletes it now, with the instance's directory.) A re-walk observes with kubectl from Cloud Shell (ADR 0023 Phasing), not over a file farcast wrote; an exported KUBECONFIG naming the absent file fails rather than falling back to ~/.kube/config [inf].
+# (2026-11-18, ADR 0023 M2.7, built, not walked) Neither install nor connect writes kubeconfig.yaml any more. (2026-11-20, M2.9a, built, not walked: farcast migrate, which deleted one an older farcast left, is removed; only release deletes it now, with the instance's directory.) A re-walk observes with kubectl from Cloud Shell (ADR 0023 Phasing), not over a file farcast wrote; an exported KUBECONFIG naming the absent file fails rather than falling back to ~/.kube/config [inf]. (2026-11-24, ADR 0023's M2 walked: M2.7 is walked; that walk ran every kubectl observation in Cloud Shell, and its walk shell had no KUBECONFIG.)
 kubectl config current-context    # confirm it points at this instance's cluster
 ```
 

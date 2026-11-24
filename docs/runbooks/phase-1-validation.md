@@ -172,7 +172,7 @@ all `0600`; metadata shows `status: running`, the DNS `endpoint`, and the
 `cost_limit`.
 *(2026-11-18, ADR 0023 M2.7, built, not walked: `install` writes no `kubeconfig.yaml` any
 more. Expect `metadata.yaml`, with `server_side_apply` for a cluster this install
-created, and `credentials.yaml`.)*
+created, and `credentials.yaml`.)* *(2026-11-24, ADR 0023's M2 walked: M2.7 is walked; that walk's install ran from a release farcast with no kubectl on its `PATH`, and its record does not list the instance's directory.)*
 *(2026-11-20, ADR 0023 M2.9a, built, not walked: `install` records no `server_side_apply`,
 since `farcast migrate` and the refusal that read it are removed. Expect `metadata.yaml`
 and `credentials.yaml`.)*

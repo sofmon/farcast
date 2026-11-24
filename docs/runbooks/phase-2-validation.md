@@ -236,7 +236,7 @@ echo "exit=$?"
   ```
 
   *(2026-11-18, ADR 0023 M2.7, built, not walked: farcast needs neither. They serve only
-  this runbook's own kubectl observation, which a re-walk runs from Cloud Shell.)*
+  this runbook's own kubectl observation, which a re-walk runs from Cloud Shell.)* *(2026-11-24, ADR 0023's M2 walked: a release farcast installed, connected, ran and released an instance from a walk shell where neither resolved, and every `kubectl` observation ran in Cloud Shell.)*
 
 ## B1. Have a checkout and a Go toolchain (no image step)
 
@@ -306,7 +306,7 @@ minutes** while the LB is assigned. ✅ Expect:
 
 ```bash
 export KUBECONFIG="$FARCAST_CONFIG_HOME/instances/$INSTANCE/kubeconfig.yaml"
-# (2026-11-18, ADR 0023 M2.7, built, not walked) Neither install nor connect writes kubeconfig.yaml any more. (2026-11-20, M2.9a, built, not walked: farcast migrate, which deleted one an older farcast left, is removed; only release deletes it now, with the instance's directory.) A re-walk observes with kubectl from Cloud Shell (ADR 0023 Phasing), not over a file farcast wrote; an exported KUBECONFIG naming the absent file fails rather than falling back to ~/.kube/config [inf].
+# (2026-11-18, ADR 0023 M2.7, built, not walked) Neither install nor connect writes kubeconfig.yaml any more. (2026-11-20, M2.9a, built, not walked: farcast migrate, which deleted one an older farcast left, is removed; only release deletes it now, with the instance's directory.) A re-walk observes with kubectl from Cloud Shell (ADR 0023 Phasing), not over a file farcast wrote; an exported KUBECONFIG naming the absent file fails rather than falling back to ~/.kube/config [inf]. (2026-11-24, ADR 0023's M2 walked: M2.7 is walked; that walk ran every kubectl observation in Cloud Shell, and its walk shell had no KUBECONFIG.)
 kubectl get all -n farcast-system
 kubectl get secret fatline-mtls -n farcast-system -o jsonpath='{.data}' | tr ',' '\n'
 ```
@@ -422,7 +422,7 @@ echo "LB=$LB  server-name=$NAME"
 # fails with "unsupported algorithm" — a client limitation that looks alarmingly
 # like a server problem. A curl linked against OpenSSL 3 works if you have one.)
 # (2026-11-11: ADR 0020 moves the instance PKI to ECDSA P-256. Once that is
-# implemented, LibreSSL curl is expected to load the leaf; the next walk confirms it.)
+# implemented, LibreSSL curl is expected to load the leaf; the next walk confirms it.) (2026-11-24: still unconfirmed. ADR 0020 was built 2026-11-13, and no walk since has run curl against FatLine.)
 ./bin/farcast connect "$INSTANCE" --status
 
 # NEGATIVE — no client certificate → dropped at the handshake:

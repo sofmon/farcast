@@ -199,7 +199,7 @@ The conformance vectors include signatures whose r or s needs a 0x00 pad, and on
 - **Hardware keys where the hardware exists.** Keeper and device leaf keys can be non-exportable hardware keys wherever the device has a Secure Enclave, an Android TEE or StrongBox, or a TPM 2.0. That goes beyond ADR 0008's "wrapped" for the leaf-key half of finding 2.
 - **What this does not deliver: the bundle's half.** Wrapping the bundle at rest under a hardware key, which PLAN 7.5 asks for, is still owed by 7.5. That wrapping key is separate from the leaf key, which signs only TLS handshakes and its own request.
 - **A packet in transit no longer carries a leaf.** A keeper's leaf key never exists on the operator's machine or in a packet. A packet intercepted in transit yields the bundle, as it does today, but no longer a usable leaf, provided the request's fingerprint was confirmed. Packet plus passphrase therefore no longer lets anyone re-seed through the tunnel.
-- **curl may work again.** The runbooks' LibreSSL curl workaround should become unnecessary. That is to be confirmed on the next walk, not assumed.
+- **curl may work again.** The runbooks' LibreSSL curl workaround should become unnecessary. That is to be confirmed on the next walk, not assumed. *(2026-11-24: not yet confirmed: no walk since has tried macOS's curl with the operator's leaf, ADR 0023's M1 and M2 walks among them; Verification 3's re-walk, still owed, attempts it.)*
 
 **Negative**
 - **Enrolment gains a round trip.** The keeper CLI gains a verb, and the operator a fingerprint to compare.

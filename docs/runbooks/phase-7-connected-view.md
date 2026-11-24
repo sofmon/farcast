@@ -8,7 +8,7 @@ The macOS FarCast app reads the operator's instances by running the operator's o
 
 **Gate G1 (2026-11-12): Q1 and Q2 accepted.** The app's child `PATH` ends with the system's own directories, and its `CLOUDSDK_CONFIG` is the gcloud directory confirmed in Settings. Without the second, a `farcast` started from Finder would read the operator's real `~/.config/gcloud`. So R4 to R9 are not blocked. *(2026-11-15: since ADR 0023 M2.4 the child's `PATH` is the system's own directories alone, and it has no `CLOUDSDK_CONFIG`: `farcast` runs no tool for the app's three commands, so neither question arises.)*
 
-**Commit walked:** `5bb19ac` (2026-11-12). **Status:** Part R walked 2026-11-12. R2, R5 and R8.3–R8.5 were not reported, and Part L is not walked. Eight findings, listed under Results.
+**Commit walked:** `5bb19ac` (2026-11-12). **Status:** Part R walked 2026-11-12. R2, R5 and R8.3–R8.5 were not reported, and Part L is not walked. Eight findings, listed under Results. All eight were fixed 2026-11-13 (a091c5f), and no walk has checked the fixes: Part R as rewritten on 2026-11-15 for ADR 0023 M2.4 is not yet walked.
 
 *(2026-11-15: R1, R3–R9 and Part L were rewritten for ADR 0023 M2.4. The rehearsal's cluster is now a local API server, and every read runs as the instance's reader. **The rewritten Part R is not yet walked:** the Results below are the 2026-11-12 walk of the old rig. Part L is still not walked.)*
 

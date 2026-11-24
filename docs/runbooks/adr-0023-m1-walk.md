@@ -93,7 +93,7 @@ Keep the Mac's `$R/a` from this step: W0 uses it as `$REL`, and W7 deletes it. D
    command -v go gofmt                # HARD STOP if this prints anything
    STATE="$HOME/Library/Application Support/farcast"
    export KUBECONFIG="$STATE/instances/$INSTANCE/kubeconfig.yaml"   # W1 writes it
-   # (2026-11-18, ADR 0023 M2.7, built, not walked) Neither install nor connect writes kubeconfig.yaml any more. (2026-11-20, M2.9a, built, not walked: farcast migrate, which deleted one an older farcast left, is removed; only release deletes it now, with the instance's directory.) A re-walk observes with kubectl from Cloud Shell (ADR 0023 Phasing), not over a file farcast wrote; an exported KUBECONFIG naming the absent file fails rather than falling back to ~/.kube/config [inf].
+   # (2026-11-18, ADR 0023 M2.7, built, not walked) Neither install nor connect writes kubeconfig.yaml any more. (2026-11-20, M2.9a, built, not walked: farcast migrate, which deleted one an older farcast left, is removed; only release deletes it now, with the instance's directory.) A re-walk observes with kubectl from Cloud Shell (ADR 0023 Phasing), not over a file farcast wrote; an exported KUBECONFIG naming the absent file fails rather than falling back to ~/.kube/config [inf]. (2026-11-24, ADR 0023's M2 walked: M2.7 is walked; that walk ran every kubectl observation in Cloud Shell, and its walk shell had no KUBECONFIG.)
    cd "$WALK"                         # outside any checkout
    farcast version
    ```
@@ -105,7 +105,7 @@ Keep the Mac's `$R/a` from this step: W0 uses it as `$REL`, and W7 deletes it. D
    INSTANCE=<name>; WALK=<the same directory>
    STATE="$HOME/Library/Application Support/farcast"
    export KUBECONFIG="$STATE/instances/$INSTANCE/kubeconfig.yaml"
-   # (2026-11-18, ADR 0023 M2.7, built, not walked) Neither install nor connect writes kubeconfig.yaml any more. (2026-11-20, M2.9a, built, not walked: farcast migrate, which deleted one an older farcast left, is removed; only release deletes it now, with the instance's directory.) A re-walk observes with kubectl from Cloud Shell (ADR 0023 Phasing), not over a file farcast wrote; an exported KUBECONFIG naming the absent file fails rather than falling back to ~/.kube/config [inf].
+   # (2026-11-18, ADR 0023 M2.7, built, not walked) Neither install nor connect writes kubeconfig.yaml any more. (2026-11-20, M2.9a, built, not walked: farcast migrate, which deleted one an older farcast left, is removed; only release deletes it now, with the instance's directory.) A re-walk observes with kubectl from Cloud Shell (ADR 0023 Phasing), not over a file farcast wrote; an exported KUBECONFIG naming the absent file fails rather than falling back to ~/.kube/config [inf]. (2026-11-24, ADR 0023's M2 walked: M2.7 is walked; that walk ran every kubectl observation in Cloud Shell, and its walk shell had no KUBECONFIG.)
    export CLOUDSDK_ACTIVE_CONFIG_NAME=<your FarCast gcloud configuration>
    # the carried manifests, by component, from the release farcast itself
    carried() { "$WALK/bin/farcast" -o json version | grep -o '"name":"[a-z]*","go":"[^"]*","manifest":"sha256:[0-9a-f]*"'; }

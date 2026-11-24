@@ -106,7 +106,7 @@ The alternative — a FarCast-built fetcher speaking Git itself — was rejected
 
 1. **A maintained, first-party in-cluster builder appearing.** Kaniko's archival is this decision's weakest link, and a supported replacement is a straight substitution — decision 1's reasoning is about privilege requirements, not about Kaniko specifically.
 2. **An operator who needs a repository the cloud must never read.** The answer is not a smaller build sandbox; it is the machine-anchored path this ADR rejected, offered as an option rather than the default.
-3. **Thin-device storage.** This ADR makes deployment machine-independent and leaves `farcast storage` requiring the keyring locally, because it encrypts client-side. Routing it through the keyholder is a planned follow-up ADR (recorded at [PLAN.md](../../PLAN.md) 5.4) and is what completes the same-capability-from-any-device goal without putting the unrotatable name key on a phone.
+3. **Thin-device storage.** This ADR makes deployment machine-independent and leaves `farcast storage` requiring the keyring locally, because it encrypts client-side. Routing it through the keyholder is a planned follow-up ADR (recorded at [PLAN.md](../../PLAN.md) 5.4) and is what completes the same-capability-from-any-device goal without putting the unrotatable name key on a phone. *(2026-11-24: that ADR is [ADR 0018](0018-thin-device-storage.md), accepted 2026-09-10; its identity on the data path and per-application scopes are built, and its `device` leaves and Tiers A and B are not.)*
 4. **Unattended deploys** — an instance pulling its own updates on a push. That bypasses decision 6's approval gate entirely and is a separate decision, not an extension of this one.
 
 ---

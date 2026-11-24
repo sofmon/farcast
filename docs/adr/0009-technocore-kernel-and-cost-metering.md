@@ -119,7 +119,7 @@ Two guards, because this is the seam where an external input reaches the enforce
 
 1. **Drift between `expected` and `confirmed` persistently exceeds the clamp.** Decision 5 corrects a model that is merely stale. A divergence the clamp keeps refusing means the model is wrong in kind rather than in calibration — a billed quantity the meter does not know about — and that is a new mechanism, not a new constant.
 2. **A second cloud provider.** The meter's shape assumes Autopilot's request-based billing. A provider that bills nodes rather than Pods makes per-application attribution genuinely hard, and that is a new ADR rather than a parameter.
-3. **The hand-rolled client outgrows its verb set.** Watch semantics, server-side apply, or CRDs would each be a signal to take T3 rather than to keep extending T2. *(2026-11-18: server-side apply arrived with ADR 0023 M2.7, built, not walked, in the CLI's own package, `farsight/cli/internal/kube`, not the kernel's. `./check.sh` step 1b refuses a technocore that links any package of `farsight/`. The trigger did not fire for the kernel.)*
+3. **The hand-rolled client outgrows its verb set.** Watch semantics, server-side apply, or CRDs would each be a signal to take T3 rather than to keep extending T2. *(2026-11-18: server-side apply arrived with ADR 0023 M2.7, built, not walked, in the CLI's own package, `farsight/cli/internal/kube`, not the kernel's. `./check.sh` step 1b refuses a technocore that links any package of `farsight/`. The trigger did not fire for the kernel.)* *(2026-11-24, ADR 0023's M2 walked: M2.7's forced server-side apply, from the CLI, was walked under Autopilot.)*
 
 ---
 

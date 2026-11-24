@@ -4,7 +4,7 @@ Wire-level notes for [`internal/providers/gcs`](../internal/providers/gcs/), the
 first `datasphere.Provider`. The module [README](../README.md) carries the
 decisions; this page carries the details an implementer or a debugging operator
 needs, and is explicit about which of them are **verified by test** and which are
-**assumptions awaiting the first integration run**.
+**assumptions awaiting the first integration run** (that run, on 2026-08-27, settled each one, as marked below).
 
 The adapter is hand-issued REST over the vendored `cloud.google.com/go/auth`
 stack — the same division [ADR 0007](../../docs/adr/0007-instance-owned-image-registry.md)
@@ -17,7 +17,7 @@ a bearer token by hand.
 
 ## Endpoints
 
-Eight calls, all `net/http` + `encoding/json`.
+Eight calls at 3.1, all `net/http` + `encoding/json`; 3.3 added the resumable upload and ranged reads, and ADR 0023 M2.8 the bucket's IAM policy read and write (`GET` and `PUT b/{bucket}/iam`), which the table below does not list.
 
 | Operation | Method & URL |
 |---|---|
@@ -237,6 +237,6 @@ breaking calls that have nothing to do with the scoping intent.
 > Object, so the first disjunct is true and the condition allows it. See
 > [the Phase 3 runbook](../../docs/runbooks/phase-3-validation.md) for the run.
 >
-> Still unexercised: this ran on a dedicated `farcast-storage` service account, while
+> Unexercised at 3.1: this ran on a dedicated `farcast-storage` service account, while
 > production puts the grant on the *installer* account that also holds container and
-> Artifact Registry roles. That combination lands with 3.3.
+> Artifact Registry roles. That combination landed with 3.3, whose pass of 2026-08-27 reached and tore down a bucket as the installer ([its finding 8](../../docs/runbooks/phase-3-validation.md#findings-from-the-phase-33-pass-2026-08-27)).

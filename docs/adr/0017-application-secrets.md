@@ -88,4 +88,4 @@ What survives unchanged is decision 3's rule about the OPERATION rather than the
 
 The shared `app` scope this ADR was written against no longer exists. Read the rest of this document as the record of why the boundary was where it was, not as a description of where it is.
 
-Until then the honest statement is the one in decision 2, and it is the reason `farcast secret` talks about applications sharing an instance rather than about applications being isolated from each other.
+Until then the honest statement is the one in decision 2, and it is the reason `farcast secret` talks about applications sharing an instance rather than about applications being isolated from each other. *(2026-11-24: "then" came with ADR 0018, whose decisions 1 and 5 were built 2026-09-11, so this no longer holds: decision 2 is superseded, and `farcast secret` now says each application has its own scope, so a neighbour cannot compute a secret's stored name, let alone open it.)*
