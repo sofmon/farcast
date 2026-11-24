@@ -605,7 +605,7 @@ func TestReleaseHumanNamesTheCloudLogs(t *testing.T) {
 	}
 
 	sys := render(&releaseCloudLogs{AuditUntil: "2027-12-15", SystemUntil: "2026-12-10", MetricsUntil: "2028-11-10"})
-	for _, want := range []string{"cloud logs:", "release cannot remove", "2027-12-15", "2026-12-10",
+	for _, want := range []string{"cloud logs:", "release cannot remove", "2027-12-15", "2026-12-10", "audit log of writes to the\n               cluster's API, every Pod's spec among them",
 		"metrics about the instance's Pods (names, states, resource use) until about 2028-11-10"} {
 		if !strings.Contains(sys, want) {
 			t.Errorf("output missing %q:\n%s", want, sys)

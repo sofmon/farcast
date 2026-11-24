@@ -37,8 +37,8 @@ const (
 	// the uid the API server gave it, which every cluster in the project's
 	// Workload Identity pool does not share, and 'farcast kernel deploy'
 	// creates it (RenderServiceAccount) so that uid exists before the first
-	// build. The uid member on a repository's policy is unverified until the
-	// M2 walk.
+	// build. On the M2 walk (2026-11-24) Artifact Registry honoured the uid
+	// member for a push.
 	ServiceAccount = "farcast-builder"
 
 	// A build is the one FarCast workload where conservative requests cause

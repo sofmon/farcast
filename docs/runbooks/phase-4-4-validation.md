@@ -387,7 +387,7 @@ All four are now fixed, and each has a test that fails without the fix:
   own question in a terminal, or under `--confirm` of a plan made with it,
   which needs a granted reader, and never with `--yes`. It names the
   keyholder's ServiceAccount by its uid, which is [unverified] until the M2
-  walk. Without the flag its commands are still printed before the workload.)*
+  walk. Without the flag its commands are still printed before the workload.)* *(2026-11-24, ADR 0023's M2 walked: Cloud Storage accepts and honours the uid member: the terminal path applied it, and the keyholder unsealed under it.)*
 
 Confirmed in passing: [ADR 0008](../adr/0008-in-cluster-key-delivery.md) decision
 9's fix, live for the first time — the `app` scope was present in the keyring

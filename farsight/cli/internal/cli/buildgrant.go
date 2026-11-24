@@ -34,8 +34,8 @@ import (
 // project, through a group or by a wider role (A33-3). The grant names the
 // builder's ServiceAccount by its uid, which every cluster in the project's
 // Workload Identity pool does not share, and the printed commands remove the
-// principal every instance in the project shares (A33-4). The uid member on
-// a repository's policy is unverified until the M2 walk.
+// principal every instance in the project shares (A33-4). On the M2 walk
+// (2026-11-24) Artifact Registry honoured the uid member for a push.
 //
 // [the 4.3 runbook]: ../../../../docs/runbooks/phase-4-3-validation.md
 
@@ -418,11 +418,11 @@ func pushDenied(logs string) bool {
 // known, read as the writer when the plan bound the placeholder, or the one
 // line that says the account could not be read.
 //
-// A grant the plan read present was refused all the same: IAM may not have
-// propagated it yet, or Artifact Registry may not honour a grant by uid,
-// which is unverified until the M2 walk (design §33, A33-4 (f)). It says so
-// rather than that nothing grants it, and still prints the add, which puts
-// the grant back if it has gone since.
+// A grant the plan read present was refused all the same: most likely IAM
+// has not propagated it yet, or it has gone since. Artifact Registry honoured
+// a push grant by uid on the M2 walk, 2026-11-24 (design §33, A33-4 (f)).
+// It says so rather than that nothing grants it, and still prints the add,
+// which puts the grant back if it has gone since.
 //
 // It writes to stderr rather than into the returned error because the grant is
 // several lines of shell: an error string is the wrong shape for something an
@@ -436,9 +436,9 @@ func explainPushDenial(w io.Writer, logs, planned string, text func() string) bo
 	if planned == plan.GrantPresent {
 		fprintln(w, "was refused. The builder pushes under its own cloud identity, and when this")
 		fprintln(w, "build was planned, the repository's own policy granted it write access by")
-		fprintln(w, "its ServiceAccount's uid. IAM may not have propagated that grant yet, or")
-		fprintln(w, "Artifact Registry may not honour a grant by uid, which is unverified until")
-		fprintln(w, "the M2 walk. If the grant is no longer there, add it again in Cloud Shell:")
+		fprintln(w, "its ServiceAccount's uid. Most likely IAM has not propagated that grant yet,")
+		fprintln(w, "or the grant has been removed since the plan read it. If the grant is no")
+		fprintln(w, "longer there, add it again in Cloud Shell:")
 	} else {
 		fprintln(w, "was refused. The builder pushes under its own cloud identity, and nothing")
 		fprintln(w, "grants that identity write access to this instance's registry. Grant it by")

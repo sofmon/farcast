@@ -92,7 +92,7 @@ chmod 600 "$KEY"
 > role that can create a repository (`repoAdmin` cannot) and it also carries the
 > repository-level `setIamPolicy` the node-SA pull grant needs — so the stored
 > credential never holds project-IAM power. If your SA is already Owner/Editor you
-> can skip the bindings. *(2026-11-22, [ADR 0024](../adr/0024-paste-the-certificate.md): the key this step downloads is a provider-made secret. By the operator's rule of that day, once the certificate route is built (ADR 0024's M3b, proposed), it is used only where that route is closed, named and consented (proposed fallback 3). Until then it is `install`'s only installer credential, and in ADR 0023's M2 walk under [B] it is an exception the operator approves at its G0a, time-boxed and deleted at teardown.)*
+> can skip the bindings. *(2026-11-22, [ADR 0024](../adr/0024-paste-the-certificate.md): the key this step downloads is a provider-made secret. By the operator's rule of that day, once the certificate route is built (ADR 0024's M3b, proposed), it is used only where that route is closed, named and consented (proposed fallback 3). Until then it is `install`'s only installer credential, and in ADR 0023's M2 walk under [B] it is an exception the operator approves at its G0a, time-boxed and deleted at teardown.)* *(2026-11-24, ADR 0023's M2 walked: the walk used the installer's existing key as that exception, approved at G0a on 2026-11-23. The installer held the three roles above with no condition, and `roles/storage.admin` under its bucket condition. The key was deleted in Google and on the Mac at W6.2, so the installer holds no user-managed key ([its Results](adr-0023-m2-walk.md#results)).)*
 
 ## 3. Build the binaries
 
@@ -221,7 +221,7 @@ farcast's cluster token, scoped to `userinfo.email` alone. So at 2482810 step 4'
 and every read this reader serves, is refused against GKE. A fix built later that day
 mints the reader's token with `cloud-platform` and `userinfo.email`, so a leaked one
 works for every Google API the reader's IAM allows, not only the cluster. It is tested
-against a local API server only. This step is still not walked.)*
+against a local API server only. This step is still not walked.)* *(2026-11-24, ADR 0023's M2 walked: under [B], in the same organization, steps 1 and 2 ran again: `reader init` exited 0, and the paste stopped at its first policy check, the legacy constraint, with nothing changed. `farcast instances` then read the reader as not uploaded, and `reader grant` was refused `credential_missing` with nothing written. This step is still not walked.)*
 
 1. Make the key and the script:
 

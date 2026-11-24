@@ -452,7 +452,7 @@ type installResult struct {
 	CostLimit costLimitResult `json:"cost_limit"`
 	// CloudLogging is the provider's logging configuration as it read the
 	// cluster back: "system" (configured to collect its mandatory system logs
-	// and Events only — the provider's word, unwalked; ADR 0019) or
+	// and Events only — the provider's word, honoured in M2's walk; ADR 0019) or
 	// "unverified".
 	CloudLogging string `json:"cloud_logging"`
 	ConfigPath   string `json:"config_path"`
@@ -489,11 +489,11 @@ func (r installResult) Human(w io.Writer) error {
 	if r.CloudLogging == config.CloudLoggingSystem {
 		// Said at install because it is a property of the cluster, fixed at
 		// creation (ADR 0019).
-		// "Configured", and no more: the read-back is the provider's word
-		// about its configuration, and only the next walk's count of the
-		// entries it received shows it is honoured.
+		// "Configured": the read-back is the provider's word about this
+		// cluster's configuration. That Autopilot honours it is from M2's walk,
+		// which counted no container entry at the provider (ADR 0019).
 		fprintln(w, "  app logs:    kept on the cluster's nodes, configured not to be sent to the provider's logging")
-		fprintln(w, "               (the provider's read-back; that it is honoured is unwalked, ADR 0019)")
+		fprintln(w, "               (the provider's read-back; a walk on 2026-11-24 found it honoured, ADR 0019)")
 		fprintln(w, "               (the provider still keeps its system logs, events, audit log and metrics)")
 	} else {
 		fprintln(w, "  app logs:    NOT verified as kept from the provider's logging")

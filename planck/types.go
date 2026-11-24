@@ -62,7 +62,7 @@ type Cluster struct {
 	// found it configured to send the cloud's logging service only the
 	// provider's mandatory system logs — not applications' stdout and stderr.
 	// That is the provider's word about its configuration, not an observation
-	// of what it sends, and on Autopilot it is unwalked (ADR 0019). False
+	// of what it sends; M2's walk found it honoured on Autopilot (ADR 0019). False
 	// means not verified, not merely "off".
 	SystemLogsOnly bool
 	// Created is set by a provider whose CreateCluster created the cluster in

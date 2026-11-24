@@ -170,8 +170,8 @@ policy does not hold it by the account's uid, the review prints the commands
 that grant it and remove the principal every FarCast instance in the project
 shares (a grant at the project, through a group or by a wider role does not
 show there), and an account that does not exist yet gets them right after
-the first build starts. The uid member on a repository's policy is
-unverified until the M2 walk.
+the first build starts. Artifact Registry honoured a push grant by the uid
+on the M2 walk (2026-11-24).
 
 The gate is the external service declarations. Nothing an application can reach
 is implicit — FatLine denies every outbound host that the manifest does not

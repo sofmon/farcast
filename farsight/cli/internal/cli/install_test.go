@@ -458,8 +458,8 @@ func TestInstallRecordsSystemOnlyLogging(t *testing.T) {
 		t.Errorf("result does not say where application logs go:\n%s", out.String())
 	}
 	// The read-back is the provider's word about its configuration; the
-	// result must not present it as observed behaviour (review finding R-3).
-	if strings.Contains(out.String(), "kept on the cluster's nodes, not sent") || !strings.Contains(out.String(), "unwalked") {
+	// result names it so and must not present it as observed (review finding R-3).
+	if strings.Contains(out.String(), "kept on the cluster's nodes, not sent") || !strings.Contains(out.String(), "the provider's read-back; a walk on 2026-11-24 found it honoured") || strings.Contains(out.String(), "unwalked") {
 		t.Errorf("result presents the provider's read-back as observed:\n%s", out.String())
 	}
 }

@@ -142,14 +142,14 @@ func TestLogsTargetsTheKindItFound(t *testing.T) {
 
 // Review finding R-3. The usage text says the cluster is CONFIGURED not to
 // send logs to the provider's logging, which is the provider's read-back, and
-// that the next walk checks it — never that the provider does not receive
-// them, which nothing has observed yet (ADR 0019).
+// that a walk found it honoured (2026-11-24) — never that the provider does
+// not receive them, which holds only as far as that walk saw (ADR 0019).
 func TestLogsUsageDoesNotPresentTheReadBackAsObserved(t *testing.T) {
 	u := strings.Join(strings.Fields((&logsCommand{}).Usage()), " ")
 	if strings.Contains(u, "does not send them") {
 		t.Errorf("usage states the provider's read-back as observed behaviour:\n%s", u)
 	}
-	for _, want := range []string{"configured not to send them to the provider's logging", "the next walk checks"} {
+	for _, want := range []string{"configured not to send them to the provider's logging", "a walk on 2026-11-24 found honoured"} {
 		if !strings.Contains(u, want) {
 			t.Errorf("usage omits %q:\n%s", want, u)
 		}

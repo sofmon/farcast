@@ -2547,13 +2547,13 @@ func (w *m3aWalk) stepWFED() {
 		o := m3aPositiveOutcome(w.ctx, w.clock, viewer, func() bool {
 			clear(body)
 			code, ctype, body, last = w.clusterRead(ep, sa.Value, r.method, r.path, r.query(), r.body)
-			return last == nil && code == http.StatusOK
+			return last == nil && (code == http.StatusOK || code == http.StatusCreated)
 		})
 		ok := o.ok
 		w.say("W-FED %s with the SA token:", r.label)
 		switch {
 		case ok:
-			w.say("  %s", w.acceptedLine(viewer, o, "status 200"))
+			w.say("  %s", w.acceptedLine(viewer, o, fmt.Sprintf("status %d", code)))
 		case last != nil:
 			w.say("  NOT ANSWERED at the bound: %s", w.sc.text(last.Error()))
 		default:

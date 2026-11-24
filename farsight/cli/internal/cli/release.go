@@ -68,11 +68,11 @@ named; release cannot reach them, and 'farcast keeper uninstall' on each does
 the same there.
 
 release cannot remove what the cloud provider has already logged or measured
-about the instance (ADR 0019). Its audit log keeps a record of every create,
-update and delete on the cluster's Kubernetes API — object names, times and
-callers, and the full spec of every workload — for 400 days from each write.
-(Status updates, such as a Pod's readiness, go to its Data Access log, which
-is off unless the project or a parent turned it on.) Its logging keeps the
+about the instance (ADR 0019). Its audit log keeps a record of writes to the
+cluster's Kubernetes API — object names, times, callers, every Pod's spec from
+its create, and each Service-backed Pod's address and readiness from the
+Endpoints — for 400 days from each write. (A Pod's status updates go to Data
+Access, off unless the project or a parent turned it on.) Its logging keeps the
 cluster's system logs and events for the project's retention, 30 days by
 default. Its monitoring keeps metrics about the instance's Pods — names,
 states such as readiness, and resource use — for 24 months from each sample.
@@ -345,8 +345,8 @@ type releaseCloudLogs struct {
 	// WorkloadLogs is true when the instance was not recorded as configured to
 	// keep its applications' output from the provider's logging (installed
 	// before ADR 0019). False is that configuration, as the provider read it
-	// back at install — its word, unwalked on Autopilot — and not an
-	// observation that no application output reached it.
+	// back at install — its word, which M2's walk found honoured on Autopilot —
+	// and not an observation that none of this instance's output reached it.
 	WorkloadLogs bool `json:"workload_logs"`
 }
 
@@ -581,8 +581,8 @@ func (r releaseResult) Human(w io.Writer) error {
 	}
 	if l := r.CloudLogs; l != nil {
 		if l.AuditUntil != "" {
-			fprintf(w, "  cloud logs:  kept by the provider; release cannot remove them — its audit log of this instance's\n"+
-				"               API writes until about %s, its system logs and events until about %s (default retention)",
+			fprintf(w, "  cloud logs:  kept by the provider; release cannot remove them — its audit log of writes to the\n"+
+				"               cluster's API, every Pod's spec among them, until about %s, its system logs and events until about %s (default retention)",
 				l.AuditUntil, l.SystemUntil)
 			if l.MetricsUntil != "" {
 				fprintf(w, ",\n               its metrics about the instance's Pods (names, states, resource use) until about %s",

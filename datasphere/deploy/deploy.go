@@ -413,8 +413,8 @@ type templateData struct {
 // ServiceAccount by the uid the API server gave it, not by its namespace and
 // name: the principal a name makes is shared by every instance in the
 // project's Workload Identity pool. A ServiceAccount deleted and created
-// again therefore needs its grant again. The uid principal on a bucket's
-// policy is unverified until the M2 walk.
+// again therefore needs its grant again. A bucket accepted the uid principal
+// on the M2 walk (2026-11-24), and the keyholder served under it.
 var accountTemplate = template.Must(template.New("datasphered-account").Parse(`apiVersion: v1
 kind: Namespace
 metadata:

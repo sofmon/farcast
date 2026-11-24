@@ -397,9 +397,9 @@ type InstanceMetadata struct {
 	// the provider read it back at install (ADR 0019). CloudLoggingSystem means
 	// configured to collect its mandatory system logs only — not the
 	// applications' stdout and stderr. That is the provider's word about its
-	// configuration, not an observation of what it collects, and on Autopilot
-	// it is unwalked. Empty means not verified: an instance installed before
-	// ADR 0019, whose cluster shipped workload logs.
+	// configuration, not an observation of what it collects; M2's walk found
+	// it honoured on Autopilot. Empty means not verified: an instance installed
+	// before ADR 0019, whose cluster shipped workload logs.
 	CloudLogging string `yaml:"cloud_logging,omitempty"`
 
 	// FatLineDeployed records that connect has applied FatLine into the cluster

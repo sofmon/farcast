@@ -22,8 +22,8 @@ import (
 // instance in the project: one instance's grant to it lets another's
 // keyholder or builder use it. A grant therefore names the principal Google
 // documents for one ServiceAccount object, by the uid the API server gave it;
-// the shared one is what a grant removes. The uid principal on a bucket's and
-// a repository's policy is unverified until the M2 walk.
+// the shared one is what a grant removes. On the M2 walk (2026-11-24) a
+// bucket and a repository each accepted and honoured the uid principal.
 
 // serviceAccountUIDShape is a uid as the API server issues one: a
 // lowercase RFC 4122 UUID.

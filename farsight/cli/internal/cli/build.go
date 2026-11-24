@@ -108,8 +108,8 @@ principal every FarCast instance in the project shares, when the policy does
 not hold it (a grant at the project, through a group or by a wider role does
 not show there). An account that does not exist yet gets its commands right
 after the build starts; 'farcast kernel deploy' creates it ahead of any
-build. The uid member on a repository's policy is unverified until the M2
-walk.
+build. Artifact Registry honoured a push grant by the uid on the M2 walk
+(2026-11-24).
 
 --plan prints what the build would do, and changes nothing: the build, its
 Job's cost, the builder image (--builder-image's, or the one the instance

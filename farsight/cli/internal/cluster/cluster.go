@@ -51,7 +51,7 @@ type Client struct {
 // meant to change nothing: on an envtest kube-apiserver 1.36.2 on
 // 2026-11-19, every stream rendered on M2.7b's tree, before its commit,
 // applied twice with nothing moved (docs/runbooks/adr-0023-m2-realapi.md,
-// Run 2). Under Autopilot's admission it is not walked.
+// Run 2). Under Autopilot the kernel's and FatLine's Deployments did too (M2's walk).
 //
 // A reader client refuses it before anything is sent, and so does a stream
 // SplitStream refuses or one that holds no document. Apply stops at the first

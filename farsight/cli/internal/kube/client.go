@@ -26,8 +26,8 @@ const (
 	ScopeCloudPlatform = "https://www.googleapis.com/auth/cloud-platform"
 	// ScopeUserinfoEmail is the second of a cluster token's two scopes
 	// (TokenScopes). It keeps the account's email in the identity GKE derives
-	// from the token, which is the name the reader's RoleBindings use. That is
-	// inferred, not walked: the probe walk could set up no reader.
+	// from the token, which is the name the reader's RoleBindings use. M2's walk
+	// showed it for an impersonated token; for the reader's own key it is inferred.
 	ScopeUserinfoEmail = "https://www.googleapis.com/auth/userinfo.email"
 )
 

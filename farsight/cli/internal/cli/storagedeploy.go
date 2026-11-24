@@ -225,8 +225,8 @@ first deploy the replicas restart on a 403 until that grant has
 propagated, and an unseal fails meanwhile. --grant-bucket applies the
 grant instead, in one change of the bucket's IAM policy, before any
 replica exists: under --confirm of a plan made with it, or after its own
-question in a terminal; never with --yes. The uid on a bucket's policy is
-unverified until the M2 walk. One project per instance is still the full
+question in a terminal; never with --yes. A bucket honoured a grant to the
+uid on the M2 walk (2026-11-24). One project per instance is still the full
 separation: every cluster in a project can present any uid.
 
 --plan prints what the deploy would do, and changes nothing: its cost, the
@@ -1530,7 +1530,7 @@ type bucketGrantLines struct {
 // terminal's question), in one policy write; otherwise these commands are
 // printed. Both name the ServiceAccount by its uid: the principal a name
 // makes is shared by every instance in the project's Workload Identity pool.
-// The uid principal on a bucket's policy is unverified until the M2 walk.
+// On the M2 walk (2026-11-24) a bucket honoured the uid principal.
 //
 // It is printed BEFORE the workload is applied. It used to be printed after,
 // as part of the result — so the replicas were already crash-looping on a 403

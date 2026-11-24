@@ -72,8 +72,8 @@ const (
 // gcloud configuration: the project, its number and the location are in
 // them. The add always prints, under an introduction that agrees with the
 // plan: a grant the plan read present and the push refused all the same is
-// IAM still propagating, or a uid member Artifact Registry does not honour,
-// which is unverified until the M2 walk, never "nothing grants it" over an
+// most likely IAM still propagating, or the grant removed since (the M2 walk
+// saw a uid member honoured, 2026-11-24), never "nothing grants it" over an
 // empty block, nor a remove alone as the fix. A policy the plan could not
 // read prints both conditional blocks, the remove included.
 func TestAPushDenialExplainsItselfWithTheCommandThatFixesIt(t *testing.T) {
@@ -85,7 +85,7 @@ func TestAPushDenialExplainsItselfWithTheCommandThatFixesIt(t *testing.T) {
 	const (
 		nothingGrants = "grants that identity write access"
 		readPresent   = "the repository's own policy granted it write access"
-		unverified    = "which is unverified until"
+		propagating   = "Most likely IAM has not propagated that grant yet"
 		// A policy the plan could not read keeps both conditional blocks,
 		// the shared principal's removal included (A33-15).
 		ifNotYet      = "If repository 'farcast-atlas' does not grant it yet:"
@@ -97,7 +97,7 @@ func TestAPushDenialExplainsItselfWithTheCommandThatFixesIt(t *testing.T) {
 	}{
 		{plan.GrantMissing, plan.GrantMissing, []string{add, nothingGrants}, []string{remove, readPresent}},
 		{plan.GrantMissing, plan.GrantPresent, []string{add, remove, nothingGrants}, []string{readPresent}},
-		{plan.GrantPresent, plan.GrantMissing, []string{add, readPresent, unverified}, []string{remove, nothingGrants}},
+		{plan.GrantPresent, plan.GrantMissing, []string{add, readPresent, propagating}, []string{remove, nothingGrants, "unverified"}},
 		{plan.GrantPresent, plan.GrantPresent, []string{add, remove, readPresent}, []string{nothingGrants}},
 		{plan.GrantUnknown, plan.GrantUnknown, []string{add, remove, ifNotYet, ifStillShared}, []string{readPresent}},
 	} {
