@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 )
@@ -87,7 +88,9 @@ func sortedSet(xs []string) []string {
 	return slices.Compact(out)
 }
 
-// snapshot reads every file under root, by its slash path relative to root.
+// snapshot reads every file under root, by its slash path relative to root. A
+// symlink is not followed: it is recorded as a NUL byte, which begins no file
+// the store writes, and its target's text, so a dangling one is recorded too.
 func snapshot(t *testing.T, root string) map[string][]byte {
 	t.Helper()
 	files := map[string][]byte{}
@@ -98,11 +101,19 @@ func snapshot(t *testing.T, root string) map[string][]byte {
 		if d.IsDir() {
 			return nil
 		}
-		data, err := os.ReadFile(p)
+		rel, err := filepath.Rel(root, p)
 		if err != nil {
 			return err
 		}
-		rel, err := filepath.Rel(root, p)
+		if d.Type()&fs.ModeSymlink != 0 {
+			target, err := os.Readlink(p)
+			if err != nil {
+				return err
+			}
+			files[filepath.ToSlash(rel)] = []byte("\x00symlink:" + target)
+			return nil
+		}
+		data, err := os.ReadFile(p)
 		if err != nil {
 			return err
 		}
@@ -734,6 +745,286 @@ func TestStoreRefusesAMismatchedPair(t *testing.T) {
 					t.Errorf("the error %q names the role ID", msg)
 				}
 			})
+		}
+	}
+}
+
+// restage replaces role.next/'s anchor.crt, anchor.key, leaf.crt and leaf.key
+// with a new anchor for id and a leaf under it, each consistent with the
+// other: a staged renewal that carries id.
+func restage(t *testing.T, dir, role string, id RoleID) {
+	t.Helper()
+	der, key, err := newAnchor(rand.Reader, id, t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	anchor, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafDER, leafKey, err := issueLeaf(rand.Reader, anchor, opaque{k: key}, t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staged := filepath.Join(dir, role+".next")
+	writeCertFile(t, filepath.Join(staged, "anchor.crt"), der)
+	writeKeyFile(t, filepath.Join(staged, "anchor.key"), key)
+	writeCertFile(t, filepath.Join(staged, "leaf.crt"), leafDER)
+	writeKeyFile(t, filepath.Join(staged, "leaf.key"), leafKey)
+}
+
+// TestCurrentCertificatesGivesTheAnchorNotAfter: CurrentCertificates gives
+// what Certificates gives, and the anchor's NotAfter, which is NotBefore plus
+// 390 days; a renewal's commit moves it.
+func TestCurrentCertificatesGivesTheAnchorNotAfter(t *testing.T) {
+	s, dir, ids := enrolBoth(t)
+	for i, r := range []Role{Reader, Writer} {
+		c, err := s.CurrentCertificates(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		anchorDER, leafDER, id, err := s.Certificates(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c.Role() != r || !c.ID().Equal(id) || !c.ID().Equal(ids[i].ID()) ||
+			!bytes.Equal(c.AnchorDER(), anchorDER) || !bytes.Equal(c.LeafDER(), leafDER) {
+			t.Errorf("CurrentCertificates(%s) is not what Certificates reads", r)
+		}
+		if want := NotBefore(t0).Add(AnchorLifetime); !c.AnchorNotAfter().Equal(want) {
+			t.Errorf("CurrentCertificates(%s).AnchorNotAfter() = %v, want %v", r, c.AnchorNotAfter(), want)
+		}
+		if want := readCert(t, filepath.Join(dir, r.String(), "anchor.crt")).NotAfter; !c.AnchorNotAfter().Equal(want) {
+			t.Errorf("CurrentCertificates(%s).AnchorNotAfter() is not the anchor's", r)
+		}
+		// The copies are the caller's.
+		a := c.AnchorDER()
+		a[0] ^= 0xff
+		if !bytes.Equal(c.AnchorDER(), anchorDER) {
+			t.Error("AnchorDER hands out the Certs' own bytes")
+		}
+		l := c.LeafDER()
+		l[0] ^= 0xff
+		if !bytes.Equal(c.LeafDER(), leafDER) {
+			t.Error("LeafDER hands out the Certs' own bytes")
+		}
+	}
+	later := t0.Add(100 * 24 * time.Hour)
+	if _, err := s.RenewAnchor(Writer, rand.Reader, later); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CommitAnchor(Writer); err != nil {
+		t.Fatal(err)
+	}
+	c, err := s.CurrentCertificates(Writer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := NotBefore(later).Add(AnchorLifetime); !c.AnchorNotAfter().Equal(want) {
+		t.Errorf("after a renewal's commit AnchorNotAfter() = %v, want %v", c.AnchorNotAfter(), want)
+	}
+	var zero Certs
+	if zero.Role() != 0 || !zero.ID().IsZero() || zero.AnchorDER() != nil || zero.LeafDER() != nil || !zero.AnchorNotAfter().IsZero() {
+		t.Error("the zero Certs carries something")
+	}
+	for _, r := range []Role{0, 3, -1} {
+		if _, err := s.CurrentCertificates(r); !isNoSuchRole(err) {
+			t.Errorf("CurrentCertificates(%v): err = %v, want the role refused as no role", r, err)
+		}
+	}
+	// An absent role is ErrNoRole, for both readings.
+	if err := s.RemoveRole(Writer); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CurrentCertificates(Writer); !errors.Is(err, ErrNoRole) {
+		t.Errorf("CurrentCertificates(Writer) on a reader-only device: err = %v, want ErrNoRole", err)
+	}
+	if _, _, _, err := s.Certificates(Writer); !errors.Is(err, ErrNoRole) {
+		t.Errorf("Certificates(Writer) on a reader-only device: err = %v, want ErrNoRole", err)
+	}
+}
+
+// TestStagedCertificates: nothing staged is not present and no error; a
+// staged renewal is read without opening any key, and is what RenewAnchor
+// staged, with the current role ID; it is gone after the commit; an
+// interrupted commit, an absent role, a staged anchor of another ID and a
+// staged leaf of another anchor are refused.
+func TestStagedCertificates(t *testing.T) {
+	s, dir, ids := enrolBoth(t)
+	for _, r := range []Role{Reader, Writer} {
+		c, present, err := s.StagedCertificates(r)
+		if err != nil || present || c.Role() != 0 {
+			t.Errorf("StagedCertificates(%s) with nothing staged = %v, %v, %v; want not present", r, c, present, err)
+		}
+	}
+	later := t0.Add(10 * 24 * time.Hour)
+	staged, err := s.RenewAnchor(Writer, rand.Reader, later)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Every key file, current and staged, at 0000: a read of one would fail.
+	// The superuser reads them anyway, so there only the watch below holds.
+	var keys []string
+	if os.Geteuid() != 0 {
+		for _, d := range []string{"reader", "writer", "writer.next"} {
+			for _, f := range []string{"anchor.key", "leaf.key"} {
+				keys = append(keys, filepath.Join(dir, d, f))
+			}
+		}
+	}
+	for _, k := range keys {
+		if err := os.Chmod(k, 0o000); err != nil {
+			t.Fatal(err)
+		}
+	}
+	unlock := func() {
+		for _, k := range keys {
+			_ = os.Chmod(k, 0o600)
+		}
+	}
+	t.Cleanup(unlock)
+	reads := recordReads(s)
+	var looked []string
+	s.hooks.afterLstat = func(rel string) { looked = append(looked, rel) }
+	c, present, err := s.StagedCertificates(Writer)
+	if err != nil || !present {
+		t.Fatalf("StagedCertificates(Writer) with a renewal staged = %v, %v", present, err)
+	}
+	if got, want := sortedSet(*reads), sortedSet([]string{"writer.next/anchor.crt", "writer.next/leaf.crt", "writer/anchor.crt"}); !slices.Equal(got, want) {
+		t.Errorf("read %v, want exactly %v", got, want)
+	}
+	if len(looked) == 0 {
+		t.Fatal("the afterLstat hook saw no read; the watch proves nothing")
+	}
+	for _, rel := range looked {
+		if filepath.Ext(rel) == ".key" {
+			t.Errorf("StagedCertificates looked at %s", rel)
+		}
+	}
+	unlock()
+	s.hooks.afterLstat = nil
+	if c.Role() != Writer || !c.ID().Equal(ids[1].ID()) || !c.ID().Equal(staged.ID()) {
+		t.Error("the staged certificates carry another role or ID")
+	}
+	if !bytes.Equal(c.AnchorDER(), staged.AnchorDER()) || !bytes.Equal(c.LeafDER(), staged.LeafDER()) {
+		t.Error("StagedCertificates is not what RenewAnchor staged")
+	}
+	if want := NotBefore(later).Add(AnchorLifetime); !c.AnchorNotAfter().Equal(want) {
+		t.Errorf("the staged AnchorNotAfter() = %v, want %v", c.AnchorNotAfter(), want)
+	}
+	if _, present, err := s.StagedCertificates(Reader); err != nil || present {
+		t.Errorf("StagedCertificates(Reader) beside a staged writer = %v, %v", present, err)
+	}
+
+	// After the commit nothing is staged, and the current certificates are
+	// the staged ones.
+	if err := s.CommitAnchor(Writer); err != nil {
+		t.Fatal(err)
+	}
+	if _, present, err := s.StagedCertificates(Writer); err != nil || present {
+		t.Errorf("StagedCertificates(Writer) after the commit = %v, %v", present, err)
+	}
+	cur, err := s.CurrentCertificates(Writer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(cur.AnchorDER(), c.AnchorDER()) || !cur.AnchorNotAfter().Equal(c.AnchorNotAfter()) {
+		t.Error("the committed certificates are not the staged ones")
+	}
+
+	// An interrupted commit.
+	if _, err := s.RenewAnchor(Writer, rand.Reader, later); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(dir, "writer"), filepath.Join(dir, "writer.old")); err != nil {
+		t.Fatal(err)
+	}
+	if _, present, err := s.StagedCertificates(Writer); !errors.Is(err, ErrRenewalInterrupted) || present {
+		t.Errorf("StagedCertificates during an interrupted commit = %v, %v; want ErrRenewalInterrupted", present, err)
+	}
+	if err := s.CommitAnchor(Writer); err != nil {
+		t.Fatal(err)
+	}
+
+	// A commit whose two renames are done and whose writer.old/ is left: the
+	// resume point CommitAnchor finishes. It is not "nothing staged".
+	committed, err := s.RenewAnchor(Writer, rand.Reader, later.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(dir, "writer"), filepath.Join(dir, "writer.old")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(dir, "writer.next"), filepath.Join(dir, "writer")); err != nil {
+		t.Fatal(err)
+	}
+	reads = recordReads(s)
+	if _, present, err := s.StagedCertificates(Writer); !errors.Is(err, ErrRenewalInterrupted) || present {
+		t.Errorf("StagedCertificates with writer.old/ left = %v, %v; want ErrRenewalInterrupted", present, err)
+	}
+	if len(*reads) != 0 {
+		t.Errorf("StagedCertificates with writer.old/ left read %v", *reads)
+	}
+	s.hooks = storeHooks{}
+	if err := s.CommitAnchor(Writer); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(dir, "writer.old")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("writer.old/ is still there after the commit finished: %v", err)
+	}
+	if _, present, err := s.StagedCertificates(Writer); err != nil || present {
+		t.Errorf("StagedCertificates once the commit finished = %v, %v; want nothing staged", present, err)
+	}
+	if cur, err := s.CurrentCertificates(Writer); err != nil || !bytes.Equal(cur.AnchorDER(), committed.AnchorDER()) {
+		t.Errorf("the finished commit's anchor is not the staged one: %v", err)
+	}
+
+	// A staged anchor that carries another role ID: the reader's.
+	if _, err := s.RenewAnchor(Writer, rand.Reader, later); err != nil {
+		t.Fatal(err)
+	}
+	restage(t, dir, "writer", ids[0].ID())
+	_, present, err = s.StagedCertificates(Writer)
+	switch {
+	case !errors.Is(err, ErrInconsistent) || present:
+		t.Errorf("StagedCertificates with a staged anchor of another ID = %v, %v; want ErrInconsistent", present, err)
+	case !strings.Contains(err.Error(), "writer.next/anchor.crt"):
+		t.Errorf("the error %q does not name the staged anchor", err)
+	case containsID(err.Error(), ids[0].ID()) || containsID(err.Error(), ids[1].ID()):
+		t.Errorf("the error %q names a role ID", err)
+	}
+	// A staged leaf, under the staged anchor, that carries another role ID.
+	restage(t, dir, "writer", ids[1].ID())
+	stagedAnchor := readCert(t, filepath.Join(dir, "writer.next", "anchor.crt"))
+	stagedKey := readKey(t, filepath.Join(dir, "writer.next", "anchor.key"))
+	leafKey := mustKey(t)
+	der, err := x509.CreateCertificate(rand.Reader, LeafTemplate(ids[0].ID(), bigOne(), NotBefore(t0), stagedAnchor), stagedAnchor, &leafKey.PublicKey, stagedKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeCertFile(t, filepath.Join(dir, "writer.next", "leaf.crt"), der)
+	_, present, err = s.StagedCertificates(Writer)
+	switch {
+	case !errors.Is(err, ErrInconsistent) || present:
+		t.Errorf("StagedCertificates with a staged leaf of another ID = %v, %v; want ErrInconsistent", present, err)
+	case !strings.Contains(err.Error(), "writer.next/leaf.crt"):
+		t.Errorf("the error %q does not name the staged leaf", err)
+	}
+	if err := s.DiscardStaged(Writer); err != nil {
+		t.Fatal(err)
+	}
+
+	// No role, and no such role.
+	if err := s.RemoveRole(Writer); err != nil {
+		t.Fatal(err)
+	}
+	if _, present, err := s.StagedCertificates(Writer); !errors.Is(err, ErrNoRole) || present {
+		t.Errorf("StagedCertificates(Writer) on a reader-only device = %v, %v; want ErrNoRole", present, err)
+	}
+	for _, r := range []Role{0, 3, -1} {
+		if _, present, err := s.StagedCertificates(r); !isNoSuchRole(err) || present {
+			t.Errorf("StagedCertificates(%v) = %v, %v; want the role refused as no role", r, present, err)
 		}
 	}
 }

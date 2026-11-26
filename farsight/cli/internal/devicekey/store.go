@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path"
 	"path/filepath"
@@ -31,6 +32,8 @@ var (
 	ErrRenewalStaged      = errors.New("devicekey: an anchor renewal is already staged for this role; commit it or discard it")
 	ErrNothingStaged      = errors.New("devicekey: no anchor renewal is staged for this role")
 	ErrRenewalInterrupted = errors.New("devicekey: an anchor renewal's commit was interrupted; commit it again")
+	ErrWriterRemains      = errors.New("devicekey: the reader role is removed only after the writer role; a device holds a writer only beside a reader")
+	ErrNotEnrolling       = errors.New("devicekey: the role's enrolment is closed (verified, or not begun on this device); its keys open only for a read or after a command's consent")
 )
 
 // The store's names. They are unexported: no product code outside devicekey
@@ -40,6 +43,7 @@ const (
 	anchorCertName = "anchor.crt"
 	leafKeyName    = "leaf.key"
 	leafCertName   = "leaf.crt"
+	enrollingName  = "enrolling"
 	readerDirName  = "reader"
 	writerDirName  = "writer"
 	stagedSuffix   = ".next"
@@ -74,6 +78,13 @@ func stagedDirName(r Role) string { return roleDirName(r) + stagedSuffix }
 // oldDirName is r's directory during a commit.
 func oldDirName(r Role) string { return roleDirName(r) + oldSuffix }
 
+// enrollingRel is r's enrolment marker, as the store's relative path.
+func enrollingRel(r Role) string { return roleDirName(r) + "/" + enrollingName }
+
+// enrollingText is what the marker holds. Nothing reads it: the marker is
+// there or not.
+const enrollingText = "this role's enrolment is not verified yet\n"
+
 // errNoSuchRole refuses a Role that is neither Reader nor Writer.
 func errNoSuchRole(r Role) error { return fmt.Errorf("devicekey: %s is not a role", r) }
 
@@ -87,10 +98,16 @@ func errNoSuchRole(r Role) error { return fmt.Errorf("devicekey: %s is not a rol
 //	    anchor.crt      0600  PEM, "CERTIFICATE"
 //	    leaf.key        0600
 //	    leaf.crt        0600
+//	    enrolling       0600  only while the role's enrolment window is open
 //	  writer/           0700  (writer-capable devices only)
-//	    … the same four
+//	    … the same
 //	  <role>.next/      0700  a staged anchor renewal, the same four files
 //	  <role>.old/       0700  only for the moment of a commit
+//
+// The enrolling marker is written with the role's directory by Enrol and
+// AddRole, and removed by EnrolmentVerified; a staged renewal never holds
+// one. While it is there OpenForEnrolment opens the role with no consent.
+// Nothing reads it: it is stat-ed only.
 //
 // The file names and the role directory names are unexported. No product
 // code outside devicekey builds a path to a key.
@@ -174,30 +191,190 @@ func (s *Store) Roles() ([]Role, error) {
 // only, never a .key file, and checks them against each other: the anchor
 // parses, is a CA and has a role ID as its CN; the leaf parses, has the
 // anchor's CN, and names the anchor's subject DN as its issuer, byte for
-// byte. A failure is ErrInconsistent.
+// byte. A failure is ErrInconsistent. CurrentCertificates reads the same, and
+// also gives the anchor's NotAfter.
 func (s *Store) Certificates(r Role) (anchorDER, leafDER []byte, id RoleID, err error) {
+	c, err := s.CurrentCertificates(r)
+	if err != nil {
+		return nil, nil, RoleID{}, err
+	}
+	return c.AnchorDER(), c.LeafDER(), c.ID(), nil
+}
+
+// CurrentCertificates is Certificates' reading as a Certs, which also gives
+// the anchor's NotAfter: what M3b's record keeps as the role's
+// AnchorNotAfter, for AnchorWarnsAt and AnchorExpiredAt, which hold the
+// boundaries AnchorWarns and the openers hold. It opens <role>/anchor.crt and
+// <role>/leaf.crt only, never a .key file, with Certificates' checks. An
+// absent role is ErrNoRole, and an interrupted commit ErrRenewalInterrupted.
+func (s *Store) CurrentCertificates(r Role) (Certs, error) {
 	if !r.valid() {
-		return nil, nil, RoleID{}, errNoSuchRole(r)
+		return Certs{}, errNoSuchRole(r)
 	}
 	root, err := s.openRoot()
 	if err != nil {
-		return nil, nil, RoleID{}, err
+		return Certs{}, err
 	}
 	defer func() { _ = root.Close() }()
 	if err := s.requireRole(root, r); err != nil {
-		return nil, nil, RoleID{}, err
+		return Certs{}, err
 	}
-	dir := roleDirName(r)
+	return s.readCerts(r, roleDirName(r))
+}
+
+// StagedCertificates reads a staged anchor renewal's two certificates, so
+// `device renew` resumes from what RenewAnchor staged: it shows the staged
+// anchor's block again, and records its NotAfter after CommitAnchor. present
+// is false, with no error, when the role holds no staged renewal.
+//
+// It opens <role>.next/anchor.crt and <role>.next/leaf.crt, with
+// Certificates' checks, and <role>/anchor.crt, whose role ID the staged
+// anchor must carry (a renewal keeps the role ID, D4); one that carries
+// another is ErrInconsistent. It never opens a .key file, staged or current.
+// An absent role is ErrNoRole.
+//
+// An interrupted commit is ErrRenewalInterrupted, at either of the points
+// CommitAnchor resumes from: the role's directory renamed away and the staged
+// one not yet in its place, or both renames done and <role>.old/ not yet
+// removed. In both, CommitAnchor finishes the commit, and CurrentCertificates
+// then gives the committed anchor's NotAfter for the record. So present is
+// false with no error only when nothing is staged and nothing is left to
+// commit.
+func (s *Store) StagedCertificates(r Role) (c Certs, present bool, err error) {
+	if !r.valid() {
+		return Certs{}, false, errNoSuchRole(r)
+	}
+	root, err := s.openRoot()
+	if err != nil {
+		return Certs{}, false, err
+	}
+	defer func() { _ = root.Close() }()
+	st, err := s.roleState(root, r)
+	if err != nil {
+		return Certs{}, false, err
+	}
+	switch {
+	case st.interrupted(), st.cur && st.old && !st.next:
+		return Certs{}, false, fmt.Errorf("devicekey: the %s role: %w", r, ErrRenewalInterrupted)
+	case !st.cur:
+		return Certs{}, false, fmt.Errorf("devicekey: the %s role: %w", r, ErrNoRole)
+	case !st.next:
+		return Certs{}, false, nil
+	}
+	staged, err := s.readCerts(r, stagedDirName(r))
+	if err != nil {
+		return Certs{}, false, err
+	}
+	_, id, err := s.readAnchorCert(roleDirName(r))
+	if err != nil {
+		return Certs{}, false, err
+	}
+	if !id.Equal(staged.ID()) {
+		return Certs{}, false, inconsistent(stagedDirName(r) + "/" + anchorCertName)
+	}
+	return staged, true, nil
+}
+
+// readCerts reads dir's anchor.crt and leaf.crt for role r, with
+// Certificates' checks. It opens no .key file.
+func (s *Store) readCerts(r Role, dir string) (Certs, error) {
 	anchor, id, err := s.readAnchorCert(dir)
 	if err != nil {
-		return nil, nil, RoleID{}, err
+		return Certs{}, err
 	}
 	leaf, err := s.readLeafCert(dir, anchor)
 	if err != nil {
-		return nil, nil, RoleID{}, err
+		return Certs{}, err
 	}
-	return bytes.Clone(anchor.Raw), bytes.Clone(leaf.Raw), id, nil
+	v := &certs{role: r, id: id, anchor: bytes.Clone(anchor.Raw), leaf: bytes.Clone(leaf.Raw), anchorNotAfter: anchor.NotAfter}
+	return Certs{p: &v}, nil
 }
+
+// Certs is one role's two certificates, current or staged, read without
+// opening a key. Both are public material: the human pastes the anchor, and
+// Google sees the leaf at every exchange. Their CN is the role ID, which the
+// package never prints, so Certs formats as Identity does: its fields sit two
+// pointers deep, for RoleID's reason, and every formatting gives "<role>
+// certificates (not printed)" or an address. It is returned by value: it is a
+// handle around a pointer.
+type Certs struct{ p **certs }
+
+type certs struct {
+	role           Role
+	id             RoleID
+	anchor         []byte // DER
+	leaf           []byte // DER
+	anchorNotAfter time.Time
+}
+
+// get is the fields; nil for the zero Certs.
+func (c Certs) get() *certs {
+	if c.p == nil {
+		return nil
+	}
+	return *c.p
+}
+
+// Role is the certificates' role; 0 for the zero Certs.
+func (c Certs) Role() Role {
+	if v := c.get(); v != nil {
+		return v.role
+	}
+	return 0
+}
+
+// ID is the role ID, the anchor's CN; the zero RoleID for the zero Certs.
+func (c Certs) ID() RoleID {
+	if v := c.get(); v != nil {
+		return v.id
+	}
+	return RoleID{}
+}
+
+// AnchorDER is a copy of the anchor certificate's DER.
+func (c Certs) AnchorDER() []byte {
+	if v := c.get(); v != nil {
+		return bytes.Clone(v.anchor)
+	}
+	return nil
+}
+
+// LeafDER is a copy of the leaf certificate's DER.
+func (c Certs) LeafDER() []byte {
+	if v := c.get(); v != nil {
+		return bytes.Clone(v.leaf)
+	}
+	return nil
+}
+
+// AnchorNotAfter is the anchor's NotAfter; the zero time for the zero Certs.
+func (c Certs) AnchorNotAfter() time.Time {
+	if v := c.get(); v != nil {
+		return v.anchorNotAfter
+	}
+	return time.Time{}
+}
+
+// text is the fixed text every formatting of a Certs gives: its role, and
+// nothing else.
+func (c Certs) text() string {
+	if v := c.get(); v != nil {
+		return v.role.String() + " certificates (not printed)"
+	}
+	return "certificates (not printed)"
+}
+
+// String is "<role> certificates (not printed)".
+func (c Certs) String() string { return c.text() }
+
+// GoString is "<role> certificates (not printed)".
+func (c Certs) GoString() string { return c.text() }
+
+// Format writes "<role> certificates (not printed)" for every verb.
+func (c Certs) Format(f fmt.State, verb rune) { _, _ = io.WriteString(f, c.text()) }
+
+// LogValue is slog.StringValue of "<role> certificates (not printed)".
+func (c Certs) LogValue() slog.Value { return slog.StringValue(c.text()) }
 
 // Erase removes every role's files and directories, staged ones included, and
 // then dir. A directory that does not exist is already erased. It refuses
@@ -521,10 +698,10 @@ func (k *keySet) identity(r Role, id RoleID) Identity {
 	return newIdentity(r, id, k.leafDER, k.anchorDER, k.leafKey, k.notAfter)
 }
 
-// writeRoleDir writes set's four files into a new temporary directory, and
-// then renames it to name, so a role or a staged renewal appears whole or not
-// at all.
-func (s *Store) writeRoleDir(root *os.Root, name string, set *keySet) error {
+// writeRoleDir writes set's four files into a new temporary directory, with
+// the enrolling marker when enrolling, and then renames it to name, so a role
+// or a staged renewal appears whole or not at all.
+func (s *Store) writeRoleDir(root *os.Root, name string, set *keySet, enrolling bool) error {
 	anchorKeyPEM, err := encodeKey(set.anchorKey)
 	if err != nil {
 		return err
@@ -543,15 +720,20 @@ func (s *Store) writeRoleDir(root *os.Root, name string, set *keySet) error {
 			_ = root.RemoveAll(tmp)
 		}
 	}()
-	for _, f := range []struct {
+	type file struct {
 		name string
 		data []byte
-	}{
+	}
+	files := []file{
 		{anchorKeyName, anchorKeyPEM},
 		{anchorCertName, encodeCert(set.anchorDER)},
 		{leafKeyName, leafKeyPEM},
 		{leafCertName, encodeCert(set.leafDER)},
-	} {
+	}
+	if enrolling {
+		files = append(files, file{enrollingName, []byte(enrollingText)})
+	}
+	for _, f := range files {
 		if err := s.writeFile(root, path.Join(tmp, f.name), f.data); err != nil {
 			return err
 		}

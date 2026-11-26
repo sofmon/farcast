@@ -104,6 +104,17 @@ func TestCustodyTable(t *testing.T) {
 			return nil, ErrNothingStaged
 		}
 	}
+	// stagedCerts is StagedCertificates' row: the staged certificates and the
+	// current anchor's, whose ID they must carry, only when one is staged;
+	// nothing, and no error, otherwise.
+	stagedCerts := func(role string) func(string) ([]string, error) {
+		return func(state string) ([]string, error) {
+			if state == "staged" {
+				return append(under(role+".next", "anchor.crt", "leaf.crt"), role+"/anchor.crt"), nil
+			}
+			return nil, nil
+		}
+	}
 	rows := []struct {
 		name string
 		prep func(s *Store) error // before reads are recorded
@@ -119,6 +130,44 @@ func TestCustodyTable(t *testing.T) {
 		{name: "OpenForWrite (no consent)",
 			run:  func(s *Store, now time.Time) error { _, err := s.OpenForWrite(Consent{}, rand.Reader, now); return err },
 			want: always(nil, ErrNoConsent)},
+		{name: "OpenForWrite (--yes)",
+			run: func(s *Store, now time.Time) error {
+				_, err := s.OpenForWrite(GiveConsent(ConsentYes), rand.Reader, now)
+				return err
+			},
+			want: opening("writer")},
+		{name: "OpenForEnrolment(Reader)",
+			run: func(s *Store, now time.Time) error {
+				_, err := s.OpenForEnrolment(Reader, rand.Reader, now)
+				return err
+			},
+			want: opening("reader")},
+		{name: "OpenForEnrolment(Writer)",
+			run: func(s *Store, now time.Time) error {
+				_, err := s.OpenForEnrolment(Writer, rand.Reader, now)
+				return err
+			},
+			want: opening("writer")},
+		{name: "OpenForEnrolment(Writer) once verified",
+			prep: func(s *Store) error { return s.EnrolmentVerified(Writer) },
+			run: func(s *Store, now time.Time) error {
+				_, err := s.OpenForEnrolment(Writer, rand.Reader, now)
+				return err
+			},
+			want: always(nil, ErrNotEnrolling)},
+		{name: "OpenForEnrolment(Reader) once verified",
+			prep: func(s *Store) error { return s.EnrolmentVerified(Reader) },
+			run: func(s *Store, now time.Time) error {
+				_, err := s.OpenForEnrolment(Reader, rand.Reader, now)
+				return err
+			},
+			want: always(nil, ErrNotEnrolling)},
+		{name: "EnrolmentVerified(Writer)",
+			run:  func(s *Store, now time.Time) error { return s.EnrolmentVerified(Writer) },
+			want: always(nil, nil)},
+		{name: "EnrolmentVerified(Reader)",
+			run:  func(s *Store, now time.Time) error { return s.EnrolmentVerified(Reader) },
+			want: always(nil, nil)},
 		{name: "RenewReaderLeaf",
 			run:  func(s *Store, now time.Time) error { _, err := s.RenewReaderLeaf(rand.Reader, now); return err },
 			want: always(under("reader", "anchor.crt", "anchor.key"), nil)},
@@ -161,9 +210,24 @@ func TestCustodyTable(t *testing.T) {
 		{name: "Certificates(Writer)",
 			run:  func(s *Store, now time.Time) error { _, _, _, err := s.Certificates(Writer); return err },
 			want: always(under("writer", "anchor.crt", "leaf.crt"), nil)},
+		{name: "CurrentCertificates(Reader)",
+			run:  func(s *Store, now time.Time) error { _, err := s.CurrentCertificates(Reader); return err },
+			want: always(under("reader", "anchor.crt", "leaf.crt"), nil)},
+		{name: "CurrentCertificates(Writer)",
+			run:  func(s *Store, now time.Time) error { _, err := s.CurrentCertificates(Writer); return err },
+			want: always(under("writer", "anchor.crt", "leaf.crt"), nil)},
+		{name: "StagedCertificates(Reader)",
+			run:  func(s *Store, now time.Time) error { _, _, err := s.StagedCertificates(Reader); return err },
+			want: stagedCerts("reader")},
+		{name: "StagedCertificates(Writer)",
+			run:  func(s *Store, now time.Time) error { _, _, err := s.StagedCertificates(Writer); return err },
+			want: stagedCerts("writer")},
 		{name: "RemoveRole(Writer)",
 			run:  func(s *Store, now time.Time) error { return s.RemoveRole(Writer) },
 			want: always(nil, nil)},
+		{name: "RemoveRole(Reader) beside the writer",
+			run:  func(s *Store, now time.Time) error { return s.RemoveRole(Reader) },
+			want: always(nil, ErrWriterRemains)},
 		{name: "AddRole(Writer)",
 			prep: func(s *Store) error { return s.RemoveRole(Writer) },
 			run:  func(s *Store, now time.Time) error { _, err := s.AddRole(Writer, rand.Reader, now); return err },
@@ -218,57 +282,100 @@ func TestCustodyTable(t *testing.T) {
 }
 
 // TestReadNeverOpensAWriterKeyEvenWhenUnreadable: with the writer's files and
-// writer.next/ at 0000, OpenForRead succeeds, fresh and due, as it would not
-// if it opened any of them.
+// writer.next/ at 0000, and then with writer/ itself at 0000 too, OpenForRead
+// succeeds, fresh and due, as it would not if it opened any of them.
 func TestReadNeverOpensAWriterKeyEvenWhenUnreadable(t *testing.T) {
-	skipIfRoot(t)
-	s, dir, _ := enrolBoth(t)
-	if _, err := s.RenewAnchor(Writer, rand.Reader, fresh); err != nil {
-		t.Fatal(err)
-	}
-	var locked []string
-	for _, f := range []string{"anchor.key", "anchor.crt", "leaf.key", "leaf.crt"} {
-		locked = append(locked, filepath.Join(dir, "writer", f), filepath.Join(dir, "writer.next", f))
-	}
-	locked = append(locked, filepath.Join(dir, "writer.next"))
-	for _, p := range locked {
-		if err := os.Chmod(p, 0o000); err != nil {
-			t.Fatal(err)
-		}
-	}
-	t.Cleanup(func() {
-		for i := len(locked) - 1; i >= 0; i-- {
-			mode := os.FileMode(0o600)
-			if filepath.Base(locked[i]) == "writer.next" {
-				mode = 0o700
-			}
-			_ = os.Chmod(locked[i], mode)
-		}
+	readerOpensWithTheWriterLocked(t, func(s *Store, now time.Time) (Identity, error) {
+		return s.OpenForRead(rand.Reader, now)
 	})
-	if _, err := os.ReadFile(filepath.Join(dir, "writer", "leaf.key")); err == nil {
-		t.Skip("a mode-0000 file is readable here; the test would prove nothing")
-	}
-	// A read whose failure is swallowed would pass the check below unseen, so
-	// every name the store's reader looks at is watched too: its Lstat comes
-	// before the open that would fail.
-	var looked []string
-	s.hooks.afterLstat = func(rel string) { looked = append(looked, rel) }
-	for _, now := range []time.Time{fresh, due} {
-		id, err := s.OpenForRead(rand.Reader, now)
-		if err != nil {
-			t.Fatalf("OpenForRead at %v with the writer's files unreadable: %v", now, err)
+}
+
+// TestEnrolmentReaderNeverOpensAWriterKeyEvenWhenUnreadable: the same for
+// OpenForEnrolment(Reader), a resumed enrolment's reader, which takes no
+// consent: with the writer's files and writer.next/ at 0000, and then with
+// writer/ itself at 0000 too, it succeeds, fresh and due, and looks at
+// nothing under them, the writer's enrolment marker included.
+func TestEnrolmentReaderNeverOpensAWriterKeyEvenWhenUnreadable(t *testing.T) {
+	readerOpensWithTheWriterLocked(t, func(s *Store, now time.Time) (Identity, error) {
+		return s.OpenForEnrolment(Reader, rand.Reader, now)
+	})
+}
+
+// readerOpensWithTheWriterLocked locks the writer's files and writer.next/ at
+// 0000, and checks that open gives the reader, fresh and due, and that the
+// store's reader looked at no name under writer/ or writer.next/. It does it
+// twice, on a new store each time: the second time writer/ itself is 0000
+// too, so a stat of any name under it fails, its enrolment marker included,
+// and an opening that looks at one, even only to stat it, fails.
+func readerOpensWithTheWriterLocked(t *testing.T, open func(s *Store, now time.Time) (Identity, error)) {
+	t.Helper()
+	skipIfRoot(t)
+	for _, lockDir := range []bool{false, true} {
+		name := "the writer's files"
+		if lockDir {
+			name = "writer/ itself"
 		}
-		if id.Role() != Reader {
-			t.Errorf("OpenForRead gave a %s identity", id.Role())
-		}
-	}
-	if len(looked) == 0 {
-		t.Fatal("the afterLstat hook saw no read; the watch proves nothing")
-	}
-	for _, rel := range looked {
-		if strings.HasPrefix(rel, "writer/") || strings.HasPrefix(rel, "writer.next/") {
-			t.Errorf("OpenForRead looked at %s", rel)
-		}
+		t.Run(name, func(t *testing.T) {
+			s, dir, _ := enrolBoth(t)
+			if _, err := s.RenewAnchor(Writer, rand.Reader, fresh); err != nil {
+				t.Fatal(err)
+			}
+			var locked []string
+			for _, f := range []string{"anchor.key", "anchor.crt", "leaf.key", "leaf.crt"} {
+				locked = append(locked, filepath.Join(dir, "writer", f), filepath.Join(dir, "writer.next", f))
+			}
+			locked = append(locked, filepath.Join(dir, "writer.next"))
+			if lockDir {
+				locked = append(locked, filepath.Join(dir, "writer"))
+			}
+			for _, p := range locked {
+				if err := os.Chmod(p, 0o000); err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Cleanup(func() {
+				for i := len(locked) - 1; i >= 0; i-- {
+					mode := os.FileMode(0o600)
+					if b := filepath.Base(locked[i]); b == "writer.next" || b == "writer" {
+						mode = 0o700
+					}
+					_ = os.Chmod(locked[i], mode)
+				}
+			})
+			if _, err := os.ReadFile(filepath.Join(dir, "writer", "leaf.key")); err == nil {
+				t.Skip("a mode-0000 file is readable here; the test would prove nothing")
+			}
+			if lockDir {
+				if _, err := os.Lstat(filepath.Join(dir, "writer", "enrolling")); err == nil {
+					t.Skip("a name under a mode-0000 directory can be stat-ed here; the test would prove nothing")
+				}
+			}
+			// A read whose failure is swallowed would pass the check below
+			// unseen, so every name the store's reader looks at is watched too:
+			// its Lstat comes before the open that would fail.
+			var looked []string
+			s.hooks.afterLstat = func(rel string) { looked = append(looked, rel) }
+			for _, now := range []time.Time{fresh, due} {
+				id, err := open(s, now)
+				if err != nil {
+					t.Fatalf("opening the reader at %v with %s unreadable: %v", now, name, err)
+				}
+				if id.Role() != Reader {
+					t.Errorf("opening the reader gave a %s identity", id.Role())
+				}
+			}
+			if len(looked) == 0 {
+				t.Fatal("the afterLstat hook saw no read; the watch proves nothing")
+			}
+			if !slices.Contains(looked, "reader/anchor.key") {
+				t.Errorf("the due opening did not renew under the reader's anchor: looked at %v", looked)
+			}
+			for _, rel := range looked {
+				if strings.HasPrefix(rel, "writer/") || strings.HasPrefix(rel, "writer.next/") {
+					t.Errorf("opening the reader looked at %s", rel)
+				}
+			}
+		})
 	}
 }
 
@@ -279,7 +386,7 @@ func TestOpenForWriteRefusesWithoutConsent(t *testing.T) {
 	reads := recordReads(s)
 	lstats := 0
 	s.hooks.afterLstat = func(string) { lstats++ }
-	for _, c := range []Consent{{}, GiveConsent(0), GiveConsent(3), GiveConsent(-1)} {
+	for _, c := range []Consent{{}, GiveConsent(0), GiveConsent(4), GiveConsent(-1)} {
 		if c.Given() {
 			t.Errorf("%+v is given", c)
 		}
@@ -293,7 +400,7 @@ func TestOpenForWriteRefusesWithoutConsent(t *testing.T) {
 	if len(*reads) != 0 || lstats != 0 {
 		t.Errorf("a refused call read %v (%d stats)", *reads, lstats)
 	}
-	for _, k := range []ConsentKind{ConsentConfirmed, ConsentAnswered} {
+	for _, k := range []ConsentKind{ConsentConfirmed, ConsentAnswered, ConsentYes} {
 		c := GiveConsent(k)
 		if !c.Given() {
 			t.Errorf("GiveConsent(%d) is not given", k)
@@ -301,6 +408,438 @@ func TestOpenForWriteRefusesWithoutConsent(t *testing.T) {
 		if id, err := s.OpenForWrite(c, rand.Reader, fresh); err != nil || id.Role() != Writer {
 			t.Errorf("OpenForWrite with consent %d: %v, %v", k, id, err)
 		}
+		if id, err := s.RenewWriterLeaf(c, rand.Reader, fresh); err != nil || id.Role() != Writer {
+			t.Errorf("RenewWriterLeaf with consent %d: %v, %v", k, id, err)
+		}
+	}
+
+	// A staged writer renewal opens under each kind of consent, and under
+	// none of the refused ones, which read nothing.
+	staged, err := s.RenewAnchor(Writer, rand.Reader, fresh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	*reads, lstats = nil, 0
+	for _, c := range []Consent{{}, GiveConsent(0), GiveConsent(4), GiveConsent(-1)} {
+		if _, err := s.OpenStaged(Writer, c); !errors.Is(err, ErrNoConsent) {
+			t.Errorf("OpenStaged(Writer) with %+v: err = %v, want ErrNoConsent", c, err)
+		}
+	}
+	if len(*reads) != 0 || lstats != 0 {
+		t.Errorf("a refused OpenStaged read %v (%d stats)", *reads, lstats)
+	}
+	for _, k := range []ConsentKind{ConsentConfirmed, ConsentAnswered, ConsentYes} {
+		id, err := s.OpenStaged(Writer, GiveConsent(k))
+		if err != nil || id.Role() != Writer || !bytes.Equal(id.LeafDER(), staged.LeafDER()) {
+			t.Errorf("OpenStaged(Writer) with consent %d: %v, %v", k, id, err)
+		}
+	}
+}
+
+// TestConsentKinds: GiveConsent gives back each of its three kinds, and the
+// zero Consent for anything else; Given is true for the three, and Confirmed
+// for --confirm alone, which is what M5's broker admits.
+func TestConsentKinds(t *testing.T) {
+	if ConsentConfirmed == ConsentAnswered || ConsentConfirmed == ConsentYes || ConsentAnswered == ConsentYes {
+		t.Fatal("two consent kinds share a value")
+	}
+	rows := []struct {
+		kind             ConsentKind
+		given, confirmed bool
+	}{
+		{ConsentConfirmed, true, true},
+		{ConsentAnswered, true, false},
+		{ConsentYes, true, false},
+		{0, false, false},
+		{4, false, false},
+		{-1, false, false},
+		{-3, false, false},
+	}
+	for _, row := range rows {
+		c := GiveConsent(row.kind)
+		if c.Given() != row.given || c.Confirmed() != row.confirmed {
+			t.Errorf("GiveConsent(%d): Given %v, Confirmed %v; want %v, %v", row.kind, c.Given(), c.Confirmed(), row.given, row.confirmed)
+		}
+		want := row.kind
+		if !row.given {
+			want = 0
+		}
+		if c.Kind() != want {
+			t.Errorf("GiveConsent(%d).Kind() = %d, want %d", row.kind, c.Kind(), want)
+		}
+		if !row.given && c != (Consent{}) {
+			t.Errorf("GiveConsent(%d) is not the zero Consent", row.kind)
+		}
+	}
+	var zero Consent
+	if zero.Given() || zero.Confirmed() || zero.Kind() != 0 {
+		t.Error("the zero Consent is a consent")
+	}
+	// Given and Confirmed name their kinds, not "any kind but 0": a Consent
+	// of another kind, which only this package could build, is neither.
+	for _, k := range []ConsentKind{4, 5, -1, -3, 100} {
+		if c := (Consent{kind: k}); c.Given() || c.Confirmed() {
+			t.Errorf("a Consent of kind %d: Given %v, Confirmed %v; want neither", k, c.Given(), c.Confirmed())
+		}
+	}
+	// The three kinds stay distinct as consents, not only as numbers.
+	yes, answered, confirmed := GiveConsent(ConsentYes), GiveConsent(ConsentAnswered), GiveConsent(ConsentConfirmed)
+	if yes == answered || yes == confirmed || answered == confirmed {
+		t.Error("two consent kinds give the same Consent")
+	}
+}
+
+// TestOpenForEnrolmentRenewsTheWriterUnderItsOwnAnchor: a resumed enrolment
+// opens the writer with no consent, renews a due writer leaf under the
+// writer's own anchor, writes it, and leaves the reader's files alone.
+func TestOpenForEnrolmentRenewsTheWriterUnderItsOwnAnchor(t *testing.T) {
+	s, dir, ids := enrolBoth(t)
+	readerBefore := snapshot(t, filepath.Join(dir, "reader"))
+	reads := recordReads(s)
+	id, err := s.OpenForEnrolment(Writer, rand.Reader, due)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id.Role() != Writer || !id.ID().Equal(ids[1].ID()) {
+		t.Fatalf("OpenForEnrolment(Writer) gave the %s identity, or another ID", id.Role())
+	}
+	if bytes.Equal(id.LeafDER(), ids[1].LeafDER()) {
+		t.Fatal("the due writer leaf was not renewed")
+	}
+	if got, want := sortedSet(*reads), sortedSet(under("writer", "anchor.crt", "anchor.key", "leaf.crt", "leaf.key")); !slices.Equal(got, want) {
+		t.Errorf("read %v, want exactly %v", got, want)
+	}
+	leaf, err := x509.ParseCertificate(id.LeafDER())
+	if err != nil {
+		t.Fatal(err)
+	}
+	writerAnchor := readCert(t, filepath.Join(dir, "writer", "anchor.crt"))
+	readerAnchor := readCert(t, filepath.Join(dir, "reader", "anchor.crt"))
+	if err := leaf.CheckSignatureFrom(writerAnchor); err != nil {
+		t.Errorf("the new writer leaf does not verify under the writer anchor: %v", err)
+	}
+	if err := leaf.CheckSignatureFrom(readerAnchor); err == nil {
+		t.Error("the new writer leaf verifies under the reader anchor")
+	}
+	if leaf.Subject.CommonName != ids[1].ID().Hex() {
+		t.Error("the new writer leaf's CN is not the writer's role ID")
+	}
+	if LeafDue(leaf, writerAnchor, due) {
+		t.Error("the renewed writer leaf is due at once")
+	}
+	if onDisk := readCert(t, filepath.Join(dir, "writer", "leaf.crt")); !bytes.Equal(onDisk.Raw, id.LeafDER()) {
+		t.Error("the renewed writer leaf was not written")
+	}
+	if !readKey(t, filepath.Join(dir, "writer", "leaf.key")).PublicKey.Equal(id.Signer().Public()) {
+		t.Error("the renewed writer leaf key on disk is not the identity's")
+	}
+	if !sameFiles(readerBefore, snapshot(t, filepath.Join(dir, "reader"))) {
+		t.Error("the reader's files changed")
+	}
+
+	// Not due: the same leaf again, and no anchor key opened.
+	*reads = nil
+	again, err := s.OpenForEnrolment(Writer, rand.Reader, due)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(again.LeafDER(), id.LeafDER()) {
+		t.Error("a fresh writer leaf was renewed")
+	}
+	if slices.Contains(*reads, "writer/anchor.key") {
+		t.Errorf("a fresh writer leaf opened the anchor key: read %v", *reads)
+	}
+}
+
+// TestOpenForEnrolmentRefuses: no role, no random source, and a role the
+// device does not hold are refused before anything is read.
+func TestOpenForEnrolmentRefuses(t *testing.T) {
+	s, _, _ := enrolBoth(t)
+	reads := recordReads(s)
+	lstats := 0
+	s.hooks.afterLstat = func(string) { lstats++ }
+	for _, r := range []Role{0, 3, -1} {
+		if _, err := s.OpenForEnrolment(r, rand.Reader, fresh); !isNoSuchRole(err) {
+			t.Errorf("OpenForEnrolment(%v): err = %v, want the role refused as no role", r, err)
+		}
+	}
+	for _, r := range []Role{Reader, Writer} {
+		if _, err := s.OpenForEnrolment(r, nil, fresh); err == nil {
+			t.Errorf("OpenForEnrolment(%s) with no random source succeeded", r)
+		}
+	}
+	if len(*reads) != 0 || lstats != 0 {
+		t.Errorf("a refused call read %v (%d stats)", *reads, lstats)
+	}
+	dir := filepath.Join(t.TempDir(), "identity")
+	ro, _, err := Enrol(rand.Reader, dir, []Role{Reader}, t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ro.OpenForEnrolment(Writer, rand.Reader, fresh); !errors.Is(err, ErrNoRole) {
+		t.Errorf("OpenForEnrolment(Writer) on a reader-only device: err = %v, want ErrNoRole", err)
+	}
+	if id, err := ro.OpenForEnrolment(Reader, rand.Reader, fresh); err != nil || id.Role() != Reader {
+		t.Errorf("OpenForEnrolment(Reader) on a reader-only device: %v, %v", id, err)
+	}
+}
+
+// TestTheEnrolmentWindow: Enrol and AddRole open a role's enrolment window, a
+// 0600 marker in the role's directory, and OpenForEnrolment opens the role
+// only while it is open. EnrolmentVerified closes it and reads nothing; from
+// then on OpenForEnrolment is ErrNotEnrolling and reads nothing, while
+// OpenForRead and a consented OpenForWrite still open. A staged renewal never
+// holds a marker, so its commit closes the window too.
+func TestTheEnrolmentWindow(t *testing.T) {
+	s, dir, _ := enrolBoth(t)
+	for _, role := range []string{"reader", "writer"} {
+		assertPerm(t, filepath.Join(dir, role, "enrolling"), 0o600)
+	}
+	for _, r := range []Role{Reader, Writer} {
+		if _, err := s.OpenForEnrolment(r, rand.Reader, fresh); err != nil {
+			t.Fatalf("OpenForEnrolment(%s) in its window: %v", r, err)
+		}
+	}
+
+	reads := recordReads(s)
+	lstats := 0
+	s.hooks.afterLstat = func(string) { lstats++ }
+	if err := s.EnrolmentVerified(Writer); err != nil {
+		t.Fatal(err)
+	}
+	if len(*reads) != 0 || lstats != 0 {
+		t.Errorf("EnrolmentVerified read %v (%d stats)", *reads, lstats)
+	}
+	if _, err := os.Lstat(filepath.Join(dir, "writer", "enrolling")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("the writer's marker is still there: %v", err)
+	}
+	for _, now := range []time.Time{fresh, due} {
+		if _, err := s.OpenForEnrolment(Writer, rand.Reader, now); !errors.Is(err, ErrNotEnrolling) {
+			t.Errorf("OpenForEnrolment(Writer) once verified, at %v: err = %v, want ErrNotEnrolling", now, err)
+		}
+	}
+	if len(*reads) != 0 || lstats != 0 {
+		t.Errorf("a refused OpenForEnrolment read %v (%d stats)", *reads, lstats)
+	}
+	if err := s.EnrolmentVerified(Writer); err != nil {
+		t.Errorf("EnrolmentVerified on a closed window: %v", err)
+	}
+	s.hooks = storeHooks{}
+
+	// The reader's window is its own, and the writer opens after a consent.
+	if id, err := s.OpenForEnrolment(Reader, rand.Reader, fresh); err != nil || id.Role() != Reader {
+		t.Errorf("OpenForEnrolment(Reader) beside a verified writer: %v, %v", id, err)
+	}
+	if _, err := s.OpenForWrite(GiveConsent(ConsentYes), rand.Reader, fresh); err != nil {
+		t.Errorf("OpenForWrite once the writer's enrolment is verified: %v", err)
+	}
+	if err := s.EnrolmentVerified(Reader); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.OpenForEnrolment(Reader, rand.Reader, fresh); !errors.Is(err, ErrNotEnrolling) {
+		t.Errorf("OpenForEnrolment(Reader) once verified: err = %v, want ErrNotEnrolling", err)
+	}
+	if _, err := s.OpenForRead(rand.Reader, fresh); err != nil {
+		t.Errorf("OpenForRead once the reader's enrolment is verified: %v", err)
+	}
+
+	// AddRole opens a window for the role it makes.
+	if err := s.RemoveRole(Writer); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AddRole(Writer, rand.Reader, fresh); err != nil {
+		t.Fatal(err)
+	}
+	assertPerm(t, filepath.Join(dir, "writer", "enrolling"), 0o600)
+	if _, err := s.OpenForEnrolment(Writer, rand.Reader, fresh); err != nil {
+		t.Errorf("OpenForEnrolment(Writer) after AddRole: %v", err)
+	}
+
+	// A staged renewal holds no marker, and its commit closes the window.
+	if _, err := s.RenewAnchor(Writer, rand.Reader, fresh); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(dir, "writer.next", "enrolling")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("a staged renewal holds a marker: %v", err)
+	}
+	if _, err := s.OpenForEnrolment(Writer, rand.Reader, fresh); err != nil {
+		t.Errorf("OpenForEnrolment(Writer) beside a staged renewal: %v", err)
+	}
+	if err := s.CommitAnchor(Writer); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.OpenForEnrolment(Writer, rand.Reader, fresh); !errors.Is(err, ErrNotEnrolling) {
+		t.Errorf("OpenForEnrolment(Writer) after a committed renewal: err = %v, want ErrNotEnrolling", err)
+	}
+
+	// No role, and no such role.
+	ro, _, err := Enrol(rand.Reader, filepath.Join(t.TempDir(), "identity"), []Role{Reader}, t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ro.EnrolmentVerified(Writer); !errors.Is(err, ErrNoRole) {
+		t.Errorf("EnrolmentVerified(Writer) on a reader-only device: err = %v, want ErrNoRole", err)
+	}
+	for _, r := range []Role{0, 3, -1} {
+		if err := s.EnrolmentVerified(r); !isNoSuchRole(err) {
+			t.Errorf("EnrolmentVerified(%v): err = %v, want the role refused as no role", r, err)
+		}
+	}
+}
+
+// isNoSuchRole reports whether err is the package's refusal of a Role that
+// is neither Reader nor Writer (errNoSuchRole), given before the store is
+// looked at: not ErrNoRole, nor an error from a path built from no role.
+func isNoSuchRole(err error) bool {
+	return err != nil && strings.HasSuffix(err.Error(), " is not a role") && !errors.Is(err, ErrNoRole)
+}
+
+// TestAnEnrolmentMarkerMustBeAPlainPrivateFile: a marker that is a symlink,
+// a dangling one included, a directory, or a file other accounts can read is
+// ErrUnsafeMode, and nothing is read.
+func TestAnEnrolmentMarkerMustBeAPlainPrivateFile(t *testing.T) {
+	replace := func(t *testing.T, p string, make func() error) {
+		t.Helper()
+		if err := os.Remove(p); err != nil {
+			t.Fatal(err)
+		}
+		if err := make(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for name, plant := range map[string]func(t *testing.T, p string){
+		"a symlink to the leaf": func(t *testing.T, p string) {
+			replace(t, p, func() error { return os.Symlink("leaf.crt", p) })
+		},
+		"a dangling symlink": func(t *testing.T, p string) {
+			replace(t, p, func() error { return os.Symlink("nowhere", p) })
+		},
+		"a directory": func(t *testing.T, p string) {
+			replace(t, p, func() error { return os.Mkdir(p, 0o700) })
+		},
+		"a 0644 file": func(t *testing.T, p string) {
+			if err := os.Chmod(p, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, dir, _ := enrolBoth(t)
+			plant(t, filepath.Join(dir, "writer", "enrolling"))
+			reads := recordReads(s)
+			if _, err := s.OpenForEnrolment(Writer, rand.Reader, fresh); !errors.Is(err, ErrUnsafeMode) {
+				t.Errorf("OpenForEnrolment(Writer): err = %v, want ErrUnsafeMode", err)
+			}
+			if len(*reads) != 0 {
+				t.Errorf("a refused OpenForEnrolment read %v", *reads)
+			}
+		})
+	}
+}
+
+// TestRemoveRoleKeepsTheReaderWhileAWriterRemains: RemoveRole(Reader) is
+// refused with ErrWriterRemains, and removes nothing, while any of the
+// writer's three names is there, whatever it is; once the writer is gone it
+// removes the reader.
+func TestRemoveRoleKeepsTheReaderWhileAWriterRemains(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T, s *Store, dir string)
+	}{
+		{"writer/", func(*testing.T, *Store, string) {}},
+		{"writer/ and writer.next/", func(t *testing.T, s *Store, _ string) {
+			if _, err := s.RenewAnchor(Writer, rand.Reader, fresh); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"an interrupted commit: writer.old/ and writer.next/", func(t *testing.T, s *Store, dir string) {
+			if _, err := s.RenewAnchor(Writer, rand.Reader, fresh); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Rename(filepath.Join(dir, "writer"), filepath.Join(dir, "writer.old")); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"writer.old/ alone", func(t *testing.T, _ *Store, dir string) {
+			if err := os.Rename(filepath.Join(dir, "writer"), filepath.Join(dir, "writer.old")); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"writer.next/ alone", func(t *testing.T, _ *Store, dir string) {
+			if err := os.Rename(filepath.Join(dir, "writer"), filepath.Join(dir, "writer.next")); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"writer/ at 0755", func(t *testing.T, _ *Store, dir string) {
+			if err := os.Chmod(filepath.Join(dir, "writer"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"writer a plain file", func(t *testing.T, _ *Store, dir string) {
+			if err := os.RemoveAll(filepath.Join(dir, "writer")); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "writer"), nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"writer a symlink", func(t *testing.T, _ *Store, dir string) {
+			if err := os.RemoveAll(filepath.Join(dir, "writer")); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(filepath.Join("reader", "leaf.crt"), filepath.Join(dir, "writer")); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"writer a dangling symlink", func(t *testing.T, _ *Store, dir string) {
+			// A Stat that follows the link finds nothing; only Lstat sees it.
+			if err := os.RemoveAll(filepath.Join(dir, "writer")); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink("nowhere", filepath.Join(dir, "writer")); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"writer.old a dangling symlink", func(t *testing.T, _ *Store, dir string) {
+			if err := os.RemoveAll(filepath.Join(dir, "writer")); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink("nowhere", filepath.Join(dir, "writer.old")); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"the store at 0755", func(t *testing.T, _ *Store, dir string) {
+			if err := os.Chmod(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, dir, _ := enrolBoth(t)
+			tc.setup(t, s, dir)
+			before := snapshot(t, dir)
+			err := s.RemoveRole(Reader)
+			if !errors.Is(err, ErrWriterRemains) {
+				t.Fatalf("RemoveRole(Reader) beside the writer: err = %v, want ErrWriterRemains", err)
+			}
+			if !sameFiles(before, snapshot(t, dir)) {
+				t.Error("the refused RemoveRole(Reader) changed the store")
+			}
+			if _, err := os.Lstat(filepath.Join(dir, "reader", "anchor.key")); err != nil {
+				t.Errorf("the reader's anchor key is gone: %v", err)
+			}
+		})
+	}
+
+	s, dir, _ := enrolBoth(t)
+	if err := s.RemoveRole(Writer); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RemoveRole(Reader); err != nil {
+		t.Fatalf("RemoveRole(Reader) once the writer is gone: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(dir, "reader")); !errors.Is(err, fs.ErrNotExist) {
+		t.Error("reader/ is still there after RemoveRole(Reader)")
 	}
 }
 
@@ -589,6 +1128,14 @@ func TestAnExpiredAnchorRenewsNothing(t *testing.T) {
 		"OpenForWrite":    func() error { _, err := s.OpenForWrite(consent, rand.Reader, past); return err },
 		"RenewReaderLeaf": func() error { _, err := s.RenewReaderLeaf(rand.Reader, past); return err },
 		"RenewWriterLeaf": func() error { _, err := s.RenewWriterLeaf(consent, rand.Reader, past); return err },
+		"OpenForEnrolment(Reader)": func() error {
+			_, err := s.OpenForEnrolment(Reader, rand.Reader, past)
+			return err
+		},
+		"OpenForEnrolment(Writer)": func() error {
+			_, err := s.OpenForEnrolment(Writer, rand.Reader, past)
+			return err
+		},
 	}
 	before := snapshot(t, dir)
 	for name, call := range calls {
@@ -750,6 +1297,10 @@ func TestSignersAreOpaque(t *testing.T) {
 	add("OpenForRead (due)", id, err)
 	id, err = s.OpenForWrite(consent, rand.Reader, fresh)
 	add("OpenForWrite", id, err)
+	id, err = s.OpenForEnrolment(Reader, rand.Reader, fresh)
+	add("OpenForEnrolment(Reader)", id, err)
+	id, err = s.OpenForEnrolment(Writer, rand.Reader, due)
+	add("OpenForEnrolment(Writer) (due)", id, err)
 	id, err = s.RenewReaderLeaf(rand.Reader, fresh)
 	add("RenewReaderLeaf", id, err)
 	id, err = s.RenewWriterLeaf(consent, rand.Reader, fresh)
@@ -966,7 +1517,45 @@ func TestDevicekeyErrorsNameNoID(t *testing.T) {
 	note(err)
 	for _, row := range providerRows(t, planted[0], ids[0].AnchorDER()) {
 		note(CheckProvider(row.answer, ids[0].AnchorDER(), planted[0]))
+		note(CheckNamedProvider(row.answer, testNumber, testPool, testProvider, ids[0].AnchorDER(), planted[0]))
 	}
+	note(CheckNamedProvider(providerAnswer(t, planted[0], ids[0].AnchorDER(), nil), testNumber, testPool, "otherprovider", ids[0].AnchorDER(), planted[0]))
+	note(CheckNamedProvider(providerAnswer(t, planted[0], ids[0].AnchorDER(), nil), testNumber, "otherpool", testProvider, ids[0].AnchorDER(), planted[0]))
+
+	// M3b.1's refusals: the reader removed beside the writer, conditions that
+	// name the planted IDs in a shape not D3's, lists that carry them, and a
+	// staged anchor of another ID.
+	note(s.RemoveRole(Reader))
+	for _, cond := range hostileConditions(planted[0], planted[1]) {
+		_, err = RoleIDFromCondition(cond)
+		note(err)
+	}
+	for _, row := range providerListRows(t, planted[0]) {
+		_, _, err = ParseProviders(row.list, testNumber, listPool)
+		note(err)
+	}
+	for _, row := range providerGetRows(t, planted[0]) {
+		_, err = ParseProvider(row.list, testNumber, listPool, listProvider)
+		note(err)
+	}
+	if _, err := s.RenewAnchor(Writer, rand.Reader, fresh); err != nil {
+		t.Fatal(err)
+	}
+	restage(t, dir, "writer", planted[0])
+	_, _, err = s.StagedCertificates(Writer)
+	note(err)
+
+	// The enrolment window: closed, and a marker that is not a plain file.
+	if err := s.EnrolmentVerified(Reader); err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.OpenForEnrolment(Reader, rand.Reader, fresh)
+	note(err)
+	if err := os.Symlink("leaf.crt", filepath.Join(dir, "writer", "enrolling")); err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.OpenForEnrolment(Writer, rand.Reader, fresh)
+	note(err)
 
 	if len(errs) < 30 {
 		t.Fatalf("only %d errors were made", len(errs))

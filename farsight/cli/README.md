@@ -1798,7 +1798,7 @@ farsight/cli/
     │   └── source.go          ← FindSource: locate the farcast checkout to build from
     ├── components/            ← the four components; behind farcast_embedded, their layers and digests  (ADR 0023 M1)
     ├── release/               ← farcast-release: the release build, the notices, the base documents  (ADR 0023 M1)
-    ├── execgate/              ← the exec gate's go/ast checker  (ADR 0023 M0); not drawn: devicekey/ (ADR 0024 M3a, wired into no command), keeper/, keyholder/, storage/
+    ├── execgate/              ← the exec gate's go/ast checker  (ADR 0023 M0); not drawn: devicekey/ (ADR 0024 M3a and M3b.1, wired into no command), keeper/, keyholder/, storage/
     ├── oci/                   ← stdlib OCI distribution client  (2.3, ADR 0007)
     │   ├── oci.go             ← reference parsing, media types, manifest/config/layer types
     │   ├── client.go          ← per-host auth: anonymous, Basic, Bearer challenge

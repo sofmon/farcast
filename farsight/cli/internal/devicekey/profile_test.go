@@ -465,6 +465,49 @@ func TestAnchorWarnsFrom45DaysBeforeItsEnd(t *testing.T) {
 	}
 }
 
+// TestAnchorWarnsAtAndExpiredAt: from a NotAfter alone, as a command reads it
+// from the record (CurrentCertificates), AnchorWarnsAt warns exactly when
+// AnchorWarns does, and AnchorExpiredAt holds exactly when the openers refuse
+// the anchor: not at its NotAfter, and from a nanosecond after it. A zero
+// NotAfter, which names no anchor, warns and has ended.
+func TestAnchorWarnsAtAndExpiredAt(t *testing.T) {
+	s, _, _ := enrolBoth(t)
+	c, err := s.CurrentCertificates(Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	anchor, err := x509.ParseCertificate(c.AnchorDER())
+	if err != nil {
+		t.Fatal(err)
+	}
+	notAfter := c.AnchorNotAfter()
+	edge := notAfter.Add(-AnchorWarning)
+	for _, now := range []time.Time{t0, edge.Add(-time.Nanosecond), edge, notAfter, notAfter.Add(time.Nanosecond)} {
+		if AnchorWarnsAt(notAfter, now) != AnchorWarns(anchor, now) {
+			t.Errorf("at %v AnchorWarnsAt and AnchorWarns differ", now)
+		}
+	}
+	if AnchorWarnsAt(notAfter, edge.Add(-time.Nanosecond)) || !AnchorWarnsAt(notAfter, edge) {
+		t.Error("AnchorWarnsAt's boundary is not 45 days before NotAfter, inclusive")
+	}
+	if AnchorExpiredAt(notAfter, notAfter) || !AnchorExpiredAt(notAfter, notAfter.Add(time.Nanosecond)) {
+		t.Error("AnchorExpiredAt's boundary is not just after NotAfter")
+	}
+	if AnchorExpiredAt(notAfter, t0) {
+		t.Error("AnchorExpiredAt holds for a new anchor")
+	}
+	// The openers agree at both instants.
+	if _, err := s.OpenForRead(rand.Reader, notAfter); err != nil {
+		t.Errorf("OpenForRead at the anchor's NotAfter: %v", err)
+	}
+	if _, err := s.OpenForRead(rand.Reader, notAfter.Add(time.Nanosecond)); !errors.Is(err, ErrAnchorExpired) {
+		t.Errorf("OpenForRead just after the anchor's NotAfter: err = %v, want ErrAnchorExpired", err)
+	}
+	if !AnchorWarnsAt(time.Time{}, t0) || !AnchorExpiredAt(time.Time{}, t0) {
+		t.Error("a zero NotAfter neither warns nor has ended")
+	}
+}
+
 // TestProfileRefusesBadArguments: the profile's constructors refuse what
 // would make another profile, before reading their random source.
 func TestProfileRefusesBadArguments(t *testing.T) {

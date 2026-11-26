@@ -126,12 +126,29 @@ func (i Identity) LogValue() slog.Value { return slog.StringValue(i.text()) }
 // ConsentKind is how a writing command's consent was given (D2).
 type ConsentKind int
 
+// The consent kinds. Each stays a kind of its own: Kind tells them apart, and
+// Confirmed tells --confirm from the other two.
 const (
-	ConsentConfirmed ConsentKind = 1 // --confirm <digest> matched
-	ConsentAnswered  ConsentKind = 2 // a terminal's question answered yes
+	// ConsentConfirmed is --confirm <digest>, given once the recomputed plan
+	// matched it: the one consent M5's broker admits for a writer token on
+	// the Mac (ADR 0023:116, :195).
+	ConsentConfirmed ConsentKind = 1
+	// ConsentAnswered is a terminal's question answered yes.
+	ConsentAnswered ConsentKind = 2
+	// ConsentYes is --yes counted as the writer's consent on the CLI,
+	// wherever a command accepts --yes today, so a scripted run can still
+	// write: the operator's answer to ADR 0024 Choices 24 (the M3b plan's
+	// Q24), given on 2026-11-26. It is never folded into ConsentConfirmed or
+	// ConsentAnswered, and it widens nothing --yes covers. What ADR 0023 keeps
+	// from --yes stays kept: its Choices 6 and its consent rule, that anything
+	// newly automated is a --plan fact bound into --confirm and never covered
+	// by --yes; so does what the M3b plan keeps from it (fallback 3's
+	// Google-made key). This package cannot see which command asks, so those
+	// rules hold in the one helper that maps --yes to ConsentYes (M3b.8's
+	// writerConsent). On the Mac at M5 the broker admits --confirm alone,
+	// which Confirmed tells apart.
+	ConsentYes ConsentKind = 3
 )
-
-// --yes is left out until the operator answers ADR 0024 Choices 24.
 
 // Consent is a writing command's consent. Its zero value is no consent.
 // GiveConsent records an intent and checks nothing. What enforces the custody
@@ -140,18 +157,32 @@ const (
 type Consent struct{ kind ConsentKind }
 
 // GiveConsent records a consent of kind k. It gives the zero Consent for any
-// k but ConsentConfirmed and ConsentAnswered.
+// k but ConsentConfirmed, ConsentAnswered and ConsentYes.
 func GiveConsent(k ConsentKind) Consent {
 	switch k {
-	case ConsentConfirmed, ConsentAnswered:
+	case ConsentConfirmed, ConsentAnswered, ConsentYes:
 		return Consent{kind: k}
 	}
 	return Consent{}
 }
 
-// Given reports whether c is a consent at all.
+// Given reports whether c is a consent at all: ConsentConfirmed,
+// ConsentAnswered or ConsentYes. It is what the writer's opening functions
+// ask on the CLI.
 func (c Consent) Given() bool {
-	return c.kind == ConsentConfirmed || c.kind == ConsentAnswered
+	return c.kind == ConsentConfirmed || c.kind == ConsentAnswered || c.kind == ConsentYes
+}
+
+// Confirmed reports whether c was given by --confirm <digest> alone, the one
+// consent M5's broker admits for a writer token on the Mac (ADR 0023:116,
+// :195). A terminal's answer and --yes are given, not confirmed.
+func (c Consent) Confirmed() bool {
+	return c.kind == ConsentConfirmed
+}
+
+// Kind is the kind c was given as; 0 for the zero Consent.
+func (c Consent) Kind() ConsentKind {
+	return c.kind
 }
 
 // errNoRandom refuses a nil random source.
@@ -163,7 +194,8 @@ var errNoRandom = errors.New("devicekey: no random source")
 // Writer alone is refused. For each role it makes a new role ID drawn from
 // rnd, a new anchor key and anchor, and a new leaf key and leaf. It returns the
 // identities for D4's one verification exchange per role, from memory: it
-// opens no file.
+// opens no file. It opens each role's enrolment window, which
+// OpenForEnrolment needs and EnrolmentVerified closes.
 //
 // A directory that is a symlink, or that other accounts can reach, is
 // ErrUnsafeMode. Everything is drawn before anything is written, each role's
@@ -260,7 +292,7 @@ func (s *Store) enrol(rnd io.Reader, roles []Role, now time.Time) ([]Identity, e
 	defer func() { _ = root.Close() }()
 	var written []string
 	for i, r := range roles {
-		if err := s.writeRoleDir(root, roleDirName(r), sets[i]); err != nil {
+		if err := s.writeRoleDir(root, roleDirName(r), sets[i], true); err != nil {
 			for _, name := range written {
 				_ = root.RemoveAll(name)
 			}
@@ -277,7 +309,8 @@ func (s *Store) enrol(rnd io.Reader, roles []Role, now time.Time) ([]Identity, e
 
 // AddRole is `device add --role writer` on a reader-only device (purpose:
 // enrolment). It refuses a role already present, and opens no existing file.
-// A writer is added only beside a reader, as Enrol refuses a writer alone.
+// A writer is added only beside a reader, as Enrol refuses a writer alone. It
+// opens the new role's enrolment window, as Enrol does.
 func (s *Store) AddRole(r Role, rnd io.Reader, now time.Time) (Identity, error) {
 	if !r.valid() {
 		return Identity{}, errNoSuchRole(r)
@@ -313,7 +346,7 @@ func (s *Store) AddRole(r Role, rnd io.Reader, now time.Time) (Identity, error) 
 	if err != nil {
 		return Identity{}, err
 	}
-	if err := s.writeRoleDir(root, roleDirName(r), set); err != nil {
+	if err := s.writeRoleDir(root, roleDirName(r), set, true); err != nil {
 		return Identity{}, err
 	}
 	return set.identity(r, id), nil
@@ -323,6 +356,12 @@ func (s *Store) AddRole(r Role, rnd io.Reader, now time.Time) (Identity, error) 
 // role's directory, staged and old ones included. It opens no file, and, like
 // Erase, refuses only a store directory that is not a real directory: a
 // widened mode does not keep the role's keys on disk.
+//
+// RemoveRole(Reader) is refused with ErrWriterRemains, and nothing is
+// removed, while any of the writer's directories is there (writer/,
+// writer.next/ or writer.old/, whatever each is): a writer is held only
+// beside a reader, as Enrol and AddRole hold it, so a store is never left
+// writer-only. Remove the writer first, or Erase the whole store.
 func (s *Store) RemoveRole(r Role) error {
 	if !r.valid() {
 		return errNoSuchRole(r)
@@ -332,9 +371,30 @@ func (s *Store) RemoveRole(r Role) error {
 		return err
 	}
 	defer func() { _ = root.Close() }()
+	if r == Reader {
+		if err := s.refuseWhileWriter(root); err != nil {
+			return err
+		}
+	}
 	for _, name := range []string{roleDirName(r), stagedDirName(r), oldDirName(r)} {
 		if err := root.RemoveAll(name); err != nil {
 			return fmt.Errorf("devicekey: remove %s: %w", s.path(name), err)
+		}
+	}
+	return nil
+}
+
+// refuseWhileWriter is ErrWriterRemains when any of the writer's three names
+// is in root, by Lstat only: a directory of any mode, a symlink or a file
+// counts, so nothing about the entry can let the reader go first.
+func (s *Store) refuseWhileWriter(root *os.Root) error {
+	for _, name := range []string{roleDirName(Writer), stagedDirName(Writer), oldDirName(Writer)} {
+		_, err := root.Lstat(name)
+		switch {
+		case err == nil:
+			return fmt.Errorf("devicekey: %s is still there: %w", s.path(name), ErrWriterRemains)
+		case !errors.Is(err, fs.ErrNotExist):
+			return fmt.Errorf("devicekey: %w", err)
 		}
 	}
 	return nil
@@ -347,7 +407,7 @@ func (s *Store) RemoveRole(r Role) error {
 // returns the new identity. It never opens a file under writer/ or
 // reader.next/, whatever they hold.
 func (s *Store) OpenForRead(rnd io.Reader, now time.Time) (Identity, error) {
-	return s.openRole(Reader, rnd, now)
+	return s.openRole(Reader, false, rnd, now)
 }
 
 // OpenForWrite is a writing command's, after its consent (purpose: consented
@@ -359,7 +419,79 @@ func (s *Store) OpenForWrite(c Consent, rnd io.Reader, now time.Time) (Identity,
 	if !c.Given() {
 		return Identity{}, ErrNoConsent
 	}
-	return s.openRole(Writer, rnd, now)
+	return s.openRole(Writer, false, rnd, now)
+}
+
+// OpenForEnrolment opens role r's current leaf for an enrolment that resumes
+// in a later process (purpose: enrolment, D6): D4's verification exchange
+// and, in install, its one read of the project's number (D7). It works as
+// OpenForRead does, for r: it opens r's leaf.key, leaf.crt and anchor.crt,
+// and r's anchor.key only when the leaf is due (LeafDue, or a key that does
+// not match its certificate), to renew the leaf under r's own anchor. It
+// takes no consent, for the writer too, as Enrol and AddRole take none: D2
+// opens the writer's keys at enrolment.
+//
+// The store's state bounds it, not only its callers. It opens r only while
+// r's enrolment window is open: from the Enrol or AddRole that made r's
+// directory until EnrolmentVerified(r). Otherwise it is ErrNotEnrolling, and
+// nothing is read. RenewAnchor's staged directory never opens a window, so a
+// committed anchor renewal closes it too. Once an enrolment is verified, the
+// writer's keys open only after a consent (OpenForWrite), and enrolling the
+// writer again is a new AddRole, which refuses a writer already there.
+//
+// Only a resumed `install --coordinates` and `device add` may call it.
+// TestCustodyCallSitesAreReviewed watches each site, keyed by its role: a
+// site whose role the scan cannot read as devicekey.Reader is the writer's.
+// OpenForEnrolment(Reader) never opens a file under writer/ or reader.next/;
+// OpenForEnrolment(Writer) none under reader/ or writer.next/.
+func (s *Store) OpenForEnrolment(r Role, rnd io.Reader, now time.Time) (Identity, error) {
+	if !r.valid() {
+		return Identity{}, errNoSuchRole(r)
+	}
+	return s.openRole(r, true, rnd, now)
+}
+
+// EnrolmentVerified closes role r's enrolment window, which Enrol and AddRole
+// open: it removes r's enrolling marker, so OpenForEnrolment(r) is
+// ErrNotEnrolling from then on. It opens no file. The caller calls it once
+// D4's verification of r has passed and is recorded where a resumed command
+// reads it, so a resume that finds the window closed knows its verification
+// is done. A window already closed is no error; an absent role is ErrNoRole,
+// and an interrupted commit ErrRenewalInterrupted.
+func (s *Store) EnrolmentVerified(r Role) error {
+	if !r.valid() {
+		return errNoSuchRole(r)
+	}
+	root, err := s.openRoot()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+	if err := s.requireRole(root, r); err != nil {
+		return err
+	}
+	if err := root.Remove(enrollingRel(r)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("devicekey: close the %s role's enrolment: %w", r, err)
+	}
+	return nil
+}
+
+// requireEnrolling is nil while r's enrolment window is open: its marker is
+// there, a plain file no other account can reach. An absent marker is
+// ErrNotEnrolling, and anything else in its place ErrUnsafeMode. It stats
+// only.
+func (s *Store) requireEnrolling(root *os.Root, r Role) error {
+	rel := enrollingRel(r)
+	fi, err := root.Lstat(rel)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return fmt.Errorf("devicekey: the %s role: %w", r, ErrNotEnrolling)
+	case err != nil:
+		return fmt.Errorf("devicekey: %w", err)
+	case !safeFile(fi):
+		return s.unsafeMode(rel)
+	}
+	return nil
 }
 
 // RenewReaderLeaf renews the reader's leaf now, due or not: M3a's T3, and
@@ -380,11 +512,12 @@ func (s *Store) RenewWriterLeaf(c Consent, rnd io.Reader, now time.Time) (Identi
 	return s.renewNow(Writer, rnd, now)
 }
 
-// openRole is OpenForRead's and OpenForWrite's body for role r: open the
-// role's anchor.crt, leaf.crt and leaf.key; refuse an expired anchor; and
-// renew the leaf with the role's own anchor.key when it is due or its key does
-// not match it.
-func (s *Store) openRole(r Role, rnd io.Reader, now time.Time) (Identity, error) {
+// openRole is OpenForRead's, OpenForWrite's and OpenForEnrolment's body for
+// role r: for an enrolment, require r's window open; open the role's
+// anchor.crt, leaf.crt and leaf.key; refuse an expired anchor; and renew the
+// leaf with the role's own anchor.key when it is due or its key does not
+// match it.
+func (s *Store) openRole(r Role, enrolment bool, rnd io.Reader, now time.Time) (Identity, error) {
 	if rnd == nil {
 		return Identity{}, errNoRandom
 	}
@@ -395,6 +528,11 @@ func (s *Store) openRole(r Role, rnd io.Reader, now time.Time) (Identity, error)
 	defer func() { _ = root.Close() }()
 	if err := s.requireRole(root, r); err != nil {
 		return Identity{}, err
+	}
+	if enrolment {
+		if err := s.requireEnrolling(root, r); err != nil {
+			return Identity{}, err
+		}
 	}
 	dir := roleDirName(r)
 	anchor, id, err := s.readAnchorCert(dir)
@@ -523,7 +661,7 @@ func (s *Store) RenewAnchor(r Role, rnd io.Reader, now time.Time) (Identity, err
 	if err != nil {
 		return Identity{}, err
 	}
-	if err := s.writeRoleDir(root, stagedDirName(r), set); err != nil {
+	if err := s.writeRoleDir(root, stagedDirName(r), set, false); err != nil {
 		return Identity{}, err
 	}
 	return set.identity(r, id), nil

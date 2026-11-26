@@ -166,17 +166,34 @@ func LeafDue(leaf, anchor *x509.Certificate, now time.Time) bool {
 }
 
 // AnchorWarns reports whether now is at or after anchor's NotAfter − 45 days.
-// A nil anchor warns.
+// A nil anchor warns. It is AnchorWarnsAt of the anchor's NotAfter.
 func AnchorWarns(anchor *x509.Certificate, now time.Time) bool {
 	if anchor == nil {
 		return true
 	}
-	return !now.Before(anchor.NotAfter.Add(-AnchorWarning))
+	return AnchorWarnsAt(anchor.NotAfter, now)
+}
+
+// AnchorWarnsAt reports whether now is at or after notAfter − 45 days
+// (AnchorWarning), for an anchor whose NotAfter is notAfter: what a command
+// reads from the record's AnchorNotAfter (CurrentCertificates), with no
+// certificate at hand. A zero notAfter, which names no anchor, is the year 1,
+// so it warns.
+func AnchorWarnsAt(notAfter, now time.Time) bool {
+	return !now.Before(notAfter.Add(-AnchorWarning))
+}
+
+// AnchorExpiredAt reports whether an anchor whose NotAfter is notAfter has
+// ended at now: strictly after notAfter, the instant at which the openers
+// refuse it (ErrAnchorExpired). At notAfter itself it has not. A zero
+// notAfter, which names no anchor, is the year 1, so it has ended.
+func AnchorExpiredAt(notAfter, now time.Time) bool {
+	return now.After(notAfter)
 }
 
 // anchorExpired reports whether anchor's validity has ended at now.
 func anchorExpired(anchor *x509.Certificate, now time.Time) bool {
-	return now.After(anchor.NotAfter)
+	return AnchorExpiredAt(anchor.NotAfter, now)
 }
 
 // newKey makes a P-256 key. Since Go 1.26 key generation draws on the

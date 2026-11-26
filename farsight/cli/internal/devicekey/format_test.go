@@ -2,6 +2,7 @@ package devicekey
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -214,5 +215,95 @@ func TestIdentityNeverFormats(t *testing.T) {
 	var zero Identity
 	if got := fmt.Sprintf("%v %d", zero, &zero); got != "identity (not printed) identity (not printed)" {
 		t.Errorf("the zero Identity prints %q", got)
+	}
+}
+
+// The Certs formatting test's holders.
+type (
+	exportedCerts   struct{ C Certs }
+	unexportedCerts struct{ c Certs }
+	unexportedCertP struct{ c *Certs }
+)
+
+// TestCertsNeverFormats: a Certs' role ID, anchor and leaf never appear,
+// under any fmt verb, as a value or a pointer, in a slice, in an exported or
+// an unexported field, in JSON, or in slog; and a Certs fmt can reach prints
+// the fixed text exactly, naming its role only. Current and staged alike.
+func TestCertsNeverFormats(t *testing.T) {
+	s, _, _ := enrolBoth(t)
+	if _, err := s.RenewAnchor(Writer, rand.Reader, fresh); err != nil {
+		t.Fatal(err)
+	}
+	var all []Certs
+	for _, r := range []Role{Reader, Writer} {
+		c, err := s.CurrentCertificates(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		all = append(all, c)
+	}
+	staged, present, err := s.StagedCertificates(Writer)
+	if err != nil || !present {
+		t.Fatalf("StagedCertificates(Writer) = %v, %v", present, err)
+	}
+	all = append(all, staged)
+	for _, c := range all {
+		want := c.Role().String() + " certificates (not printed)"
+		p := &c
+		leaks := func(s string) string {
+			switch {
+			case containsID(s, c.ID()):
+				return "the role ID"
+			case strings.Contains(strings.ToLower(s), c.ID().Hex()):
+				return "the role ID's hex"
+			case containsBytes(s, c.LeafDER()):
+				return "the leaf"
+			case containsBytes(s, c.AnchorDER()):
+				return "the anchor"
+			}
+			return ""
+		}
+		verbs := []string{"%v", "%+v", "%#v", "%s", "%q", "%x", "%X", "%d"}
+		for _, verb := range append(verbs, "%p", "%t", "%08.3f", "%U", "%c", "%e") {
+			for _, arg := range []any{c, p} {
+				got := fmt.Sprintf(verb, arg)
+				if what := leaks(got); what != "" {
+					t.Errorf("%s of a %T prints %s", verb, arg, what)
+				}
+				if slices.Contains(verbs, verb) && got != want {
+					t.Errorf("%s of a %T = %q, want %q", verb, arg, got, want)
+				}
+			}
+			for _, arg := range []any{
+				[]Certs{c}, []*Certs{p},
+				exportedCerts{c}, &exportedCerts{c}, unexportedCerts{c}, &unexportedCerts{c},
+				unexportedCertP{p}, &unexportedCertP{p},
+			} {
+				if what := leaks(fmt.Sprintf(verb, arg)); what != "" {
+					t.Errorf("%s of a %T prints %s", verb, arg, what)
+				}
+			}
+		}
+		for _, v := range []any{c, p, exportedCerts{c}, unexportedCerts{c}, []Certs{c}} {
+			b, err := json.Marshal(v)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if what := leaks(string(b)); what != "" {
+				t.Errorf("json.Marshal of a %T prints %s: %s", v, what, b)
+			}
+		}
+		for _, out := range slogOutputs("certs", c, "ptr", p, "exported", exportedCerts{c}, "unexported", unexportedCerts{c}, "slice", []Certs{c}) {
+			if what := leaks(out); what != "" {
+				t.Errorf("slog prints %s: %s", what, out)
+			}
+			if !strings.Contains(out, want) {
+				t.Errorf("slog did not use LogValue: %s", out)
+			}
+		}
+	}
+	var zero Certs
+	if got := fmt.Sprintf("%v %d", zero, &zero); got != "certificates (not printed) certificates (not printed)" {
+		t.Errorf("the zero Certs prints %q", got)
 	}
 }

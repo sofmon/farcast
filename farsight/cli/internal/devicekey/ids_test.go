@@ -8,9 +8,10 @@ import (
 )
 
 // TestObjectIDShapes: each kind's length, a letter first, [a-z0-9] after,
-// never gcp-, and 1,000 draws all distinct.
+// never gcp-, and 1,000 draws all distinct; a condition title is drawn as an
+// account ID is.
 func TestObjectIDShapes(t *testing.T) {
-	for kind, n := range map[ObjectKind]int{PoolID: 32, ProviderID: 32, ServiceAccountID: 30} {
+	for kind, n := range map[ObjectKind]int{PoolID: 32, ProviderID: 32, ServiceAccountID: 30, ConditionTitle: 30} {
 		seen := map[string]bool{}
 		for range 1000 {
 			id, err := NewObjectID(kind, rand.Reader)
@@ -38,7 +39,7 @@ func TestObjectIDShapes(t *testing.T) {
 		}
 	}
 	cr := &countingReader{}
-	for _, kind := range []ObjectKind{0, 4, -1} {
+	for _, kind := range []ObjectKind{0, 5, -1} {
 		if _, err := NewObjectID(kind, cr); err == nil {
 			t.Errorf("NewObjectID(%d) succeeded", kind)
 		}
@@ -63,7 +64,7 @@ func TestObjectIDRejectsBiasedBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 	biased := []byte{252, 253, 254, 255, 255, 252, 254}
-	for _, kind := range []ObjectKind{PoolID, ProviderID, ServiceAccountID} {
+	for _, kind := range []ObjectKind{PoolID, ProviderID, ServiceAccountID, ConditionTitle} {
 		want, err := NewObjectID(kind, bytes.NewReader(valid))
 		if err != nil {
 			t.Fatal(err)
@@ -99,5 +100,33 @@ func TestObjectIDRejectsBiasedBytes(t *testing.T) {
 	}
 	if exact.Len() == 0 {
 		t.Error("NewObjectID read past what it used")
+	}
+}
+
+// TestConditionTitleIsDrawnFromRnd: a condition title is drawn from the
+// caller's rnd, as the other IDs are: the same stream gives the same title,
+// and it is the account ID's draw from that stream, 30 characters.
+func TestConditionTitleIsDrawnFromRnd(t *testing.T) {
+	stream := func() *detStream { return &detStream{seed: "devicekey-test/condition-title"} }
+	a, err := NewObjectID(ConditionTitle, stream())
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := NewObjectID(ConditionTitle, stream())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sa, err := NewObjectID(ServiceAccountID, stream())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a != b || a != sa || len(a) != 30 {
+		t.Errorf("titles %q and %q, account ID %q: want one 30-character draw", a, b, sa)
+	}
+	if _, err := NewObjectID(ConditionTitle, nil); err == nil {
+		t.Error("a condition title with no random source")
+	}
+	if _, err := NewObjectID(ConditionTitle, failingReader{}); err == nil {
+		t.Error("a condition title from a failing source")
 	}
 }
