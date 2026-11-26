@@ -2,7 +2,7 @@
 
 *(2026-11-22: kept in the repository from here on, with ADR 0024's records. It was drafted outside it, so the sizing prototypes it cites (`proto/`, `variantb/` and `twoanchor/`, with `twoanchor/perrole_test.go`), the critique of v1 and the earlier versions were working files in a scratch directory, and are not kept. A [ran] result is reproduced only by repeating it. Code citations are file:line at 5ef5ee8, and paths are relative to the repository root. A bare file name is in `farsight/cli/internal/cli/`, or is cited with its directory earlier in this design; `kube/` is `farsight/cli/internal/kube/`.)*
 
-This is the design behind [ADR 0024](../adr/0024-paste-the-certificate.md), the operator's cloud credential, and behind [ADR 0023](../adr/0023-one-download-farcast.md)'s milestone M3a, the identity probe. It was written 2026-11-22 against the repository at 5ef5ee8 (ADR 0023 M2.9b). Nothing in it is built or walked, M3a has not run, and no cloud call was made. *(2026-11-23: M3a's part of it was built 2026-11-22 to 2026-11-23: `devicekey`, `kube/federated.go`, the probe, its runbook and W-FED's steps, offline and wired into no command (§11). M3a has not run.)* *(2026-11-23, M3a walked: it ran 2026-11-23 at bb51a6d and passes in a project in the operator's own organization (§6; [the runbook's Results](../runbooks/adr-0024-m3a-probe.md#results)). The run in a project with no organization stays deferred, and the DNS endpoint with an impersonated token stays unverified.)* *(2026-11-24, ADR 0023's M2 walked: W-FED ran in M2's walk on 2026-11-24, in a project in the operator's own organization. GKE's DNS endpoint accepted a token impersonated with the scope pair from the device's federated reader token, and the username Kubernetes saw was the reader SA's email ("email matches: yes"); the federated token itself got 403, authenticated, then refused.)* *(2026-11-26, M3b.1: M3b's build began; its first step, M3b.1, was built that day in `devicekey`, offline and wired into no command (§12). Nothing of M3b is walked.)*
+This is the design behind [ADR 0024](../adr/0024-paste-the-certificate.md), the operator's cloud credential, and behind [ADR 0023](../adr/0023-one-download-farcast.md)'s milestone M3a, the identity probe. It was written 2026-11-22 against the repository at 5ef5ee8 (ADR 0023 M2.9b). Nothing in it is built or walked, M3a has not run, and no cloud call was made. *(2026-11-23: M3a's part of it was built 2026-11-22 to 2026-11-23: `devicekey`, `kube/federated.go`, the probe, its runbook and W-FED's steps, offline and wired into no command (§11). M3a has not run.)* *(2026-11-23, M3a walked: it ran 2026-11-23 at bb51a6d and passes in a project in the operator's own organization (§6; [the runbook's Results](../runbooks/adr-0024-m3a-probe.md#results)). The run in a project with no organization stays deferred, and the DNS endpoint with an impersonated token stays unverified.)* *(2026-11-24, ADR 0023's M2 walked: W-FED ran in M2's walk on 2026-11-24, in a project in the operator's own organization. GKE's DNS endpoint accepted a token impersonated with the scope pair from the device's federated reader token, and the username Kubernetes saw was the reader SA's email ("email matches: yes"); the federated token itself got 403, authenticated, then refused.)* *(2026-11-26, M3b.1: M3b's build began; its first step, M3b.1, was built that day in `devicekey`, offline and wired into no command (§12). Nothing of M3b is walked.)* *(2026-11-26, M3b.2: M3b's second step, M3b.2, was built that day in `config`, offline and wired into no command but for the installer key's load, which now refuses a blank key and quotes nothing of a file that does not parse (§13).)*
 
 This is v3. All three versions are of 2026-11-22.
 - **v1** merged three designs written from three priorities: privacy, the operator's procedure, and uniformity across providers. Where they disagreed, privacy and cost control won, then the operator's procedure, then uniformity. Each decision says which answer it took, and why the others lost where that is still true.
@@ -472,7 +472,7 @@ The app shows these on three surfaces: the provider's console, the guide, and th
 6. After `connect`, `reader grant` writes the reader's RBAC as today, and `reader init` and `reader record` become fallback 2.
 
 **Pending installs.** Until `install` creates the instance's record, after verification, the keys live in the pending directory, outside any record.
-- `farcast instances` lists each pending install with its state (keys made; setup shown; coordinates received) and its age.
+- `farcast instances` lists each pending install with its state (keys made; setup shown; coordinates received) and its age. *(2026-11-26, M3b.2: and a fourth, `verified`, which the hand-off requires of an entry holding keys (§13, departure 1).)*
 - Every command warns about a pending install older than 7 days.
 - `farcast install --name $INSTANCE --abandon` prints the teardown block for what the setup created (the bindings first, then the providers, the pool if it holds no other provider, and the three SAs), and erases the pending keys. It acts on a pending install's entry alone, so a pending install can always be abandoned, and never on a finished record; that is `release`'s. The device cannot know how far the setup ran, so each line of the block skips an object that is absent, as `readerinit.go:412`'s `describe ||` does in reverse; `release`'s and `device rm`'s blocks do the same. For the pool and a provider, absent means not found, or found in the state `DELETED`, which Google keeps for about 30 days after a delete [doc: PROV]; a provider's line is also skipped once the pool is absent. Whether a describe returns a soft-deleted object is [unverified].
 - Nothing erases pending keys by age alone.
@@ -1281,7 +1281,7 @@ The code's own departures, which the runbook does not number:
 
 ### What stays open
 
-- **The macOS ACL limit** (round 2's X2). `devicekey` and the probe check mode bits only, and an inherited ACL can let another account read a 0600 key. Reading an ACL needs libSystem's ACL API, against `devicekey`'s rule of no platform-only call. The limit is documented in the package and on `Store`, and both runbooks check for an ACL with `ls -led` (P0.2, WF.1). Where M3b places the store needs the same check, or a decision to enforce it. *(2026-11-26, M3b.1: answered with its default, the M3b plan's X2: the store under the 0700 config root, mode bits only, `ls -led` checked at the walk, and a darwin-only check added only if M3b.2's spike shows that a raw `getattrlist` reports an ACL.)*
+- **The macOS ACL limit** (round 2's X2). `devicekey` and the probe check mode bits only, and an inherited ACL can let another account read a 0600 key. Reading an ACL needs libSystem's ACL API, against `devicekey`'s rule of no platform-only call. The limit is documented in the package and on `Store`, and both runbooks check for an ACL with `ls -led` (P0.2, WF.1). Where M3b places the store needs the same check, or a decision to enforce it. *(2026-11-26, M3b.1: answered with its default, the M3b plan's X2: the store under the 0700 config root, mode bits only, `ls -led` checked at the walk, and a darwin-only check added only if M3b.2's spike shows that a raw `getattrlist` reports an ACL.)* *(2026-11-26, M3b.2: it does, on the dev Mac (§13). A shipped check would cost a raw system call Apple does not support [inf] and FarCast's first `unsafe` import outside a test; X2's enforcement is decided before M3b.14.)*
 - **The read-back's host** (Q3), at M3b. *(2026-11-26, M3b.1: answered with its default before M3b.1; built at M3b.3.)*
 - **Q1, Q2, Q4 and Q5,** until the operator answers.
 - **`handshake_failure` and `decrypt_error`.** A row they leave `INCONCLUSIVE` is the operator's call (P4).
@@ -1362,3 +1362,103 @@ M3b.1, the first of the nineteen steps of [the M3b plan](adr-0024-m3b-plan.md), 
 - **The list's shape** is [inf]: M3a read one provider with `get`, and never a list. The parsers refuse any other shape, so a different one fails closed, and M3b's walk reads the real one.
 - **The name's project segment.** The three name checks take the project's number. If Google names a provider by the project's ID instead, they refuse it [inf], and M3b's walk settles it.
 - **Concurrent removal.** A `RemoveRole(Reader)` racing an `AddRole(Writer)` in another process could still leave a writer alone. No lock guards that yet: config's only lock is the keyring's, and M3b.2 plans none. The M3b plan's notes have `device rm` (M3b.15) and `device add` (M3b.16) take one per-instance lock around those calls.
+
+---
+
+## 13. Amendments from M3b.2's build (2026-11-26)
+
+M3b.2, the second of the nineteen steps of [the M3b plan](adr-0024-m3b-plan.md), was built 2026-11-26 on b0a0237. It changes `farsight/cli/internal/config/`. In `cli` it changes `loadInstallerKey`, which maps config's new refusal, the error classifier `classified`, which gives that refusal its kind, and a doc comment in `fatline.go`. Its tests are in `config`, `cli` and `storage`. Outside `config`, no product code but those two `cli` functions uses what it adds, and they use only the new `ErrNoServiceAccountKey`. It is tested offline, and nothing has run against Google for it.
+
+Two changes reach commands, both where the installer key is loaded: a blank key is refused (below), and a `credentials.yaml` that does not parse is refused in words that quote none of it (departure 5). The reviews', the mutants' and the spike's reports were working files in a scratch directory, and are not kept.
+
+### What landed
+
+- **The record.** `InstanceMetadata.Identity`, with `Identity`, `DeviceRole` and `KnownProvider` as the plan names them, and the five routes, recorded per role.
+  - `CheckedIdentity(meta)` checks each value that is present against the alphabet it is later rendered in: the project's number, 1 to 20 digits; the pool's and each provider's ID, 32 characters; each service account's ID and the condition's title, 30; each ID `[a-z][a-z0-9]*`. It also checks what each route needs (D7). Its errors name the field and the shape, never the value.
+  - `ServiceAccountEmail(id, project)` refuses an ID or a project out of shape.
+- **The merge.** `mergeOntoNewer` merges `Identity` field by field, `Roles` per role and `Known` per provider, with the three-way rule `SystemImages` keeps. A time compares by its instant, and a list that names a key twice is refused, not merged.
+- **The pending store.** `<config>/pending/<name>/` (0700), holding `pending.yaml` (0600) and `identity/` (0700), beside `instances/`, never in it.
+  - `Pending`, as the plan names it, with its draw as `PendingDraw`. It has two kinds, `install` and `device_add`, and four states: `keys_made`, `setup_shown`, `coordinates_received` and `verified`, the one §12 asked for.
+  - `CreatePending`, one exclusive `mkdir`; `SavePending` and `LoadPending`, atomic, strict and read through `readFile`; `ListPending`; `PendingExists`; `PendingOnly`, the abandon's precondition; and `RemovePending`.
+  - Every function that takes a name checks it with `ValidateInstanceName` before it builds a path. That is config's own copy of `install`'s rule, and a `cli` test holds the two equal for every byte value and every length.
+  - Where the store keeps something, it refuses a symbolic link, a directory other accounts can reach, and anything else that is not a directory or a regular file (`ErrUnsafePath`). An abandon still removes a widened directory rather than refusing it.
+- **The paths.** `InstanceIdentityDir`, `PendingDir` and `PendingIdentityDir`.
+- **The hand-off.** `AdoptPending(name, meta)` in D7's order: `CreateInstance`, then `SaveInstanceMetadata`, then the rename of `identity/` into the instance, then `RemovePending`.
+  - `ResumeAdoption(name)` finishes one that stopped after its record; `AdoptPending` again finishes one that stopped before it.
+  - A test seam can stop either function before each of its steps.
+- **A blank key.** `LoadInstanceCredentials` refuses a key that is empty or white space, `ErrNoServiceAccountKey`.
+  - `loadInstallerKey` maps it to the refusal it gave before, with the same text and kind, `credential_missing`.
+  - Three callers load the key without `loadInstallerKey`: `release`; the commands that open storage (`storage ls`, `cp`, `rm`, `usage` and `key rekey`, and the `secret` commands); and `toolchain`'s registry ensure. They now refuse such a record at that load, `load credentials for "<name>": …`, as `credential_missing` too: `classified` gives that kind to an error that names no kind of its own and holds `ErrNoServiceAccountKey` anywhere in its chain, as these three do. `storage deploy` opens the writer first and keeps `loadInstallerKey`'s refusal.
+  - With an empty key, each of those three would otherwise have opened its provider as the machine's Application Default Credentials. So no farcast command now hands planck or datasphere a blank key. The adapters' own fallback to ADC stays until M3b.4.
+
+### Where it departs from the plan
+
+1. **The hand-off requires `verified`.** `AdoptPending` and `ResumeAdoption` refuse an entry that is not at `verified` while it holds an `identity/` or its record puts a role on the certificate route (`ErrPendingUnverified`).
+   - Without it, an entry at `keys_made` could be handed off. The instance's writer would then open through `OpenForEnrolment` with no consent, because devicekey's enrolment markers move with the keys (§12, departure 1).
+   - config cannot see those markers, so the state is the only evidence of verification it has, and closing the markers stays the caller's.
+   - M3b.14 keeps the order: `SavePending` at `verified`, then `EnrolmentVerified` for each role, then `AdoptPending`. A resume that finds `verified` calls `EnrolmentVerified` again first, which is no error on a closed window.
+2. **A device add's record is `running`.** `AdoptPending` requires `provisioning` of an install's entry and `running` of a device add's, whose instance is there already (M3b.16). The plan named `provisioning` alone.
+3. **Stops inside a step, and an abandon after step 1.** The plan tested stops between steps. Three more cases are now handled:
+   - a stop inside step 2's write, which leaves the record's temporary files in the instance's directory: `AdoptPending` again takes a directory holding nothing else as step 1 done, removes them and goes on;
+   - a stop inside step 4's removal, which unlinks `pending.yaml` before the entry's directory: `ResumeAdoption` removes an entry with no `pending.yaml` and no `identity/` beside a record of this instance that `CheckedIdentity` passes;
+   - a stop after step 1, then an abandon: `RemovePending` removes the instance's directory too when it holds no record and nothing but those temporary files, so the name can be installed again.
+4. **No roles is no identity.** `CheckedIdentity` refuses an identity that names no role as `ErrNoIdentity`. A role a machine cannot act as is named with the route `none`.
+5. **No caller quotes a credentials file that does not parse.** The YAML library's error quotes the lines around the fault, which can hold the installer's private key. `release`, the commands that open storage and `toolchain`'s registry ensure printed it. `LoadInstanceCredentials`' error is now the path and `ParseFault`'s fault and position alone, and it still unwraps to the library's error. The leak predates M3b.2.
+6. **Where the draws are checked.** The test that every drawn ID passes config's shapes is in `identity_test.go`, not `config_test.go`.
+7. **Size.** About 1,550 product lines and 3,200 test lines, against the plan's 450 and 700: the departures above, and the documentation of each function's refusals.
+
+### The X2 spike
+
+X2 asks whether a raw `getattrlist(ATTR_CMN_EXTENDED_SECURITY)`, with no cgo, reports an inherited ACL (§11). It ran 2026-11-26 as scratch code, twice and independently: once as a standalone program over the standard library's `syscall`, built with `CGO_ENABLED=0`, and once as a test built in with `-overlay` and `-race` over `x/sys/unix`. Neither is shipped.
+
+**Answer: yes, on the dev Mac** (macOS 27.2.1, arm64, go1.27.4). Each case agreed with `ls -le`:
+- a file or a directory with no ACL returns no extended security;
+- an explicit entry on a file, and an inheritable one on a directory, each return a `kauth_filesec` with one entry;
+- so does each object made in that directory, which inherits the entry: a file, a subdirectory, and a key written through a temporary file and a rename, as devicekey writes keys;
+- a symbolic link read with `FSOPT_NOFOLLOW` returns its own, which is none.
+
+The filesec came back in the host's byte order.
+
+**What it costs,** for X2's enforcement decision, due before M3b.14:
+- Go's `syscall.Syscall6` on darwin/arm64 is a raw trap, not a call into libSystem, and `x/sys/unix` reaches the same trap. Apple supports neither the trap nor the filesec's layout as an interface [inf].
+- A shipped check would be the first FarCast Go file outside a test to import `unsafe`.
+- amd64 Macs and a sandboxed app (M5) were not tried.
+- It needs no new dependency and no cgo.
+
+### What later steps take from it
+
+- **M3b.7:** `loadInstallerKey`'s blank-key text still tells the operator to release the instance, and since M3b.2 `release` refuses such an instance when it loads the key. So the advice leads to a refusal until M3b.7's message replaces it (the plan's §4). No instance with a blank key exists.
+- **M3b.14:**
+  - the order in departure 1;
+  - whether fallback 3's check records `verified`: the hand-off does not require it where there are no keys and no certificate route;
+  - X2's enforcement, from the spike above;
+  - `install --abandon` is `PendingOnly`, then the keys' erasure, then `RemovePending`;
+  - concurrency in the store. M3b.2 adds no lock, and no step of the plan names one for the store: M3b.15's per-instance lock is for devicekey's `RemoveRole`, which M3b.16's `AddRole(Writer)` takes too. Once M3b.14 wires `install`, its resume and `--abandon`, two processes can race in the store. For example, an abandon could remove the new, empty instance directory of another `install` of the same name. Each check of a path and its use are inside the 0700 config root, so only the same account can race them.
+- **M3b.16:** a device add's hand-off records `running`, with the endpoint read through `planck.Open` as the reader. Like an install's, it needs the entry at `verified`, then `EnrolmentVerified`, first (departure 1).
+
+### How it was checked
+
+- **Three reviews,** read-only: security and custody, correctness against the plan and this design, and the tests' strength. They reported 18 findings, 2 of them major: 4 on security, 8 on correctness and 6 on the tests, five pairs of them the same defect. A refute-first fixer checked each against the code, the plan and this design, and each held. Of the 13 defects they name:
+  - 11 were fixed in code and tests;
+  - the X2 spike, which two findings asked for, was run (above);
+  - the blank-key text, two more, M3b.2 keeps by design (M3b.7, above).
+- **The records' review.** Two read-only reviews of these records were made, one for accuracy and one for the record rules. The second found that the three callers' refusals of a blank key printed the kind `internal`. That is fixed in `classified`, with a test that fails without the fix: `release`'s and `ensureRegistry`'s kind, and the JSON error of `storage ls` and `secret ls` run through the CLI's router.
+- **Mutation testing.** 301 mutants, each a copy compiled in with `go test -overlay`. 22 survived their first run. The tests were strengthened, and 16 of those 22 were then killed. In the final run 295 failed a test, and the 6 that still survive are equivalent:
+  - a sort of a list `os.ReadDir` had already sorted;
+  - two checks of a name that the next call checks first;
+  - a comparison of a key the caller had already matched;
+  - a path recomputed to the same string;
+  - `RemoveAll` in place of `Remove`, of a directory already emptied.
+- **The network guard.** Every test binary run in the build, the reviews, the fix round, the mutation proof and the final runs ran with `-race` under macOS's `sandbox-exec`, with M3a's profile, which refuses every outbound connection but loopback and local sockets, and refuses the system resolver's socket. That includes the mutants' and the X2 spike's test. The exceptions are listings of a binary's tests, which run none (the build's and the mutation proof's among them), and `./check.sh`'s own run.
+- **The gates,** 2026-11-26:
+  - `gofmt -l` prints nothing;
+  - `go vet`, with and without the `walk`, `integration` and `realapi` tags, is clean for `config`, `cli` and `storage`, and so is `golangci-lint` with those tags, as `./check.sh` runs it;
+  - under the guard, `config`'s 74 tests, `storage`'s 18 and `devicekey`'s 65 pass, and `cli`'s 979, with its two `TestHandOverModel*` skipped, as they are without `FARCAST_MODEL=1`;
+  - `./check.sh` passes on the dev Mac;
+  - the vendored modules stay 31, and the exec allowlist gains no entry.
+
+### What is not verified
+
+- **The field set** is fixed before its consumers exist, the plan's M3b.2 risk. M3b.7 is its first reader and M3b.14 its first writer, and either may amend it.
+- **The X2 check** held on one OS build, on arm64, as above.
+- **Concurrency** in the store: no step yet names a lock for it, as above.

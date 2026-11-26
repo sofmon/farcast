@@ -82,6 +82,7 @@ func kindOf(err error) string { return output.KindOf(err) }
 
 // classified is err with the kinds the router can infer for a command that
 // did not name one: an instance with no record on this machine is not_found,
+// a blank installer key refused where it is loaded is credential_missing,
 // and a failure clusterKind knows (the in-process cluster client's, and the
 // refusals of openCluster) carries that kind. Everything else unnamed is
 // internal.
@@ -95,6 +96,12 @@ func classified(err error) error {
 	}
 	if errors.Is(err, config.ErrNoInstanceRecord) {
 		return withKind(kindNotFound, err)
+	}
+	if errors.Is(err, config.ErrNoServiceAccountKey) {
+		// ADR 0024 M3b.2: release, the storage and secret commands and
+		// toolchain's registry ensure load the key themselves, under their own
+		// words; the kind is the one loadInstallerKey's refusal of it names.
+		return withKind(kindCredentialMissing, err)
 	}
 	if kind := clusterKind(err); kind != "" {
 		return withKind(kind, err)

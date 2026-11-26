@@ -138,7 +138,7 @@ func reproSession(t *testing.T) (*storage.Session, *reproProvider, config.Dir) {
 	if err := dir.SaveInstanceMetadata(name, meta); err != nil {
 		t.Fatal(err)
 	}
-	if err := dir.SaveInstanceCredentials(name, &config.InstanceCredentials{Provider: "gke"}); err != nil {
+	if err := dir.SaveInstanceCredentials(name, &config.InstanceCredentials{Provider: "gke", ServiceAccountKey: standInKey}); err != nil {
 		t.Fatal(err)
 	}
 	env, _ := testEnv(dir, output.ModeHuman)

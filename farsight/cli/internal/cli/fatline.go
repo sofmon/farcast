@@ -509,8 +509,9 @@ func checkCarried(carried carriedComponents, build func() buildinfo.Info) error 
 // Credentials, is refused with errCredentialMissing in the writer's words,
 // and the provider is never opened with it. So no deploying command, a
 // reconnect included, ensures a registry as this machine's ADC. The
-// package-level ensureRegistry, which toolchain calls, is unchanged: ADC
-// leaves it at M3b.
+// package-level ensureRegistry, which toolchain calls, reads the key through
+// config.LoadInstanceCredentials, which refuses a blank key too (ADR 0024
+// M3b.2, config.ErrNoServiceAccountKey), in its own words.
 func (d *fatlineDeployer) ensureRegistry(ctx context.Context, env *Env, name string, meta *config.InstanceMetadata) (*registryAccess, error) {
 	creds, err := loadInstallerKey(env.ConfigDir, name)
 	if err != nil {

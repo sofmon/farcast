@@ -152,7 +152,7 @@ These states are fixed. Each refusal has a fixed message and a test, and every o
 
 | After | Certificate-route record | Fallback-route record |
 |---|---|---|
-| M3b.1-M3b.6 | nothing reads `Identity` | As at 4bbbb5f. From M3b.4, a blank installer key fails closed in planck and datasphere instead of reaching ADC, and an empty node account keeps the default compute account (until M3b.14). |
+| M3b.1-M3b.6 | nothing reads `Identity` | As at 4bbbb5f. From M3b.4, a blank installer key fails closed in planck and datasphere instead of reaching ADC, and an empty node account keeps the default compute account (until M3b.14). *(2026-11-26, M3b.2: `release`, the commands that open storage (`storage ls`, `cp`, `rm`, `usage` and `key rekey`, and the `secret` commands) and `toolchain`'s registry ensure now refuse a blank installer key when they load it, as `credential_missing`, in words that do not end "nothing was sent". `loadInstallerKey`'s refusal still says "release it", which now names a command that refuses, until M3b.7's message replaces it.)* |
 | M3b.7 | Cluster reads, and plans' cluster reads, run as the federated reader. The writer refuses: "instance %q's writer on the certificate route opens from M3b.8". Google API calls refuse: "… from M3b.9". | Every record names its routes. A record with no `Identity` is refused by every command: "instance %q's record names no identity route; a farcast before M3b wrote it, and that is not supported". The message names no command that would itself refuse (Plan A's "release it" did). The writer (`credentials.yaml`) and the reader (`reader.key`) open through the one opener. |
 | M3b.8 | Cluster writes run as the federated writer, after consent. | The cluster writer reads `credentials.yaml` only after consent. Only D5's installer-minted Google reads still mint from it before consent, as at 4bbbb5f, until M3b.11. Interactive plans run as N1 says. |
 | M3b.9 | planck and registry writes run as the writer after consent. The installer-minted registry reads in plans refuse: "… as the reader from M3b.11". Storage, secret and `release` refuse: "… from M3b.10". | planck and the registry run through role token sources. The installer-minted registry reads keep the writer route's token, as at 4bbbb5f, until M3b.11. |
@@ -216,7 +216,7 @@ These states are fixed. Each refusal has a fixed message and a test, and every o
     - pool and provider IDs 32 long, SA IDs 30 long, condition titles 30 long, all `[a-z][a-z0-9]*`.
   - It also checks the fields each route requires. The M2-shape fallback routes from M3b.7 carry only the route. M3b.14 tightens fallback 3 to the drawn IDs.
   - `ServiceAccountEmail(id, project)`.
-  - config keeps its own regexps and does not import devicekey. `config_test.go` imports devicekey to check that every `NewObjectID` and `ConditionTitle` draw passes.
+  - config keeps its own regexps and does not import devicekey. `config_test.go` imports devicekey to check that every `NewObjectID` and `ConditionTitle` draw passes. *(2026-11-26, M3b.2: `identity_test.go` does.)*
 - **`config/instance.go`.**
   - `InstanceMetadata.Identity` (yaml `identity`).
   - `mergeOntoNewer` merges `Identity.Known` and `Identity.Roles` per key, as `SystemImages` is (:648-655).
@@ -225,17 +225,17 @@ These states are fixed. Each refusal has a fixed message and a test, and every o
 - **New file `config/pending.go`.**
   - The store: `<config>/pending/<name>/` at 0700, holding `pending.yaml` (0600) and `identity/`.
   - `Pending{Kind (install | device_add), Name, Provider, Project, Region, CostLimit, CreatedAt, State, Draw{Pool, ReaderProvider, WriterProvider, ReaderAccount, WriterAccount, NodeAccount, ConditionTitle}, Route, ProjectNumber}`.
-  - States: `keys_made`, `setup_shown`, `coordinates_received`. *(2026-11-26, M3b.1: and one recording that a role's verification passed, written before `EnrolmentVerified`, which M3b.14's resume reads.)*
+  - States: `keys_made`, `setup_shown`, `coordinates_received`. *(2026-11-26, M3b.1: and one recording that a role's verification passed, written before `EnrolmentVerified`, which M3b.14's resume reads.)* *(2026-11-26, M3b.2: built as `verified`, which the hand-off requires of an entry holding keys or a certificate route ([the design's §13](adr-0024-design.md#13-amendments-from-m3b2s-build-2026-11-26), departure 1).)*
   - Functions: `CreatePending` (exclusive `Mkdir`), `Save`/`LoadPending` (atomic; through `readFile`, so `ObserveReads` sees it), `ListPending`, `PendingExists` and `RemovePending` (refuses a symlink). Names are validated before any path is built.
   - **`AdoptPending(name, meta)`** hands off in pitfall 10.1's order:
     1. `CreateInstance`;
-    2. `SaveInstanceMetadata`, with `Identity` and status `provisioning`;
+    2. `SaveInstanceMetadata`, with `Identity` and status `provisioning`; *(2026-11-26, M3b.2: `running` for a device add's entry, whose instance is there already (M3b.16).)*
     3. rename `identity/` into the instance;
     4. `RemovePending`.
 
     It refuses an existing destination `identity/`.
   - **`ResumeAdoption(name)`** finishes a hand-off when both the record and the pending entry exist.
-- **X2 spike** (no shipped code). It answers whether a cgo-free raw `getattrlist(ATTR_CMN_EXTENDED_SECURITY)` through the already-linked x/sys/unix reports an inherited ACL on the dev Mac. That is [unverified]: x/sys has no wrapper, and Apple does not support raw syscalls. The result feeds X2's enforcement decision before M3b.14.
+- **X2 spike** (no shipped code). It answers whether a cgo-free raw `getattrlist(ATTR_CMN_EXTENDED_SECURITY)` through the already-linked x/sys/unix reports an inherited ACL on the dev Mac. That is [unverified]: x/sys has no wrapper, and Apple does not support raw syscalls. The result feeds X2's enforcement decision before M3b.14. *(2026-11-26, M3b.2: run as scratch code, twice: yes on the dev Mac, with costs ([the design's §13](adr-0024-design.md#13-amendments-from-m3b2s-build-2026-11-26)).)*
 
 **Tests.**
 - Round trip; the per-key merge under two concurrent writers.
@@ -248,9 +248,9 @@ These states are fixed. Each refusal has a fixed message and a test, and every o
 
 **Unwired** until M3b.7, where the opener reads the record, and M3b.14, where `install` writes it.
 
-**Size.** About 450 product lines and 700 test lines.
+**Size.** About 450 product lines and 700 test lines. *(2026-11-26, M3b.2: about 1,550 and 3,200.)*
 
-**Risks.** The field set is fixed before its consumers exist, so expect a dated design amendment.
+**Risks.** The field set is fixed before its consumers exist, so expect a dated design amendment. *(2026-11-26, M3b.2: the design's §13 records what the build changed.)*
 
 ### M3b.3: kube, the federated credential, role tokens and IAM's read host (unwired; Q3)
 
@@ -830,12 +830,12 @@ The tests:
   6. `verifyEnrolment` for both roles, with the in-memory identities, or `OpenForEnrolment` when resumed. *(2026-11-26, M3b.1: the pending state records "verified" before `EnrolmentVerified`, and a resume that meets `ErrNotEnrolling` has nothing left to verify.)*
   7. `planck.Open` with the reader's tokens, then `Validate`, as the reader [inf: `clusterViewer` carries `container.clusters.list`].
   8. `warnIfBelowFloor`, then consent by y/N (`ConsentAnswered`) or `--yes` (`ConsentYes`).
-  9. `AdoptPending`, which puts the record, `Identity` and the keys in place before any cluster call. A resume that finds both a record and a pending entry runs `ResumeAdoption`.
+  9. `AdoptPending`, which puts the record, `Identity` and the keys in place before any cluster call. A resume that finds both a record and a pending entry runs `ResumeAdoption`. *(2026-11-26, M3b.2: `AdoptPending` refuses an entry not at `verified` while it holds keys or a certificate route. So step 6 ends by saving `verified` and then calling `EnrolmentVerified` for each role, before step 9 hands off; a resume that finds `verified` calls `EnrolmentVerified` again first.)*
   10. `planck.Open` with the writer's tokens, then `CreateCluster` with `NodeServiceAccount`, the registry with the node account as puller, and the health check.
 - **`--abandon`.**
   - It acts on a pending entry of kind `install` only, and refuses when a record exists.
   - It prints `setupblock.Abandon` from `pending.yaml`'s IDs, with its SHA-256, and JSON `teardown`.
-  - It erases the pending keys (`Store.Erase`), then the entry.
+  - It erases the pending keys (`Store.Erase`), then the entry. *(2026-11-26, M3b.2: first `PendingOnly`, then the erasure, then `RemovePending`, which also removes an instance directory that a stopped hand-off left with no record.)*
 - **Fallback 3, `--google-made-key <file>`** (Q16's specifics):
   - the `GoogleMadeKey` block and console steps;
   - a terminal question only, "Google made this key; it does not expire". It is never under `--yes`, and refused when not interactive;
@@ -845,7 +845,7 @@ The tests:
 - **Removed:** `--credentials`, `readCredentials`, `msgCredentialsRequired` and `msgCredentialsEmpty`.
 - **`installResult`** gains `identity_route` and `roles`.
 - **Custody:** `install.go`'s importer, and its `Enrol` and `OpenForEnrolment` sites, are listed.
-- **X2:** enforced as decided (§7).
+- **X2:** enforced as decided (§7). *(2026-11-26, M3b.2: the spike answered yes on the dev Mac; a shipped check would cost a raw system call Apple does not support [inf] and FarCast's first `unsafe` import outside a test ([the design's §13](adr-0024-design.md#13-amendments-from-m3b2s-build-2026-11-26)).)*
 
 **Owns.**
 - R19: an install that makes a key, or shows a block, for a recorded or pending name (an `Enrol` seam proves no key is made); or that calls `CreateCluster` before the record holds the keys and the coordinates. A fake planck checks both crash windows.
@@ -912,7 +912,7 @@ The tests:
     1. Take the device-coordinates line.
     2. Make a pending entry of kind `device_add`, then `Enrol` into it.
     3. Show `AddDevice`'s block, then wait for Enter, then verify.
-    4. Create the record through `AdoptPending`:
+    4. Create the record through `AdoptPending`: *(2026-11-26, M3b.2: with the status `running`, which `AdoptPending` requires of a `device_add` entry, and only once the entry is at `verified` and `EnrolmentVerified` has run, as for an install ([the design's §13](adr-0024-design.md#13-amendments-from-m3b2s-build-2026-11-26), departure 1).)*
        - the region comes from the line;
        - the endpoint from `planck.Open` as the reader;
        - the cost limit from the kernel's in-cluster record, read as the reader, or "unknown";
@@ -1077,7 +1077,7 @@ Each of these has a default this plan would build, but either the default is ris
    - **Why it matters:** it widens D6's bearer-host rule, and it adds a provider-visible IAM read to every enrolment, every `device ls` and every `world` refresh. Without it there is no read-back, which is D4's binding check, no `device ls`, and no unknown-provider mark, so D4 reopens. It blocks M3b.3.
 3. **X2: where the identity store lives, and whether the ACL limit is enforced.**
    - **Default placement:** `instances/<name>/identity` and `pending/<name>/identity`, both under the 0700 config root.
-   - **Default enforcement:** mode bits only, the limit documented, and `ls -led` checked at the walk. A darwin-only check, with stubs for the linux and windows builds, is added only if M3b.2's spike shows that a cgo-free raw `getattrlist` through the already-linked x/sys/unix reports an ACL. That is [unverified]: x/sys has the constant but no wrapper.
+   - **Default enforcement:** mode bits only, the limit documented, and `ls -led` checked at the walk. A darwin-only check, with stubs for the linux and windows builds, is added only if M3b.2's spike shows that a cgo-free raw `getattrlist` through the already-linked x/sys/unix reports an ACL. That is [unverified]: x/sys has the constant but no wrapper. *(2026-11-26, M3b.2: it does, on the dev Mac. A shipped check would cost a raw system call Apple does not support [inf] and FarCast's first `unsafe` import outside a test; X2's enforcement is decided before M3b.14 ([the design's §13](adr-0024-design.md#13-amendments-from-m3b2s-build-2026-11-26).)*
    - **Why it matters:** M3b places real anchor keys there. An inherited ACL can let another account read a 0600 writer anchor key, which mints project-wide writer tokens for up to 390 days.
    - **When:** the placement blocks M3b.2; the enforcement decision is due before M3b.14.
 4. **Q9: the installer-minted reads run as the reader, with resource-scoped grants.**

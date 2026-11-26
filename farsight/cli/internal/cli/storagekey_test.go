@@ -212,7 +212,7 @@ func newStorageEnv(t *testing.T, mode output.Mode) (*Env, *bytes.Buffer, *bytes.
 	if err := dir.SaveInstanceMetadata("prod", meta); err != nil {
 		t.Fatalf("SaveInstanceMetadata: %v", err)
 	}
-	if err := dir.SaveInstanceCredentials("prod", &config.InstanceCredentials{Provider: "gke"}); err != nil {
+	if err := dir.SaveInstanceCredentials("prod", &config.InstanceCredentials{Provider: "gke", ServiceAccountKey: standInKey}); err != nil {
 		t.Fatalf("SaveInstanceCredentials: %v", err)
 	}
 	mintKeyring(t, dir, "prod")

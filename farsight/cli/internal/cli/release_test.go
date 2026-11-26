@@ -45,7 +45,7 @@ func recordInstance(t *testing.T, dir config.Dir, name, provider string) {
 	if err := dir.SaveInstanceMetadata(name, meta); err != nil {
 		t.Fatalf("SaveInstanceMetadata: %v", err)
 	}
-	if err := dir.SaveInstanceCredentials(name, &config.InstanceCredentials{Provider: provider}); err != nil {
+	if err := dir.SaveInstanceCredentials(name, &config.InstanceCredentials{Provider: provider, ServiceAccountKey: standInKey}); err != nil {
 		t.Fatalf("SaveInstanceCredentials: %v", err)
 	}
 }

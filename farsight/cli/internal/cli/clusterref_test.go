@@ -552,9 +552,12 @@ func TestOpenClusterRefusesTheWriterInOrder(t *testing.T) {
 			t.Fatal(err)
 		}
 		// The fixture is only worth its name if the library's text would
-		// have leaked the key.
-		if _, err := dir.LoadInstanceCredentials(name); err == nil || !keyBytesIn(err.Error(), writer.PrivateKeyPEM) {
-			t.Fatalf("the corrupt credentials.yaml's own parse error = %v; want one that quotes the key", err)
+		// have leaked the key. config.LoadInstanceCredentials' own text
+		// quotes none of the file (ADR 0024 M3b.2's fix round, S3); the
+		// library's error it unwraps to does.
+		_, err = dir.LoadInstanceCredentials(name)
+		if inner := errors.Unwrap(err); err == nil || inner == nil || !keyBytesIn(inner.Error(), writer.PrivateKeyPEM) {
+			t.Fatalf("the corrupt credentials.yaml's own parse error = %v; want one whose YAML error quotes the key", err)
 		}
 	}
 	for _, row := range []struct {

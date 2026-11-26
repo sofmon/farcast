@@ -171,13 +171,22 @@ func writerCredential(r clusterRef) (kube.Credential, error) {
 // by config.ParseFault's fault and position, never by the YAML library's
 // text, which can echo the source lines. A missing, unreadable or
 // unparsable file, and a blank key (an instance installed with Application
-// Default Credentials), are each refused with errCredentialMissing, before
-// anything is opened with the key.
+// Default Credentials, which config.LoadInstanceCredentials refuses as
+// config.ErrNoServiceAccountKey), are each refused with
+// errCredentialMissing, before anything is opened with the key.
+//
+// The blank key's text is kept as it was at ADR 0024 M3b.2 (its decision
+// 3), though the 'farcast release' it names now refuses such an instance at
+// the same load; the M3b plan's M3b.7 replaces it with a refusal that names
+// no command that would itself refuse.
 func loadInstallerKey(dir config.Dir, name string) (*config.InstanceCredentials, error) {
 	creds, err := dir.LoadInstanceCredentials(name)
 	if err != nil {
 		var pe *fs.PathError
 		switch {
+		case errors.Is(err, config.ErrNoServiceAccountKey):
+			return nil, refuse(errCredentialMissing, "instance %q was installed without a service-account key (Application Default Credentials), "+
+				"which farcast no longer uses for its cluster (ADR 0023 M2); release it ('farcast release %s') and install a new instance with --credentials", name, name)
 		case errors.Is(err, fs.ErrNotExist):
 			return nil, refuse(errCredentialMissing, "instances/%s/credentials.yaml is missing; this machine holds no installer key for instance %q; nothing was sent", name, name)
 		case errors.As(err, &pe):
@@ -189,10 +198,6 @@ func loadInstallerKey(dir config.Dir, name string) (*config.InstanceCredentials,
 			fault = "a YAML error"
 		}
 		return nil, refuse(errCredentialMissing, "instance %q's credentials.yaml does not parse (%s); nothing was sent", name, fault)
-	}
-	if strings.TrimSpace(creds.ServiceAccountKey) == "" {
-		return nil, refuse(errCredentialMissing, "instance %q was installed without a service-account key (Application Default Credentials), "+
-			"which farcast no longer uses for its cluster (ADR 0023 M2); release it ('farcast release %s') and install a new instance with --credentials", name, name)
 	}
 	return creds, nil
 }

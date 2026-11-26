@@ -184,8 +184,80 @@ func recordInstance(t *testing.T, dir config.Dir, name, provider string, store *
 	if err := dir.SaveInstanceMetadata(name, meta); err != nil {
 		t.Fatalf("SaveInstanceMetadata: %v", err)
 	}
-	if err := dir.SaveInstanceCredentials(name, &config.InstanceCredentials{Provider: provider}); err != nil {
+	if err := dir.SaveInstanceCredentials(name, &config.InstanceCredentials{Provider: provider, ServiceAccountKey: standInKey}); err != nil {
 		t.Fatalf("SaveInstanceCredentials: %v", err)
+	}
+}
+
+// standInKey is recordInstance's installer key: not blank, which
+// config.LoadInstanceCredentials refuses, and not a key; the fakes never
+// read it.
+const standInKey = `{"type":"service_account","note":"a stand-in; no test parses it"}`
+
+// ADR 0024 M3b.2: an instance whose credentials.yaml holds a blank key, or
+// one of white space, is refused before any provider opens, with
+// config.ErrNoServiceAccountKey under Open's own "load credentials for"
+// words, so the adapter never reads an empty credential as "use Application
+// Default Credentials".
+func TestOpenRefusesABlankInstallerKey(t *testing.T) {
+	for _, row := range []struct{ name, key string }{{"blank", ""}, {"white space", " \n\t"}} {
+		t.Run(row.name, func(t *testing.T) {
+			dir := newTestDir(t)
+			opened := 0
+			suffix := strings.ReplaceAll(t.Name(), "/", "-")
+			storageName, computeName := "ds-blank-key-"+suffix, "compute-blank-key-"+suffix
+			datasphere.Register(storageName, func(datasphere.Config) (datasphere.Provider, error) {
+				opened++
+				return newFakeProvider(dir, "prod"), nil
+			})
+			storageProviders[computeName] = storageName
+			t.Cleanup(func() { delete(storageProviders, computeName) })
+			recordInstance(t, dir, "prod", computeName, nil)
+			if err := dir.SaveInstanceCredentials("prod", &config.InstanceCredentials{Provider: computeName, ServiceAccountKey: row.key}); err != nil {
+				t.Fatal(err)
+			}
+			session, err := Open(context.Background(), Options{Dir: dir, Instance: "prod", Mint: true})
+			if session != nil || !errors.Is(err, config.ErrNoServiceAccountKey) || !strings.HasPrefix(err.Error(), `load credentials for "prod": `) {
+				t.Errorf("Open = %v, %v; want the blank key refused under Open's words", session != nil, err)
+			}
+			if opened != 0 {
+				t.Errorf("the provider was opened %d times with no key", opened)
+			}
+			if s := loadStorage(t, dir, "prod"); s != nil {
+				t.Errorf("a refused Open recorded storage: %+v", s)
+			}
+		})
+	}
+}
+
+// ADR 0024 M3b.2 (the fix round's S3): a credentials.yaml that does not
+// parse is refused before any provider opens, under Open's own "load
+// credentials for" words, quoting no byte of the file: the YAML library's
+// text would quote the lines around the fault, which hold the installer's
+// private key.
+func TestOpenQuotesNoKeyOfACredentialsFileThatDoesNotParse(t *testing.T) {
+	const secret = "MIIEvSECRETSECRET"
+	dir := newTestDir(t)
+	opened := 0
+	storageName, computeName := "ds-parse-fault", "compute-parse-fault"
+	datasphere.Register(storageName, func(datasphere.Config) (datasphere.Provider, error) {
+		opened++
+		return newFakeProvider(dir, "prod"), nil
+	})
+	storageProviders[computeName] = storageName
+	t.Cleanup(func() { delete(storageProviders, computeName) })
+	recordInstance(t, dir, "prod", computeName, nil)
+	body := "provider: " + computeName + "\nservice_account_key: |\n  {\"private_key\": \"-----BEGIN PRIVATE KEY-----\\n" + secret + "\"}\n bad: [\n"
+	if err := os.WriteFile(filepath.Join(dir.InstancePath("prod"), "credentials.yaml"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	session, err := Open(context.Background(), Options{Dir: dir, Instance: "prod", Mint: true})
+	if session != nil || err == nil || strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), "PRIVATE") ||
+		!strings.HasPrefix(err.Error(), `load credentials for "prod": parse `) {
+		t.Errorf("Open = %v, %v; want the fault refused, quoting none of the file", session != nil, err)
+	}
+	if opened != 0 {
+		t.Errorf("the provider was opened %d times", opened)
 	}
 }
 
@@ -641,7 +713,7 @@ func TestAnEmptyBucketNameCountsAsNoStorage(t *testing.T) {
 	if err := dir.SaveInstanceMetadata(name, meta); err != nil {
 		t.Fatal(err)
 	}
-	if err := dir.SaveInstanceCredentials(name, &config.InstanceCredentials{Provider: "gke"}); err != nil {
+	if err := dir.SaveInstanceCredentials(name, &config.InstanceCredentials{Provider: "gke", ServiceAccountKey: standInKey}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -693,7 +765,7 @@ func TestTheApplicationScopeIsMintedWithTheKeyring(t *testing.T) {
 	if err := dir.SaveInstanceMetadata(name, meta); err != nil {
 		t.Fatal(err)
 	}
-	if err := dir.SaveInstanceCredentials(name, &config.InstanceCredentials{Provider: "gke"}); err != nil {
+	if err := dir.SaveInstanceCredentials(name, &config.InstanceCredentials{Provider: "gke", ServiceAccountKey: standInKey}); err != nil {
 		t.Fatal(err)
 	}
 

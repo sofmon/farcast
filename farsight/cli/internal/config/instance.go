@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -393,6 +394,14 @@ type InstanceMetadata struct {
 	// before readers existed still loads.
 	Reader *Reader `yaml:"reader,omitempty"`
 
+	// Identity is the instance's identity on this machine (ADR 0024): the
+	// drawn IDs of its pool and its three service accounts, the project's
+	// number, and this device's roles, each with its route. Nil on a record
+	// that names no route. Pointer-typed like Reader. It is merged field by
+	// field, its Roles per role and its Known per provider (see
+	// mergeOntoNewer), and CheckedIdentity checks it before it is used.
+	Identity *Identity `yaml:"identity,omitempty"`
+
 	// CloudLogging is the provider's logging configuration for the cluster, as
 	// the provider read it back at install (ADR 0019). CloudLoggingSystem means
 	// configured to collect its mandatory system logs only — not the
@@ -479,8 +488,10 @@ type MTLSMaterial struct {
 	ServerKeyPEM  []byte
 }
 
-// InstanceCredentials is the secret credential material for an instance. An
-// empty ServiceAccountKey means ambient / Application Default Credentials.
+// InstanceCredentials is the secret credential material for an instance:
+// the installer's service-account key. LoadInstanceCredentials refuses a
+// blank key (ErrNoServiceAccountKey): farcast never falls back to the
+// machine's Application Default Credentials.
 type InstanceCredentials struct {
 	Provider          string `yaml:"provider"`
 	ServiceAccountKey string `yaml:"service_account_key,omitempty"`
@@ -491,6 +502,54 @@ func (d Dir) instanceDir(n string) string { return filepath.Join(d.instancesDir(
 
 // InstancePath returns an instance's on-disk directory (for display).
 func (d Dir) InstancePath(name string) string { return d.instanceDir(name) }
+
+// MaxInstanceName is the longest instance name 'farcast install' accepts,
+// so the cluster's name, farcast- and the name, stays within GKE's 40.
+const MaxInstanceName = 32
+
+// ValidateInstanceName is the rule 'farcast install' names an instance by,
+// config's own copy (cli's validateInstanceName; a cli test holds the two to
+// agree): a lowercase letter first, then lowercase letters, digits and
+// hyphens, not ending with a hyphen, at most MaxInstanceName characters. A
+// name that passes it is one path segment, with no separator, no dot and no
+// control character, so the pending store and the identity paths check it
+// before they build any path from it.
+func ValidateInstanceName(name string) error {
+	switch {
+	case name == "":
+		return errors.New("instance name is required")
+	case len(name) > MaxInstanceName:
+		return fmt.Errorf("instance name %q is too long (max %d characters)", name, MaxInstanceName)
+	case name[0] < 'a' || name[0] > 'z':
+		return fmt.Errorf("instance name %q must start with a lowercase letter", name)
+	case name[len(name)-1] == '-':
+		return fmt.Errorf("instance name %q must not end with a hyphen", name)
+	}
+	for i := range len(name) {
+		switch ch := name[i]; {
+		case ch >= 'a' && ch <= 'z', ch >= '0' && ch <= '9', ch == '-':
+		default:
+			return fmt.Errorf("instance name %q has an invalid character %q (use lowercase letters, digits, hyphens)", name, string(ch))
+		}
+	}
+	return nil
+}
+
+// InstanceIdentityDir is the directory an instance's device keys live in,
+// <config>/instances/<name>/identity, devicekey's store. It refuses a name
+// 'farcast install' would refuse before it builds the path, and a symbolic
+// link, a non-directory or a directory other accounts can reach in place of
+// instances/, instances/<name>/ or identity/, where each is there
+// (ErrUnsafePath). It needs none of them to be there.
+func (d Dir) InstanceIdentityDir(name string) (string, error) {
+	if err := ValidateInstanceName(name); err != nil {
+		return "", err
+	}
+	if err := checkTree(d.instancesDir(), name, identitySubdir); err != nil {
+		return "", err
+	}
+	return filepath.Join(d.instanceDir(name), identitySubdir), nil
+}
 
 // InstanceExists reports whether an instance directory already exists.
 func (d Dir) InstanceExists(name string) (bool, error) {
@@ -614,11 +673,14 @@ func (d Dir) SaveInstanceMetadata(name string, m *InstanceMetadata) error {
 //
 // Top-level granularity is the right grain here: each command owns a distinct
 // subtree of this struct, so two commands writing the same field at once means
-// two commands doing the same job. SystemImages is the one exception: it is a
-// map that every deploying command writes its own key of, so 'redeploy' and
-// 'kernel deploy' running at once would collide on the whole field while each
-// touched only its own component. It is merged per key instead, with the same
-// three-way rule (a missing key counts as a value).
+// two commands doing the same job. SystemImages and Identity are the
+// exceptions. SystemImages is a map that every deploying command writes its
+// own key of, so 'redeploy' and 'kernel deploy' running at once would collide
+// on the whole field while each touched only its own component. It is merged
+// per key instead, with the same three-way rule (a missing key counts as a
+// value). Identity is merged field by field, its Roles per role and its Known
+// per provider, with the same rule (mergeIdentity): a 'device known' and a
+// 'device renew' running at once each touch their own entry.
 func mergeOntoNewer(baseRaw []byte, mine *InstanceMetadata, newerRaw []byte) (*InstanceMetadata, error) {
 	var base, newer InstanceMetadata
 	if err := yaml.Unmarshal(baseRaw, &base); err != nil {
@@ -651,6 +713,14 @@ func mergeOntoNewer(baseRaw []byte, mine *InstanceMetadata, newerRaw []byte) (*I
 				return nil, err
 			}
 			out.SystemImages = merged
+			continue
+		}
+		if f.Name == "Identity" {
+			merged, err := mergeIdentity(base.Identity, mine.Identity, newer.Identity)
+			if err != nil {
+				return nil, err
+			}
+			out.Identity = merged
 			continue
 		}
 		baseF, mineF, newerF := bv.Field(i).Interface(), mv.Field(i).Interface(), ov.Field(i).Interface()
@@ -816,7 +886,37 @@ func (d Dir) SaveInstanceCredentials(name string, c *InstanceCredentials) error 
 	return d.writeInstanceFile(name, credentialsFile, data)
 }
 
-// LoadInstanceCredentials reads credentials.yaml for an instance.
+// ErrNoServiceAccountKey is a credentials.yaml that holds no service-account
+// key, or one of white space alone: an instance installed with the machine's
+// Application Default Credentials, which farcast no longer reaches for.
+var ErrNoServiceAccountKey = errors.New("no service-account key; farcast never uses Application Default Credentials")
+
+// credentialsParseError is a credentials.yaml that does not parse. Its text
+// is the file's path and ParseFault's fault and position alone, never the
+// YAML library's own text, which quotes the lines around the fault, and
+// those can hold the installer's private key; every caller of
+// LoadInstanceCredentials prints what it returns. It unwraps to the
+// library's error, so ParseFault and errors.As still read it.
+type credentialsParseError struct {
+	path string
+	err  error
+}
+
+func (e *credentialsParseError) Error() string {
+	fault, ok := ParseFault(e.err)
+	if !ok {
+		fault = "a YAML error"
+	}
+	return fmt.Sprintf("parse %s: %s", e.path, fault)
+}
+
+func (e *credentialsParseError) Unwrap() error { return e.err }
+
+// LoadInstanceCredentials reads credentials.yaml for an instance. A blank
+// key, or one of white space alone, is refused with ErrNoServiceAccountKey,
+// so no caller hands an adapter an empty credential that it would read as
+// "use the machine's Application Default Credentials". A file that does not
+// parse is refused in words that quote none of it (credentialsParseError).
 func (d Dir) LoadInstanceCredentials(name string) (*InstanceCredentials, error) {
 	path := filepath.Join(d.instanceDir(name), credentialsFile)
 	data, err := readFile(path)
@@ -825,7 +925,10 @@ func (d Dir) LoadInstanceCredentials(name string) (*InstanceCredentials, error) 
 	}
 	var c InstanceCredentials
 	if err := yaml.Unmarshal(data, &c); err != nil {
-		return nil, fmt.Errorf("parse %s: %w", path, err)
+		return nil, &credentialsParseError{path: path, err: err}
+	}
+	if strings.TrimSpace(c.ServiceAccountKey) == "" {
+		return nil, fmt.Errorf("%s: %w", path, ErrNoServiceAccountKey)
 	}
 	return &c, nil
 }

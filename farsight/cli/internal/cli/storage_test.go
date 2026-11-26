@@ -240,7 +240,7 @@ func newDataEnv(t *testing.T, mode output.Mode) (*Env, *bytes.Buffer, *bytes.Buf
 	if err := dir.SaveInstanceMetadata("prod", meta); err != nil {
 		t.Fatalf("SaveInstanceMetadata: %v", err)
 	}
-	if err := dir.SaveInstanceCredentials("prod", &config.InstanceCredentials{Provider: "gke"}); err != nil {
+	if err := dir.SaveInstanceCredentials("prod", &config.InstanceCredentials{Provider: "gke", ServiceAccountKey: standInKey}); err != nil {
 		t.Fatalf("SaveInstanceCredentials: %v", err)
 	}
 	return env, out, errb, dir, f
