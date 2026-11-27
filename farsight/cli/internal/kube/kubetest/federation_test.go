@@ -293,6 +293,10 @@ func TestFakeSTSAppliesTheTrustStoreAndTheCondition(t *testing.T) {
 	otherCN := fedID(t)
 	wrongIssuer := newFedPair(t, otherCN, r.id)
 	audWrongIssuer := fedAddRole(t, fake, "provissuer1", wrongIssuer, r.id)
+	// A provider whose condition pins another ID than the one its anchor and
+	// leaf both name: the stored condition decides, not their agreement.
+	pinnedElsewhere := newFedRole(t)
+	audPinnedElsewhere := fedAddRole(t, fake, "provpinned1", pinnedElsewhere, otherCN)
 	wrongSubjectDER, wrongSubjectKey := r.issue(t, otherCN, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour), []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth})
 	expiredDER, expiredKey := r.issue(t, r.id, time.Now().Add(-48*time.Hour), time.Now().Add(-24*time.Hour), []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth})
 	serverDER, serverKey := r.issue(t, r.id, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour), []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth})
@@ -312,8 +316,10 @@ func TestFakeSTSAppliesTheTrustStoreAndTheCondition(t *testing.T) {
 		{"the role's own leaf", [][]byte{r.leafDER}, r.leafKey, aud, http.StatusOK, ""},
 		{"a leaf under a foreign anchor", [][]byte{foreign.leafDER}, foreign.leafKey, aud, http.StatusBadRequest, "invalid_grant"},
 		{"a leaf naming the ID under another anchor", [][]byte{foreignSameID.leafDER}, foreignSameID.leafKey, aud, http.StatusBadRequest, "invalid_grant"},
+		{"the role's own leaf at another provider's audience pinning its ID", [][]byte{r.leafDER}, r.leafKey, audWrongIssuer, http.StatusBadRequest, "invalid_grant"},
 		{"a leaf whose CN is another ID", [][]byte{wrongSubjectDER}, wrongSubjectKey, aud, http.StatusBadRequest, "unauthorized_client"},
 		{"an anchor whose CN is another ID", [][]byte{wrongIssuer.leafDER}, wrongIssuer.leafKey, audWrongIssuer, http.StatusBadRequest, "unauthorized_client"},
+		{"an anchor and a leaf agreeing on an ID the condition does not pin", [][]byte{pinnedElsewhere.leafDER}, pinnedElsewhere.leafKey, audPinnedElsewhere, http.StatusBadRequest, "unauthorized_client"},
 		{"an expired leaf", [][]byte{expiredDER}, expiredKey, aud, http.StatusBadRequest, "invalid_grant"},
 		{"a leaf for server authentication", [][]byte{serverDER}, serverKey, aud, http.StatusBadRequest, "invalid_grant"},
 		{"an audience naming no provider", [][]byte{r.leafDER}, r.leafKey, unknownAud, http.StatusBadRequest, "invalid_target"},
@@ -372,8 +378,9 @@ func fedFederatedToken(t *testing.T, fake *kubetest.Federation, r fedRole, aud s
 
 // TestFakeIAMCredentialsChecksBearerBodyAndBinding: generateAccessToken needs
 // a federated token the STS fake issued, a body of exactly scope and lifetime
-// read by their exact keys, and a binding of the token's role ID to the
-// account.
+// read by their exact keys, its scope one of kube's closed list (N9), and a
+// binding of the token's role ID to the account; each token issued is kept
+// with its role ID, email and scopes.
 func TestFakeIAMCredentialsChecksBearerBodyAndBinding(t *testing.T) {
 	fake := kubetest.NewFederation(t)
 	r := newFedRole(t)
@@ -384,7 +391,7 @@ func TestFakeIAMCredentialsChecksBearerBodyAndBinding(t *testing.T) {
 	gat := func(email string) string {
 		return "https://" + fake.IAMAddr() + "/v1/projects/-/serviceAccounts/" + email + ":generateAccessToken"
 	}
-	body := string(kube.ImpersonationBody())
+	body := string(kube.ImpersonationBody(kube.ScopesCluster))
 	for _, row := range []struct {
 		name, target, bearer, body string
 		code                       int
@@ -398,7 +405,11 @@ func TestFakeIAMCredentialsChecksBearerBodyAndBinding(t *testing.T) {
 		{"no lifetime", gat(fedSA), tok, `{"scope":["` + kube.ScopeCloudPlatform + `","` + kube.ScopeUserinfoEmail + `"]}`, http.StatusBadRequest, "INVALID_ARGUMENT", r.id},
 		{"a lifetime with no unit", gat(fedSA), tok, `{"scope":["` + kube.ScopeCloudPlatform + `","` + kube.ScopeUserinfoEmail + `"],"lifetime":"3600"}`, http.StatusBadRequest, "INVALID_ARGUMENT", r.id},
 		{"the scopes reversed", gat(fedSA), tok, `{"scope":["` + kube.ScopeUserinfoEmail + `","` + kube.ScopeCloudPlatform + `"],"lifetime":"3600s"}`, http.StatusBadRequest, "INVALID_ARGUMENT", r.id},
-		{"one scope", gat(fedSA), tok, `{"scope":["` + kube.ScopeCloudPlatform + `"],"lifetime":"3600s"}`, http.StatusBadRequest, "INVALID_ARGUMENT", r.id},
+		{"userinfo.email alone", gat(fedSA), tok, `{"scope":["` + kube.ScopeUserinfoEmail + `"],"lifetime":"3600s"}`, http.StatusBadRequest, "INVALID_ARGUMENT", r.id},
+		{"storage beside cloud-platform", gat(fedSA), tok, `{"scope":["` + kube.ScopeCloudPlatform + `","` + kube.ScopeDevstorageFullControl + `"],"lifetime":"3600s"}`, http.StatusBadRequest, "INVALID_ARGUMENT", r.id},
+		{"no scope", gat(fedSA), tok, `{"scope":[],"lifetime":"3600s"}`, http.StatusBadRequest, "INVALID_ARGUMENT", r.id},
+		{"cloud-platform alone (ScopesRegistry)", gat(fedSA), tok, string(kube.ImpersonationBody(kube.ScopesRegistry)), http.StatusOK, "", r.id},
+		{"devstorage.full_control alone (ScopesStorage)", gat(fedSA), tok, string(kube.ImpersonationBody(kube.ScopesStorage)), http.StatusOK, "", r.id},
 		{"not JSON", gat(fedSA), tok, `scope=x`, http.StatusBadRequest, "INVALID_ARGUMENT", r.id},
 		{"an account the role is not bound to", gat(fedOtherSA), tok, body, http.StatusForbidden, "PERMISSION_DENIED", r.id},
 		{"another path", "https://" + fake.IAMAddr() + "/v1/projects/-/serviceAccounts/" + fedSA, tok, body, http.StatusNotFound, "NOT_FOUND", r.id},
@@ -422,36 +433,69 @@ func TestFakeIAMCredentialsChecksBearerBodyAndBinding(t *testing.T) {
 			}
 		}
 	}
+	// The registry holds the three tokens issued, each with what it was
+	// issued for.
+	var got []string
+	for _, sa := range fake.ServiceAccountTokens() {
+		if sa.RoleID != r.id || sa.Email != fedSA || time.Until(sa.Expires) < 59*time.Minute || time.Until(sa.Expires) > 61*time.Minute {
+			t.Errorf("a registered token is not the bound account's for an hour: %+v", sa)
+		}
+		got = append(got, strings.Join(sa.Scopes, " "))
+	}
+	slices.Sort(got)
+	want := []string{
+		kube.ScopeCloudPlatform,
+		kube.ScopeCloudPlatform + " " + kube.ScopeUserinfoEmail,
+		kube.ScopeDevstorageFullControl,
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("the registry's scopes are %q, want %q", got, want)
+	}
 }
 
 // TestFakeFederationRecordsNoTokenValue: neither a federated nor a service
-// account token, nor any Authorization value, is in what the fakes record;
-// Authorization is recorded by name alone.
+// account token, nor any Authorization value, is in what the fakes record,
+// at IAM Credentials or at IAM's API; Authorization is recorded by name
+// alone.
 func TestFakeFederationRecordsNoTokenValue(t *testing.T) {
 	fake := kubetest.NewFederation(t)
 	r := newFedRole(t)
 	aud := fedAddRole(t, fake, "provreader1", r, r.id)
 	fake.Bind(r.id, fedSA)
+	fake.GrantPoolViewer(fedSA)
 	fedTok := fedFederatedToken(t, fake, r, aud)
 	code, m := fedPost(t, fedHTTP(fake, nil, nil, tls.VersionTLS12),
-		"https://"+fake.IAMAddr()+"/v1/projects/-/serviceAccounts/"+fedSA+":generateAccessToken", "application/json", fedTok, string(kube.ImpersonationBody()))
+		"https://"+fake.IAMAddr()+"/v1/projects/-/serviceAccounts/"+fedSA+":generateAccessToken", "application/json", fedTok, string(kube.ImpersonationBody(kube.ScopesCluster)))
 	saTok, _ := m["accessToken"].(string)
 	if code != http.StatusOK || saTok == "" {
 		t.Fatalf("the impersonation answered %d", code)
+	}
+	if code, _ := fedGet(t, fedHTTP(fake, nil, nil, tls.VersionTLS12), providersURL(fake, fedPool, "", ""), saTok); code != http.StatusOK {
+		t.Fatalf("the list answered %d", code)
+	}
+	if code, _ := fedGet(t, fedHTTP(fake, nil, nil, tls.VersionTLS12), providersURL(fake, fedPool, "", ""), fedTok); code != http.StatusUnauthorized {
+		t.Fatalf("the list with the federated token answered %d", code)
 	}
 	if !strings.HasPrefix(fedTok, "kubetest-federated-") || len(fedTok) < len("kubetest-federated-1-")+16 {
 		t.Errorf("the federated token is not kubetest-federated-<n>-<16 hex>")
 	}
 	reqs := fake.Requests()
-	all := fmt.Sprintf("%#v %#v", reqs, fake.Handshakes())
+	all := fmt.Sprintf("%#v %#v %#v", reqs, fake.Handshakes(), fake.ServiceAccountTokens())
+	if n := len(fake.ServiceAccountTokens()); n != 1 {
+		t.Errorf("the registry holds %d tokens, want 1", n)
+	}
 	for name, v := range map[string]string{"the federated token": fedTok, "the service account token": saTok} {
 		if strings.Contains(all, v) {
 			t.Errorf("%s is in the record", name)
 		}
 	}
-	last := reqs[len(reqs)-1]
-	if !slices.Contains(last.Headers, "Authorization") || last.As != r.id {
-		t.Errorf("the IAM request's headers %q and As do not show its bearer by name", last.Headers)
+	gat := reqs[len(reqs)-3]
+	if gat.Server != "iam" || !slices.Contains(gat.Headers, "Authorization") || gat.As != r.id {
+		t.Errorf("the IAM request's headers %q and As do not show its bearer by name", gat.Headers)
+	}
+	list := reqs[len(reqs)-2]
+	if list.Server != "iamapi" || !slices.Contains(list.Headers, "Authorization") || list.As != fedSA {
+		t.Errorf("the IAM API request's headers %q and As do not show its bearer by name", list.Headers)
 	}
 }
 
@@ -534,6 +578,7 @@ func TestFakeHandshakesAreRecordedWithoutARequest(t *testing.T) {
 	}{
 		{"sts", fake.STSAddr(), [][]byte{r.leafDER, r.anchorDER}},
 		{"iam", fake.IAMAddr(), nil},
+		{"iamapi", fake.IAMAPIAddr(), nil},
 	} {
 		tc := &tls.Config{RootCAs: fake.Roots(), ServerName: "127.0.0.1", MinVersion: tls.VersionTLS13}
 		if c.chain != nil {

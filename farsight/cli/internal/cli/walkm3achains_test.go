@@ -572,7 +572,8 @@ func m3aWIFIDShape(s string) bool {
 
 // m3aAudienceForProjectID is I5's audience: the documented audience with the
 // project's ID in place of its number. kube.Audience takes a number only, and
-// Exchange's audience guard admits this form. The error names the part,
+// since M3b.3 (2026-11-27) Exchange's audience guard refuses this form too,
+// so the walk's I5 stops before sending (stepI5). The error names the part,
 // never the value.
 func m3aAudienceForProjectID(projectID, pool, provider string) (string, error) {
 	switch {

@@ -23,6 +23,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -149,12 +150,12 @@ func (r wireRole) request() kube.ExchangeRequest {
 	return kube.NewExchangeRequest(r.aud, r.identity(), nil, nil)
 }
 
-// wireSetup starts the fakes with opts, adds the role's provider, and points
-// a Federation at them.
+// wireSetup starts the fakes with opts and points a Federation at their
+// three hosts.
 func wireSetup(t *testing.T, opts ...kubetest.FederationOption) (*kubetest.Federation, *kube.Federation) {
 	t.Helper()
 	fake := kubetest.NewFederation(t, opts...)
-	f, err := kube.NewFederationForTest(fake.STSAddr(), fake.IAMAddr(), fake.Roots())
+	f, err := kube.NewLoopbackFederation(fake.STSAddr(), fake.IAMAddr(), fake.IAMAPIAddr(), fake.Roots())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -332,7 +333,7 @@ func TestExchangeThenImpersonate(t *testing.T) {
 		t.Fatal(err)
 	}
 	start := time.Now()
-	sa, err := f.Impersonate(t.Context(), ans.Token(), wireReaderSA)
+	sa, err := f.Impersonate(t.Context(), ans.Token(), wireReaderSA, kube.ScopesCluster)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -350,7 +351,7 @@ func TestExchangeThenImpersonate(t *testing.T) {
 	if got.Method != http.MethodPost || got.Path != "/v1/projects/-/serviceAccounts/"+wireReaderSA+":generateAccessToken" {
 		t.Errorf("sent %s %s", got.Method, got.Path)
 	}
-	if !bytes.Equal(got.Body, kube.ImpersonationBody()) || got.ContentType != "application/json" || got.UserAgent != "farcast" {
+	if !bytes.Equal(got.Body, kube.ImpersonationBody(kube.ScopesCluster)) || got.ContentType != "application/json" || got.UserAgent != "farcast" {
 		t.Errorf("body %s, Content-Type %q, User-Agent %q", got.Body, got.ContentType, got.UserAgent)
 	}
 	if got.As != reader.id {
@@ -364,13 +365,13 @@ func TestExchangeThenImpersonate(t *testing.T) {
 	}
 
 	// The reader's federated token does not reach the writer's account.
-	_, err = f.Impersonate(t.Context(), ans.Token(), wireWriterSA)
+	_, err = f.Impersonate(t.Context(), ans.Token(), wireWriterSA, kube.ScopesCluster)
 	fe := federationError(t, err)
 	if !errors.Is(err, kube.ErrTokenRefused) || fe.Step != kube.StepImpersonate || fe.Status != http.StatusForbidden || fe.GoogleStatus != "PERMISSION_DENIED" {
 		t.Errorf("the reader at the writer's account: %v", err)
 	}
 	// And a token STS never issued is unauthenticated.
-	_, err = f.Impersonate(t.Context(), &auth.Token{Value: "not-issued"}, wireReaderSA)
+	_, err = f.Impersonate(t.Context(), &auth.Token{Value: "not-issued"}, wireReaderSA, kube.ScopesCluster)
 	if fe := federationError(t, err); fe.Status != http.StatusUnauthorized || fe.GoogleStatus != "UNAUTHENTICATED" {
 		t.Errorf("an unissued token: %v", err)
 	}
@@ -389,7 +390,7 @@ func TestNoClientCertificateReachesIAMCredentials(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := f.Impersonate(t.Context(), ans.Token(), wireReaderSA); err != nil {
+		if _, err := f.Impersonate(t.Context(), ans.Token(), wireReaderSA, kube.ScopesCluster); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -565,7 +566,7 @@ func TestAnAlertAtTheHandshakeKeepsItsWords(t *testing.T) {
 		},
 	}
 	addr := wireAlertServer(t, func(c net.Conn) { _ = tls.Server(c, cfg).Handshake() })
-	f, err := kube.NewFederationForTest(addr, addr, roots)
+	f, err := kube.NewLoopbackFederation(addr, addr, addr, roots)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -624,7 +625,7 @@ func TestAnAlertWhileTheAnswerIsReadIsNoRefusal(t *testing.T) {
 		ac.oversize.Store(true)
 		_, _ = tc.Read(make([]byte, 1))
 	})
-	f, err := kube.NewFederationForTest(addr, addr, roots)
+	f, err := kube.NewLoopbackFederation(addr, addr, addr, roots)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -721,7 +722,7 @@ func TestImpersonationRefusalCarriesNoSecret(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = f.Impersonate(t.Context(), ans.Token(), wireReaderSA)
+	_, err = f.Impersonate(t.Context(), ans.Token(), wireReaderSA, kube.ScopesCluster)
 	want := "kube: IAM Credentials refused the service account's token (403 Forbidden, status PERMISSION_DENIED)"
 	if err == nil || err.Error() != want || federationError(t, err).GoogleStatus != "PERMISSION_DENIED" {
 		t.Errorf("got %v; want %q", err, want)
@@ -776,7 +777,7 @@ func TestOversizedFederationAnswerIsUnusable(t *testing.T) {
 		roots := x509.NewCertPool()
 		roots.AddCert(srv.Certificate())
 		addr := srv.Listener.Addr().String()
-		f, err := kube.NewFederationForTest(addr, addr, roots)
+		f, err := kube.NewLoopbackFederation(addr, addr, addr, roots)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -797,7 +798,7 @@ func TestOversizedFederationAnswerIsUnusable(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		_, err = f.Impersonate(t.Context(), ans.Token(), wireReaderSA)
+		_, err = f.Impersonate(t.Context(), ans.Token(), wireReaderSA, kube.ScopesCluster)
 		if !errors.Is(err, kube.ErrUnreadable) || federationError(t, err).Field != "the answer is larger than 64 KiB" {
 			t.Errorf("got %v", err)
 		}
@@ -831,7 +832,7 @@ func TestFederationFollowsNoRedirect(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		_, err = f.Impersonate(t.Context(), ans.Token(), wireReaderSA)
+		_, err = f.Impersonate(t.Context(), ans.Token(), wireReaderSA, kube.ScopesCluster)
 		if fe := federationError(t, err); fe.Status != http.StatusTemporaryRedirect || !errors.Is(err, kube.ErrTokenRefused) {
 			t.Errorf("got %v; want a refusal with status 307", err)
 		}
@@ -886,7 +887,7 @@ func TestFederationFollowsNoRedirect(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		_, err = f.Impersonate(t.Context(), ans.Token(), wireReaderSA)
+		_, err = f.Impersonate(t.Context(), ans.Token(), wireReaderSA, kube.ScopesCluster)
 		if fe := federationError(t, err); fe.Status != http.StatusTemporaryRedirect || !errors.Is(err, kube.ErrTokenRefused) || errors.Is(err, kube.ErrUnreachable) {
 			t.Errorf("got %v; want a refusal with status 307", err)
 		}
@@ -1028,14 +1029,14 @@ func TestAnAnswerNetHTTPCannotParseNamesNothing(t *testing.T) {
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			addr, roots := wireRawServer(t, c.raw)
-			f, err := kube.NewFederationForTest(addr, addr, roots)
+			f, err := kube.NewLoopbackFederation(addr, addr, addr, roots)
 			if err != nil {
 				t.Fatal(err)
 			}
 			r := newWireRole(t, "provreader1")
 			_, err = f.Exchange(t.Context(), r.request())
 			check(t, err, kube.StepExchange)
-			_, err = f.Impersonate(t.Context(), &auth.Token{Value: "x"}, wireReaderSA)
+			_, err = f.Impersonate(t.Context(), &auth.Token{Value: "x"}, wireReaderSA, kube.ScopesCluster)
 			check(t, err, kube.StepImpersonate)
 		})
 	}
@@ -1048,11 +1049,11 @@ func TestAnAnswerNetHTTPCannotParseNamesNothing(t *testing.T) {
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			addr, roots := wireGoAwayServer(t, planted, c.answer)
-			f, err := kube.NewFederationForTest(addr, addr, roots)
+			f, err := kube.NewLoopbackFederation(addr, addr, addr, roots)
 			if err != nil {
 				t.Fatal(err)
 			}
-			_, err = f.Impersonate(t.Context(), &auth.Token{Value: "x"}, wireReaderSA)
+			_, err = f.Impersonate(t.Context(), &auth.Token{Value: "x"}, wireReaderSA, kube.ScopesCluster)
 			check(t, err, kube.StepImpersonate)
 		})
 	}
@@ -1065,7 +1066,7 @@ func TestAnAnswerNetHTTPCannotParseNamesNothing(t *testing.T) {
 func TestAServerOffTheRootsIsRefusedBeforeTheCertificate(t *testing.T) {
 	fake := kubetest.NewFederation(t)
 	other := kubetest.NewFederation(t)
-	f, err := kube.NewFederationForTest(fake.STSAddr(), fake.IAMAddr(), other.Roots())
+	f, err := kube.NewLoopbackFederation(fake.STSAddr(), fake.IAMAddr(), fake.IAMAPIAddr(), other.Roots())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1076,7 +1077,7 @@ func TestAServerOffTheRootsIsRefusedBeforeTheCertificate(t *testing.T) {
 	if fe := federationError(t, err); !errors.Is(err, kube.ErrUnreachable) || fe.Handshake || fe.Status != 0 || !strings.Contains(err.Error(), "x509") {
 		t.Errorf("the exchange: %v; want unreachable with the x509 words", err)
 	}
-	_, err = f.Impersonate(t.Context(), &auth.Token{Value: "x"}, wireReaderSA)
+	_, err = f.Impersonate(t.Context(), &auth.Token{Value: "x"}, wireReaderSA, kube.ScopesCluster)
 	if !errors.Is(err, kube.ErrUnreachable) {
 		t.Errorf("the impersonation: %v; want unreachable", err)
 	}
@@ -1104,13 +1105,13 @@ func closedAddr(t *testing.T) string {
 // anywhere in its tree, and no text of the path.
 func TestUnreachableNamesNoURL(t *testing.T) {
 	fake := kubetest.NewFederation(t)
-	f, err := kube.NewFederationForTest(closedAddr(t), closedAddr(t), fake.Roots())
+	f, err := kube.NewLoopbackFederation(closedAddr(t), closedAddr(t), closedAddr(t), fake.Roots())
 	if err != nil {
 		t.Fatal(err)
 	}
 	r := newWireRole(t, "provreader1")
 	_, exErr := f.Exchange(t.Context(), r.request())
-	_, imErr := f.Impersonate(t.Context(), &auth.Token{Value: "x"}, wireReaderSA)
+	_, imErr := f.Impersonate(t.Context(), &auth.Token{Value: "x"}, wireReaderSA, kube.ScopesCluster)
 	for name, err := range map[string]error{"exchange": exErr, "impersonation": imErr} {
 		if !errors.Is(err, kube.ErrUnreachable) || !strings.Contains(err.Error(), "connect") {
 			t.Errorf("%s: %v; want unreachable with the transport's words", name, err)
@@ -1122,67 +1123,83 @@ func TestUnreachableNamesNoURL(t *testing.T) {
 	}
 }
 
-// TestLoopbackFederationRefusesOffMachineAddresses: the test constructor
-// takes loopback IP literals with ports alone, and each host's dialer
-// reaches its own address alone, refusing every other before it connects.
+// TestLoopbackFederationRefusesOffMachineAddresses: the loopback constructor
+// takes 127.0.0.1 and [::1] with a port alone (R4), at each of its three
+// hosts, and each host's dialer reaches its own address alone, refusing
+// every other before it connects.
 func TestLoopbackFederationRefusesOffMachineAddresses(t *testing.T) {
 	fake := kubetest.NewFederation(t)
 	roots := fake.Roots()
+	api := newAcceptCounter(t) // stands for IAM's API: a listener that counts what reaches it
 	for _, addr := range []string{
 		"192.0.2.1:443", "198.51.100.7:8443", "203.0.113.5:443",
-		"localhost:443", "sts.mtls.googleapis.com:443",
-		"127.0.0.1", "[::1]", "127.0.0.1:0", "127.0.0.1:65536",
-		"[::ffff:127.0.0.1]:443", "", "127.0.0.1:443/x",
+		"localhost:443", "sts.mtls.googleapis.com:443", "iam.googleapis.com:443",
+		"127.0.0.1", "[::1]", "::1", "127.0.0.1:0", "127.0.0.1:65536", "127.0.0.1:0443", "127.0.0.1:+443",
+		"[::ffff:127.0.0.1]:443", "", "127.0.0.1:443/x", "https://127.0.0.1:443", " 127.0.0.1:443",
+		"127.8.9.10:1", "127.0.0.2:443", "127.1:443", "[127.0.0.1]:443", "::1:443", "[::1%lo0]:443",
+		"[0:0:0:0:0:0:0:1]:443",
 	} {
 		for name, build := range map[string]func() (*kube.Federation, error){
-			"sts": func() (*kube.Federation, error) { return kube.NewFederationForTest(addr, fake.IAMAddr(), roots) },
-			"iam": func() (*kube.Federation, error) { return kube.NewFederationForTest(fake.STSAddr(), addr, roots) },
+			"sts": func() (*kube.Federation, error) {
+				return kube.NewLoopbackFederation(addr, fake.IAMAddr(), api.addr(), roots)
+			},
+			"iam": func() (*kube.Federation, error) {
+				return kube.NewLoopbackFederation(fake.STSAddr(), addr, api.addr(), roots)
+			},
+			"iamapi": func() (*kube.Federation, error) {
+				return kube.NewLoopbackFederation(fake.STSAddr(), fake.IAMAddr(), addr, roots)
+			},
 		} {
-			if f, err := build(); f != nil || !errors.Is(err, kube.ErrEndpointRefused) {
+			f, err := build()
+			want := "kube: the loopback federation takes 127.0.0.1 or [::1] with a port from 1 to 65535, not " + strconv.Quote(addr) + "; nothing was sent"
+			if f != nil || !errors.Is(err, kube.ErrEndpointRefused) || err.Error() != want {
 				t.Errorf("%s %q: %v, %v; want refused", name, addr, f, err)
 			}
 		}
 	}
-	if f, err := kube.NewFederationForTest(fake.STSAddr(), fake.IAMAddr(), nil); f != nil || err == nil {
-		t.Error("NewFederationForTest took no roots")
+	if f, err := kube.NewLoopbackFederation(fake.STSAddr(), fake.IAMAddr(), api.addr(), nil); f != nil || !errors.Is(err, kube.ErrEndpointRefused) ||
+		err.Error() != "kube: the loopback federation needs its fakes' CA; nothing was sent" {
+		t.Errorf("no roots: %v, %v; want refused", f, err)
 	}
-	for _, addr := range []string{"127.0.0.1:443", "127.8.9.10:1", "[::1]:443"} {
-		if _, err := kube.NewFederationForTest(addr, addr, roots); err != nil {
+	for _, addr := range []string{"127.0.0.1:443", "127.0.0.1:1", "127.0.0.1:65535", "[::1]:443"} {
+		if _, err := kube.NewLoopbackFederation(addr, addr, addr, roots); err != nil {
 			t.Errorf("%q: %v", addr, err)
 		}
 	}
 
-	// The dial guard.
-	f, err := kube.NewFederationForTest(fake.STSAddr(), fake.IAMAddr(), roots)
+	// The dial guard, at each of the three hosts.
+	f, err := kube.NewLoopbackFederation(fake.STSAddr(), fake.IAMAddr(), api.addr(), roots)
 	if err != nil {
 		t.Fatal(err)
 	}
+	own := map[string]string{"sts": fake.STSAddr(), "iam": fake.IAMAddr(), "iamapi": api.addr()}
 	other := newAcceptCounter(t)
-	for _, c := range []struct {
-		name, addr string
-		sts        bool
-	}{
-		{"STS to another listener", other.addr(), true},
-		{"IAM Credentials to another listener", other.addr(), false},
-		{"STS to IAM Credentials' address", fake.IAMAddr(), true},
-		{"IAM Credentials to STS's address", fake.STSAddr(), false},
-	} {
-		err := kube.FederationDial(t.Context(), f, c.sts, c.addr)
-		if err == nil || !strings.Contains(err.Error(), "loopback client refused to dial") {
-			t.Errorf("%s: %v; want the dial guard's refusal", c.name, err)
+	for host := range own {
+		for to, addr := range own {
+			if to == host {
+				continue
+			}
+			if err := kube.FederationDial(t.Context(), f, host, addr); err == nil || !strings.Contains(err.Error(), "loopback client refused to dial") {
+				t.Errorf("%s to %s's address: %v; want the dial guard's refusal", host, to, err)
+			}
+		}
+		if err := kube.FederationDial(t.Context(), f, host, other.addr()); err == nil || !strings.Contains(err.Error(), "loopback client refused to dial") {
+			t.Errorf("%s to another listener: %v; want the dial guard's refusal", host, err)
 		}
 	}
 	if n := other.count(t); n != 0 {
 		t.Errorf("%d connections reached the other listener", n)
 	}
-	for name, sts := range map[string]bool{"STS": true, "IAM Credentials": false} {
-		addr := fake.IAMAddr()
-		if sts {
-			addr = fake.STSAddr()
+	if n := api.count(t); n != 0 {
+		t.Errorf("%d connections reached IAM's API's address from another host's dialer", n)
+	}
+	for host, addr := range own {
+		if err := kube.FederationDial(t.Context(), f, host, addr); err != nil {
+			t.Errorf("%s to its own address: %v", host, err)
 		}
-		if err := kube.FederationDial(t.Context(), f, sts, addr); err != nil {
-			t.Errorf("%s to its own address: %v", name, err)
-		}
+	}
+	if err := kube.FederationDial(t.Context(), f, "nowhere", fake.STSAddr()); err == nil {
+		t.Error("FederationDial took a host it does not name")
 	}
 }
 

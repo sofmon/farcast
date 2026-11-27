@@ -26,8 +26,10 @@ import (
 
 // This file is the identity path's wire code (ADR 0024 decision 8, design
 // D5 and D6): the mTLS token exchange at STS and generateAccessToken at IAM
-// Credentials. Nothing calls it until M3b, so the linker drops it, and it
-// holds no init-time state: no init function, no package-level variable
+// Credentials. credential.go's federated credential, tokensource.go's
+// RoleTokens and iamread.go's IAMReader are built on it (M3b.3). No command
+// calls any of them until M3b's wiring, so the linker drops them, and they
+// hold no init-time state: no init function, no package-level variable
 // whose value is a call (a conversion included), and no regexp. Every shape
 // check is a byte loop. TestFederatedHasNoInitTimeState holds that.
 
@@ -87,7 +89,8 @@ const (
 	generateAccessTokenPrefix = "/v1/projects/-/serviceAccounts/"
 	generateAccessTokenSuffix = ":generateAccessToken"
 
-	// maxFederationHeader caps an answer's headers on both transports.
+	// maxFederationHeader caps an answer's headers on the three identity
+	// transports (the exchange, impersonation and IAM's API).
 	maxFederationHeader = 64 << 10
 
 	// The words an answer that is not a token's gives in place of a field.
@@ -109,7 +112,8 @@ const (
 //
 // projectNumber is ^[0-9]{1,20}$. pool and provider are ^[a-z0-9-]{4,32}$,
 // not starting "gcp-" [MGMT]. The error names the part, never the value. It
-// takes no project ID: M3a's I5 builds its own audience string.
+// takes no project ID, and since M3b.3 neither does Exchange's guard
+// (checkAudience).
 func Audience(projectNumber, pool, provider string) (string, error) {
 	switch {
 	case !isProjectNumber(projectNumber):
@@ -123,18 +127,19 @@ func Audience(projectNumber, pool, provider string) (string, error) {
 }
 
 // checkAudience is Exchange's own guard on its audience before anything is
-// sent: the documented shape, with the project segment either a number or a
-// project ID (^[a-z][a-z0-9-]{4,28}[a-z0-9]$). It guards against a malformed
-// or injected audience; it builds nothing. The ID form is admitted for M3a's
-// I5, which asks whether STS takes it; M3b narrows the guard to the number
-// form once I5 is recorded.
+// sent: the documented shape, with the project segment a project number
+// (^[0-9]{1,20}$), the form Audience builds. It guards against a malformed
+// or injected audience; it builds nothing. Until M3b.3 it also admitted a
+// project ID, for M3a's I5, which asked whether STS takes one; it no longer
+// does, so the walk probe's I5 is refused here, before anything is sent
+// (2026-11-27, M3b.3).
 func checkAudience(aud string) bool {
 	rest, ok := strings.CutPrefix(aud, audiencePrefix)
 	if !ok {
 		return false
 	}
 	project, rest, ok := strings.Cut(rest, "/")
-	if !ok || (!isProjectNumber(project) && !isProjectID(project)) {
+	if !ok || !isProjectNumber(project) {
 		return false
 	}
 	rest, ok = strings.CutPrefix("/"+rest, audiencePools)
@@ -189,23 +194,33 @@ func ExchangeForm(audience, subjectTokenType, subjectToken string, scopes []stri
 	}.Encode()
 }
 
-// ImpersonationBody is generateAccessToken's body, byte for byte:
+// ImpersonationBody is generateAccessToken's body for one consumer's scopes
+// (N9), byte for byte. For ScopesCluster it is D5.2's:
 //
 //	{"scope":["https://www.googleapis.com/auth/cloud-platform","https://www.googleapis.com/auth/userinfo.email"],"lifetime":"3600s"}
 //
+// for ScopesStorage devstorage.full_control alone, and for ScopesRegistry
+// cloud-platform alone (a dated amendment to D5.2 for the consumers that are
+// not the cluster, 2026-11-27, M3b.3). It is nil for a Scopes the closed list
+// does not hold.
+//
 // The fields are in the GAT reference's order (delegates, scope, lifetime,
-// with no delegates) [GAT, fetched 2026-11-22], and the scopes in
-// TokenScopes()'s order (D5). The vendored struct marshals lifetime first
-// (impersonate.go:41-45), so it is not the source. The order matters to
-// neither server; the test pins this one.
-func ImpersonationBody() []byte {
+// with no delegates) [GAT, fetched 2026-11-22], and the scopes in s.List()'s
+// order, TokenScopes()'s for the cluster (D5). The vendored struct marshals
+// lifetime first (impersonate.go:41-45), so it is not the source. The order
+// matters to neither server; the test pins this one.
+func ImpersonationBody(s Scopes) []byte {
+	list := s.List()
+	if list == nil {
+		return nil
+	}
 	var b bytes.Buffer
 	b.WriteString(`{"scope":[`)
-	for i, s := range TokenScopes() {
+	for i, sc := range list {
 		if i > 0 {
 			b.WriteByte(',')
 		}
-		b.WriteString(strconv.Quote(s)) // a fixed URL: Go's quoting is JSON's here
+		b.WriteString(strconv.Quote(sc)) // a fixed URL: Go's quoting is JSON's here
 	}
 	b.WriteString(`],"lifetime":"`)
 	b.WriteString(impersonationLifetimeText())
@@ -320,10 +335,11 @@ type exchangeRequest struct {
 }
 
 // NewExchangeRequest is one exchange. M3b's callers pass an audience and a
-// client identity, with subject and scopes nil; the other two exist for
-// M3a's chain shapes and negatives:
-//   - audience: from Audience (Exchange's guard also admits I5's project-ID
-//     form);
+// client identity, with subject and scopes nil (productExchange, held by
+// TestProductExchangesCarryNoKnobs); the other two exist for M3a's chain
+// shapes and negatives:
+//   - audience: from Audience, the project-number form, the only one
+//     Exchange's guard admits;
 //   - client: what the handshake presents; the zero ClientIdentity presents no
 //     client certificate at all (M3a's N6);
 //   - subject: subject_token's chain, leaf first; nil: client's chain;
@@ -432,12 +448,17 @@ func cloneChain(chain [][]byte) [][]byte {
 	return out
 }
 
-// Federation exchanges a role's leaf at STS's mTLS endpoint, and impersonates
-// the role's service account at IAM Credentials.
+// Federation exchanges a role's leaf at STS's mTLS endpoint, impersonates
+// the role's service account at IAM Credentials, and names the host IAM's
+// API is read at (IAMReader). Its mode is where its three hosts are: Google's
+// (NewFederation) or loopback fakes (NewLoopbackFederation). A federated
+// credential pairs with a cluster endpoint by this mode alone (pair), never
+// by its email's domain.
 type Federation struct {
-	sts, iam      federationHost
-	now           func() time.Time // wallNow
-	impersonation *http.Client
+	mode             Mode
+	sts, iam, iamAPI federationHost
+	now              func() time.Time // wallNow
+	impersonation    *http.Client
 }
 
 // federationHost is one destination: its origin, the name TLS verifies, its
@@ -473,21 +494,72 @@ func (h federationHost) dialContext() func(ctx context.Context, network, address
 	return d.DialContext
 }
 
-// NewFederation is the product constructor: Google's hosts, the system roots.
-// It takes no URL and reads no file. The one environment variable it reads is
+// NewFederation is the product constructor: Google's three hosts (STS's mTLS
+// endpoint, IAM Credentials and IAM's API), the system roots, ModeGoogle. It
+// takes no URL and reads no file. The one environment variable it reads is
 // GODEBUG's http2debug, through UnsafeEnvironment, which it calls first:
 // under http2debug it returns ErrUnsafeEnvironment's refusal (msgHTTP2Debug)
 // and builds nothing.
 func NewFederation() (*Federation, error) {
-	return newFederation(googleFederationHost(STSMTLSHost), googleFederationHost(IAMCredentialsHost))
+	return newFederation(ModeGoogle, googleFederationHost(STSMTLSHost), googleFederationHost(IAMCredentialsHost), googleFederationHost(IAMHost))
 }
 
-// newFederation builds a Federation for two hosts, after UnsafeEnvironment.
-func newFederation(sts, iam federationHost) (*Federation, error) {
+// NewLoopbackFederation is a Federation pointed at loopback fakes
+// (kubetest.Federation), ModeLoopback. It is product code so that the
+// rehearsal, which farcast never links, can build one; nothing else that
+// ships calls it, and a source scan holds that
+// (TestOnlyTheRehearsalCallsNewLoopbackFederation).
+//
+// stsAddr, iamCredentialsAddr and iamAPIAddr are each "127.0.0.1:<port>" or
+// "[::1]:<port>", the port from 1 to 65535 written canonically: no other
+// address in 127.0.0.0/8, no name (localhost included), no IPv4-mapped form,
+// no zone, no path and no missing port. roots is the fakes' CA, and nil is
+// refused. Each host's dialer reaches its own address alone, and TLS
+// verifies the IP. Like NewFederation it calls UnsafeEnvironment first, and
+// returns its refusal (ErrUnsafeEnvironment) as it is. Every other refusal
+// wraps ErrEndpointRefused, and nothing is dialled.
+func NewLoopbackFederation(stsAddr, iamCredentialsAddr, iamAPIAddr string, roots *x509.CertPool) (*Federation, error) {
 	if err := UnsafeEnvironment(); err != nil {
 		return nil, err
 	}
-	f := &Federation{sts: sts, iam: iam, now: wallNow}
+	if roots == nil {
+		return nil, refuse(ErrEndpointRefused, msgLoopbackFederationRoots)
+	}
+	var hosts [3]federationHost
+	for i, addr := range []string{stsAddr, iamCredentialsAddr, iamAPIAddr} {
+		h, err := loopbackFederationHost(addr, roots)
+		if err != nil {
+			return nil, err
+		}
+		hosts[i] = h
+	}
+	return newFederation(ModeLoopback, hosts[0], hosts[1], hosts[2])
+}
+
+// loopbackFederationHost is one loopback destination: addr must be exactly
+// net.JoinHostPort of 127.0.0.1 or ::1 and a valid port, and the dialer may
+// reach it alone.
+func loopbackFederationHost(addr string, roots *x509.CertPool) (federationHost, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil || (host != "127.0.0.1" && host != "::1") || !validPort(port) || net.JoinHostPort(host, port) != addr {
+		return federationHost{}, refuse(ErrEndpointRefused, msgLoopbackFederation, addr)
+	}
+	return federationHost{
+		origin:     "https://" + addr,
+		host:       addr,
+		serverName: host,
+		roots:      roots,
+		dialOnly:   addr,
+	}, nil
+}
+
+// newFederation builds a Federation for its three hosts, after
+// UnsafeEnvironment.
+func newFederation(mode Mode, sts, iam, iamAPI federationHost) (*Federation, error) {
+	if err := UnsafeEnvironment(); err != nil {
+		return nil, err
+	}
+	f := &Federation{mode: mode, sts: sts, iam: iam, iamAPI: iamAPI, now: wallNow}
 	f.impersonation = f.impersonationClient()
 	return f, nil
 }
@@ -521,7 +593,7 @@ func (f *Federation) exchangeClient(id ClientIdentity, leaf *x509.Certificate) (
 		MaxResponseHeaderBytes: maxFederationHeader,
 	}
 	return &http.Client{
-		Transport:     &identityTransport{inner: tr, host: f.sts.host, bearer: false},
+		Transport:     &identityTransport{inner: tr, host: f.sts.host, bearer: noBearer},
 		Timeout:       federationTimeout,
 		CheckRedirect: noRedirect,
 	}, tr
@@ -544,7 +616,31 @@ func (f *Federation) impersonationClient() *http.Client {
 		MaxIdleConnsPerHost:    2,
 	}
 	return &http.Client{
-		Transport:     &identityTransport{inner: tr, host: f.iam.host, bearer: true},
+		Transport:     &identityTransport{inner: tr, host: f.iam.host, bearer: federatedBearer},
+		Timeout:       federationTimeout,
+		CheckRedirect: noRedirect,
+	}
+}
+
+// iamAPIClient is an IAMReader's client for IAM's API host: TLS 1.2 at
+// least, HTTP/2 allowed, keep-alive on, and no client certificate of any
+// kind, as the impersonation client. Its transport alone adds the service
+// account's bearer, and only the reader's (NewIAMReader).
+func (f *Federation) iamAPIClient() *http.Client {
+	tr := &http.Transport{
+		Proxy:                  nil,
+		DialContext:            f.iamAPI.dialContext(),
+		TLSClientConfig:        &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: f.iamAPI.roots, ServerName: f.iamAPI.serverName},
+		ForceAttemptHTTP2:      true,
+		DisableKeepAlives:      false,
+		TLSHandshakeTimeout:    10 * time.Second,
+		ResponseHeaderTimeout:  responseHeaderTimeout,
+		MaxResponseHeaderBytes: maxFederationHeader,
+		IdleConnTimeout:        90 * time.Second,
+		MaxIdleConnsPerHost:    2,
+	}
+	return &http.Client{
+		Transport:     &identityTransport{inner: tr, host: f.iamAPI.host, bearer: serviceAccountBearer},
 		Timeout:       federationTimeout,
 		CheckRedirect: noRedirect,
 	}
@@ -552,7 +648,8 @@ func (f *Federation) impersonationClient() *http.Client {
 
 // federatedBearerKey carries a federated token on a request's context, from
 // Impersonate to identityTransport. It is distinct from the cluster's
-// bearerKey, so neither transport ever finds the other's token.
+// bearerKey and from serviceAccountBearerKey, so no transport ever finds
+// another's token.
 type federatedBearerKey struct{}
 
 func withFederatedBearer(ctx context.Context, tok *auth.Token) context.Context {
@@ -564,16 +661,43 @@ func federatedBearerFrom(ctx context.Context) *auth.Token {
 	return tok
 }
 
-// identityTransport is both identity clients' RoundTripper. It sends only to
-// its own host, over https, and with only the headers it chooses:
+// serviceAccountBearerKey carries the reader's service-account token on a
+// request's context, from IAMReader to identityTransport: a key of its own,
+// distinct from the cluster's bearerKey and from federatedBearerKey, so the
+// exchange and impersonation transports never find it and IAM's API
+// transport never finds a federated token.
+type serviceAccountBearerKey struct{}
+
+func withServiceAccountBearer(ctx context.Context, tok string) context.Context {
+	return context.WithValue(ctx, serviceAccountBearerKey{}, tok)
+}
+
+func serviceAccountBearerFrom(ctx context.Context) string {
+	tok, _ := ctx.Value(serviceAccountBearerKey{}).(string)
+	return tok
+}
+
+// bearerSource is which bearer an identityTransport sends, read from which
+// context key: none (the exchange), the federated token (impersonation), or
+// the service account's token (IAM's API).
+type bearerSource int
+
+const (
+	noBearer             bearerSource = iota // the exchange: never an Authorization header
+	federatedBearer                          // IAM Credentials: federatedBearerKey's token alone
+	serviceAccountBearer                     // IAM's API: serviceAccountBearerKey's token alone
+)
+
+// identityTransport is the three identity clients' RoundTripper. It sends
+// only to its own host, over https, and with only the headers it chooses:
 // User-Agent: farcast, Accept: application/json, the caller's Content-Type
-// when it is the form's or JSON's, and, on the impersonation client alone,
-// the federated bearer from the request's context. Nothing else the caller
-// set survives: no x-goog-api-client, no caller Authorization, no cookie.
+// when it is the form's or JSON's, and the one bearer its source names, read
+// from that source's context key alone. Nothing else the caller set
+// survives: no x-goog-api-client, no caller Authorization, no cookie.
 type identityTransport struct {
 	inner  http.RoundTripper
 	host   string
-	bearer bool
+	bearer bearerSource
 }
 
 func (t *identityTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -591,9 +715,14 @@ func (t *identityTransport) RoundTrip(req *http.Request) (*http.Response, error)
 	if ct := req.Header.Get("Content-Type"); ct == mediaForm || ct == mediaJSON {
 		h.Set("Content-Type", ct)
 	}
-	if t.bearer {
+	switch t.bearer {
+	case federatedBearer:
 		if tok := federatedBearerFrom(r.Context()); tok != nil && tok.Value != "" {
 			h.Set("Authorization", "Bearer "+tok.Value)
+		}
+	case serviceAccountBearer:
+		if tok := serviceAccountBearerFrom(r.Context()); tok != "" {
+			h.Set("Authorization", "Bearer "+tok)
 		}
 	}
 	r.Header = h
@@ -609,9 +738,11 @@ func (t *identityTransport) RoundTrip(req *http.Request) (*http.Response, error)
 // asks CheckRedirect (go1.27.4 src/net/http/client.go:662-666), and a parse
 // failure becomes a *url.Error whose words quote the header whole: remote
 // text, which on the impersonation path may name a service account. Without
-// the header the client returns the 3xx itself (:655-661), which Exchange and
-// Impersonate read as the answer, a refusal with its status and no text. A
-// Location that parses is left for noRedirect to refuse.
+// the header the client returns the 3xx itself (:655-661), which Exchange,
+// Impersonate and IAMReader read as the answer, a refusal with its status and
+// no text; tokenTransport drops it too, for the 2LO token client, whose
+// library reports the 3xx as a refusal. A Location that parses is left for
+// noRedirect to refuse.
 func dropUnparsableLocation(u *url.URL, resp *http.Response) {
 	loc := resp.Header.Get("Location")
 	if loc == "" || resp.StatusCode < 300 || resp.StatusCode > 399 {
@@ -720,10 +851,12 @@ func clientLeaf(id ClientIdentity) (*x509.Certificate, bool) {
 }
 
 // Impersonate calls generateAccessToken for serviceAccount, with federated as
-// the bearer, TokenScopes() and ImpersonationLifetime. Before sending it
-// refuses a nil or empty federated token and a malformed email. It does not
-// check federated's expiry; Google decides that (M3a's P7 times exactly that).
-func (f *Federation) Impersonate(ctx context.Context, federated *auth.Token, serviceAccount string) (*auth.Token, error) {
+// the bearer, s's scopes (ImpersonationBody) and ImpersonationLifetime.
+// Before sending it refuses, in this order, a nil or empty federated token, a
+// malformed email and a Scopes the closed list does not hold ("scopes"). It
+// does not check federated's expiry; Google decides that (M3a's P7 times
+// exactly that).
+func (f *Federation) Impersonate(ctx context.Context, federated *auth.Token, serviceAccount string, s Scopes) (*auth.Token, error) {
 	if federated == nil || federated.Value == "" {
 		return nil, refuse(ErrCredentialInvalid, msgFederationRequest, "federated token")
 	}
@@ -731,10 +864,14 @@ func (f *Federation) Impersonate(ctx context.Context, federated *auth.Token, ser
 	if err != nil {
 		return nil, err
 	}
+	gat := ImpersonationBody(s)
+	if gat == nil {
+		return nil, refuse(ErrCredentialInvalid, msgFederationRequest, "scopes")
+	}
 	if ctx == nil {
 		return nil, refuse(ErrCredentialInvalid, msgFederationRequest, "request")
 	}
-	req, err := http.NewRequestWithContext(withFederatedBearer(ctx, federated), http.MethodPost, f.iam.origin+path, bytes.NewReader(ImpersonationBody()))
+	req, err := http.NewRequestWithContext(withFederatedBearer(ctx, federated), http.MethodPost, f.iam.origin+path, bytes.NewReader(gat))
 	if err != nil {
 		return nil, refuse(ErrCredentialInvalid, msgFederationRequest, "request")
 	}
@@ -902,17 +1039,40 @@ func errorCodes(body []byte) (oauth, status string) {
 	return "", ""
 }
 
+// stepMessages are a step's refusal, unreachable and unusable formats, and
+// the sentinel its refusals wrap: ErrTokenRefused at STS and IAM
+// Credentials, ErrIAMRefused at IAM's API.
+func stepMessages(step Step) (refused, unreachable, unusable string, sentinel error) {
+	switch step {
+	case StepImpersonate:
+		return msgImpersonateRefused, msgImpersonateUnreachable, msgImpersonateUnusable, ErrTokenRefused
+	case StepProviderGet, StepProviderList:
+		return msgIAMRefused, msgIAMUnreachable, msgIAMUnusable, ErrIAMRefused
+	}
+	return msgExchangeRefused, msgExchangeUnreachable, msgExchangeUnusable, ErrTokenRefused
+}
+
+// answerCap is the most of an answer a step reads: 64 KiB at STS and IAM
+// Credentials, 1 MiB at IAM's API.
+func answerCap(step Step) int {
+	if step == StepProviderGet || step == StepProviderList {
+		return maxProviderAnswer
+	}
+	return maxFederationAnswer
+}
+
 // refusedAnswer is a non-200 answer as an error: its status and StatusText,
-// and its code when one is in its shape. An answer larger than the cap
-// carries no code. IAM Credentials' is Google's error.status alone.
+// and its code when one is in its shape. An answer larger than the step's
+// cap carries no code. IAM Credentials' and IAM's API's code is Google's
+// error.status alone; STS's is its OAuth error or Google's error.status.
 func refusedAnswer(step Step, code int, body []byte, tlsVersion uint16) error {
 	var oauth, status string
-	if len(body) <= maxFederationAnswer {
+	if len(body) <= answerCap(step) {
 		oauth, status = errorCodes(body)
 	}
-	format := msgExchangeRefused
-	if step == StepImpersonate {
-		format, oauth = msgImpersonateRefused, ""
+	format, _, _, sentinel := stepMessages(step)
+	if step != StepExchange {
+		oauth = ""
 	}
 	suffix := ""
 	switch {
@@ -928,16 +1088,13 @@ func refusedAnswer(step Step, code int, body []byte, tlsVersion uint16) error {
 		GoogleStatus: status,
 		TLSVersion:   tlsVersion,
 		msg:          fmt.Sprintf(format, code, http.StatusText(code), suffix),
-		sentinel:     ErrTokenRefused,
+		sentinel:     sentinel,
 	}
 }
 
 // unusableAnswer is a 200 the decoder refused, by the field that failed.
 func unusableAnswer(step Step, field string, tlsVersion uint16) error {
-	format := msgExchangeUnusable
-	if step == StepImpersonate {
-		format = msgImpersonateUnusable
-	}
+	_, _, format, _ := stepMessages(step)
 	return &FederationError{
 		Step:       step,
 		Status:     http.StatusOK,
@@ -957,7 +1114,7 @@ func unusableAnswer(step Step, field string, tlsVersion uint16) error {
 //     alert's words when they are in the alert shape, also in Alert. Before
 //     any answer came (reading false) it ended the call at the handshake, or
 //     in TLS 1.3 just after it: at the exchange a refusal at the handshake,
-//     at IAM Credentials unreachable. While an answer was read (reading true)
+//     at IAM Credentials and IAM's API unreachable. While an answer was read (reading true)
 //     it ended no handshake and decided nothing: unreachable, with Handshake
 //     false. The alert's words alone do not say whether the server refused
 //     the certificate (an internal_error is an alert too), so a caller that
@@ -967,17 +1124,15 @@ func unusableAnswer(step Step, field string, tlsVersion uint16) error {
 //     error (the read's error) holds a failure Go's network stack described
 //     itself; otherwise msgNoReadableAnswer, with no cause. The *url.Error
 //     itself is always dropped, because its URL names the service account's
-//     email on the impersonation path. A server's answer that net/http cannot
+//     email on the impersonation path, and the project number, pool and
+//     provider at IAM's API. A server's answer that net/http cannot
 //     parse (a malformed status or header line, an HTTP/2 GOAWAY's debug
 //     data, a bad chunk) is described in the server's own bytes, which may
 //     echo the request: neither its words nor the error carrying them is
 //     kept. Such an answer decides nothing, so it is unreachable too;
 //  6. anything else: no answer within 30 s, with no cause.
 func classifyFailure(ctx context.Context, step Step, err error, reading bool) error {
-	format := msgExchangeUnreachable
-	if step == StepImpersonate {
-		format = msgImpersonateUnreachable
-	}
+	_, format, _, _ := stepMessages(step)
 	unreachable := func(why string, cause error) error {
 		return &FederationError{Step: step, msg: fmt.Sprintf(format, why), sentinel: ErrUnreachable, cause: cause}
 	}
@@ -1148,8 +1303,10 @@ func isDigit(c byte) bool { return c >= '0' && c <= '9' }
 type Step string
 
 const (
-	StepExchange    Step = "exchange"
-	StepImpersonate Step = "impersonate"
+	StepExchange     Step = "exchange"
+	StepImpersonate  Step = "impersonate"
+	StepProviderGet  Step = "provider get"  // IAMReader.GetProvider, at IAM's API
+	StepProviderList Step = "provider list" // IAMReader.ListProviders, at IAM's API
 )
 
 // FederationError is a failure on the identity path. Its text is exactly msg,
@@ -1160,8 +1317,9 @@ const (
 // server sent. An answer net/http could not parse is unreachable with fixed
 // words, because Go quotes the server's bytes in such an error.
 //
-// Its sentinel is ErrTokenRefused (refused, at HTTP or at the handshake),
-// ErrUnreachable or ErrUnreadable (an unusable 200). A refusal before sending
+// Its sentinel is ErrTokenRefused (refused, at HTTP or at the handshake;
+// ErrIAMRefused at IAM's API), ErrUnreachable or ErrUnreadable (an unusable
+// 200). A refusal before sending
 // is ErrCredentialInvalid, and the host guard's is ErrEndpointRefused, both
 // through refuse, not a FederationError.
 //
@@ -1196,15 +1354,20 @@ func (e *FederationError) Unwrap() []error {
 
 // The identity path's messages. These are exact, and the tests pin them.
 const (
-	msgExchangeRefused        = "kube: Google's token exchange refused the request (%d %s%s)"                        // %s%s: StatusText, then ", OAuth error <code>", ", status <STATUS>" or ""
-	msgExchangeHandshake      = "kube: Google's token exchange refused the client certificate at the handshake (%s)" // e.g. "tls: certificate required"
-	msgExchangeUnreachable    = "kube: Google's token exchange could not be reached: %s"
-	msgExchangeUnusable       = "kube: Google's token exchange answered without a usable token (%s)"  // the field
-	msgImpersonateRefused     = "kube: IAM Credentials refused the service account's token (%d %s%s)" // ", status <STATUS>" or ""
-	msgImpersonateUnreachable = "kube: IAM Credentials could not be reached: %s"
-	msgImpersonateUnusable    = "kube: IAM Credentials answered without a usable token (%s)"
-	msgFederationRequest      = "kube: the federation request has no usable %s; nothing was sent" // audience, client certificate, subject token, scope, service account, federated token, request
-	msgFederationHost         = "kube: the identity transport sends only to its own host; nothing was sent"
-	msgNoReadableAnswer       = "no readable answer" // an unreachable's words when Go's own words would quote the server
-	msgTimedOut               = "timed out"          // a timeout's words when it carries no context error
+	msgExchangeRefused         = "kube: Google's token exchange refused the request (%d %s%s)"                        // %s%s: StatusText, then ", OAuth error <code>", ", status <STATUS>" or ""
+	msgExchangeHandshake       = "kube: Google's token exchange refused the client certificate at the handshake (%s)" // e.g. "tls: certificate required"
+	msgExchangeUnreachable     = "kube: Google's token exchange could not be reached: %s"
+	msgExchangeUnusable        = "kube: Google's token exchange answered without a usable token (%s)"  // the field
+	msgImpersonateRefused      = "kube: IAM Credentials refused the service account's token (%d %s%s)" // ", status <STATUS>" or ""
+	msgImpersonateUnreachable  = "kube: IAM Credentials could not be reached: %s"
+	msgImpersonateUnusable     = "kube: IAM Credentials answered without a usable token (%s)"
+	msgIAMRefused              = "kube: IAM refused the provider read (%d %s%s)" // ", status <STATUS>" or ""
+	msgIAMUnreachable          = "kube: IAM could not be reached: %s"
+	msgIAMUnusable             = "kube: IAM answered without a usable provider read (%s)"          // the field
+	msgFederationRequest       = "kube: the federation request has no usable %s; nothing was sent" // audience, client certificate, subject token, scope, scopes, service account, federated token, request
+	msgFederationHost          = "kube: the identity transport sends only to its own host; nothing was sent"
+	msgLoopbackFederation      = "kube: the loopback federation takes 127.0.0.1 or [::1] with a port from 1 to 65535, not %q; nothing was sent"
+	msgLoopbackFederationRoots = "kube: the loopback federation needs its fakes' CA; nothing was sent"
+	msgNoReadableAnswer        = "no readable answer" // an unreachable's words when Go's own words would quote the server
+	msgTimedOut                = "timed out"          // a timeout's words when it carries no context error
 )

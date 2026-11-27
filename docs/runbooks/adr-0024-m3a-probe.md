@@ -14,7 +14,7 @@
 7. silent leaf renewal (T3), and anchor replacement, by the paste and in the console (P6);
 8. the revocation window, and IAM's settle times (P7, and every positive's delta, read with its timing note: P3);
 9. the 390-day rule's reach (I4, V6, V7);
-10. whether the audience takes the project's ID in place of its number (I5);
+10. whether the audience takes the project's ID in place of its number (I5); *(2026-11-27, M3b.3: Exchange's own guard now refuses that audience before anything is sent, so a run of the probe from M3b.3 on stops I5 locally; the result recorded in this runbook, from 2026-11-23, is Google's answer.)*
 11. the organization's policies, as the project sees them (P9);
 12. which IAM Credentials endpoint is needed (I1);
 13. what the audit logs carry (P8);
@@ -277,7 +277,7 @@ Walked 2026-11-23, at bb51a6d, in a fresh scratch project in the operator's own 
 ## Deviations
 
 From the design, accepted at G0 or recorded here, and any found while walking:
-1. **T4's read-back sends the reader's SA token to IAM's API host, from the probe.** D6's rule, the bearer only to IAM Credentials' host, binds `federated.go` and holds there. T4 must read the providers through the reader's own token, and providers are read at `iam.googleapis.com`. The comparison itself is product code (`devicekey.CheckProvider`).
+1. **T4's read-back sends the reader's SA token to IAM's API host, from the probe.** D6's rule, the bearer only to IAM Credentials' host, binds `federated.go` and holds there. T4 must read the providers through the reader's own token, and providers are read at `iam.googleapis.com`. The comparison itself is product code (`devicekey.CheckProvider`). *(2026-11-27, M3b.3: Q3's default is now product code, wired into no command: `federated.go` also sends the reader's service-account token, and no other, to IAM's API host, through `IAMReader` ([the design's §14](../design/adr-0024-design.md#14-amendments-from-m3b3s-build-2026-11-27)); the probe's T4 keeps its own client.)*
 2. **I1, I6 and V5's exchange are probe-only paths.** They share the product's body builders. Product code presents its certificate to STS's mTLS host alone, and never sends to STS's plain endpoint.
 3. **The firewall has six destinations, not four.** V5 and I6 also need STS's plain endpoint, and T4 needs IAM's API host.
 4. **P7 (c) runs before P10's bindings first.** V1's two providers are deleted while their bindings stand, so the measurement isolates the deletion. P10 (b) removes the bindings afterwards. Accepted at G0, because it changes the order of the project's teardown from the design's "bindings first".

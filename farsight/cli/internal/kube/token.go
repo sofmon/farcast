@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -15,9 +16,10 @@ import (
 	"cloud.google.com/go/auth"
 )
 
-// tokenFunc mints one token. The 2LO provider of §3.3 is the only one a
-// product path builds; a test, or the real-Kubernetes test of §10.6, hands
-// newClient a static one. No exported path takes a token function.
+// tokenFunc mints one token. A product path builds two: the 2LO provider of
+// §3.3 for a service-account key, and a federated credential's mint (design
+// D5) for a federated one. A test, or the real-Kubernetes test of §10.6,
+// hands newClient a static one. No exported path takes a token function.
 type tokenFunc func(ctx context.Context) (*auth.Token, error)
 
 // earlyExpiry is how long before its expiry a cached token is minted anew:
@@ -38,8 +40,10 @@ const (
 // newClient is New with the token source given. It checks that the endpoint
 // and the credential pair (§3.2) before it builds a transport, a token source
 // or a cache, so the rule holds for every caller of either; it dials nothing
-// and mints nothing. A nil mint is the 2LO provider of §3.3, which is what New
-// passes.
+// and mints nothing. A nil mint is what New passes: for a service-account
+// key the 2LO provider of §3.3, built on the client's own token client; for
+// a federated credential its mint with ScopesCluster (design D5), which
+// needs no token client, so none is built (tokenHTTP stays nil).
 //
 // Before anything else it refuses, with UnsafeEnvironment's error, while
 // GODEBUG has turned on Go's HTTP/2 logging (http2Verbose), which would print
@@ -49,7 +53,7 @@ func newClient(cfg Config, mint tokenFunc) (*Client, error) {
 	if err := UnsafeEnvironment(); err != nil {
 		return nil, err
 	}
-	if err := pair(cfg.Endpoint, cfg.Credential); err != nil {
+	if err := pair(cfg.Endpoint, cfg.Credential, cfg.Identity); err != nil {
 		return nil, err
 	}
 	ep := cfg.Endpoint
@@ -64,11 +68,17 @@ func newClient(cfg Config, mint tokenFunc) (*Client, error) {
 	}
 	c.api = apiHTTPClient(ep)
 	c.follow = followHTTPClient(ep)
-	c.tokenHTTP = tokenHTTPClient(ep)
-	if mint == nil {
-		var err error
-		if mint, err = twoLegged(cfg, c.tokenHTTP, c.domain); err != nil {
-			return nil, err
+	if fc := cfg.Credential.fed(); fc != nil {
+		if mint == nil {
+			mint = fc.minter(ScopesCluster)
+		}
+	} else {
+		c.tokenHTTP = tokenHTTPClient(ep)
+		if mint == nil {
+			var err error
+			if mint, err = twoLegged(cfg, c.tokenHTTP, c.domain); err != nil {
+				return nil, err
+			}
 		}
 	}
 	c.tokens = &tokenCache{mint: mint, now: wallNow}
@@ -124,10 +134,17 @@ func twoLegged(cfg Config, client *http.Client, domain string) (tokenFunc, error
 
 // tokenError classifies a mint's failure. A non-2xx answer, which the
 // library reports as *auth.Error, is ErrTokenRefused, named by its code
-// alone: the body, which the library's own text quotes, is never carried. A
-// failure to reach the endpoint is ErrUnreachable, with the transport's own
-// words, which name an address and never a header. Anything else is a
-// token answer that could not be read.
+// alone: the body, which the library's own text quotes, is never carried.
+//
+// A failure to send the assertion or to read the answer's head (a
+// *url.Error) is ErrUnreachable. Its words are only words Go's network stack
+// wrote from nothing the server sent: transportFailure's, with that error as
+// the cause, or a server's TLS alert in the alert shape. An answer net/http
+// could not parse (a malformed status or header line, an HTTP/2 GOAWAY's
+// debug data) is described in the server's own bytes, which may echo the
+// request and so the signed assertion: it is msgNoReadableAnswer, with no
+// cause, as classifyFailure words it. The *url.Error itself is never
+// carried. Anything else is a token answer that could not be read.
 func tokenError(err error, domain string) error {
 	var ae *auth.Error
 	if errors.As(err, &ae) && ae.Response != nil {
@@ -135,14 +152,22 @@ func tokenError(err error, domain string) error {
 		return refuse(ErrTokenRefused, msgTokenRefused, domain, code, http.StatusText(code))
 	}
 	var ue *url.Error
-	if errors.As(err, &ue) {
-		return &wireError{
-			msg:      fmt.Sprintf(msgTokenUnreachable, domain, ue.Err.Error()),
-			sentinel: ErrUnreachable,
-			cause:    ue.Err,
+	if !errors.As(err, &ue) || ue.Err == nil {
+		return refuse(ErrUnreadable, msgTokenUnreadable, domain)
+	}
+	words, cause := transportFailure(ue.Err)
+	if words == "" {
+		words = msgNoReadableAnswer
+		var opErr *net.OpError
+		if errors.As(ue.Err, &opErr) && opErr.Op == "remote error" && opErr.Err != nil && isAlertWords(opErr.Err.Error()) {
+			words, cause = opErr.Error(), opErr
 		}
 	}
-	return refuse(ErrUnreadable, msgTokenUnreadable, domain)
+	return &wireError{
+		msg:      fmt.Sprintf(msgTokenUnreachable, domain, words),
+		sentinel: ErrUnreachable,
+		cause:    cause,
+	}
 }
 
 // tokenCache holds one token for one identity, in memory only. It is
@@ -213,13 +238,29 @@ const (
 	msgPairEndpoint = "the cluster endpoint %q was not classified by ParseEndpoint; nothing was sent"
 )
 
+// The pairing refusals of a federated credential (M3b.3), each wrapping
+// ErrEndpointRefused. None names a value but the modes and the role.
+const (
+	msgPairFederation     = "a %s federated credential does not go to a %s endpoint; nothing was sent"
+	msgPairRole           = "the federated credential is the %s's, and the client was asked to act as %q; nothing was sent"
+	msgPairFederatedField = "a federated credential takes no %s from a key file; nothing was sent" // private key, private key ID, token URI, universe domain
+	msgPairFederatedEmail = "the federated credential's email is not the service account it impersonates; nothing was sent"
+)
+
 // pair is §3.2's table: each endpoint mode takes only a credential of its own
 // origin, a token URI that is absent or the mode's own, and a universe that is
 // absent or, in Google mode, googleapis.com. So no single field enables either
 // mode. An Endpoint that ParseEndpoint would not have made is refused first.
-func pair(ep Endpoint, cred Credential) error {
+//
+// A federated credential's origin is its Federation's mode, never its
+// email's domain: its email is a real service account's in both modes,
+// because GenerateAccessTokenPath takes no other (pairFederated).
+func pair(ep Endpoint, cred Credential, identity Identity) error {
 	if !classified(ep) {
 		return refuse(ErrEndpointRefused, msgPairEndpoint, ep.Host)
+	}
+	if fc := cred.fed(); fc != nil {
+		return pairFederated(ep, cred, fc, identity)
 	}
 	domain := emailDomain(cred.Email)
 	if origin := credentialOrigin(domain); origin != ep.Mode {
@@ -236,6 +277,39 @@ func pair(ep Endpoint, cred Credential) error {
 	case ep.Mode == ModeGoogle && cred.UniverseDomain != "" && cred.UniverseDomain != googleUniverse,
 		ep.Mode == ModeLoopback && cred.UniverseDomain != "":
 		return refuse(ErrEndpointRefused, msgPairUniverse, cred.UniverseDomain)
+	}
+	return nil
+}
+
+// pairFederated is pair for a federated credential, in this order: its
+// Federation's mode must be the endpoint's (a loopback federation pairs only
+// with a loopback endpoint, a Google one only with a Google one); the
+// client's identity must be the credential's role; none of the key file's
+// fields may be set (a federated credential has no key, no key ID, no token
+// URI and no universe); and its Email must be the service account it
+// impersonates, the one NewFederatedCredential set.
+func pairFederated(ep Endpoint, cred Credential, fc *federatedCredential, identity Identity) error {
+	if fc.fed.mode != ep.Mode {
+		return refuse(ErrEndpointRefused, msgPairFederation, fc.fed.mode, ep.Mode)
+	}
+	if identity != fc.role {
+		return refuse(ErrEndpointRefused, msgPairRole, fc.role, string(identity))
+	}
+	for _, f := range []struct {
+		set  bool
+		name string
+	}{
+		{len(cred.PrivateKeyPEM) != 0, "private key"},
+		{cred.PrivateKeyID != "", "private key ID"},
+		{cred.TokenURI != "", "token URI"},
+		{cred.UniverseDomain != "", "universe domain"},
+	} {
+		if f.set {
+			return refuse(ErrEndpointRefused, msgPairFederatedField, f.name)
+		}
+	}
+	if cred.Email != fc.email {
+		return refuse(ErrEndpointRefused, msgPairFederatedEmail)
 	}
 	return nil
 }

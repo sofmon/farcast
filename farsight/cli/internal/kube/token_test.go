@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -145,10 +146,39 @@ func TestTokenErrorsNameTheDomainAndCodeOnly(t *testing.T) {
 		t.Errorf("a refusal does not wrap ErrTokenRefused: %v", err)
 	}
 
-	unreached := &url.Error{Op: "Post", URL: GoogleTokenURL, Err: errors.New("dial tcp: connection refused")}
+	dial := &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connect: connection refused")}
+	unreached := &url.Error{Op: "Post", URL: GoogleTokenURL + "?" + marker, Err: dial}
 	err = tokenError(fmt.Errorf("auth: cannot fetch token: %w", unreached), googleDomain)
-	if !errors.Is(err, ErrUnreachable) || !strings.Contains(err.Error(), "connection refused") {
-		t.Errorf("a network failure = %v, want ErrUnreachable with the transport's words", err)
+	if want := "the token endpoint for the " + googleDomain + " service account could not be reached: dial tcp: connect: connection refused"; err.Error() != want ||
+		!errors.Is(err, ErrUnreachable) || !errors.Is(err, dial) {
+		t.Errorf("a network failure = %v, want ErrUnreachable %q with the dial error as its cause", err, want)
+	}
+
+	// Go's own words for an answer it could not parse quote the server's
+	// bytes, which may echo the signed assertion: none is kept, and neither
+	// is the error that carries them. A server's TLS alert keeps its words,
+	// which Go writes from the alert's code.
+	for _, c := range []struct {
+		name, want string
+		inner      error
+	}{
+		{"a malformed status line", "no readable answer", fmt.Errorf("net/http: HTTP/1.x transport connection broken: %w",
+			errors.New(`malformed HTTP status code "`+marker+`"`))},
+		{"a malformed header line", "no readable answer", errors.New(`malformed MIME header: missing colon: "` + marker + `"`)},
+		{"an unparsable Location", "no readable answer", fmt.Errorf("failed to parse Location header %q: %w", "http://["+marker, errors.New("missing ']' in host"))},
+		{"an alert in its shape", "remote error: tls: bad certificate", &net.OpError{Op: "remote error", Err: errors.New("tls: bad certificate")}},
+		{"an alert out of its shape", "no readable answer", &net.OpError{Op: "remote error", Err: errors.New("tls: " + marker)}},
+	} {
+		err := tokenError(&url.Error{Op: "Post", URL: GoogleTokenURL, Err: c.inner}, googleDomain)
+		want := "the token endpoint for the " + googleDomain + " service account could not be reached: " + c.want
+		if err.Error() != want || !errors.Is(err, ErrUnreachable) {
+			t.Errorf("%s = %v, want ErrUnreachable %q", c.name, err, want)
+		}
+		for _, e := range fedErrorTree(err) {
+			if strings.Contains(e.Error(), marker) {
+				t.Errorf("%s: the error tree carries the server's bytes: %v", c.name, e)
+			}
+		}
 	}
 
 	err = tokenError(errors.New("auth: cannot fetch token: invalid character '"+marker+"'"), googleDomain)

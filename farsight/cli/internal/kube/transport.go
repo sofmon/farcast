@@ -202,6 +202,9 @@ func (t *apiTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 // tokenTransport sets User-Agent: farcast and never an Authorization header.
+// A redirect whose Location does not parse loses that header
+// (dropUnparsableLocation), so the client returns the 3xx, a refusal named
+// by its status, rather than an error quoting the header.
 type tokenTransport struct {
 	inner http.RoundTripper
 }
@@ -210,7 +213,11 @@ func (t *tokenTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	r := req.Clone(req.Context())
 	r.Header.Set("User-Agent", UserAgent)
 	r.Header.Del("Authorization")
-	return t.inner.RoundTrip(r)
+	resp, err := t.inner.RoundTrip(r)
+	if err == nil && resp != nil {
+		dropUnparsableLocation(r.URL, resp)
+	}
+	return resp, err
 }
 
 // call is one API request, as the methods describe it.

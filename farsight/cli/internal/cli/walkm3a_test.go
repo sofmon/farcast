@@ -765,7 +765,7 @@ func (w *m3aWalk) impersonateVerdict(label string, since time.Time, fed *auth.To
 	var tok *auth.Token
 	var last error
 	o := m3aPositiveOutcome(w.ctx, w.clock, since, func() bool {
-		t, err := w.federation().Impersonate(w.ctx, fed, w.email(role))
+		t, err := w.federation().Impersonate(w.ctx, fed, w.email(role), kube.ScopesCluster)
 		if err == nil && t != nil && t.Value != "" {
 			tok = t
 			return true
@@ -879,7 +879,7 @@ func (w *m3aWalk) rounds(since time.Time, targets []m3aRoundTarget, follows []m3
 		}
 		j := k - n
 		f := follows[j]
-		tok, err := w.federation().Impersonate(w.ctx, source(f).Token(), w.email(f.role))
+		tok, err := w.federation().Impersonate(w.ctx, source(f).Token(), w.email(f.role), kube.ScopesCluster)
 		if err == nil && tok != nil && tok.Value != "" {
 			r.tokens[j] = tok
 			return true
@@ -1601,7 +1601,10 @@ func (w *m3aWalk) stepNegatives() {
 	}
 	readerTok, writerTok := token(audR, readerP, rs), token(audW, writerP, ws)
 	imp := func(tok *auth.Token, role string) func() error {
-		return func() error { _, err := w.federation().Impersonate(w.ctx, tok, w.email(role)); return err }
+		return func() error {
+			_, err := w.federation().Impersonate(w.ctx, tok, w.email(role), kube.ScopesCluster)
+			return err
+		}
 	}
 
 	negs := []*m3aNeg{
@@ -1800,7 +1803,7 @@ func (w *m3aWalk) stepI1() {
 		cert  *tls.Certificate
 	}{{"with V1's reader leaf (TLS 1.3 at least, so the leaf is never sent in clear)", cert}, {"without a client certificate", nil}} {
 		code, body, err := w.probeSend(m3aIAMCredsMTLSHost, c.cert, http.MethodPost, path,
-			http.Header{"Authorization": {"Bearer " + a.Token().Value}, "Content-Type": {"application/json"}, "Accept": {"application/json"}}, kube.ImpersonationBody())
+			http.Header{"Authorization": {"Bearer " + a.Token().Value}, "Content-Type": {"application/json"}, "Accept": {"application/json"}}, kube.ImpersonationBody(kube.ScopesCluster))
 		if err != nil {
 			w.say("I1 %s: NOT ANSWERED: %s", c.label, w.sc.text(err.Error()))
 			continue
@@ -1871,7 +1874,11 @@ func (w *m3aWalk) stepI4() {
 	}
 }
 
-// stepI5 is I5: an audience naming the project's ID.
+// stepI5 is I5: an audience naming the project's ID. Since M3b.3
+// (2026-11-27) kube's Exchange admits the project-number form alone, so this
+// step's exchange is refused before anything is sent, and the walk stops
+// with "NOT SENT (refused before sending)"; I5's answer stays M3a's recorded
+// one.
 func (w *m3aWalk) stepI5() {
 	w.load()
 	since := w.since()
@@ -2197,8 +2204,8 @@ func (w *m3aWalk) watch(mark time.Time, gating []m3aGatingWatch, held []m3aHeldW
 	}
 	for _, h := range held {
 		things = append(things, m3aWatched{expiry: h.held.Expiry, poll: func() m3aCheck {
-			_, err := w.federation().Impersonate(w.ctx, h.held, w.email(h.role))
-			_, cerr := w.federation().Impersonate(w.ctx, h.ctrl, w.email(h.ctrlRole))
+			_, err := w.federation().Impersonate(w.ctx, h.held, w.email(h.role), kube.ScopesCluster)
+			_, cerr := w.federation().Impersonate(w.ctx, h.ctrl, w.email(h.ctrlRole), kube.ScopesCluster)
 			return m3aCheckOf(err, cerr)
 		}})
 	}
@@ -2249,7 +2256,7 @@ func (w *m3aWalk) heldMissing(err error, paste string) {
 // refusal, or no answer, stops the step before the paste (heldMissing).
 func (w *m3aWalk) heldImpersonates(label string, tok *auth.Token, role, paste string) {
 	w.t.Helper()
-	if _, err := w.federation().Impersonate(w.ctx, tok, w.email(role)); err != nil {
+	if _, err := w.federation().Impersonate(w.ctx, tok, w.email(role), kube.ScopesCluster); err != nil {
 		w.say("%s: %s", label, w.refusal(err))
 		w.heldMissing(err, paste)
 	}
@@ -2365,7 +2372,7 @@ func (w *m3aWalk) stepHoldDelete() {
 		// its impersonation is refused with a decision, and the held writer
 		// token is not timed; its exchange still works, so the writer
 		// provider's deletion is still polled.
-		if _, err := w.federation().Impersonate(w.ctx, wt, w.email(m3aWriter)); err != nil {
+		if _, err := w.federation().Impersonate(w.ctx, wt, w.email(m3aWriter), kube.ScopesCluster); err != nil {
 			w.say("held writer token impersonating the writer SA: %s", w.refusal(err))
 			if !m3aWriterLeftOut(err) {
 				w.heldMissing(err, "teardown-v1.sh")

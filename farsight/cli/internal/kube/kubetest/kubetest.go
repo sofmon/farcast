@@ -1,6 +1,9 @@
 // Package kubetest is a fake Kubernetes API server and Google token endpoint
 // for farcast's cluster client, package kube, and for the rehearsal (ADR 0023
-// M2.1, design §2.2).
+// M2.1, design §2.2). Federation (federation.go, iamapi.go) fakes Google's
+// three identity hosts, STS, IAM Credentials and IAM's API, for kube's
+// federated credential (ADR 0024); a Server given WithFederation takes the
+// service-account tokens it issues.
 //
 // It is an ordinary package, not a _test file, so the rehearsal binary can run
 // it; ./check.sh keeps it out of the farcast binary. It listens on loopback
@@ -132,6 +135,8 @@ type options struct {
 	answered    func(r Request, status int)
 	noRecording bool
 	settled     bool
+	federation  *Federation
+	federatedID map[string]string // service account email → the id it is recorded as
 }
 
 type identity struct {
@@ -272,6 +277,38 @@ func WithSettledWorkloads() Option {
 	return func(o *options) { o.settled = true }
 }
 
+// WithFederation makes the server take, beside its own 2LO tokens, the
+// service-account tokens f's IAM Credentials fake issues (ADR 0024 M3b.3):
+// a bearer is looked up first among the tokens the server's own /token
+// minted, and then in f's registry, where a live token minted with exactly
+// kube.ScopesCluster's scopes authenticates as the account it was issued
+// for. Any other scopes (ScopesStorage's, ScopesRegistry's) are 401, a
+// rule of the fake's own [inf: what GKE answers such a token is
+// [unverified]], and so are a federated token and an expired one.
+//
+// Such a request's email is the service account's, so WithRBAC on that
+// email decides it and a 403 names it, as GKE names an impersonated token's
+// account [M2's W-FED, 2026-11-24]. Its id, in Request.As and for
+// WithAccess, is the one WithFederatedIdentity gives that email, else the
+// email itself. The /token rules are unchanged, and a server without it
+// takes no token f issued.
+func WithFederation(f *Federation) Option {
+	return func(o *options) { o.federation = f }
+}
+
+// WithFederatedIdentity records a WithFederation service account's requests
+// as id rather than its email, as WithIdentity names a key's. A second
+// WithFederatedIdentity for the same email replaces the first. Start fails
+// on an empty id or email.
+func WithFederatedIdentity(id, email string) Option {
+	return func(o *options) {
+		if o.federatedID == nil {
+			o.federatedID = map[string]string{}
+		}
+		o.federatedID[email] = id
+	}
+}
+
 // New starts a TLS server on 127.0.0.1:0, with a leaf for IP 127.0.0.1 issued by
 // its own CA (crypto/x509, P-256), and registers t.Cleanup to stop it.
 func New(t testing.TB, opts ...Option) *Server {
@@ -301,6 +338,11 @@ func Start(opts ...Option) (*Server, error) {
 	for _, id := range o.identities {
 		if id.id == "" || id.email == "" || id.pub == nil {
 			return nil, fmt.Errorf("WithIdentity(%q, %q) needs an id, an email and a public key", id.id, id.email)
+		}
+	}
+	for email, id := range o.federatedID {
+		if id == "" || email == "" {
+			return nil, fmt.Errorf("WithFederatedIdentity(%q, %q) needs an id and an email", id, email)
 		}
 	}
 	authorizers := map[string]*authorizer{}

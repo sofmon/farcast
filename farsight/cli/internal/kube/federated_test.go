@@ -159,6 +159,7 @@ var fedSentinels = map[string]error{
 	"ErrCredentialInvalid": ErrCredentialInvalid,
 	"ErrEndpointRefused":   ErrEndpointRefused,
 	"ErrUnsafeEnvironment": ErrUnsafeEnvironment,
+	"ErrIAMRefused":        ErrIAMRefused,
 }
 
 // TestFederatedFixedValues pins the identity path's fixed values (spec v2
@@ -187,6 +188,24 @@ func TestFederatedFixedValues(t *testing.T) {
 		{"federationTimeout", federationTimeout.String(), "30s"},
 		{"exchangeMinTLS", tls.VersionName(exchangeMinTLS), "TLS 1.3"},
 		{"UserAgent", UserAgent, "farcast"},
+		{"IAMHost", IAMHost, "iam.googleapis.com"},
+		{"ScopeDevstorageFullControl", ScopeDevstorageFullControl, "https://www.googleapis.com/auth/devstorage.full_control"},
+		{"ScopesCluster", strings.Join(ScopesCluster.List(), " "), "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email"},
+		{"ScopesStorage", strings.Join(ScopesStorage.List(), " "), "https://www.googleapis.com/auth/devstorage.full_control"},
+		{"ScopesRegistry", strings.Join(ScopesRegistry.List(), " "), "https://www.googleapis.com/auth/cloud-platform"},
+		{"the IAM reader's scopes", strings.Join(scopesIAM.List(), " "), "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email"},
+		{"the provider list's query", providerListQuery, "pageSize=10&showDeleted=true"},
+		{"maxProviderAnswer", strconv.Itoa(maxProviderAnswer), "1048576"},
+		{"maxProviderPages", strconv.Itoa(maxProviderPages), "50"},
+		{"maxPageToken", strconv.Itoa(maxPageToken), "4096"},
+		{"federatedEarlyExpiry", federatedEarlyExpiry.String(), "3m45s"},
+		{"the IAM reader's paths", providersPath("123456789012", "pool1234") + "/prov1234",
+			"/v1/projects/123456789012/locations/global/workloadIdentityPools/pool1234/providers/prov1234"},
+		{"StepProviderGet", string(StepProviderGet), "provider get"},
+		{"StepProviderList", string(StepProviderList), "provider list"},
+		{"ErrIAMRefused", ErrIAMRefused.Error(), "kube: IAM refused a read"},
+		{"RoleTokens' fixed text", roleTokensText, "role tokens (not printed)"},
+		{"IAMReader's fixed text", iamReaderText, "IAM reader (not printed)"},
 	} {
 		if c.got != c.want {
 			t.Errorf("%s = %q, want %q", c.name, c.got, c.want)
@@ -194,6 +213,24 @@ func TestFederatedFixedValues(t *testing.T) {
 	}
 	if exchangeMinTLS != tls.VersionTLS13 {
 		t.Errorf("exchangeMinTLS = %#x, want TLS 1.3", exchangeMinTLS)
+	}
+	// The closed list: every value outside it lists nothing, and each list is
+	// a fresh slice.
+	for _, s := range []Scopes{0, scopesIAM + 1, 255} {
+		if l := s.List(); l != nil {
+			t.Errorf("Scopes(%d).List() = %q, want nil", s, l)
+		}
+	}
+	for _, s := range []Scopes{ScopesCluster, ScopesStorage, ScopesRegistry, scopesIAM} {
+		a := s.List()
+		want := a[0]
+		a[0] = "changed"
+		if got := s.List()[0]; got != want {
+			t.Errorf("Scopes(%d).List hands out a shared slice: %q after a caller's edit", s, got)
+		}
+	}
+	if ScopesCluster != 1 || ScopesStorage != 2 || ScopesRegistry != 3 || scopesIAM != 4 {
+		t.Errorf("the Scopes values moved: %d %d %d %d", ScopesCluster, ScopesStorage, ScopesRegistry, scopesIAM)
 	}
 }
 
@@ -205,8 +242,16 @@ func TestNewFederationRefusesUnderHTTP2Debug(t *testing.T) {
 	t.Cleanup(func() { http2Verbose = saved })
 	http2Verbose = true
 	for name, build := range map[string]func() (*Federation, error){
-		"NewFederation":        NewFederation,
-		"NewFederationForTest": func() (*Federation, error) { return NewFederationForTest("127.0.0.1:1", "127.0.0.1:2", fedPool(t)) },
+		"NewFederation": NewFederation,
+		"NewLoopbackFederation": func() (*Federation, error) {
+			return NewLoopbackFederation("127.0.0.1:1", "127.0.0.1:2", "127.0.0.1:3", fedPool(t))
+		},
+		"NewLoopbackFederation with no roots": func() (*Federation, error) {
+			return NewLoopbackFederation("127.0.0.1:1", "127.0.0.1:2", "127.0.0.1:3", nil)
+		},
+		"NewLoopbackFederation off the machine": func() (*Federation, error) {
+			return NewLoopbackFederation("192.0.2.1:443", "127.0.0.1:2", "127.0.0.1:3", fedPool(t))
+		},
 	} {
 		f, err := build()
 		if f != nil || !errors.Is(err, ErrUnsafeEnvironment) || err.Error() != msgHTTP2Debug {
@@ -231,6 +276,7 @@ func TestNewFederationURLsAreTheConstants(t *testing.T) {
 		"GOOGLE_CLOUD_UNIVERSE_DOMAIN", "GOOGLE_API_GO_EXPERIMENTAL_ENABLE_NEW_AUTH_LIB",
 		"STS_ENDPOINT", "STS_HOST", "GOOGLE_STS_ENDPOINT", "IAM_CREDENTIALS_ENDPOINT",
 		"CLOUDSDK_API_ENDPOINT_OVERRIDES_STS", "CLOUDSDK_API_ENDPOINT_OVERRIDES_IAMCREDENTIALS",
+		"CLOUDSDK_API_ENDPOINT_OVERRIDES_IAM", "IAM_ENDPOINT", "GOOGLE_IAM_ENDPOINT",
 	} {
 		t.Setenv(v, "https://192.0.2.1:8443")
 	}
@@ -242,33 +288,48 @@ func TestNewFederationURLsAreTheConstants(t *testing.T) {
 		name string
 		got  federationHost
 		host string
-	}{{"STS", f.sts, STSMTLSHost}, {"IAM Credentials", f.iam, IAMCredentialsHost}} {
+	}{{"STS", f.sts, STSMTLSHost}, {"IAM Credentials", f.iam, IAMCredentialsHost}, {"IAM's API", f.iamAPI, IAMHost}} {
 		want := federationHost{origin: "https://" + h.host, host: h.host, serverName: h.host}
 		if h.got != want {
 			t.Errorf("%s host = %+v, want %+v", h.name, h.got, want)
 		}
 	}
-
-	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, "federated.go", nil, parser.SkipObjectResolution)
-	if err != nil {
-		t.Fatal(err)
+	if f.mode != ModeGoogle {
+		t.Errorf("NewFederation's mode = %s, want Google", f.mode)
 	}
-	ast.Inspect(file, func(n ast.Node) bool {
-		if sel, ok := n.(*ast.SelectorExpr); ok {
-			switch sel.Sel.Name {
-			case "Getenv", "LookupEnv", "Environ", "ReadFile", "Open", "OpenFile", "ReadDir", "Args":
-				t.Errorf("federated.go names %s at %s: it reads no environment, file or argument", sel.Sel.Name, fset.Position(sel.Pos()))
-			}
+	// A key's token source mints at GoogleTokenURL whatever the key file
+	// names; one naming another is refused (TestTokenSourceForRefusesBeforeSending).
+	if got := (Endpoint{Mode: ModeGoogle}).TokenURL(); got != GoogleTokenURL {
+		t.Errorf("a key's token source mints at %q", got)
+	}
+
+	for _, name := range fedProductFiles {
+		fset := token.NewFileSet()
+		file, err := parser.ParseFile(fset, name, nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatal(err)
 		}
-		return true
-	})
-	for _, imp := range file.Imports {
-		if p, _ := strconv.Unquote(imp.Path.Value); p == "os" || p == "flag" {
-			t.Errorf("federated.go imports %s", p)
+		ast.Inspect(file, func(n ast.Node) bool {
+			if sel, ok := n.(*ast.SelectorExpr); ok {
+				switch sel.Sel.Name {
+				case "Getenv", "LookupEnv", "Environ", "ReadFile", "Open", "OpenFile", "ReadDir", "Args":
+					t.Errorf("%s names %s at %s: it reads no environment, file or argument", name, sel.Sel.Name, fset.Position(sel.Pos()))
+				}
+			}
+			return true
+		})
+		for _, imp := range file.Imports {
+			if p, _ := strconv.Unquote(imp.Path.Value); p == "os" || p == "flag" {
+				t.Errorf("%s imports %s", name, p)
+			}
 		}
 	}
 }
+
+// fedProductFiles are the identity path's product files: the wire code, the
+// federated credential, the role token source and the IAM reader. Each reads
+// no environment, file or argument, and holds no init-time state.
+var fedProductFiles = []string{"federated.go", "credential.go", "tokensource.go", "iamread.go"}
 
 // fedTransports are a Federation's two inner transports for one exchange:
 // the exchange's (built for id) and the shared impersonation one.
@@ -303,41 +364,55 @@ func TestFederationTransportsHaveNoProxy(t *testing.T) {
 		t.Fatal(err)
 	}
 	roots := fedPool(t)
-	loop, err := NewFederationForTest("127.0.0.1:7001", "127.0.0.1:7002", roots)
+	loop, err := NewLoopbackFederation("127.0.0.1:7001", "127.0.0.1:7002", "[::1]:7003", roots)
 	if err != nil {
 		t.Fatal(err)
+	}
+	// The proxy variables are set: a transport built from the environment
+	// would carry a Proxy, and no transport here may.
+	for _, v := range []string{"HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy"} {
+		t.Setenv(v, "http://192.0.2.1:3128")
 	}
 	id := newFedIdentity(t, fedHexID)
 	ci := NewClientIdentity([][]byte{id.leafDER, id.anchorDER}, id.key)
 	for _, m := range []struct {
-		name     string
-		f        *Federation
-		roots    *x509.CertPool
-		sts, iam string // ServerName
+		name             string
+		f                *Federation
+		roots            *x509.CertPool
+		sts, iam, iamAPI string // ServerName
 	}{
-		{"Google", google, nil, STSMTLSHost, IAMCredentialsHost},
-		{"loopback", loop, roots, "127.0.0.1", "127.0.0.1"},
+		{"Google", google, nil, STSMTLSHost, IAMCredentialsHost, IAMHost},
+		{"loopback", loop, roots, "127.0.0.1", "127.0.0.1", "::1"},
 	} {
 		t.Run(m.name, func(t *testing.T) {
 			hc, ex, tr, im, imTr := fedTransports(t, m.f, ci, id.leaf)
-			if tr == imTr {
-				t.Fatal("the exchange and impersonation share one transport")
+			ac := m.f.iamAPIClient()
+			api, ok := ac.Transport.(*identityTransport)
+			if !ok {
+				t.Fatalf("the IAM API client's transport is %T", ac.Transport)
+			}
+			apiTr, ok := api.inner.(*http.Transport)
+			if !ok {
+				t.Fatalf("the IAM API transport's inner is %T", api.inner)
+			}
+			if tr == imTr || apiTr == imTr || apiTr == tr {
+				t.Fatal("two of the identity clients share one transport")
 			}
 			if _, tr2 := m.f.exchangeClient(ci, id.leaf); tr2 == tr {
 				t.Error("two exchanges share one transport")
 			}
-			if ex.bearer || !im.bearer {
-				t.Errorf("bearer: exchange %v, impersonation %v; want false, true", ex.bearer, im.bearer)
+			if ex.bearer != noBearer || im.bearer != federatedBearer || api.bearer != serviceAccountBearer {
+				t.Errorf("bearer: exchange %v, impersonation %v, IAM API %v; want none, the federated token, the service account's", ex.bearer, im.bearer, api.bearer)
 			}
-			if ex.host != m.f.sts.host || im.host != m.f.iam.host {
-				t.Errorf("hosts: exchange %q, impersonation %q", ex.host, im.host)
+			if ex.host != m.f.sts.host || im.host != m.f.iam.host || api.host != m.f.iamAPI.host {
+				t.Errorf("hosts: exchange %q, impersonation %q, IAM API %q", ex.host, im.host, api.host)
 			}
 			for _, s := range []struct {
 				name       string
 				tr         *http.Transport
 				min        uint16
 				serverName string
-			}{{"exchange", tr, tls.VersionTLS13, m.sts}, {"impersonation", imTr, tls.VersionTLS12, m.iam}} {
+			}{{"exchange", tr, tls.VersionTLS13, m.sts}, {"impersonation", imTr, tls.VersionTLS12, m.iam}, {"IAM API", apiTr, tls.VersionTLS12, m.iamAPI}} {
 				if s.tr.Proxy != nil {
 					t.Errorf("%s: Proxy is set; it must be nil so no proxy variable routes the identity path", s.name)
 				}
@@ -384,15 +459,17 @@ func TestFederationTransportsHaveNoProxy(t *testing.T) {
 			if _, none := m.f.exchangeClient(ClientIdentity{}, nil); none.TLSClientConfig.GetClientCertificate != nil {
 				t.Error("an exchange with no identity still has GetClientCertificate")
 			}
-			// Impersonation: no certificate of any kind.
-			itc := imTr.TLSClientConfig
-			if itc.GetClientCertificate != nil || itc.Certificates != nil || itc.NextProtos != nil {
-				t.Error("the impersonation transport can present a certificate or overrides NextProtos")
+			// Impersonation and IAM's API: no certificate of any kind.
+			for name, tr := range map[string]*http.Transport{"impersonation": imTr, "IAM API": apiTr} {
+				itc := tr.TLSClientConfig
+				if itc.GetClientCertificate != nil || itc.Certificates != nil || itc.NextProtos != nil {
+					t.Errorf("the %s transport can present a certificate or overrides NextProtos", name)
+				}
+				if !tr.ForceAttemptHTTP2 || tr.DisableKeepAlives || tr.MaxIdleConnsPerHost != 2 || tr.IdleConnTimeout != 90*time.Second || tr.TLSNextProto != nil {
+					t.Errorf("%s: %+v is not §2.4's shape", name, tr)
+				}
 			}
-			if !imTr.ForceAttemptHTTP2 || imTr.DisableKeepAlives || imTr.MaxIdleConnsPerHost != 2 || imTr.IdleConnTimeout != 90*time.Second || imTr.TLSNextProto != nil {
-				t.Errorf("impersonation: %+v is not §2.4's shape", imTr)
-			}
-			for name, c := range map[string]*http.Client{"exchange": hc, "impersonation": m.f.impersonation} {
+			for name, c := range map[string]*http.Client{"exchange": hc, "impersonation": m.f.impersonation, "IAM API": ac} {
 				if c.CheckRedirect == nil || !errors.Is(c.CheckRedirect(nil, nil), http.ErrUseLastResponse) {
 					t.Errorf("the %s client follows redirects", name)
 				}
@@ -413,6 +490,7 @@ func TestIdentityTransportSendsOnlyToItsHost(t *testing.T) {
 		t.Fatal(err)
 	}
 	hc, _ := f.exchangeClient(ClientIdentity{}, nil)
+	hosts := []string{STSMTLSHost, IAMCredentialsHost, IAMHost}
 	for _, side := range []struct {
 		name string
 		it   identityTransport
@@ -420,21 +498,31 @@ func TestIdentityTransportSendsOnlyToItsHost(t *testing.T) {
 	}{
 		{"exchange", *hc.Transport.(*identityTransport), STSMTLSHost},
 		{"impersonation", *f.impersonation.Transport.(*identityTransport), IAMCredentialsHost},
+		{"IAM API", *f.iamAPIClient().Transport.(*identityTransport), IAMHost},
 	} {
 		t.Run(side.name, func(t *testing.T) {
 			rec := &recordingRoundTripper{}
 			side.it.inner = rec
-			ctx := withFederatedBearer(context.Background(), &auth.Token{Value: "federated-marker"})
-			for _, target := range []string{
+			ctx := withServiceAccountBearer(withFederatedBearer(context.Background(), &auth.Token{Value: "federated-marker"}), "sa-marker")
+			targets := []string{
 				"https://evil.example/v1/token",
 				"https://oauth2.googleapis.com/token",
-				"https://" + map[bool]string{true: IAMCredentialsHost, false: STSMTLSHost}[side.host == STSMTLSHost] + "/v1/token",
-				"http://" + side.host + "/v1/token",
-				"https://" + side.host + ":8443/v1/token",
-				"https://" + side.host + "@evil.example/v1/token",
-				"https://" + side.host + "./v1/token",
-				"https://" + strings.ToUpper(side.host) + "/v1/token",
-			} {
+				"https://iam.mtls.googleapis.com/v1/token",
+				"https://iamcredentials.mtls.googleapis.com/v1/token",
+			}
+			for _, other := range hosts {
+				if other != side.host {
+					targets = append(targets, "https://"+other+"/v1/token")
+				}
+			}
+			for _, target := range append(targets,
+				"http://"+side.host+"/v1/token",
+				"https://"+side.host+":8443/v1/token",
+				"https://"+side.host+":443/v1/token",
+				"https://"+side.host+"@evil.example/v1/token",
+				"https://"+side.host+"./v1/token",
+				"https://"+strings.ToUpper(side.host)+"/v1/token",
+			) {
 				req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, strings.NewReader("x"))
 				if err != nil {
 					t.Fatal(err)
@@ -498,9 +586,11 @@ func fedHeaderNames(h http.Header) []string {
 }
 
 // TestBearerOnlyToIAMCredentialsHost is TestAuthorizationOnlyToTheEndpointHost
-// for the identity path: the impersonation transport sends the federated
-// bearer, and only over https to its own host; the exchange transport never
-// sends one; no caller header but an allowed Content-Type survives.
+// for the identity path (R1): the impersonation transport sends the
+// federated bearer, and only over https to its own host; IAM's API transport
+// sends the service account's bearer, and only over https to IAMHost; the
+// exchange transport never sends one; no transport sends another's token;
+// no caller header but an allowed Content-Type survives.
 func TestBearerOnlyToIAMCredentialsHost(t *testing.T) {
 	f, err := NewFederation()
 	if err != nil {
@@ -588,11 +678,62 @@ func TestBearerOnlyToIAMCredentialsHost(t *testing.T) {
 	if orig.Header.Get("Authorization") != "Bearer set-by-the-caller" {
 		t.Error("the exchange RoundTripper changed its caller's request")
 	}
+
+	// The service account's bearer: IAM's API transport alone sends it, and
+	// only to IAMHost; neither other transport sends it.
+	api := *f.iamAPIClient().Transport.(*identityTransport)
+	saCtx := withServiceAccountBearer(ctx, "sa-marker")
+	read := "https://" + IAMHost + "/v1/projects/123456789012/locations/global/workloadIdentityPools/pool1234/providers"
+	orig, sent = fedSend(t, api, saCtx, read, callerHeaders(""))
+	if got := sent.Header.Get("Authorization"); got != "Bearer sa-marker" {
+		t.Errorf("IAM API: Authorization = %q, want the service account's bearer", got)
+	}
+	if got := fedHeaderNames(sent.Header); !slices.Equal(got, []string{"Accept", "Authorization", "User-Agent"}) {
+		t.Errorf("IAM API: header names %q, want exactly Accept, Authorization and User-Agent", got)
+	}
+	if sent.Header.Get("User-Agent") != "farcast" || sent.Header.Get("Accept") != "application/json" {
+		t.Errorf("IAM API: User-Agent %q, Accept %q", sent.Header.Get("User-Agent"), sent.Header.Get("Accept"))
+	}
+	if orig.Header.Get("Authorization") != "Bearer set-by-the-caller" {
+		t.Error("the IAM API RoundTripper changed its caller's request")
+	}
+	// Without the service account's token, IAM's API gets none: neither the
+	// federated token nor the cluster's is one.
+	_, sent = fedSend(t, api, ctx, read, callerHeaders(""))
+	if got := sent.Header.Get("Authorization"); got != "" {
+		t.Errorf("IAM API with a federated and a cluster bearer only: Authorization = %q", got)
+	}
+	for name, it := range map[string]identityTransport{"impersonation": im, "exchange": ex} {
+		target := gat
+		if name == "exchange" {
+			target = "https://" + STSMTLSHost + STSTokenPath
+		}
+		_, sent = fedSend(t, it, withServiceAccountBearer(context.Background(), "sa-marker"), target, http.Header{})
+		if got := sent.Header.Get("Authorization"); got != "" {
+			t.Errorf("the %s transport sent the service account's bearer: %q", name, got)
+		}
+	}
+	for _, target := range []string{
+		"http://" + IAMHost + "/v1/projects/123456789012/locations/global/workloadIdentityPools/pool1234/providers",
+		"https://" + IAMCredentialsHost + "/v1/projects/-/serviceAccounts/" + fedEmail + ":generateAccessToken",
+		"https://" + STSMTLSHost + STSTokenPath,
+		"https://iam.mtls.googleapis.com/v1/projects/123456789012/locations/global/workloadIdentityPools/pool1234/providers",
+		"https://evil.example/collect",
+	} {
+		rec := &recordingRoundTripper{}
+		it := api
+		it.inner = rec
+		req, _ := http.NewRequestWithContext(saCtx, http.MethodGet, target, nil)
+		if _, err := it.RoundTrip(req); !errors.Is(err, ErrEndpointRefused) || len(rec.reqs) != 0 {
+			t.Errorf("IAM API to %s: %v, %d sent; want the guard's refusal and nothing sent", target, err, len(rec.reqs))
+		}
+	}
 }
 
-// TestTheTwoBearerKeysDoNotCross: the cluster's bearer key and the federated
-// one are distinct, so the impersonation transport never sends a cluster
-// token and the API transport never sends a federated one.
+// TestTheTwoBearerKeysDoNotCross: the cluster's bearer key, the federated
+// one and IAM's API's are distinct, so the impersonation transport never
+// sends a cluster token and the API transport never sends a federated or an
+// IAM API one.
 func TestTheTwoBearerKeysDoNotCross(t *testing.T) {
 	f, err := NewFederation()
 	if err != nil {
@@ -616,7 +757,7 @@ func TestTheTwoBearerKeysDoNotCross(t *testing.T) {
 	at := *c.api.Transport.(*apiTransport)
 	rec := &recordingRoundTripper{}
 	at.inner = rec
-	req, err := http.NewRequestWithContext(withFederatedBearer(context.Background(), &auth.Token{Value: "federated-marker"}), http.MethodGet, ep.BaseURL()+"/api", nil)
+	req, err := http.NewRequestWithContext(withServiceAccountBearer(withFederatedBearer(context.Background(), &auth.Token{Value: "federated-marker"}), "sa-marker"), http.MethodGet, ep.BaseURL()+"/api", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -626,7 +767,7 @@ func TestTheTwoBearerKeysDoNotCross(t *testing.T) {
 	}
 	_ = resp.Body.Close()
 	if got := rec.reqs[0].Header.Get("Authorization"); got != "" {
-		t.Errorf("the API transport sent the federated bearer: %q", got)
+		t.Errorf("the API transport sent the federated or the IAM API's bearer: %q", got)
 	}
 }
 
@@ -728,19 +869,37 @@ func TestExchangeFormFields(t *testing.T) {
 	}
 }
 
-// TestImpersonationBodyIsExact pins generateAccessToken's body, byte for byte.
+// TestImpersonationBodyIsExact pins generateAccessToken's body for each
+// consumer's scopes (N9), byte for byte, and nil outside the closed list.
 func TestImpersonationBodyIsExact(t *testing.T) {
-	want := `{"scope":["https://www.googleapis.com/auth/cloud-platform","https://www.googleapis.com/auth/userinfo.email"],"lifetime":"3600s"}`
-	if got := string(ImpersonationBody()); got != want {
-		t.Errorf("ImpersonationBody() = %s\nwant %s", got, want)
+	for _, c := range []struct {
+		name string
+		s    Scopes
+		want string
+	}{
+		{"ScopesCluster", ScopesCluster, `{"scope":["https://www.googleapis.com/auth/cloud-platform","https://www.googleapis.com/auth/userinfo.email"],"lifetime":"3600s"}`},
+		{"ScopesStorage", ScopesStorage, `{"scope":["https://www.googleapis.com/auth/devstorage.full_control"],"lifetime":"3600s"}`},
+		{"ScopesRegistry", ScopesRegistry, `{"scope":["https://www.googleapis.com/auth/cloud-platform"],"lifetime":"3600s"}`},
+		{"the IAM reader's", scopesIAM, `{"scope":["https://www.googleapis.com/auth/cloud-platform","https://www.googleapis.com/auth/userinfo.email"],"lifetime":"3600s"}`},
+	} {
+		got := ImpersonationBody(c.s)
+		if string(got) != c.want {
+			t.Errorf("ImpersonationBody(%s) = %s\nwant %s", c.name, got, c.want)
+		}
+		if !json.Valid(got) {
+			t.Errorf("ImpersonationBody(%s) is not JSON", c.name)
+		}
 	}
-	if !json.Valid(ImpersonationBody()) {
-		t.Error("ImpersonationBody is not JSON")
+	for _, s := range []Scopes{0, scopesIAM + 1, 255} {
+		if got := ImpersonationBody(s); got != nil {
+			t.Errorf("ImpersonationBody(%d) = %s, want nil", s, got)
+		}
 	}
 }
 
-// TestAudienceShapes: Audience takes a project number alone; Exchange's guard
-// also admits a project ID; and every refusal names the part, never the value.
+// TestAudienceShapes: Audience takes a project number alone, and since
+// M3b.3 so does Exchange's guard, which refuses the project-ID form M3a's I5
+// sent; and every refusal names the part, never the value.
 func TestAudienceShapes(t *testing.T) {
 	got, err := Audience("123456789012", "pool1234", "prov1234")
 	if err != nil || got != fedAudience {
@@ -750,8 +909,8 @@ func TestAudienceShapes(t *testing.T) {
 		t.Error("checkAudience refuses the number form")
 	}
 	idForm := "//iam.googleapis.com/projects/my-project-1/locations/global/workloadIdentityPools/pool1234/providers/prov1234"
-	if !checkAudience(idForm) {
-		t.Error("checkAudience refuses the project-ID form I5 sends")
+	if checkAudience(idForm) {
+		t.Error("checkAudience admits the project-ID form I5 sends")
 	}
 	if _, err := Audience("my-project-1", "pool1234", "prov1234"); err == nil || err.Error() != fmt.Sprintf(msgFederationRequest, "audience (project number)") {
 		t.Errorf("Audience took a project ID: %v", err)
@@ -854,7 +1013,7 @@ func TestGenerateAccessTokenPathShapes(t *testing.T) {
 	}
 }
 
-// fedCounting is a Federation whose two hosts are one counting listener's
+// fedCounting is a Federation whose three hosts are one counting listener's
 // address: a refusal before sending must leave it at zero.
 func fedCounting(t *testing.T) (*Federation, *countingListener) {
 	t.Helper()
@@ -863,7 +1022,7 @@ func fedCounting(t *testing.T) (*Federation, *countingListener) {
 		t.Fatal("no IPv4 loopback")
 	}
 	addr := net.JoinHostPort("127.0.0.1", l.port())
-	f, err := NewFederationForTest(addr, addr, fedPool(t))
+	f, err := NewLoopbackFederation(addr, addr, addr, fedPool(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -914,20 +1073,27 @@ func TestExchangeRefusesBeforeSending(t *testing.T) {
 	}
 }
 
-// TestImpersonateRefusesBeforeSending: a nil or empty federated token and a
-// malformed email are refused before anything is dialled.
+// TestImpersonateRefusesBeforeSending: a nil or empty federated token, a
+// malformed email and a Scopes outside the closed list are refused before
+// anything is dialled.
 func TestImpersonateRefusesBeforeSending(t *testing.T) {
 	f, l := fedCounting(t)
 	for _, c := range []struct {
 		name, field, email string
 		tok                *auth.Token
+		s                  Scopes
 	}{
-		{"a nil token", "federated token", fedEmail, nil},
-		{"an empty token", "federated token", fedEmail, &auth.Token{Type: "Bearer"}},
-		{"a bad email", "service account", "reader@example.com", &auth.Token{Value: "x"}},
-		{"an empty email", "service account", "", &auth.Token{Value: "x"}},
+		{"a nil token", "federated token", fedEmail, nil, ScopesCluster},
+		{"an empty token", "federated token", fedEmail, &auth.Token{Type: "Bearer"}, ScopesCluster},
+		{"a bad email", "service account", "reader@example.com", &auth.Token{Value: "x"}, ScopesCluster},
+		{"an empty email", "service account", "", &auth.Token{Value: "x"}, ScopesCluster},
+		{"the zero Scopes", "scopes", fedEmail, &auth.Token{Value: "x"}, 0},
+		{"a Scopes past the list", "scopes", fedEmail, &auth.Token{Value: "x"}, scopesIAM + 1},
+		// The order: the token, then the email, then the scopes.
+		{"a bad email and the zero Scopes", "service account", "reader@example.com", &auth.Token{Value: "x"}, 0},
+		{"no token, no email and the zero Scopes", "federated token", "", nil, 0},
 	} {
-		tok, err := f.Impersonate(t.Context(), c.tok, c.email)
+		tok, err := f.Impersonate(t.Context(), c.tok, c.email, c.s)
 		if tok != nil || !errors.Is(err, ErrCredentialInvalid) || err.Error() != fmt.Sprintf(msgFederationRequest, c.field) {
 			t.Errorf("%s: %v, %v; want the %s refusal", c.name, tok, err, c.field)
 		}
@@ -935,7 +1101,7 @@ func TestImpersonateRefusesBeforeSending(t *testing.T) {
 	if n := l.accepted(t); n != 0 {
 		t.Fatalf("%d connections were made for refused requests", n)
 	}
-	if _, err := f.Impersonate(t.Context(), &auth.Token{Value: "x"}, fedEmail); !errors.Is(err, ErrUnreachable) {
+	if _, err := f.Impersonate(t.Context(), &auth.Token{Value: "x"}, fedEmail, ScopesStorage); !errors.Is(err, ErrUnreachable) {
 		t.Errorf("the control: %v; want unreachable", err)
 	}
 	if n := l.accepted(t); n == 0 {
@@ -1427,8 +1593,10 @@ func TestImpersonationAnswerValidation(t *testing.T) {
 // Expiry as Exchange and Impersonate return it, end to end over loopback.
 func TestFederationClockHasNoMonotonicReading(t *testing.T) {
 	for name, build := range map[string]func() (*Federation, error){
-		"NewFederation":        NewFederation,
-		"NewFederationForTest": func() (*Federation, error) { return NewFederationForTest("127.0.0.1:1", "127.0.0.1:2", fedPool(t)) },
+		"NewFederation": NewFederation,
+		"NewLoopbackFederation": func() (*Federation, error) {
+			return NewLoopbackFederation("127.0.0.1:1", "127.0.0.1:2", "127.0.0.1:3", fedPool(t))
+		},
 	} {
 		f, err := build()
 		if err != nil {
@@ -1454,7 +1622,7 @@ func TestFederationClockHasNoMonotonicReading(t *testing.T) {
 	roots := x509.NewCertPool()
 	roots.AddCert(srv.Certificate())
 	addr := srv.Listener.Addr().String()
-	f, err := NewFederationForTest(addr, addr, roots)
+	f, err := NewLoopbackFederation(addr, addr, addr, roots)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1475,7 +1643,7 @@ func TestFederationClockHasNoMonotonicReading(t *testing.T) {
 	if ans.TLSVersion() != tls.VersionTLS13 {
 		t.Errorf("TLSVersion = %s", tls.VersionName(ans.TLSVersion()))
 	}
-	sa, err := f.Impersonate(t.Context(), ans.Token(), fedEmail)
+	sa, err := f.Impersonate(t.Context(), ans.Token(), fedEmail, ScopesCluster)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1527,6 +1695,23 @@ type (
 		rs []ExchangeRequest
 		as []*ExchangeAnswer
 	}
+	// M3b.3's types: the federated Credential, RoleTokens and IAMReader.
+	fedExportedRole struct {
+		Cr  Credential
+		CrP *Credential
+		T   RoleTokens
+		TP  *RoleTokens
+		I   IAMReader
+		IP  *IAMReader
+	}
+	fedUnexportedRole struct {
+		cr  Credential
+		crp *Credential
+		t   RoleTokens
+		tp  *RoleTokens
+		i   IAMReader
+		ip  *IAMReader
+	}
 )
 
 // TestFederationTypesNeverFormat: the identity path's types never print a
@@ -1535,7 +1720,9 @@ type (
 // handlers: alone, as a pointer, in a struct's exported field, and in an
 // unexported one by value or by pointer, where only their contents' two
 // pointers keep them unprinted (fmt's badVerb dereferences a pointer at depth
-// 0 under %s and %q).
+// 0 under %s and %q). Since M3b.3 that holds for a federated Credential's
+// federated part (the rest of a Credential formats as before: its exported
+// fields), for RoleTokens holding a token, and for an IAMReader.
 func TestFederationTypesNeverFormat(t *testing.T) {
 	const (
 		plantedCN       = "planted-cn-" + fedHexID
@@ -1555,6 +1742,28 @@ func TestFederationTypesNeverFormat(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	fed, err := NewLoopbackFederation("127.0.0.1:1", "127.0.0.1:2", "127.0.0.1:3", fedPool(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cred, err := NewFederatedCredential(fed, aud, ci, fedEmail, Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cred.fed().cache.tok = &auth.Token{Value: fedSecretMarker + "-federated", Expiry: time.Now().Add(time.Hour)}
+	rtp := newRoleTokens(Reader, true, ScopesStorage, func(context.Context) (*auth.Token, error) {
+		return &auth.Token{Value: fedSecretMarker + "-sa", Expiry: time.Now().Add(time.Hour)}, nil
+	})
+	if v, _, err := rtp.Token(t.Context()); err != nil || v != fedSecretMarker+"-sa" {
+		t.Fatalf("the planted RoleTokens: %q, %v", v, err)
+	}
+	rt := *rtp
+	irp, err := NewIAMReader(cred)
+	if err != nil {
+		t.Fatal(err)
+	}
+	irp.get().tokens.get().tok = &auth.Token{Value: fedSecretMarker + "-iam", Expiry: time.Now().Add(time.Hour)}
+	ir := *irp
 	forbidden := []string{
 		plantedCN, hex.EncodeToString([]byte(plantedCN)),
 		string(id.leafDER), hex.EncodeToString(id.leafDER), base64.StdEncoding.EncodeToString(id.leafDER),
@@ -1593,6 +1802,21 @@ func TestFederationTypesNeverFormat(t *testing.T) {
 		"*all of them unexported":         &fedUnexportedAll{ci, &ci, req, &req, ans, &ans},
 		"unexported slices of them":       fedUnexportedSlices{[]ClientIdentity{ci}, []ExchangeRequest{req}, []*ExchangeAnswer{&ans}},
 		"slices of them":                  []any{ci, &req, ans},
+
+		"a federated Credential":                 cred,
+		"*a federated Credential":                &cred,
+		"RoleTokens":                             rt,
+		"*RoleTokens":                            rtp,
+		"IAMReader":                              ir,
+		"*IAMReader":                             irp,
+		"M3b.3's types in exported fields":       fedExportedRole{cred, &cred, rt, rtp, ir, irp},
+		"*M3b.3's types in exported fields":      &fedExportedRole{cred, &cred, rt, rtp, ir, irp},
+		"M3b.3's types in unexported fields":     fedUnexportedRole{cred, &cred, rt, rtp, ir, irp},
+		"*M3b.3's types in unexported fields":    &fedUnexportedRole{cred, &cred, rt, rtp, ir, irp},
+		"slices of M3b.3's types":                []any{cred, rtp, ir},
+		"a slice of federated Credentials":       []Credential{cred, cred},
+		"a map of RoleTokens by their consumer":  map[string]*RoleTokens{"storage": rtp},
+		"an unexported federated Credential map": struct{ m map[string]Credential }{map[string]Credential{"reader": cred}},
 	}
 	check := func(what, out string) {
 		t.Helper()
@@ -1624,6 +1848,8 @@ func TestFederationTypesNeverFormat(t *testing.T) {
 	var zeroC ClientIdentity
 	var zeroR ExchangeRequest
 	var zeroA ExchangeAnswer
+	var zeroT RoleTokens
+	var zeroI IAMReader
 	for _, c := range []struct {
 		name string
 		v    any
@@ -1638,6 +1864,12 @@ func TestFederationTypesNeverFormat(t *testing.T) {
 		{"the zero ClientIdentity", zeroC, clientIdentityText},
 		{"the zero ExchangeRequest", zeroR, exchangeRequestText},
 		{"the zero ExchangeAnswer", zeroA, exchangeAnswerText},
+		{"RoleTokens", rt, roleTokensText},
+		{"*RoleTokens", rtp, roleTokensText},
+		{"IAMReader", ir, iamReaderText},
+		{"*IAMReader", irp, iamReaderText},
+		{"the zero RoleTokens", zeroT, roleTokensText},
+		{"the zero IAMReader", zeroI, iamReaderText},
 	} {
 		for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%q", "%x", "%X", "%d", "%o", "%b", "%t"} {
 			if got := fmt.Sprintf(verb, c.v); got != c.want {
@@ -1664,6 +1896,12 @@ func TestFederationTypesNeverFormat(t *testing.T) {
 		{"the zero ClientIdentity", zeroC, clientIdentityText},
 		{"the zero ExchangeRequest", zeroR, exchangeRequestText},
 		{"the zero ExchangeAnswer", zeroA, exchangeAnswerText},
+		{"RoleTokens", rt, roleTokensText},
+		{"*RoleTokens", rtp, roleTokensText},
+		{"IAMReader", ir, iamReaderText},
+		{"*IAMReader", irp, iamReaderText},
+		{"the zero RoleTokens", zeroT, roleTokensText},
+		{"the zero IAMReader", zeroI, iamReaderText},
 	} {
 		want, err := json.Marshal(c.want)
 		if err != nil {
@@ -1671,6 +1909,38 @@ func TestFederationTypesNeverFormat(t *testing.T) {
 		}
 		if got, err := json.Marshal(c.v); err != nil || !bytes.Equal(got, want) {
 			t.Errorf("%s under json.Marshal = %.40q, %v; want %s", c.name, got, err, want)
+		}
+	}
+	// slog resolves each of M3b.3's types to its fixed text through
+	// LogValue, alone and as the zero value, before any handler sees it.
+	for _, c := range []struct {
+		name string
+		v    any
+		want string
+	}{
+		{"RoleTokens", rt, roleTokensText},
+		{"*RoleTokens", rtp, roleTokensText},
+		{"the zero RoleTokens", zeroT, roleTokensText},
+		{"IAMReader", ir, iamReaderText},
+		{"*IAMReader", irp, iamReaderText},
+		{"the zero IAMReader", zeroI, iamReaderText},
+	} {
+		if v := slog.AnyValue(c.v).Resolve(); v.Kind() != slog.KindString || v.String() != c.want {
+			t.Errorf("%s resolves under slog to %s %.40q, not the string %q", c.name, v.Kind(), v.String(), c.want)
+		}
+	}
+	// Held in a caller's unexported fields, where fmt cannot reach their
+	// methods, RoleTokens' and IAMReader's contents are two pointers deep.
+	// Under a verb a pointer does not take, fmt prints the inner pointer
+	// again at depth 0, where one pointer to a struct would be followed and
+	// the struct printed: the role, the IAM API host.
+	held := struct {
+		rt RoleTokens
+		ir IAMReader
+	}{rt, ir}
+	for _, verb := range []string{"%s", "%q", "%t", "%v", "%+v"} {
+		if out := fmt.Sprintf(verb, held); strings.Contains(out, string(Reader)) || strings.Contains(out, "127.0.0.1") {
+			t.Errorf("RoleTokens and IAMReader in unexported fields under %s print their contents: %.120q", verb, out)
 		}
 	}
 	holderJSON := `{"C":"` + clientIdentityText + `","CP":"` + clientIdentityText + `","R":"` + exchangeRequestText +
@@ -1701,6 +1971,17 @@ func TestFederationTypesNeverFormat(t *testing.T) {
 	}
 	if zeroA.Token() != nil || zeroA.ExpiresIn() != 0 || zeroA.TLSVersion() != 0 {
 		t.Error("the zero ExchangeAnswer's accessors are not empty")
+	}
+	// A federated Credential's federated part prints as an address at most,
+	// and encoding/json, which skips it, gives the exported fields alone.
+	for _, verb := range []string{"%v", "%+v", "%#v", "%s"} {
+		out := fmt.Sprintf(verb, cred)
+		if !strings.Contains(out, "0x") || strings.Contains(out, "127.0.0.1") || strings.Contains(out, "reader\"") {
+			t.Errorf("a federated Credential under %s prints more than an address for its federated part: %.120q", verb, out)
+		}
+	}
+	if b, err := json.Marshal(cred); err != nil || string(b) != `{"Email":"`+fedEmail+`","PrivateKeyID":"","PrivateKeyPEM":null,"TokenURI":"","UniverseDomain":""}` {
+		t.Errorf("a federated Credential under json.Marshal = %s, %v", b, err)
 	}
 }
 
@@ -1747,20 +2028,23 @@ func initTimeFaults(src string) ([]string, error) {
 	return faults, nil
 }
 
-// TestFederatedHasNoInitTimeState: federated.go runs nothing at package
-// initialisation, so while nothing calls it the linker drops it and farcast
-// starts exactly as before. The scan itself is checked on planted sources.
+// TestFederatedHasNoInitTimeState: the identity path's product files
+// (fedProductFiles) run nothing at package initialisation, so while nothing
+// calls them the linker drops them and farcast starts exactly as before. The
+// scan itself is checked on planted sources.
 func TestFederatedHasNoInitTimeState(t *testing.T) {
-	src, err := os.ReadFile("federated.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	faults, err := initTimeFaults(string(src))
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, f := range faults {
-		t.Errorf("federated.go %s", f)
+	for _, name := range fedProductFiles {
+		src, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		faults, err := initTimeFaults(string(src))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, f := range faults {
+			t.Errorf("%s %s", name, f)
+		}
 	}
 	for name, planted := range map[string]string{
 		"an init function":    "package kube\nfunc init() {}\n",

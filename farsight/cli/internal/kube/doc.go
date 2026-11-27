@@ -31,6 +31,19 @@
 //     choice of a workload's pod for logs;
 //   - readerkey.go makes the reader identity's key and generic certificate.
 //
-// federated.go is the identity path's wire code (ADR 0024 decision 8), wired
-// into no command until M3b.
+// The identity path (ADR 0024 decision 8) is wired into no command until
+// M3b's wiring; no cli product file calls it yet:
+//   - federated.go is its wire code: the mTLS exchange at STS,
+//     generateAccessToken at IAM Credentials, the Federation (Google's hosts,
+//     or loopback fakes through NewLoopbackFederation, which only the
+//     rehearsal and tests call) and its transports;
+//   - credential.go's NewFederatedCredential is a role's federated
+//     credential, from which New builds a cluster client (M3b.3): one
+//     federated token per credential, shared by its copies and consumers,
+//     and one impersonation per consumer;
+//   - tokensource.go's TokenSourceFor is one consumer's token source for a
+//     role, federated or a service-account key, with its scopes from a closed
+//     list (N9: ScopesCluster, ScopesStorage, ScopesRegistry);
+//   - iamread.go's IAMReader reads the instance's providers at IAM's API
+//     host, as the reader's service account alone.
 package kube

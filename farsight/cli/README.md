@@ -1785,9 +1785,9 @@ farsight/cli/
     │                            in-process reads, and git-credential rm's DeleteSecret; a reader
     │                            never writes  (ADR 0023 M2.3–M2.8)
     ├── plan/                  ← the plan document: its canonical encoding, digest and fact types; standard library only  (ADR 0023 M2.6)
-    ├── kube/                  ← the in-process Kubernetes client: endpoint rule, token, reads, logs, rollout, apply  (ADR 0023 M2.1)
+    ├── kube/                  ← the in-process Kubernetes client: endpoint rule, token, reads, logs, rollout, apply  (ADR 0023 M2.1); not drawn: federated.go (ADR 0024 M3a), and tokensource.go and iamread.go, the per-consumer token sources and the reader's IAM read, with the federated credential (ADR 0024 M3b.3, wired into no command)
     │   ├── realapi_test.go    ← the real-API suite, build tag realapi: vetted and linted by ./check.sh, run only by its runbook  (ADR 0023 M2.7)
-    │   └── kubetest/          ← a fake API server and token endpoint on loopback, for tests and the rehearsal; never linked into farcast (./check.sh step 1b refuses it)
+    │   └── kubetest/          ← a fake API server and token endpoint on loopback, for tests and the rehearsal, and the federation's fakes, STS, IAM Credentials and, since ADR 0024 M3b.3, IAM's API, for tests; never linked into farcast (./check.sh step 1b refuses it)
     ├── image/                 ← FarCast's own container images, no engine  (2.3, ADR 0007, ADR 0023)
     │   ├── image.go           ← Builder/Options, BuildAndPush, Resolve, ComponentLayer, Assemble, BaseImage
     │   ├── recipe.go          ← the one compile recipe: BuildFlags, FindToolchain, BuildEnviron, CheckBinary

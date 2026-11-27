@@ -2,7 +2,7 @@
 
 *(2026-11-22: kept in the repository from here on, with ADR 0024's records. It was drafted outside it, so the sizing prototypes it cites (`proto/`, `variantb/` and `twoanchor/`, with `twoanchor/perrole_test.go`), the critique of v1 and the earlier versions were working files in a scratch directory, and are not kept. A [ran] result is reproduced only by repeating it. Code citations are file:line at 5ef5ee8, and paths are relative to the repository root. A bare file name is in `farsight/cli/internal/cli/`, or is cited with its directory earlier in this design; `kube/` is `farsight/cli/internal/kube/`.)*
 
-This is the design behind [ADR 0024](../adr/0024-paste-the-certificate.md), the operator's cloud credential, and behind [ADR 0023](../adr/0023-one-download-farcast.md)'s milestone M3a, the identity probe. It was written 2026-11-22 against the repository at 5ef5ee8 (ADR 0023 M2.9b). Nothing in it is built or walked, M3a has not run, and no cloud call was made. *(2026-11-23: M3a's part of it was built 2026-11-22 to 2026-11-23: `devicekey`, `kube/federated.go`, the probe, its runbook and W-FED's steps, offline and wired into no command (§11). M3a has not run.)* *(2026-11-23, M3a walked: it ran 2026-11-23 at bb51a6d and passes in a project in the operator's own organization (§6; [the runbook's Results](../runbooks/adr-0024-m3a-probe.md#results)). The run in a project with no organization stays deferred, and the DNS endpoint with an impersonated token stays unverified.)* *(2026-11-24, ADR 0023's M2 walked: W-FED ran in M2's walk on 2026-11-24, in a project in the operator's own organization. GKE's DNS endpoint accepted a token impersonated with the scope pair from the device's federated reader token, and the username Kubernetes saw was the reader SA's email ("email matches: yes"); the federated token itself got 403, authenticated, then refused.)* *(2026-11-26, M3b.1: M3b's build began; its first step, M3b.1, was built that day in `devicekey`, offline and wired into no command (§12). Nothing of M3b is walked.)* *(2026-11-26, M3b.2: M3b's second step, M3b.2, was built that day in `config`, offline and wired into no command but for the installer key's load, which now refuses a blank key and quotes nothing of a file that does not parse (§13).)*
+This is the design behind [ADR 0024](../adr/0024-paste-the-certificate.md), the operator's cloud credential, and behind [ADR 0023](../adr/0023-one-download-farcast.md)'s milestone M3a, the identity probe. It was written 2026-11-22 against the repository at 5ef5ee8 (ADR 0023 M2.9b). Nothing in it is built or walked, M3a has not run, and no cloud call was made. *(2026-11-23: M3a's part of it was built 2026-11-22 to 2026-11-23: `devicekey`, `kube/federated.go`, the probe, its runbook and W-FED's steps, offline and wired into no command (§11). M3a has not run.)* *(2026-11-23, M3a walked: it ran 2026-11-23 at bb51a6d and passes in a project in the operator's own organization (§6; [the runbook's Results](../runbooks/adr-0024-m3a-probe.md#results)). The run in a project with no organization stays deferred, and the DNS endpoint with an impersonated token stays unverified.)* *(2026-11-24, ADR 0023's M2 walked: W-FED ran in M2's walk on 2026-11-24, in a project in the operator's own organization. GKE's DNS endpoint accepted a token impersonated with the scope pair from the device's federated reader token, and the username Kubernetes saw was the reader SA's email ("email matches: yes"); the federated token itself got 403, authenticated, then refused.)* *(2026-11-26, M3b.1: M3b's build began; its first step, M3b.1, was built that day in `devicekey`, offline and wired into no command (§12). Nothing of M3b is walked.)* *(2026-11-26, M3b.2: M3b's second step, M3b.2, was built that day in `config`, offline and wired into no command but for the installer key's load, which now refuses a blank key and quotes nothing of a file that does not parse (§13).)* *(2026-11-27, M3b.3: M3b's third step, M3b.3, was built that day in `kube`: the federated credential, per-consumer token sources and the reader's IAM read, offline and wired into no command. Two fixes of the cluster client's token mint, which every cluster call uses, now keep a token endpoint's unparsable answer out of its errors (§14).)*
 
 This is v3. All three versions are of 2026-11-22.
 - **v1** merged three designs written from three priorities: privacy, the operator's procedure, and uniformity across providers. Where they disagreed, privacy and cost control won, then the operator's procedure, then uniformity. Each decision says which answer it took, and why the others lost where that is still true.
@@ -320,8 +320,8 @@ FarSight warns before revoking an instance's last writer-capable device. The ins
 ### D5. The token path: impersonation *(proposed; the installer-minted reads are decided per read in M3b's build)*
 
 **Decision.**
-1. For each role it needs, the device runs the mTLS exchange with that role's leaf, at that role's provider's audience, with scope `cloud-platform`, and keeps the federated token in memory, one per role per instance.
-2. It calls `generateAccessToken` on that role's SA only, with `[cloud-platform, userinfo.email]` in `kube.TokenScopes`'s order (`farsight/cli/internal/kube/client.go:34-46`) and a lifetime of 3600 seconds.
+1. For each role it needs, the device runs the mTLS exchange with that role's leaf, at that role's provider's audience, with scope `cloud-platform`, and keeps the federated token in memory, one per role per instance. *(2026-11-27, M3b.3: built, wired into no command, as one federated token per credential, which every copy of it and every consumer of it shares, exchanged anew once it is within 225 s of its expiry; one per role per process once M3b.7's opener builds one credential per role, since a second credential for the same role exchanges on its own (§14).)*
+2. It calls `generateAccessToken` on that role's SA only, with `[cloud-platform, userinfo.email]` in `kube.TokenScopes`'s order (`farsight/cli/internal/kube/client.go:34-46`) and a lifetime of 3600 seconds. *(2026-11-27, M3b.3: under the M3b plan's N9, this pair is kept for the cluster client and for the reader's read of the instance's providers at IAM's API host. A Cloud Storage consumer is to take `devstorage.full_control` alone, and an Artifact Registry one `cloud-platform` alone, from a closed list (§14).)*
 3. The SA token goes only to the endpoint's host, as today (`TestAuthorizationOnlyToTheEndpointHost`, `kube/transport_test.go:179`).
 
 The rules that keep:
@@ -381,7 +381,7 @@ M2's walk can settle the first two in its optional W-FED step (D9), if M3a passe
   - the exchange and `generateAccessToken`, their URLs Go constants with the values the X.509 page and the IAM Credentials reference give, never read from a file or the environment;
   - an mTLS token transport: `Proxy` nil, the system roots, TLS 1.2 or later, no redirects;
   - `GetClientCertificate` returns the role's leaf with its `crypto.Signer`. The client certificate is presented only to STS's host, and to IAM Credentials' mTLS host only if M3a's I1 shows that endpoint is needed; *(2026-11-23, M3a walked: it is not needed: I1's mTLS endpoint answered 200 with no client certificate, and T2's impersonations at IAM Credentials were accepted.)*
-  - no `Authorization` header to STS, and the bearer only to IAM Credentials' host;
+  - no `Authorization` header to STS, and the bearer only to IAM Credentials' host; *(2026-11-27, M3b.3: Q3's note on D6. The reader's service-account token goes to IAM's API host too, Q3's default, through a client of its own; no other identity's token goes there. Built, wired into no command (§14).)*
   - no `x-goog-api-client` header, and the user agent of `kube.UserAgent`;
   - response bodies size-limited and never put into an error. Errors are typed by step, status and OAuth error code. That goes beyond `tokenError` (`token.go:125-146`), which names a refusal by its status alone and never carries the body.
 - **M3a's probe:** `farsight/cli/internal/cli/walkm3a_test.go`, `//go:build walk`. It calls the product code above, so what M3a walks is what M3b ships. Three pieces are probe-only:
@@ -391,7 +391,7 @@ M2's walk can settle the first two in its optional W-FED step (D9), if M3a passe
   - It is built once with `go test -c` to a fixed path, so the firewall's per-binary rules hold.
   - It prints only status, OAuth error code, `issued_token_type`, lifetimes and settle times as deltas, the scope set, counts, and "email matches: yes or no". It never prints a token, key, email, project number or ID (`walkprobe_test.go:1-110`'s rule).
 - **M3b's wiring** (§7):
-  - `kube.Credential` (`kube/credential.go:13-20`) gains a federated variant: coordinates, the role's leaf and its signer. `newClient` mints from it beside `twoLegged` (`token.go:48-123`), and `pair` and `credentialOrigin` (`token.go:220-282`) learn its origin. `kubetest` gains a loopback STS that requires and verifies a client certificate, and an IAM Credentials fake.
+  - `kube.Credential` (`kube/credential.go:13-20`) gains a federated variant: coordinates, the role's leaf and its signer. `newClient` mints from it beside `twoLegged` (`token.go:48-123`), and `pair` and `credentialOrigin` (`token.go:220-282`) learn its origin. `kubetest` gains a loopback STS that requires and verifies a client certificate, and an IAM Credentials fake. *(2026-11-27, M3b.3: built, wired into no command: `NewFederatedCredential`, which holds the Federation, the audience, the leaf with its signer, the account and the role; pairing by the Federation's mode, not by `credentialOrigin`; and kubetest's federation fakes, with an IAM API listener and the cluster fake's `WithFederation` (§14).)*
   - `planck.Config` (`planck/types.go:98`) and `datasphere.Config` (`datasphere/types.go:162`) gain a token-provider field for the CLI, given the reader's or the writer's provider as D5 says. It goes through the vendored `auth.NewCredentials` (`vendor/cloud.google.com/go/auth/auth.go:217-243`), with `option.WithAuthCredentials` (`vendor/google.golang.org/api/option/option.go:504`) for the cluster client (`planck/internal/providers/gke/client.go:87-100`), and `httptransport.Options{Credentials}` for Artifact Registry (`registry.go:568-600`) and Cloud Storage (`datasphere/internal/providers/gcs/client.go:96-119`).
   - The SA-JSON loaders and their service-account-only guard (`registry.go:588-600`) stay, for fallbacks 2 and 3.
   - `DetectDefault` stays only in the in-cluster `datasphered`, which opens storage with no credential unless given `--credentials` (`datasphere/cmd/datasphere/main.go:315-324`) and so falls back to it (`datasphere/internal/providers/gcs/client.go:113-119`).
@@ -984,7 +984,7 @@ Every edit below appends to the end of an existing line, or rewrites a sentence 
   - I2: STS asked for `userinfo.email`.
   - I3: the lifetime for a leaf 20 minutes from its end.
   - I4: the 390-day rule. A leaf under V1's reader anchor valid 430 days in all, backdated 400; and V6.
-  - I5: an audience naming the project's ID instead of its number.
+  - I5: an audience naming the project's ID instead of its number. *(2026-11-27, M3b.3: Exchange's own guard now refuses that audience before anything is sent, so the probe's I5 stops locally; the answer M3a recorded on 2026-11-23 was Google's (§14).)*
   - I6: the mTLS token type sent to STS's plain endpoint.
   - I7: a second anchor added to V1's reader provider's trust store, then removed: accepted? (The page's limit is three; only an overlap renewal would use it.)
   - Any limit hit on providers per pool.
@@ -1073,13 +1073,13 @@ Every edit below appends to the end of an existing line, or rewrites a sentence 
 - **Random IDs,** a pool and three SAs per instance, and `release`'s teardown block.
 - **The setup-block generator,** with its digest, its readerinit-style shell, its neutral tags, its random condition title, one provider per role, each trust store in Google's YAML form, the dedicated node account, the two Workload Identity counts, and the writer's tested role allowlist, `roles/iam.serviceAccountUser` never at the project level among its checks (D4's actAs rule); and the console guide's text.
 - **The dedicated node account in planck** (D4): `buildCluster` names it as the nodes' account, `grantPull` and the instance's metadata name it in place of the default compute account (`nodeServiceAccountFmt`, `registry.go:63-68`), and a test checks that the create request names it.
-- **D6's wiring:** the federated `kube.Credential`, and the token providers for `planck` and `datasphere`. The `creds.ServiceAccountKey` callers move: `fatline.go:168`, `release.go:143`, `storage/storage.go:98`, and `storagedeploy.go:140`, through `storage.OpenBucketGrants` (`storage/storage.go:238`); and `clusterref.go:159`, with its check at `:193`, the writer's cluster credential, which the federated `kube.Credential` replaces.
+- **D6's wiring:** the federated `kube.Credential`, and the token providers for `planck` and `datasphere`. The `creds.ServiceAccountKey` callers move: `fatline.go:168`, `release.go:143`, `storage/storage.go:98`, and `storagedeploy.go:140`, through `storage.OpenBucketGrants` (`storage/storage.go:238`); and `clusterref.go:159`, with its check at `:193`, the writer's cluster credential, which the federated `kube.Credential` replaces. *(2026-11-27, M3b.3: the federated `kube.Credential` is built, wired into no command (§14).)*
 - **The installer-minted reads** (D5), each decided in this build: the reader's resource-scoped read grants, applied by the writer as consented acts when it creates or re-ensures the repository and the bucket; `projects.get` replaced by the recorded project number.
 - **Fallbacks 2 and 3** behind their flags and plan facts. `reader init` and `reader record` become fallback 2, and `reader init`'s policy message (`readerinit.go:404`, `:409`), which says an organization administrator must allow upload, is reworded to name the policy and the routes still open. Fallback 1, with one provider per role, if M3a recorded V5 passing. *(2026-11-23, M3a walked: M3a recorded V5 passing, in a project in the operator's own organization, so this condition is met.)*
 - **ADC out of the CLI.** `GOOGLE_API_CERTIFICATE_CONFIG` is unset.
 - **The `instances` and `world` documents** gain the identity route, the roles and pending installs, and the Swift app's documents follow in lockstep.
 - **Tests against fakes.** Mutation rows, each shown to fail with its defect restored:
-  - a bearer sent to a host other than IAM Credentials';
+  - a bearer sent to a host other than IAM Credentials'; *(2026-11-27, M3b.3: and, since Q3's default, the reader's service-account token sent to a host other than IAM's API host; `NewIAMReader` refuses a key and the writer's credential before anything is sent (§14).)*
   - the client certificate presented to a host other than STS's (and IAM Credentials' mTLS host, only if M3a's I1 required it);
   - the environment proxy honoured;
   - a URL taken from input or a file;
@@ -1223,7 +1223,7 @@ M3a was built 2026-11-22 to 2026-11-23, on 2b7f461, from a build spec that took 
 The operator has not answered them. The build took each default, which stays proposed until the operator answers. *(2026-11-23, M3a walked: G0 accepted deviation 9, Q1's default, for the walk on 2026-11-23, which ran under it. No answer to Q2 to Q5 is recorded; they stay at their defaults.)* *(2026-11-26, M3b.1: the operator answered Q3 with its default before M3b.1; Q2, Q4 and Q5 stay at theirs.)*
 - **Q1, I6 accepted:** I6 gates as N6 does, so an acceptance at I6 fails M3a (deviation 9).
 - **Q2, token info:** by POST only, with the token in the body. Any status but 200 reads "not answered by POST", and T2 then holds on `generateAccessToken`'s 200 alone.
-- **Q3, the read-back's host:** T4's read-back at IAM's API host is the probe's own (deviation 1). Default: IAM's API host becomes the read-back's one further bearer host, for the reader's SA token only, by a dated note on D6 when M3b builds it. *(2026-11-26, M3b.1: answered with its default before M3b.1; D6's note comes with M3b.3 ([the M3b plan](adr-0024-m3b-plan.md)).)*
+- **Q3, the read-back's host:** T4's read-back at IAM's API host is the probe's own (deviation 1). Default: IAM's API host becomes the read-back's one further bearer host, for the reader's SA token only, by a dated note on D6 when M3b builds it. *(2026-11-26, M3b.1: answered with its default before M3b.1; D6's note comes with M3b.3 ([the M3b plan](adr-0024-m3b-plan.md)).)* *(2026-11-27, M3b.3: built, wired into no command, and D6's note made (§14).)*
 - **Q4, the TLS floor:** 1.3 wherever a client certificate is carried, that is the exchange and the probe's I1 client; 1.2 for impersonation (deviation 10). If T1 meets a protocol-version alert, the walk stops and the operator decides.
 - **Q5, the records:** in this build, made last, as dated notes and in-place rewrites only. They were made before `./check.sh` ran as a whole, where the default puts them after it passes; it then passed on the tree they describe, and no check reads a record.
 
@@ -1282,7 +1282,7 @@ The code's own departures, which the runbook does not number:
 ### What stays open
 
 - **The macOS ACL limit** (round 2's X2). `devicekey` and the probe check mode bits only, and an inherited ACL can let another account read a 0600 key. Reading an ACL needs libSystem's ACL API, against `devicekey`'s rule of no platform-only call. The limit is documented in the package and on `Store`, and both runbooks check for an ACL with `ls -led` (P0.2, WF.1). Where M3b places the store needs the same check, or a decision to enforce it. *(2026-11-26, M3b.1: answered with its default, the M3b plan's X2: the store under the 0700 config root, mode bits only, `ls -led` checked at the walk, and a darwin-only check added only if M3b.2's spike shows that a raw `getattrlist` reports an ACL.)* *(2026-11-26, M3b.2: it does, on the dev Mac (§13). A shipped check would cost a raw system call Apple does not support [inf] and FarCast's first `unsafe` import outside a test; X2's enforcement is decided before M3b.14.)*
-- **The read-back's host** (Q3), at M3b. *(2026-11-26, M3b.1: answered with its default before M3b.1; built at M3b.3.)*
+- **The read-back's host** (Q3), at M3b. *(2026-11-26, M3b.1: answered with its default before M3b.1; built at M3b.3.)* *(2026-11-27, M3b.3: built that day, wired into no command (§14).)*
 - **Q1, Q2, Q4 and Q5,** until the operator answers.
 - **`handshake_failure` and `decrypt_error`.** A row they leave `INCONCLUSIVE` is the operator's call (P4).
 - **`--yes` as writer consent** (ADR 0024 *Choices* 24). `devicekey` has no consent kind for it until that is answered. *(2026-11-26, M3b.1: answered with its default before M3b.1; M3b.1 built `ConsentYes` (§12), and M3b.8 wires it.)*
@@ -1342,7 +1342,7 @@ M3b.1, the first of the nineteen steps of [the M3b plan](adr-0024-m3b-plan.md), 
 
 ### What later steps take from it
 
-- **M3b.3:** the providers-list reader requires status 200, caps the pages it follows, and refuses a page token it was already given; `ParseProviders` leaves those to it. Its read of one provider caps the answer's size, which `CheckNamedProvider` leaves to it.
+- **M3b.3:** the providers-list reader requires status 200, caps the pages it follows, and refuses a page token it was already given; `ParseProviders` leaves those to it. Its read of one provider caps the answer's size, which `CheckNamedProvider` leaves to it. *(2026-11-27, M3b.3: done: only a 200 is read, at most 1 MiB, a list makes at most 50 requests, and a page token already given is refused (§14).)*
 - **M3b.6:** the read-back is `CheckNamedProvider`. Once a role's verification has passed and is recorded where a resumed command reads it, the caller calls `EnrolmentVerified(r)`.
 - **M3b.12:** `anchor: ok|expiring|expired` comes from `AnchorWarnsAt` and `AnchorExpiredAt` on the record's `AnchorNotAfter`.
 - **M3b.14:** a resumed verification opens through `OpenForEnrolment`; the pending state records "verified" before `EnrolmentVerified`, one more state for M3b.2's list; and a resume that meets `ErrNotEnrolling` has nothing left to verify.
@@ -1462,3 +1462,141 @@ The filesec came back in the host's byte order.
 - **The field set** is fixed before its consumers exist, the plan's M3b.2 risk. M3b.7 is its first reader and M3b.14 its first writer, and either may amend it.
 - **The X2 check** held on one OS build, on arm64, as above.
 - **Concurrency** in the store: no step yet names a lock for it, as above.
+
+---
+
+## 14. Amendments from M3b.3's build (2026-11-27)
+
+M3b.3, the third of the nineteen steps of [the M3b plan](adr-0024-m3b-plan.md), was built 2026-11-27 on 46f8f23. It changes `farsight/cli/internal/kube/` and `farsight/cli/internal/kube/kubetest/`. In `cli` it changes only tests: the walk-tagged probe `walkm3a_test.go`, whose `Impersonate` calls take `kube.ScopesCluster`, whose I1 body is `ImpersonationBody(kube.ScopesCluster)`, and whose `stepI5` comment is brought up to date; a comment in `walkm3achains_test.go`; and the new `m3b3kube_test.go`. No `cli` product file calls anything it adds, so it is wired into no command. It is tested offline against kubetest's fakes, and nothing has run against Google for it.
+
+Two changes reach commands. Both fix code that predates M3b.3, in the cluster client's 2LO mint, which every cluster call uses today: an error from the token endpoint no longer quotes the words Go wrote from an answer it could not parse, and a redirect whose `Location` does not parse is a refusal named by its status (departure 7). The reviews', the mutants' and the fixer's reports were working files in a scratch directory, and are not kept.
+
+### What landed
+
+- **The federated credential.** `NewFederatedCredential(fed, audience, id, email, role)`, in `credential.go`. The federated part is held two pointers deep in an unexported field of `Credential`, so every copy shares it. Formatting is unchanged but for an address, and `encoding/json` shows only the exported fields. `Credential.Federated()`, and `Credential.Role()`, which is empty for a key.
+  - Before anything is sent it refuses, in this order, each as `ErrCredentialInvalid` naming the part and never its value: a nil Federation; an audience Exchange's guard refuses; a `ClientIdentity` that is zero, whose chain does not parse or whose signer is not the leaf's; an email not in `GenerateAccessTokenPath`'s shape; and a role other than reader or writer.
+  - It sets `Email` and none of the key's other fields.
+- **One federated token per credential** (D5.1), which every copy of it and every consumer of it shares. The exchange cache lives in the shared part. It is one per role per process once M3b.7's opener builds one credential per role: a second credential for the same role exchanges on its own.
+  - It holds its lock across the exchange, so consumers asking at once exchange once.
+  - A token is reused until it is within 225 s of its expiry on the wall clock, the margin a service account's token has.
+  - A failed exchange caches nothing.
+  - The product exchange passes no subject chain and no scopes (`productExchange`).
+- **The federated mint** (D5). The credential's federated token from its cache, then `Impersonate` for the role's service account with the consumer's scopes.
+  - An IAM Credentials 401 drops that federated token, if it is still the cached one, exchanges once more and impersonates once more. A second failure is the error. Every other failure is returned as it is.
+  - A cluster 401 goes through the unchanged `tokenCache`: it impersonates again with the cached federated token, and does not exchange again.
+- **`newClient`.** For a federated credential the mint is the credential's, with `ScopesCluster`, and no token client is built. The 2LO route is unchanged.
+- **`pair()`.** A federated credential pairs by its Federation's mode, never by its email's domain: its email is a real service account's in both modes, because `GenerateAccessTokenPath` takes no other. In this order:
+  - the Federation's mode must be the endpoint's: a loopback federation only with a loopback endpoint, a Google one only with a Google one;
+  - `Config.Identity` must equal the credential's role;
+  - the private key, its ID, the token URI and the universe domain must be empty;
+  - `Email` must be the account the credential impersonates (departure 4).
+
+  The 2LO table and its tests are untouched.
+- **`federated.go`.**
+  - `checkAudience` takes the project-number form only, and `TestAudienceShapes` is inverted. The walk-tagged probe's I5, an audience naming the project's ID, is now refused by Exchange's own guard before anything is sent, and `TestWalkM3aAudienceForProjectID` still passes.
+  - `Federation` gains a mode, Google or loopback, and a third host, IAM's API (`IAMHost`, `iam.googleapis.com`, in `iamread.go`). `NewFederation()` is Google's three hosts with the system roots.
+  - `NewLoopbackFederation(stsAddr, iamCredentialsAddr, iamAPIAddr, roots)` is exported product code, so that the rehearsal can build one. It replaces the test-only `NewFederationForTest`, which is gone.
+    - Each address must be exactly the IPv4 or the IPv6 loopback literal with a port from 1 to 65535, written canonically, as a `net.JoinHostPort` round trip gives it: no other loopback address, no name, no `localhost`, no zone, no leading zero.
+    - Nil roots are refused.
+    - It calls `UnsafeEnvironment` first, and every other refusal wraps `ErrEndpointRefused`.
+    - Each host's dialer reaches its own address alone.
+  - `ImpersonationBody(s)` and `Impersonate(ctx, federated, serviceAccount, s)` take a `Scopes`. The body is byte-exact for each scope set and nil outside the closed list, and `Impersonate` refuses an unknown set before it sends.
+  - `identityTransport` reads one of three bearer sources, each from its own context key: none, for the exchange; the federated token, for IAM Credentials; and the service account's token, for IAM's API. Each is sent only over https to its own host.
+  - New steps, `StepProviderGet` and `StepProviderList`. IAM's API errors are `FederationError`s with those steps.
+- **Per-consumer scopes, a closed list** (the plan's N9): `type Scopes uint8`, in `tokensource.go`.
+  - `ScopesCluster` is `TokenScopes`, `cloud-platform` then `userinfo.email`, exactly D5.2's.
+  - `ScopesStorage` is `devstorage.full_control` alone (`ScopeDevstorageFullControl`).
+  - `ScopesRegistry` is `cloud-platform` alone.
+  - One unexported set, the IAM reader's, is `TokenScopes` too, the pair M3a's T4 read the providers with on 2026-11-23. `TokenSourceFor` refuses it, and only `NewIAMReader` uses it (departure 2).
+- **`RoleTokens` and `TokenSourceFor(cred, s)`**, in `tokensource.go`.
+  - `Token(ctx) (string, time.Time, error)`, the signature planck's and datasphere's neutral interfaces will take, and `Invalidate(token)`, with `Role()`, `Federated()` and `Scopes()`.
+  - It is goroutine-safe: `Token` holds its lock across the mint, so concurrent callers mint once. It never returns an empty value or a zero expiry, each `ErrUnreadable` with nothing held, and it returns the expiry with no monotonic reading. `Invalidate` drops only this consumer's token, only if it is still the one named, and never the credential's federated token.
+  - The federated route: one impersonation per consumer over the credential's shared federated token.
+  - The key route, for `reader.key` and `credentials.yaml`'s key: the vendored 2LO provider with the consumer's scopes, the token URL fixed to `GoogleTokenURL`, a logger that discards, and a token client with no proxy, the system roots, TLS 1.2 at least, no redirects, 30 s, `User-Agent` farcast and no `Authorization`.
+    - Before it sends it refuses a scope set outside the three, an email not in `GenerateAccessTokenPath`'s shape (departure 5), a key the signer cannot use, a token URI other than empty or `GoogleTokenURL`, and a universe other than empty or googleapis.com. A key's token URI is never dialled.
+    - The token it holds keeps only its value, type and expiry. The vendored token's metadata, the whole answer, is dropped.
+  - It formats as "role tokens (not printed)" under every verb, slog and `encoding/json`, its contents two pointers deep.
+- **The reader's IAM read,** Q3's default (D6's note): `IAMReader`, in `iamread.go`, with `NewIAMReader(cred)`, `GetProvider(ctx, projectNumber, pool, provider)` and `ListProviders(ctx, projectNumber, pool)`.
+  - It takes the reader's federated credential alone. A service-account key and the writer's federated credential are refused before anything is sent (`ErrEndpointRefused`), so only the reader's service-account token ever goes to IAM's API host. It impersonates the reader's account for itself, with the IAM reader's scope set, sharing the credential's one federated token (departure 1).
+  - Its client: IAM's API host alone, no proxy, that host's roots (the system's in Google mode), TLS 1.2 at least, no client certificate of any kind, no redirects, a 64 KiB header cap, 30 s a call, `User-Agent` farcast, and `Accept` JSON.
+  - Its paths are built only from shape-checked parts: the project number, 1 to 20 digits; the pool and the provider, `^[a-z0-9-]{4,32}$`, not starting `gcp-`. The get has no query. The list's query is `pageSize=10&showDeleted=true`, then `&pageToken=` and the token, query-escaped.
+  - Only a 200 is read, and at most 1 MiB of it: it reads to 1 MiB and one byte, and refuses an answer beyond, never cutting it. A 401 drops the token, impersonates once more, with no exchange, and reads once more. Every other status, and a second 401, is a refusal carrying the status and Google's `error.status` alone, never the body, wrapping the new `ErrIAMRefused` (departure 3).
+  - Each list page must be one JSON object with no key given twice, an escaped spelling of a key included, and no trailing data. Its `nextPageToken` is absent, null or empty on the last page, and otherwise 1 to 4096 characters of `[A-Za-z0-9+/=_.~-]`, devicekey's shape. A token already given is refused, and so is a list whose 50th page still names a token, so a list makes at most 50 requests.
+  - It returns bytes: `kube` does not import `devicekey`. `cli` will parse them with M3b.1's `CheckNamedProvider`, `ParseProvider` and `ParseProviders`.
+  - It formats as "IAM reader (not printed)".
+- **No init-time state,** and no environment read but GODEBUG's http2debug, through `UnsafeEnvironment`, and no file or argument read, in the new files: the existing scans now cover `tokensource.go` and `iamread.go`.
+- **From package `cli`.** `TestM3b3FederatedReaderChain`, in `m3b3kube_test.go`, runs over kubetest's fakes alone what M3b.7 is to wire as a read command's reader. A device enrolled by `devicekey` opens its reader, and its leaf and signer become kube's client identity. Its cluster client reads as the reader's account, and its IAM reader's answers pass devicekey's parsers. The chain exchanges the reader's leaf once, and never the writer's.
+- **kubetest,** which farcast never links (`./check.sh` step 1b refuses it).
+  - Its providers keep their anchor PEM, the mapping `{"google.subject":"assertion.issuer.dn.cn"}`, D3's condition text, a state, `ACTIVE` or `DELETED`, `disabled` and `expireTime`. `AddProvider` keeps its signature, and now panics on a role ID that is not 32 lowercase hex characters.
+  - The STS fake refuses a `DELETED` or disabled provider with `invalid_target`, verifies against the stored anchors, and evaluates the stored condition, of which only D3's exact form holds.
+  - New controls: `RemoveProvider` (to `DELETED`, with `expireTime` 30 days on), `DisableProvider`, `Unbind`, `GrantPoolViewer` and `RevokeFederatedTokens`.
+  - The IAM Credentials fake takes the closed scope lists, and keeps a registry of the service-account tokens it issued, never their values in any record (`ServiceAccountTokens()`). `WithServiceAccountTokenLifetime` sets their lifetime, so that an expired token can be tested.
+  - An IAM API listener, `iamapi.go`, at `IAMAPIAddr()`, recorded as the server `iamapi`. It serves the get and the list of providers, in ID order, `pageSize` 50 by default and at most 100, `DELETED` providers only under `showDeleted=true`, in the JSON devicekey's parsers read.
+    - Its bearer checks, in order: none, 401; not a live service-account token, 401; scopes without `cloud-platform`, 403; the account not granted the pool viewer, 403.
+    - The path (404) and the method (405) are checked before the bearer, and it answers 400 to some inputs Google is not known to refuse [inf].
+    - Its page token holds `+`, `/` and `=` on purpose. `WithIAMAPIAnswer(code, body)` overrides every answer.
+  - The cluster fake takes `WithFederation(f)` and `WithFederatedIdentity(id, email)`. It authenticates the IAM Credentials fake's service-account tokens, only those with exactly the cluster scope list, as the account's email or the label given. Its own 2LO `/token` check stays. A storage- or registry-scoped token gets 401.
+  - `StartFederation`, a start that takes no `testing.T`, for the rehearsal. `NewFederation(t, …)` wraps it.
+  - kubetest does not import `devicekey`, and uses no selector name the custody scan watches.
+
+### Where it departs from the plan
+
+1. **The IAM reader takes the credential, not a `RoleTokens`.** The plan says `IAMReader` "accepts only a federated reader's `RoleTokens`". It is built as `NewIAMReader(cred)`, which refuses a key and the writer and builds its own token source with the IAM reader's scope set. So no caller can hand it another identity's tokens, or another consumer's.
+2. **A fourth scope set, unexported:** the IAM reader's, `TokenScopes`, the pair M3a's T4 read the providers with on 2026-11-23. N9 named three.
+3. **A new sentinel, `ErrIAMRefused`** ("kube: IAM refused a read"), for IAM's refusals, apart from `ErrTokenRefused`: the token was minted, and IAM declined the read. No `cli` kind maps it until M3b.6 wires the reader's provider reads.
+4. **Pairing also checks the email.** `Email` is exported, so a copy whose `Email` was edited is refused. Otherwise messages would name one domain while the token was another account's.
+5. **`TokenSourceFor`'s key route takes only `GenerateAccessTokenPath`'s email shape:** an account ID of 6 to 30 characters at the project ID's `iam.gserviceaccount.com` domain. A key of the Compute default account, of an App Engine account or of a domain-scoped project is refused. farcast's installer and reader accounts fit. M3b.9 confirms it.
+6. **The source scans,** in `scan_test.go`.
+   - `TestOnlyTheRehearsalCallsNewLoopbackFederation`: only `_test` files and `farsight/cli/internal/rehearsal/` call it.
+   - `TestProductExchangesCarryNoKnobs`: every shipped `NewExchangeRequest` site passes the identifier `nil` as its subject and its scopes. After the security review it also flags a function value, an alias, and any declaration of an identifier named `nil`.
+   - A planted module checks the scans' walk itself (`TestSourceScansWalkTheModule`).
+7. **Two fixes of code that predates M3b.3,** from the security review. Both are in the cluster client's 2LO mint, which every cluster call uses today, and in `TokenSourceFor`'s key route, which shares it.
+   - `tokenError` no longer quotes Go's text for an answer it could not parse. Before, an unreachable token endpoint's error carried Go's own error words whole. For an answer net/http cannot parse, a malformed status or header line or a `Location` that does not parse, Go writes those words from the server's bytes, which may echo the request and so the signed assertion. Now the words are only Go's own network words (a dial error, a certificate error, a timeout, EOF), a server's TLS alert in the alert shape, or else "no readable answer", with no cause. One more change is visible: a client timeout now reads "context deadline exceeded", without Go's "(Client.Timeout exceeded …)" suffix.
+   - `tokenTransport` drops a redirect's `Location` that does not parse, so a 3xx from the token endpoint is a refusal named by its status, not an error quoting the header. Its `cli` kind is now `credential_refused`, where it was `cluster_unreachable`.
+
+   The leak was in the cluster client's `twoLegged`, and `TokenSourceFor` would have carried it to every consumer.
+8. **kubetest's additions beyond the plan:** `WithFederatedIdentity`, `RevokeFederatedTokens`, `WithIAMAPIAnswer`, `WithServiceAccountTokenLifetime`, `ServiceAccountTokens()`, `AddProvider`'s role-ID panic, and the IAM API fake's 404 and 405 before the bearer and its 400s [inf]. The plan's "exported non-testing `Start`" is `StartFederation`.
+9. **Test names.** Where package `kube` holds the plan's exact name, the wire half in package `kube_test` carries a suffix: `TestIAMReaderRefusesAWriterAtTheFake`, `TestListProvidersPagesAndDeletedOnTheWire` and `TestPerConsumerScopesAtTheCluster`. So `-run` with the plan's name runs both halves.
+10. **Size.** About 1,970 product lines, 1,170 in `kube` and 800 in `kubetest`, and 4,800 test lines, against the plan's 800 and 1,500.
+
+### What later steps take from it
+
+- **M3b.4:** `RoleTokens` is the neutral token source. The vendored httptransport wraps a token provider in a cache that refreshes in the background, treats a zero expiry as fresh forever, and has no invalidate. `RoleTokens` never returns a zero expiry and is goroutine-safe. M3b.4 needs a small adapter from `Token(ctx) (string, time.Time, error)` to the vendored `auth.TokenProvider`.
+- **M3b.6:** it maps `ErrIAMRefused` to a `cli` kind when it wires the reader's provider reads. kubetest has no way to store a provider in any shape but D3's: `AddProvider` takes no second anchor, no intermediates, no display name and no other condition, which M3b.6's mutated setups need.
+- **M3b.7:** it wires the federated reader for cluster reads. The walk probe's I5 is now refused locally. Its opener must build one credential per role and hand that one to every consumer, because a second credential for the same role exchanges on its own; only then is the federated token one per role per process (D5.1).
+- **M3b.9:** it confirms the key route's email shape (departure 5).
+- **M3b.12:** `StartFederation` has no address option and no recording-off mode, and its leaf names the IPv4 loopback address alone. A restarted rehearsal and a long-lived log will need both.
+- **Open, outside this step's plan:** the cluster API path's `unreachable` (`kube/transport.go`, its classifier for an API request that fails) still keeps Go's error words whole. It has the flaw fix 1 removed from the mint: an API server's answer that Go cannot parse would be quoted in the server's own bytes, and the API request carries the bearer. It predates M3b.3, and the plan scopes R10 to the mint and the IAM client. It needs a separate fix, or M3b.18.
+
+### How it was checked
+
+- **Two implementers,** one for `kube`, then one for `kubetest` and the tests that need it.
+- **Three reviews,** read-only: security and the wire, correctness against the plan and this design, and the tests' strength. They reported 12 findings, 1 of them major:
+  - security, 2, both minor: the key mint's errors quoting the server's bytes, and the knobs scan missing a function value;
+  - correctness, 4: two stale doc comments, minor, and two nits;
+  - the tests, 6. The major one: nothing pinned the key route's discarding logger, and a test showed that without it a debug environment variable makes the library log the minted token and the assertion. Three minor: the scans' walk and the rehearsal's exemption had no planted-tree check, the fakes' expiry rule could not be tested, and R3 was not shown for the key route's token client. And two nits.
+
+  A refute-first fixer checked each against the code, the plan and this design. All 12 held, and all 12 were fixed in code and tests. The tests' review ran 76 mutants and killed 70; its 6 survivors became five of its findings. The fixer ran 13, and all were killed.
+- **Mutation testing.** 310 mutants, one rule each, each a copy compiled in with `go test -overlay`. The scans that read source from disk were also run against a shadow copy of the module holding the mutated file. 37 survived their first run. Tests were added or strengthened, in test files only, and 30 of the 37 were then killed; one more, whose first spelling could not differ from the code, was respelled and killed. In the final run 304 failed a test, and the 6 that still survive are equivalent:
+  - dropping a step check that `Impersonate` alone can satisfy, since it only ever fails at that step;
+  - `newClient` ignoring a mint it is given for a federated credential, which only tests pass;
+  - dropping a page's opening-brace check, since the closing-brace and end checks still refuse any non-object;
+  - the IAM API client taking another host's roots, since both constructors give the three hosts one roots value;
+  - kubetest's revoked 2LO token falling through to the federation's registry, since the two token formats are disjoint;
+  - dropping the exchange cache's empty-token check, since the exchange's answer already refuses an empty token.
+- **The network guard.** Every test binary run in the build, the reviews, the fix round, the mutation proof and the final runs ran with `-race` under macOS's `sandbox-exec`, with M3a's profile, which refuses every outbound connection but loopback and local sockets, and refuses the system resolver's socket. The exception is `./check.sh`'s own run.
+- **The gates,** 2026-11-27:
+  - `gofmt -l` prints nothing for `kube`, `cli` and `rehearsal`;
+  - `go build ./...` passes; `go vet`, with and without the `integration`, `walk` and `realapi` tags, is clean, so the walk-tagged probe compiles; and `golangci-lint` with those tags reports no issue, as `./check.sh` runs it;
+  - under the guard, `kube`'s 155 tests, `kubetest`'s 57, `devicekey`'s 65, `rehearsal`'s 31 and `execgate`'s 7 pass, none skipped in `kube` and `kubetest`, and so do `cli`'s 982, with its two `TestHandOverModel*` skipped, as they are without `FARCAST_MODEL=1`;
+  - `./check.sh` passes on the dev Mac. Its first run stopped at step 7d, which found no eligible iPhone simulator although iOS 26 ones were installed and Xcode listed them as eligible straight after; every step before it had passed. A second run passed every step. Two doc comments in `kube` (`credential.go`'s and `doc.go`'s, on one federated token per credential) were corrected after it, and `gofmt`, `go vet`, `golangci-lint` and `kube`'s tests under the guard pass on them;
+  - the vendored modules stay 31; `vendor/`, `go.mod`, `go.sum` and `exec-allowlist.txt` are unchanged; and there is no cgo.
+
+### What is not verified
+
+- **Google's answers.** Nothing ran against Google for M3b.3. The fakes' rules are FarCast's model of Google's:
+  - Google's code at STS for a deleted or disabled provider is [unverified]; the fake answers `invalid_target`;
+  - GKE's answer to a storage- or registry-scoped token is [unverified]; the fake answers 401;
+  - the IAM API's answers to malformed requests are [inf]; the fake is stricter.
+- **The key route** of `TokenSourceFor` has run only against a loopback token endpoint.
+- **The adapters.** That planck's and datasphere's libraries take a `RoleTokens` through an adapter is M3b.4's to show.

@@ -238,6 +238,9 @@ func claimInt(claims map[string]json.RawMessage, name string) (int64, bool) {
 // authenticate reads a request's bearer. It returns the token's identity
 // and the request's As: "" with no Authorization header at all, "?" for any
 // header that carries no live kubetest token, and the identity's id otherwise.
+// A token the server's own /token minted is looked up first; then, under
+// WithFederation, the Federation's service-account tokens, with s.mu not
+// held.
 func (s *Server) authenticate(header string) (*tokenInfo, string) {
 	if header == "" {
 		return nil, ""
@@ -246,12 +249,37 @@ func (s *Server) authenticate(header string) (*tokenInfo, string) {
 	if !ok || !strings.EqualFold(scheme, "Bearer") || token == "" {
 		return nil, "?"
 	}
+	if info, minted := s.minted2LO(token); minted {
+		if info == nil {
+			return nil, "?"
+		}
+		return info, info.id
+	}
+	if f := s.opts.federation; f != nil {
+		if email, ok := f.clusterServiceAccount(token); ok {
+			id := email
+			if label, ok := s.opts.federatedID[email]; ok {
+				id = label
+			}
+			return &tokenInfo{id: id, email: email}, id
+		}
+	}
+	return nil, "?"
+}
+
+// minted2LO is a copy of the identity a token the server's /token minted
+// carries, nil for a revoked one; minted is false for a token it never
+// minted.
+func (s *Server) minted2LO(token string) (info *tokenInfo, minted bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	info := s.tokens[token]
-	if info == nil || info.revoked {
-		return nil, "?"
+	t := s.tokens[token]
+	if t == nil {
+		return nil, false
 	}
-	c := *info
-	return &c, c.id
+	if t.revoked {
+		return nil, true
+	}
+	c := *t
+	return &c, true
 }

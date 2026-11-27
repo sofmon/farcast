@@ -53,8 +53,9 @@ const (
 	Reader Identity = "reader"
 )
 
-// Config is everything a client is built from: where the cluster is, whose
-// key signs the token, and which of the instance's identities that key is.
+// Config is everything a client is built from: where the cluster is, the
+// credential its token comes from (a service-account key, or a federated
+// credential), and which of the instance's identities that credential is.
 type Config struct {
 	Endpoint   Endpoint
 	Credential Credential
@@ -72,7 +73,7 @@ type Client struct {
 
 	api       *http.Client // the API: apiTransport, no Timeout, no redirects
 	follow    *http.Client // a followed log: api's shape with no ResponseHeaderTimeout
-	tokenHTTP *http.Client // the token endpoint: tokenTransport, 30 s, no redirects
+	tokenHTTP *http.Client // the token endpoint: tokenTransport, 30 s, no redirects; nil for a federated credential
 	tokens    *tokenCache
 
 	// attemptTimeout bounds each attempt of a non-streaming request
@@ -90,9 +91,15 @@ type Client struct {
 // New checks that the endpoint and the credential pair (§3.2), then builds the
 // transports and the token cache. It dials nothing and mints nothing.
 //
-// Its token is the credential's own 2LO token (§3.3): minted in memory from
-// the key, scoped to TokenScopes (cloud-platform and userinfo.email), from
-// Endpoint.TokenURL and never from a URL a key file names.
+// Its token depends on the credential:
+//   - for a service-account key, the key's own 2LO token (§3.3): minted in
+//     memory from the key, scoped to TokenScopes (cloud-platform and
+//     userinfo.email), from Endpoint.TokenURL and never from a URL a key file
+//     names;
+//   - for a federated credential (NewFederatedCredential), the role's
+//     service-account token for ScopesCluster (design D5): impersonated at
+//     IAM Credentials with the role's one federated token, which the
+//     credential shares with its other consumers. No token client is built.
 func New(cfg Config) (*Client, error) {
 	return newClient(cfg, nil)
 }

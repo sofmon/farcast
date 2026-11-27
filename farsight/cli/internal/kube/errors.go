@@ -26,6 +26,10 @@ var (
 	// would print a secret, such as GODEBUG's http2debug. It is not
 	// ErrEndpointRefused: the endpoint and the credential may pair perfectly.
 	ErrUnsafeEnvironment = errors.New("kube: the process environment would print a secret")
+	// ErrIAMRefused is IAM's API refusing a read of the instance's providers
+	// (IAMReader): a non-200 answer, a second 401 included. It is not
+	// ErrTokenRefused: the token was minted, and IAM declined the read.
+	ErrIAMRefused = errors.New("kube: IAM refused a read")
 )
 
 // refusal is an error whose text is exactly its message and which unwraps to

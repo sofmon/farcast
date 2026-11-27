@@ -152,7 +152,7 @@ These states are fixed. Each refusal has a fixed message and a test, and every o
 
 | After | Certificate-route record | Fallback-route record |
 |---|---|---|
-| M3b.1-M3b.6 | nothing reads `Identity` | As at 4bbbb5f. From M3b.4, a blank installer key fails closed in planck and datasphere instead of reaching ADC, and an empty node account keeps the default compute account (until M3b.14). *(2026-11-26, M3b.2: `release`, the commands that open storage (`storage ls`, `cp`, `rm`, `usage` and `key rekey`, and the `secret` commands) and `toolchain`'s registry ensure now refuse a blank installer key when they load it, as `credential_missing`, in words that do not end "nothing was sent". `loadInstallerKey`'s refusal still says "release it", which now names a command that refuses, until M3b.7's message replaces it.)* |
+| M3b.1-M3b.6 | nothing reads `Identity` | As at 4bbbb5f. From M3b.4, a blank installer key fails closed in planck and datasphere instead of reaching ADC, and an empty node account keeps the default compute account (until M3b.14). *(2026-11-26, M3b.2: `release`, the commands that open storage (`storage ls`, `cp`, `rm`, `usage` and `key rekey`, and the `secret` commands) and `toolchain`'s registry ensure now refuse a blank installer key when they load it, as `credential_missing`, in words that do not end "nothing was sent". `loadInstallerKey`'s refusal still says "release it", which now names a command that refuses, until M3b.7's message replaces it.)* *(2026-11-27, M3b.3: two fixes of the cluster client's 2LO mint change what a command prints when its cluster client mints from a stored key: a token endpoint's answer Go cannot parse is "no readable answer", and a 3xx whose `Location` does not parse is `credential_refused` named by its status, where it was `cluster_unreachable` ([the design's §14](adr-0024-design.md#14-amendments-from-m3b3s-build-2026-11-27), departure 7).)* |
 | M3b.7 | Cluster reads, and plans' cluster reads, run as the federated reader. The writer refuses: "instance %q's writer on the certificate route opens from M3b.8". Google API calls refuse: "… from M3b.9". | Every record names its routes. A record with no `Identity` is refused by every command: "instance %q's record names no identity route; a farcast before M3b wrote it, and that is not supported". The message names no command that would itself refuse (Plan A's "release it" did). The writer (`credentials.yaml`) and the reader (`reader.key`) open through the one opener. |
 | M3b.8 | Cluster writes run as the federated writer, after consent. | The cluster writer reads `credentials.yaml` only after consent. Only D5's installer-minted Google reads still mint from it before consent, as at 4bbbb5f, until M3b.11. Interactive plans run as N1 says. |
 | M3b.9 | planck and registry writes run as the writer after consent. The installer-minted registry reads in plans refuse: "… as the reader from M3b.11". Storage, secret and `release` refuse: "… from M3b.10". | planck and the registry run through role token sources. The installer-minted registry reads keep the writer route's token, as at 4bbbb5f, until M3b.11. |
@@ -256,13 +256,13 @@ These states are fixed. Each refusal has a fixed message and a test, and every o
 
 **Goal.**
 - A `kube.Client`, and a per-role token source, minted from a device leaf through STS and IAM Credentials.
-- The reader can read providers at IAM's API host, and no other identity can. *(2026-11-26, M3b.1: the list reader requires status 200, caps the pages it follows and refuses a page token it was already given; `ParseProviders` leaves those to it.)*
+- The reader can read providers at IAM's API host, and no other identity can. *(2026-11-26, M3b.1: the list reader requires status 200, caps the pages it follows and refuses a page token it was already given; `ParseProviders` leaves those to it.)* *(2026-11-27, M3b.3: built: `NewIAMReader` takes the reader's federated credential alone and refuses a key and the writer's before anything is sent. Only a 200 is read, at most 1 MiB; a list makes at most 50 requests and refuses a page token it was already given ([the design's §14](adr-0024-design.md#14-amendments-from-m3b3s-build-2026-11-27), departure 1).)*
 - All of it testable from package cli.
 
 **Changes.**
-- **`kube/credential.go`.** A federated variant, held two pointers deep and built only by `NewFederatedCredential(fed, audience, ClientIdentity, email, role)`. The audience comes only from `Audience`.
+- **`kube/credential.go`.** A federated variant, held two pointers deep and built only by `NewFederatedCredential(fed, audience, ClientIdentity, email, role)`. The audience comes only from `Audience`. *(2026-11-27, M3b.3: built so. Before anything is sent it refuses a nil Federation, an audience Exchange's guard refuses (any but `Audience`'s number form), an unusable `ClientIdentity`, an email not in `GenerateAccessTokenPath`'s shape and a role other than reader or writer, naming the part and never its value.)*
 - **`kube/token.go`.**
-  - `newClient` (:48-76) gets a federated mint:
+  - `newClient` (:48-76) gets a federated mint: *(2026-11-27, M3b.3: built. The federated token is reused until it is within 225 s of its expiry, the margin a service account's token has, and a failed exchange caches nothing. For a federated credential no token client is built.)*
     - exchange, caching the federated token per credential until `ExpiresIn` minus a margin (D5.1: one exchange per role per process);
     - then `Impersonate`;
     - an IAM 401 re-exchanges once.
@@ -271,36 +271,36 @@ These states are fixed. Each refusal has a fixed message and a test, and every o
     - the origin comes from the `Federation`'s mode (Google or loopback), never from the email's domain;
     - a loopback federation pairs only with a loopback endpoint;
     - `Config.Identity` must equal the credential's role;
-    - `TokenURI` and `UniverseDomain` must be empty.
+    - `TokenURI` and `UniverseDomain` must be empty. *(2026-11-27, M3b.3: so must the private key and its ID, and `Email` must be the account the credential impersonates, so an edited copy is refused ([the design's §14](adr-0024-design.md#14-amendments-from-m3b3s-build-2026-11-27), departure 4).)*
 
     This resolves the `.invalid` and `GenerateAccessTokenPath` clash. Loopback credentials keep `*.iam.gserviceaccount.com` emails.
 - **`kube/federated.go`.**
-  - `checkAudience` narrowed to the number form. This inverts `federated_test.go:754`. `walkm3achains_test.go:927` keeps passing, and the walk-tagged I5 path now refuses locally (a dated amendment).
+  - `checkAudience` narrowed to the number form. This inverts `federated_test.go:754`. `walkm3achains_test.go:927` keeps passing, and the walk-tagged I5 path now refuses locally (a dated amendment). *(2026-11-27, M3b.3: done: `TestAudienceShapes` is inverted, `TestWalkM3aAudienceForProjectID` passes, and the design's I5 carries the note.)*
   - `Federation` gains a mode.
-  - Exported `NewLoopbackFederation(sts, iamCredentials, iamAPI, roots)` admits only `127.0.0.1` and `::1` literals. A source scan checks that only `_test` files and `internal/rehearsal` call it.
-  - `TestProductExchangesCarryNoKnobs`: no product caller passes a subject chain or scopes (DES:1259).
+  - Exported `NewLoopbackFederation(sts, iamCredentials, iamAPI, roots)` admits only `127.0.0.1` and `::1` literals. A source scan checks that only `_test` files and `internal/rehearsal` call it. *(2026-11-27, M3b.3: built, and the test-only `NewFederationForTest` is gone. Each address is the IPv4 or the IPv6 loopback literal with a port written canonically, nil roots are refused, and each host's dialer reaches its own address alone. The scan is `TestOnlyTheRehearsalCallsNewLoopbackFederation`.)*
+  - `TestProductExchangesCarryNoKnobs`: no product caller passes a subject chain or scopes (DES:1259). *(2026-11-27, M3b.3: built. After the security review it also flags a function value, an alias and any declaration of an identifier named `nil`, and a planted module checks the scans' walk (`TestSourceScansWalkTheModule`).)*
 - **`kube/tokensource.go`** (new).
   - `RoleTokens` with `Token(ctx) (string, time.Time, error)`, the signature planck's and datasphere's neutral interfaces take, and `Invalidate(token)`.
   - It is goroutine-safe, because httptransport refreshes in the background (transport.go:90).
-  - It holds one federated token per role per process, and one impersonation per consumer.
+  - It holds one federated token per role per process, and one impersonation per consumer. *(2026-11-27, M3b.3: built as one federated token per credential, which every copy of it and every consumer of it shares; one per role per process once M3b.7's opener builds one credential per role, since a second credential for the same role exchanges on its own ([the design's §14](adr-0024-design.md#14-amendments-from-m3b3s-build-2026-11-27)).)*
   - **N9: each consumer has its scopes from a closed list:**
     - `ScopesCluster` = `TokenScopes`, exactly D5.2's;
     - `ScopesStorage` = `devstorage.full_control`;
     - `ScopesRegistry` = `cloud-platform`.
 
-    `ImpersonationBody` takes one of them; the pinned body and the IAM fake follow. This is a dated amendment to D5.2 for the non-cluster consumers.
-  - `TokenSourceFor` wraps a 2LO credential (`reader.key`, `credentials.yaml`) with the same per-consumer scopes, so every route yields a token source.
+    `ImpersonationBody` takes one of them; the pinned body and the IAM fake follow. This is a dated amendment to D5.2 for the non-cluster consumers. *(2026-11-27, M3b.3: built, with a fourth set, unexported, for the reader's IAM read: `TokenScopes`, the pair M3a's T4 read the providers with. `TokenSourceFor` refuses it. D5.2 carries the note ([the design's §14](adr-0024-design.md#14-amendments-from-m3b3s-build-2026-11-27), departure 2).)*
+  - `TokenSourceFor` wraps a 2LO credential (`reader.key`, `credentials.yaml`) with the same per-consumer scopes, so every route yields a token source. *(2026-11-27, M3b.3: built. The key route fixes the token URL to `GoogleTokenURL`, logs nothing, and takes only `GenerateAccessTokenPath`'s email shape ([the design's §14](adr-0024-design.md#14-amendments-from-m3b3s-build-2026-11-27), departure 5).)*
 - **`kube/iamread.go`** (new).
   - `IAMHost = "iam.googleapis.com"`.
-  - `IAMReader` accepts only a federated reader's `RoleTokens`.
+  - `IAMReader` accepts only a federated reader's `RoleTokens`. *(2026-11-27, M3b.3: built as `NewIAMReader(cred)`, which takes the reader's federated credential alone and makes its own token source; refusing a key or the writer's credential is `ErrEndpointRefused`, and IAM's refusals of a read wrap a new sentinel, `ErrIAMRefused` ([the design's §14](adr-0024-design.md#14-amendments-from-m3b3s-build-2026-11-27), departures 1 and 3).)*
   - Its client: `Proxy` nil, system roots, TLS 1.2 or later (Q4), no client certificate, no redirects, a size cap, body-free errors typed by step, the bearer only to `IAMHost`, `User-Agent` `kube.UserAgent` (Q14).
   - `GetProvider` and `ListProviders` (paging) take paths built only from shape-checked parts.
 - **kubetest.**
-  - A `Server` option `WithFederation(f)`: the cluster fake authenticates the IAM fake's SA tokens with id and email. Its own `/token` check stays.
-  - The providers keep their PEM, mapping, condition, state and `disabled`.
-  - New `RemoveProvider` (to `DELETED`), `DisableProvider`, `Unbind` and `GrantPoolViewer`.
-  - An IAM API listener serving get and list, with the bearer checked.
-  - An exported non-testing `Start` for the rehearsal.
+  - A `Server` option `WithFederation(f)`: the cluster fake authenticates the IAM fake's SA tokens with id and email. Its own `/token` check stays. *(2026-11-27, M3b.3: with `WithFederatedIdentity(id, email)` beside it. Only a token carrying exactly the cluster scope list is accepted; a storage- or registry-scoped one gets 401.)*
+  - The providers keep their PEM, mapping, condition, state and `disabled`. *(2026-11-27, M3b.3: and `expireTime`. `AddProvider` keeps its signature and now panics on a role ID that is not 32 lowercase hex characters.)*
+  - New `RemoveProvider` (to `DELETED`), `DisableProvider`, `Unbind` and `GrantPoolViewer`. *(2026-11-27, M3b.3: and `RevokeFederatedTokens`. The IAM Credentials fake lists the tokens it issued, never their values (`ServiceAccountTokens()`), and `WithServiceAccountTokenLifetime` sets their lifetime.)*
+  - An IAM API listener serving get and list, with the bearer checked. *(2026-11-27, M3b.3: with `WithIAMAPIAnswer(code, body)`. The path and the method are checked before the bearer, and it answers 400 to some inputs Google is not known to refuse [inf].)*
+  - An exported non-testing `Start` for the rehearsal. *(2026-11-27, M3b.3: built as `StartFederation`, which `NewFederation(t, …)` wraps ([the design's §14](adr-0024-design.md#14-amendments-from-m3b3s-build-2026-11-27), departure 8).)*
 
 **Owns rows.**
 - R1: a bearer only to IAM Credentials, and the reader's to IAM's API host only; a writer token there fails.
@@ -319,7 +319,7 @@ These states are fixed. Each refusal has a fixed message and a test, and every o
   - `TestRoleTokensConcurrentRefresh`, under `-race`.
   - `TestPerConsumerScopes`.
   - `TestIAMReaderRefusesAWriter`.
-  - `TestListProvidersPagesAndDeleted`.
+  - `TestListProvidersPagesAndDeleted`. *(2026-11-27, M3b.3: where package `kube` holds a name above, its wire half in package `kube_test` carries a suffix: `TestIAMReaderRefusesAWriterAtTheFake`, `TestListProvidersPagesAndDeletedOnTheWire` and `TestPerConsumerScopesAtTheCluster` ([the design's §14](adr-0024-design.md#14-amendments-from-m3b3s-build-2026-11-27), departure 9).)*
 - Extended:
   - `TestFederatedFixedValues`;
   - `TestNewFederationURLsAreTheConstants`, now with `IAMHost`;
@@ -329,14 +329,14 @@ These states are fixed. Each refusal has a fixed message and a test, and every o
   - `TestFederationTypesNeverFormat`;
   - `TestFederatedHasNoInitTimeState`.
 
-**Unwired.** No cli caller.
+**Unwired.** No cli caller. *(2026-11-27, M3b.3: no cli product file calls it. Two fixes of code that predates it, in the cluster client's 2LO mint, reach every cluster call ([the design's §14](adr-0024-design.md#14-amendments-from-m3b3s-build-2026-11-27), departure 7).)*
 
-**Size.** About 800 product lines and 1,500 test lines.
+**Size.** About 800 product lines and 1,500 test lines. *(2026-11-27, M3b.3: about 1,970 and 4,800.)*
 
 **Risks.**
-- The pairing change must keep `TestAuthorizationOnlyToTheEndpointHost` intact.
-- The scope change moves a pinned body.
-- The walk-tagged probe must still compile.
+- The pairing change must keep `TestAuthorizationOnlyToTheEndpointHost` intact. *(2026-11-27, M3b.3: it did: that test is unchanged and passes.)*
+- The scope change moves a pinned body. *(2026-11-27, M3b.3: it moved with `ImpersonationBody`'s scopes; `TestImpersonationBodyIsExact` pins the body of each set.)*
+- The walk-tagged probe must still compile. *(2026-11-27, M3b.3: it compiles, and is vetted and linted with the `walk` tag.)*
 
 ### M3b.4: planck and datasphere, token sources, `Ambient` and the node-account plumbing (adapters)
 
@@ -351,7 +351,7 @@ These states are fixed. Each refusal has a fixed message and a test, and every o
   - `Config.Ambient bool`.
   - Setting both credentials is refused, and so is neither without `Ambient`. `String()` redacts both.
 - **gke.**
-  - `newClient` (client.go:87-101) wraps the token source with `auth.NewCredentials{TokenProvider}` and passes `option.WithAuthCredentials`.
+  - `newClient` (client.go:87-101) wraps the token source with `auth.NewCredentials{TokenProvider}` and passes `option.WithAuthCredentials`. *(2026-11-27, M3b.3: `RoleTokens` never returns a zero expiry, which the vendored cache would take as fresh forever, and is goroutine-safe; a small adapter from its `Token(ctx)` to the vendored `auth.TokenProvider` is needed ([the design's §14](adr-0024-design.md#14-amendments-from-m3b3s-build-2026-11-27)).)*
   - `registryCredentials` (registry.go:594-600) feeds `httptransport.Options{Credentials}` and `RegistryToken`.
   - `DetectDefault` runs only under `Ambient`.
 - **datasphere.**
@@ -490,7 +490,7 @@ These states are fixed. Each refusal has a fixed message and a test, and every o
 - **`cli/settle.go`** ports `m3aWait`, `m3aNextTry` and `m3aPositive`: a 10-minute bound, waits of 5, 10, 20, 40 and 60 s, and a clock seam.
 - **`cli/enrolverify.go`: `verifyEnrolment(ctx, deps, ids, coords, clock)`.**
   - Per role, exchange and impersonate under the settle rule.
-  - Then read this device's providers back as the reader: `GetProvider`, then `CheckProvider`.
+  - Then read this device's providers back as the reader: `GetProvider`, then `CheckProvider`. *(2026-11-27, M3b.3: `GetProvider` returns the answer's bytes, and its refusals wrap `ErrIAMRefused`, which no cli kind maps yet; this step maps it ([the design's §14](adr-0024-design.md#14-amendments-from-m3b3s-build-2026-11-27)).)*
   - The alerts `handshake_failure` and `decrypt_error` are retried within the bound, then reported.
   - Errors name the field, never a body.
   - The writer's identity is passed in, from `Enrol` or `OpenForEnrolment` at the caller.
@@ -503,7 +503,7 @@ These states are fixed. Each refusal has a fixed message and a test, and every o
 2. Render `Setup` and run it under `sh` with `gcloudtest`.
 3. Load the fake's providers and bindings into `kubetest.Federation`.
 4. Parse the printed line, and `verifyEnrolment` passes.
-5. Mutated setups fail, each naming its field: a second anchor, a wrong condition, the writer bound to the reader SA, and a display name set.
+5. Mutated setups fail, each naming its field: a second anchor, a wrong condition, the writer bound to the reader SA, and a display name set. *(2026-11-27, M3b.3: kubetest's `AddProvider` stores D3's shape alone, so these mutants need a way to store another: a second anchor, intermediates, a display name or another condition ([the design's §14](adr-0024-design.md#14-amendments-from-m3b3s-build-2026-11-27)).)*
 
 Also: the line vectors, and every line refused for a foreign project, foreign IDs, a bad tag or a control character.
 
@@ -626,7 +626,7 @@ The tests:
 **Changes.**
 - **New file `cli/googlecreds.go`: `roleTokens(dir, meta, role, consent, consumer)`,** for every route:
   - federated, on the certificate route;
-  - kube's 2LO over `reader.key` or `credentials.yaml`, on the fallbacks.
+  - kube's 2LO over `reader.key` or `credentials.yaml`, on the fallbacks. *(2026-11-27, M3b.3: `TokenSourceFor`'s key route takes only `GenerateAccessTokenPath`'s email shape; this step confirms it ([the design's §14](adr-0024-design.md#14-amendments-from-m3b3s-build-2026-11-27), departure 5).)*
 
   The CLI never hands planck an empty credential or SA JSON. A go/ast scan checks that every `planck.Open` in cli passes `Tokens`. planck's SA-JSON loaders stay for the harness only, a small departure from D6's sentence, recorded.
 - **`providerOpener` (fatline.go:160)** becomes `(meta, roleSource)`.
@@ -751,7 +751,7 @@ The tests:
 - **Kinds.** `credential_expired` (N4) replaces M3b.7's interim mapping. It moves `errorKinds` (kinds.go:47-54), the README kinds list and `testdata/kinds/kinds.json`.
 - **Schema 3** (N5), in `worldSchema`.
 - **The line vectors.** `testdata/coordinates/` joins check.sh:397's list.
-- **The rehearsal** moves to the certificate route (N12): `kubetest.Federation.Start`, the IAM API fake, an identity-store fixture and an `Identity` record.
+- **The rehearsal** moves to the certificate route (N12): `kubetest.Federation.Start`, the IAM API fake, an identity-store fixture and an `Identity` record. *(2026-11-27, M3b.3: built as `kubetest.StartFederation`, which has no address option and no recording-off mode, and whose leaf names the IPv4 loopback address alone; a restarted rehearsal and a long-lived log need both ([the design's §14](adr-0024-design.md#14-amendments-from-m3b3s-build-2026-11-27)).)*
 - **README.** "What each read tells the provider" gains `world`'s identity section, and states that `instances` opens no key.
 
 **Changes (Swift, same step).**
@@ -978,7 +978,7 @@ The tests:
 
 **Delivers.** S10c.
 
-**Tests.** The R1-R4 and R10 regressions for the plain STS host. The JWT never formats.
+**Tests.** The R1-R4 and R10 regressions for the plain STS host. The JWT never formats. *(2026-11-27, M3b.3: R10 stays open on one path outside M3b.3's plan: the cluster API path's `unreachable` keeps Go's error words whole, which for an answer Go cannot parse are the server's own bytes; a separate fix, or this step ([the design's §14](adr-0024-design.md#14-amendments-from-m3b3s-build-2026-11-27)).)*
 
 **Size.** About 1.5 d. If the operator defers it, a dated note in ADR 0024 says so.
 
@@ -1090,7 +1090,7 @@ Each of these has a default this plan would build, but either the default is ris
 |---|---|---|
 | N1 Interactive plans | As the granted reader. A reader role that is present but not granted refuses, naming `reader grant`. With no reader route at all (fallback 3 alone), a record-only summary that says its reads were not made. Alternatives: strict everywhere; summary everywhere (Plan A); fold the reader's RBAC into `connect`. | before M3b.8 |
 | N10 `world` may renew the reader leaf | Allowed, and Usage says so | before M3b.7 |
-| N9 Per-consumer impersonation scopes (amends D5.2 for non-cluster consumers) | cluster `TokenScopes`; storage `devstorage.full_control`; registry `cloud-platform` | built at M3b.3; reversing it later is local |
+| N9 Per-consumer impersonation scopes (amends D5.2 for non-cluster consumers) | cluster `TokenScopes`; storage `devstorage.full_control`; registry `cloud-platform` | built at M3b.3; reversing it later is local *(2026-11-27, M3b.3: built, with a fourth set, unexported, for the reader's IAM read ([the design's §14](adr-0024-design.md#14-amendments-from-m3b3s-build-2026-11-27), departure 2))* |
 | N2 `storage cp` uploads, `secret set` and `toolchain` gain a question | A terminal question, never stdin, plus `--yes` | before M3b.9 |
 | Reconnect's registry ensure | Skipped; the next consented deploy repairs it | before M3b.9 |
 | N3 The reader's resource roles | `artifactregistry.reader`; `storage.objectViewer` with `legacyBucketReader`; unreadable policies read `GrantUnknown` | before M3b.11; settled at the walk |
@@ -1130,7 +1130,7 @@ The further records, by step:
 
 | Step | Further records |
 |---|---|
-| M3b.3 | The design amendments for D5.2's scopes and the audience's narrowing; Q3's dated note on D6 |
+| M3b.3 | The design amendments for D5.2's scopes and the audience's narrowing; Q3's dated note on D6 *(2026-11-27, M3b.3: made, with the design's §14)* |
 | M3b.4 | planck/README.md:354; datasphere's README (`Ambient`) |
 | M3b.7 | The README's per-read provider exposure (:1671) |
 | M3b.9, M3b.10 | ADR 0007 :32 and :38; the comments at registry.go:588-600; AGENTS.md's ADC and `credentials.yaml` sentences, rewritten in place |
